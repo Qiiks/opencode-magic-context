@@ -1,0 +1,28 @@
+[package]
+name = "mc-module"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The Magic Context subc module: harness-agnostic cache-stability transform (CK-in/CK-out), backed by the single-writer mc-store, served over the subc wire."
+
+[lib]
+name = "mc_module"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mc-module"
+path = "src/main.rs"
+
+[dependencies]
+mc-core = { workspace = true }
+mc-store = { workspace = true }
+cortexkit-store-types = { workspace = true }
+subc-protocol = { workspace = true }
+subc-client-rs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+subc-core = { workspace = true }
+tempfile = "3"
