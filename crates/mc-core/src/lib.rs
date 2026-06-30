@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod decay;
+
 pub use cortexkit_cache_core::{
     Action, CoreState, DurabilityClass, FrozenUnit, PassInput, StepResult,
 };
