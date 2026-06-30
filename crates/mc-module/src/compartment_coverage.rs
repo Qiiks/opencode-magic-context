@@ -15,25 +15,28 @@
 use mc_store::StoredCompartment;
 
 /// Hashes for the parts of the m0 baseline whose change means the frozen m0 bytes have
-/// changed, so the pass must re-render m0 (a HARD fold). Folded into the render_config
-/// string the classifier compares each pass: when any of these differ, the composed
-/// render_config differs, and the classifier's existing "render_config changed → HARD"
-/// rule fires. Kept as NAMED fields (not one combined hash) so a diff of the composed
-/// string shows WHICH part changed (useful for telemetry); equality cost is the same,
-/// since any field change still flips the whole string.
+/// changed AND that have no cheaper correction, so the pass must re-render m0 (a HARD
+/// fold). Folded into the render_config string the classifier compares each pass: when
+/// any of these differ, the composed render_config differs, and the classifier's
+/// existing "render_config changed → HARD" rule fires. Kept as NAMED fields (not one
+/// combined hash) so a diff of the composed string shows WHICH part changed (useful for
+/// telemetry); equality cost is the same, since any field change still flips the string.
 ///
-/// Only MONOLITHIC, wholesale content belongs here: a change to it has no cheap discrete
-/// correction, so the whole m0 must re-render. DISCRETE itemized content (id'd memories,
-/// sequenced compartments, additive profile entries) does NOT belong here — those are
-/// forward-corrected on the m1 delta (a new memory appends, an in-session memory edit
-/// rides a `<memory-updates>` correction), which is a SOFT that leaves m0 frozen.
-/// Including a discrete signal here would force a full m0 re-render on every additive
-/// add or in-session edit — the exact over-bust the m1 delta path exists to avoid.
+/// Only MONOLITHIC wholesale content with no cheap correction belongs here. TWO classes
+/// are deliberately EXCLUDED:
+///  - DISCRETE itemized content (id'd memories, sequenced compartments, additive profile
+///    entries) — forward-corrected on the m1 delta (a new memory appends, an in-session
+///    memory edit rides a `<memory-updates>` correction); a SOFT that leaves m0 frozen.
+///  - PROJECT-DOCS — even though docs are monolithic m0 content, a docs-only edit must
+///    NOT evict the cached prefix (it's a low-value, frequent edit). Docs fold into m0
+///    on the NEXT natural HARD (from another cause), which re-reads them from disk; the
+///    docs hash is a SNAPSHOT MARKER persisted with the rendered m0 bytes for
+///    observability, NOT a trigger. So `docs_hash` is intentionally NOT a field here.
+///
+/// Including any of these would force a full m0 re-render on a routine event — the exact
+/// over-bust the m1 delta path and the docs-defer-fold exist to avoid.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct M0ContentEpoch {
-    /// The project-docs canonical hash (ARCHITECTURE.md + STRUCTURE.md): a wholesale
-    /// on-disk blob with no discrete correction.
-    pub docs_hash: String,
     /// The workspace membership/policy fingerprint (member identities + their epochs +
     /// the shared-category policy): a wholesale change to which foreign memories are
     /// visible.
@@ -52,21 +55,20 @@ pub struct M0ContentEpoch {
 }
 
 /// Combine the base render_config (the provider-eviction triggers: system/model/
-/// serializer) with the four [`M0ContentEpoch`] fields into the effective render_config
-/// the classifier compares. Any difference in the base OR any epoch field produces a
-/// different string (→ the classifier's "render_config changed → HARD" fires). The
-/// base is kept as a prefix so provider changes still trigger. Deterministic (fixed
-/// field order); each field is length-prefixed so no value can forge a field boundary
-/// (e.g. ("a","bc") and ("ab","c") must not collapse to the same string).
+/// serializer) with the [`M0ContentEpoch`] fields into the effective render_config the
+/// classifier compares. Any difference in the base OR any epoch field produces a
+/// different string (→ the classifier's "render_config changed → HARD" fires). The base
+/// is kept as a prefix so provider changes still trigger. Deterministic (fixed field
+/// order); each field is length-prefixed so no value can forge a field boundary (e.g.
+/// ("a","bc") and ("ab","c") must not collapse to the same string).
 pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -> String {
-    // length-prefix each field so no value can forge a boundary (e.g. a docs_hash
-    // containing the delimiter can't masquerade as the next field).
+    // length-prefix each field so no value can forge a boundary (a value containing the
+    // delimiter can't masquerade as the next field).
     fn part(label: &str, value: &str) -> String {
         format!("{label}:{}:{value}", value.len())
     }
     format!(
-        "{base_render_config}|m0epoch[{};{};{};{}]",
-        part("docs", &epoch.docs_hash),
+        "{base_render_config}|m0epoch[{};{};{}]",
         part("ws", &epoch.workspace_fingerprint),
         part("upg", &epoch.upgrade_state),
         part("mem", &epoch.memory_content_epoch),
@@ -217,7 +219,6 @@ mod tests {
     fn m0_content_epoch_folds_legibly_and_deterministically() {
         let base = "sys0|tools0|model0|prof0";
         let epoch = M0ContentEpoch {
-            docs_hash: "dh1".into(),
             workspace_fingerprint: "wf1".into(),
             upgrade_state: "u1".into(),
             memory_content_epoch: "mc1".into(),
@@ -226,8 +227,11 @@ mod tests {
         // the base is kept as a prefix (a provider change still alters the string) and
         // each epoch field appears by name so a diff shows the cause
         assert!(folded.starts_with(base));
-        assert!(folded.contains("docs:3:dh1"));
+        assert!(folded.contains("ws:3:wf1"));
         assert!(folded.contains("mem:3:mc1"));
+        // docs hash is deliberately excluded from the fold (a docs-only edit must not
+        // force a full m0 re-render)
+        assert!(!folded.contains("docs"));
         // deterministic: same inputs → same string
         assert_eq!(folded, fold_m0_content_epoch(base, &epoch));
 
@@ -236,19 +240,19 @@ mod tests {
         e2.memory_content_epoch = "mc2".into();
         assert_ne!(folded, fold_m0_content_epoch(base, &e2));
         let mut e3 = epoch.clone();
-        e3.docs_hash = "dh2".into();
+        e3.upgrade_state = "u2".into();
         assert_ne!(folded, fold_m0_content_epoch(base, &e3));
 
         // length-prefix prevents a delimiter-forging collision: ("a","bc") vs ("ab","c")
         // for adjacent fields must NOT collapse to the same token.
         let forge_a = M0ContentEpoch {
-            docs_hash: "a".into(),
-            workspace_fingerprint: "bc".into(),
+            workspace_fingerprint: "a".into(),
+            upgrade_state: "bc".into(),
             ..Default::default()
         };
         let forge_b = M0ContentEpoch {
-            docs_hash: "ab".into(),
-            workspace_fingerprint: "c".into(),
+            workspace_fingerprint: "ab".into(),
+            upgrade_state: "c".into(),
             ..Default::default()
         };
         assert_ne!(

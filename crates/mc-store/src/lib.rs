@@ -593,29 +593,42 @@ impl McStore {
         Ok(rows)
     }
 
-    /// The coalesced memory corrections to render as the delta: mutation-log rows with
-    /// `id > after_id` whose `target_memory_id` is in `rendered_memory_ids` (the exact
-    /// set of memories included in the last rendered baseline). The membership test is by
-    /// that manifest, NOT by an `id <= last_id` test — the baseline can drop a
-    /// low-importance memory when over its token budget, so id-in-range does not imply
-    /// in-baseline. Coalesced to ONE correction per target, deterministic latest-wins
-    /// with terminal precedence: a terminal mutation (archive/delete/superseded) always
-    /// outranks a later `update`, so an update queued after an archive can't resurrect a
-    /// memory that already left the set. Sorted by id for a stable render order.
+    /// The coalesced memory corrections to render as the delta, across one OR MORE
+    /// project identities (the workspace union — a single-project session passes a
+    /// 1-element slice). Mutation-log rows with `id > after_id`, from any of
+    /// `project_paths`, whose `target_memory_id` is in `rendered_memory_ids` (the exact
+    /// set of memories included in the last rendered baseline). The manifest membership
+    /// IS the share filter: a foreign non-shared memory never entered the baseline, so
+    /// it's not in `rendered_memory_ids`, so its mutation can't supersede here — no extra
+    /// category check needed. The manifest test (NOT an `id <= last_id` test) is required
+    /// because budget-trim can drop a low-importance in-range memory.
+    ///
+    /// Coalesced to ONE correction per target, deterministic latest-wins with terminal
+    /// precedence: a terminal mutation (archive/delete/superseded) always outranks a
+    /// later `update`, so an update queued after an archive can't resurrect a memory that
+    /// already left the set. Sorted by id for a stable render order. Coalescing by
+    /// target_id is union-safe (a memory id is unique across the store).
     pub fn memory_mutations_for_render(
         &self,
-        project_path: &str,
+        project_paths: &[String],
         after_id: i64,
         rendered_memory_ids: &[i64],
     ) -> Result<Vec<StoredMemoryMutation>, McStoreError> {
-        if rendered_memory_ids.is_empty() {
+        if rendered_memory_ids.is_empty() || project_paths.is_empty() {
             return Ok(Vec::new());
         }
         // dedup + sort the id set for a stable IN-clause.
         let mut ids: Vec<i64> = rendered_memory_ids.to_vec();
         ids.sort_unstable();
         ids.dedup();
-        let placeholders = std::iter::repeat_n("?", ids.len())
+        let id_ph = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // dedup the project identities for a stable IN-clause.
+        let mut projects: Vec<String> = project_paths.to_vec();
+        projects.sort_unstable();
+        projects.dedup();
+        let proj_ph = std::iter::repeat_n("?", projects.len())
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -624,15 +637,16 @@ impl McStore {
                 "SELECT id, mutation_type, target_memory_id, superseded_by_id, category,
                         new_content, queued_at
                  FROM mc_memory_mutation_log
-                 WHERE project_path = ?1 AND id > ?2 AND target_memory_id IN ({placeholders})
+                 WHERE project_path IN ({proj_ph}) AND id > ? AND target_memory_id IN ({id_ph})
                  ORDER BY id ASC"
             );
             let mut stmt = conn.prepare(&sql)?;
-            // bind project_path, after_id, then the id set positionally.
-            let mut binds: Vec<rusqlite::types::Value> = vec![
-                rusqlite::types::Value::from(project_path.to_string()),
-                rusqlite::types::Value::from(after_id),
-            ];
+            // bind: the project set, then after_id, then the id set (matching SQL order).
+            let mut binds: Vec<rusqlite::types::Value> = projects
+                .iter()
+                .map(|p| rusqlite::types::Value::from(p.clone()))
+                .collect();
+            binds.push(rusqlite::types::Value::from(after_id));
             binds.extend(ids.iter().map(|&i| rusqlite::types::Value::from(i)));
             let mapped = stmt
                 .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
@@ -1083,8 +1097,9 @@ mod tests {
         log_mutation(&store, proj, "update", 30, "off-m0");
 
         let rendered = [10i64, 20];
+        let projects = vec![proj.to_string()];
         let out = store
-            .memory_mutations_for_render(proj, 0, &rendered)
+            .memory_mutations_for_render(&projects, 0, &rendered)
             .unwrap();
 
         assert_eq!(out.len(), 2, "one coalesced row per in-manifest target");
@@ -1102,7 +1117,7 @@ mod tests {
 
         // afterId cursor past id 2 → memory 10's updates fold out; 20's archive renders.
         let after = store
-            .memory_mutations_for_render(proj, 2, &rendered)
+            .memory_mutations_for_render(&projects, 2, &rendered)
             .unwrap();
         assert!(
             !after.iter().any(|m| m.target_memory_id == 10),
@@ -1113,9 +1128,40 @@ mod tests {
 
         // empty manifest → no corrections (nothing in m0 to correct).
         assert!(store
-            .memory_mutations_for_render(proj, 0, &[])
+            .memory_mutations_for_render(&projects, 0, &[])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn mutation_render_spans_workspace_union() {
+        // a foreign member's shared memory (in the manifest) updates → its correction
+        // must render across the whole workspace union, not just the own project; a
+        // single-project query would miss it (the foreign update would never supersede).
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:own";
+        let foreign = "git:foreign";
+
+        log_mutation(&store, own, "update", 100, "own-updated"); // id 1
+        log_mutation(&store, foreign, "update", 200, "foreign-updated"); // id 2
+
+        // manifest holds BOTH (the union baseline rendered own-100 + foreign-shared-200)
+        let rendered = [100i64, 200];
+        let single = store
+            .memory_mutations_for_render(&[own.to_string()], 0, &rendered)
+            .unwrap();
+        assert_eq!(single.len(), 1, "single-project misses the foreign update");
+        assert_eq!(single[0].target_memory_id, 100);
+
+        let union = store
+            .memory_mutations_for_render(&[own.to_string(), foreign.to_string()], 0, &rendered)
+            .unwrap();
+        let targets: Vec<i64> = union.iter().map(|m| m.target_memory_id).collect();
+        assert!(
+            targets.contains(&100) && targets.contains(&200),
+            "union supersedes both: {targets:?}"
+        );
     }
 
     #[test]
