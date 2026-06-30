@@ -49,6 +49,12 @@ pub struct ModuleMeta {
     /// The terminal covered ordinal as of the last baseline. Monotonic-absolute,
     /// never positional; can DECREASE on a revert-Hard.
     pub coverage_ordinal: Option<u64>,
+    /// The content-digest revision the frozen m1 block was last rendered from. The
+    /// classifier compares the incoming m1 content's revision against this to decide
+    /// whether an m1 delta rides (Soft) WITHOUT rendering. 0 = placeholder (no delta).
+    /// `serde(default)` so meta JSON persisted before this field loads cleanly.
+    #[serde(default)]
+    pub m1_revision: u64,
 }
 
 /// A loaded per-session row: the core state, the meta blob, and the CAS token.
@@ -246,6 +252,7 @@ mod tests {
             initialized: true,
             last_render_config: "cfg1".into(),
             coverage_ordinal: Some(42),
+            m1_revision: 0,
         };
 
         let v1 = store.commit("ses_a", None, &core, &meta).unwrap();

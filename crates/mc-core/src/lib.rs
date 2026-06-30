@@ -1,11 +1,10 @@
 //! Magic Context cache-stability core.
 //!
-//! Origin-agnostic: consumes already-decoded CK items, classifies each transform
-//! pass into a cache [`Action`], renders the full baseline on a Hard fold, and
-//! drives `cortexkit-cache-core`'s [`CoreState`]. Slice-1 is the spine only
-//! (full-baseline freeze + Hard fold + SoftPlus replay); reduction (the only
-//! `Soft` producer) lands in a later slice, so this classifier never returns
-//! [`Action::Soft`].
+//! Origin-agnostic PURE decision layer: the [`CkItem`] trait, the pass
+//! [`classify`] function, and re-exports of the shipped `cortexkit-cache-core`
+//! types. It performs NO rendering and NO I/O — those belong to the `mc-module`
+//! crate that consumes this one. The cache-core itself stays "dumb": it freezes
+//! whatever rendered units it is handed and never decides what to freeze.
 
 #![forbid(unsafe_code)]
 
@@ -13,100 +12,137 @@ pub use cortexkit_cache_core::{
     Action, CoreState, DurabilityClass, FrozenUnit, PassInput, StepResult,
 };
 
-/// A decoded CK conversation item the renderer can freeze. Origin-agnostic: the
-/// harness/codec produces these; the core never parses provider/harness wire bytes.
+/// A decoded CK conversation item. Origin-agnostic: these items are produced by the
+/// outer system (whichever coding-agent harness fed the conversation in); this crate
+/// never parses raw provider wire bytes.
 pub trait CkItem {
     /// Stable identity. The coverage boundary is expressed as one of these ids.
     fn id(&self) -> &str;
     /// Monotonic absolute ordinal — strictly increasing across the lineage, NEVER
-    /// positional (the window start moves; the ordinal does not). The coverage
-    /// watermark is compared against this.
+    /// positional (the window start moves; the ordinal does not).
     fn ordinal(&self) -> u64;
-    /// Opaque byte-complete rendering of this item: the source of the frozen
-    /// payload. The core concatenates these and never interprets them.
+    /// Opaque byte-complete rendering of this item.
     fn bytes(&self) -> &str;
+    /// Whether this is a module-synthesized block (m0/m1) rather than a real
+    /// conversation item. Synthetic items are stripped before boundary/coverage/
+    /// tail computation — they must never masquerade as the real boundary. Defaults
+    /// to `false` (a real item).
+    fn synthetic(&self) -> bool {
+        false
+    }
 }
 
-/// Signals the harness extracts from a pass, fed to [`classify`]. The core then
-/// executes the chosen [`Action`].
+/// Inputs to [`classify`], all booleans the consuming module computes from the loaded
+/// state + the incoming array + its decision inputs. This crate stays blind to the
+/// actual frozen units (it never inspects their bytes or keys).
 #[derive(Debug, Clone, Default)]
 pub struct ClassifierInput {
-    /// Has a baseline ever been materialized? (`module_meta.initialized`). False on
-    /// a fresh session — forces a bootstrap Hard so a baseline always exists before
-    /// any defer can replay it.
+    /// Has a baseline ever been materialized? False on a fresh session — forces a
+    /// bootstrap Hard so a baseline exists before any defer can replay it.
     pub initialized: bool,
-    /// Does the current render-config differ from the persisted one? An epoch-class
-    /// change (model key, system-prompt hash, project-memory epoch, …) whose
-    /// baseline bytes differ → Hard.
+    /// EXACTLY one legacy single `"baseline"` frozen unit AND no pending changes (the
+    /// shape an earlier single-block version of this code persisted). The ONLY shape
+    /// eligible for the destructive clear-then-Hard migration.
+    pub is_legacy_baseline: bool,
+    /// Frozen-set keys ⊆ {`m0`, `m1`} (the current two-block shape). An initialized
+    /// state that is neither legacy nor valid is an UNKNOWN shape → [`PassPlan::Reject`]
+    /// (never cleared — a destructive clear must never fire on an unrecognized shape).
+    pub valid_m0m1_shape: bool,
+    /// Render-config (model/system/tool) differs from the persisted one → epoch Hard.
     pub render_config_changed: bool,
-    /// Is the live coverage boundary token present in the incoming CK array?
+    /// A HARD trigger fired (compaction fold / idle-ttl / pressure) — decider-supplied.
+    pub hard_fold_requested: bool,
+    /// Is the durable boundary id present in the synthetic-stripped live array?
     pub boundary_present: bool,
-    /// The prior-pass reconcile flag (`CoreState.reconcile_pending`): an earlier
-    /// defer lost the boundary because a revert removed it.
+    /// The prior-pass reconcile flag: an earlier defer lost the boundary (a revert).
     pub reconcile_pending: bool,
+    /// The incoming m1 content's digest differs from the frozen m1's digest. A real
+    /// delta (content change), computed WITHOUT rendering (a revision compare).
+    pub m1_revision_changed: bool,
 }
 
-/// Ordered first-match pass classifier.
+/// The routing decision for a pass. Distinguishes a plain Hard from a legacy
+/// migration (clear-then-Hard) and from a clean reject (unknown/unsafe state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassPlan {
+    /// Plain hard fold (bootstrap / epoch / trigger / reconcile-rematerialize).
+    Hard,
+    /// Legacy single-`"baseline"`-unit state: clear the frozen set, THEN hard fold.
+    MigrateHard,
+    /// An m1 delta rides at the m1 breakpoint (boundary present).
+    Soft,
+    /// Defer: replay the frozen bytes verbatim (the cache-core `SoftPlus` action — no
+    /// new render, the cached prefix stays byte-identical).
+    Defer,
+    /// Unknown / unsafe frozen-set shape: clean Error, leave durable state unchanged.
+    Reject(&'static str),
+}
+
+/// Ordered first-match pass classifier. Hard triggers and the legacy / unknown-shape
+/// guards are evaluated BEFORE the soft-delta and defer paths.
 ///
-/// Hard triggers are evaluated BEFORE the boundary-absent path so a pass that is
-/// both boundary-absent AND an epoch change folds Hard (rematerializes) instead of
-/// mis-deferring. The slice-1 spine never returns [`Action::Soft`] — reduction is
-/// the only `Soft` producer and lands later.
-pub fn classify(input: &ClassifierInput) -> Action {
+/// The load-bearing ordering facts (the cache-core `step_*` mechanics referenced are
+/// in `cortexkit-cache-core`):
+/// - Rules 2 and 2b run right after bootstrap so a destructive clear fires ONLY on the
+///   exact legacy single-`"baseline"` shape, and any other unrecognized shape errors
+///   instead of being cleared.
+/// - Rule 6 (reconcile-clearing defer) runs BEFORE rule 7 (soft-delta): the core's
+///   `step_soft` never touches `reconcile_pending`, so a pass with the flag still set
+///   must clear it via a `step_defer` first; the deferred m1 delta re-derives next pass.
+/// - Rule 7 REQUIRES `boundary_present`: `step_soft` ignores the boundary and never sets
+///   `reconcile_pending`, so a boundary-absent Soft would bust the m1 breakpoint AND
+///   strand the reconcile flag (serving stale frozen bytes with no path to reconcile).
+///   The boundary-absent delta case therefore falls to rule 8 (defer + set reconcile via
+///   `step_defer`); the delta re-derives once reconcile resolves.
+pub fn classify(input: &ClassifierInput) -> PassPlan {
     // 1. Bootstrap: no baseline yet → Hard (materialize the first baseline).
     if !input.initialized {
-        return Action::Hard;
+        return PassPlan::Hard;
     }
-    // 2. Render-config epoch change → Hard (baseline bytes differ).
+    // 2. Legacy single-"baseline"-unit state → clear-then-Hard migration.
+    if input.is_legacy_baseline {
+        return PassPlan::MigrateHard;
+    }
+    // 2b. Any other unrecognized shape → clean Error, NEVER a destructive clear.
+    if !input.valid_m0m1_shape {
+        return PassPlan::Reject("unknown frozen-set shape");
+    }
+    // 3. Render-config epoch change → Hard.
     if input.render_config_changed {
-        return Action::Hard;
+        return PassPlan::Hard;
     }
-    // 3. Reconcile forced-Hard: a prior revert removed the boundary and it is STILL
-    //    absent → rematerialize against the live (shorter) array. If the boundary
-    //    returned (the user undid the revert), this is skipped and the next defer
-    //    clears reconcile_pending naturally — folds once, never re-fires.
+    // 4. A HARD trigger fired → Hard.
+    if input.hard_fold_requested {
+        return PassPlan::Hard;
+    }
+    // 5. Reconcile rematerialize: revert removed the boundary, still absent.
     if input.reconcile_pending && !input.boundary_present {
-        return Action::Hard;
+        return PassPlan::Hard;
     }
-    // 4. Default: no baseline change → defer; replay frozen bytes verbatim.
-    Action::SoftPlus
-}
-
-/// Render the full baseline as a single `synthesized-region` frozen unit covering
-/// all `items`. Slice-1 freezes the whole compacted prefix as one lineage unit; the
-/// reduction slice will emit finer drop / strip / skeleton units.
-pub fn render_baseline<I: CkItem>(items: &[I]) -> Vec<FrozenUnit> {
-    if items.is_empty() {
-        return Vec::new();
+    // 6. Reconcile CLEARING: boundary returned → defer; step_defer clears the flag.
+    if input.reconcile_pending {
+        return PassPlan::Defer;
     }
-    let payload: String = items.iter().map(CkItem::bytes).collect();
-    vec![FrozenUnit {
-        key: "baseline".to_string(),
-        kind: "synthesized-region".to_string(),
-        frozen_payload: payload,
-        durability_class: DurabilityClass::Lineage,
-        reset_rule: String::new(),
-    }]
-}
-
-/// The boundary id minted for a rendered baseline: the id of the terminal covered
-/// item. A Hard fold sets `PassInput.new_boundary_id` to this; later passes test
-/// boundary presence by finding this id in the live array.
-pub fn boundary_id<I: CkItem>(items: &[I]) -> Option<String> {
-    items.last().map(|i| i.id().to_string())
-}
-
-/// The coverage watermark for a rendered baseline: the terminal (highest) ordinal
-/// covered. A monotonic absolute ordinal, never positional. On a revert-Hard this
-/// can DECREASE (the live array is shorter) — it is always the CURRENT terminal,
-/// never `max(old, new)`.
-pub fn coverage_ordinal<I: CkItem>(items: &[I]) -> Option<u64> {
-    items.last().map(CkItem::ordinal)
+    // 7. m1 delta rides — ONLY with the boundary present.
+    if input.boundary_present && input.m1_revision_changed {
+        return PassPlan::Soft;
+    }
+    // 8. Defer: replay frozen bytes verbatim.
+    PassPlan::Defer
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn base() -> ClassifierInput {
+        ClassifierInput {
+            initialized: true,
+            valid_m0m1_shape: true,
+            boundary_present: true,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn bootstrap_when_uninitialized_is_hard() {
@@ -114,110 +150,95 @@ mod tests {
             initialized: false,
             ..Default::default()
         };
-        assert_eq!(classify(&input), Action::Hard);
+        assert_eq!(classify(&input), PassPlan::Hard);
     }
 
     #[test]
-    fn render_config_change_is_hard() {
+    fn legacy_baseline_migrates() {
         let input = ClassifierInput {
-            initialized: true,
+            is_legacy_baseline: true,
+            valid_m0m1_shape: false, // legacy is not m0/m1-valid, but rule 2 wins
+            ..base()
+        };
+        assert_eq!(classify(&input), PassPlan::MigrateHard);
+    }
+
+    #[test]
+    fn unknown_shape_rejects_never_clears() {
+        let input = ClassifierInput {
+            is_legacy_baseline: false,
+            valid_m0m1_shape: false,
+            ..base()
+        };
+        assert!(matches!(classify(&input), PassPlan::Reject(_)));
+    }
+
+    #[test]
+    fn epoch_change_is_hard() {
+        let input = ClassifierInput {
             render_config_changed: true,
-            boundary_present: true,
-            reconcile_pending: false,
+            ..base()
         };
-        assert_eq!(classify(&input), Action::Hard);
+        assert_eq!(classify(&input), PassPlan::Hard);
     }
 
     #[test]
-    fn reconcile_with_boundary_still_absent_is_hard() {
+    fn hard_fold_requested_is_hard() {
         let input = ClassifierInput {
-            initialized: true,
-            render_config_changed: false,
+            hard_fold_requested: true,
+            ..base()
+        };
+        assert_eq!(classify(&input), PassPlan::Hard);
+    }
+
+    #[test]
+    fn reconcile_boundary_absent_rematerializes() {
+        let input = ClassifierInput {
+            reconcile_pending: true,
             boundary_present: false,
-            reconcile_pending: true,
+            ..base()
         };
-        assert_eq!(classify(&input), Action::Hard);
+        assert_eq!(classify(&input), PassPlan::Hard);
     }
 
     #[test]
-    fn reconcile_but_boundary_returned_defers() {
-        // The user undid the revert: boundary is back, so do NOT re-fold — a defer
-        // clears reconcile_pending naturally (folds once, never re-fires).
+    fn reconcile_boundary_present_defers_to_clear() {
         let input = ClassifierInput {
-            initialized: true,
-            render_config_changed: false,
-            boundary_present: true,
             reconcile_pending: true,
+            boundary_present: true,
+            m1_revision_changed: true, // even with a delta, the clearing defer wins
+            ..base()
         };
-        assert_eq!(classify(&input), Action::SoftPlus);
+        assert_eq!(classify(&input), PassPlan::Defer);
     }
 
     #[test]
-    fn steady_state_defers() {
-        let input = ClassifierInput {
-            initialized: true,
-            render_config_changed: false,
+    fn soft_delta_rides_only_with_boundary_present() {
+        let present = ClassifierInput {
             boundary_present: true,
+            m1_revision_changed: true,
+            ..base()
+        };
+        assert_eq!(classify(&present), PassPlan::Soft);
+
+        // The first-boundary-loss case: boundary absent + delta must DEFER (set
+        // reconcile), never Soft (which would bust the m1 breakpoint and strand the flag).
+        let absent = ClassifierInput {
+            boundary_present: false,
+            m1_revision_changed: true,
             reconcile_pending: false,
+            ..base()
         };
-        assert_eq!(classify(&input), Action::SoftPlus);
-    }
-
-    struct Item {
-        id: String,
-        ordinal: u64,
-        bytes: String,
-    }
-    impl CkItem for Item {
-        fn id(&self) -> &str {
-            &self.id
-        }
-        fn ordinal(&self) -> u64 {
-            self.ordinal
-        }
-        fn bytes(&self) -> &str {
-            &self.bytes
-        }
-    }
-
-    fn items() -> Vec<Item> {
-        vec![
-            Item {
-                id: "a".into(),
-                ordinal: 10,
-                bytes: "AA".into(),
-            },
-            Item {
-                id: "b".into(),
-                ordinal: 20,
-                bytes: "BB".into(),
-            },
-        ]
+        assert_eq!(classify(&absent), PassPlan::Defer);
     }
 
     #[test]
-    fn baseline_concatenates_bytes_as_one_lineage_unit() {
-        let units = render_baseline(&items());
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].frozen_payload, "AABB");
-        assert_eq!(units[0].kind, "synthesized-region");
-        assert_eq!(units[0].durability_class, DurabilityClass::Lineage);
-    }
-
-    #[test]
-    fn boundary_and_coverage_are_terminal_not_max() {
-        assert_eq!(boundary_id(&items()).as_deref(), Some("b"));
-        assert_eq!(coverage_ordinal(&items()), Some(20));
-        // A shorter (reverted) array yields the SMALLER terminal — never the max.
-        let reverted = &items()[..1];
-        assert_eq!(coverage_ordinal(reverted), Some(10));
-    }
-
-    #[test]
-    fn empty_renders_nothing() {
-        let empty: Vec<Item> = Vec::new();
-        assert!(render_baseline(&empty).is_empty());
-        assert_eq!(boundary_id(&empty), None);
-        assert_eq!(coverage_ordinal(&empty), None);
+    fn boundary_present_no_delta_defers() {
+        let input = ClassifierInput {
+            boundary_present: true,
+            m1_revision_changed: false,
+            ..base()
+        };
+        assert_eq!(classify(&input), PassPlan::Defer);
     }
 }

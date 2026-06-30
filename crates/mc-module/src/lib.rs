@@ -32,7 +32,7 @@ use subc_protocol::{
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
-use transform::{transform, TransformRequest};
+use transform::{transform, DeciderInputs, TransformRequest};
 
 /// Canonical module id (overridable via `SUBC_MODULE_ID_ENV` at boot).
 pub const DEFAULT_MODULE_ID: &str = "magic-context";
@@ -128,7 +128,22 @@ impl ModuleHandler for McHandler {
                         }
                     }
                 };
-                match transform(store, &parsed) {
+                // The `_decider` wire field is test-only scaffolding (production builds
+                // the decision inputs internally, not from the request). Absent →
+                // all-default → the pure production path.
+                let deciders: DeciderInputs = match request.get("_decider") {
+                    Some(d) => match serde_json::from_value(d.clone()) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            return HandlerOutcome::Error {
+                                code: "bad_request".to_string(),
+                                message: format!("_decider: {e}"),
+                            }
+                        }
+                    },
+                    None => DeciderInputs::default(),
+                };
+                match transform(store, &parsed, &deciders) {
                     Ok(response) => respond(serde_json::to_value(response).unwrap_or(Value::Null)),
                     Err(e) => HandlerOutcome::Error {
                         code: "transform_failed".to_string(),

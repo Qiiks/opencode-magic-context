@@ -1,12 +1,13 @@
-//! Slice-1 acceptance gate: the cache-stability spine driven THROUGH a live subc
-//! daemon (real subc-core spawns nothing — mc-module self-registers as a provider —
-//! and a SubcConsumer calls the `transform` op end-to-end over the wire).
+//! End-to-end acceptance test: the cache-stability transform driven THROUGH a live
+//! subc daemon (a real subc-core spawns mc-module as a provider, and a SubcConsumer
+//! calls the `transform` op over the wire).
 //!
-//! Proves the production-driveable spine subset: bootstrap-Hard, V1 (growing-tail
-//! defer byte-stable), V7 (nonce-only defer stable), epoch-Hard, V8 (revert →
-//! defer+reconcile → Hard rematerialize), and V9 (restart → byte-identical replay).
-//! The Soft vectors (V2–V5) and the deferred-drain V6 stay lib-only: they need a
-//! reduction producer that slice-1 deliberately omits.
+//! Covered here (the cases drivable through the real production path): the first-pass
+//! Hard fold, growing-tail and nonce-only defers (cached prefix byte-stable), an
+//! epoch (render-config) Hard, a revert that removes the boundary (defer + reconcile,
+//! then Hard rematerialize), and a process restart replaying byte-identical. The m1
+//! delta SOFT and the deferred-drop drain need a content/reducer producer not yet
+//! built, so they are exercised in the library tests with stubbed inputs instead.
 
 #![forbid(unsafe_code)]
 
@@ -98,70 +99,72 @@ async fn mc_transform_spine_through_real_daemon() {
         .unwrap();
     let identity = identity("spine");
 
-    // --- bootstrap-Hard: first pass folds Hard, renders the baseline, mints boundary ---
-    let r = call_transform(
+    // ===== PRODUCTION-PATH cases (session "spine", `_decider` ABSENT) =====
+    // These drive the real transform path with no test-only surface present.
+
+    // bootstrap: the first pass folds Hard, rendering [m0(covered), m1(placeholder)] ++ tail.
+    let r = call(
         &consumer,
         &identity,
         json!({
-            "session_id": "ses",
-            "boundary_present": "ignored",
-            "render_config": "cfg0",
-            "items": [{ "id": "a", "ordinal": 1, "bytes": "<h>BASE</h>" }]
+            "session_id": "spine", "render_config": "cfg0",
+            "items": [ck("a", 1, "<h>BASE</h>")]
         }),
     )
     .await;
     assert_eq!(r["action"], "HARD", "bootstrap must fold Hard");
     assert_eq!(r["boundary_id"], "a");
-    assert_eq!(r["cached_prefix_bytes"], "<h>BASE</h>");
+    assert_eq!(m0(&r), "<h>BASE</h>");
+    assert_eq!(m1(&r), M1_PLACEHOLDER);
     assert_eq!(r["committed"], true);
 
-    // --- V1 + V7: growing-tail / nonce-only defers, byte-stable, no write ---
-    let mut prev: Option<String> = None;
-    for _ in 0..4 {
-        let d = call_transform(
+    // growing-tail defers. Send the FULL live array each pass (the module locates the
+    // boundary over it). Prefix blocks byte-identical; tail verbatim; no write.
+    let mut prev_m0: Option<String> = None;
+    for n in 2..=5u64 {
+        let mut items = vec![ck("a", 1, "<h>BASE</h>")];
+        for k in 2..=n {
+            items.push(ck(&format!("t{k}"), k, &format!("tail{k}")));
+        }
+        let d = call(
             &consumer,
             &identity,
-            json!({ "session_id": "ses", "boundary_present": "a", "render_config": "cfg0", "items": [] }),
+            json!({
+                "session_id": "spine", "render_config": "cfg0", "items": items
+            }),
         )
         .await;
         assert_eq!(d["action"], "SOFT+", "defer must not bust");
         assert_eq!(d["committed"], false, "pure defer must not write");
-        let bytes = d["cached_prefix_bytes"].as_str().unwrap().to_string();
-        if let Some(p) = &prev {
-            assert_eq!(&bytes, p, "defer changed bytes over the wire");
+        if let Some(p) = &prev_m0 {
+            assert_eq!(&m0(&d), p, "m0 changed on defer over the wire");
         }
-        prev = Some(bytes);
+        let tail: Vec<String> = (2..=n).map(|k| format!("t{k}")).collect();
+        assert_eq!(tail_ids(&d), tail, "tail must be verbatim live items");
+        prev_m0 = Some(m0(&d));
     }
 
-    // --- epoch-Hard: a render-config change rematerializes ---
-    let e = call_transform(
+    // epoch-Hard: a render-config change rematerializes.
+    let e = call(
         &consumer,
         &identity,
         json!({
-            "session_id": "ses",
-            "boundary_present": "a",
-            "render_config": "cfg1",
-            "items": [{ "id": "a", "ordinal": 1, "bytes": "<h>BASE2</h>" }]
+            "session_id": "spine", "render_config": "cfg1",
+            "items": [ck("a", 1, "<h>BASE2</h>")]
         }),
     )
     .await;
     assert_eq!(e["action"], "HARD", "epoch change must fold Hard");
-    assert_eq!(e["cached_prefix_bytes"], "<h>BASE2</h>");
+    assert_eq!(m0(&e), "<h>BASE2</h>");
 
-    // settle back to defer on the new config
-    let s = call_transform(
+    // revert removes the boundary "a" (array no longer contains it) → defer+reconcile,
+    // then Hard rematerialize against the live array.
+    let rev = call(
         &consumer,
         &identity,
-        json!({ "session_id": "ses", "boundary_present": "a", "render_config": "cfg1", "items": [] }),
-    )
-    .await;
-    assert_eq!(s["action"], "SOFT+");
-
-    // --- V8: revert removes the boundary → defer+reconcile, then Hard rematerialize ---
-    let rev = call_transform(
-        &consumer,
-        &identity,
-        json!({ "session_id": "ses", "boundary_present": "-", "render_config": "cfg1", "items": [] }),
+        json!({
+            "session_id": "spine", "render_config": "cfg1", "items": [ck("z", 9, "<h>OTHER</h>")]
+        }),
     )
     .await;
     assert_eq!(rev["action"], "SOFT+", "revert pass must not bust");
@@ -169,75 +172,128 @@ async fn mc_transform_spine_through_real_daemon() {
         rev["reconcile_pending"], true,
         "boundary loss flags reconcile"
     );
-    assert_eq!(
-        rev["cached_prefix_bytes"], "<h>BASE2</h>",
-        "revert keeps frozen bytes"
-    );
+    assert_eq!(m0(&rev), "<h>BASE2</h>", "revert keeps frozen m0");
 
-    let remat = call_transform(
-        &consumer,
-        &identity,
-        json!({
-            "session_id": "ses",
-            "boundary_present": "-",
-            "render_config": "cfg1",
-            "items": [{ "id": "a2", "ordinal": 2, "bytes": "<h>REVERTED</h>" }]
-        }),
-    )
-    .await;
+    let remat = call(&consumer, &identity, json!({
+        "session_id": "spine", "render_config": "cfg1", "items": [ck("a2", 10, "<h>REVERTED</h>")]
+    })).await;
     assert_eq!(
         remat["action"], "HARD",
         "boundary still absent → Hard remat"
     );
     assert_eq!(remat["boundary_id"], "a2");
-    assert_eq!(remat["cached_prefix_bytes"], "<h>REVERTED</h>");
+    assert_eq!(m0(&remat), "<h>REVERTED</h>");
     assert_eq!(remat["reconcile_pending"], false);
 
-    let stable_bytes = call_transform(
+    // ===== PRODUCER-LOGIC cases (session "prod", `_decider` PRESENT) =====
+    // The delta/fold LOGIC runs for real through the transform; only the upstream content (which
+    // memories/compartments changed, where to cut) is stubbed via `_decider`. A separate session
+    // keeps the production-path cases above free of any test-only surface.
+
+    // bootstrap the prod session
+    call(
         &consumer,
         &identity,
-        json!({ "session_id": "ses", "boundary_present": "a2", "render_config": "cfg1", "items": [] }),
-    )
-    .await["cached_prefix_bytes"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(stable_bytes, "<h>REVERTED</h>");
-
-    // --- V9: restart the module process; durable lineage state replays byte-identical ---
-    module.kill_and_wait();
-    drop(module);
-    // brief settle so the OS releases the single-writer lease before re-acquire
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let _module2 = spawn_module(&module_bin, &daemon.connection_file, &data_home);
-
-    let after_restart = call_transform(
-        &consumer,
-        &identity,
-        json!({ "session_id": "ses", "boundary_present": "a2", "render_config": "cfg1", "items": [] }),
+        json!({
+            "session_id": "prod", "render_config": "cfg0", "items": [ck("a", 1, "<h>BASE</h>")]
+        }),
     )
     .await;
-    assert_eq!(after_restart["action"], "SOFT+", "restart must not bust");
+
+    // an m1 delta rides as a SOFT — m0 frozen, m1 re-renders.
+    let v5 = call(
+        &consumer,
+        &identity,
+        json!({
+            "session_id": "prod", "render_config": "cfg0", "items": [ck("a", 1, "<h>BASE</h>")],
+            "_decider": { "m1_content": { "revision": 7, "body": "<mem>rule</mem>" } }
+        }),
+    )
+    .await;
+    assert_eq!(v5["action"], "SOFT", "m1 delta rides as a SOFT");
+    assert_eq!(m0(&v5), "<h>BASE</h>", "m0 stays frozen across a SOFT");
+    assert_eq!(m1(&v5), "<mem>rule</mem>");
+
+    // a HARD fold folds the m1 content into m0, resets m1, mints a new boundary.
+    let v6 = call(
+        &consumer,
+        &identity,
+        json!({
+            "session_id": "prod", "render_config": "cfg0",
+            "items": [ck("a", 1, "<h>BASE</h>"), ck("b", 2, "<h>MORE</h>")],
+            "_decider": { "hard_fold_requested": true, "fold_through_ordinal": 2,
+                          "m1_content": { "revision": 7, "body": "<mem>rule</mem>" } }
+        }),
+    )
+    .await;
+    assert_eq!(v6["action"], "HARD");
+    assert_eq!(v6["boundary_id"], "b");
     assert_eq!(
-        after_restart["committed"], false,
-        "restart replay writes nothing"
+        m0(&v6),
+        "<h>BASE</h><h>MORE</h><mem>rule</mem>",
+        "m1 folded into m0"
     );
+    assert_eq!(m1(&v6), M1_PLACEHOLDER, "m1 reset to placeholder");
+
+    // ===== restart the module process and confirm byte-identical replay (spine session) =====
+    module.kill_and_wait();
+    drop(module);
+    tokio::time::sleep(Duration::from_millis(200)).await; // OS releases the single-writer lease
+    let _module2 = spawn_module(&module_bin, &daemon.connection_file, &data_home);
+
+    let after = call(&consumer, &identity, json!({
+        "session_id": "spine", "render_config": "cfg1", "items": [ck("a2", 10, "<h>REVERTED</h>")]
+    })).await;
+    assert_eq!(after["action"], "SOFT+", "restart must not bust");
+    assert_eq!(after["committed"], false, "restart replay writes nothing");
     assert_eq!(
-        after_restart["cached_prefix_bytes"], "<h>REVERTED</h>",
-        "lineage state must reproduce byte-identical across a real process restart"
+        m0(&after),
+        "<h>REVERTED</h>",
+        "lineage m0 reproduces byte-identical across restart"
     );
 
     drop(consumer);
     drop(daemon);
 }
 
+const M1_PLACEHOLDER: &str = "(no new content since last materialization)";
+
+fn ck(id: &str, ordinal: u64, bytes: &str) -> Value {
+    json!({ "id": id, "ordinal": ordinal, "bytes": bytes })
+}
+
+/// The m0 synthetic block bytes from a response's ck_messages.
+fn m0(r: &Value) -> String {
+    block_bytes(r, "mc_m0")
+}
+fn m1(r: &Value) -> String {
+    block_bytes(r, "mc_m1")
+}
+fn block_bytes(r: &Value, id: &str) -> String {
+    r["ck_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} block in ck_messages: {r}"))["bytes"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+/// The non-synthetic tail item ids, in order.
+fn tail_ids(r: &Value) -> Vec<String> {
+    r["ck_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["synthetic"] != json!(true))
+        .map(|i| i["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
 // ---- helpers (adapted from subc-client-rs/tests/real_daemon.rs) ----
 
-async fn call_transform(
-    consumer: &SubcConsumer,
-    identity: &BindIdentity,
-    mut body: Value,
-) -> Value {
+async fn call(consumer: &SubcConsumer, identity: &BindIdentity, mut body: Value) -> Value {
     // The handler dispatches on `kind`; tag the envelope as a transform op. The
     // TransformRequest struct ignores this extra field.
     if let Value::Object(map) = &mut body {
