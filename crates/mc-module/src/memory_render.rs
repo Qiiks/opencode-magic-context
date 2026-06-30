@@ -14,8 +14,16 @@
 //! Routing + timing (which memories are in the baseline, when the corrections fold in)
 //! is the slice-4d integration decision, already ruled; the byte render here is pure.
 
+use crate::decay_render::{render_decayed_compartments, DecayRenderCompartment};
 use mc_store::{StoredMemory, StoredMemoryMutation};
 use std::collections::HashSet;
+
+/// The body for an empty session history. The `<session-history>` tag is always present
+/// (never omitted) so the provider prompt-cache has a stable breakpoint to anchor on —
+/// an absent block would shift the bytes after it and bust the cache.
+pub const M0_EMPTY_BODY: &str = "<session-history></session-history>";
+/// Default history budget when a caller doesn't supply one.
+pub const DEFAULT_HISTORY_BUDGET_TOKENS: f64 = 60_000.0;
 
 fn escape_xml_attr(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -70,6 +78,79 @@ pub fn render_memory_block(
     }
     lines.push(format!("</{wrapper}>"));
     lines.join("\n")
+}
+
+/// Render the `<user-profile>` baseline block: one `- <content>` line per user memory
+/// (already budget-trimmed by the caller). Empty set → empty string.
+pub fn render_user_profile_block(profile_lines: &[String], wrapper: &str) -> String {
+    if profile_lines.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::with_capacity(profile_lines.len() + 2);
+    lines.push(format!("<{wrapper}>"));
+    for content in profile_lines {
+        lines.push(format!("- {}", escape_xml_content(content)));
+    }
+    lines.push(format!("</{wrapper}>"));
+    lines.join("\n")
+}
+
+/// Inputs to [`render_m0`]: the four sub-blocks' source content, already budget-trimmed
+/// by the caller (the trim needs the token estimator, a separate subsystem). The render
+/// here is the pure COMPOSITION: order + framing + the decay-pressure→budget mapping.
+pub struct M0Inputs<'a> {
+    /// The pre-rendered `<project-docs>` block (empty string when absent).
+    pub project_docs: &'a str,
+    /// User-profile memory contents (trimmed); rendered as `- <content>` lines.
+    pub user_profile: &'a [String],
+    /// The compartment history (trimmed/ordered chronological), decay-rendered here.
+    pub compartments: &'a [DecayRenderCompartment],
+    /// The project memories (selected + ordered + trimmed) for the `<project-memory>` block.
+    pub memories: &'a [StoredMemory],
+    /// Map from memory id to its source project name, for memories that come from OTHER
+    /// projects sharing a workspace with this one (empty when every memory is the
+    /// current project's own).
+    pub source_name_by_id: &'a std::collections::HashMap<i64, String>,
+    /// The history budget in tokens (before the pressure multiplier).
+    pub history_budget_tokens: f64,
+    /// The drift-pressure multiplier (≥1): a tighter effective budget → more decay
+    /// demotion. Maps to `effective_budget = budget / max(1, multiplier)`, keeping the
+    /// decay curve the single source of pressure math.
+    pub decay_pressure_multiplier: f64,
+}
+
+/// Compose the m0 baseline: `<project-docs>` + `<user-profile>` + `<session-history>` +
+/// `<project-memory>`, joined by blank lines and trimmed. The session-history block is
+/// always present (empty history uses the `M0_EMPTY_BODY` placeholder — see its doc for
+/// why); the other three are omitted when empty. `estimate_tokens` is used inside the
+/// decay renderer for its budget-fit check (injected; under a loose budget the render is
+/// pure and estimator-independent). This function only composes; sub-block budget trims
+/// happen in the caller (they need the token estimator, a separate subsystem).
+pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    if !inputs.project_docs.is_empty() {
+        sections.push(inputs.project_docs.to_string());
+    }
+    let user_profile = render_user_profile_block(inputs.user_profile, "user-profile");
+    if !user_profile.is_empty() {
+        sections.push(user_profile);
+    }
+
+    let effective_budget = inputs.history_budget_tokens / inputs.decay_pressure_multiplier.max(1.0);
+    let session_history =
+        render_decayed_compartments(inputs.compartments, effective_budget, estimate_tokens);
+    sections.push(if session_history.is_empty() {
+        M0_EMPTY_BODY.to_string()
+    } else {
+        format!("<session-history>\n{session_history}\n</session-history>")
+    });
+
+    let memories_block =
+        render_memory_block(inputs.memories, "project-memory", inputs.source_name_by_id);
+    if !memories_block.is_empty() {
+        sections.push(memories_block);
+    }
+    sections.join("\n\n").trim().to_string()
 }
 
 /// Render the `<memory-updates>` corrections block from the coalesced mutation set.
@@ -175,6 +256,64 @@ mod tests {
             &src,
         );
         assert!(block.contains("source=\"svc-auth\""), "{block}");
+    }
+
+    #[test]
+    fn user_profile_block() {
+        assert_eq!(render_user_profile_block(&[], "user-profile"), "");
+        let prof = vec!["prefers root cause".to_string(), "x < y".to_string()];
+        let block = render_user_profile_block(&prof, "user-profile");
+        assert_eq!(
+            block,
+            "<user-profile>\n- prefers root cause\n- x &lt; y\n</user-profile>"
+        );
+    }
+
+    #[test]
+    fn m0_composition_orders_and_frames_sub_blocks() {
+        let comps = vec![DecayRenderCompartment {
+            start_message: 1,
+            end_message: 9,
+            title: "T".into(),
+            p1: Some("HIST".into()),
+            importance: Some(50),
+            ..Default::default()
+        }];
+        let inputs = M0Inputs {
+            project_docs: "<project-docs>\n<file name=\"A.md\">x</file>\n</project-docs>",
+            user_profile: &["likes tests".to_string()],
+            compartments: &comps,
+            memories: &[mem(1, "ARCHITECTURE", "m1", Some(80))],
+            source_name_by_id: &Default::default(),
+            history_budget_tokens: 60_000.0,
+            decay_pressure_multiplier: 1.0,
+        };
+        let m0 = render_m0(&inputs, |_| 0);
+        // order: project-docs, user-profile, session-history, project-memory
+        let i_docs = m0.find("<project-docs>").unwrap();
+        let i_prof = m0.find("<user-profile>").unwrap();
+        let i_hist = m0.find("<session-history>").unwrap();
+        let i_mem = m0.find("<project-memory>").unwrap();
+        assert!(
+            i_docs < i_prof && i_prof < i_hist && i_hist < i_mem,
+            "sub-block order: {m0}"
+        );
+        assert!(m0.contains(">\nHIST\n<"), "history rendered: {m0}");
+    }
+
+    #[test]
+    fn m0_empty_history_uses_placeholder_not_absent() {
+        let inputs = M0Inputs {
+            project_docs: "",
+            user_profile: &[],
+            compartments: &[],
+            memories: &[],
+            source_name_by_id: &Default::default(),
+            history_budget_tokens: 60_000.0,
+            decay_pressure_multiplier: 1.0,
+        };
+        // no docs/profile/memory + no compartments → just the empty-history placeholder
+        assert_eq!(render_m0(&inputs, |_| 0), M0_EMPTY_BODY);
     }
 
     #[test]
