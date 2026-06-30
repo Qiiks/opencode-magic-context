@@ -23,6 +23,9 @@ import {
     type DecayRenderCompartment,
     renderDecayedCompartments,
 } from "../../../packages/plugin/src/hooks/magic-context/decay-render.ts";
+import { mkdtempSync, rmSync, writeFileSync as writeDocFile } from "node:fs";
+import { tmpdir } from "node:os";
+import { readProjectDocsCanonical } from "../../../packages/plugin/src/features/magic-context/project-docs-hash.ts";
 
 const indices = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 200, 400, 1000];
 const importances = [1, 10, 25, 40, 50, 60, 75, 90, 100];
@@ -137,3 +140,37 @@ const renderOut = join(import.meta.dir, "../../mc-module/testdata/render-golden.
 mkdirSync(dirname(renderOut), { recursive: true });
 writeFileSync(renderOut, `${JSON.stringify({ cases: renderCases }, null, 2)}\n`);
 console.log(`wrote ${renderCases.length} render cases → ${renderOut}`);
+
+// --- project-docs golden (canonical hash + rendered <project-docs> block) ---
+// Each case writes the given files into a temp dir, runs the TS reference
+// implementation, and records the rendered block + canonical hash. Symlink/oversize
+// cases are NOT in the golden (they're filesystem-shape tests, covered directly in the
+// Rust unit tests). ASCII + the canonicalization edge cases (BOM/CRLF/trailing) so the
+// Rust char port and the TS UTF-16 port agree.
+const docCaseInputs: Array<Array<[string, string]>> = [
+    [],
+    [["ARCHITECTURE.md", "# Arch\nbody line"]],
+    [
+        ["ARCHITECTURE.md", "# Arch\nalpha"],
+        ["STRUCTURE.md", "# Struct\nbeta"],
+    ],
+    // canonicalization: BOM + CRLF + trailing spaces/tabs + trailing blank lines
+    [["ARCHITECTURE.md", "\uFEFFline1  \r\nline2\t\n\n\n"]],
+    // XML-escaped content
+    [["STRUCTURE.md", "a < b & c > d"]],
+    // only STRUCTURE present (ARCHITECTURE absent)
+    [["STRUCTURE.md", "solo struct"]],
+];
+const docsCases = docCaseInputs.map((files) => {
+    const tmp = mkdtempSync(join(tmpdir(), "mc-docs-golden-"));
+    try {
+        for (const [name, body] of files) writeDocFile(join(tmp, name), body);
+        const { renderedBlock, canonicalHash } = readProjectDocsCanonical(tmp);
+        return { files, rendered_block: renderedBlock, canonical_hash: canonicalHash };
+    } finally {
+        rmSync(tmp, { recursive: true, force: true });
+    }
+});
+const docsOut = join(import.meta.dir, "../../mc-module/testdata/project-docs-golden.json");
+writeFileSync(docsOut, `${JSON.stringify({ cases: docsCases }, null, 2)}\n`);
+console.log(`wrote ${docsCases.length} project-docs cases → ${docsOut}`);

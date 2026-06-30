@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod decay_render;
+pub mod project_docs;
 pub mod transform;
 
 use std::sync::OnceLock;

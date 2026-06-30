@@ -330,6 +330,8 @@ name = "mc-core"
 version = "0.1.0"
 dependencies = [
  "cortexkit-cache-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -341,6 +343,7 @@ dependencies = [
  "mc-store",
  "serde",
  "serde_json",
+ "sha2",
  "subc-client-rs",
  "subc-core",
  "subc-protocol",
