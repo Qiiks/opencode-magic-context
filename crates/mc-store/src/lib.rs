@@ -241,6 +241,30 @@ pub struct ModuleMeta {
     /// `serde(default)` so meta JSON persisted before this field loads cleanly.
     #[serde(default)]
     pub m1_revision: u64,
+
+    // --- slice 4d-m0: the two-watermark coverage model + memory manifest ---
+    // (all serde(default) so pre-4d meta JSON loads cleanly)
+    /// The highest compartment `sequence` folded INTO m0. The "in-m0 vs riding-m1"
+    /// divider — advances ONLY on a HARD fold. The m1 renderer treats compartments with
+    /// `sequence > folded_compartment_seq` as new (renders them at P1); the HARD folds
+    /// them and advances this. Distinct from `coverage_ordinal` (the m0+m1 coverage end /
+    /// tail-trim point, which advances on a coverage-extending SOFT too).
+    #[serde(default)]
+    pub folded_compartment_seq: i64,
+    /// The manifest of memory ids actually rendered into the frozen m0 (post-budget-trim).
+    /// The supersede router uses membership here (NOT id<=max_memory_id, since a trim
+    /// drops low-importance memories) to decide whether a memory UPDATE rides m1 as a
+    /// `<memory-updates>` correction. Persisted atomically with the m0 bytes.
+    #[serde(default)]
+    pub rendered_memory_ids: Vec<i64>,
+    /// The memory-mutation-log id folded as of the last HARD. m1 renders corrections with
+    /// `id > memory_mutation_cursor`; a HARD reconciles them into m0 and advances this.
+    #[serde(default)]
+    pub memory_mutation_cursor: i64,
+    /// The highest memory id folded into m0. m1 renders memories with `id > max_memory_id`
+    /// as `<new-memories>`; a HARD folds them and advances this.
+    #[serde(default)]
+    pub max_memory_id: i64,
 }
 
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
@@ -849,6 +873,7 @@ mod tests {
             last_render_config: "cfg1".into(),
             coverage_ordinal: Some(42),
             m1_revision: 0,
+            ..Default::default()
         };
 
         let v1 = store.commit("ses_a", None, &core, &meta).unwrap();

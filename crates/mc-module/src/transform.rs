@@ -952,6 +952,7 @@ mod tests {
             last_render_config: "cfg0".into(),
             coverage_ordinal: Some(1),
             m1_revision: 0,
+            ..Default::default()
         };
         s.commit("ses", None, &legacy_core, &legacy_meta).unwrap();
 
@@ -993,6 +994,7 @@ mod tests {
             last_render_config: "cfg0".into(),
             coverage_ordinal: Some(1),
             m1_revision: 0,
+            ..Default::default()
         };
         s.commit("ses", None, &weird, &meta).unwrap();
         let err =
@@ -1459,6 +1461,7 @@ mod tests {
             last_render_config: "cfg0".into(),
             coverage_ordinal: Some(1),
             m1_revision: 0,
+            ..Default::default()
         };
         s.commit("ses", None, &bad, &meta).unwrap();
         let err = transform(
