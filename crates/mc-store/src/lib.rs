@@ -68,6 +68,49 @@ const MIGRATIONS: &[Migration] = &[
         );
     ",
     },
+    Migration {
+        version: 3,
+        // Project memories — the durable knowledge rendered into the prompt baseline.
+        // Uses the full original `memories` schema (every field) so the background
+        // maintenance worker that owns memory upkeep can read/write all of it; the
+        // prompt render only projects the subset it needs. Keyed by id;
+        // UNIQUE(project_path, category, normalized_hash) dedups. `importance` orders the
+        // budget trim (highest survives); `status` selects active/permanent for the
+        // render (archived is ignored); `superseded_by_memory_id` records that a later
+        // memory replaced this one (used when rendering memory corrections).
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_memories (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_path             TEXT NOT NULL,
+            category                 TEXT NOT NULL,
+            content                  TEXT NOT NULL,
+            normalized_hash          TEXT NOT NULL,
+            importance               INTEGER,
+            scope                    TEXT NOT NULL DEFAULT 'project',
+            shareable                INTEGER NOT NULL DEFAULT 0,
+            source_session_id        TEXT,
+            source_type              TEXT DEFAULT 'historian',
+            seen_count               INTEGER DEFAULT 1,
+            retrieval_count          INTEGER DEFAULT 0,
+            first_seen_at            INTEGER NOT NULL DEFAULT 0,
+            created_at               INTEGER NOT NULL DEFAULT 0,
+            updated_at               INTEGER NOT NULL DEFAULT 0,
+            last_seen_at             INTEGER NOT NULL DEFAULT 0,
+            last_retrieved_at        INTEGER,
+            status                   TEXT DEFAULT 'active',
+            expires_at               INTEGER,
+            verification_status      TEXT DEFAULT 'unverified',
+            verified_at              INTEGER,
+            classified_at            INTEGER,
+            superseded_by_memory_id  INTEGER,
+            merged_from              TEXT,
+            metadata_json            TEXT,
+            UNIQUE(project_path, category, normalized_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_memories_project_status
+            ON mc_memories(project_path, status);
+    ",
+    },
 ];
 
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
@@ -112,6 +155,26 @@ pub struct StoredCompartment {
     /// 1 = pre-v2 flat compartment, 0 = v2 tiered.
     pub legacy: i32,
     pub created_at: i64,
+}
+
+/// A project memory row projected for rendering into the prompt. The store keeps the
+/// full original schema; this struct carries only the columns the render, the budget
+/// trim (drop lowest-importance when over budget), and the supersede/correction logic
+/// actually read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredMemory {
+    pub id: i64,
+    pub category: String,
+    pub content: String,
+    /// Decay-rate / budget-trim ordering signal (1..100); None when unclassified.
+    pub importance: Option<i32>,
+    /// "active" | "permanent" | "archived" — the render set is active+permanent.
+    pub status: String,
+    pub expires_at: Option<i64>,
+    /// Set when a later memory has replaced this one; consulted when rendering the list
+    /// of memory corrections (a superseded memory renders as "X → Y").
+    pub superseded_by_memory_id: Option<i64>,
+    pub updated_at: i64,
 }
 
 /// A loaded per-session row: the core state, the meta blob, and the CAS token.
@@ -353,6 +416,47 @@ impl McStore {
         })?;
         Ok(())
     }
+
+    /// Load a project's render-eligible memories: `active` + `permanent`, excluding
+    /// expired ones (an `expires_at` at/before `now_ms`, NULL = never expires), ordered
+    /// by importance descending then id ascending (the budget-trim order — highest
+    /// importance survives a trim; id breaks ties deterministically). The expiry cutoff
+    /// is supplied by the caller, NOT read from the live clock, so the full render and
+    /// every later byte-identical replay of it observe the SAME memory set — a live
+    /// clock would expire a memory mid-replay and silently change the rendered bytes.
+    pub fn load_active_memories(
+        &self,
+        project_path: &str,
+        now_ms: i64,
+    ) -> Result<Vec<StoredMemory>, McStoreError> {
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, content, importance, status, expires_at,
+                        superseded_by_memory_id, updated_at
+                 FROM mc_memories
+                 WHERE project_path = ?1
+                   AND status IN ('active', 'permanent')
+                   AND (expires_at IS NULL OR expires_at > ?2)
+                 ORDER BY COALESCE(importance, 50) DESC, id ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![project_path, now_ms], |r| {
+                    Ok(StoredMemory {
+                        id: r.get(0)?,
+                        category: r.get(1)?,
+                        content: r.get(2)?,
+                        importance: r.get(3)?,
+                        status: r.get(4)?,
+                        expires_at: r.get(5)?,
+                        superseded_by_memory_id: r.get(6)?,
+                        updated_at: r.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -496,5 +600,80 @@ mod tests {
 
         // distinct sessions are isolated
         assert!(store.load_compartments("ses_b").unwrap().is_empty());
+    }
+
+    fn insert_memory(
+        store: &McStore,
+        project: &str,
+        id: i64,
+        content: &str,
+        importance: Option<i32>,
+        status: &str,
+        expires_at: Option<i64>,
+    ) {
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_memories
+                       (id, project_path, category, content, normalized_hash, importance,
+                        status, expires_at, first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (?1,?2,'ARCHITECTURE',?3,?4,?5,?6,?7,0,0,0,0)",
+                    params![
+                        id,
+                        project,
+                        content,
+                        format!("h{id}"),
+                        importance,
+                        status,
+                        expires_at
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn active_memories_filter_order_and_frozen_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let proj = "git:proj";
+
+        insert_memory(&store, proj, 1, "low active", Some(20), "active", None);
+        insert_memory(&store, proj, 2, "high active", Some(90), "active", None);
+        insert_memory(&store, proj, 3, "permanent", Some(50), "permanent", None);
+        insert_memory(&store, proj, 4, "archived", Some(99), "archived", None); // excluded
+        insert_memory(&store, proj, 5, "expired", Some(99), "active", Some(1000)); // expires at 1000
+        insert_memory(&store, proj, 6, "other proj", Some(99), "active", None);
+        // (re-key the last under a different project)
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE mc_memories SET project_path = 'git:other' WHERE id = 6",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // cutoff AFTER the expiry → memory 5 excluded; archived + other-project excluded;
+        // ordered importance desc (90, 50, 20).
+        let read = store.load_active_memories(proj, 2000).unwrap();
+        let ids: Vec<i64> = read.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 3, 1],
+            "active+permanent, expired excluded, importance desc"
+        );
+
+        // a cutoff BEFORE the expiry keeps memory 5 (frozen-cutoff determinism: the
+        // caller controls the cutoff, not a live clock).
+        let read_early = store.load_active_memories(proj, 500).unwrap();
+        assert!(
+            read_early.iter().any(|m| m.id == 5),
+            "not-yet-expired at the earlier cutoff"
+        );
     }
 }
