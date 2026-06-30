@@ -64,11 +64,19 @@ impl ModuleHandler for McHandler {
     /// The storage seam: HELLO_ACK carries the resolved descriptor (or none in
     /// standalone dev). Open the store ONCE here — never at construction, because the
     /// path isn't known until the ACK lands.
+    ///
+    /// Guard the OPEN itself, not just the `set`: `McStore::open` acquires the
+    /// single-writer lease, so on a reconnect ack (if serve re-fires this) an
+    /// unconditional open briefly takes a second lease on a process that already
+    /// holds one. `on_hello_ack` is called serially by serve, so the get/open/set
+    /// is race-free without a lock.
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
+        if self.store.get().is_some() {
+            return;
+        }
         let descriptor = resolve_descriptor(ack.storage.as_ref());
         match McStore::open(&descriptor) {
             Ok(store) => {
-                // set() fails only if already set (a second ACK); ignore — one store.
                 let _ = self.store.set(store);
             }
             Err(e) => {
