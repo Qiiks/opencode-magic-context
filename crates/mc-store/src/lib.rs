@@ -111,7 +111,55 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_memories(project_path, status);
     ",
     },
+    Migration {
+        version: 4,
+        // Records non-additive memory changes (update / archive / delete / superseded)
+        // as append-only rows instead of editing the rendered memory baseline. The
+        // prompt baseline is cached byte-for-byte once rendered; rather than re-rendering
+        // it for every memory edit (which would invalidate the cache), these rows are
+        // coalesced to one correction per target memory and sent as a small "corrections"
+        // delta on top of the cached baseline. On the next full baseline re-render the
+        // corrections fold in and a cursor advances past the processed rows.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_memory_mutation_log (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_path       TEXT NOT NULL,
+            mutation_type      TEXT NOT NULL
+                CHECK (mutation_type IN ('archive', 'delete', 'update', 'superseded')),
+            target_memory_id   INTEGER NOT NULL,
+            superseded_by_id   INTEGER,
+            category           TEXT,
+            new_content        TEXT,
+            queued_at          INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_memory_mutation_log_project
+            ON mc_memory_mutation_log(project_path, id);
+    ",
+    },
 ];
+
+/// A memory mutation-log entry. `update` is non-terminal (the memory is still present
+/// with new content → renders `<updated>`); `archive`/`delete`/`superseded` are TERMINAL
+/// (the memory left the active set → renders `<removed>`/`<superseded>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredMemoryMutation {
+    pub id: i64,
+    pub mutation_type: String,
+    pub target_memory_id: i64,
+    pub superseded_by_id: Option<i64>,
+    pub category: Option<String>,
+    pub new_content: Option<String>,
+    pub queued_at: i64,
+}
+
+impl StoredMemoryMutation {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.mutation_type.as_str(),
+            "archive" | "delete" | "superseded"
+        )
+    }
+}
 
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,6 +505,98 @@ impl McStore {
         })?;
         Ok(rows)
     }
+
+    /// The coalesced memory corrections to render as the delta: mutation-log rows with
+    /// `id > after_id` whose `target_memory_id` is in `rendered_memory_ids` (the exact
+    /// set of memories included in the last rendered baseline). The membership test is by
+    /// that manifest, NOT by an `id <= last_id` test — the baseline can drop a
+    /// low-importance memory when over its token budget, so id-in-range does not imply
+    /// in-baseline. Coalesced to ONE correction per target, deterministic latest-wins
+    /// with terminal precedence: a terminal mutation (archive/delete/superseded) always
+    /// outranks a later `update`, so an update queued after an archive can't resurrect a
+    /// memory that already left the set. Sorted by id for a stable render order.
+    pub fn memory_mutations_for_render(
+        &self,
+        project_path: &str,
+        after_id: i64,
+        rendered_memory_ids: &[i64],
+    ) -> Result<Vec<StoredMemoryMutation>, McStoreError> {
+        if rendered_memory_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // dedup + sort the id set for a stable IN-clause.
+        let mut ids: Vec<i64> = rendered_memory_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let rows = self.inner.with_conn(|conn| {
+            let sql = format!(
+                "SELECT id, mutation_type, target_memory_id, superseded_by_id, category,
+                        new_content, queued_at
+                 FROM mc_memory_mutation_log
+                 WHERE project_path = ?1 AND id > ?2 AND target_memory_id IN ({placeholders})
+                 ORDER BY id ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            // bind project_path, after_id, then the id set positionally.
+            let mut binds: Vec<rusqlite::types::Value> = vec![
+                rusqlite::types::Value::from(project_path.to_string()),
+                rusqlite::types::Value::from(after_id),
+            ];
+            binds.extend(ids.iter().map(|&i| rusqlite::types::Value::from(i)));
+            let mapped = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                    Ok(StoredMemoryMutation {
+                        id: r.get(0)?,
+                        mutation_type: r.get(1)?,
+                        target_memory_id: r.get(2)?,
+                        superseded_by_id: r.get(3)?,
+                        category: r.get(4)?,
+                        new_content: r.get(5)?,
+                        queued_at: r.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+
+        Ok(coalesce_mutations(rows))
+    }
+}
+
+/// Coalesce mutation-log rows to one per target memory: deterministic latest-wins with
+/// TERMINAL precedence (terminal always outranks a non-terminal `update`, regardless of
+/// id order). Among rows of the same terminality, the later id wins. Sorted by id for a
+/// stable render order.
+fn coalesce_mutations(rows: Vec<StoredMemoryMutation>) -> Vec<StoredMemoryMutation> {
+    use std::collections::HashMap;
+    let mut chosen: HashMap<i64, StoredMemoryMutation> = HashMap::new();
+    // rows arrive id-ASC; iterate in that order so "later id wins" = last-write-wins
+    // for same-terminality, and the terminal-precedence guard handles the rest.
+    for candidate in rows {
+        match chosen.get(&candidate.target_memory_id) {
+            None => {
+                chosen.insert(candidate.target_memory_id, candidate);
+            }
+            Some(current) => {
+                let current_terminal = current.is_terminal();
+                let candidate_terminal = candidate.is_terminal();
+                if current_terminal && !candidate_terminal {
+                    // keep the terminal; a later update can't resurrect it.
+                    continue;
+                }
+                // candidate-terminal-over-current-nonterminal, OR same-terminality
+                // later-id → candidate wins.
+                chosen.insert(candidate.target_memory_id, candidate);
+            }
+        }
+    }
+    let mut out: Vec<StoredMemoryMutation> = chosen.into_values().collect();
+    out.sort_by_key(|m| m.id);
+    out
 }
 
 #[cfg(test)]
@@ -675,5 +815,71 @@ mod tests {
             read_early.iter().any(|m| m.id == 5),
             "not-yet-expired at the earlier cutoff"
         );
+    }
+
+    fn log_mutation(store: &McStore, project: &str, kind: &str, target: i64, content: &str) {
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_memory_mutation_log
+                       (project_path, mutation_type, target_memory_id, new_content, queued_at)
+                     VALUES (?1, ?2, ?3, ?4, 0)",
+                    params![project, kind, target, content],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn mutation_render_coalesces_latest_wins_with_terminal_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let proj = "git:proj";
+
+        // memory 10: two updates → latest-wins (single terminal correction).
+        log_mutation(&store, proj, "update", 10, "v1"); // id 1
+        log_mutation(&store, proj, "update", 10, "v2"); // id 2 (newer wins)
+                                                        // memory 20: an archive then a later update → terminal (archive) outranks update.
+        log_mutation(&store, proj, "archive", 20, ""); // id 3 terminal
+        log_mutation(&store, proj, "update", 20, "resurrect?"); // id 4 must NOT win
+                                                                // memory 30: in the log but NOT in the rendered manifest → excluded.
+        log_mutation(&store, proj, "update", 30, "off-m0");
+
+        let rendered = [10i64, 20];
+        let out = store
+            .memory_mutations_for_render(proj, 0, &rendered)
+            .unwrap();
+
+        assert_eq!(out.len(), 2, "one coalesced row per in-manifest target");
+        let m10 = out.iter().find(|m| m.target_memory_id == 10).unwrap();
+        assert_eq!(m10.new_content.as_deref(), Some("v2"), "latest update wins");
+        let m20 = out.iter().find(|m| m.target_memory_id == 20).unwrap();
+        assert_eq!(
+            m20.mutation_type, "archive",
+            "terminal outranks a later update"
+        );
+        assert!(
+            !out.iter().any(|m| m.target_memory_id == 30),
+            "off-manifest excluded"
+        );
+
+        // afterId cursor past id 2 → memory 10's updates fold out; 20's archive renders.
+        let after = store
+            .memory_mutations_for_render(proj, 2, &rendered)
+            .unwrap();
+        assert!(
+            !after.iter().any(|m| m.target_memory_id == 10),
+            "folded updates excluded by cursor"
+        );
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].target_memory_id, 20);
+
+        // empty manifest → no corrections (nothing in m0 to correct).
+        assert!(store
+            .memory_mutations_for_render(proj, 0, &[])
+            .unwrap()
+            .is_empty());
     }
 }
