@@ -715,6 +715,38 @@ impl McStore {
         Ok(membership)
     }
 
+    /// A DETERMINISTIC fingerprint of the project's workspace membership + share policy.
+    /// The cache layer treats a change in this value as a baseline re-render (a HARD fold):
+    /// a membership/policy change re-composes m0 over a DIFFERENT project set, so a stale
+    /// fingerprint can't be tolerated the way stale content can. MUST be canonical: members
+    /// sorted by `project_path`, the share-category list sorted, each field length-prefixed
+    /// so no value forges a boundary. A nondeterministic fingerprint over a STABLE
+    /// workspace would false-HARD every pass (the over-bust the m0/m1 split exists to
+    /// avoid). Empty string when the project is in no workspace (the single-project state —
+    /// a stable "no workspace" marker). NOTE: in this slice the fingerprint covers
+    /// membership + share-policy only; production also folds each member's project-memory
+    /// epoch, which has no `mc_*` source yet (it lands with the deferred
+    /// `project_memory_epoch` marker when the write paths relocate).
+    pub fn workspace_fingerprint(&self, project_path: &str) -> Result<String, McStoreError> {
+        let Some(m) = self.resolve_workspace_membership(project_path)? else {
+            return Ok(String::new());
+        };
+        // resolve_workspace_membership returns members sorted by project_path; sort the
+        // share categories too so the policy axis is order-independent.
+        let mut shared = m.share_categories.clone();
+        shared.sort_unstable();
+        let mut out = String::from("ws[");
+        for id in &m.union_identities {
+            out.push_str(&format!("m:{}:{};", id.len(), id));
+        }
+        out.push_str("|share:");
+        for cat in &shared {
+            out.push_str(&format!("{}:{};", cat.len(), cat));
+        }
+        out.push(']');
+        Ok(out)
+    }
+
     /// Load render-eligible memories across a workspace UNION: every member's `active` +
     /// `permanent` non-expired memories, but a FOREIGN member's only in the shared
     /// categories (`share_categories`); the OWN project sees all its own. Ordered by
@@ -1187,6 +1219,57 @@ mod tests {
             .memory_mutations_for_render(&projects, 0, &[])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn workspace_fingerprint_is_deterministic_and_membership_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:own";
+        let foreign = "git:foreign";
+
+        // a project in NO workspace → stable empty marker
+        assert_eq!(store.workspace_fingerprint(own).unwrap(), "");
+
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_workspaces (id, name, share_categories) VALUES (1,'ws','[\"CONSTRAINTS\",\"ARCHITECTURE\"]')",
+                    [],
+                )?;
+                // insert members in NON-sorted order to prove the fingerprint canonicalizes
+                tx.execute(
+                    "INSERT INTO mc_workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                     VALUES (1, ?1, 'foreign', '/f', 0), (1, ?2, 'own', '/o', 0)",
+                    params![foreign, own],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // same membership → byte-identical across repeated reads (stability for an
+        // unchanged workspace, so it never forces a needless re-render)
+        let fp1 = store.workspace_fingerprint(own).unwrap();
+        let fp2 = store.workspace_fingerprint(own).unwrap();
+        assert_eq!(fp1, fp2, "stable workspace → stable fingerprint");
+        assert!(!fp1.is_empty());
+        // both members appear; the foreign member changes the marker (membership-sensitive)
+        assert!(fp1.contains(own) && fp1.contains(foreign), "{fp1}");
+
+        // removing the foreign member changes the fingerprint (a real membership change HARDs)
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "DELETE FROM mc_workspace_members WHERE project_path = ?1",
+                    params![foreign],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let fp3 = store.workspace_fingerprint(own).unwrap();
+        assert_ne!(fp1, fp3, "a real membership change must change the marker");
     }
 
     #[test]
