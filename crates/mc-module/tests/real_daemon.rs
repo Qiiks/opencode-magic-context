@@ -97,7 +97,6 @@ async fn mc_transform_spine_through_real_daemon() {
     let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
         .await
         .unwrap();
-    let identity = identity("spine");
 
     // ===== PRODUCTION-PATH cases (session "spine", `_decider` ABSENT) =====
     // These drive the real transform path with no test-only surface present.
@@ -105,7 +104,6 @@ async fn mc_transform_spine_through_real_daemon() {
     // bootstrap: the first pass folds Hard, rendering [m0(covered), m1(placeholder)] ++ tail.
     let r = call(
         &consumer,
-        &identity,
         json!({
             "session_id": "spine", "render_config": "cfg0",
             "items": [ck("a", 1, "<h>BASE</h>")]
@@ -128,7 +126,6 @@ async fn mc_transform_spine_through_real_daemon() {
         }
         let d = call(
             &consumer,
-            &identity,
             json!({
                 "session_id": "spine", "render_config": "cfg0", "items": items
             }),
@@ -147,7 +144,6 @@ async fn mc_transform_spine_through_real_daemon() {
     // epoch-Hard: a render-config change rematerializes.
     let e = call(
         &consumer,
-        &identity,
         json!({
             "session_id": "spine", "render_config": "cfg1",
             "items": [ck("a", 1, "<h>BASE2</h>")]
@@ -161,7 +157,6 @@ async fn mc_transform_spine_through_real_daemon() {
     // then Hard rematerialize against the live array.
     let rev = call(
         &consumer,
-        &identity,
         json!({
             "session_id": "spine", "render_config": "cfg1", "items": [ck("z", 9, "<h>OTHER</h>")]
         }),
@@ -174,7 +169,7 @@ async fn mc_transform_spine_through_real_daemon() {
     );
     assert_eq!(m0(&rev), "<h>BASE2</h>", "revert keeps frozen m0");
 
-    let remat = call(&consumer, &identity, json!({
+    let remat = call(&consumer, json!({
         "session_id": "spine", "render_config": "cfg1", "items": [ck("a2", 10, "<h>REVERTED</h>")]
     })).await;
     assert_eq!(
@@ -193,7 +188,6 @@ async fn mc_transform_spine_through_real_daemon() {
     // bootstrap the prod session
     call(
         &consumer,
-        &identity,
         json!({
             "session_id": "prod", "render_config": "cfg0", "items": [ck("a", 1, "<h>BASE</h>")]
         }),
@@ -203,7 +197,6 @@ async fn mc_transform_spine_through_real_daemon() {
     // an m1 delta rides as a SOFT — m0 frozen, m1 re-renders.
     let v5 = call(
         &consumer,
-        &identity,
         json!({
             "session_id": "prod", "render_config": "cfg0", "items": [ck("a", 1, "<h>BASE</h>")],
             "_decider": { "m1_content": { "revision": 7, "body": "<mem>rule</mem>" } }
@@ -217,7 +210,6 @@ async fn mc_transform_spine_through_real_daemon() {
     // a HARD fold folds the m1 content into m0, resets m1, mints a new boundary.
     let v6 = call(
         &consumer,
-        &identity,
         json!({
             "session_id": "prod", "render_config": "cfg0",
             "items": [ck("a", 1, "<h>BASE</h>"), ck("b", 2, "<h>MORE</h>")],
@@ -241,7 +233,6 @@ async fn mc_transform_spine_through_real_daemon() {
 
     call(
         &consumer,
-        &identity,
         json!({ "session_id": "red", "render_config": "cfg0", "items": [ck("a", 1, "BASE")] }),
     )
     .await;
@@ -256,7 +247,6 @@ async fn mc_transform_spine_through_real_daemon() {
         json!({ "reductions": [{ "target_id": "t2", "kind": "drop", "payload": "[dropped 1]" }] });
     let froze = call(
         &consumer,
-        &identity,
         json!({ "session_id": "red", "render_config": "cfg0", "items": red_items, "_decider": rd }),
     )
     .await;
@@ -275,7 +265,6 @@ async fn mc_transform_spine_through_real_daemon() {
     // defer: the frozen reduction replays byte-identical, no write
     let defer = call(
         &consumer,
-        &identity,
         json!({ "session_id": "red", "render_config": "cfg0", "items": red_items, "_decider": rd }),
     )
     .await;
@@ -295,11 +284,7 @@ async fn mc_transform_spine_through_real_daemon() {
         "hard_fold_requested": true, "fold_through_ordinal": 2,
         "reductions": [{ "target_id": "t2", "kind": "drop", "payload": "[dropped 1]" }]
     });
-    let folded = call(
-        &consumer,
-        &identity,
-        json!({ "session_id": "red", "render_config": "cfg0", "items": red_items, "_decider": fold_red }),
-    )
+    let folded = call(&consumer, json!({ "session_id": "red", "render_config": "cfg0", "items": red_items, "_decider": fold_red }),)
     .await;
     assert_eq!(folded["action"], "HARD");
     assert_eq!(folded["boundary_id"], "t2");
@@ -315,7 +300,7 @@ async fn mc_transform_spine_through_real_daemon() {
     tokio::time::sleep(Duration::from_millis(200)).await; // OS releases the single-writer lease
     let _module2 = spawn_module(&module_bin, &daemon.connection_file, &data_home);
 
-    let after = call(&consumer, &identity, json!({
+    let after = call(&consumer, json!({
         "session_id": "spine", "render_config": "cfg1", "items": [ck("a2", 10, "<h>REVERTED</h>")]
     })).await;
     assert_eq!(after["action"], "SOFT+", "restart must not bust");
@@ -379,18 +364,27 @@ fn tail_bytes(r: &Value, id: &str) -> String {
 
 // ---- helpers (adapted from subc-client-rs/tests/real_daemon.rs) ----
 
-async fn call(consumer: &SubcConsumer, identity: &BindIdentity, mut body: Value) -> Value {
+async fn call(consumer: &SubcConsumer, mut body: Value) -> Value {
     // The handler dispatches on `kind`; tag the envelope as a transform op. The
     // TransformRequest struct ignores this extra field.
     if let Value::Object(map) = &mut body {
         map.insert("kind".to_string(), Value::String("transform".to_string()));
     }
+    // Route per logical session: the identity's session MUST equal the body's session_id
+    // (the module's channel-keyed cross-check rejects a mismatch), and one stable identity
+    // per session reuses the SAME route (one on_bind) — the production "one route per
+    // session" shape. Derive the identity from the body so the two can never diverge.
+    let session = body
+        .get("session_id")
+        .and_then(Value::as_str)
+        .expect("transform body carries session_id")
+        .to_string();
     let bytes = consumer
         .call(
             RouteTarget::ToolProvider {
                 module_id: MODULE_ID.to_string(),
             },
-            identity.clone(),
+            identity_for(&session),
             serde_json::to_vec(&body).unwrap(),
             fast_call_options(),
         )
@@ -465,14 +459,24 @@ fn fast_call_options() -> CallOptions {
     }
 }
 
-fn identity(session: &str) -> BindIdentity {
-    let project_root = unique_temp_dir("mc-module-project");
-    fs::create_dir_all(&project_root).unwrap();
-    BindIdentity {
-        project_root,
-        harness: "mc-module-test".to_string(),
-        session: session.to_string(),
-    }
+/// One stable BindIdentity per logical session: repeated calls for the same session reuse
+/// the SAME (target, identity) route (one on_bind), the production "one route per session"
+/// shape. A new session mints a fresh project_root + identity on first use.
+fn identity_for(session: &str) -> BindIdentity {
+    static REG: OnceLock<Mutex<std::collections::HashMap<String, BindIdentity>>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut map = reg.lock().unwrap();
+    map.entry(session.to_string())
+        .or_insert_with(|| {
+            let project_root = unique_temp_dir("mc-module-project");
+            fs::create_dir_all(&project_root).unwrap();
+            BindIdentity {
+                project_root,
+                harness: "mc-module-test".to_string(),
+                session: session.to_string(),
+            }
+        })
+        .clone()
 }
 
 async fn wait_for_connection_file(path: &Path, wait: Duration) {

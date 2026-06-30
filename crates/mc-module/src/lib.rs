@@ -110,9 +110,10 @@ impl McHandler {
 
     /// Resolve the project for a transform request on `channel`, FAIL-LOUD: the channel
     /// must be bound AND its bound session must match the request's `session_id`. Returns
-    /// the project_root to key the store reads off, never a default. Wired into `handle()`
-    /// in the branch step (where the store reads it keys actually run); inert until then.
-    #[allow(dead_code)]
+    /// the project_root the caller keys its store reads off, never a default. The returned
+    /// root is not yet consumed (the Hard/Soft transform arms will read the store under it);
+    /// but the resolve-or-reject is enforced from the start, and it changes no transform
+    /// output — a correctly-bound request resolves and proceeds identically.
     fn resolve_project(
         &self,
         channel: u16,
@@ -179,7 +180,7 @@ impl ModuleHandler for McHandler {
         self.unbind_route(channel);
     }
 
-    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
         match request.get("kind").and_then(Value::as_str) {
             // Proves the store opened end-to-end: load a sentinel session through the
@@ -219,6 +220,33 @@ impl ModuleHandler for McHandler {
                         return HandlerOutcome::Error {
                             code: "bad_request".to_string(),
                             message: e.to_string(),
+                        }
+                    }
+                };
+                // Resolve the project from the route channel the request arrived on
+                // (ctx.channel(), the identity subc authenticated at route.bind), NEVER
+                // the session_id in the request body (caller-claimed, spoofable). Fail
+                // loud two ways: Unbound (no on_bind for this channel, or it was torn
+                // down) and SessionMismatch (the body's session_id != the session this
+                // channel was bound for — a request can't drive a session its route
+                // wasn't bound for). Both reject before any transform work. The resolved
+                // project_root is not consumed yet (the Hard/Soft arms will read the
+                // store under it); resolving + rejecting here produces identical output
+                // for a correctly-bound request, so it changes no cached bytes.
+                let _project_root = match self.resolve_project(ctx.channel(), &parsed.session_id) {
+                    Ok(root) => root,
+                    Err(BindingError::Unbound) => {
+                        return HandlerOutcome::Error {
+                            code: "route_unbound".to_string(),
+                            message: "transform on a channel with no session binding".to_string(),
+                        }
+                    }
+                    Err(BindingError::SessionMismatch) => {
+                        return HandlerOutcome::Error {
+                            code: "session_mismatch".to_string(),
+                            message:
+                                "request session_id does not match the channel's bound session"
+                                    .to_string(),
                         }
                     }
                 };
