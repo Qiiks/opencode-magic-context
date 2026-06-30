@@ -14,6 +14,7 @@
 //! coverage / tail computation (PRIMARY), and the `mc_*` id namespace is reserved
 //! (BACKSTOP) so a synthetic block can never masquerade as the real boundary.
 
+use crate::memory_render::M1_PLACEHOLDER;
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{McStore, McStoreError, ModuleMeta};
 use serde::{Deserialize, Serialize};
@@ -28,8 +29,6 @@ const M0_ID: &str = "mc_m0";
 const M1_ID: &str = "mc_m1";
 /// The reserved id prefix: a non-synthetic item bearing it is a contract violation.
 const RESERVED_ID_PREFIX: &str = "mc_";
-/// The non-empty m1 placeholder (never fully empty — cache-breakpoint structure).
-const M1_PLACEHOLDER: &str = "(no new content since last materialization)";
 const SYNTH_REGION_KIND: &str = "synthesized-region";
 /// Frozen-unit key prefix for a tail reduction (a reduced tool output / superseded edit).
 /// `red:<target_id>` — the target is the real tail item whose bytes are replaced.

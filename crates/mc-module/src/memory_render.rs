@@ -22,6 +22,10 @@ use std::collections::HashSet;
 /// (never omitted) so the provider prompt-cache has a stable breakpoint to anchor on —
 /// an absent block would shift the bytes after it and bust the cache.
 pub const M0_EMPTY_BODY: &str = "<session-history></session-history>";
+/// The non-empty placeholder emitted for the m1 delta block when it has no new content.
+/// The m1 block is never fully empty because the provider prompt-cache needs a stable
+/// breakpoint to anchor on, so even an empty update still emits this marker.
+pub const M1_PLACEHOLDER: &str = "(no new content since last materialization)";
 /// Default history budget when a caller doesn't supply one.
 pub const DEFAULT_HISTORY_BUDGET_TOKENS: f64 = 60_000.0;
 

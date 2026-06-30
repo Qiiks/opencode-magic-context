@@ -19,6 +19,7 @@
 pub mod compartment_coverage;
 pub mod decay_render;
 pub mod m0_compose;
+pub mod m1_compose;
 pub mod memory_render;
 pub mod project_docs;
 pub mod transform;

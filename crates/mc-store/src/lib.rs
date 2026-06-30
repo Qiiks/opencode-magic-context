@@ -505,6 +505,22 @@ impl McStore {
         Ok(rows)
     }
 
+    /// The highest compartment `sequence` for a session (0 when none). A cheap read the
+    /// transform does every pass to detect "a new compartment was published" without
+    /// loading the full compartment rows (those load only on the pass that actually
+    /// re-composes the m1 delta block).
+    pub fn max_compartment_seq(&self, session_id: &str) -> Result<i64, McStoreError> {
+        let max = self.inner.with_conn(|conn| {
+            let v: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )?;
+            Ok(v)
+        })?;
+        Ok(max)
+    }
+
     /// Replace a session's entire compartment set in one fenced transaction. The
     /// history producer republishes the full chronological set each time, so a
     /// wholesale delete-then-insert (rather than an incremental upsert) keeps the
@@ -900,6 +916,61 @@ impl McStore {
             Ok(v)
         })?;
         Ok(max)
+    }
+}
+
+/// Test-support seed helpers for sibling crates (gated behind `test-support` so the
+/// writers never ship in production). mc-module composes over this store and needs to
+/// populate memories/mutations in its tests.
+#[cfg(feature = "test-support")]
+impl McStore {
+    /// Insert an active memory for `project_path`.
+    pub fn seed_memory(
+        &self,
+        id: i64,
+        project_path: &str,
+        category: &str,
+        content: &str,
+        importance: i64,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO mc_memories (id, project_path, category, content, normalized_hash,
+                                          importance, status, first_seen_at, created_at,
+                                          updated_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, 0, 0, 0)",
+                params![
+                    id,
+                    project_path,
+                    category,
+                    content,
+                    format!("h{id}"),
+                    importance
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Append a memory-mutation-log row for `project_path`.
+    pub fn seed_mutation(
+        &self,
+        project_path: &str,
+        mutation_type: &str,
+        target_memory_id: i64,
+        new_content: &str,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO mc_memory_mutation_log
+                    (project_path, mutation_type, target_memory_id, new_content, queued_at)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![project_path, mutation_type, target_memory_id, new_content],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
     }
 }
 
