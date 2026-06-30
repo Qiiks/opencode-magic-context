@@ -22,12 +22,14 @@ pub mod memory_render;
 pub mod project_docs;
 pub mod transform;
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::McStore;
 use serde_json::{json, Value};
-use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx};
+use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest};
 
 use subc_protocol::{
     manifest::{
@@ -38,22 +40,90 @@ use subc_protocol::{
 };
 use transform::{transform, DeciderInputs, TransformRequest};
 
+/// The per-route session binding: the project + session a route channel is bound to.
+/// Established once at `on_bind` (the daemon relays the resolved {project_root, session}
+/// for the route), read by the transform path to resolve which project's store to read,
+/// and removed at `on_route_gone`. The project is NEVER taken from a per-pass request
+/// field — a crafted request could spoof it to read another project's memories — so it
+/// lives here, keyed by the route channel the daemon controls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBinding {
+    pub project_root: PathBuf,
+    pub session: String,
+}
+
+/// Why a transform request can't be served: the route isn't bound, or the request's
+/// session doesn't match the channel's bound session. Both fail LOUD — never default to
+/// a project (a default would be a cross-project read of another project's store).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingError {
+    /// No `on_bind` for this channel (or it was torn down). Reject the transform.
+    Unbound,
+    /// The request's session_id doesn't match the channel's bound session — a poison
+    /// cross-check (the channel is the daemon-controlled identity; the request's session
+    /// must agree with it).
+    SessionMismatch,
+}
+
 /// Canonical module id (overridable via `SUBC_MODULE_ID_ENV` at boot).
 pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
 /// Storage namespace for the cache-state domain.
 const STORAGE_NAMESPACE: &str = "mc_cache";
 
-/// The module handler. Holds the single store handle, opened once in `on_hello_ack`.
+/// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
+/// and the per-route session bindings (channel → {project, session}).
 pub struct McHandler {
     store: OnceLock<McStore>,
+    /// Route channel → its session binding. Populated at `on_bind`, removed at
+    /// `on_route_gone`. A `Mutex<HashMap>` (not a lock-free map) because writes are
+    /// rare (once per route open/close) and reads are one cheap lookup per transform.
+    bindings: Mutex<HashMap<u16, SessionBinding>>,
 }
 
 impl McHandler {
     pub fn new() -> Self {
         McHandler {
             store: OnceLock::new(),
+            bindings: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record the route's session binding (called from `on_bind`). Last write wins for a
+    /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
+    /// this only overwrites a stale entry that somehow survived (defensive).
+    fn bind_route(&self, channel: u16, binding: SessionBinding) {
+        self.bindings
+            .lock()
+            .expect("bindings mutex")
+            .insert(channel, binding);
+    }
+
+    /// Remove a route's binding (called from `on_route_gone`) so a reused channel can't
+    /// resolve a stale/wrong project, and the map doesn't leak entries.
+    fn unbind_route(&self, channel: u16) {
+        self.bindings
+            .lock()
+            .expect("bindings mutex")
+            .remove(&channel);
+    }
+
+    /// Resolve the project for a transform request on `channel`, FAIL-LOUD: the channel
+    /// must be bound AND its bound session must match the request's `session_id`. Returns
+    /// the project_root to key the store reads off, never a default. Wired into `handle()`
+    /// in the branch step (where the store reads it keys actually run); inert until then.
+    #[allow(dead_code)]
+    fn resolve_project(
+        &self,
+        channel: u16,
+        request_session: &str,
+    ) -> Result<PathBuf, BindingError> {
+        let map = self.bindings.lock().expect("bindings mutex");
+        let binding = map.get(&channel).ok_or(BindingError::Unbound)?;
+        if binding.session != request_session {
+            return Err(BindingError::SessionMismatch);
+        }
+        Ok(binding.project_root.clone())
     }
 }
 
@@ -87,6 +157,26 @@ impl ModuleHandler for McHandler {
                 eprintln!("mc-module: store open failed: {e}");
             }
         }
+    }
+
+    /// Record the route's {project_root, session} so the transform path can resolve the
+    /// project from the daemon-controlled channel (never a per-pass request field). Accept
+    /// every route — project resolution, not authorization, is the concern here.
+    async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
+        self.bind_route(
+            req.route_channel,
+            SessionBinding {
+                project_root: req.identity.project_root.clone(),
+                session: req.identity.session.clone(),
+            },
+        );
+        subc_client_rs::BindDecision::accept()
+    }
+
+    /// Drop the route's binding on teardown so a reused channel can't resolve a stale
+    /// project and the map doesn't leak.
+    async fn on_route_gone(&self, channel: u16) {
+        self.unbind_route(channel);
     }
 
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
@@ -274,5 +364,75 @@ mod tests {
         let m = manifest("magic-context");
         assert_eq!(m.module_id, "magic-context");
         assert_eq!(m.protocol_ver, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn route_binding_bind_resolve_unbind() {
+        let h = McHandler::new();
+        let binding = SessionBinding {
+            project_root: PathBuf::from("/repo/proj"),
+            session: "ses_a".to_string(),
+        };
+        h.bind_route(7, binding);
+
+        // resolve succeeds when the channel is bound AND the session matches
+        assert_eq!(
+            h.resolve_project(7, "ses_a").unwrap(),
+            PathBuf::from("/repo/proj")
+        );
+
+        // a teardown removes the binding → a later resolve fails loud (no stale project)
+        h.unbind_route(7);
+        assert_eq!(h.resolve_project(7, "ses_a"), Err(BindingError::Unbound));
+    }
+
+    #[test]
+    fn resolve_fails_loud_unbound_and_on_session_mismatch() {
+        let h = McHandler::new();
+        // never bound → Unbound (NEVER a default project, which would be a cross-project read)
+        assert_eq!(h.resolve_project(3, "ses_x"), Err(BindingError::Unbound));
+
+        h.bind_route(
+            3,
+            SessionBinding {
+                project_root: PathBuf::from("/repo/own"),
+                session: "ses_own".to_string(),
+            },
+        );
+        // bound, but a request claiming a DIFFERENT session on this channel → SessionMismatch
+        assert_eq!(
+            h.resolve_project(3, "ses_other"),
+            Err(BindingError::SessionMismatch)
+        );
+        // the matching session still resolves
+        assert_eq!(
+            h.resolve_project(3, "ses_own").unwrap(),
+            PathBuf::from("/repo/own")
+        );
+    }
+
+    #[test]
+    fn rebind_overwrites_stale_channel_entry() {
+        let h = McHandler::new();
+        h.bind_route(
+            5,
+            SessionBinding {
+                project_root: PathBuf::from("/a"),
+                session: "s1".into(),
+            },
+        );
+        // a reused channel re-binds to a new session → last write wins (no stale leak)
+        h.bind_route(
+            5,
+            SessionBinding {
+                project_root: PathBuf::from("/b"),
+                session: "s2".into(),
+            },
+        );
+        assert_eq!(h.resolve_project(5, "s2").unwrap(), PathBuf::from("/b"));
+        assert_eq!(
+            h.resolve_project(5, "s1"),
+            Err(BindingError::SessionMismatch)
+        );
     }
 }

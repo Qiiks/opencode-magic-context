@@ -35,6 +35,16 @@ use mc_store::StoredCompartment;
 ///
 /// Including any of these would force a full m0 re-render on a routine event — the exact
 /// over-bust the m1 delta path and the docs-defer-fold exist to avoid.
+///
+/// THE RULE that decides what belongs here (so docs_hash isn't re-added "to be more
+/// correct"): content-vs-composition. A stale CONTENT block inside an unchanged m0
+/// composition is tolerable for a few passes — it folds in on the next natural HARD, no
+/// HARD-on-its-own needed (project-docs is exactly this). But a stale COMPOSITION or
+/// STRUCTURE marker means m0 is built WRONG: a stale workspace_fingerprint → m0 composed
+/// over the wrong project set; a stale upgrade_state → m0 in an incompatible format; a
+/// stale external memory epoch → m0 missing an out-of-process edit it can't see any other
+/// way. Composition/structure staleness can't be tolerated, so it HARDs. Content
+/// staleness defer-folds. Only composition/structure markers belong in this struct.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct M0ContentEpoch {
     /// The workspace membership/policy fingerprint (member identities + their epochs +
