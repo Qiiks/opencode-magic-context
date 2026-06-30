@@ -1,0 +1,104 @@
+{
+  "memory_block_cases": [
+    {
+      "memories": [],
+      "block": ""
+    },
+    {
+      "memories": [
+        {
+          "id": 1,
+          "category": "ARCHITECTURE",
+          "content": "the spine holds the frozen set",
+          "importance": 80
+        }
+      ],
+      "block": "<project-memory>\n  <memory id=\"1\" category=\"ARCHITECTURE\" importance=\"80\">the spine holds the frozen set</memory>\n</project-memory>"
+    },
+    {
+      "memories": [
+        {
+          "id": 1,
+          "category": "ARCHITECTURE",
+          "content": "alpha",
+          "importance": 90
+        },
+        {
+          "id": 2,
+          "category": "CONSTRAINTS",
+          "content": "x < y & \"z\"",
+          "importance": null
+        },
+        {
+          "id": 3,
+          "category": "NAMING",
+          "content": "use ctx_* prefix",
+          "importance": 40
+        }
+      ],
+      "block": "<project-memory>\n  <memory id=\"1\" category=\"ARCHITECTURE\" importance=\"90\">alpha</memory>\n  <memory id=\"2\" category=\"CONSTRAINTS\" importance=\"50\">x &lt; y &amp; \"z\"</memory>\n  <memory id=\"3\" category=\"NAMING\" importance=\"40\">use ctx_* prefix</memory>\n</project-memory>"
+    }
+  ],
+  "memory_updates_cases": [
+    {
+      "mutations": [],
+      "rendered_ids": [
+        1
+      ],
+      "block": ""
+    },
+    {
+      "mutations": [
+        {
+          "id": 1,
+          "type": "update",
+          "target": 1,
+          "content": "new < content",
+          "by": null
+        }
+      ],
+      "rendered_ids": [
+        1
+      ],
+      "block": "<memory-updates>\nThese memories changed since the snapshot below — trust these:\n  <updated id=\"1\">new &lt; content</updated>\n</memory-updates>"
+    },
+    {
+      "mutations": [
+        {
+          "id": 2,
+          "type": "update",
+          "target": 1,
+          "content": "u",
+          "by": null
+        },
+        {
+          "id": 3,
+          "type": "superseded",
+          "target": 2,
+          "content": "",
+          "by": 9
+        },
+        {
+          "id": 4,
+          "type": "superseded",
+          "target": 3,
+          "content": "",
+          "by": 99
+        },
+        {
+          "id": 5,
+          "type": "archive",
+          "target": 4,
+          "content": "",
+          "by": null
+        }
+      ],
+      "rendered_ids": [
+        1,
+        2,
+        9
+      ],
+      "block": "<memory-updates>\nThese memories changed since the snapshot below — trust these:\n  <updated id=\"1\">u</updated>\n  <superseded id=\"2\" by=\"9\"/>\n  <removed id=\"3\"/>\n  <removed id=\"4\"/>\n</memory-updates>"
+    }
+  ]
+}

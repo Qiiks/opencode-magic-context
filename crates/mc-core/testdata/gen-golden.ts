@@ -26,6 +26,8 @@ import {
 import { mkdtempSync, rmSync, writeFileSync as writeDocFile } from "node:fs";
 import { tmpdir } from "node:os";
 import { readProjectDocsCanonical } from "../../../packages/plugin/src/features/magic-context/project-docs-hash.ts";
+import { renderMemoryBlockV2 } from "../../../packages/plugin/src/hooks/magic-context/inject-compartments.ts";
+import type { Memory } from "../../../packages/plugin/src/features/magic-context/memory/storage-memory.ts";
 
 const indices = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 200, 400, 1000];
 const importances = [1, 10, 25, 40, 50, 60, 75, 90, 100];
@@ -174,3 +176,71 @@ const docsCases = docCaseInputs.map((files) => {
 const docsOut = join(import.meta.dir, "../../mc-module/testdata/project-docs-golden.json");
 writeFileSync(docsOut, `${JSON.stringify({ cases: docsCases }, null, 2)}\n`);
 console.log(`wrote ${docsCases.length} project-docs cases → ${docsOut}`);
+
+// --- memory-render golden (the <project-memory> block + <memory-updates> corrections) ---
+// The block render uses the exported renderMemoryBlockV2 (real reference). The updates
+// render is a private DB-backed function; its branch logic (update/superseded/removed)
+// is mirrored here byte-for-byte (the Rust unit tests assert the same three branches
+// directly), so the golden still pins the Rust render to the TS shape.
+const xmlAttr = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const xmlContent = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const mkMem = (id: number, category: string, content: string, importance: number | null): Memory =>
+    ({ id, category, content, importance }) as unknown as Memory;
+
+const memoryBlockInputs: Array<Array<[number, string, string, number | null]>> = [
+    [],
+    [[1, "ARCHITECTURE", "the spine holds the frozen set", 80]],
+    [
+        [1, "ARCHITECTURE", "alpha", 90],
+        [2, "CONSTRAINTS", "x < y & \"z\"", null], // null importance defaults to 50; content special chars escape
+        [3, "NAMING", "use ctx_* prefix", 40],
+    ],
+];
+const memoryBlockCases = memoryBlockInputs.map((rows) => {
+    const memories = rows.map(([id, c, content, imp]) => mkMem(id, c, content, imp));
+    return {
+        memories: rows.map(([id, category, content, importance]) => ({ id, category, content, importance })),
+        block: renderMemoryBlockV2(memories, "project-memory"),
+    };
+});
+
+type Mut = { id: number; type: string; target: number; content?: string; by?: number | null };
+function renderUpdates(mutations: Mut[], renderedIds: number[]): string {
+    if (mutations.length === 0) return "";
+    const ids = new Set(renderedIds);
+    const lines = ["These memories changed since the snapshot below — trust these:"];
+    for (const m of mutations) {
+        if (m.type === "update") {
+            lines.push(`  <updated id="${m.target}">${xmlContent(m.content ?? "")}</updated>`);
+        } else if (m.type === "superseded") {
+            if (m.by != null && ids.has(m.by)) lines.push(`  <superseded id="${m.target}" by="${m.by}"/>`);
+            else lines.push(`  <removed id="${m.target}"/>`);
+        } else {
+            lines.push(`  <removed id="${m.target}"/>`);
+        }
+    }
+    return `<memory-updates>\n${lines.join("\n")}\n</memory-updates>`;
+}
+const memoryUpdatesInputs: Array<{ mutations: Mut[]; rendered_ids: number[] }> = [
+    { mutations: [], rendered_ids: [1] },
+    { mutations: [{ id: 1, type: "update", target: 1, content: "new < content" }], rendered_ids: [1] },
+    {
+        mutations: [
+            { id: 2, type: "update", target: 1, content: "u" },
+            { id: 3, type: "superseded", target: 2, by: 9 },
+            { id: 4, type: "superseded", target: 3, by: 99 },
+            { id: 5, type: "archive", target: 4 },
+        ],
+        rendered_ids: [1, 2, 9],
+    },
+];
+const memoryUpdatesCases = memoryUpdatesInputs.map(({ mutations, rendered_ids }) => ({
+    mutations: mutations.map((m) => ({ id: m.id, type: m.type, target: m.target, content: m.content ?? "", by: m.by ?? null })),
+    rendered_ids,
+    block: renderUpdates(mutations, rendered_ids),
+}));
+
+const memOut = join(import.meta.dir, "../../mc-module/testdata/memory-render-golden.json");
+writeFileSync(memOut, `${JSON.stringify({ memory_block_cases: memoryBlockCases, memory_updates_cases: memoryUpdatesCases }, null, 2)}\n`);
+console.log(`wrote ${memoryBlockCases.length} memory-block + ${memoryUpdatesCases.length} memory-updates cases → ${memOut}`);
+void xmlAttr;
