@@ -26,9 +26,10 @@ const NS: &str = "mc_cache";
 /// Sentinel row_version meaning "no row present" (COALESCE default inside the txn).
 const NO_ROW: i64 = -1;
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    statements: "
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        statements: "
         CREATE TABLE IF NOT EXISTS mc_cache_state (
             session_id   TEXT PRIMARY KEY,
             row_version  INTEGER NOT NULL,
@@ -36,7 +37,38 @@ const MIGRATIONS: &[Migration] = &[Migration {
             meta         TEXT NOT NULL
         );
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        // The compartment history (the m0/m1 render source). Keyed by
+        // (session_id, sequence); sequence is the chronological order (1 = oldest).
+        // `content` is the primary text (the P1 tier, or a legacy flat body); p1..p4
+        // are the four paraphrase tiers a compartment can render at (NULL for legacy
+        // rows); `importance` is the decay rate (1..100); `legacy=1` marks a pre-tier
+        // flat row with no paraphrases.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_compartments (
+            session_id        TEXT NOT NULL,
+            sequence          INTEGER NOT NULL,
+            start_message     INTEGER NOT NULL,
+            end_message       INTEGER NOT NULL,
+            start_message_id  TEXT NOT NULL DEFAULT '',
+            end_message_id    TEXT NOT NULL DEFAULT '',
+            title             TEXT NOT NULL,
+            content           TEXT NOT NULL,
+            p1                TEXT,
+            p2                TEXT,
+            p3                TEXT,
+            p4                TEXT,
+            importance        INTEGER NOT NULL DEFAULT 50,
+            episode_type      TEXT,
+            legacy            INTEGER NOT NULL DEFAULT 0,
+            created_at        INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, sequence)
+        );
+    ",
+    },
+];
 
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +87,31 @@ pub struct ModuleMeta {
     /// `serde(default)` so meta JSON persisted before this field loads cleanly.
     #[serde(default)]
     pub m1_revision: u64,
+}
+
+/// A stored compartment row (the m0/m1 history source). `sequence` is the
+/// chronological order (1 = oldest).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredCompartment {
+    pub sequence: i64,
+    pub start_message: i64,
+    pub end_message: i64,
+    pub start_message_id: String,
+    pub end_message_id: String,
+    pub title: String,
+    /// v2 P1 text, or the flat legacy body. Always present.
+    pub content: String,
+    /// v2 paraphrase tiers; None for legacy rows.
+    pub p1: Option<String>,
+    pub p2: Option<String>,
+    pub p3: Option<String>,
+    pub p4: Option<String>,
+    /// Decay rate (1..100), defaults to 50.
+    pub importance: i32,
+    pub episode_type: Option<String>,
+    /// 1 = pre-v2 flat compartment, 0 = v2 tiered.
+    pub legacy: i32,
+    pub created_at: i64,
 }
 
 /// A loaded per-session row: the core state, the meta blob, and the CAS token.
@@ -211,6 +268,91 @@ impl McStore {
             CommitOutcome::CasConflict(found) => Err(McStoreError::CasConflict { expected, found }),
         }
     }
+
+    /// Read a session's compartments in chronological order (oldest first), the order
+    /// the decay renderer expects (it indexes from newest internally).
+    pub fn load_compartments(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<StoredCompartment>, McStoreError> {
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
+                        title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at
+                 FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![session_id], |r| {
+                    Ok(StoredCompartment {
+                        sequence: r.get(0)?,
+                        start_message: r.get(1)?,
+                        end_message: r.get(2)?,
+                        start_message_id: r.get(3)?,
+                        end_message_id: r.get(4)?,
+                        title: r.get(5)?,
+                        content: r.get(6)?,
+                        p1: r.get(7)?,
+                        p2: r.get(8)?,
+                        p3: r.get(9)?,
+                        p4: r.get(10)?,
+                        importance: r.get::<_, Option<i64>>(11)?.unwrap_or(50) as i32,
+                        episode_type: r.get(12)?,
+                        legacy: r.get::<_, Option<i64>>(13)?.unwrap_or(0) as i32,
+                        created_at: r.get(14)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
+    /// Replace a session's entire compartment set in one fenced transaction. The
+    /// history producer republishes the full chronological set each time, so a
+    /// wholesale delete-then-insert (rather than an incremental upsert) keeps the
+    /// stored `sequence` contiguous. Writes are serialized by the store's single-writer
+    /// lease (the same one guarding the cache-state commit).
+    pub fn replace_compartments(
+        &self,
+        session_id: &str,
+        compartments: &[StoredCompartment],
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "DELETE FROM mc_compartments WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for c in compartments {
+                tx.execute(
+                    "INSERT INTO mc_compartments
+                       (session_id, sequence, start_message, end_message, start_message_id,
+                        end_message_id, title, content, p1, p2, p3, p4, importance,
+                        episode_type, legacy, created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                    params![
+                        session_id,
+                        c.sequence,
+                        c.start_message,
+                        c.end_message,
+                        c.start_message_id,
+                        c.end_message_id,
+                        c.title,
+                        c.content,
+                        c.p1,
+                        c.p2,
+                        c.p3,
+                        c.p4,
+                        c.importance as i64,
+                        c.episode_type,
+                        c.legacy as i64,
+                        c.created_at,
+                    ],
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -293,5 +435,66 @@ mod tests {
         let _first = McStore::open(&d).unwrap();
         // Second live handle on the same database must be rejected (single-writer).
         assert!(McStore::open(&d).is_err());
+    }
+
+    #[test]
+    fn compartments_roundtrip_chronological_with_tiers_and_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        assert!(store.load_compartments("ses_a").unwrap().is_empty());
+
+        let comps = vec![
+            StoredCompartment {
+                sequence: 1,
+                start_message: 1,
+                end_message: 9,
+                title: "oldest legacy".into(),
+                content: "U: flat body".into(),
+                legacy: 1,
+                importance: 50,
+                created_at: 100,
+                ..Default::default()
+            },
+            StoredCompartment {
+                sequence: 2,
+                start_message: 10,
+                end_message: 19,
+                title: "v2 row".into(),
+                content: "P1 full".into(),
+                p1: Some("P1 full".into()),
+                p2: Some("P2 dense".into()),
+                p3: Some("P3".into()),
+                p4: None,
+                importance: 80,
+                episode_type: Some("design,feature".into()),
+                legacy: 0,
+                created_at: 200,
+                ..Default::default()
+            },
+        ];
+        store.replace_compartments("ses_a", &comps).unwrap();
+
+        let read = store.load_compartments("ses_a").unwrap();
+        assert_eq!(
+            read, comps,
+            "chronological round-trip incl NULL p4 + tiers + legacy"
+        );
+        assert_eq!(read[0].sequence, 1, "oldest first");
+
+        // a wholesale replace fully supplants the prior set
+        let replacement = vec![StoredCompartment {
+            sequence: 1,
+            title: "only".into(),
+            content: "x".into(),
+            importance: 50,
+            ..Default::default()
+        }];
+        store.replace_compartments("ses_a", &replacement).unwrap();
+        let read2 = store.load_compartments("ses_a").unwrap();
+        assert_eq!(read2.len(), 1);
+        assert_eq!(read2[0].title, "only");
+
+        // distinct sessions are isolated
+        assert!(store.load_compartments("ses_b").unwrap().is_empty());
     }
 }

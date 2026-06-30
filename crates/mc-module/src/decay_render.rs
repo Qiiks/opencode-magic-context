@@ -17,6 +17,7 @@
 //! independent and purely curve-driven (which is what the golden exercises).
 
 use mc_core::decay::{compute_budget_pressure, rendered_tier, DecayInput};
+use mc_store::StoredCompartment;
 
 /// Default history budget when a caller doesn't supply one.
 pub const DEFAULT_HISTORY_BUDGET_TOKENS: u32 = 60_000;
@@ -36,6 +37,40 @@ pub struct DecayRenderCompartment {
     pub p4: Option<String>,
     pub importance: Option<i32>,
     pub legacy: Option<i32>,
+}
+
+impl From<&StoredCompartment> for DecayRenderCompartment {
+    /// Project a stored compartment into the renderer's input shape. Empty tier
+    /// strings stay empty (the `is_tiered_row`/`tier_body` logic distinguishes an
+    /// empty p1 = not-tiered from a non-empty p1 with an empty p4 = self-close).
+    fn from(c: &StoredCompartment) -> Self {
+        DecayRenderCompartment {
+            start_message: c.start_message,
+            end_message: c.end_message,
+            title: c.title.clone(),
+            content: c.content.clone(),
+            p1: c.p1.clone(),
+            p2: c.p2.clone(),
+            p3: c.p3.clone(),
+            p4: c.p4.clone(),
+            importance: Some(c.importance),
+            legacy: Some(c.legacy),
+        }
+    }
+}
+
+/// Render a session's stored compartments (chronological, oldest first — the order
+/// [`mc_store::McStore::load_compartments`] returns) into the m0/m1 history body.
+pub fn render_stored_compartments(
+    compartments: &[StoredCompartment],
+    history_budget_tokens: f64,
+    estimate_tokens: impl Fn(&str) -> usize,
+) -> String {
+    let mapped: Vec<DecayRenderCompartment> = compartments
+        .iter()
+        .map(DecayRenderCompartment::from)
+        .collect();
+    render_decayed_compartments(&mapped, history_budget_tokens, estimate_tokens)
 }
 
 fn escape_xml_attr(s: &str) -> String {
@@ -406,6 +441,42 @@ mod tests {
         );
         // the newest should retain more fidelity than the oldest after demotion
         assert!(out.contains("title=\"NEW\""), "newest survives: {out}");
+    }
+
+    #[test]
+    fn stored_compartment_projects_and_renders() {
+        // a StoredCompartment converts directly into the renderer's input shape and
+        // renders the same as a hand-built compartment
+        let stored = StoredCompartment {
+            sequence: 1,
+            start_message: 1,
+            end_message: 9,
+            title: "Stored".into(),
+            content: "P1 full".into(),
+            p1: Some("P1 full".into()),
+            p2: Some("P2".into()),
+            importance: 50,
+            legacy: 0,
+            ..Default::default()
+        };
+        let out = render_stored_compartments(std::slice::from_ref(&stored), 60_000.0, no_guard);
+        assert!(out.contains("title=\"Stored\""), "{out}");
+        assert!(
+            out.contains(">\nP1 full\n<"),
+            "newest stored row at p1: {out}"
+        );
+        // an empty-p1 stored row is treated as not-tiered → flat content
+        let legacy_ish = StoredCompartment {
+            sequence: 1,
+            title: "Flat".into(),
+            content: "flat".into(),
+            p1: Some(String::new()),
+            legacy: 0,
+            ..Default::default()
+        };
+        let out2 =
+            render_stored_compartments(std::slice::from_ref(&legacy_ish), 60_000.0, no_guard);
+        assert!(out2.contains(">\nflat\n<"), "empty p1 → flat: {out2}");
     }
 
     #[test]
