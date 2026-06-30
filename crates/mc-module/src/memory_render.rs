@@ -153,6 +153,60 @@ pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> 
     sections.join("\n\n").trim().to_string()
 }
 
+/// Assemble the m1 delta body from its (already-rendered) sub-blocks, in order:
+/// `<memory-updates>` → `<new-compartments>` → `<new-memories>` → `<new-user-profile>`,
+/// joining the non-empty pieces with newlines and wrapping them in
+/// `<session-history-since>`. Each piece is an empty string when absent (no rows / no
+/// change). When ALL are empty, returns the `placeholder` instead — m1 is the volatile
+/// half of the cached prefix and must never be fully empty, because the provider cache
+/// anchors a breakpoint at the m1 block and an empty block would shift it.
+pub fn assemble_m1(
+    memory_updates: &str,
+    new_compartments: &str,
+    new_memories: &str,
+    new_user_profile: &str,
+    placeholder: &str,
+) -> String {
+    let mut blocks: Vec<&str> = Vec::with_capacity(4);
+    for piece in [
+        memory_updates,
+        new_compartments,
+        new_memories,
+        new_user_profile,
+    ] {
+        if !piece.is_empty() {
+            blocks.push(piece);
+        }
+    }
+    if blocks.is_empty() {
+        return placeholder.to_string();
+    }
+    format!(
+        "<session-history-since>\n{}\n</session-history-since>",
+        blocks.join("\n")
+    )
+}
+
+/// Render the `<new-compartments>` block: each new compartment at full-fidelity P1 (no
+/// decay applies to a newly-added compartment until it folds into the baseline), joined
+/// by a blank line. An empty slice returns an empty string so the caller can omit the
+/// block.
+pub fn render_new_compartments(
+    compartments: &[&crate::decay_render::DecayRenderCompartment],
+) -> String {
+    if compartments.is_empty() {
+        return String::new();
+    }
+    let bodies: Vec<String> = compartments
+        .iter()
+        .map(|c| crate::decay_render::render_compartment_at_tier(c, 1))
+        .collect();
+    format!(
+        "<new-compartments>\n{}\n</new-compartments>",
+        bodies.join("\n\n")
+    )
+}
+
 /// Render the `<memory-updates>` corrections block from the coalesced mutation set.
 /// `rendered_ids` is the baseline manifest — a `superseded` mutation renders as
 /// `<superseded by=>` only when the replacement is ALSO in the baseline (so the model
@@ -314,6 +368,52 @@ mod tests {
         };
         // no docs/profile/memory + no compartments → just the empty-history placeholder
         assert_eq!(render_m0(&inputs, |_| 0), M0_EMPTY_BODY);
+    }
+
+    #[test]
+    fn m1_assembly_order_and_placeholder() {
+        // all empty → the placeholder (m1 never fully empty)
+        assert_eq!(assemble_m1("", "", "", "", "(none)"), "(none)");
+
+        // present blocks render in production order, joined by \n, wrapped
+        let m1 = assemble_m1(
+            "<memory-updates>U</memory-updates>",
+            "<new-compartments>C</new-compartments>",
+            "<new-memories>M</new-memories>",
+            "<new-user-profile>P</new-user-profile>",
+            "(none)",
+        );
+        assert_eq!(
+            m1,
+            "<session-history-since>\n<memory-updates>U</memory-updates>\n<new-compartments>C</new-compartments>\n<new-memories>M</new-memories>\n<new-user-profile>P</new-user-profile>\n</session-history-since>"
+        );
+
+        // a subset (memory-updates + new-memories) skips the empty ones, keeps order
+        let partial = assemble_m1("UPD", "", "MEM", "", "(none)");
+        assert_eq!(
+            partial,
+            "<session-history-since>\nUPD\nMEM\n</session-history-since>"
+        );
+    }
+
+    #[test]
+    fn new_compartments_render_at_p1() {
+        use crate::decay_render::DecayRenderCompartment;
+        assert_eq!(render_new_compartments(&[]), "");
+        let c = DecayRenderCompartment {
+            start_message: 1,
+            end_message: 9,
+            title: "New".into(),
+            p1: Some("FULL P1".into()),
+            p2: Some("dense".into()),
+            importance: Some(50),
+            ..Default::default()
+        };
+        let block = render_new_compartments(&[&c]);
+        assert!(block.starts_with("<new-compartments>\n"));
+        assert!(block.ends_with("\n</new-compartments>"));
+        // P1 (full), never a decayed tier, for a brand-new compartment
+        assert!(block.contains(">\nFULL P1\n<"), "{block}");
     }
 
     #[test]
