@@ -136,6 +136,27 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_memory_mutation_log(project_path, id);
     ",
     },
+    Migration {
+        version: 5,
+        // User memories — the <user-profile> baseline source. GLOBAL (cross-project, no
+        // project_path): durable observations about the user that apply everywhere. The
+        // render reads active ones ordered promoted_at ASC, id ASC (the id tiebreaker is
+        // load-bearing: promoted_at can tie at ms granularity, and a non-deterministic
+        // order would drift the rendered bytes between passes).
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_user_memories (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            content              TEXT NOT NULL,
+            status               TEXT NOT NULL DEFAULT 'active',
+            promoted_at          INTEGER NOT NULL DEFAULT 0,
+            source_candidate_ids TEXT DEFAULT '[]',
+            created_at           INTEGER NOT NULL DEFAULT 0,
+            updated_at           INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_user_memories_status
+            ON mc_user_memories(status);
+    ",
+    },
 ];
 
 /// A memory mutation-log entry. `update` is non-terminal (the memory is still present
@@ -565,6 +586,24 @@ impl McStore {
 
         Ok(coalesce_mutations(rows))
     }
+
+    /// Load active user-memory contents (the `<user-profile>` baseline source), ordered
+    /// `promoted_at ASC, id ASC`. The id tiebreaker is load-bearing: `promoted_at` can
+    /// tie at ms granularity and a non-deterministic order would drift the rendered
+    /// bytes between passes. Returns just the contents (the render is `- <content>`).
+    pub fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError> {
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT content FROM mc_user_memories WHERE status = 'active'
+                 ORDER BY promoted_at ASC, id ASC",
+            )?;
+            let mapped = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
 }
 
 /// Coalesce mutation-log rows to one per target memory: deterministic latest-wins with
@@ -881,5 +920,32 @@ mod tests {
             .memory_mutations_for_render(proj, 0, &[])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn active_user_memories_ordered_promoted_then_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let insert = |id: i64, content: &str, status: &str, promoted: i64| {
+            store
+                .inner
+                .with_conn_fenced(|tx| {
+                    tx.execute(
+                        "INSERT INTO mc_user_memories (id, content, status, promoted_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![id, content, status, promoted],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        // two share promoted_at=100 → id breaks the tie deterministically (3 before 4).
+        insert(1, "first", "active", 50);
+        insert(4, "tie-later-id", "active", 100);
+        insert(3, "tie-earlier-id", "active", 100);
+        insert(2, "archived", "archived", 10); // status != active → excluded from the result
+
+        let got = store.load_active_user_memories().unwrap();
+        assert_eq!(got, vec!["first", "tie-earlier-id", "tie-later-id"]);
     }
 }
