@@ -235,6 +235,80 @@ async fn mc_transform_spine_through_real_daemon() {
     );
     assert_eq!(m1(&v6), M1_PLACEHOLDER, "m1 reset to placeholder");
 
+    // ===== TAIL-REDUCER cases (session "red", `_decider.reductions` PRESENT) =====
+    // A tail tool output is reduced in place (its bytes → [dropped N]) and the reduction
+    // is frozen/replayed/folded through the real transform over the wire.
+
+    call(
+        &consumer,
+        &identity,
+        json!({ "session_id": "red", "render_config": "cfg0", "items": [ck("a", 1, "BASE")] }),
+    )
+    .await;
+
+    // freeze a drop on tail item t2 (a SOFT); the surrounding live item stays verbatim
+    let red_items = json!([
+        ck("a", 1, "BASE"),
+        ck("t2", 2, "HUGE-OUTPUT"),
+        ck("t3", 3, "after")
+    ]);
+    let rd =
+        json!({ "reductions": [{ "target_id": "t2", "kind": "drop", "payload": "[dropped 1]" }] });
+    let froze = call(
+        &consumer,
+        &identity,
+        json!({ "session_id": "red", "render_config": "cfg0", "items": red_items, "_decider": rd }),
+    )
+    .await;
+    assert_eq!(froze["action"], "SOFT", "a new reduction rides a SOFT");
+    assert_eq!(
+        tail_bytes(&froze, "t2"),
+        "[dropped 1]",
+        "t2 reduced in place"
+    );
+    assert_eq!(
+        tail_bytes(&froze, "t3"),
+        "after",
+        "interleaved live item verbatim"
+    );
+
+    // defer: the frozen reduction replays byte-identical, no write
+    let defer = call(
+        &consumer,
+        &identity,
+        json!({ "session_id": "red", "render_config": "cfg0", "items": red_items, "_decider": rd }),
+    )
+    .await;
+    assert_eq!(
+        defer["action"], "SOFT+",
+        "unchanged reduction set → pure defer"
+    );
+    assert_eq!(defer["committed"], false);
+    assert_eq!(
+        tail_bytes(&defer, "t2"),
+        "[dropped 1]",
+        "frozen reduction replays"
+    );
+
+    // a HARD fold whose coverage crosses t2 → m0 carries the REDUCED bytes, red:t2 GC'd
+    let fold_red = json!({
+        "hard_fold_requested": true, "fold_through_ordinal": 2,
+        "reductions": [{ "target_id": "t2", "kind": "drop", "payload": "[dropped 1]" }]
+    });
+    let folded = call(
+        &consumer,
+        &identity,
+        json!({ "session_id": "red", "render_config": "cfg0", "items": red_items, "_decider": fold_red }),
+    )
+    .await;
+    assert_eq!(folded["action"], "HARD");
+    assert_eq!(folded["boundary_id"], "t2");
+    assert_eq!(
+        m0(&folded),
+        "BASE[dropped 1]",
+        "m0 carries the reduced bytes for the covered item"
+    );
+
     // ===== restart the module process and confirm byte-identical replay (spine session) =====
     module.kill_and_wait();
     drop(module);
@@ -289,6 +363,18 @@ fn tail_ids(r: &Value) -> Vec<String> {
         .filter(|i| i["synthetic"] != json!(true))
         .map(|i| i["id"].as_str().unwrap().to_string())
         .collect()
+}
+/// The bytes of a non-synthetic tail item by id.
+fn tail_bytes(r: &Value, id: &str) -> String {
+    r["ck_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == id && i["synthetic"] != json!(true))
+        .unwrap_or_else(|| panic!("no tail item {id} in ck_messages: {r}"))["bytes"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 // ---- helpers (adapted from subc-client-rs/tests/real_daemon.rs) ----

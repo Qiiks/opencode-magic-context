@@ -44,9 +44,11 @@ pub struct ClassifierInput {
     /// shape an earlier single-block version of this code persisted). The ONLY shape
     /// eligible for the destructive clear-then-Hard migration.
     pub is_legacy_baseline: bool,
-    /// Frozen-set keys ⊆ {`m0`, `m1`} (the current two-block shape). An initialized
-    /// state that is neither legacy nor valid is an UNKNOWN shape → [`PassPlan::Reject`]
-    /// (never cleared — a destructive clear must never fire on an unrecognized shape).
+    /// The frozen set is a valid current shape: EXACTLY one `m0`, EXACTLY one `m1`, and
+    /// zero-or-more tail-reduction units (`red:*`). An initialized state that is neither
+    /// legacy nor valid (missing `m0`/`m1`, or any other key) is an UNKNOWN shape →
+    /// [`PassPlan::Reject`] (never cleared — a destructive clear must never fire on an
+    /// unrecognized shape). The module computes this; this crate only carries the bool.
     pub valid_m0m1_shape: bool,
     /// Render-config (model/system/tool) differs from the persisted one → epoch Hard.
     pub render_config_changed: bool,
@@ -59,6 +61,12 @@ pub struct ClassifierInput {
     /// The incoming m1 content's digest differs from the frozen m1's digest. A real
     /// delta (content change), computed WITHOUT rendering (a revision compare).
     pub m1_revision_changed: bool,
+    /// A NEW tail reduction needs freezing: ∃ a decision whose target is in the live
+    /// tail AND not yet in the frozen reduction set. A pure id set-membership check (no
+    /// payload digest) — sound because reductions are one-way / immutable-once-frozen,
+    /// so a never-before-seen target id is the only "change" that can occur within an
+    /// epoch. Coalesces with `m1_revision_changed` into one SOFT (never two busts).
+    pub reductions_pending: bool,
 }
 
 /// The routing decision for a pass. Distinguishes a plain Hard from a legacy
@@ -123,8 +131,11 @@ pub fn classify(input: &ClassifierInput) -> PassPlan {
     if input.reconcile_pending {
         return PassPlan::Defer;
     }
-    // 7. m1 delta rides — ONLY with the boundary present.
-    if input.boundary_present && input.m1_revision_changed {
+    // 7. A delta rides — m1 content OR a new reduction to freeze — ONLY with the
+    //    boundary present. The two coalesce into ONE Soft: the module's Soft render
+    //    emits whichever deltas are active (changed m1 + each newly-frozen reduction)
+    //    in a single rendered set, so a pass where both change is one bust, not two.
+    if input.boundary_present && (input.m1_revision_changed || input.reductions_pending) {
         return PassPlan::Soft;
     }
     // 8. Defer: replay frozen bytes verbatim.
@@ -237,6 +248,44 @@ mod tests {
         let input = ClassifierInput {
             boundary_present: true,
             m1_revision_changed: false,
+            reductions_pending: false,
+            ..base()
+        };
+        assert_eq!(classify(&input), PassPlan::Defer);
+    }
+
+    #[test]
+    fn a_new_reduction_rides_a_soft() {
+        // a reduction to freeze, no m1 change → still one SOFT
+        let input = ClassifierInput {
+            boundary_present: true,
+            m1_revision_changed: false,
+            reductions_pending: true,
+            ..base()
+        };
+        assert_eq!(classify(&input), PassPlan::Soft);
+    }
+
+    #[test]
+    fn m1_and_reduction_coalesce_into_one_soft() {
+        // both change on one pass → ONE Soft (the module renders both deltas)
+        let input = ClassifierInput {
+            boundary_present: true,
+            m1_revision_changed: true,
+            reductions_pending: true,
+            ..base()
+        };
+        assert_eq!(classify(&input), PassPlan::Soft);
+    }
+
+    #[test]
+    fn boundary_absent_reduction_defers_never_soft() {
+        // a new reduction while the boundary is absent must DEFER (set reconcile),
+        // never Soft-bust + strand the flag — same guard as the m1 soft-delta.
+        let input = ClassifierInput {
+            boundary_present: false,
+            reductions_pending: true,
+            reconcile_pending: false,
             ..base()
         };
         assert_eq!(classify(&input), PassPlan::Defer);
