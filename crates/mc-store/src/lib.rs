@@ -16,7 +16,7 @@
 use cortexkit_cache_core::CoreState;
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// Migration namespace for the cache-state domain (one DB can host several
@@ -157,7 +157,49 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_user_memories(status);
     ",
     },
+    Migration {
+        version: 6,
+        // Cross-project workspaces. A project belongs to at most one workspace (the
+        // UNIQUE index on project_path). A member session reads the UNION of members'
+        // memories, but a FOREIGN member's memories are visible only in the workspace's
+        // shared categories (share_categories); the owning project always sees all its
+        // own. share_categories is a JSON array (default ["CONSTRAINTS"]).
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_workspaces (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            name             TEXT NOT NULL UNIQUE,
+            created_at       INTEGER NOT NULL DEFAULT 0,
+            updated_at       INTEGER NOT NULL DEFAULT 0,
+            share_categories TEXT NOT NULL DEFAULT '[\"CONSTRAINTS\"]'
+        );
+        CREATE TABLE IF NOT EXISTS mc_workspace_members (
+            workspace_id  INTEGER NOT NULL REFERENCES mc_workspaces(id) ON DELETE CASCADE,
+            project_path  TEXT NOT NULL,
+            display_name  TEXT NOT NULL,
+            display_path  TEXT NOT NULL,
+            added_at      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (workspace_id, project_path)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mc_workspace_member_unique
+            ON mc_workspace_members(project_path);
+    ",
+    },
 ];
+
+/// A project's workspace membership: the union of member identities it reads, which of
+/// them are its OWN (full visibility) vs FOREIGN (visible only in `share_categories`),
+/// the shared-category allow-list, and per-foreign-member display attribution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceMembership {
+    /// All member project_paths (own + foreign), the union read set.
+    pub union_identities: Vec<String>,
+    /// The calling project's own identity (full-visibility).
+    pub own_identity: String,
+    /// Categories in which FOREIGN members' memories are shared into this project.
+    pub share_categories: Vec<String>,
+    /// project_path → display_name, for repo-attributing a foreign memory on render.
+    pub display_name_by_path: std::collections::HashMap<String, String>,
+}
 
 /// A memory mutation-log entry. `update` is non-terminal (the memory is still present
 /// with new content → renders `<updated>`); `archive`/`delete`/`superseded` are TERMINAL
@@ -587,6 +629,135 @@ impl McStore {
         Ok(coalesce_mutations(rows))
     }
 
+    /// Resolve a project's workspace membership: the union of member identities it
+    /// reads, the share-category allow-list, and per-foreign-member display attribution.
+    /// Returns None when the project is in no workspace (the single-project fast path —
+    /// the caller reads only its own memories). A project is in at most one workspace
+    /// (the UNIQUE index on project_path).
+    pub fn resolve_workspace_membership(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<WorkspaceMembership>, McStoreError> {
+        let membership = self.inner.with_conn(|conn| {
+            // which workspace (if any) does this project belong to?
+            let ws: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT w.id, w.share_categories
+                       FROM mc_workspace_members m
+                       JOIN mc_workspaces w ON w.id = m.workspace_id
+                      WHERE m.project_path = ?1",
+                    params![project_path],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((workspace_id, share_categories_json)) = ws else {
+                return Ok(None);
+            };
+
+            let mut stmt = conn.prepare(
+                "SELECT project_path, display_name FROM mc_workspace_members
+                  WHERE workspace_id = ?1 ORDER BY project_path ASC",
+            )?;
+            let members: Vec<(String, String)> = stmt
+                .query_map(params![workspace_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let union_identities: Vec<String> = members.iter().map(|(p, _)| p.clone()).collect();
+            let display_name_by_path = members.into_iter().collect();
+            let share_categories: Vec<String> =
+                serde_json::from_str(&share_categories_json).unwrap_or_default();
+
+            Ok(Some(WorkspaceMembership {
+                union_identities,
+                own_identity: project_path.to_string(),
+                share_categories,
+                display_name_by_path,
+            }))
+        })?;
+        Ok(membership)
+    }
+
+    /// Load render-eligible memories across a workspace UNION: every member's `active` +
+    /// `permanent` non-expired memories, but a FOREIGN member's only in the shared
+    /// categories (`share_categories`); the OWN project sees all its own. Ordered by
+    /// importance desc then id asc (the same order budget-trimming uses — highest
+    /// importance survives a trim, id breaks ties). The own-vs-foreign-by-category
+    /// filter is the security boundary — a foreign memory outside the shared categories
+    /// must never render here. `now_ms` is the frozen expiry cutoff (see
+    /// [`Self::load_active_memories`]).
+    pub fn load_workspace_union_memories(
+        &self,
+        membership: &WorkspaceMembership,
+        now_ms: i64,
+    ) -> Result<Vec<StoredMemory>, McStoreError> {
+        let WorkspaceMembership {
+            union_identities,
+            own_identity,
+            share_categories,
+            ..
+        } = membership;
+        if union_identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        // own predicate (full visibility) OR foreign predicate (shared categories only).
+        let foreign: Vec<&String> = union_identities
+            .iter()
+            .filter(|p| *p != own_identity)
+            .collect();
+
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        let mut sharing = String::from("project_path IN (?)");
+        binds.push(rusqlite::types::Value::from(own_identity.clone()));
+        if !foreign.is_empty() && !share_categories.is_empty() {
+            let fph = std::iter::repeat_n("?", foreign.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cph = std::iter::repeat_n("?", share_categories.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            sharing.push_str(&format!(
+                " OR (project_path IN ({fph}) AND category IN ({cph}))"
+            ));
+            for p in &foreign {
+                binds.push(rusqlite::types::Value::from((*p).clone()));
+            }
+            for c in share_categories {
+                binds.push(rusqlite::types::Value::from(c.clone()));
+            }
+        }
+
+        let rows = self.inner.with_conn(|conn| {
+            let sql = format!(
+                "SELECT id, category, content, importance, status, expires_at,
+                        superseded_by_memory_id, updated_at
+                 FROM mc_memories
+                 WHERE ({sharing})
+                   AND status IN ('active', 'permanent')
+                   AND (expires_at IS NULL OR expires_at > ?)
+                 ORDER BY COALESCE(importance, 50) DESC, id ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut all_binds = binds.clone();
+            all_binds.push(rusqlite::types::Value::from(now_ms));
+            let mapped = stmt
+                .query_map(rusqlite::params_from_iter(all_binds.iter()), |r| {
+                    Ok(StoredMemory {
+                        id: r.get(0)?,
+                        category: r.get(1)?,
+                        content: r.get(2)?,
+                        importance: r.get(3)?,
+                        status: r.get(4)?,
+                        expires_at: r.get(5)?,
+                        superseded_by_memory_id: r.get(6)?,
+                        updated_at: r.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
     /// Load active user-memory contents (the `<user-profile>` baseline source), ordered
     /// `promoted_at ASC, id ASC`. The id tiebreaker is load-bearing: `promoted_at` can
     /// tie at ms granularity and a non-deterministic order would drift the rendered
@@ -947,5 +1118,98 @@ mod tests {
 
         let got = store.load_active_user_memories().unwrap();
         assert_eq!(got, vec!["first", "tie-earlier-id", "tie-later-id"]);
+    }
+
+    #[test]
+    fn workspace_union_shares_foreign_only_in_shared_categories() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:own";
+        let foreign = "git:foreign";
+
+        // own: id1 CONSTRAINTS + id2 ARCHITECTURE (both visible to own). foreign: id3
+        // CONSTRAINTS (shared) + id4 ARCHITECTURE (NOT shared). insert_memory defaults
+        // category=ARCHITECTURE, so insert all four then UPDATE ids 1 and 3 to CONSTRAINTS.
+        insert_memory(&store, own, 1, "own constraint", Some(70), "active", None);
+        insert_memory(&store, own, 2, "own arch", Some(90), "active", None);
+        insert_memory(
+            &store,
+            foreign,
+            3,
+            "foreign shared",
+            Some(80),
+            "active",
+            None,
+        );
+        insert_memory(
+            &store,
+            foreign,
+            4,
+            "foreign secret",
+            Some(99),
+            "active",
+            None,
+        );
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE mc_memories SET category='CONSTRAINTS' WHERE id IN (1,3)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // build a workspace with share_categories=["CONSTRAINTS"], members own+foreign.
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_workspaces (id, name, share_categories) VALUES (1,'ws','[\"CONSTRAINTS\"]')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                     VALUES (1, ?1, 'own', '/own', 0), (1, ?2, 'svc-foreign', '/foreign', 0)",
+                    params![own, foreign],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let membership = store.resolve_workspace_membership(own).unwrap().unwrap();
+        assert_eq!(membership.own_identity, own);
+        assert_eq!(membership.share_categories, vec!["CONSTRAINTS"]);
+        assert_eq!(
+            membership
+                .display_name_by_path
+                .get(foreign)
+                .map(String::as_str),
+            Some("svc-foreign")
+        );
+
+        let union = store.load_workspace_union_memories(&membership, 0).unwrap();
+        let ids: Vec<i64> = union.iter().map(|m| m.id).collect();
+        // own sees BOTH its own (1 CONSTRAINTS, 2 ARCHITECTURE); foreign only the shared
+        // CONSTRAINTS (3) — NOT the foreign ARCHITECTURE (4, the security boundary).
+        assert!(
+            ids.contains(&1) && ids.contains(&2),
+            "own sees all own: {ids:?}"
+        );
+        assert!(
+            ids.contains(&3),
+            "foreign shared CONSTRAINTS visible: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&4),
+            "foreign non-shared ARCHITECTURE must NOT leak: {ids:?}"
+        );
+
+        // a project in NO workspace → None (single-project fast path)
+        assert!(store
+            .resolve_workspace_membership("git:loner")
+            .unwrap()
+            .is_none());
     }
 }
