@@ -55,6 +55,11 @@ pub struct M0Composition {
     /// The last covered ordinal (the m0 coverage end / tail-trim point). None when there
     /// are no compartments.
     pub coverage_ordinal: Option<u64>,
+    /// The FIRST covered ordinal (the leading edge of m0 coverage = the first compartment's
+    /// start). None when there are no compartments. The caller fails loud if any live item
+    /// sits BELOW this — it would be covered by no compartment yet trimmed as covered (a
+    /// silent leading-gap drop).
+    pub first_covered_ordinal: Option<u64>,
     /// The highest compartment sequence folded into m0 (advances only on a HARD).
     pub folded_compartment_seq: i64,
     /// The memory ids actually rendered into m0 (the supersede manifest). Until the token
@@ -101,15 +106,17 @@ pub fn compose_m0_from_store(
     // A contiguity gap means a raw message is covered by no compartment — composing m0
     // anyway would drop it from the tail (unrecoverable). Fail loud.
     let coverage = resolve_coverage(&compartments).map_err(M0ComposeError::CoverageGap)?;
-    let (boundary_id, coverage_ordinal, folded_compartment_seq) = match &coverage {
-        Some(c) => (
-            c.boundary_id.clone(),
-            Some(c.coverage_end_ordinal),
-            c.max_sequence,
-        ),
-        // no compartments → nothing summarized → no covered prefix
-        None => (String::new(), None, 0),
-    };
+    let (boundary_id, coverage_ordinal, first_covered_ordinal, folded_compartment_seq) =
+        match &coverage {
+            Some(c) => (
+                c.boundary_id.clone(),
+                Some(c.coverage_end_ordinal),
+                Some(c.first_covered_ordinal),
+                c.max_sequence,
+            ),
+            // no compartments → nothing summarized → no covered prefix
+            None => (String::new(), None, None, 0),
+        };
 
     // --- memories: own-only, or the workspace union (foreign shared-category attributed) ---
     let membership = store.resolve_workspace_membership(inputs.project_path)?;
@@ -155,6 +162,7 @@ pub fn compose_m0_from_store(
         m0_bytes,
         boundary_id,
         coverage_ordinal,
+        first_covered_ordinal,
         folded_compartment_seq,
         rendered_memory_ids,
         memory_mutation_cursor,

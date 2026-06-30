@@ -14,6 +14,9 @@
 //! coverage / tail computation (PRIMARY), and the `mc_*` id namespace is reserved
 //! (BACKSTOP) so a synthetic block can never masquerade as the real boundary.
 
+use crate::compartment_coverage::{fold_m0_content_epoch, M0ContentEpoch};
+use crate::m0_compose::compose_m0_from_store;
+use crate::m1_compose::{compose_m1_from_store, m1_revision_signal};
 use crate::memory_render::M1_PLACEHOLDER;
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{McStore, McStoreError, ModuleMeta};
@@ -84,25 +87,39 @@ pub struct ReductionDecision {
     pub payload: String,
 }
 
-/// Decision inputs for a pass: the contiguous cut point, the current m1 delta content,
-/// the hard-fold trigger, and the current tail-reduction set. These come from the
-/// module's own decision logic in production; the wire handler can also build them from
-/// an optional test-only `_decider` request field (absent → the all-default behavior).
+/// The tail-reduction decisions for a pass. The producer that SELECTS reductions (the
+/// supersession / ctx_reduce / emergency / smart-drops heuristics) is not yet implemented
+/// in its final location, so these still arrive via the test-only `_decider` request field
+/// — the one remaining such seam, which goes away when that producer lands. The m0/m1
+/// content is NO LONGER here: it is composed from the store (see [`ProducerContext`]).
 /// `Deserialize` with field defaults so a partial `_decider` body fills the rest.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct DeciderInputs {
-    pub hard_fold_requested: bool,
-    /// The contiguous cut for a fold (None = cover-all / bootstrap).
-    pub fold_through_ordinal: Option<u64>,
-    /// The FULL current m1 delta content, re-derived each pass (None = no delta).
-    pub m1_content: Option<M1Content>,
     /// The FULL current tail-reduction set, re-derived each pass. A target NOT yet
     /// frozen + present in the live tail is a NEW reduction to freeze (a SOFT trigger).
     /// An already-frozen target's payload here is IGNORED (the frozen payload wins);
     /// supplying a DIFFERENT payload for a frozen target is a monotonicity-contract
-    /// violation that fails loud (see `reduction_conflict`).
+    /// violation that fails loud (see `validate_reduction_monotonicity`).
     pub reductions: Vec<ReductionDecision>,
+}
+
+/// The project context the module composes m0/m1 FROM. Resolved once per request from the
+/// authenticated route binding (never a request body field) and threaded into the
+/// transform. Production ALWAYS supplies it; it carries the frozen render inputs (budget,
+/// expiry cutoff) so a HARD freezes them and later passes replay identical bytes.
+pub struct ProducerContext<'a> {
+    /// The project identity the store reads key off (memories, mutation log, workspace).
+    pub project_path: &'a str,
+    /// The project directory on disk, for reading ARCHITECTURE.md / STRUCTURE.md.
+    pub project_directory: &'a str,
+    /// The history budget in tokens, FROZEN at route bind (byte-affecting: a different
+    /// budget → a different m0 trim → different bytes, so it can't change mid-session).
+    pub history_budget_tokens: f64,
+    /// The wall-clock now (ms) for THIS pass. Used only to SET `meta.expiry_cutoff_ms` on
+    /// a HARD (the first materialization freezes it); every later pass reads the frozen
+    /// meta value, never this, so expiry never drifts the bytes between passes.
+    pub now_ms: i64,
 }
 
 /// A transform pass request. `boundary_present` is deliberately NOT a field: it is a
@@ -141,13 +158,13 @@ pub enum TransformError {
     ReservedId,
     /// An unknown / corrupt frozen-set shape (never destructively cleared).
     UnknownShape(&'static str),
-    /// A HARD would fold but the re-derived m1 content is missing while the prior m1
-    /// was non-placeholder — folding would silently drop live m1 content.
-    HardWouldDropM1,
     /// The decider supplied a reduction for an already-frozen target with DIFFERENT
     /// bytes — a monotonicity-contract violation (a frozen reduction is immutable
     /// within an epoch). Fail loud instead of silently serving the stale frozen bytes.
     ReductionConflict,
+    /// The stored compartments don't tile contiguously — a raw message is covered by no
+    /// compartment, so composing m0/m1 would silently drop it from the tail. Fail loud.
+    CoverageGap(String),
 }
 
 impl std::fmt::Display for TransformError {
@@ -159,13 +176,11 @@ impl std::fmt::Display for TransformError {
             }
             TransformError::ReservedId => write!(f, "non-synthetic item used a reserved mc_* id"),
             TransformError::UnknownShape(m) => write!(f, "unknown frozen-set shape: {m}"),
-            TransformError::HardWouldDropM1 => {
-                write!(f, "hard fold would drop non-placeholder m1 content")
-            }
             TransformError::ReductionConflict => write!(
                 f,
                 "decider re-supplied an already-frozen reduction target with different bytes"
             ),
+            TransformError::CoverageGap(m) => write!(f, "{m}"),
         }
     }
 }
@@ -175,17 +190,45 @@ impl From<McStoreError> for TransformError {
         TransformError::Store(e)
     }
 }
+impl From<crate::m0_compose::M0ComposeError> for TransformError {
+    fn from(e: crate::m0_compose::M0ComposeError) -> Self {
+        use crate::m0_compose::M0ComposeError;
+        match e {
+            M0ComposeError::Store(s) => TransformError::Store(s),
+            M0ComposeError::CoverageGap(g) => TransformError::CoverageGap(g.to_string()),
+        }
+    }
+}
+impl From<crate::m1_compose::M1ComposeError> for TransformError {
+    fn from(e: crate::m1_compose::M1ComposeError) -> Self {
+        use crate::m1_compose::M1ComposeError;
+        match e {
+            M1ComposeError::Store(s) => TransformError::Store(s),
+            M1ComposeError::CoverageGap(g) => TransformError::CoverageGap(g.to_string()),
+        }
+    }
+}
+
+/// The token estimator threaded into the decay renderer. A no-op (returns 0) until the
+/// real BPE estimator lands; under a loose budget the m0 render is estimator-independent,
+/// so this keeps the compose pure + deterministic in the interim.
+fn no_estimate(_: &str) -> usize {
+    0
+}
 
 /// Apply one transform pass, retrying the whole load→classify→step→commit cycle on a
-/// CAS conflict (re-classification depends on the freshly-loaded state).
+/// CAS conflict (re-classification depends on the freshly-loaded state). `ctx` is the
+/// resolved project producer context (m0/m1 are composed from its store reads);
+/// `deciders` now carries ONLY the tail reductions (the m0/m1 content is store-produced).
 pub fn transform(
     store: &McStore,
     req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
     deciders: &DeciderInputs,
 ) -> Result<TransformResponse, TransformError> {
     let mut attempt = 0;
     loop {
-        match apply_once(store, req, deciders) {
+        match apply_once(store, req, ctx, deciders) {
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
                 if attempt < MAX_CAS_RETRIES =>
             {
@@ -200,6 +243,7 @@ pub fn transform(
 fn apply_once(
     store: &McStore,
     req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
     deciders: &DeciderInputs,
 ) -> Result<TransformResponse, TransformError> {
     // --- ingress: strip synthetic, reserve mc_*, validate ordinals (over live source) ---
@@ -236,12 +280,21 @@ fn apply_once(
         "-".to_string()
     };
 
-    // --- classify ---
-    let incoming_m1_rev = deciders
-        .m1_content
-        .as_ref()
-        .map(|m| m.revision)
-        .unwrap_or(0);
+    // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
+    // The effective render_config folds the live m0-content-epoch (workspace_fingerprint)
+    // into the provider base, so a membership/policy change drives the render_config HARD.
+    // upgrade_state + the external memory epoch have no mc_* source yet → empty (inert).
+    let effective_render_config = fold_m0_content_epoch(
+        &req.render_config,
+        &M0ContentEpoch {
+            workspace_fingerprint: store.workspace_fingerprint(ctx.project_path)?,
+            upgrade_state: String::new(),
+            memory_content_epoch: String::new(),
+        },
+    );
+    // The cheap m1-change digest (watermark triple). Computed every pass to gate SOFT vs
+    // defer WITHOUT composing the body; the body composes only on the bust arm below.
+    let current_m1_digest = m1_revision_signal(store, ctx.project_path, &req.session_id)?;
     let reductions_pending_now =
         reductions_pending(&loaded.core, deciders, &live, loaded.meta.coverage_ordinal);
     let plan = classify(&ClassifierInput {
@@ -249,11 +302,15 @@ fn apply_once(
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
         valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
         render_config_changed: loaded.meta.initialized
-            && req.render_config != loaded.meta.last_render_config,
-        hard_fold_requested: deciders.hard_fold_requested,
+            && effective_render_config != loaded.meta.last_render_config,
+        // No store-sourced HARD trigger yet: new compartments RIDE m1 as a SOFT delta and
+        // fold into m0 on the next natural HARD. A dedicated fold-on-publish trigger lands
+        // when the compartment write path moves in. For now all HARDs come from bootstrap,
+        // a render_config change, or a reconcile.
+        hard_fold_requested: false,
         boundary_present,
         reconcile_pending: loaded.core.reconcile_pending,
-        m1_revision_changed: incoming_m1_rev != loaded.meta.m1_revision,
+        m1_revision_changed: current_m1_digest != loaded.meta.m1_revision,
         reductions_pending: reductions_pending_now,
     });
 
@@ -263,68 +320,115 @@ fn apply_once(
     match plan {
         PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
         PassPlan::Hard | PassPlan::MigrateHard => {
-            // Hard-render m1 guard (release): a fold must not silently drop a
-            // non-placeholder m1 when its re-derived content is absent.
-            if loaded.meta.m1_revision != 0 && deciders.m1_content.is_none() {
-                return Err(TransformError::HardWouldDropM1);
+            // EXPENSIVE bust-only: compose the m0 baseline from the store. now_ms freezes
+            // the expiry cutoff into meta so every later in-epoch SOFT/defer reads the
+            // SAME memory set (a memory expiring mid-epoch stays rendered until the next
+            // HARD re-freezes the cutoff — the byte-stability tradeoff).
+            let comp = compose_m0_from_store(
+                store,
+                &crate::m0_compose::M0ComposeInputs {
+                    session_id: &req.session_id,
+                    project_path: ctx.project_path,
+                    project_directory: ctx.project_directory,
+                    now_ms: ctx.now_ms,
+                    history_budget_tokens: ctx.history_budget_tokens,
+                },
+                no_estimate,
+            )?;
+
+            // Leading-gap guard (symmetric with the interior contiguity gap that
+            // resolve_coverage fails loud on): a live item BELOW the first covered ordinal
+            // is covered by no compartment, yet build_output trims everything at/under the
+            // coverage end (and the first covered ordinal is itself <= the coverage end), so
+            // it would be silently dropped from the tail. resolve_coverage can't see the
+            // live array (it's store-pure), so the check lives here where the ordinals are.
+            if let Some(first) = comp.first_covered_ordinal {
+                if let Some(stray) = live.iter().find(|i| i.ordinal() < first) {
+                    return Err(TransformError::CoverageGap(format!(
+                        "leading coverage gap: live item {} (ordinal {}) sits before the first \
+                         compartment start (ordinal {}); composing m0 would silently drop it \
+                         from the tail",
+                        stray.id(),
+                        stray.ordinal(),
+                        first
+                    )));
+                }
             }
-            // SNAPSHOT the effective reductions (frozen payloads ∪ new decider ones)
-            // BEFORE any frozen-set mutation — clearing first would lose the payloads
-            // and fold LIVE bytes for a reduced covered item.
+
+            // The reductions that SURVIVE the fold: m0 is now a compartment SUMMARY (not
+            // covered raw bytes), so a reduction on a now-covered item simply drops with
+            // it (no "fold reduced bytes into m0"); a target still in the new tail is kept;
+            // a reverted-away target is an orphan. apply_units can't delete → rebuild.
             let effective = effective_reductions(&core, deciders);
-
-            let covered = covered_items(&live, deciders.fold_through_ordinal);
-            let new_boundary = covered.last().map(|i| i.id().to_string());
-            let new_coverage = covered.last().map(|i| i.ordinal());
-
-            // Render m0 over the covered set using each item's REDUCED bytes if present
-            // (the reduction decision survives the fold), else its live bytes.
-            let m0_unit = render_hard_m0(&covered, &effective, deciders.m1_content.as_ref());
-            // The surviving `red:*` units after a HARD: a covered target is folded into
-            // m0 (dropped from the frozen set); a target still in the new tail is kept; a
-            // target absent from the live array (reverted away) is dropped as an orphan.
-            // apply_units can't delete, so REBUILD the frozen set module-side (same shape
-            // as the legacy-baseline clear).
-            let survivors = surviving_red_units(&effective, &live, new_coverage);
+            let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
             core.frozen_units.clear();
             core.pending_changes.clear();
-            let mut rendered = vec![m0_unit, render_m1(None)];
+            let mut rendered = vec![synth_region("m0", comp.m0_bytes), render_m1_placeholder()];
             rendered.extend(survivors);
 
+            // A HARD re-composes m0 fully from the store, so the boundary ALWAYS reflects
+            // the current coverage — set it unconditionally (empty when no compartments,
+            // keeping boundary_id + coverage_ordinal consistent). The core only SETS on
+            // Some, so mapping empty→None would leave a stale prior anchor alongside a
+            // None coverage_ordinal — an inconsistent state.
             core.step(PassInput {
                 proposed: Some(mc_core::Action::Hard),
                 boundary_present: boundary_token,
                 rendered_units: rendered,
-                new_boundary_id: new_boundary,
+                new_boundary_id: Some(comp.boundary_id.clone()),
                 queued: Vec::new(),
                 run_started: false,
             });
             meta.initialized = true;
-            meta.last_render_config = req.render_config.clone();
-            meta.coverage_ordinal = new_coverage;
-            meta.m1_revision = 0; // m1 folded into m0 + reset to placeholder
+            meta.last_render_config = effective_render_config;
+            meta.coverage_ordinal = comp.coverage_ordinal;
+            meta.folded_compartment_seq = comp.folded_compartment_seq;
+            meta.rendered_memory_ids = comp.rendered_memory_ids;
+            meta.memory_mutation_cursor = comp.memory_mutation_cursor;
+            meta.max_memory_id = comp.max_memory_id;
+            meta.expiry_cutoff_ms = ctx.now_ms; // FROZEN here, atomic with the m0 bytes
+                                                // The post-fold m1 baseline digest — NOT 0. After folding up to the current
+                                                // watermarks, "no delta" == "watermarks unchanged since this digest"; setting
+                                                // 0 would make the next pass's non-zero digest read as a phantom SOFT.
+            meta.m1_revision = current_m1_digest;
         }
         PassPlan::Soft => {
-            // Coalesced SOFT: render whichever deltas are active — the m1 unit (if its
-            // revision changed) PLUS each newly-frozen `red:*` — in ONE rendered set, so
-            // a pass where both changed is one bust, not two. m1 always re-rendered so a
-            // reduction-only SOFT keeps m1 byte-identical (revision unchanged → same body).
-            let mut rendered = vec![render_m1(deciders.m1_content.as_ref())];
+            // EXPENSIVE bust-only: compose the m1 delta body from the store against the
+            // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
+            // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
+            // the m1 unit stays stable; a new compartment extends coverage → advance the
+            // boundary anchor in this same commit.
+            let m1 = compose_m1_from_store(
+                store,
+                ctx.project_path,
+                &req.session_id,
+                &meta,
+                meta.expiry_cutoff_ms,
+            )?;
+            let mut rendered = vec![render_m1_body(&m1.body)];
             rendered.extend(new_reduction_units(
                 &core,
                 deciders,
                 &live,
                 loaded.meta.coverage_ordinal,
             ));
+            // A coverage-extending SOFT advances the boundary anchor (the bound core
+            // primitive); a memory-only SOFT leaves it put (None).
+            let new_boundary_id = m1.new_coverage.as_ref().map(|(id, _)| id.clone());
             core.step(PassInput {
                 proposed: Some(mc_core::Action::Soft),
                 boundary_present: boundary_token,
                 rendered_units: rendered,
-                new_boundary_id: None,
+                new_boundary_id,
                 queued: Vec::new(),
                 run_started: false,
             });
-            meta.m1_revision = incoming_m1_rev;
+            // coverage_ordinal advances ATOMICALLY with the anchor (two views of one
+            // coverage end — they must not desync).
+            if let Some((_, ord)) = m1.new_coverage {
+                meta.coverage_ordinal = Some(ord);
+            }
+            meta.m1_revision = current_m1_digest;
         }
         PassPlan::Defer => {
             core.step(PassInput {
@@ -527,54 +631,15 @@ fn surviving_red_units(
 
 // --- render helpers (the ONLY producers of frozen bytes) ---
 
-/// The covered contiguous prefix: items with `ordinal <= fold_through` (None =
-/// cover-all). The slice is sorted by ordinal so m0 bytes are deterministic
-/// regardless of input iteration order (a nondeterministic order = phantom HARD).
-fn covered_items<'a>(live: &[&'a CkItemWire], fold_through: Option<u64>) -> Vec<&'a CkItemWire> {
-    let mut covered: Vec<&CkItemWire> = match fold_through {
-        Some(cut) => live
-            .iter()
-            .copied()
-            .filter(|i| i.ordinal() <= cut)
-            .collect(),
-        None => live.to_vec(),
-    };
-    covered.sort_by_key(|i| i.ordinal());
-    covered
+/// The m1 placeholder unit (a HARD resets m1 to it; m1 is never fully empty).
+fn render_m1_placeholder() -> FrozenUnit {
+    synth_region("m1", M1_PLACEHOLDER.to_string())
 }
 
-/// Render the m0 unit: the covered set concatenated in ordinal order — using each
-/// covered item's REDUCED bytes if a reduction is in effect for it (the decision folds
-/// into m0), else its live bytes — followed by the folded m1 content. The fold carries
-/// the current m1 content INTO m0; m1 resets to its placeholder separately.
-fn render_hard_m0(
-    covered: &[&CkItemWire],
-    effective: &BTreeMap<String, (String, String)>,
-    fold_in: Option<&M1Content>,
-) -> FrozenUnit {
-    let mut m0 = String::new();
-    for item in covered {
-        match effective.get(item.id()) {
-            Some((_, payload)) => m0.push_str(payload),
-            None => m0.push_str(item.bytes()),
-        }
-    }
-    if let Some(c) = fold_in {
-        if c.revision != 0 {
-            m0.push_str(&c.body);
-        }
-    }
-    synth_region("m0", m0)
-}
-
-/// Render the m1 delta unit (replaces the m1 key on a Soft). None / revision 0 → the
-/// non-empty placeholder.
-fn render_m1(content: Option<&M1Content>) -> FrozenUnit {
-    let payload = match content {
-        Some(c) if c.revision != 0 => c.body.clone(),
-        _ => M1_PLACEHOLDER.to_string(),
-    };
-    synth_region("m1", payload)
+/// The m1 delta unit from a composed body (an empty delta composes to the placeholder
+/// body upstream, so this is a verbatim wrap).
+fn render_m1_body(body: &str) -> FrozenUnit {
+    synth_region("m1", body.to_string())
 }
 
 fn synth_region(key: &str, payload: String) -> FrozenUnit {
@@ -649,6 +714,8 @@ mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
+    use mc_store::StoredCompartment;
+
     fn store(dir: &std::path::Path) -> McStore {
         McStore::open(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
@@ -682,6 +749,40 @@ mod tests {
         DeciderInputs::default()
     }
 
+    /// A store compartment covering raw ordinals `start..=end`, ending at message id
+    /// `end_id`, rendered at P1 with body `p1`. The m0 baseline is composed from these.
+    fn comp(seq: i64, start: i64, end: i64, end_id: &str, p1: &str) -> StoredCompartment {
+        StoredCompartment {
+            sequence: seq,
+            start_message: start,
+            end_message: end,
+            end_message_id: end_id.to_string(),
+            title: format!("C{seq}"),
+            content: p1.to_string(),
+            p1: Some(p1.to_string()),
+            importance: 50,
+            ..Default::default()
+        }
+    }
+
+    /// A producer context over a throwaway project dir (no docs on disk → empty docs
+    /// block). `now_ms` is FIXED per test (never wall-clock) so the frozen expiry cutoff
+    /// is deterministic.
+    fn pctx<'a>(project: &'a str, dir: &'a str, now_ms: i64) -> ProducerContext<'a> {
+        ProducerContext {
+            project_path: project,
+            project_directory: dir,
+            history_budget_tokens: 60_000.0,
+            now_ms,
+        }
+    }
+
+    /// Run a transform with a default producer context (project "git:proj", a nonexistent
+    /// docs dir, now_ms=0). Most tests don't vary the context.
+    fn run(s: &McStore, req: &TransformRequest, d: &DeciderInputs) -> TransformResponse {
+        transform(s, req, &pctx("git:proj", "/nonexistent-docs", 0), d).unwrap()
+    }
+
     fn m0_bytes(r: &TransformResponse) -> &str {
         &r.ck_messages.iter().find(|i| i.id == M0_ID).unwrap().bytes
     }
@@ -696,55 +797,129 @@ mod tests {
             .collect()
     }
 
+    // ===== Module-integration tests: STORE STATE in → compose+core bytes out.
+    // The cache MECHANICS (defer-replay, the SOFT/HARD taxonomy, reduction freeze/replay)
+    // are owned by cortexkit-cache-core's golden vectors + the live-daemon harness; these
+    // tests prove the MC module's job: resolve → compose-from-store → wire-to-core. m0 is
+    // a compartment SUMMARY composed from the store (NOT live bytes), so "cover ordinal N"
+    // means a store compartment covering N, and the raw boundary message stays in the live
+    // input (only absent from the OUTPUT tail). =====
+
     #[test]
-    fn bootstrap_emits_m0_m1_and_tail() {
+    fn bootstrap_with_no_compartments_is_empty_baseline_whole_array_is_tail() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        let r = transform(
+        // no compartments → nothing summarized → empty boundary, the live array is all tail
+        let r = run(
             &s,
             &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
             &spine(),
-        )
-        .unwrap();
-        assert_eq!(r.action, "HARD");
-        assert_eq!(r.boundary_id, "a");
-        assert_eq!(m0_bytes(&r), "<h>BASE</h>");
+        );
+        assert_eq!(r.action, "HARD", "first pass materializes a baseline");
+        assert_eq!(r.boundary_id, "", "no compartment → no coverage anchor");
+        // m0 is the empty-history placeholder baseline (no docs/memories seeded)
+        assert!(
+            m0_bytes(&r).contains("<session-history></session-history>"),
+            "{}",
+            m0_bytes(&r)
+        );
         assert_eq!(m1_bytes(&r), M1_PLACEHOLDER);
-        assert!(tail_ids(&r).is_empty(), "all covered, tail empty");
+        assert_eq!(tail_ids(&r), vec!["a"], "uncovered live item is the tail");
         assert!(r.committed);
     }
 
     #[test]
-    fn v1_growing_tail_prefix_byte_stable_tail_verbatim_no_write() {
+    fn bootstrap_with_a_compartment_summarizes_it_and_trims_the_covered_tail() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // bootstrap covers "a"
-        transform(
+        // a compartment covers raw ordinals 1..=10, ending at message id "m10"
+        s.replace_compartments("ses", &[comp(1, 1, 10, "m10", "SUMMARY-OF-1-10")])
+            .unwrap();
+        // the live array still carries the raw covered message m10 (ordinal 10) + a tail item
+        let items = vec![item("m10", 10, "raw covered"), item("t11", 11, "tail")];
+        let r = run(&s, &req("ses", "cfg0", items), &spine());
+        assert_eq!(r.action, "HARD");
+        assert_eq!(
+            r.boundary_id, "m10",
+            "anchor = the compartment's end message id"
+        );
+        // m0 is the decay-rendered SUMMARY, not the raw covered bytes
+        assert!(
+            m0_bytes(&r).contains("SUMMARY-OF-1-10"),
+            "m0 is the summary: {}",
+            m0_bytes(&r)
+        );
+        assert!(
+            !m0_bytes(&r).contains("raw covered"),
+            "m0 is NOT the raw bytes"
+        );
+        // the covered raw message (ordinal 10 <= coverage 10) is trimmed; only the tail remains
+        assert_eq!(
+            tail_ids(&r),
+            vec!["t11"],
+            "covered raw msg trimmed, tail kept"
+        );
+    }
+
+    #[test]
+    fn leading_coverage_gap_fails_loud_not_silent_drop() {
+        // Regression: the first compartment starts at ordinal 10, but the live array still
+        // carries raw messages at ordinals 1..9 (before the first compartment). Those are
+        // covered by no compartment, yet they sit below coverage_ordinal so build_output
+        // would trim them — a SILENT drop. The leading-gap guard must fail loud instead
+        // (symmetric with the interior contiguity gap resolve_coverage already catches).
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 10, 20, "m20", "S")])
+            .unwrap();
+        let items = vec![
+            item("early", 1, "live before the first compartment"),
+            item("m20", 20, "covered"),
+            item("t21", 21, "tail"),
+        ];
+        let err = transform(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
+            &req("ses", "cfg0", items),
+            &pctx("git:proj", "/nonexistent-docs", 0),
             &spine(),
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            matches!(err, TransformError::CoverageGap(_)),
+            "a leading gap must fail loud, not silently drop the early live item: {err:?}"
+        );
+    }
+
+    #[test]
+    fn growing_tail_defers_byte_stable_and_no_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // a compartment covers ordinal 1 (end id "m1msg"); the boundary stays present
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
 
         let mut prev_m0: Option<String> = None;
         let mut prev_m1: Option<String> = None;
         for n in 2..=5u64 {
-            // tail grows each pass; boundary "a" stays present
-            let mut items = vec![item("a", 1, "BASE")];
+            let mut items = vec![item("m1msg", 1, "raw")];
             for k in 2..=n {
                 items.push(item(&format!("t{k}"), k, &format!("tail{k}")));
             }
-            let r = transform(&s, &req("ses", "cfg0", items), &spine()).unwrap();
-            assert_eq!(r.action, "SOFT+");
+            let r = run(&s, &req("ses", "cfg0", items), &spine());
+            assert_eq!(r.action, "SOFT+", "no delta → pure defer");
             assert!(!r.committed, "pure defer must not write");
-            // prefix blocks byte-identical across the growing tail
             if let Some(p) = &prev_m0 {
                 assert_eq!(m0_bytes(&r), p, "m0 changed on defer");
             }
             if let Some(p) = &prev_m1 {
                 assert_eq!(m1_bytes(&r), p, "m1 changed on defer");
             }
-            // tail is the verbatim live items after coverage_ordinal=1
+            // tail = the verbatim live items past coverage_ordinal=1 (the covered m1msg trimmed)
             let expected: Vec<String> = (2..=n).map(|k| format!("t{k}")).collect();
             assert_eq!(
                 tail_ids(&r),
@@ -756,182 +931,313 @@ mod tests {
     }
 
     #[test]
-    fn v5_m1_delta_soft_m0_frozen() {
+    fn new_memory_rides_m1_soft_and_m0_stays_frozen() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let before = run(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
-        )
-        .unwrap();
-        let before = transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &spine(),
-        )
-        .unwrap();
+        );
+        assert_eq!(before.action, "HARD");
 
-        // an m1 delta rides (boundary present)
-        let deciders = DeciderInputs {
-            m1_content: Some(M1Content {
-                revision: 7,
-                body: "<mem>rule</mem>".to_string(),
-            }),
-            ..Default::default()
-        };
-        let soft = transform(
+        // a NEW memory lands (id past the folded max) → the digest moves → a SOFT
+        s.seed_memory(5, "git:proj", "ARCHITECTURE", "a durable rule", 70)
+            .unwrap();
+        let soft = run(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &deciders,
-        )
-        .unwrap();
-        assert_eq!(soft.action, "SOFT");
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        assert_eq!(soft.action, "SOFT", "a new store memory rides a SOFT");
         assert_eq!(
             m0_bytes(&soft),
             m0_bytes(&before),
-            "m0 must stay frozen across a SOFT"
+            "m0 frozen across the SOFT"
         );
-        assert_eq!(m1_bytes(&soft), "<mem>rule</mem>");
+        assert!(
+            m1_bytes(&soft).contains("<new-memories>"),
+            "{}",
+            m1_bytes(&soft)
+        );
+        assert!(m1_bytes(&soft).contains("a durable rule"));
         assert!(soft.committed);
 
-        // Defer after the delta: the decider RE-DERIVES the SAME live content each pass
-        // (same revision), so the steady state is a pure SOFT+ replay, no write. (Passing
-        // an EMPTY decider would mean the delta vanished — a real m1 change back to the
-        // placeholder, which is a legitimate SOFT, not a defer.)
-        let after = transform(
+        // defer after: the store is unchanged → digest stable → pure SOFT+ replay, no write
+        let after = run(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &deciders,
-        )
-        .unwrap();
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
         assert_eq!(after.action, "SOFT+");
         assert!(!after.committed);
-        assert_eq!(m1_bytes(&after), "<mem>rule</mem>");
+        assert_eq!(
+            m1_bytes(&after),
+            m1_bytes(&soft),
+            "m1 replays byte-identical"
+        );
         assert_eq!(m0_bytes(&after), m0_bytes(&before));
     }
 
     #[test]
-    fn v5_same_id_update_fires_on_content_digest_not_max_id() {
+    fn in_m0_memory_update_rides_m1_as_a_supersede_delta() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
+        // a memory is in the m0 baseline (seeded before bootstrap → in the manifest)
+        s.seed_memory(5, "git:proj", "ARCHITECTURE", "original", 70)
+            .unwrap();
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let before = run(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
-        )
-        .unwrap();
-        // first delta, revision 7
-        let d1 = DeciderInputs {
-            m1_content: Some(M1Content {
-                revision: 7,
-                body: "v1".into(),
-            }),
-            ..Default::default()
-        };
-        transform(&s, &req("ses", "cfg0", vec![item("a", 1, "BASE")]), &d1).unwrap();
-        // a same-id UPDATE: max-id unchanged, but content (digest) changed → must Soft again
-        let d2 = DeciderInputs {
-            m1_content: Some(M1Content {
-                revision: 8,
-                body: "v2".into(),
-            }),
-            ..Default::default()
-        };
-        let r = transform(&s, &req("ses", "cfg0", vec![item("a", 1, "BASE")]), &d2).unwrap();
-        assert_eq!(
-            r.action, "SOFT",
-            "a content change must re-bust m1 even at unchanged max-id"
         );
-        assert_eq!(m1_bytes(&r), "v2");
+        assert!(
+            m0_bytes(&before).contains("original"),
+            "memory in m0 baseline"
+        );
+
+        // an in-session UPDATE to that in-m0 memory → a mutation-log row → digest moves → SOFT
+        s.seed_mutation("git:proj", "update", 5, "corrected")
+            .unwrap();
+        let r = run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        assert_eq!(r.action, "SOFT", "an in-m0 memory mutation rides a SOFT");
+        assert_eq!(
+            m0_bytes(&r),
+            m0_bytes(&before),
+            "m0 frozen (the supersede rides m1)"
+        );
+        assert!(
+            m1_bytes(&r).contains("corrected"),
+            "memory-updates delta: {}",
+            m1_bytes(&r)
+        );
     }
 
     #[test]
-    fn v6_fold_only_folds_m1_into_m0_and_resets() {
+    fn render_config_change_hard_folds_the_m1_delta_into_m0() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        run(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
-        )
-        .unwrap();
-        // m1 delta
-        let d = DeciderInputs {
-            m1_content: Some(M1Content {
-                revision: 3,
-                body: "<mem>X</mem>".into(),
-            }),
-            ..Default::default()
-        };
-        transform(
+        );
+        // ride a new memory on m1
+        s.seed_memory(5, "git:proj", "ARCHITECTURE", "folded rule", 70)
+            .unwrap();
+        let soft = run(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
-            &d,
-        )
-        .unwrap();
-        // a HARD fold: m1 folds into m0, m1 resets, new boundary minted
-        let fold = DeciderInputs {
-            hard_fold_requested: true,
-            fold_through_ordinal: Some(2),
-            m1_content: Some(M1Content {
-                revision: 3,
-                body: "<mem>X</mem>".into(),
-            }),
-            ..Default::default()
-        };
-        let items = vec![item("a", 1, "<h>BASE</h>"), item("b", 2, "<h>MORE</h>")];
-        let r = transform(&s, &req("ses", "cfg0", items), &fold).unwrap();
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        assert_eq!(soft.action, "SOFT");
+        assert!(!m0_bytes(&soft).contains("folded rule"), "not in m0 yet");
+
+        // a render_config (model/system) change → HARD: re-compose m0 from the store, which
+        // now INCLUDES the memory, and reset m1 to the placeholder.
+        let r = run(
+            &s,
+            &req("ses", "cfg1", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
         assert_eq!(r.action, "HARD");
-        assert_eq!(r.boundary_id, "b", "fold mints the new terminal boundary");
-        assert_eq!(
-            m0_bytes(&r),
-            "<h>BASE</h><h>MORE</h><mem>X</mem>",
-            "m1 folded into m0"
+        assert!(
+            m0_bytes(&r).contains("folded rule"),
+            "m1 delta folded into m0: {}",
+            m0_bytes(&r)
         );
         assert_eq!(m1_bytes(&r), M1_PLACEHOLDER, "m1 reset to placeholder");
     }
 
     #[test]
-    fn v8_revert_defers_then_reconcile_rematerializes() {
+    fn new_compartment_extends_coverage_on_soft_advancing_the_anchor() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
+        // m0 folds C1 (covers 1..=10, end "m10")
+        s.replace_compartments("ses", &[comp(1, 1, 10, "m10", "S1")])
+            .unwrap();
+        let boot = run(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
+            &req(
+                "ses",
+                "cfg0",
+                vec![item("m10", 10, "raw"), item("t11", 11, "tail")],
+            ),
             &spine(),
+        );
+        assert_eq!(boot.boundary_id, "m10");
+        assert_eq!(tail_ids(&boot), vec!["t11"]);
+
+        // C2 (covers 11..=20, end "m20") publishes → it rides m1 at P1 AND extends coverage
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 20, "m20", "S2")],
         )
         .unwrap();
-        let before = transform(
+        let items = vec![
+            item("m10", 10, "raw"),
+            item("m20", 20, "raw2"),
+            item("t21", 21, "tail"),
+        ];
+        let soft = run(&s, &req("ses", "cfg0", items.clone()), &spine());
+        assert_eq!(soft.action, "SOFT", "a new compartment rides a SOFT");
+        assert_eq!(
+            soft.boundary_id, "m20",
+            "the anchor ADVANCED on the SOFT (b0→b1)"
+        );
+        assert!(
+            m1_bytes(&soft).contains("<new-compartments>"),
+            "{}",
+            m1_bytes(&soft)
+        );
+        assert!(m1_bytes(&soft).contains("S2") && !m1_bytes(&soft).contains("title=\"C1\""));
+        // coverage advanced to 20 → raw m20 trimmed, only t21 remains
+        assert_eq!(tail_ids(&soft), vec!["t21"]);
+
+        // a defer at the new anchor replays byte-identical
+        let defer = run(&s, &req("ses", "cfg0", items), &spine());
+        assert_eq!(defer.action, "SOFT+");
+        assert!(!defer.committed);
+        assert_eq!(
+            m1_bytes(&defer),
+            m1_bytes(&soft),
+            "m1 replays identical at b1"
+        );
+        assert_eq!(m0_bytes(&defer), m0_bytes(&soft));
+
+        // revert BELOW the new boundary (m20 gone) → boundary absent → reconcile
+        let revert = run(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
+            &req("ses", "cfg0", vec![item("z", 30, "other")]),
+            &spine(),
+        );
+        assert_eq!(revert.action, "SOFT+");
+        assert!(
+            revert.reconcile_pending,
+            "revert below b1 → reconcile pending"
+        );
+    }
+
+    #[test]
+    fn frozen_expiry_cutoff_survives_a_wall_clock_advance_on_recompose() {
+        // Resume-determinism guard for the frozen expiry cutoff: a memory live under the
+        // FROZEN cutoff must keep rendering even when a later SOFT recomposes at a
+        // wall-clock past its expiry (e.g. after a restart). A live-clock bug (using now_ms
+        // instead of the frozen meta cutoff) drops it here and ONLY here — the non-vacuous
+        // proof.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        // bootstrap at now_ms=500 → expiry cutoff FROZEN at 500. No memories folded yet.
+        transform(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &pctx("git:proj", "/nonexistent-docs", 500),
             &spine(),
         )
         .unwrap();
 
-        // revert removed the boundary item "a" — array no longer contains it
-        let revert = transform(
+        // a NEW memory expiring at 1000: LIVE under cutoff 500, EXPIRED under wall-clock 2000.
+        s.seed_expiring_memory(5, "git:proj", "ARCHITECTURE", "still valid", 70, 1000)
+            .unwrap();
+
+        // a SOFT recompose at wall-clock 2000 — the cutoff stays FROZEN at 500, so the
+        // memory is live and renders. A bug using now_ms=2000 would expire + drop it.
+        let soft = transform(
             &s,
-            &req("ses", "cfg0", vec![item("z", 5, "<h>OTHER</h>")]),
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &pctx("git:proj", "/nonexistent-docs", 2000),
             &spine(),
         )
         .unwrap();
+        assert_eq!(soft.action, "SOFT");
+        assert!(
+            m1_bytes(&soft).contains("still valid"),
+            "frozen cutoff (500) keeps the memory live at wall-clock 2000: {}",
+            m1_bytes(&soft)
+        );
+    }
+
+    #[test]
+    fn workspace_membership_change_is_a_render_config_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        // a steady defer (no change)
+        let defer = run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        assert_eq!(defer.action, "SOFT+");
+
+        // joining a workspace changes the deterministic workspace_fingerprint → the folded
+        // render_config changes → a HARD (m0 is now composed over a different project set).
+        s.seed_workspace_member("ws1", "git:proj", "[\"CONSTRAINTS\"]")
+            .unwrap();
+        let r = run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        assert_eq!(r.action, "HARD", "a membership change re-materializes m0");
+    }
+
+    #[test]
+    fn revert_defers_then_reconcile_rematerializes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 10, "m10", "S1")])
+            .unwrap();
+        let before = run(
+            &s,
+            &req("ses", "cfg0", vec![item("m10", 10, "raw")]),
+            &spine(),
+        );
+        assert_eq!(before.action, "HARD");
+        assert_eq!(before.boundary_id, "m10");
+
+        // revert removed the boundary message m10 — array no longer contains it
+        let revert = run(
+            &s,
+            &req("ses", "cfg0", vec![item("z", 50, "other")]),
+            &spine(),
+        );
         assert_eq!(revert.action, "SOFT+", "revert must not bust");
         assert!(revert.reconcile_pending);
         assert_eq!(m0_bytes(&revert), m0_bytes(&before), "frozen m0 replays");
         assert!(revert.committed, "reconcile flag flip persists");
 
-        // next pass, boundary still absent → Hard rematerialize against live array
-        let remat = transform(
+        // the compartment is also gone after the revert (the historian would re-cut), so
+        // the next pass with the boundary still absent → Hard rematerialize. With no
+        // compartments now, m0 is the empty-history placeholder over the live tail.
+        s.replace_compartments("ses", &[]).unwrap();
+        let remat = run(
             &s,
-            &req("ses", "cfg0", vec![item("a2", 6, "<h>REVERTED</h>")]),
+            &req("ses", "cfg0", vec![item("a2", 60, "reverted")]),
             &spine(),
-        )
-        .unwrap();
+        );
         assert_eq!(remat.action, "HARD");
-        assert_eq!(remat.boundary_id, "a2");
-        assert_eq!(m0_bytes(&remat), "<h>REVERTED</h>");
+        assert_eq!(remat.boundary_id, "", "no compartment → empty anchor");
         assert!(!remat.reconcile_pending);
+        assert_eq!(tail_ids(&remat), vec!["a2"], "live item is the tail");
     }
 
     #[test]
@@ -950,17 +1256,19 @@ mod tests {
             initialized: true,
             last_render_config: "cfg0".into(),
             coverage_ordinal: Some(1),
-            m1_revision: 0,
             ..Default::default()
         };
         s.commit("ses", None, &legacy_core, &legacy_meta).unwrap();
+        // a compartment so the migrated m0 has real summary content
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "FRESH-SUMMARY")])
+            .unwrap();
 
-        let r = transform(&s, &req("ses", "cfg0", vec![item("a", 1, "NEW")]), &spine()).unwrap();
+        let r = run(&s, &req("ses", "cfg0", vec![item("a", 1, "NEW")]), &spine());
         assert_eq!(
             r.action, "HARD",
             "legacy shape migrates via clear-then-Hard"
         );
-        // no "baseline" residue: exactly [m0, m1] synthetic blocks
+        // no "baseline" residue: exactly [m0, m1] synthetic blocks, m0 re-composed from store
         let synth_ids: Vec<&str> = r
             .ck_messages
             .iter()
@@ -968,7 +1276,11 @@ mod tests {
             .map(|i| i.id.as_str())
             .collect();
         assert_eq!(synth_ids, vec![M0_ID, M1_ID]);
-        assert_eq!(m0_bytes(&r), "NEW");
+        assert!(
+            m0_bytes(&r).contains("FRESH-SUMMARY"),
+            "m0 re-composed: {}",
+            m0_bytes(&r)
+        );
         let reloaded = s.load("ses").unwrap();
         assert!(reloaded
             .core
@@ -992,12 +1304,16 @@ mod tests {
             initialized: true,
             last_render_config: "cfg0".into(),
             coverage_ordinal: Some(1),
-            m1_revision: 0,
             ..Default::default()
         };
         s.commit("ses", None, &weird, &meta).unwrap();
-        let err =
-            transform(&s, &req("ses", "cfg0", vec![item("a", 1, "X")]), &spine()).unwrap_err();
+        let err = transform(
+            &s,
+            &req("ses", "cfg0", vec![item("a", 1, "X")]),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+            &spine(),
+        )
+        .unwrap_err();
         assert!(matches!(err, TransformError::UnknownShape(_)));
         // durable state unchanged (the "junk" unit survives — not destructively cleared)
         let reloaded = s.load("ses").unwrap();
@@ -1008,17 +1324,13 @@ mod tests {
     fn reserved_id_and_ordinal_violations_error() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &spine(),
-        )
-        .unwrap();
+        let dc = pctx("git:proj", "/nonexistent-docs", 0);
 
-        // a non-synthetic item with a reserved mc_* id
+        // a non-synthetic item with a reserved mc_* id (a pre-load ingress guard)
         let reserved = transform(
             &s,
             &req("ses", "cfg0", vec![item("mc_m0", 2, "x")]),
+            &dc,
             &spine(),
         );
         assert!(matches!(reserved, Err(TransformError::ReservedId)));
@@ -1027,6 +1339,7 @@ mod tests {
         let bad = transform(
             &s,
             &req("ses", "cfg0", vec![item("a", 5, "x"), item("b", 5, "y")]),
+            &dc,
             &spine(),
         );
         assert!(matches!(bad, Err(TransformError::OrdinalViolation)));
@@ -1036,23 +1349,26 @@ mod tests {
     fn synthetic_ingress_is_stripped_before_boundary_and_tail() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "S")])
+            .unwrap();
+        run(
             &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
-        )
-        .unwrap();
+        );
         // feed our own synthetic m0 back in alongside the real array
-        let mut items = vec![CkItemWire {
-            id: M0_ID.into(),
-            ordinal: 0,
-            bytes: "STALE".into(),
-            synthetic: true,
-        }];
-        items.push(item("a", 1, "BASE"));
-        items.push(item("t2", 2, "tail2"));
-        let r = transform(&s, &req("ses", "cfg0", items), &spine()).unwrap();
-        // boundary "a" still found (synthetic stripped), tail filter uncorrupted
+        let items = vec![
+            CkItemWire {
+                id: M0_ID.into(),
+                ordinal: 0,
+                bytes: "STALE".into(),
+                synthetic: true,
+            },
+            item("m1msg", 1, "raw"),
+            item("t2", 2, "tail2"),
+        ];
+        let r = run(&s, &req("ses", "cfg0", items), &spine());
+        // boundary m1msg still found (synthetic stripped), tail filter uncorrupted
         assert_eq!(r.action, "SOFT+");
         assert_eq!(tail_ids(&r), vec!["t2"]);
     }
@@ -1064,28 +1380,27 @@ mod tests {
         let bytes_m1;
         {
             let s = store(dir.path());
-            transform(
+            s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+                .unwrap();
+            run(
                 &s,
-                &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
+                &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
                 &spine(),
-            )
-            .unwrap();
-            let r = transform(
+            );
+            let r = run(
                 &s,
-                &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
+                &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
                 &spine(),
-            )
-            .unwrap();
+            );
             bytes_m0 = m0_bytes(&r).to_string();
             bytes_m1 = m1_bytes(&r).to_string();
         } // lease released
         let s2 = store(dir.path());
-        let after = transform(
+        let after = run(
             &s2,
-            &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
-        )
-        .unwrap();
+        );
         assert_eq!(after.action, "SOFT+");
         assert!(!after.committed);
         assert_eq!(m0_bytes(&after), bytes_m0);
@@ -1093,11 +1408,14 @@ mod tests {
     }
 
     #[test]
-    fn old_meta_json_without_m1_revision_loads() {
-        // serde(default) lets pre-m1_revision meta JSON deserialize cleanly.
+    fn old_meta_json_without_new_fields_loads() {
+        // serde(default) lets older meta JSON (written before m1_revision and the
+        // two-watermark fields existed) deserialize cleanly — they all default.
         let json = r#"{"initialized":true,"last_render_config":"cfg0","coverage_ordinal":1}"#;
         let meta: ModuleMeta = serde_json::from_str(json).unwrap();
         assert_eq!(meta.m1_revision, 0);
+        assert_eq!(meta.folded_compartment_seq, 0);
+        assert_eq!(meta.expiry_cutoff_ms, 0);
         assert!(meta.initialized);
     }
 
@@ -1111,10 +1429,7 @@ mod tests {
         }
     }
     fn with_reductions(rs: Vec<ReductionDecision>) -> DeciderInputs {
-        DeciderInputs {
-            reductions: rs,
-            ..Default::default()
-        }
+        DeciderInputs { reductions: rs }
     }
     /// The bytes of a tail item (non-synthetic) by id.
     fn tail_bytes<'a>(r: &'a TransformResponse, id: &str) -> &'a str {
@@ -1125,37 +1440,38 @@ mod tests {
             .bytes
     }
 
+    /// Bootstrap a session whose m0 covers ordinal 1 (compartment ends at id "a"), so the
+    /// boundary "a" is present and tail items (ordinal ≥ 2) are reducible.
+    fn bootstrap_covering_a(s: &McStore) {
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        run(s, &req("ses", "cfg0", vec![item("a", 1, "raw")]), &spine());
+    }
+
     #[test]
-    fn v2_reduction_freezes_on_bust_replays_on_defer() {
+    fn reduction_freezes_on_bust_replays_on_defer() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &spine(),
-        )
-        .unwrap();
+        bootstrap_covering_a(&s);
 
-        // a bust pass freezes a drop on tail item t2 → [dropped 1]
-        let items = vec![item("a", 1, "BASE"), item("t2", 2, "BIGOUTPUT")];
+        // a new reduction on tail item t2 → SOFT, frozen → [dropped 1]
+        let items = vec![item("a", 1, "raw"), item("t2", 2, "BIGOUTPUT")];
         let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
-        let soft = transform(&s, &req("ses", "cfg0", items.clone()), &d).unwrap();
+        let soft = run(&s, &req("ses", "cfg0", items.clone()), &d);
         assert_eq!(soft.action, "SOFT", "a new reduction rides a SOFT");
         assert_eq!(
             tail_bytes(&soft, "t2"),
             "[dropped 1]",
             "t2 reduced in place"
         );
-        // "a" (ordinal 1) is covered into m0 by bootstrap, so only t2 is in the tail.
         assert_eq!(
             tail_ids(&soft),
             vec!["t2"],
-            "only the uncovered item is in the tail"
+            "covered 'a' trimmed, only t2 in tail"
         );
 
-        // defers after: replay the frozen reduction byte-identical, no write
         for _ in 0..3 {
-            let after = transform(&s, &req("ses", "cfg0", items.clone()), &d).unwrap();
+            let after = run(&s, &req("ses", "cfg0", items.clone()), &d);
             assert_eq!(after.action, "SOFT+", "no new reduction → pure defer");
             assert!(!after.committed, "pure defer must not write");
             assert_eq!(tail_bytes(&after, "t2"), "[dropped 1]");
@@ -1163,30 +1479,30 @@ mod tests {
     }
 
     #[test]
-    fn v3_frozen_reduction_never_first_applied_on_defer() {
+    fn frozen_reduction_never_first_applied_on_defer() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &spine(),
-        )
-        .unwrap();
+        bootstrap_covering_a(&s);
 
-        // freeze a strip on t2 (a bust)
         let d = with_reductions(vec![reduce("t2", "strip", "[dropped 99999]")]);
-        let base_items = vec![item("a", 1, "BASE"), item("t2", 2, "OUT")];
-        transform(&s, &req("ses", "cfg0", base_items), &d).unwrap();
+        run(
+            &s,
+            &req(
+                "ses",
+                "cfg0",
+                vec![item("a", 1, "raw"), item("t2", 2, "OUT")],
+            ),
+            &d,
+        );
 
-        // the tail GROWS (newer items land); the SAME reduction set is re-supplied each
-        // pass. No new reduction → every pass is a pure defer; the frozen [dropped 99999]
-        // replays verbatim and NO reduction is first-applied on a defer.
+        // the tail grows; the SAME reduction set re-supplied each pass → pure defer, the
+        // frozen [dropped 99999] replays verbatim, never first-applied on a defer.
         for n in 3..=6u64 {
-            let mut items = vec![item("a", 1, "BASE"), item("t2", 2, "OUT")];
+            let mut items = vec![item("a", 1, "raw"), item("t2", 2, "OUT")];
             for k in 3..=n {
                 items.push(item(&format!("t{k}"), k, &format!("new{k}")));
             }
-            let r = transform(&s, &req("ses", "cfg0", items), &d).unwrap();
+            let r = run(&s, &req("ses", "cfg0", items), &d);
             assert_eq!(
                 r.action, "SOFT+",
                 "an aged-but-unchanged reduction set defers"
@@ -1201,114 +1517,111 @@ mod tests {
     }
 
     #[test]
-    fn v4_skeleton_byte_complete_across_moving_window() {
+    fn skeleton_byte_complete_across_moving_window() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &spine(),
-        )
-        .unwrap();
+        bootstrap_covering_a(&s);
 
-        // freeze edit1's skeleton with a fixed region-hint payload
         let skel = "edit packages/app/x.ts | @@ -10,6 +10,8 @@ [dropped 1]";
         let d1 = with_reductions(vec![reduce("edit1", "edit_marker", skel)]);
-        let items1 = vec![item("a", 1, "BASE"), item("edit1", 2, "FULL-DIFF-BYTES")];
-        let frozen = transform(&s, &req("ses", "cfg0", items1), &d1).unwrap();
+        let items1 = vec![item("a", 1, "raw"), item("edit1", 2, "FULL-DIFF-BYTES")];
+        let frozen = run(&s, &req("ses", "cfg0", items1), &d1);
         assert_eq!(tail_bytes(&frozen, "edit1"), skel);
 
-        // a NEWER edit lands (the recent window moves). The decider STILL carries edit1
-        // (frozen) plus a new edit2. edit1 must replay its frozen payload verbatim — a
-        // re-derive of the region-hint from current content would flip its bytes.
+        // a newer edit lands; edit1 must replay its FROZEN payload verbatim (a re-derive
+        // of the region-hint from current content would flip its bytes).
         let skel2 = "edit packages/app/y.ts | @@ -1,2 +1,3 @@ [dropped 2]";
         let d2 = with_reductions(vec![
-            reduce("edit1", "edit_marker", skel), // same frozen payload (authoritative)
+            reduce("edit1", "edit_marker", skel),
             reduce("edit2", "edit_marker", skel2),
         ]);
         let items2 = vec![
-            item("a", 1, "BASE"),
+            item("a", 1, "raw"),
             item("edit1", 2, "FULL-DIFF-BYTES"),
             item("edit2", 3, "ANOTHER-FULL-DIFF"),
         ];
-        let moved = transform(&s, &req("ses", "cfg0", items2), &d2).unwrap();
+        let moved = run(&s, &req("ses", "cfg0", items2), &d2);
         assert_eq!(moved.action, "SOFT", "the new edit2 reduction rides a SOFT");
         assert_eq!(tail_bytes(&moved, "edit1"), skel, "older skeleton verbatim");
         assert_eq!(tail_bytes(&moved, "edit2"), skel2, "new skeleton frozen");
     }
 
     #[test]
-    fn v6_fold_carries_reduced_bytes_into_m0_and_gcs_covered_red() {
+    fn fold_gcs_a_reduction_whose_item_becomes_covered() {
+        // The new-model equivalent of "fold carries reduced bytes into m0": m0 is now a
+        // SUMMARY (never reduced raw bytes), so when a HARD's coverage crosses a reduced
+        // tail item, that item is represented by the compartment summary and its red:* unit
+        // is GC'd — no stale [dropped] leak, no double-count.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
-            &spine(),
-        )
-        .unwrap();
+        bootstrap_covering_a(&s);
 
-        // freeze a drop on t2 (a tail item)
+        // freeze a drop on tail item t2 (ordinal 2)
         let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
-        let items = vec![item("a", 1, "<h>BASE</h>"), item("t2", 2, "HUGE")];
-        transform(&s, &req("ses", "cfg0", items.clone()), &d).unwrap();
-
-        // a HARD fold whose coverage crosses t2 → m0 carries t2's REDUCED bytes (not
-        // "HUGE"), the red:t2 unit is GC'd (no double-count), new boundary minted.
-        let fold = DeciderInputs {
-            hard_fold_requested: true,
-            fold_through_ordinal: Some(2),
-            reductions: vec![reduce("t2", "drop", "[dropped 1]")],
-            ..Default::default()
-        };
-        let r = transform(&s, &req("ses", "cfg0", items), &fold).unwrap();
-        assert_eq!(r.action, "HARD");
-        assert_eq!(r.boundary_id, "t2");
-        assert_eq!(
-            m0_bytes(&r),
-            "<h>BASE</h>[dropped 1]",
-            "m0 carries the REDUCED bytes for the covered reduced item"
-        );
-        // red:t2 GC'd: a defer after must not double-count (t2 now inside m0, gone from tail)
-        let after = transform(
+        run(
             &s,
-            &req("ses", "cfg0", vec![item("t2", 2, "HUGE")]),
-            &spine(),
+            &req(
+                "ses",
+                "cfg0",
+                vec![item("a", 1, "raw"), item("t2", 2, "HUGE")],
+            ),
+            &d,
+        );
+
+        // a compartment now covers ordinal 2 (t2 is summarized); a HARD (render_config
+        // change) re-composes m0 over both compartments — coverage advances to 2, so
+        // surviving_red_units GCs red:t2 (its ordinal is now covered).
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 1, "a", "S1"), comp(2, 2, 2, "t2", "S2")],
         )
         .unwrap();
-        assert_eq!(after.action, "SOFT+");
-        assert_eq!(
-            m0_bytes(&after),
-            "<h>BASE</h>[dropped 1]",
-            "no double-count after fold"
+        let r = run(
+            &s,
+            &req(
+                "ses",
+                "cfg1",
+                vec![item("a", 1, "raw"), item("t2", 2, "HUGE")],
+            ),
+            &d,
         );
-        assert!(tail_ids(&after).is_empty(), "t2 folded, tail empty");
+        assert_eq!(r.action, "HARD");
+        assert_eq!(r.boundary_id, "t2", "anchor = last compartment end id");
+        assert!(
+            m0_bytes(&r).contains("S2"),
+            "m0 is the summary, not [dropped 1]: {}",
+            m0_bytes(&r)
+        );
+        assert!(
+            !m0_bytes(&r).contains("[dropped 1]"),
+            "m0 never carries reduced bytes"
+        );
+        let reloaded = s.load("ses").unwrap();
+        assert!(
+            !reloaded.core.frozen_units.iter().any(|u| u.key == "red:t2"),
+            "covered reduction GC'd"
+        );
+        assert!(tail_ids(&r).is_empty(), "both items covered, tail empty");
     }
 
     #[test]
-    fn coalesced_m1_and_reduction_one_soft() {
+    fn coalesced_memory_delta_and_reduction_one_soft() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &spine(),
-        )
-        .unwrap();
+        bootstrap_covering_a(&s);
 
-        // both an m1 delta AND a new reduction on one pass → ONE SOFT rendering both
-        let d = DeciderInputs {
-            m1_content: Some(M1Content {
-                revision: 5,
-                body: "<mem>R</mem>".into(),
-            }),
-            reductions: vec![reduce("t2", "drop", "[dropped 1]")],
-            ..Default::default()
-        };
-        let items = vec![item("a", 1, "BASE"), item("t2", 2, "OUT")];
-        let r = transform(&s, &req("ses", "cfg0", items.clone()), &d).unwrap();
+        // both a store m1 delta (a new memory) AND a new reduction on one pass → ONE SOFT
+        s.seed_memory(5, "git:proj", "ARCHITECTURE", "a rule", 70)
+            .unwrap();
+        let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
+        let items = vec![item("a", 1, "raw"), item("t2", 2, "OUT")];
+        let r = run(&s, &req("ses", "cfg0", items.clone()), &d);
         assert_eq!(r.action, "SOFT");
-        assert_eq!(m1_bytes(&r), "<mem>R</mem>", "m1 rendered");
+        assert!(
+            m1_bytes(&r).contains("a rule"),
+            "m1 delta rendered: {}",
+            m1_bytes(&r)
+        );
         assert_eq!(
             tail_bytes(&r, "t2"),
             "[dropped 1]",
@@ -1316,10 +1629,10 @@ mod tests {
         );
 
         // defer after: both replay byte-identical, no second bust
-        let after = transform(&s, &req("ses", "cfg0", items), &d).unwrap();
+        let after = run(&s, &req("ses", "cfg0", items), &d);
         assert_eq!(after.action, "SOFT+");
         assert!(!after.committed);
-        assert_eq!(m1_bytes(&after), "<mem>R</mem>");
+        assert_eq!(m1_bytes(&after), m1_bytes(&r));
         assert_eq!(tail_bytes(&after, "t2"), "[dropped 1]");
     }
 
@@ -1327,49 +1640,40 @@ mod tests {
     fn reverted_orphan_reduction_gcd_on_reconcile_hard() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
-            &spine(),
-        )
-        .unwrap();
+        bootstrap_covering_a(&s);
 
         // freeze a drop on t2
         let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
-        transform(
+        run(
             &s,
             &req(
                 "ses",
                 "cfg0",
-                vec![item("a", 1, "<h>BASE</h>"), item("t2", 2, "OUT")],
+                vec![item("a", 1, "raw"), item("t2", 2, "OUT")],
             ),
             &d,
-        )
-        .unwrap();
+        );
 
         // a revert removes BOTH the boundary "a" AND the reduced item t2 from the array
-        let revert = transform(
+        let revert = run(
             &s,
-            &req("ses", "cfg0", vec![item("z", 9, "<h>OTHER</h>")]),
+            &req("ses", "cfg0", vec![item("z", 9, "other")]),
             &spine(),
-        )
-        .unwrap();
+        );
         assert_eq!(revert.action, "SOFT+");
         assert!(revert.reconcile_pending);
 
-        // reconcile-HARD rematerializes against the live array; the orphaned red:t2
-        // (target in neither tail nor covered) is GC'd — m0 is just the live item, no
-        // stale [dropped 1] leak.
-        let remat = transform(
+        // reconcile-HARD rematerializes; the compartment is gone too (the historian re-cut),
+        // so m0 is the empty-history baseline and the orphaned red:t2 is GC'd.
+        s.replace_compartments("ses", &[]).unwrap();
+        let remat = run(
             &s,
-            &req("ses", "cfg0", vec![item("a2", 10, "<h>REVERTED</h>")]),
+            &req("ses", "cfg0", vec![item("a2", 10, "reverted")]),
             &spine(),
-        )
-        .unwrap();
+        );
         assert_eq!(remat.action, "HARD");
-        assert_eq!(
-            m0_bytes(&remat),
-            "<h>REVERTED</h>",
+        assert!(
+            !m0_bytes(&remat).contains("[dropped 1]"),
             "no orphaned reduction in m0"
         );
         let reloaded = s.load("ses").unwrap();
@@ -1383,22 +1687,23 @@ mod tests {
     fn monotonicity_violation_fails_loud() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &spine(),
-        )
-        .unwrap();
+        bootstrap_covering_a(&s);
 
         // freeze t2 → [dropped 1]
         let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
-        let items = vec![item("a", 1, "BASE"), item("t2", 2, "OUT")];
-        transform(&s, &req("ses", "cfg0", items.clone()), &d).unwrap();
+        let items = vec![item("a", 1, "raw"), item("t2", 2, "OUT")];
+        run(&s, &req("ses", "cfg0", items.clone()), &d);
 
         // re-supply t2 with DIFFERENT bytes (a contract violation) → fail loud, not a
         // silent skip-and-serve-stale. Tested on a defer (the silent-miss surface).
         let bad = with_reductions(vec![reduce("t2", "drop", "[dropped DIFFERENT]")]);
-        let err = transform(&s, &req("ses", "cfg0", items), &bad).unwrap_err();
+        let err = transform(
+            &s,
+            &req("ses", "cfg0", items),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+            &bad,
+        )
+        .unwrap_err();
         assert!(matches!(err, TransformError::ReductionConflict));
     }
 
@@ -1406,23 +1711,18 @@ mod tests {
     fn interleaved_reduction_keeps_surrounding_tail_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &spine(),
-        )
-        .unwrap();
+        bootstrap_covering_a(&s);
 
         // a reduction sits BETWEEN live tail items; the surrounding items stay verbatim
         // and stable across a defer (the contiguous-prefix cache holds per-item).
         let d = with_reductions(vec![reduce("t3", "drop", "[dropped 1]")]);
         let items = vec![
-            item("a", 1, "BASE"),
+            item("a", 1, "raw"),
             item("t2", 2, "before"),
             item("t3", 3, "REDUCED-AWAY"),
             item("t4", 4, "after"),
         ];
-        let soft = transform(&s, &req("ses", "cfg0", items.clone()), &d).unwrap();
+        let soft = run(&s, &req("ses", "cfg0", items.clone()), &d);
         assert_eq!(soft.action, "SOFT");
         assert_eq!(
             tail_ids(&soft),
@@ -1433,7 +1733,7 @@ mod tests {
         assert_eq!(tail_bytes(&soft, "t3"), "[dropped 1]");
         assert_eq!(tail_bytes(&soft, "t4"), "after");
 
-        let after = transform(&s, &req("ses", "cfg0", items), &d).unwrap();
+        let after = run(&s, &req("ses", "cfg0", items), &d);
         assert_eq!(after.action, "SOFT+");
         assert_eq!(tail_bytes(&after, "t2"), "before");
         assert_eq!(tail_bytes(&after, "t3"), "[dropped 1]");
@@ -1444,6 +1744,7 @@ mod tests {
     fn shape_tighten_rejects_missing_m1_but_allows_red() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
+        let dc = pctx("git:proj", "/nonexistent-docs", 0);
         // an initialized state with m0 + a red:* but NO m1 → unknown shape, reject
         let bad = CoreState {
             version: 1,
@@ -1459,13 +1760,13 @@ mod tests {
             initialized: true,
             last_render_config: "cfg0".into(),
             coverage_ordinal: Some(1),
-            m1_revision: 0,
             ..Default::default()
         };
         s.commit("ses", None, &bad, &meta).unwrap();
         let err = transform(
             &s,
             &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
+            &dc,
             &spine(),
         )
         .unwrap_err();
@@ -1474,7 +1775,10 @@ mod tests {
             "missing m1 rejects"
         );
 
-        // a valid m0 + m1 + red:* state classifies normally (does NOT reject)
+        // a valid m0 + m1 + red:* state classifies normally (does NOT reject). Use the
+        // effective render_config (with the empty-workspace fingerprint folded) and the
+        // matching post-HARD m1 digest so the steady-state pass is a clean SOFT+ (no
+        // phantom delta from a mismatched digest).
         let good = CoreState {
             version: 1,
             boundary_id: "a".into(),
@@ -1486,10 +1790,26 @@ mod tests {
             pending_changes: vec![],
             reconcile_pending: false,
         };
-        s.commit("ses2", None, &good, &meta).unwrap();
+        let good_cfg = fold_m0_content_epoch(
+            "cfg0",
+            &M0ContentEpoch {
+                workspace_fingerprint: s.workspace_fingerprint("git:proj").unwrap(),
+                upgrade_state: String::new(),
+                memory_content_epoch: String::new(),
+            },
+        );
+        let good_meta = ModuleMeta {
+            initialized: true,
+            last_render_config: good_cfg,
+            coverage_ordinal: Some(1),
+            m1_revision: m1_revision_signal(&s, "git:proj", "ses2").unwrap(),
+            ..Default::default()
+        };
+        s.commit("ses2", None, &good, &good_meta).unwrap();
         let ok = transform(
             &s,
             &req("ses2", "cfg0", vec![item("a", 1, "BASE")]),
+            &dc,
             &spine(),
         )
         .unwrap();

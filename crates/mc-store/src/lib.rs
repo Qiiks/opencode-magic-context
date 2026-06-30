@@ -265,6 +265,13 @@ pub struct ModuleMeta {
     /// as `<new-memories>`; a HARD folds them and advances this.
     #[serde(default)]
     pub max_memory_id: i64,
+    /// The expiry cutoff FROZEN at the last HARD (the module clock at materialization). A
+    /// memory's expiry is judged against THIS, not a live clock, so every later SOFT/defer
+    /// compose sees the SAME memory set the m0 baseline was built against — a memory
+    /// expiring between the HARD and a later pass must not change the rendered bytes.
+    /// 0 before the first HARD.
+    #[serde(default)]
+    pub expiry_cutoff_ms: i64,
 }
 
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
@@ -947,6 +954,68 @@ impl McStore {
                     format!("h{id}"),
                     importance
                 ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Insert an active memory with an explicit `expires_at` (ms) for `project_path` —
+    /// used to test the frozen expiry cutoff (a memory live under one cutoff, expired
+    /// under a later one).
+    pub fn seed_expiring_memory(
+        &self,
+        id: i64,
+        project_path: &str,
+        category: &str,
+        content: &str,
+        importance: i64,
+        expires_at: i64,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO mc_memories (id, project_path, category, content, normalized_hash,
+                                          importance, status, expires_at, first_seen_at,
+                                          created_at, updated_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, 0, 0, 0, 0)",
+                params![
+                    id,
+                    project_path,
+                    category,
+                    content,
+                    format!("h{id}"),
+                    importance,
+                    expires_at
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Add `project_path` to a workspace named `workspace` (creating it with the given
+    /// sorted share categories), so `workspace_fingerprint` reflects the membership.
+    pub fn seed_workspace_member(
+        &self,
+        workspace: &str,
+        project_path: &str,
+        share_categories_json: &str,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO mc_workspaces (name, share_categories) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO NOTHING",
+                params![workspace, share_categories_json],
+            )?;
+            let ws_id: i64 = tx.query_row(
+                "SELECT id FROM mc_workspaces WHERE name = ?1",
+                params![workspace],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO mc_workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                 VALUES (?1, ?2, ?2, ?2, 0)",
+                params![ws_id, project_path],
             )?;
             Ok(())
         })?;

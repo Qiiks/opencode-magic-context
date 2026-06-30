@@ -91,6 +91,10 @@ pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -
 pub struct CompartmentCoverage {
     /// The highest compartment `sequence` in the set.
     pub max_sequence: i64,
+    /// The first compartment's `start_message` — the LEADING edge of m0 coverage. The
+    /// caller fails loud if a live item sits below this (it would be covered by no
+    /// compartment yet trimmed as covered — a silent leading-gap drop).
+    pub first_covered_ordinal: u64,
     /// The last compartment's `end_message` — the m0+m1 coverage end ordinal (the
     /// tail-trim point: items with a greater ordinal are the live tail).
     pub coverage_end_ordinal: u64,
@@ -148,6 +152,7 @@ pub fn resolve_coverage(
     let last = compartments.last().expect("non-empty checked above");
     Ok(Some(CompartmentCoverage {
         max_sequence: compartments.iter().map(|c| c.sequence).max().unwrap_or(0),
+        first_covered_ordinal: first.start_message.max(0) as u64,
         coverage_end_ordinal: last.end_message.max(0) as u64,
         boundary_id: last.end_message_id.clone(),
     }))

@@ -195,6 +195,13 @@ pub fn assemble_m1(
 /// decay applies to a newly-added compartment until it folds into the baseline), joined
 /// by a blank line. An empty slice returns an empty string so the caller can omit the
 /// block.
+/// Render the `<new-compartments>` block: each unfolded compartment at a FIXED tier (1),
+/// with NO clock/age/pressure input, so the bytes are a pure function of the compartment
+/// ROW fields. This row-purity is load-bearing for the m1 digest: `m1_revision_signal`
+/// uses `max_compartment_seq` as the complete m1-SOFT leg for compartments BECAUSE the
+/// only way these bytes change without a new sequence (a row mutation) routes to a HARD.
+/// If you add a time/age/pressure-varying input here, that completeness breaks — re-read
+/// the COMPLETENESS INVARIANT on `m1_revision_signal` before doing so.
 pub fn render_new_compartments(
     compartments: &[&crate::decay_render::DecayRenderCompartment],
 ) -> String {

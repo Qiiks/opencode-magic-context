@@ -42,16 +42,21 @@ use subc_protocol::{
 };
 use transform::{transform, DeciderInputs, TransformRequest};
 
-/// The per-route session binding: the project + session a route channel is bound to.
-/// Established once at `on_bind` (the daemon relays the resolved {project_root, session}
-/// for the route), read by the transform path to resolve which project's store to read,
-/// and removed at `on_route_gone`. The project is NEVER taken from a per-pass request
-/// field — a crafted request could spoof it to read another project's memories — so it
-/// lives here, keyed by the route channel the daemon controls.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The per-route session binding: the project + session a route channel is bound to, plus
+/// the render budget frozen at bind. Established once at `on_bind` (the daemon relays the
+/// resolved {project_root, session} for the route), read by the transform path to resolve
+/// which project's store to read, and removed at `on_route_gone`. The project is NEVER
+/// taken from a per-pass request field — a crafted request could spoof it to read another
+/// project's memories — so it lives here, keyed by the route channel the daemon controls.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
     pub project_root: PathBuf,
     pub session: String,
+    /// The history budget (tokens) FROZEN at bind. Byte-affecting (a different budget → a
+    /// different m0 trim → different bytes), so it's read once and never per-pass. A
+    /// default for now (reading it from config is a later refinement); the freeze-once is
+    /// the load-bearing part — it can't change mid-session.
+    pub history_budget_tokens: f64,
 }
 
 /// Why a transform request can't be served: the route isn't bound, or the request's
@@ -110,23 +115,22 @@ impl McHandler {
             .remove(&channel);
     }
 
-    /// Resolve the project for a transform request on `channel`, FAIL-LOUD: the channel
+    /// Resolve the binding for a transform request on `channel`, FAIL-LOUD: the channel
     /// must be bound AND its bound session must match the request's `session_id`. Returns
-    /// the project_root the caller keys its store reads off, never a default. The returned
-    /// root is not yet consumed (the Hard/Soft transform arms will read the store under it);
-    /// but the resolve-or-reject is enforced from the start, and it changes no transform
-    /// output — a correctly-bound request resolves and proceeds identically.
-    fn resolve_project(
+    /// the full binding (project_root + frozen budget) the caller keys its store reads off,
+    /// never a default. The resolve-or-reject is enforced from the start, and it changes no
+    /// transform output — a correctly-bound request resolves and proceeds identically.
+    fn resolve_binding(
         &self,
         channel: u16,
         request_session: &str,
-    ) -> Result<PathBuf, BindingError> {
+    ) -> Result<SessionBinding, BindingError> {
         let map = self.bindings.lock().expect("bindings mutex");
         let binding = map.get(&channel).ok_or(BindingError::Unbound)?;
         if binding.session != request_session {
             return Err(BindingError::SessionMismatch);
         }
-        Ok(binding.project_root.clone())
+        Ok(binding.clone())
     }
 }
 
@@ -171,6 +175,10 @@ impl ModuleHandler for McHandler {
             SessionBinding {
                 project_root: req.identity.project_root.clone(),
                 session: req.identity.session.clone(),
+                // Frozen at bind. Currently a default constant (reading it from config is a
+                // later refinement); the load-bearing part is the freeze-once — a different
+                // budget would change the rendered m0 bytes, so it can't move mid-session.
+                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
             },
         );
         subc_client_rs::BindDecision::accept()
@@ -235,8 +243,8 @@ impl ModuleHandler for McHandler {
                 // project_root is not consumed yet (the Hard/Soft arms will read the
                 // store under it); resolving + rejecting here produces identical output
                 // for a correctly-bound request, so it changes no cached bytes.
-                let _project_root = match self.resolve_project(ctx.channel(), &parsed.session_id) {
-                    Ok(root) => root,
+                let binding = match self.resolve_binding(ctx.channel(), &parsed.session_id) {
+                    Ok(b) => b,
                     Err(BindingError::Unbound) => {
                         return HandlerOutcome::Error {
                             code: "route_unbound".to_string(),
@@ -252,9 +260,9 @@ impl ModuleHandler for McHandler {
                         }
                     }
                 };
-                // The `_decider` wire field is test-only scaffolding (production builds
-                // the decision inputs internally, not from the request). Absent →
-                // all-default → the pure production path.
+                // The `_decider` wire field now carries ONLY the tail reductions (their
+                // selection producer is not yet implemented in its final location). The
+                // m0/m1 CONTENT is composed from the store — never from the request.
                 let deciders: DeciderInputs = match request.get("_decider") {
                     Some(d) => match serde_json::from_value(d.clone()) {
                         Ok(d) => d,
@@ -267,7 +275,14 @@ impl ModuleHandler for McHandler {
                     },
                     None => DeciderInputs::default(),
                 };
-                match transform(store, &parsed, &deciders) {
+                let project_path = binding.project_root.to_string_lossy();
+                let producer_ctx = transform::ProducerContext {
+                    project_path: &project_path,
+                    project_directory: &project_path,
+                    history_budget_tokens: binding.history_budget_tokens,
+                    now_ms: now_ms(),
+                };
+                match transform(store, &parsed, &producer_ctx, &deciders) {
                     Ok(response) => respond(serde_json::to_value(response).unwrap_or(Value::Null)),
                     Err(e) => HandlerOutcome::Error {
                         code: "transform_failed".to_string(),
@@ -279,6 +294,16 @@ impl ModuleHandler for McHandler {
             _ => respond(json!({ "ok": true, "echo": request })),
         }
     }
+}
+
+/// The wall-clock now in ms. Used ONLY to set the frozen expiry cutoff on a HARD (the
+/// first materialization freezes it into meta); every later pass reads the frozen value,
+/// never this, so expiry never drifts the rendered bytes between passes.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn respond(value: Value) -> HandlerOutcome {
@@ -310,12 +335,19 @@ fn dev_descriptor() -> StorageDescriptor {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             format!("{home}/.local/share")
         });
+    dev_descriptor_at(&data_home)
+}
+
+/// The store descriptor the module uses for a given data-home — the SAME path computation
+/// the running module performs from `XDG_DATA_HOME`. Exposed so the acceptance harness can
+/// seed the very store the spawned module will open (under its single-writer lease).
+pub fn dev_descriptor_at(data_home: &str) -> StorageDescriptor {
     StorageDescriptor {
         module_id: DEFAULT_MODULE_ID.to_string(),
         storage_namespace: STORAGE_NAMESPACE.to_string(),
         isolation: Isolation::Module,
         backend: StorageBackend::Sqlite {
-            path: sqlite_store_path(&data_home, DEFAULT_MODULE_ID),
+            path: sqlite_store_path(data_home, DEFAULT_MODULE_ID),
         },
     }
 }
@@ -396,47 +428,50 @@ mod tests {
         assert_eq!(m.protocol_ver, PROTOCOL_VERSION);
     }
 
+    fn binding(root: &str, session: &str) -> SessionBinding {
+        SessionBinding {
+            project_root: PathBuf::from(root),
+            session: session.to_string(),
+            history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+        }
+    }
+
+    /// Resolve just the project_root (the binding's identity) for the resolve assertions.
+    fn resolved_root(h: &McHandler, channel: u16, session: &str) -> Result<PathBuf, BindingError> {
+        h.resolve_binding(channel, session).map(|b| b.project_root)
+    }
+
     #[test]
     fn route_binding_bind_resolve_unbind() {
         let h = McHandler::new();
-        let binding = SessionBinding {
-            project_root: PathBuf::from("/repo/proj"),
-            session: "ses_a".to_string(),
-        };
-        h.bind_route(7, binding);
+        h.bind_route(7, binding("/repo/proj", "ses_a"));
 
         // resolve succeeds when the channel is bound AND the session matches
         assert_eq!(
-            h.resolve_project(7, "ses_a").unwrap(),
+            resolved_root(&h, 7, "ses_a").unwrap(),
             PathBuf::from("/repo/proj")
         );
 
         // a teardown removes the binding → a later resolve fails loud (no stale project)
         h.unbind_route(7);
-        assert_eq!(h.resolve_project(7, "ses_a"), Err(BindingError::Unbound));
+        assert_eq!(resolved_root(&h, 7, "ses_a"), Err(BindingError::Unbound));
     }
 
     #[test]
     fn resolve_fails_loud_unbound_and_on_session_mismatch() {
         let h = McHandler::new();
         // never bound → Unbound (NEVER a default project, which would be a cross-project read)
-        assert_eq!(h.resolve_project(3, "ses_x"), Err(BindingError::Unbound));
+        assert_eq!(resolved_root(&h, 3, "ses_x"), Err(BindingError::Unbound));
 
-        h.bind_route(
-            3,
-            SessionBinding {
-                project_root: PathBuf::from("/repo/own"),
-                session: "ses_own".to_string(),
-            },
-        );
+        h.bind_route(3, binding("/repo/own", "ses_own"));
         // bound, but a request claiming a DIFFERENT session on this channel → SessionMismatch
         assert_eq!(
-            h.resolve_project(3, "ses_other"),
+            resolved_root(&h, 3, "ses_other"),
             Err(BindingError::SessionMismatch)
         );
         // the matching session still resolves
         assert_eq!(
-            h.resolve_project(3, "ses_own").unwrap(),
+            resolved_root(&h, 3, "ses_own").unwrap(),
             PathBuf::from("/repo/own")
         );
     }
@@ -444,24 +479,12 @@ mod tests {
     #[test]
     fn rebind_overwrites_stale_channel_entry() {
         let h = McHandler::new();
-        h.bind_route(
-            5,
-            SessionBinding {
-                project_root: PathBuf::from("/a"),
-                session: "s1".into(),
-            },
-        );
+        h.bind_route(5, binding("/a", "s1"));
         // a reused channel re-binds to a new session → last write wins (no stale leak)
-        h.bind_route(
-            5,
-            SessionBinding {
-                project_root: PathBuf::from("/b"),
-                session: "s2".into(),
-            },
-        );
-        assert_eq!(h.resolve_project(5, "s2").unwrap(), PathBuf::from("/b"));
+        h.bind_route(5, binding("/b", "s2"));
+        assert_eq!(resolved_root(&h, 5, "s2").unwrap(), PathBuf::from("/b"));
         assert_eq!(
-            h.resolve_project(5, "s1"),
+            resolved_root(&h, 5, "s1"),
             Err(BindingError::SessionMismatch)
         );
     }
