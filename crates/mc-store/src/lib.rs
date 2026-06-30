@@ -813,6 +813,62 @@ impl McStore {
         })?;
         Ok(rows)
     }
+
+    /// The highest memory-mutation-log id across the given project identities (the union,
+    /// or a single-element slice). The cursor a baseline re-render (HARD) folds the
+    /// corrections up to, and the watermark a delta pass (SOFT) reads new corrections
+    /// past. 0 when the log is empty. Union-scoped to match
+    /// [`Self::memory_mutations_for_render`].
+    pub fn max_memory_mutation_id(&self, project_paths: &[String]) -> Result<i64, McStoreError> {
+        if project_paths.is_empty() {
+            return Ok(0);
+        }
+        let mut projects: Vec<String> = project_paths.to_vec();
+        projects.sort_unstable();
+        projects.dedup();
+        let ph = std::iter::repeat_n("?", projects.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let max = self.inner.with_conn(|conn| {
+            let sql = format!(
+                "SELECT COALESCE(MAX(id), 0) FROM mc_memory_mutation_log
+                 WHERE project_path IN ({ph})"
+            );
+            let v: i64 =
+                conn.query_row(&sql, rusqlite::params_from_iter(projects.iter()), |r| {
+                    r.get(0)
+                })?;
+            Ok(v)
+        })?;
+        Ok(max)
+    }
+
+    /// The highest memory id across the given project identities (the union, or a
+    /// single-element slice). A baseline re-render (HARD) folds memories up to this; a
+    /// delta pass (SOFT) renders memories with `id > max_memory_id` as `<new-memories>`.
+    /// 0 when there are no memories.
+    pub fn max_memory_id(&self, project_paths: &[String]) -> Result<i64, McStoreError> {
+        if project_paths.is_empty() {
+            return Ok(0);
+        }
+        let mut projects: Vec<String> = project_paths.to_vec();
+        projects.sort_unstable();
+        projects.dedup();
+        let ph = std::iter::repeat_n("?", projects.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let max = self.inner.with_conn(|conn| {
+            let sql = format!(
+                "SELECT COALESCE(MAX(id), 0) FROM mc_memories WHERE project_path IN ({ph})"
+            );
+            let v: i64 =
+                conn.query_row(&sql, rusqlite::params_from_iter(projects.iter()), |r| {
+                    r.get(0)
+                })?;
+            Ok(v)
+        })?;
+        Ok(max)
+    }
 }
 
 /// Coalesce mutation-log rows to one per target memory: deterministic latest-wins with
@@ -1131,6 +1187,30 @@ mod tests {
             .memory_mutations_for_render(&projects, 0, &[])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn max_mutation_and_memory_ids_union_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:own";
+        let foreign = "git:foreign";
+
+        insert_memory(&store, own, 10, "a", Some(50), "active", None);
+        insert_memory(&store, foreign, 25, "b", Some(50), "active", None);
+        log_mutation(&store, own, "update", 10, "v2"); // id 1
+        log_mutation(&store, foreign, "archive", 25, ""); // id 2
+
+        // single-project sees only its own max
+        assert_eq!(store.max_memory_id(&[own.to_string()]).unwrap(), 10);
+        assert_eq!(store.max_memory_mutation_id(&[own.to_string()]).unwrap(), 1);
+        // union spans both
+        let union = vec![own.to_string(), foreign.to_string()];
+        assert_eq!(store.max_memory_id(&union).unwrap(), 25);
+        assert_eq!(store.max_memory_mutation_id(&union).unwrap(), 2);
+        // empty inputs → 0 (no panic, no all-rows scan)
+        assert_eq!(store.max_memory_id(&[]).unwrap(), 0);
+        assert_eq!(store.max_memory_mutation_id(&[]).unwrap(), 0);
     }
 
     #[test]
