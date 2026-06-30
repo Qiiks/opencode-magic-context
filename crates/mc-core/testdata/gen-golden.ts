@@ -19,6 +19,10 @@ import {
     shouldArchive,
     tier,
 } from "../../../packages/plugin/src/hooks/magic-context/decay-curve.ts";
+import {
+    type DecayRenderCompartment,
+    renderDecayedCompartments,
+} from "../../../packages/plugin/src/hooks/magic-context/decay-render.ts";
 
 const indices = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 200, 400, 1000];
 const importances = [1, 10, 25, 40, 50, 60, 75, 90, 100];
@@ -64,3 +68,72 @@ const out = join(import.meta.dir, "decay-golden.json");
 mkdirSync(dirname(out), { recursive: true });
 writeFileSync(out, `${JSON.stringify({ tier_cases: tierCases, pressure_cases: pressureCases }, null, 2)}\n`);
 console.log(`wrote ${tierCases.length} tier cases + ${pressureCases.length} pressure cases → ${out}`);
+
+// --- decay RENDERER golden (fixture for the Rust mc-module port of decay-render.ts) ---
+// All cases use a deliberately huge budget so the TS token-estimate demotion guard
+// never fires; the Rust port (which injects that guard as a no-op) then produces the
+// same output driven purely by the decay curve. Legacy/flat bodies are ASCII-only so
+// the TS UTF-16 string slice and the Rust char slice truncate identically. The cases
+// exercise: the P1..P4 paraphrase bodies across a set old enough to demote and archive
+// some rows, XML escaping in titles/bodies, the empty-P4 self-close, legacy-row
+// truncation, and the malformed-pseudo-v2 (empty p1) flat-content fallback.
+const LOOSE = 10_000_000;
+const v2 = (
+    start: number,
+    end: number,
+    title: string,
+    importance: number,
+    bodies: [string, string, string, string],
+): DecayRenderCompartment => ({
+    startMessage: start,
+    endMessage: end,
+    title,
+    content: "",
+    p1: bodies[0],
+    p2: bodies[1],
+    p3: bodies[2],
+    p4: bodies[3],
+    importance,
+    legacy: 0,
+});
+
+const renderCases: Array<{ compartments: DecayRenderCompartment[]; budget: number; body: string }> = [];
+const pushRender = (compartments: DecayRenderCompartment[], budget = LOOSE) => {
+    renderCases.push({ compartments, body: renderDecayedCompartments({ compartments, historyBudgetTokens: budget }), budget });
+};
+
+// 30 v2 compartments at mixed importance, old enough that the curve demotes the
+// oldest paraphrases and archives (omits) the lowest-importance tail
+pushRender(
+    Array.from({ length: 30 }, (_, i) =>
+        v2(i * 10 + 1, i * 10 + 9, `arc ${i}`, [10, 50, 90][i % 3], [
+            `P1 verbose body for compartment number ${i} with enough text to be distinct`,
+            `P2 dense ${i}`,
+            `P3 ${i}`,
+            i % 4 === 0 ? "" : `P4anchor${i}`,
+        ]),
+    ),
+);
+// XML escaping in title + body
+pushRender([v2(1, 2, 'a<b>&"c"', 50, ["x < y & z", "d", "e", "f"])]);
+// legacy (pre-v2 flat-content) rows: one whose content has a "U:" line, one without
+// (the renderer starts the former one tier less truncated than the latter)
+pushRender([
+    { startMessage: 1, endMessage: 5, title: "LegU", content: `U: question\n${"a".repeat(2000)}`, legacy: 1, importance: 50 },
+    { startMessage: 6, endMessage: 9, title: "LegNoU", content: "b".repeat(2000), legacy: 1, importance: 50 },
+]);
+// malformed pseudo-v2 (legacy=0 but empty p1) → flat content
+pushRender([{ startMessage: 1, endMessage: 2, title: "Pseudo", content: "flat body here", p1: "", legacy: 0, importance: 50 }]);
+// mixed v2 + legacy in one set: legacy rows are excluded from the budget-pressure
+// input so their fixed truncation cost can't demote the v2 paraphrases
+pushRender([
+    v2(1, 9, "v2a", 80, ["P1 first", "P2 first", "P3 first", "P4first"]),
+    { startMessage: 10, endMessage: 14, title: "leg", content: `U: x\n${"c".repeat(600)}`, legacy: 1, importance: 50 },
+    v2(15, 20, "v2b", 30, ["P1 second", "P2 second", "P3 second", ""]),
+]);
+
+// the render golden is consumed by the mc-module port → write it to that crate's testdata
+const renderOut = join(import.meta.dir, "../../mc-module/testdata/render-golden.json");
+mkdirSync(dirname(renderOut), { recursive: true });
+writeFileSync(renderOut, `${JSON.stringify({ cases: renderCases }, null, 2)}\n`);
+console.log(`wrote ${renderCases.length} render cases → ${renderOut}`);
