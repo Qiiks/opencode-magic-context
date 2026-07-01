@@ -173,7 +173,7 @@ pub struct ValidatedCompartment {
 }
 
 /// The side-effect-free publish plan produced by validation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatedChunk {
     pub compartments: Vec<ValidatedCompartment>,
     pub facts: Vec<FactCandidate>,

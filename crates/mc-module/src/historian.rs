@@ -13,14 +13,42 @@ use mc_store::{
     HistorianPublishResult, McStore, McStoreError, StoredCompartment,
 };
 
-/// A validated historian chunk ready for durable publication. The sibling
-/// validation module owns parsing and semantic checks; orchestration only needs
-/// the additive rows plus the first ordinal left unprocessed by this chunk.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ValidatedChunk {
-    pub compartments: Vec<StoredCompartment>,
-    pub facts: Vec<FactCandidate>,
-    pub unprocessed_from: Option<u64>,
+use crate::historian_validate::{ValidatedChunk, ValidatedCompartment};
+
+/// Project a validated compartment onto the durable store row shape. Validation
+/// resolves the message-id endpoints and tiers; publication only stamps the
+/// creation time and marks the row as v2 (non-legacy).
+fn to_stored_compartment(c: &ValidatedCompartment, created_at_ms: i64) -> StoredCompartment {
+    StoredCompartment {
+        sequence: c.sequence as i64,
+        start_message: c.start_message as i64,
+        end_message: c.end_message as i64,
+        start_message_id: c.start_message_id.clone(),
+        end_message_id: c.end_message_id.clone(),
+        title: c.title.clone(),
+        content: c.content.clone(),
+        p1: c.p1.clone(),
+        p2: c.p2.clone(),
+        p3: c.p3.clone(),
+        p4: c.p4.clone(),
+        importance: c.importance.map(|i| i as i32).unwrap_or(50),
+        episode_type: c.episode_type.clone(),
+        legacy: 0,
+        created_at: created_at_ms,
+    }
+}
+
+/// Project a validated fact candidate onto the store's promotion input. The
+/// historian promotes facts with no importance/expiry/source at publish time —
+/// classification and decay are later, cache-neutral passes.
+fn to_store_fact(f: &crate::historian_validate::FactCandidate) -> FactCandidate {
+    FactCandidate {
+        category: f.category.clone(),
+        content: f.content.clone(),
+        importance: None,
+        expires_at: None,
+        source_session_id: None,
+    }
 }
 
 /// One flat item in the pinned chunk snapshot used to guard producer output.
@@ -259,12 +287,20 @@ pub struct ValidatedPublishRequest<'a> {
     pub observed_chunk_fingerprint: &'a str,
     pub validated: &'a ValidatedChunk,
     pub publication_floor_ordinal: u64,
+    /// Creation timestamp stamped on the appended compartment rows.
+    pub created_at_ms: i64,
     pub failure_backoff_at_ms: i64,
 }
 
 /// Publish after re-checking the chunk fingerprint at the commit point. A mismatch
 /// abandons the matching firing before returning the typed error, so a future fire
 /// is not blocked by the stale producer.
+///
+/// The validation module owns the [`ValidatedChunk`] shape (message-id endpoints,
+/// tiers, discard-last healing); this boundary projects it onto the durable store
+/// rows and drives the CAS-gated publish transaction. Facts promote as additive
+/// inserts, so a publish only surfaces on the next materializing pass via the
+/// compartment/memory watermarks — it never mutates cached render state.
 pub fn publish_validated_chunk(
     store: &McStore,
     request: ValidatedPublishRequest<'_>,
@@ -282,13 +318,21 @@ pub fn publish_validated_chunk(
         });
     }
 
+    let compartments: Vec<StoredCompartment> = request
+        .validated
+        .compartments
+        .iter()
+        .map(|c| to_stored_compartment(c, request.created_at_ms))
+        .collect();
+    let facts: Vec<FactCandidate> = request.validated.facts.iter().map(to_store_fact).collect();
+
     Ok(store.publish_historian_chunk(HistorianPublishRequest {
         session_id: request.session_id,
         expected_row_version: request.expected_row_version,
         predicate: request.predicate,
         project_path: request.project_path,
-        compartments: &request.validated.compartments,
-        facts: &request.validated.facts,
+        compartments: &compartments,
+        facts: &facts,
         publication_floor_ordinal: request.publication_floor_ordinal,
     })?)
 }
@@ -475,6 +519,127 @@ mod tests {
         }
     }
 
+    /// The seam-close proof: a real historian output is parsed + validated by the
+    /// validation module, and the resulting `ValidatedChunk` drives the publish
+    /// path end to end. This is the capstone that both parallel units are correct
+    /// TOGETHER — the validator's message-id endpoints and tiers land as durable
+    /// compartment rows, and the publish stays defer-invisible.
+    #[test]
+    fn validated_output_drives_publish_end_to_end() {
+        use crate::historian_validate::{
+            validate_historian_output, ChunkLine, HistorianChunk, ValidateOptions,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // m0 already folds C1 (covers ordinal 1); ordinals 2..=4 are the chunk the
+        // historian just summarized into C2.
+        store
+            .replace_compartments("ses", &[comp(1, 1, 1, "m1", "C1 summary")])
+            .unwrap();
+
+        let text = r#"<output>
+<compartments>
+<compartment start="2" end="3" title="second arc" episode_type="feature" importance="60">
+<p1>second arc full and exact</p1>
+<p2>second arc short</p2>
+<p3>second arc</p3>
+<p4 />
+</compartment>
+</compartments>
+<meta><messages_processed>2-3</messages_processed><unprocessed_from>4</unprocessed_from></meta>
+</output>"#;
+        let chunk = HistorianChunk {
+            start_index: 2,
+            end_index: 4,
+            lines: vec![
+                ChunkLine {
+                    ordinal: 2,
+                    message_id: "m2".into(),
+                },
+                ChunkLine {
+                    ordinal: 3,
+                    message_id: "m3".into(),
+                },
+                ChunkLine {
+                    ordinal: 4,
+                    message_id: "m4".into(),
+                },
+            ],
+            tool_only_ranges: vec![],
+        };
+        let prior = [crate::historian_validate::StoredCompartmentRange {
+            start_message: 1,
+            end_message: 1,
+        }];
+        let validated = validate_historian_output(
+            text,
+            &chunk,
+            &prior,
+            ValidateOptions {
+                sequence_offset: 1,
+                in_emergency: true, // skip discard-last so the single compartment persists
+            },
+        )
+        .expect("validation succeeds");
+        assert_eq!(validated.compartments.len(), 1);
+        assert_eq!(validated.compartments[0].end_message_id, "m3");
+
+        // Drive the state machine to a publishing row and publish the validated chunk.
+        let mut meta = store.load("ses").unwrap().meta;
+        meta.historian = HistorianDurableState {
+            state: HistorianPhase::Publishing,
+            firing_seq: 1,
+            chunk_range: Some(HistorianChunkRange {
+                from_ordinal: 2,
+                to_ordinal: 4,
+            }),
+            chunk_fingerprint: "fp".into(),
+            producer_session_id: Some("ps".into()),
+            producer_run_id: Some("run-1".into()),
+            fired_at_ms: Some(1),
+            failure_backoff_at_ms: None,
+        };
+        let rv = store
+            .commit(
+                "ses",
+                store.load("ses").unwrap().row_version,
+                &store.load("ses").unwrap().core,
+                &meta,
+            )
+            .unwrap();
+        let predicate = publish_predicate(&meta.historian).unwrap();
+
+        publish_validated_chunk(
+            &store,
+            ValidatedPublishRequest {
+                session_id: "ses",
+                project_path: "git:proj",
+                expected_row_version: Some(rv),
+                predicate: &predicate,
+                observed_chunk_fingerprint: "fp",
+                validated: &validated,
+                publication_floor_ordinal: 4,
+                created_at_ms: 123,
+                failure_backoff_at_ms: 0,
+            },
+        )
+        .expect("publish succeeds");
+
+        // The validated compartment landed as a durable v2 row with the resolved
+        // end message id and tier, and the state machine returned to idle.
+        let after = store.load("ses").unwrap();
+        assert_eq!(after.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(after.meta.publication_floor_ordinal, Some(4));
+        let comps = store.load_compartments("ses").unwrap();
+        assert_eq!(comps.len(), 2, "C1 preserved, C2 appended");
+        let c2 = comps.last().unwrap();
+        assert_eq!(c2.end_message_id, "m3");
+        assert_eq!(c2.p1.as_deref(), Some("second arc full and exact"));
+        assert_eq!(c2.legacy, 0);
+        assert_eq!(c2.created_at, 123);
+    }
+
     #[test]
     fn chunk_fingerprint_uses_id_kind_and_byte_length() {
         let a = compute_chunk_fingerprint(&[
@@ -550,6 +715,7 @@ mod tests {
                 observed_chunk_fingerprint: "different-fingerprint",
                 validated: &ValidatedChunk::default(),
                 publication_floor_ordinal: 5,
+                created_at_ms: 0,
                 failure_backoff_at_ms: 999,
             },
         )
