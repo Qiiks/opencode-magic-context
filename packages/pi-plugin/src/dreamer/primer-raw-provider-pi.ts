@@ -1,6 +1,7 @@
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
 import { convertEntriesToRawMessages } from "../read-session-pi";
+import { loadDefaultPiSessionApi } from "./pi-session-api";
 
 /**
  * Pi `primerRawProviderFactory`: resolve a historical session id to a
@@ -17,8 +18,6 @@ export interface PiPrimerRawProviderDeps {
 	loadEntriesFromFile?: (filePath: string) => unknown[] | Promise<unknown[]>;
 	sessionDir?: string;
 }
-
-const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
 
 interface PiSessionInfoLike {
 	id?: unknown;
@@ -41,7 +40,7 @@ export function createPiPrimerRawProviderFactory(
 				loadEntriesFromFile: deps.loadEntriesFromFile,
 			};
 		}
-		resolved ??= loadDefaultPiSessionDeps();
+		resolved ??= loadDefaultPiSessionApi();
 		return resolved;
 	};
 
@@ -73,32 +72,5 @@ export function createPiPrimerRawProviderFactory(
 		} catch {
 			return null;
 		}
-	};
-}
-
-async function loadDefaultPiSessionDeps(): Promise<
-	Required<
-		Pick<PiPrimerRawProviderDeps, "listSessions" | "loadEntriesFromFile">
-	>
-> {
-	const mod = (await import(/* @vite-ignore */ PI_CODING_AGENT_MODULE)) as {
-		SessionManager?: {
-			listSessions?: (sessionDir?: string) => unknown[] | Promise<unknown[]>;
-		};
-		loadEntriesFromFile?: (filePath: string) => unknown[] | Promise<unknown[]>;
-	};
-	const listSessions = mod.SessionManager?.listSessions;
-	const loadEntriesFromFile = mod.loadEntriesFromFile;
-	if (
-		typeof listSessions !== "function" ||
-		typeof loadEntriesFromFile !== "function"
-	) {
-		throw new Error(
-			"Pi session APIs unavailable: expected SessionManager.listSessions and loadEntriesFromFile",
-		);
-	}
-	return {
-		listSessions: listSessions.bind(mod.SessionManager),
-		loadEntriesFromFile,
 	};
 }

@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import type {
@@ -7,6 +6,7 @@ import type {
 	RetrospectiveRawProvider,
 	RetrospectiveSinceRead,
 } from "@magic-context/core/features/magic-context/dreamer/retrospective-raw-provider";
+import { loadDefaultPiSessionApi } from "./pi-session-api";
 
 interface PiSessionInfoLike {
 	id?: unknown;
@@ -33,8 +33,6 @@ export interface PiRetrospectiveRawProviderDeps {
 	listSessions?: (sessionDir?: string) => unknown[] | Promise<unknown[]>;
 	loadEntriesFromFile?: (filePath: string) => unknown[] | Promise<unknown[]>;
 }
-
-const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
 
 export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 	private readonly sessionPathById = new Map<string, string>();
@@ -144,7 +142,7 @@ export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 				loadEntriesFromFile: this.deps.loadEntriesFromFile,
 			};
 		}
-		this.resolvedDefaultDeps ??= loadDefaultPiSessionDeps();
+		this.resolvedDefaultDeps ??= loadDefaultPiSessionApi();
 		return this.resolvedDefaultDeps;
 	}
 }
@@ -183,38 +181,4 @@ function extractPiTextContent(content: unknown): string {
 				: [];
 		})
 		.join("\n");
-}
-
-async function loadDefaultPiSessionDeps(): Promise<
-	Required<
-		Pick<PiRetrospectiveRawProviderDeps, "listSessions" | "loadEntriesFromFile">
-	>
-> {
-	const mod = (await import(/* @vite-ignore */ PI_CODING_AGENT_MODULE)) as {
-		SessionManager?: {
-			listAll?: (sessionDir?: string) => unknown[] | Promise<unknown[]>;
-		};
-		loadEntriesFromFile?: (filePath: string) => unknown[] | Promise<unknown[]>;
-		parseSessionEntries?: (content: string) => unknown[];
-	};
-	const listSessions = mod.SessionManager?.listAll;
-	if (typeof listSessions !== "function") {
-		throw new Error(
-			"Pi session APIs unavailable: expected SessionManager.listAll on pi-coding-agent",
-		);
-	}
-	// loadEntriesFromFile is NOT part of pi-coding-agent's public API —
-	// fall back to readFileSync + parseSessionEntries (both exported).
-	const loadEntriesFromFile: (
-		filePath: string,
-	) => unknown[] | Promise<unknown[]> =
-		mod.loadEntriesFromFile ??
-		((filePath: string) => {
-			const content = readFileSync(filePath, "utf8");
-			return mod.parseSessionEntries?.(content) ?? [];
-		});
-	return {
-		listSessions: listSessions.bind(mod.SessionManager),
-		loadEntriesFromFile,
-	};
 }
