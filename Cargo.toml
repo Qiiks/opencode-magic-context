@@ -4,7 +4,7 @@
 # context); the dashboard's Tauri crate is its own standalone build, excluded here.
 [workspace]
 resolver = "2"
-members = ["crates/mc-core", "crates/mc-store", "crates/mc-module"]
+members = ["crates/mc-core", "crates/mc-store", "crates/mc-module", "crates/mc-tokenizer"]
 exclude = ["packages/dashboard/src-tauri"]
 
 [workspace.dependencies]
