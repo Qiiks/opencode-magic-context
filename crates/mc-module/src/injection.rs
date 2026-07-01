@@ -2,4 +2,572 @@
 //! the deterministic `mc_synthetic_todo_<hash>` call id, the byte-exact injected
 //! pair, and the bust-only freeze / defer-replay transition.
 //!
-//! Stub: implementation lands with the Wave 2 injection unit.
+//! The functions in this module are deliberately pure. The caller supplies the
+//! newest observed todo state and the currently frozen synthetic unit; this module
+//! returns the next state transition without reading stores, clocks, or the live
+//! conversation history.
+
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+const SYNTHETIC_CALL_ID_PREFIX: &str = "mc_synthetic_todo_";
+const TODO_TOOL_NAME: &str = "todowrite";
+const DEFAULT_PRIORITY: &str = "medium";
+const COMPLETED_STATUS: &str = "completed";
+const TERMINAL_STATUSES: &[&str] = &["completed", "cancelled"];
+const TITLE_DONE_STATUSES: &[&str] = &["completed"];
+const SYNTHETIC_TIMESTAMP: i64 = 0;
+const SYNTHETIC_MARKER: bool = true;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TodoItem {
+    content: String,
+    status: String,
+    priority: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TodoInput {
+    todos: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TodoMetadata {
+    todos: Vec<TodoItem>,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SyntheticTime {
+    start: i64,
+    end: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SyntheticState {
+    status: &'static str,
+    input: TodoInput,
+    output: String,
+    title: String,
+    metadata: TodoMetadata,
+    time: SyntheticTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SyntheticPartWire {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(rename = "callID")]
+    call_id: String,
+    tool: &'static str,
+    state: SyntheticState,
+    #[serde(rename = "syntheticTodoMarker")]
+    synthetic_todo_marker: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SyntheticInvocationWire {
+    #[serde(rename = "callID")]
+    call_id: String,
+    tool: &'static str,
+    input: TodoInput,
+    #[serde(rename = "syntheticTodoMarker")]
+    synthetic_todo_marker: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SyntheticResultWire {
+    #[serde(rename = "callID")]
+    call_id: String,
+    tool: &'static str,
+    state: SyntheticState,
+    #[serde(rename = "syntheticTodoMarker")]
+    synthetic_todo_marker: bool,
+}
+
+/// The byte-complete synthetic todowrite unit produced from one normalized todo state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticTodo {
+    /// Shared synthetic tool-call id used by both halves of the injected pair.
+    pub call_id: String,
+    /// Canonical todo-state JSON that was hashed to produce [`Self::call_id`].
+    pub state_json: String,
+    /// Canonical invocation bytes: the `todowrite` tool name plus `{ todos }` input.
+    pub invocation_json: String,
+    /// Canonical result bytes: the completed todowrite result state and metadata.
+    pub result_json: String,
+    /// Canonical OpenCode combined tool-part bytes: a single part that merges the tool call and its result.
+    pub part_json: String,
+}
+
+/// A previously built synthetic todo unit that callers replay verbatim while it remains current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenInjection {
+    /// Shared synthetic tool-call id; this is the hash key for change detection.
+    pub call_id: String,
+    /// Frozen invocation bytes. Defer-mode callers replay these bytes without rebuilding them.
+    pub invocation_json: String,
+    /// Frozen result bytes. Defer-mode callers replay these bytes without rebuilding them.
+    pub result_json: String,
+    /// Frozen OpenCode combined tool-part bytes for renderers that emit a merged call-and-result part.
+    pub part_json: String,
+}
+
+impl From<SyntheticTodo> for FrozenInjection {
+    fn from(value: SyntheticTodo) -> Self {
+        Self {
+            call_id: value.call_id,
+            invocation_json: value.invocation_json,
+            result_json: value.result_json,
+            part_json: value.part_json,
+        }
+    }
+}
+
+impl From<&SyntheticTodo> for FrozenInjection {
+    fn from(value: &SyntheticTodo) -> Self {
+        Self {
+            call_id: value.call_id.clone(),
+            invocation_json: value.invocation_json.clone(),
+            result_json: value.result_json.clone(),
+            part_json: value.part_json.clone(),
+        }
+    }
+}
+
+/// The pure state transition for synthetic-todo frozen state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InjectionOutcome {
+    /// Keep replaying the currently frozen unit byte-for-byte.
+    Keep,
+    /// Freeze this newly built unit and replay its bytes from now on.
+    Replace(SyntheticTodo),
+    /// Remove the currently frozen unit because the current todo state no longer produces synthetic bytes.
+    Clear,
+    /// No valid state exists, or no frozen unit exists for a no-op transition.
+    None,
+}
+
+/// Normalize raw `todowrite` todos JSON into the stable state string used for hashing.
+///
+/// The accepted input is a JSON array. Each item must be an object with string
+/// `content` and `status`; `priority` is optional and defaults to `"medium"`.
+/// Extra fields are stripped, and the output field order is always
+/// `content`, `status`, then `priority`. If any item is malformed, the whole
+/// state is rejected.
+pub fn normalize_todo_state_json(todos_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(todos_json).ok()?;
+    let todos = value.as_array()?;
+    let mut normalized = Vec::with_capacity(todos.len());
+    for todo in todos {
+        normalized.push(read_todo_item(todo)?);
+    }
+    serde_json::to_string(&normalized).ok()
+}
+
+/// Compute the deterministic `mc_synthetic_todo_<sha256[:16]>` call id.
+pub fn synthetic_call_id(state_json: &str) -> String {
+    let digest = Sha256::digest(state_json.as_bytes());
+    let hex = format!("{digest:x}");
+    format!("{}{}", SYNTHETIC_CALL_ID_PREFIX, &hex[..16])
+}
+
+/// Build the byte-complete synthetic todowrite pair for a normalized state JSON.
+///
+/// Returns [`None`] when the state is invalid, empty, or every todo is terminal
+/// (`completed` or `cancelled`). Completed todos are excluded from the title's
+/// active count, while cancelled todos are still counted there, matching the
+/// real todowrite result title.
+pub fn build_synthetic_todo_pair(state_json: &str) -> Option<SyntheticTodo> {
+    let todos = parse_todo_state(state_json)?;
+    if todos.is_empty() || todos.iter().all(|todo| is_terminal_status(&todo.status)) {
+        return None;
+    }
+
+    let call_id = synthetic_call_id(state_json);
+    let active_count = todos
+        .iter()
+        .filter(|todo| !is_title_done_status(&todo.status))
+        .count();
+    let output = serde_json::to_string_pretty(&todos).ok()?;
+    let title = format!("{active_count} todos");
+    let state = synthetic_state(todos.clone(), output, title);
+
+    let invocation = SyntheticInvocationWire {
+        call_id: call_id.clone(),
+        tool: TODO_TOOL_NAME,
+        input: TodoInput {
+            todos: todos.clone(),
+        },
+        synthetic_todo_marker: SYNTHETIC_MARKER,
+    };
+    let result = SyntheticResultWire {
+        call_id: call_id.clone(),
+        tool: TODO_TOOL_NAME,
+        state: state.clone(),
+        synthetic_todo_marker: SYNTHETIC_MARKER,
+    };
+    let part = SyntheticPartWire {
+        kind: "tool",
+        call_id: call_id.clone(),
+        tool: TODO_TOOL_NAME,
+        state,
+        synthetic_todo_marker: SYNTHETIC_MARKER,
+    };
+
+    Some(SyntheticTodo {
+        call_id,
+        state_json: state_json.to_string(),
+        invocation_json: serde_json::to_string(&invocation).ok()?,
+        result_json: serde_json::to_string(&result).ok()?,
+        part_json: serde_json::to_string(&part).ok()?,
+    })
+}
+
+/// Return true when an id belongs to the synthetic-todowrite namespace.
+pub fn is_synthetic_todo_id(id: &str) -> bool {
+    id.starts_with(SYNTHETIC_CALL_ID_PREFIX)
+}
+
+/// Advance the frozen synthetic-todo unit for one pass without mutating storage.
+///
+/// Bust passes may replace or clear the frozen unit. Defer passes never build
+/// from the current state and never clear: if a unit is already frozen they
+/// return [`InjectionOutcome::Keep`], otherwise there is no unit to replay.
+pub fn advance_injection(
+    persisted_state_json: Option<&str>,
+    frozen: Option<&FrozenInjection>,
+    is_bust_pass: bool,
+) -> InjectionOutcome {
+    if !is_bust_pass {
+        return if frozen.is_some() {
+            InjectionOutcome::Keep
+        } else {
+            InjectionOutcome::None
+        };
+    }
+
+    let Some(state_json) = persisted_state_json else {
+        return InjectionOutcome::None;
+    };
+    let Some(normalized) = normalize_todo_state_json(state_json) else {
+        return InjectionOutcome::None;
+    };
+    let Some(next) = build_synthetic_todo_pair(&normalized) else {
+        return if frozen.is_some() {
+            InjectionOutcome::Clear
+        } else {
+            InjectionOutcome::None
+        };
+    };
+
+    if frozen
+        .map(|unit| unit.call_id.as_str() == next.call_id.as_str())
+        .unwrap_or(false)
+    {
+        InjectionOutcome::Keep
+    } else {
+        InjectionOutcome::Replace(next)
+    }
+}
+
+fn synthetic_state(todos: Vec<TodoItem>, output: String, title: String) -> SyntheticState {
+    SyntheticState {
+        status: COMPLETED_STATUS,
+        input: TodoInput {
+            todos: todos.clone(),
+        },
+        output,
+        title,
+        metadata: TodoMetadata {
+            todos,
+            truncated: false,
+        },
+        time: SyntheticTime {
+            start: SYNTHETIC_TIMESTAMP,
+            end: SYNTHETIC_TIMESTAMP,
+        },
+    }
+}
+
+fn parse_todo_state(state_json: &str) -> Option<Vec<TodoItem>> {
+    if state_json.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(state_json).ok()?;
+    let items = value.as_array()?;
+    let mut todos = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(todo) = read_todo_item(item) {
+            todos.push(todo);
+        }
+    }
+    Some(todos)
+}
+
+fn read_todo_item(value: &serde_json::Value) -> Option<TodoItem> {
+    let obj = value.as_object()?;
+    let content = obj.get("content")?.as_str()?.to_string();
+    let status = obj.get("status")?.as_str()?.to_string();
+    let priority = match obj.get("priority") {
+        None => DEFAULT_PRIORITY.to_string(),
+        Some(serde_json::Value::String(priority)) => priority.clone(),
+        Some(_) => return None,
+    };
+    Some(TodoItem {
+        content,
+        status,
+        priority,
+    })
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    TERMINAL_STATUSES.contains(&status)
+}
+
+fn is_title_done_status(status: &str) -> bool {
+    TITLE_DONE_STATUSES.contains(&status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenFile {
+        constants: GoldenConstants,
+        cases: Vec<GoldenCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenConstants {
+        synthetic_call_id_prefix: String,
+        terminal_statuses: Vec<String>,
+        title_done_statuses: Vec<String>,
+        default_priority: String,
+        tool_name: String,
+        completed_status: String,
+        synthetic_timestamp: i64,
+        synthetic_marker: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenCase {
+        label: String,
+        input_json: String,
+        normalized: Option<String>,
+        call_id: Option<String>,
+        invocation_json: Option<String>,
+        result_json: Option<String>,
+        part_json: Option<String>,
+    }
+
+    fn load_golden() -> GoldenFile {
+        let raw = include_str!("../testdata/injection-golden.json");
+        serde_json::from_str(raw).expect("parse injection-golden.json")
+    }
+
+    fn active_state(label: &str) -> String {
+        normalize_todo_state_json(&format!(
+            r#"[{{"content":"{label}","status":"in_progress","priority":"high"}}]"#
+        ))
+        .expect("active state normalizes")
+    }
+
+    fn terminal_state() -> String {
+        normalize_todo_state_json(
+            r#"[
+                {"content":"Done","status":"completed","priority":"high"},
+                {"content":"Cancelled","status":"cancelled","priority":"low"}
+            ]"#,
+        )
+        .expect("terminal state normalizes")
+    }
+
+    fn frozen_for(state_json: &str) -> FrozenInjection {
+        FrozenInjection::from(
+            build_synthetic_todo_pair(state_json).expect("state builds synthetic todo"),
+        )
+    }
+
+    #[test]
+    fn constants_match_ts_golden() {
+        let constants = load_golden().constants;
+        assert_eq!(constants.synthetic_call_id_prefix, SYNTHETIC_CALL_ID_PREFIX);
+        assert_eq!(constants.terminal_statuses, TERMINAL_STATUSES);
+        assert_eq!(constants.title_done_statuses, TITLE_DONE_STATUSES);
+        assert_eq!(constants.default_priority, DEFAULT_PRIORITY);
+        assert_eq!(constants.tool_name, TODO_TOOL_NAME);
+        assert_eq!(constants.completed_status, COMPLETED_STATUS);
+        assert_eq!(constants.synthetic_timestamp, SYNTHETIC_TIMESTAMP);
+        assert_eq!(constants.synthetic_marker, SYNTHETIC_MARKER);
+    }
+
+    #[test]
+    fn injection_golden_matches_ts_todo_view() {
+        let golden = load_golden();
+        assert!(!golden.cases.is_empty(), "empty injection golden");
+
+        for case in golden.cases {
+            let normalized = normalize_todo_state_json(&case.input_json);
+            assert_eq!(normalized, case.normalized, "normalize: {}", case.label);
+
+            if let Some(state_json) = normalized {
+                assert_eq!(
+                    Some(synthetic_call_id(&state_json)),
+                    case.call_id,
+                    "call id: {}",
+                    case.label
+                );
+                let part = build_synthetic_todo_pair(&state_json);
+                assert_eq!(
+                    part.as_ref().map(|p| p.invocation_json.as_str()),
+                    case.invocation_json.as_deref(),
+                    "invocation bytes: {}",
+                    case.label
+                );
+                assert_eq!(
+                    part.as_ref().map(|p| p.result_json.as_str()),
+                    case.result_json.as_deref(),
+                    "result bytes: {}",
+                    case.label
+                );
+                assert_eq!(
+                    part.as_ref().map(|p| p.part_json.as_str()),
+                    case.part_json.as_deref(),
+                    "part bytes: {}",
+                    case.label
+                );
+            } else {
+                assert_eq!(case.call_id, None, "invalid state call id: {}", case.label);
+                assert_eq!(
+                    case.invocation_json, None,
+                    "invalid invocation: {}",
+                    case.label
+                );
+                assert_eq!(case.result_json, None, "invalid result: {}", case.label);
+                assert_eq!(case.part_json, None, "invalid part: {}", case.label);
+            }
+        }
+    }
+
+    #[test]
+    fn defer_never_replaces_but_bust_does() {
+        let old_state = active_state("old");
+        let new_state = active_state("new");
+        let frozen = frozen_for(&old_state);
+
+        assert_eq!(
+            advance_injection(Some(&new_state), Some(&frozen), false),
+            InjectionOutcome::Keep
+        );
+        assert!(matches!(
+            advance_injection(Some(&new_state), Some(&frozen), true),
+            InjectionOutcome::Replace(todo) if todo.call_id == synthetic_call_id(&new_state)
+        ));
+    }
+
+    #[test]
+    fn defer_never_clears_but_bust_does() {
+        let frozen = frozen_for(&active_state("active"));
+        let terminal = terminal_state();
+
+        assert_eq!(
+            advance_injection(Some(&terminal), Some(&frozen), false),
+            InjectionOutcome::Keep
+        );
+        assert_eq!(
+            advance_injection(Some(&terminal), Some(&frozen), true),
+            InjectionOutcome::Clear
+        );
+    }
+
+    #[test]
+    fn same_state_bust_is_idempotent() {
+        let state = active_state("same");
+        let frozen = frozen_for(&state);
+
+        assert_eq!(
+            advance_injection(Some(&state), Some(&frozen), true),
+            InjectionOutcome::Keep
+        );
+    }
+
+    #[test]
+    fn empty_and_all_terminal_bust_clear_only_when_frozen() {
+        let frozen = frozen_for(&active_state("active"));
+        let empty = "[]";
+        let terminal = terminal_state();
+
+        assert_eq!(
+            advance_injection(Some(empty), Some(&frozen), true),
+            InjectionOutcome::Clear
+        );
+        assert_eq!(
+            advance_injection(Some(empty), None, true),
+            InjectionOutcome::None
+        );
+        assert_eq!(
+            advance_injection(Some(&terminal), Some(&frozen), true),
+            InjectionOutcome::Clear
+        );
+        assert_eq!(
+            advance_injection(Some(&terminal), None, true),
+            InjectionOutcome::None
+        );
+    }
+
+    #[test]
+    fn none_state_does_not_first_apply_until_next_bust() {
+        let state = active_state("appears later");
+
+        assert_eq!(advance_injection(None, None, true), InjectionOutcome::None);
+        assert_eq!(
+            advance_injection(Some(&state), None, false),
+            InjectionOutcome::None
+        );
+        assert!(matches!(
+            advance_injection(Some(&state), None, true),
+            InjectionOutcome::Replace(todo) if todo.call_id == synthetic_call_id(&state)
+        ));
+    }
+
+    #[test]
+    fn transition_is_deterministic() {
+        let old_state = active_state("old deterministic");
+        let new_state = active_state("new deterministic");
+        let frozen = frozen_for(&old_state);
+
+        let first = advance_injection(Some(&new_state), Some(&frozen), true);
+        let second = advance_injection(Some(&new_state), Some(&frozen), true);
+        assert_eq!(first, second);
+
+        let InjectionOutcome::Replace(todo) = first else {
+            panic!("expected replacement");
+        };
+        let rebuilt = build_synthetic_todo_pair(&new_state).expect("new state builds");
+        assert_eq!(todo, rebuilt);
+    }
+
+    #[test]
+    fn key_order_scrambling_keeps_call_id_stable() {
+        let a = normalize_todo_state_json(
+            r#"[{"content":"Scrambled","status":"pending","priority":"low","id":"drop-me"}]"#,
+        )
+        .expect("first shape normalizes");
+        let b = normalize_todo_state_json(
+            r#"[{"id":"drop-me","priority":"low","status":"pending","content":"Scrambled"}]"#,
+        )
+        .expect("second shape normalizes");
+
+        assert_eq!(a, b);
+        assert_eq!(synthetic_call_id(&a), synthetic_call_id(&b));
+    }
+
+    #[test]
+    fn synthetic_id_detection_is_prefix_only() {
+        assert!(is_synthetic_todo_id("mc_synthetic_todo_0123456789abcdef"));
+        assert!(!is_synthetic_todo_id("toolu_0123456789abcdef"));
+    }
+}
