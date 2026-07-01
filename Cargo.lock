@@ -399,6 +399,7 @@ dependencies = [
  "cortexkit-store-types",
  "mc-core",
  "mc-store",
+ "mc-tokenizer",
  "serde",
  "serde_json",
  "sha2",

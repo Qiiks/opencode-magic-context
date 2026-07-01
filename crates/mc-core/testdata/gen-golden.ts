@@ -143,6 +143,70 @@ mkdirSync(dirname(renderOut), { recursive: true });
 writeFileSync(renderOut, `${JSON.stringify({ cases: renderCases }, null, 2)}\n`);
 console.log(`wrote ${renderCases.length} render cases → ${renderOut}`);
 
+// --- TIGHT-budget render golden: the cases where the token-estimate budget GUARD FIRES ---
+// The loose-budget golden above validates the pure curve; this set validates the guard
+// demotion loop end-to-end. The bodies are produced by the SAME TS renderDecayedCompartments
+// with the REAL estimateTokens (Claude BPE), at budgets tight enough to overshoot the
+// curve's tier selection and force oldest-first demotion. The Rust mc-module test runs the
+// SAME cases with the REAL mc_tokenizer::estimate_tokens — so both sides measure with a
+// bit-identical tokenizer (proven by the mc-tokenizer differential golden) and MUST agree.
+// v2-only (whole-tier selection, no legacy char-slicing) so the only cross-language input
+// is the token count. UTF-8 content (CJK/code) is included on purpose: a char/N proxy would
+// mis-demote it, which is exactly the drift the real estimator prevents.
+const tightBody = (compartments: DecayRenderCompartment[], budget: number) =>
+    renderDecayedCompartments({ compartments, historyBudgetTokens: budget });
+
+const bigP1 = (i: number) =>
+    `P1 verbose narrative for compartment ${i}: ` +
+    `the historian condensed a long arc of work here with enough distinct prose that the ` +
+    `first-tier paraphrase carries real token weight — file paths like src/hooks/magic-context/` +
+    `transform.ts, decisions, and follow-ups, repeated across ${i} to make each body sizeable.`;
+
+const tightPool = (n: number): DecayRenderCompartment[] =>
+    Array.from({ length: n }, (_, i) =>
+        v2(i * 10 + 1, i * 10 + 9, `arc ${i}`, [30, 55, 85][i % 3], [
+            bigP1(i),
+            `P2 dense summary for ${i} with moderate length keeping some detail`,
+            `P3 terse ${i}`,
+            i % 3 === 0 ? "" : `P4anchor${i}`,
+        ]),
+    );
+
+const cjkPool = (n: number): DecayRenderCompartment[] =>
+    Array.from({ length: n }, (_, i) =>
+        v2(i * 10 + 1, i * 10 + 9, `弧 ${i}`, [40, 60, 80][i % 3], [
+            `P1 详细叙述 compartment ${i}：历史学家在这里压缩了一段很长的工作，包含足够独特的文字，` +
+                `路径如 src/hooks/magic-context/transform.ts，决策与后续，重复 ${i} 次以增加体量。`,
+            `P2 密集摘要 ${i} 保留部分细节`,
+            `P3 简短 ${i}`,
+            `P4锚点${i}`,
+        ]),
+    );
+
+const tightRenderCases: Array<{
+    compartments: DecayRenderCompartment[];
+    budget: number;
+    body: string;
+}> = [];
+const pushTight = (compartments: DecayRenderCompartment[], budget: number) =>
+    tightRenderCases.push({ compartments, budget, body: tightBody(compartments, budget) });
+
+// A pool that fits loosely but overshoots progressively tighter budgets → forces 1, then
+// several, then near-total demotion. Each budget exercises a different depth of the guard.
+pushTight(tightPool(20), 1500);
+pushTight(tightPool(20), 800);
+pushTight(tightPool(20), 300);
+pushTight(tightPool(12), 120);
+// a budget so tight even all-P4 overshoots → guard runs to its cap, best-effort floor
+pushTight(tightPool(12), 20);
+// UTF-8/CJK pool: the char/N-proxy drift case the real estimator fixes
+pushTight(cjkPool(15), 600);
+pushTight(cjkPool(15), 150);
+
+const tightOut = join(import.meta.dir, "../../mc-module/testdata/render-tight-golden.json");
+writeFileSync(tightOut, `${JSON.stringify({ cases: tightRenderCases }, null, 2)}\n`);
+console.log(`wrote ${tightRenderCases.length} tight-budget render cases → ${tightOut}`);
+
 // --- project-docs golden (canonical hash + rendered <project-docs> block) ---
 // Each case writes the given files into a temp dir, runs the TS reference
 // implementation, and records the rendered block + canonical hash. Symlink/oversize

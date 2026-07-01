@@ -209,26 +209,39 @@ impl From<crate::m1_compose::M1ComposeError> for TransformError {
     }
 }
 
-/// The token estimator threaded into the decay renderer. A no-op (returns 0) until the
-/// real BPE estimator lands; under a loose budget the m0 render is estimator-independent,
-/// so this keeps the compose pure + deterministic in the interim.
-fn no_estimate(_: &str) -> usize {
-    0
-}
-
 /// Apply one transform pass, retrying the whole load→classify→step→commit cycle on a
 /// CAS conflict (re-classification depends on the freshly-loaded state). `ctx` is the
 /// resolved project producer context (m0/m1 are composed from its store reads);
 /// `deciders` now carries ONLY the tail reductions (the m0/m1 content is store-produced).
+///
+/// The real Claude token estimator ([`mc_tokenizer::estimate_tokens`]) is injected into
+/// the m0 compose (the decay renderer's budget guard). It is reached ONLY on the
+/// Hard/MigrateHard arm — never SOFT, defer, m1 compose, or the tail splice — so it can
+/// only change bytes during an intentional HARD rematerialization; determinism (the same
+/// text always counts identically, via the vendored+pinned vocab) is what preserves
+/// byte-identical replay between HARDs.
 pub fn transform(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     deciders: &DeciderInputs,
 ) -> Result<TransformResponse, TransformError> {
+    apply_once_with_estimator(store, req, ctx, deciders, mc_tokenizer::estimate_tokens)
+}
+
+/// The retry wrapper around [`apply_once`], parameterized by the token estimator so tests
+/// can inject a panicking/counting one to prove the estimator is HARD-only (never called
+/// on SOFT/defer). Production always passes [`mc_tokenizer::estimate_tokens`].
+fn apply_once_with_estimator(
+    store: &McStore,
+    req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
+    deciders: &DeciderInputs,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<TransformResponse, TransformError> {
     let mut attempt = 0;
     loop {
-        match apply_once(store, req, ctx, deciders) {
+        match apply_once(store, req, ctx, deciders, estimate_tokens) {
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
                 if attempt < MAX_CAS_RETRIES =>
             {
@@ -245,6 +258,7 @@ fn apply_once(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     deciders: &DeciderInputs,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<TransformResponse, TransformError> {
     // --- ingress: strip synthetic, reserve mc_*, validate ordinals (over live source) ---
     let live: Vec<&CkItemWire> = req.items.iter().filter(|i| !i.synthetic()).collect();
@@ -333,7 +347,7 @@ fn apply_once(
                     now_ms: ctx.now_ms,
                     history_budget_tokens: ctx.history_budget_tokens,
                 },
-                no_estimate,
+                estimate_tokens,
             )?;
 
             // Leading-gap guard (symmetric with the interior contiguity gap that
@@ -1814,5 +1828,91 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.action, "SOFT+", "m0+m1+red is a valid shape");
+    }
+
+    #[test]
+    fn token_estimator_is_hard_only_never_called_on_soft_or_defer() {
+        // The load-bearing cache claim behind wiring the real BPE estimator: it is
+        // reachable ONLY on the HARD m0 compose (the decay budget guard), never on a
+        // SOFT (m1 composes at fixed tier 1) or a defer (frozen replay). If it were
+        // ever called on a non-HARD pass, activating a real (non-zero) estimator could
+        // change bytes on a pass that must replay byte-identically. Prove it with a
+        // call-counting estimator: the counter must be >0 after a HARD and EXACTLY 0
+        // after a SOFT and a defer.
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let calls = Cell::new(0usize);
+        let counting = |text: &str| -> usize {
+            calls.set(calls.get() + 1);
+            mc_tokenizer::estimate_tokens(text)
+        };
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+
+        // HARD bootstrap: m0 folds C1, so compose_m0_from_store runs the decay renderer
+        // whose budget guard evaluates the estimator at least once (non-empty pool).
+        s.replace_compartments("ses", &[comp(1, 1, 10, "m10", "S1")])
+            .unwrap();
+        let boot = apply_once_with_estimator(
+            &s,
+            &req(
+                "ses",
+                "cfg0",
+                vec![item("m10", 10, "raw"), item("t11", 11, "tail")],
+            ),
+            &ctx,
+            &spine(),
+            counting,
+        )
+        .unwrap();
+        assert_eq!(boot.action, "HARD");
+        assert!(
+            calls.get() > 0,
+            "the HARD m0 compose must exercise the estimator (budget guard)"
+        );
+
+        // SOFT: a second compartment rides m1 at fixed tier 1 (no decay budget guard).
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 20, "m20", "S2")],
+        )
+        .unwrap();
+        calls.set(0);
+        let soft_items = vec![
+            item("m10", 10, "raw"),
+            item("m20", 20, "raw2"),
+            item("t21", 21, "tail"),
+        ];
+        let soft = apply_once_with_estimator(
+            &s,
+            &req("ses", "cfg0", soft_items.clone()),
+            &ctx,
+            &spine(),
+            counting,
+        )
+        .unwrap();
+        assert_eq!(soft.action, "SOFT");
+        assert_eq!(
+            calls.get(),
+            0,
+            "a SOFT composes m1 without the m0 decay budget guard → estimator must NOT be called"
+        );
+
+        // defer: replays frozen m0/m1, composes nothing.
+        calls.set(0);
+        let defer = apply_once_with_estimator(
+            &s,
+            &req("ses", "cfg0", soft_items),
+            &ctx,
+            &spine(),
+            counting,
+        )
+        .unwrap();
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(
+            calls.get(),
+            0,
+            "a defer replays frozen m0/m1 → estimator must NOT be called"
+        );
     }
 }

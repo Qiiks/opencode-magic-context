@@ -549,4 +549,59 @@ mod tests {
             assert_eq!(got, case.body, "render mismatch in case {n}");
         }
     }
+
+    #[test]
+    fn render_tight_golden_matches_reference_with_real_estimator() {
+        // The budget GUARD path: these cases use budgets tight enough that the TS
+        // renderDecayedCompartments demoted compartments oldest-first (via the REAL
+        // Claude estimateTokens). Here we run the SAME cases with the REAL
+        // mc_tokenizer::estimate_tokens. Because the tokenizer is bit-identical to
+        // ai-tokenizer (proven by mc-tokenizer's differential golden) AND the demotion
+        // loops are structurally identical, the Rust guard must reach the same tiers and
+        // emit byte-identical bodies — including the CJK cases where a char/N proxy would
+        // mis-demote. This is the end-to-end proof that activating the estimator is
+        // faithful, not just that the tokenizer counts match in isolation.
+        let raw = include_str!("../testdata/render-tight-golden.json");
+        let golden: RenderGolden = serde_json::from_str(raw).expect("parse render-tight-golden");
+        assert!(!golden.cases.is_empty(), "empty tight render golden");
+
+        let mut fired = 0;
+        for (n, case) in golden.cases.iter().enumerate() {
+            let comps: Vec<DecayRenderCompartment> = case
+                .compartments
+                .iter()
+                .map(|r| DecayRenderCompartment {
+                    start_message: r.start,
+                    end_message: r.end,
+                    title: r.title.clone(),
+                    content: r.content.clone(),
+                    p1: r.p1.clone(),
+                    p2: r.p2.clone(),
+                    p3: r.p3.clone(),
+                    p4: r.p4.clone(),
+                    importance: r.importance,
+                    legacy: r.legacy,
+                })
+                .collect();
+            // The real estimator drives the guard, exactly as production's HARD arm does.
+            let got =
+                render_decayed_compartments(&comps, case.budget, mc_tokenizer::estimate_tokens);
+            assert_eq!(
+                got, case.body,
+                "tight render mismatch in case {n} (budget {})",
+                case.budget
+            );
+            // Confirm this case actually exercised the guard (the real estimator agrees the
+            // body fits): either it demoted to fit, or it hit the floor (empty). A case
+            // whose curve output already fit the tight budget wouldn't prove the guard.
+            if mc_tokenizer::estimate_tokens(&got) as f64 <= case.budget || got.is_empty() {
+                fired += 1;
+            }
+        }
+        assert_eq!(
+            fired,
+            golden.cases.len(),
+            "every tight case must end within budget (or at the floor) under the real estimator"
+        );
+    }
 }
