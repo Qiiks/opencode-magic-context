@@ -2,5 +2,1178 @@
 //! idle-TTL fire, the mid-turn deferred-execute transition, the emergency-drain
 //! latch, and provider context-overflow detection. Pure state-transition
 //! functions; durable state enters as parameters and exits in return values.
-//!
-//! Stub: implementation lands with the Wave 2 scheduler unit.
+
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+use regex::{Regex, RegexBuilder};
+use serde::{Deserialize, Serialize};
+
+use crate::selection::PassClass;
+
+/// Default execute threshold percentage used when config has no usable value.
+pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
+/// Maximum execute threshold percentage; higher values leave too little headroom.
+pub const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 80.0;
+/// Context-usage percentage that forces materialization and bypasses mid-turn deferral.
+pub const FORCE_MATERIALIZE_PERCENTAGE: f64 = 85.0;
+/// Context-usage percentage that enters the block-and-drain emergency band.
+pub const EMERGENCY_PERCENTAGE: f64 = 95.0;
+/// Default cache idle TTL used when the configured TTL string is invalid.
+pub const DEFAULT_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+/// Usage percentage at or above which the emergency drain latch arms.
+pub const EMERGENCY_DRAIN_ENTER_PERCENTAGE: f64 = 95.0;
+/// Percentage points below the execute threshold required to clear the latch.
+pub const EMERGENCY_DRAIN_EXIT_MARGIN: f64 = 10.0;
+/// Exit percentage used when the execute threshold is missing or unusable.
+pub const EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE: f64 = 55.0;
+/// Duration after a drain failure during which latch bypass is suppressed.
+pub const EMERGENCY_DRAIN_FAILURE_BACKOFF_MS: u64 = 60_000;
+/// Maximum duration the emergency drain latch can remain active without re-entry.
+pub const EMERGENCY_DRAIN_MAX_LATCH_MS: u64 = 30 * 60 * 1000;
+/// Smallest provider-reported context limit accepted as plausible.
+pub const MIN_PLAUSIBLE_CONTEXT_LIMIT: u64 = 1024;
+/// Largest provider-reported context limit accepted as plausible.
+pub const MAX_PLAUSIBLE_CONTEXT_LIMIT: u64 = 10_000_000;
+
+const OVERFLOW_PATTERN_SOURCES: &[&str] = &[
+    r"prompt is too long",
+    r"input is too long for requested model",
+    r"exceeds the context window",
+    r"input token count.*exceeds the maximum",
+    r"maximum prompt length is \d+",
+    r"reduce the length of the messages",
+    r"maximum context length is \d+ tokens",
+    r"exceeds the limit of \d+",
+    r"exceeds the available context size",
+    r"greater than the context length",
+    r"context window exceeds limit",
+    r"exceeded model token limit",
+    r"context[_ ]length[_ ]exceeded",
+    r"request entity too large",
+    r"context length is only \d+ tokens",
+    r"input length.*exceeds.*context length",
+    r"prompt too long; exceeded (?:max )?context length",
+    r"too large for model with \d+ maximum context length",
+    r"model_context_window_exceeded",
+    r"context size has been exceeded",
+];
+
+const LIMIT_EXTRACTION_PATTERN_SOURCES: &[&str] = &[
+    r"maximum prompt length is (\d+)",
+    r"maximum context length is (\d+) tokens?",
+    r"context length is only (\d+) tokens?",
+    r"exceeds the limit of (\d+)",
+    r"too large for model with (\d+) maximum context length",
+    r"context size.*(\d+) tokens?",
+    r"exceeds? the context length of (\d+)",
+    r">\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b",
+    r"max(?:imum)?.*context.*?(\d+)",
+];
+
+/// A parse error for cache idle TTL strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheTtlParseError;
+
+/// Percentage threshold config: one value for every model, or per-model values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExecuteThresholdConfig {
+    /// A single percentage used for all models.
+    Percentage(f64),
+    /// A map keyed by model id plus an optional `default` entry.
+    ByModel(BTreeMap<String, f64>),
+}
+
+/// Tokens threshold config keyed by model id plus an optional `default` entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExecuteThresholdTokensConfig {
+    /// Token thresholds. The `default` key is used when no model-specific key matches.
+    pub values: BTreeMap<String, f64>,
+}
+
+/// Scheduler config used by the decision logic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    /// Percentage threshold config, capped by [`MAX_EXECUTE_THRESHOLD_PERCENTAGE`].
+    pub execute_threshold_percentage: ExecuteThresholdConfig,
+    /// Optional absolute-token threshold config; wins when a context limit is known.
+    pub execute_threshold_tokens: Option<ExecuteThresholdTokensConfig>,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            execute_threshold_percentage: ExecuteThresholdConfig::Percentage(
+                DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+            ),
+            execute_threshold_tokens: None,
+        }
+    }
+}
+
+/// Provider-reported context pressure for the current pass.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    /// Provider-reported context fill percentage.
+    pub percentage: f64,
+    /// Provider-reported input tokens for this pass.
+    pub input_tokens: f64,
+}
+
+/// Durable timing metadata needed for scheduler and idle-TTL predicates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    /// Unix milliseconds for the last completed provider response; `0` means none yet.
+    pub last_response_time_ms: u64,
+    /// Cache idle TTL string such as `5m`, `30s`, `2h`, or a bare millisecond count.
+    pub cache_ttl: String,
+}
+
+/// Base scheduler decision before pressure bands and boundary deferral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseDecision {
+    /// Do not execute cache-busting work on this pass.
+    Defer,
+    /// Execute cache-busting work on this pass.
+    Execute,
+}
+
+/// Pressure band derived from provider-reported context usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Band {
+    /// Below the force-materialization threshold.
+    Normal,
+    /// At or above 85%, force materialization and bypass mid-turn deferral.
+    Force85,
+    /// At or above 95%, block and drain in the emergency band.
+    Emergency95,
+}
+
+/// Final pass decision returned by the scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PassDecision {
+    /// Do not run a new cache-busting pass.
+    Defer,
+    /// Run a normal cache-busting pass.
+    Execute,
+    /// Force materialization at or above 85% usage.
+    Force85,
+    /// Emergency block-and-drain pass at or above 95% usage.
+    Emergency95,
+}
+
+impl PassDecision {
+    fn is_force_or_emergency(self) -> bool {
+        matches!(self, PassDecision::Force85 | PassDecision::Emergency95)
+    }
+}
+
+/// Live-tail state computed by the caller from typed content blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TailState {
+    /// True when the newest assistant span has a tool call without its paired result.
+    pub mid_tool_use: bool,
+}
+
+/// Reasons that bypass mid-turn deferral for an execute decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BoundaryBypass {
+    /// True when the user explicitly requested a cache bust.
+    pub explicit_bust: bool,
+    /// True for subagent sessions, whose cache work must not wait on the parent session's tail state.
+    pub subagent: bool,
+}
+
+impl BoundaryBypass {
+    fn is_active(self) -> bool {
+        self.explicit_bust || self.subagent
+    }
+}
+
+/// Durable intent that an execute pass was deferred until the current tool call is resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredExecute {
+    /// Stable reason for the deferred intent.
+    pub reason: String,
+}
+
+impl DeferredExecute {
+    /// Create the canonical pending execute intent recorded by mid-turn deferral.
+    pub fn pending_execute() -> Self {
+        Self {
+            reason: "execute-none".to_string(),
+        }
+    }
+}
+
+/// Emergency drain latch state persisted by the caller between passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LatchState {
+    /// Unix milliseconds when the latch armed; `None` means inactive.
+    pub active_since_ms: Option<u64>,
+}
+
+impl LatchState {
+    /// Return true when the emergency drain latch is currently active.
+    pub fn is_active(self) -> bool {
+        self.active_since_ms.is_some()
+    }
+}
+
+/// Provider context-overflow detection result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverflowDetection {
+    /// True when the error text matches a known context-overflow shape.
+    pub is_overflow: bool,
+    /// Reported provider context limit in tokens, when one is extractable and plausible.
+    pub reported_limit: Option<u64>,
+    /// Source text of the first overflow regex that matched, for diagnostics.
+    pub matched_pattern: Option<String>,
+}
+
+/// Inputs for the composed scheduler decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerInputs {
+    /// Scheduler threshold config.
+    pub config: SchedulerConfig,
+    /// Provider-reported context pressure.
+    pub usage: ContextUsage,
+    /// Durable session timing metadata.
+    pub session: SessionMeta,
+    /// Current time in Unix milliseconds, supplied by the caller for determinism.
+    pub now_ms: u64,
+    /// Optional provider/model key for per-model threshold lookup.
+    pub model_key: Option<String>,
+    /// Optional explicit model context limit in tokens.
+    pub context_limit: Option<f64>,
+    /// Live-tail state used by mid-turn deferral.
+    pub tail_state: TailState,
+    /// Existing deferred execute intent, if a prior execute pass was postponed.
+    pub deferred_execute: Option<DeferredExecute>,
+    /// Non-pressure bypasses for mid-turn deferral.
+    pub boundary_bypass: BoundaryBypass,
+    /// Current emergency drain latch state.
+    pub drain_latch: LatchState,
+    /// Optional provider error text to scan for context overflow.
+    pub overflow_error_text: Option<String>,
+}
+
+/// Composed scheduler output returned to the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerOutcome {
+    /// Execute/defer/force/emergency pass class.
+    pub pass: PassDecision,
+    /// True when the hard idle-TTL predicate fired and should be materialized.
+    pub idle_ttl_fired: bool,
+    /// Updated emergency drain latch state for the caller to persist.
+    pub drain_latch: LatchState,
+    /// Updated deferred execute intent for the caller to persist.
+    pub deferred_execute: Option<DeferredExecute>,
+    /// Detected provider context limit in tokens, when overflow text reports one.
+    pub detected_limit: Option<u64>,
+}
+
+struct CompiledPattern {
+    source: &'static str,
+    regex: Regex,
+}
+
+/// Parse a cache idle TTL string into milliseconds.
+pub fn parse_cache_ttl(ttl: &str) -> Result<u64, CacheTtlParseError> {
+    let normalized = ttl.trim();
+    if !normalized.is_empty() && normalized.chars().all(|c| c.is_ascii_digit()) {
+        return normalized.parse().map_err(|_| CacheTtlParseError);
+    }
+
+    let Some(unit) = normalized.chars().last() else {
+        return Err(CacheTtlParseError);
+    };
+    let number = &normalized[..normalized.len().saturating_sub(unit.len_utf8())];
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return Err(CacheTtlParseError);
+    }
+    let value = number.parse::<u64>().map_err(|_| CacheTtlParseError)?;
+    let multiplier = match unit {
+        's' => 1000,
+        'm' => 60 * 1000,
+        'h' => 60 * 60 * 1000,
+        _ => return Err(CacheTtlParseError),
+    };
+    value.checked_mul(multiplier).ok_or(CacheTtlParseError)
+}
+
+/// Return the scheduler's strict idle predicate (`elapsed > ttl`).
+pub fn ttl_execute_fired(now_ms: u64, last_response_time_ms: u64, ttl_ms: u64) -> bool {
+    now_ms.saturating_sub(last_response_time_ms) > ttl_ms
+}
+
+/// Return the hard cache-expiry idle predicate (`last_response_time > 0 && elapsed >= ttl`).
+pub fn ttl_hard_expired(now_ms: u64, last_response_time_ms: u64, ttl_ms: u64) -> bool {
+    last_response_time_ms > 0 && now_ms.saturating_sub(last_response_time_ms) >= ttl_ms
+}
+
+/// Resolve the effective execute threshold percentage for a model and context limit.
+pub fn resolve_execute_threshold(
+    config: &ExecuteThresholdConfig,
+    model_key: Option<&str>,
+    fallback: f64,
+    tokens_config: Option<&ExecuteThresholdTokensConfig>,
+    context_limit: Option<f64>,
+) -> f64 {
+    if let (Some(tokens), Some(limit)) = (tokens_config, context_limit) {
+        if is_finite_positive(limit) {
+            if let Some((token_value, _matched_key)) = resolve_tokens_match(tokens, model_key) {
+                if is_finite_positive(token_value) {
+                    let cap = limit * (MAX_EXECUTE_THRESHOLD_PERCENTAGE / 100.0);
+                    let effective_tokens = token_value.min(cap);
+                    let percentage = (effective_tokens / limit) * 100.0;
+                    return percentage.min(MAX_EXECUTE_THRESHOLD_PERCENTAGE);
+                }
+            }
+        }
+    }
+
+    let mut resolved = match config {
+        ExecuteThresholdConfig::Percentage(value) => *value,
+        ExecuteThresholdConfig::ByModel(values) => {
+            resolve_percentage_match(values, model_key).unwrap_or(fallback)
+        }
+    };
+
+    if !resolved.is_finite() || resolved < 0.0 {
+        resolved = fallback;
+    }
+    resolved.min(MAX_EXECUTE_THRESHOLD_PERCENTAGE)
+}
+
+/// Compute the base scheduler execute/defer decision before pressure bands.
+pub fn should_execute(
+    config: &SchedulerConfig,
+    session: &SessionMeta,
+    usage: &ContextUsage,
+    now_ms: u64,
+    model_key: Option<&str>,
+    context_limit: Option<f64>,
+) -> BaseDecision {
+    if usage.percentage == 0.0 && session.last_response_time_ms == 0 {
+        return BaseDecision::Defer;
+    }
+
+    let effective_context_limit = context_limit.or_else(|| {
+        if usage.percentage > 0.0 && usage.input_tokens > 0.0 {
+            Some(usage.input_tokens / (usage.percentage / 100.0))
+        } else {
+            None
+        }
+    });
+    let threshold = resolve_execute_threshold(
+        &config.execute_threshold_percentage,
+        model_key,
+        DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+        config.execute_threshold_tokens.as_ref(),
+        effective_context_limit,
+    );
+    if usage.percentage >= threshold {
+        return BaseDecision::Execute;
+    }
+
+    let ttl_ms = scheduler_ttl_ms(&session.cache_ttl);
+    if ttl_execute_fired(now_ms, session.last_response_time_ms, ttl_ms) {
+        BaseDecision::Execute
+    } else {
+        BaseDecision::Defer
+    }
+}
+
+/// Derive the pressure band from provider-reported usage percentage.
+pub fn derive_band(usage_percentage: f64) -> Band {
+    if usage_percentage >= EMERGENCY_PERCENTAGE {
+        Band::Emergency95
+    } else if usage_percentage >= FORCE_MATERIALIZE_PERCENTAGE {
+        Band::Force85
+    } else {
+        Band::Normal
+    }
+}
+
+/// Apply the mid-turn boundary deferral transition to a pass decision.
+pub fn apply_boundary_deferral(
+    decision: PassDecision,
+    tail_state: TailState,
+    pending: Option<DeferredExecute>,
+    bypass: BoundaryBypass,
+) -> (PassDecision, Option<DeferredExecute>) {
+    if decision == PassDecision::Defer {
+        return (PassDecision::Defer, pending);
+    }
+    if decision.is_force_or_emergency() || bypass.is_active() {
+        return (decision, pending);
+    }
+    if tail_state.mid_tool_use {
+        return (
+            PassDecision::Defer,
+            Some(pending.unwrap_or_else(DeferredExecute::pending_execute)),
+        );
+    }
+    (decision, pending)
+}
+
+/// Clear a deferred execute intent after the scheduled work succeeds.
+pub fn drain_deferred_after_work(
+    pending: Option<DeferredExecute>,
+    work_succeeded: bool,
+) -> Option<DeferredExecute> {
+    if work_succeeded {
+        None
+    } else {
+        pending
+    }
+}
+
+/// Resolve the usage percentage below which the emergency drain latch clears.
+pub fn emergency_drain_exit_threshold(execute_threshold_percentage: f64) -> f64 {
+    if !execute_threshold_percentage.is_finite() || execute_threshold_percentage <= 0.0 {
+        return EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE;
+    }
+    (execute_threshold_percentage - EMERGENCY_DRAIN_EXIT_MARGIN).max(0.0)
+}
+
+/// Advance the emergency drain latch using only current usage and wall-clock input.
+pub fn advance_drain_latch(
+    state: LatchState,
+    usage_percentage: f64,
+    execute_threshold_percentage: f64,
+    now_ms: u64,
+) -> LatchState {
+    if usage_percentage >= EMERGENCY_DRAIN_ENTER_PERCENTAGE {
+        return LatchState {
+            active_since_ms: state.active_since_ms.or(Some(now_ms)),
+        };
+    }
+
+    let Some(active_since_ms) = state.active_since_ms else {
+        return state;
+    };
+    let expired = now_ms.saturating_sub(active_since_ms) > EMERGENCY_DRAIN_MAX_LATCH_MS;
+    let below_exit =
+        usage_percentage < emergency_drain_exit_threshold(execute_threshold_percentage);
+    if below_exit || expired {
+        LatchState {
+            active_since_ms: None,
+        }
+    } else {
+        state
+    }
+}
+
+/// Return true when an active drain latch may bypass normal scheduling constraints.
+pub fn drain_bypass_allowed(latch: LatchState, failure_at_ms: u64, now_ms: u64) -> bool {
+    if !latch.is_active() {
+        return false;
+    }
+    !(failure_at_ms > 0
+        && now_ms.saturating_sub(failure_at_ms) < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS)
+}
+
+/// Extract an error message from common JSON error shapes.
+pub fn extract_error_message(error: &serde_json::Value) -> String {
+    match error {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(obj) => {
+            if let Some(message) = obj
+                .get("error")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|nested| nested.get("message"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if !message.is_empty() {
+                    return message.to_string();
+                }
+            }
+            if let Some(message) = obj.get("message").and_then(serde_json::Value::as_str) {
+                return message.to_string();
+            }
+            if let Some(body) = obj.get("responseBody").and_then(serde_json::Value::as_str) {
+                return body.to_string();
+            }
+            serde_json::to_string(error).unwrap_or_else(|_| error.to_string())
+        }
+        _ => error.to_string(),
+    }
+}
+
+/// Detect provider context overflow from raw error text.
+pub fn detect_overflow(error_text: &str) -> OverflowDetection {
+    if error_text.is_empty() {
+        return OverflowDetection {
+            is_overflow: false,
+            reported_limit: None,
+            matched_pattern: None,
+        };
+    }
+
+    let has_status_413 =
+        status_413_regex().is_match(error_text) && status_413_context_regex().is_match(error_text);
+    let matched = overflow_patterns()
+        .iter()
+        .find(|pattern| pattern.regex.is_match(error_text));
+
+    if matched.is_none() && !has_status_413 {
+        return OverflowDetection {
+            is_overflow: false,
+            reported_limit: None,
+            matched_pattern: None,
+        };
+    }
+
+    OverflowDetection {
+        is_overflow: true,
+        reported_limit: parse_reported_limit(error_text),
+        matched_pattern: matched.map(|pattern| pattern.source.to_string()),
+    }
+}
+
+/// Detect provider context overflow from a JSON-shaped error value.
+pub fn detect_overflow_value(error: &serde_json::Value) -> OverflowDetection {
+    let message = extract_error_message(error);
+    detect_overflow(&message)
+}
+
+/// Extract a plausible reported provider context limit from an error message.
+pub fn parse_reported_limit(message: &str) -> Option<u64> {
+    if message.is_empty() {
+        return None;
+    }
+    for regex in limit_patterns() {
+        let Some(captures) = regex.captures(message) else {
+            continue;
+        };
+        let Some(raw) = captures.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Ok(value) = raw.parse::<u64>() else {
+            continue;
+        };
+        if (MIN_PLAUSIBLE_CONTEXT_LIMIT..=MAX_PLAUSIBLE_CONTEXT_LIMIT).contains(&value) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Compose scheduler, pressure, boundary, latch, and overflow transitions.
+pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
+    let effective_context_limit = inputs.context_limit.or_else(|| {
+        if inputs.usage.percentage > 0.0 && inputs.usage.input_tokens > 0.0 {
+            Some(inputs.usage.input_tokens / (inputs.usage.percentage / 100.0))
+        } else {
+            None
+        }
+    });
+    let threshold = resolve_execute_threshold(
+        &inputs.config.execute_threshold_percentage,
+        inputs.model_key.as_deref(),
+        DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+        inputs.config.execute_threshold_tokens.as_ref(),
+        effective_context_limit,
+    );
+
+    let ttl_ms = scheduler_ttl_ms(&inputs.session.cache_ttl);
+    let idle_ttl_fired =
+        ttl_hard_expired(inputs.now_ms, inputs.session.last_response_time_ms, ttl_ms);
+    let base = should_execute(
+        &inputs.config,
+        &inputs.session,
+        &inputs.usage,
+        inputs.now_ms,
+        inputs.model_key.as_deref(),
+        inputs.context_limit,
+    );
+    let mut pass =
+        if base == BaseDecision::Execute || idle_ttl_fired || inputs.deferred_execute.is_some() {
+            PassDecision::Execute
+        } else {
+            PassDecision::Defer
+        };
+
+    pass = match derive_band(inputs.usage.percentage) {
+        Band::Emergency95 => PassDecision::Emergency95,
+        Band::Force85 => PassDecision::Force85,
+        Band::Normal => pass,
+    };
+
+    let (pass, deferred_execute) = apply_boundary_deferral(
+        pass,
+        inputs.tail_state,
+        inputs.deferred_execute.clone(),
+        inputs.boundary_bypass,
+    );
+    let drain_latch = advance_drain_latch(
+        inputs.drain_latch,
+        inputs.usage.percentage,
+        threshold,
+        inputs.now_ms,
+    );
+    let detected_limit = inputs.overflow_error_text.as_deref().and_then(|text| {
+        let detection = detect_overflow(text);
+        if detection.is_overflow {
+            detection.reported_limit
+        } else {
+            None
+        }
+    });
+
+    SchedulerOutcome {
+        pass,
+        idle_ttl_fired,
+        drain_latch,
+        deferred_execute,
+        detected_limit,
+    }
+}
+
+/// Convert a scheduler pass decision into the selection module's pass class.
+pub fn to_selection_pass_class(pass: PassDecision) -> PassClass {
+    match pass {
+        PassDecision::Defer => PassClass::Defer,
+        PassDecision::Execute => PassClass::Execute,
+        PassDecision::Force85 | PassDecision::Emergency95 => PassClass::EmergencyForce,
+    }
+}
+
+fn scheduler_ttl_ms(cache_ttl: &str) -> u64 {
+    parse_cache_ttl(cache_ttl).unwrap_or(DEFAULT_CACHE_TTL_MS)
+}
+
+fn is_finite_positive(value: f64) -> bool {
+    value.is_finite() && value > 0.0
+}
+
+fn resolve_percentage_match(
+    values: &BTreeMap<String, f64>,
+    model_key: Option<&str>,
+) -> Option<f64> {
+    if let Some(model_key) = model_key {
+        for candidate in model_key_lookup_order(model_key) {
+            if let Some(value) = values.get(&candidate) {
+                return Some(*value);
+            }
+        }
+    }
+    values.get("default").copied()
+}
+
+fn resolve_tokens_match(
+    tokens: &ExecuteThresholdTokensConfig,
+    model_key: Option<&str>,
+) -> Option<(f64, String)> {
+    if let Some(model_key) = model_key {
+        for candidate in model_key_lookup_order(model_key) {
+            if let Some(value) = tokens.values.get(&candidate) {
+                return Some((*value, candidate));
+            }
+        }
+    }
+    tokens
+        .values
+        .get("default")
+        .map(|value| (*value, "default".to_string()))
+}
+
+fn model_key_lookup_order(model_key: &str) -> Vec<String> {
+    let slash = model_key.find('/');
+    let provider = slash.map_or("", |idx| &model_key[..idx]);
+    let mut model_id = slash.map_or(model_key, |idx| &model_key[idx + 1..]);
+    let mut keys = Vec::new();
+
+    while !model_id.is_empty() {
+        if !provider.is_empty() {
+            keys.push(format!("{provider}/{model_id}"));
+        }
+        keys.push(model_id.to_string());
+        let Some(last_dash) = model_id.rfind('-') else {
+            break;
+        };
+        if last_dash == 0 {
+            break;
+        }
+        model_id = &model_id[..last_dash];
+    }
+    keys
+}
+
+fn compile_case_insensitive(source: &'static str) -> Regex {
+    RegexBuilder::new(source)
+        .case_insensitive(true)
+        .build()
+        .unwrap_or_else(|err| panic!("invalid regex {source:?}: {err}"))
+}
+
+fn overflow_patterns() -> &'static [CompiledPattern] {
+    static PATTERNS: OnceLock<Vec<CompiledPattern>> = OnceLock::new();
+    PATTERNS
+        .get_or_init(|| {
+            OVERFLOW_PATTERN_SOURCES
+                .iter()
+                .map(|source| CompiledPattern {
+                    source,
+                    regex: compile_case_insensitive(source),
+                })
+                .collect()
+        })
+        .as_slice()
+}
+
+fn limit_patterns() -> &'static [Regex] {
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    PATTERNS
+        .get_or_init(|| {
+            LIMIT_EXTRACTION_PATTERN_SOURCES
+                .iter()
+                .map(|source| compile_case_insensitive(source))
+                .collect()
+        })
+        .as_slice()
+}
+
+fn status_413_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b413\b").expect("valid 413 regex"))
+}
+
+fn status_413_context_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| compile_case_insensitive(r"(entity|payload|context|prompt)"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Golden {
+        constants: GoldenConstants,
+        parse_ttl_cases: Vec<ParseTtlCase>,
+        threshold_cases: Vec<ThresholdCase>,
+        should_execute_cases: Vec<ShouldExecuteCase>,
+        ttl_predicate_cases: Vec<TtlPredicateCase>,
+        overflow_cases: Vec<OverflowCase>,
+        limit_cases: Vec<LimitCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct GoldenConstants {
+        default_execute_threshold_percentage: f64,
+        max_execute_threshold_percentage: f64,
+        force_materialize_percentage: f64,
+        emergency_percentage: f64,
+        default_cache_ttl_ms: u64,
+        one_second_ms: u64,
+        one_minute_ms: u64,
+        one_hour_ms: u64,
+        bare_numeric_ms: u64,
+        emergency_drain_enter_percentage: f64,
+        emergency_drain_exit_margin: f64,
+        emergency_drain_fallback_exit_percentage: f64,
+        emergency_drain_failure_backoff_ms: u64,
+        emergency_drain_max_latch_ms: u64,
+        min_plausible_context_limit: u64,
+        max_plausible_context_limit: u64,
+        overflow_pattern_sources: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct ParseTtlCase {
+        label: String,
+        ttl: String,
+        expected_ms: Option<u64>,
+    }
+
+    #[derive(Deserialize)]
+    struct ThresholdCase {
+        label: String,
+        percentage_config: ExecuteThresholdConfig,
+        tokens_config: Option<ExecuteThresholdTokensConfig>,
+        model_key: Option<String>,
+        fallback: f64,
+        context_limit: Option<f64>,
+        expected: f64,
+    }
+
+    #[derive(Deserialize)]
+    struct ShouldExecuteCase {
+        label: String,
+        config: SchedulerConfig,
+        session: SessionMeta,
+        usage: ContextUsage,
+        now_ms: u64,
+        model_key: Option<String>,
+        context_limit: Option<f64>,
+        expected: String,
+    }
+
+    #[derive(Deserialize)]
+    struct TtlPredicateCase {
+        label: String,
+        now_ms: u64,
+        last_response_time_ms: u64,
+        ttl_ms: u64,
+        expected_execute_fired: bool,
+        expected_hard_expired: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct OverflowCase {
+        label: String,
+        input: serde_json::Value,
+        expected_message: String,
+        expected: OverflowExpected,
+    }
+
+    #[derive(Deserialize)]
+    struct OverflowExpected {
+        is_overflow: bool,
+        reported_limit: Option<u64>,
+        matched_pattern: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct LimitCase {
+        label: String,
+        message: String,
+        expected: Option<u64>,
+    }
+
+    fn assert_close(got: f64, expected: f64, label: &str) {
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "{label}: got {got}, expected {expected}"
+        );
+    }
+
+    fn base_inputs() -> SchedulerInputs {
+        SchedulerInputs {
+            config: SchedulerConfig::default(),
+            usage: ContextUsage {
+                percentage: 10.0,
+                input_tokens: 10_000.0,
+            },
+            session: SessionMeta {
+                last_response_time_ms: 1_000,
+                cache_ttl: "5m".to_string(),
+            },
+            now_ms: 2_000,
+            model_key: None,
+            context_limit: None,
+            tail_state: TailState::default(),
+            deferred_execute: None,
+            boundary_bypass: BoundaryBypass::default(),
+            drain_latch: LatchState::default(),
+            overflow_error_text: None,
+        }
+    }
+
+    #[test]
+    fn scheduler_golden_matches_production_behaviour() {
+        let raw = include_str!("../testdata/scheduler-golden.json");
+        let golden: Golden = serde_json::from_str(raw).expect("parse scheduler-golden.json");
+
+        assert_close(
+            DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+            golden.constants.default_execute_threshold_percentage,
+            "default execute threshold",
+        );
+        assert_close(
+            MAX_EXECUTE_THRESHOLD_PERCENTAGE,
+            golden.constants.max_execute_threshold_percentage,
+            "max execute threshold",
+        );
+        assert_close(
+            FORCE_MATERIALIZE_PERCENTAGE,
+            golden.constants.force_materialize_percentage,
+            "force materialize percentage",
+        );
+        assert_close(
+            EMERGENCY_PERCENTAGE,
+            golden.constants.emergency_percentage,
+            "emergency percentage",
+        );
+        assert_eq!(DEFAULT_CACHE_TTL_MS, golden.constants.default_cache_ttl_ms);
+        assert_eq!(1000, golden.constants.one_second_ms);
+        assert_eq!(60_000, golden.constants.one_minute_ms);
+        assert_eq!(3_600_000, golden.constants.one_hour_ms);
+        assert_eq!(1234, golden.constants.bare_numeric_ms);
+        assert_close(
+            EMERGENCY_DRAIN_ENTER_PERCENTAGE,
+            golden.constants.emergency_drain_enter_percentage,
+            "emergency drain enter",
+        );
+        assert_close(
+            EMERGENCY_DRAIN_EXIT_MARGIN,
+            golden.constants.emergency_drain_exit_margin,
+            "emergency drain exit margin",
+        );
+        assert_close(
+            EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE,
+            golden.constants.emergency_drain_fallback_exit_percentage,
+            "emergency drain fallback exit",
+        );
+        assert_eq!(
+            EMERGENCY_DRAIN_FAILURE_BACKOFF_MS,
+            golden.constants.emergency_drain_failure_backoff_ms
+        );
+        assert_eq!(
+            EMERGENCY_DRAIN_MAX_LATCH_MS,
+            golden.constants.emergency_drain_max_latch_ms
+        );
+        assert_eq!(
+            MIN_PLAUSIBLE_CONTEXT_LIMIT,
+            golden.constants.min_plausible_context_limit
+        );
+        assert_eq!(
+            MAX_PLAUSIBLE_CONTEXT_LIMIT,
+            golden.constants.max_plausible_context_limit
+        );
+        assert_eq!(
+            OVERFLOW_PATTERN_SOURCES,
+            golden
+                .constants
+                .overflow_pattern_sources
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+
+        for case in golden.parse_ttl_cases {
+            let got = parse_cache_ttl(&case.ttl).ok();
+            assert_eq!(got, case.expected_ms, "parse ttl {}", case.label);
+        }
+
+        for case in golden.threshold_cases {
+            let got = resolve_execute_threshold(
+                &case.percentage_config,
+                case.model_key.as_deref(),
+                case.fallback,
+                case.tokens_config.as_ref(),
+                case.context_limit,
+            );
+            assert_close(got, case.expected, &case.label);
+        }
+
+        for case in golden.should_execute_cases {
+            let got = should_execute(
+                &case.config,
+                &case.session,
+                &case.usage,
+                case.now_ms,
+                case.model_key.as_deref(),
+                case.context_limit,
+            );
+            let expected = match case.expected.as_str() {
+                "execute" => BaseDecision::Execute,
+                "defer" => BaseDecision::Defer,
+                other => panic!("unknown expected decision {other:?}"),
+            };
+            assert_eq!(got, expected, "should execute {}", case.label);
+        }
+
+        for case in golden.ttl_predicate_cases {
+            assert_eq!(
+                ttl_execute_fired(case.now_ms, case.last_response_time_ms, case.ttl_ms),
+                case.expected_execute_fired,
+                "scheduler ttl predicate {}",
+                case.label
+            );
+            assert_eq!(
+                ttl_hard_expired(case.now_ms, case.last_response_time_ms, case.ttl_ms),
+                case.expected_hard_expired,
+                "hard ttl predicate {}",
+                case.label
+            );
+        }
+
+        for case in golden.overflow_cases {
+            let message = extract_error_message(&case.input);
+            assert_eq!(message, case.expected_message, "extract {}", case.label);
+            let got = detect_overflow_value(&case.input);
+            assert_eq!(
+                got.is_overflow, case.expected.is_overflow,
+                "overflow flag {}",
+                case.label
+            );
+            assert_eq!(
+                got.reported_limit, case.expected.reported_limit,
+                "reported limit {}",
+                case.label
+            );
+            assert_eq!(
+                got.matched_pattern, case.expected.matched_pattern,
+                "matched pattern {}",
+                case.label
+            );
+        }
+
+        for case in golden.limit_cases {
+            assert_eq!(
+                parse_reported_limit(&case.message),
+                case.expected,
+                "parse reported limit {}",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn band_boundaries_are_non_vacuous() {
+        assert_eq!(derive_band(84.9), Band::Normal);
+        assert_eq!(derive_band(85.0), Band::Force85);
+        assert_eq!(derive_band(94.9), Band::Force85);
+        assert_eq!(derive_band(95.0), Band::Emergency95);
+    }
+
+    #[test]
+    fn boundary_deferral_records_retries_and_respects_bypasses() {
+        let tail = TailState { mid_tool_use: true };
+        let (decision, pending) =
+            apply_boundary_deferral(PassDecision::Execute, tail, None, BoundaryBypass::default());
+        assert_eq!(decision, PassDecision::Defer);
+        assert!(pending.is_some(), "mid-tool execute must record an intent");
+
+        let (decision, pending) = apply_boundary_deferral(
+            PassDecision::Execute,
+            TailState {
+                mid_tool_use: false,
+            },
+            pending,
+            BoundaryBypass::default(),
+        );
+        assert_eq!(decision, PassDecision::Execute);
+        let pending = drain_deferred_after_work(pending, true);
+        assert!(pending.is_none(), "successful work drains the retry intent");
+
+        let (decision, pending) =
+            apply_boundary_deferral(PassDecision::Force85, tail, None, BoundaryBypass::default());
+        assert_eq!(decision, PassDecision::Force85);
+        assert!(pending.is_none(), "force passes bypass mid-turn deferral");
+
+        let (decision, pending) = apply_boundary_deferral(
+            PassDecision::Execute,
+            tail,
+            None,
+            BoundaryBypass {
+                explicit_bust: false,
+                subagent: true,
+            },
+        );
+        assert_eq!(decision, PassDecision::Execute);
+        assert!(
+            pending.is_none(),
+            "subagent passes bypass mid-turn deferral"
+        );
+
+        let failed = drain_deferred_after_work(Some(DeferredExecute::pending_execute()), false);
+        assert!(failed.is_some(), "failed work keeps the retry intent");
+    }
+
+    #[test]
+    fn latch_lifecycle_and_failure_backoff_are_distinct() {
+        let t = 1_000_000;
+        let entered = advance_drain_latch(LatchState::default(), 95.0, 65.0, t);
+        assert_eq!(entered.active_since_ms, Some(t));
+
+        let held = advance_drain_latch(entered, 90.0, 65.0, t + 1_000);
+        assert_eq!(held, entered, "90% is above the 55% exit threshold");
+
+        let exited = advance_drain_latch(held, 54.9, 65.0, t + 2_000);
+        assert_eq!(exited.active_since_ms, None);
+
+        let expired =
+            advance_drain_latch(entered, 90.0, 65.0, t + EMERGENCY_DRAIN_MAX_LATCH_MS + 1);
+        assert_eq!(expired.active_since_ms, None);
+
+        let failure_at = t + 10;
+        assert!(
+            !drain_bypass_allowed(entered, failure_at, t + 20),
+            "recent failure suppresses only the bypass"
+        );
+        assert_eq!(
+            advance_drain_latch(entered, 90.0, 65.0, t + 20),
+            entered,
+            "failure backoff must not deactivate the latch"
+        );
+        assert!(
+            drain_bypass_allowed(
+                entered,
+                failure_at,
+                failure_at + EMERGENCY_DRAIN_FAILURE_BACKOFF_MS
+            ),
+            "bypass resumes at the backoff boundary"
+        );
+    }
+
+    #[test]
+    fn decide_is_deterministic_for_identical_inputs() {
+        let mut inputs = base_inputs();
+        inputs.usage.percentage = 86.0;
+        inputs.overflow_error_text =
+            Some("This model's maximum context length is 128000 tokens".to_string());
+        let first = decide(&inputs);
+        let second = decide(&inputs);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn hard_idle_ttl_forces_execute_but_fresh_session_stays_deferred() {
+        let mut inputs = base_inputs();
+        inputs.session.last_response_time_ms = 1_000;
+        inputs.session.cache_ttl = "5m".to_string();
+        inputs.now_ms = 1_000 + DEFAULT_CACHE_TTL_MS;
+        let boundary = decide(&inputs);
+        assert!(boundary.idle_ttl_fired);
+        assert_eq!(boundary.pass, PassDecision::Execute);
+
+        inputs.usage.percentage = 0.0;
+        inputs.usage.input_tokens = 0.0;
+        inputs.session.last_response_time_ms = 0;
+        inputs.now_ms = DEFAULT_CACHE_TTL_MS + 1;
+        let fresh = decide(&inputs);
+        assert!(!fresh.idle_ttl_fired);
+        assert_eq!(fresh.pass, PassDecision::Defer);
+    }
+
+    #[test]
+    fn pending_execute_retries_after_tail_closes() {
+        let mut inputs = base_inputs();
+        inputs.deferred_execute = Some(DeferredExecute::pending_execute());
+        inputs.tail_state.mid_tool_use = false;
+        let outcome = decide(&inputs);
+        assert_eq!(outcome.pass, PassDecision::Execute);
+        assert!(outcome.deferred_execute.is_some());
+        assert!(drain_deferred_after_work(outcome.deferred_execute, true).is_none());
+    }
+
+    #[test]
+    fn pass_decision_maps_to_selection_vocabulary() {
+        assert_eq!(
+            to_selection_pass_class(PassDecision::Defer),
+            PassClass::Defer
+        );
+        assert_eq!(
+            to_selection_pass_class(PassDecision::Execute),
+            PassClass::Execute
+        );
+        assert_eq!(
+            to_selection_pass_class(PassDecision::Force85),
+            PassClass::EmergencyForce
+        );
+        assert_eq!(
+            to_selection_pass_class(PassDecision::Emergency95),
+            PassClass::EmergencyForce
+        );
+    }
+}
