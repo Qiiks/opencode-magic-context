@@ -18,7 +18,6 @@ import { waitForSafeNotificationTarget } from "../shared/safe-notification-targe
 const CONFLICT_WARNING_MARKER = "⚠️ Magic Context is disabled due to conflicting configuration:";
 const SCHEMA_FENCE_MARKER = "⚠️ Magic Context is disabled — database is newer than this version";
 const ENABLED_MARKER = "✨ Magic Context is now enabled";
-const TUI_SETUP_MARKER = "📊 Magic Context sidebar configured";
 const ANNOUNCEMENT_MARKER = "✨ Magic Context — what's new in";
 
 // --- Desktop state file resolution ---
@@ -414,86 +413,6 @@ async function cleanupEnabledMessages(
             break;
         }
     }
-}
-
-/**
- * Notify the user that tui.json was configured with the sidebar plugin.
- * Sends an ignored message that auto-deletes after 1 second.
- */
-export async function sendTuiSetupNotification(
-    client: unknown,
-    directory: string,
-    serverUrl?: string,
-): Promise<void> {
-    const { sessionId } = getDesktopState(directory);
-    if (!sessionId) return;
-
-    // Title-safety guard (issue #129): one-shot informational notice — losing
-    // it beats suppressing a fresh session's title forever.
-    if ((await waitForSafeNotificationTarget(client, sessionId)) === "skip") return;
-
-    const text = [
-        `${TUI_SETUP_MARKER}`,
-        "",
-        "Magic Context added its TUI plugin to your tui.json.",
-        "Restart OpenCode to see the sidebar with live context breakdown,",
-        "token usage, historian status, memory counts, and more.",
-    ].join("\n");
-
-    try {
-        const c = client as {
-            session?: {
-                prompt?: (input: unknown) => unknown;
-                promptAsync?: (input: unknown) => unknown;
-            };
-        };
-
-        const promptInput = {
-            path: { id: sessionId },
-            body: {
-                noReply: true,
-                parts: [{ type: "text", text, ignored: true }],
-            },
-        };
-
-        if (typeof c.session?.prompt === "function") {
-            await Promise.resolve(c.session.prompt(promptInput));
-        } else if (typeof c.session?.promptAsync === "function") {
-            await c.session.promptAsync(promptInput);
-        }
-    } catch {
-        return;
-    }
-
-    // Auto-remove after 1 second — user only needs to see it once
-    if (!serverUrl) return;
-    setTimeout(async () => {
-        try {
-            const msgs = await getSessionMessages(client, sessionId);
-            for (let i = msgs.length - 1; i >= 0; i--) {
-                const msg = msgs[i];
-                const msgId = msg.info?.id;
-                if (!msgId || msg.info?.role !== "user") break;
-                const parts = msg.parts ?? [];
-                const isTuiSetup =
-                    parts.length > 0 &&
-                    parts.every(
-                        (p) =>
-                            p.ignored === true &&
-                            p.type === "text" &&
-                            typeof p.text === "string" &&
-                            p.text.startsWith(TUI_SETUP_MARKER),
-                    );
-                if (isTuiSetup) {
-                    await deleteMessage(serverUrl, sessionId, msgId);
-                } else {
-                    break;
-                }
-            }
-        } catch {
-            // best-effort
-        }
-    }, 1000);
 }
 
 /**

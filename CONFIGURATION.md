@@ -109,8 +109,9 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `historian_timeout_ms` | `number` | `300000` | Timeout per historian call (ms). |
 | `history_budget_percentage` | `number` (0.05–0.5) | `0.15` | Fraction of usable context (`context_limit × execute_threshold`) reserved for the history block. Triggers compression when exceeded. |
 | `commit_cluster_trigger` | `object` | See below | Controls the commit-cluster historian trigger. |
+| `system_prompt_injection` | `object` | See below | Controls whether and where Magic Context augments the system prompt; lets you opt specific agents out. |
+| `keep_subagents` | `boolean` | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success, so their full transcript stays in the host session store for inspection. Kept sessions accumulate until cleared manually — leave `false` for normal use. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
-| `compressor` | `object` | See below | Controls the background compressor that merges older compartments when the history block exceeds its budget. |
 
 ### `language`
 
@@ -139,6 +140,29 @@ A **commit cluster** is a distinct work phase where the agent made one or more g
 }
 ```
 
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `boolean` | `true` | Enable commit-cluster based historian triggering. |
+| `min_clusters` | `number` | `3` | Minimum number of commit clusters in the unsummarized tail before historian fires. The tail must also contain at least one `trigger_budget` worth of tokens, where `trigger_budget = main_context × execute_threshold × 5%` clamped to `[5K, 50K]`. |
+
+Set `enabled: false` to disable this trigger entirely and rely only on pressure-based and tail-size triggers for historian.
+
+### `system_prompt_injection`
+
+Controls whether and where Magic Context augments the system prompt (its guidance block plus the surrounding project-docs and user-profile blocks). OpenCode's internal hidden agents — `title`, `summary`, and `compaction` — are always skipped automatically; this section lets you opt out additional agents, or disable injection globally.
+
+```jsonc
+{
+  "system_prompt_injection": {
+    "enabled": true,                               // default: true
+    "skip_signatures": ["<!-- magic-context: skip -->"]  // default
+  }
+}
+```
+
+- **`enabled`** — when `false`, NO injection happens for ANY agent. Global escape hatch; Magic Context's transform and compaction still run, but nothing is added to the system prompt.
+- **`skip_signatures`** — substring opt-out list. If an agent's system prompt contains any of these strings, Magic Context skips ALL injection for that call. Use it to exempt a specific custom agent by putting the signature (e.g. the default `<!-- magic-context: skip -->`) in that agent's prompt.
+
 ### `sqlite`
 
 Per-connection PRAGMAs applied to Magic Context's own `context.db` at open. These tune SQLite's runtime behaviour only — they do not change the schema or what is stored, and they do not touch OpenCode's or Pi's databases.
@@ -156,63 +180,6 @@ Per-connection PRAGMAs applied to Magic Context's own `context.db` at open. Thes
 - **`mmap_size_mb`** — memory-maps the database file (`PRAGMA mmap_size`) so reads avoid a copy through the page cache. Can reduce read overhead on large DBs at the cost of address space. **Disabled by default (`0`)**, matching SQLite's default; raise it (e.g. `256`) only if you want to experiment with read performance.
 
 Separately, Magic Context runs `PRAGMA optimize` (bounded by `PRAGMA analysis_limit=400`) on its 15-minute maintenance tick. This is self-gating — it re-analyses a table only when its row count has drifted enough to matter — so the query planner keeps choosing good indexes as the database grows. There is no config knob for it.
-
-### `compressor`
-
-Compressor is a background pass that runs when the rendered `<session-history>` block exceeds its budget. It merges older compartments using progressively aggressive **caveman-style** compression at each depth level, enforcing style consistency via a deterministic post-process after the historian LLM call. Each compartment range can be compressed at most `max_merge_depth` times.
-
-**Depth tiers** (applied progressively as compartments are re-compressed):
-
-| Depth | Style | What happens |
-|---|---|---|
-| 1 | **Merge only** | Preserve narrative and all U: lines. Drop only duplicates spanning compartments. |
-| 2 | **Lite caveman** | Drop filler words (just, really, basically) and hedging. Keep grammar. |
-| 3 | **Full caveman** | Drop articles (the, a, an), weak auxiliaries. Fragments OK. Single paragraph per compartment. |
-| 4 | **Ultra caveman** | Telegraphic. Symbol connectives (`→`, `+`, `//`, `\|`). Pattern: `[thing] [action] [reason]`. |
-| 5 | **Title-only collapse** | Content cleared (no LLM call). Raw messages recoverable via `ctx_expand`. |
-
-Inspired by the [caveman Claude Code skill](https://github.com/JuliusBrussee/caveman) which validated telegraph-style compression as LLM-friendly (and saves tokens without tokenizer fallback issues that character-dropping causes).
-
-```jsonc
-{
-  "compressor": {
-    "enabled": true,                  // default: true
-    "min_compartment_ratio": 1000,     // default: 1000 (floor = ceil(total_raw_messages / ratio))
-    "max_merge_depth": 5,             // default: 5 (1-5, deeper = more aggressive)
-    "cooldown_ms": 600000,            // default: 600000 (10 min between background runs)
-    "max_compartments_per_pass": 15,  // default: 15 (LLM batch cap)
-    "grace_compartments": 10          // default: 10 (newest N compartments never compressed)
-  }
-}
-```
-
-**Merge ratios per depth** (applied per LLM pass — small ratios preserve more narrative):
-
-| Depth transition | Ratio | Shape |
-|---|---|---|
-| 0 → 1 | 1.33× (4:3) | Narrative merge; preserve all `U:` lines |
-| 1 → 2 | 1.5× (3:2) | Drop filler, keep grammar (caveman-lite) |
-| 2 → 3 | 2× (2:1) | Paragraph, fragments OK (caveman-full) |
-| 3 → 4 | 2× (2:1) | Telegraph + symbol connectives (caveman-ultra) |
-| 4 → 5 | — | Title-only collapse (no LLM, recoverable via `ctx_expand`) |
-
-**Selection strategy:** The compressor picks the oldest contiguous run of compartments that share the SAME rounded compression depth (up to `max_compartments_per_pass`). This progresses naturally: depth-0 bands get compressed first → depth-1 bands compressed next → and so on. Each run goes through one LLM call.
-
-**Floor protection:** The compressor never reduces your session's compartment count below `ceil(total_raw_messages / min_compartment_ratio)`. For a 20K-message session with the default ratio, that's a floor of 20 compartments.
-
-**Grace period:** The newest `grace_compartments` compartments are always excluded from compression. This protects freshly-published historian output from being re-compressed before it has been used. Default is 10, which works well even for long autonomous runs that publish many compartments per hour.
-
-**Ordinal snap:** When the LLM drifts by ±1-2 ordinals on merged boundaries (e.g. outputs `start=8161` when the actual input boundary is `8160`), the runtime snaps those values to the enclosing input compartment's canonical boundary rather than rejecting the whole pass. Snaps are logged for observability.
-
-**Disable entirely:** Set `compressor.enabled: false` to skip all background compression. Older sessions will simply carry a larger history footprint.
-
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Enable commit-cluster based historian triggering. |
-| `min_clusters` | `number` | `3` | Minimum number of commit clusters in the unsummarized tail before historian fires. The tail must also contain at least one `trigger_budget` worth of tokens, where `trigger_budget = main_context × execute_threshold × 5%` clamped to `[5K, 50K]`. |
-
-Set `enabled: false` to disable this trigger entirely and rely only on pressure-based and tail-size triggers for historian.
 
 ### `execute_threshold_tokens`
 

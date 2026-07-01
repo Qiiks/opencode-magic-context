@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
+
 import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
 import { getHarness } from "../../shared/harness";
+import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { recursiveCharacterSplit } from "./recursive-text-splitter";
 
 export const DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS = 512;
 
@@ -501,6 +504,28 @@ export function chunkCanonicalText(
         const lineStart = range?.start ?? startOrdinal;
         const lineEnd = range?.end ?? lineStart;
         const lineTokens = estimateTokens(line);
+
+        // A single canonical line (one U:/A: span) can itself exceed the per-window
+        // budget — e.g. a span containing a large file dump or paste rendered into
+        // one line. Packing only flushes BETWEEN lines, so such a line would be
+        // emitted as one oversized window and blow past the provider's hard context
+        // window (#206: jina returned 400 exceed_context_size for a 51774-token
+        // window against an 8192 ceiling). Split the line down to budget first, and
+        // emit each sub-slice as its own window carrying this line's ordinal range.
+        if (lineTokens > effectiveMax) {
+            flush();
+            for (const slice of splitOversizedLine(line, effectiveMax)) {
+                windows.push({
+                    windowIndex: windows.length + 1,
+                    startOrdinal: lineStart,
+                    endOrdinal: lineEnd,
+                    text: slice,
+                    chunkHash: hashChunkText(slice),
+                });
+            }
+            continue;
+        }
+
         if (currentLines.length > 0 && currentTokens + lineTokens > effectiveMax) {
             flush();
         }
@@ -513,7 +538,106 @@ export function chunkCanonicalText(
     }
     flush();
 
+    // windowIndex is assigned contiguously as 1-based at push time (both the
+    // flush path and the oversized-line split use `windows.length + 1`), so it is
+    // already gap-free and stable — preserve it (chunk identity = compartmentId +
+    // windowIndex + hash; renumbering would orphan every stored chunk row).
     return windows;
+}
+
+/**
+ * Split a single oversized canonical line into sub-slices each within
+ * `effectiveMax` tokens, using a recursive character splitter (best-in-class
+ * boundary hierarchy: paragraph → line → sentence → word → char). The
+ * `lengthFunction` is our real tokenizer (`estimateTokens`), so slicing is
+ * token-accurate against the same heuristic the windower uses — deterministic,
+ * no provider call, cache-stable. A hard char-level safety cap guarantees
+ * termination even if a single token-dense fragment resists separator splitting.
+ */
+function splitOversizedLine(line: string, effectiveMax: number): string[] {
+    // Recursive split on the best-in-class separator hierarchy (paragraph → line
+    // → word → char), measured with our real tokenizer. Fall back to a
+    // deterministic char-budget split if the splitter throws or yields nothing
+    // (never leave an oversized line un-split).
+    let slices: string[] = [];
+    try {
+        slices = recursiveCharacterSplit(line, {
+            chunkSize: effectiveMax,
+            lengthFunction: estimateTokens,
+        });
+    } catch (error) {
+        // Surface the regression instead of degrading silently: if the splitter
+        // consistently fails for some input shape the char-budget fallback still
+        // embeds, but we want a signal.
+        log("[magic-context] recursiveCharacterSplit failed; using char-budget fallback:", error);
+        slices = [];
+    }
+    if (slices.length === 0) {
+        slices = charBudgetSplit(line, effectiveMax);
+    }
+    // Final guard: any slice still over budget (token-dense, no separators) is
+    // hard-split by character budget. charBudgetSplit is the TERMINAL splitter —
+    // it shrinks to a single character, the smallest indivisible unit — so its
+    // output is budget-compliant by construction EXCEPT for the degenerate case
+    // of a lone character that alone exceeds the budget (only reachable with a
+    // tiny effectiveMax; never with real provider budgets). We assert that
+    // contract in dev/test rather than re-splitting (which cannot reduce a
+    // 1-char slice further and would loop): any escapee is a genuine bug, not
+    // something to silently paper over.
+    const safe: string[] = [];
+    const pushChecked = (slice: string): void => {
+        if (estimateTokens(slice) > effectiveMax && slice.length > 1) {
+            // Not terminal yet — split further. (Defensive: charBudgetSplit
+            // should already guarantee this; only triggers if its contract
+            // regresses.)
+            safe.push(...charBudgetSplit(slice, effectiveMax));
+            return;
+        }
+        safe.push(slice);
+    };
+    for (const slice of slices) {
+        if (estimateTokens(slice) <= effectiveMax) {
+            safe.push(slice);
+        } else {
+            for (const sub of charBudgetSplit(slice, effectiveMax)) pushChecked(sub);
+        }
+    }
+    return safe.filter((s) => s.length > 0);
+}
+
+/**
+ * Deterministic character-budget fallback split. Estimates a chars-per-token
+ * ratio from the input and slices on that, then trims each slice down until it
+ * fits the token budget. Always terminates.
+ *
+ * Budget guarantee: every emitted slice is within `effectiveMax` tokens EXCEPT
+ * the degenerate case where a single character already exceeds the budget (only
+ * reachable when `effectiveMax` is tiny — e.g. 1 — and one char tokenizes to
+ * multiple tokens). In that case the slice is a single character: it cannot be
+ * split further, so emitting it is the only progress-making choice. With real
+ * provider budgets (thousands of tokens) this case never arises.
+ */
+function charBudgetSplit(text: string, effectiveMax: number): string[] {
+    const totalTokens = Math.max(1, estimateTokens(text));
+    const charsPerToken = Math.max(1, Math.floor(text.length / totalTokens));
+    const sliceChars = Math.max(1, effectiveMax * charsPerToken);
+    const out: string[] = [];
+    let pos = 0;
+    while (pos < text.length) {
+        let end = Math.min(text.length, pos + sliceChars);
+        let slice = text.slice(pos, end);
+        // Shrink until the slice fits the token budget (handles dense regions).
+        // Floor at one character: a single char is the smallest indivisible unit,
+        // so we stop there even if it alone exceeds the budget (degenerate tiny
+        // budget) — otherwise the loop could not make progress.
+        while (slice.length > 1 && estimateTokens(slice) > effectiveMax) {
+            end = pos + Math.max(1, Math.floor((end - pos) / 2));
+            slice = text.slice(pos, end);
+        }
+        out.push(slice);
+        pos = end;
+    }
+    return out;
 }
 
 export function getExistingChunkHashes(

@@ -4,12 +4,21 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:te
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { CATEGORY_DEFAULT_TTL } from "./constants";
+// The real module is imported (and evaluated) here BEFORE the mock registers,
+// so it captures every real export. Bun's mock.module is process-global and
+// persists across files in one test run, so a PARTIAL mock leaks into sibling
+// tests that import the omitted exports (e.g. embedding-backfill.test.ts /
+// embedding-cache.test.ts fail with "Export named 'embedBatchForProject' not
+// found" under a whole-dir run). Spreading the real module keeps the mock
+// complete — only the three functions this file needs stubbed are overridden.
+import * as realEmbedding from "./embedding";
 import { computeNormalizedHash } from "./normalize-hash";
 
 const mockEmbedText = mock(async () => null);
 const mockLog = mock(() => {});
 
 mock.module("./embedding", () => ({
+    ...realEmbedding,
     embedText: mockEmbedText,
     embedTextForProject: mockEmbedText,
     getEmbeddingModelId: () => "mock:model",

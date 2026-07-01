@@ -1,7 +1,5 @@
 /** @jsxImportSource @opentui/solid */
 // @ts-nocheck
-import { existsSync, mkdirSync, writeFileSync } from "node:fs"
-import { dirname, join } from "node:path"
 import { createMemo } from "solid-js"
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import { createSidebarContentSlot, kickRecompProgressRefresh } from "./slots/sidebar-content"
@@ -11,10 +9,7 @@ import { startNotificationSocket, stopNotificationSocket, type SocketNotificatio
 import { formatThresholdPercent } from "../shared/format-threshold"
 import { detectConflicts } from "../shared/conflict-detector"
 import { fixConflicts } from "../shared/conflict-fixer"
-import { readJsoncFile } from "../shared/jsonc-parser"
-import { getOpenCodeConfigPaths } from "../shared/opencode-config-dir"
 
-const PLUGIN_NAME = "@cortexkit/opencode-magic-context"
 const DEFAULT_TOAST_DURATION_MS = 5000
 let unifiedToastDurationMs = DEFAULT_TOAST_DURATION_MS
 
@@ -58,71 +53,6 @@ function showToast(
     })
 }
 
-function ensureParentDir(filePath: string) {
-    mkdirSync(dirname(filePath), { recursive: true })
-}
-
-function resolveTuiConfigPath() {
-    const configDir = getOpenCodeConfigPaths({ binary: "opencode" }).configDir
-    const jsoncPath = join(configDir, "tui.jsonc")
-    const jsonPath = join(configDir, "tui.json")
-
-    if (existsSync(jsoncPath)) {
-        return jsoncPath
-    }
-
-    if (existsSync(jsonPath)) {
-        return jsonPath
-    }
-
-    return jsonPath
-}
-
-function readTuiConfig(filePath: string): Record<string, unknown> | null {
-    if (!existsSync(filePath)) {
-        return {}
-    }
-
-    return readJsoncFile<Record<string, unknown>>(filePath)
-}
-
-function hasMagicContextTuiPlugin(): boolean {
-    const configPath = resolveTuiConfigPath()
-    const config = readTuiConfig(configPath)
-    if (!config) {
-        return false
-    }
-
-    const plugins = Array.isArray(config.plugin)
-        ? config.plugin.filter((plugin): plugin is string => typeof plugin === "string")
-        : []
-
-    return plugins.some((plugin) => plugin === PLUGIN_NAME || plugin.startsWith(`${PLUGIN_NAME}@`))
-}
-
-function addMagicContextTuiPlugin(): { ok: boolean; updated: boolean } {
-    const configPath = resolveTuiConfigPath()
-    const config = readTuiConfig(configPath)
-    if (!config) {
-        return { ok: false, updated: false }
-    }
-
-    const plugins = Array.isArray(config.plugin)
-        ? config.plugin.filter((plugin): plugin is string => typeof plugin === "string")
-        : []
-
-    if (plugins.some((plugin) => plugin === PLUGIN_NAME || plugin.startsWith(`${PLUGIN_NAME}@`))) {
-        return { ok: true, updated: false }
-    }
-
-    plugins.push(PLUGIN_NAME)
-    config.plugin = plugins
-
-    ensureParentDir(configPath)
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`)
-    return { ok: true, updated: true }
-}
-
 function showConflictDialog(api: TuiPluginApi, directory: string, reasons: string[], conflicts: ReturnType<typeof detectConflicts>["conflicts"]) {
     api.ui.dialog.replace(() => (
         <api.ui.DialogConfirm
@@ -152,59 +82,6 @@ function showConflictDialog(api: TuiPluginApi, directory: string, reasons: strin
             }}
             onCancel={() => {
                 showToast(api, { message: "Magic Context remains disabled. Run: npx @cortexkit/opencode-magic-context@latest doctor", variant: "warning" })
-            }}
-        />
-    ))
-}
-
-function showTuiSetupDialog(api: TuiPluginApi) {
-    api.ui.dialog.replace(() => (
-        <api.ui.DialogConfirm
-            title="✨ Enable Magic Context Sidebar"
-            message={[
-                "Magic Context can show a sidebar with live context breakdown,",
-                "token usage, historian status, memory counts, and dreamer info.",
-                "",
-                "This requires adding the plugin to your tui.json config",
-                "(OpenCode's TUI plugin configuration file).",
-                "",
-                "Add it now?",
-            ].join("\n")}
-            onConfirm={() => {
-                const result = addMagicContextTuiPlugin()
-                if (!result.ok) {
-                    setTimeout(() => {
-                        api.ui.dialog.replace(() => (
-                            <api.ui.DialogAlert
-                                title="❌ Setup Failed"
-                                message={'Could not update tui.json automatically. Add the plugin manually:\n\n  { "plugin": ["@cortexkit/opencode-magic-context"] }'}
-                                onConfirm={() => {
-                                    showToast(api, { message: "Add plugin to tui.json manually", variant: "warning" })
-                                }}
-                            />
-                        ))
-                    }, 50)
-                    return
-                }
-
-                setTimeout(() => {
-                    api.ui.dialog.replace(() => (
-                        <api.ui.DialogAlert
-                            title="✅ Sidebar Enabled"
-                            message="tui.json updated with Magic Context plugin.\n\nPlease restart OpenCode to see the sidebar."
-                            onConfirm={() => {
-                                showToast(api, {
-                                    message: "Restart OpenCode to see the sidebar",
-                                    variant: "warning",
-                                    durationOverrideMs: 10_000,
-                                })
-                            }}
-                        />
-                    ))
-                }, 50)
-            }}
-            onCancel={() => {
-                showToast(api, { message: "You can add the sidebar later via: npx @cortexkit/opencode-magic-context@latest doctor", variant: "info" })
             }}
         />
     ))
@@ -955,10 +832,6 @@ const tui: TuiPlugin = async (api, _options, meta) => {
     // launch will retry. Dialog only appears once per ANNOUNCEMENT_VERSION
     // (persisted via mark-announced RPC writing last_announced_version).
     void showStartupAnnouncement(api)
-
-    // Note: if TUI plugin is loaded, tui.json already has our entry.
-    // But if the user added it manually and later removes it, or if they
-    // use setup/doctor which handles tui.json, this code is already running.
 }
 
 const id = "opencode-magic-context"

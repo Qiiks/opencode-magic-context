@@ -46,6 +46,11 @@ export function getMagicContextTempDir(harness: HarnessId = getHarness()): strin
  * reflected in the next flush.
  */
 export function getMagicContextLogPath(harness: HarnessId = getHarness()): string {
+    // An explicit override wins over the harness temp-dir default, so users on
+    // sandboxed/ephemeral setups (Docker, CI) can point the diagnostic log at a
+    // persistent or shared path. Blank/whitespace is treated as unset.
+    const envPath = process.env.MAGIC_CONTEXT_LOG_PATH?.trim();
+    if (envPath) return envPath;
     return path.join(getMagicContextTempDir(harness), "magic-context.log");
 }
 

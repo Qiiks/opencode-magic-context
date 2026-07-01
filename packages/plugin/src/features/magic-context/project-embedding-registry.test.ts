@@ -167,6 +167,36 @@ function seedManyCompartmentsWithFts(
     }
 }
 
+/**
+ * Seed one compartment whose single assistant message is huge, so its canonical
+ * chunk text is one oversized line that chunkCanonicalText splits into many
+ * windows — the #207 batching case.
+ */
+function seedOversizedCompartmentWithFts(
+    db: NonNullable<ReturnType<typeof openDatabase>>,
+    sessionId: string,
+): number {
+    appendCompartments(db, sessionId, [
+        {
+            sequence: 0,
+            startMessage: 1,
+            endMessage: 1,
+            startMessageId: "a1",
+            endMessageId: "a1",
+            title: "Giant dump",
+            content: "P1 content",
+            p1: "P1 content",
+        },
+    ]);
+    // ~6000 words ≈ thousands of tokens » the default chunk budget, all in one
+    // assistant message → one oversized canonical line.
+    const huge = Array.from({ length: 6000 }, (_, i) => `word${i}`).join(" ");
+    db.prepare(
+        "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
+    ).run(sessionId, 1, `${sessionId}-a1`, "assistant", huge);
+    return getCompartments(db, sessionId)[0].id;
+}
+
 describe("project embedding registry", () => {
     const tempDirs: string[] = [];
     const originalXdgDataHome = process.env.XDG_DATA_HOME;
@@ -641,7 +671,7 @@ describe("project embedding registry", () => {
         expect(loadAllEmbeddings(db, projectIdentity, second.modelId).size).toBe(1);
     });
 
-    it("keeps old-model compartment chunk embeddings inert on provider change", () => {
+    it("keeps old-model compartment chunk embeddings inert on provider change", async () => {
         const db = useTempDb();
         const compartmentId = seedCompartmentWithFts(db, "ses-wipe");
         const windows = chunkCanonicalText("[1] U: hello", 1, 1, 10_000);
@@ -716,6 +746,51 @@ describe("project embedding registry", () => {
         expect(batchCalls).toBe(1);
     });
 
+    it("bounds provider call size even when one compartment has many windows (#207)", async () => {
+        const callSizes: number[] = [];
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new (class extends FakeEmbeddingProvider {
+                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                        callSizes.push(texts.length);
+                        return super.embedBatch(texts);
+                    }
+                })(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        const compartmentId = seedOversizedCompartmentWithFts(db, "ses-huge");
+        recordSessionProjectIdentity(db, "ses-huge", "git:huge");
+        registerProjectEmbedding(
+            db,
+            "git:huge",
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/huge",
+        );
+
+        const embedded = await embedUnembeddedCompartmentChunksForProject(db, "git:huge");
+        expect(embedded).toBe(1);
+
+        // The single compartment produced many windows; assert NO provider call
+        // exceeded the per-call window cap (MAX_WINDOWS_PER_EMBED_CALL = 2), i.e.
+        // the windows were sub-batched across calls rather than sent as one
+        // enormous payload.
+        expect(callSizes.length).toBeGreaterThan(1);
+        for (const size of callSizes) {
+            expect(size).toBeLessThanOrEqual(2);
+        }
+
+        // And the compartment is fully embedded (one row per window, all persisted).
+        const rows = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            "ses-huge",
+            "git:huge",
+            currentChunkModelId("git:huge"),
+        );
+        expect(rows.length).toBeGreaterThan(1);
+        expect(new Set(rows.map((r) => r.compartmentId))).toEqual(new Set([compartmentId]));
+    });
+
     it("keeps passive chunk backfill scoped to the caller project", async () => {
         _setTestProviderFactoryForProject(
             (config) =>
@@ -763,7 +838,7 @@ describe("project embedding registry", () => {
         ).toHaveLength(0);
     });
 
-    it("repairs chunk rows stamped with a different project than their session owner", () => {
+    it("repairs chunk rows stamped with a different project than their session owner", async () => {
         const db = useTempDb();
         const compartmentId = seedCompartmentWithFts(db, "ses-repair");
         const windows = chunkCanonicalText("[1] U: hello", 1, 1, 10_000);

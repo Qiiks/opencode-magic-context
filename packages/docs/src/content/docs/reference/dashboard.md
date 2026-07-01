@@ -148,4 +148,4 @@ Use [Configuration](/reference/configuration/) for the full generated key refere
 
 ## Logs
 
-Optional **log tail** for `magic-context.log` with filtering, useful alongside Cache when correlating busts with plugin log lines.
+Optional **log tail** for `magic-context.log` with filtering, useful alongside Cache when correlating busts with plugin log lines. The log path defaults to `${TMPDIR}/opencode/magic-context/magic-context.log` (`pi/` for Pi); set the `MAGIC_CONTEXT_LOG_PATH` environment variable to redirect it.

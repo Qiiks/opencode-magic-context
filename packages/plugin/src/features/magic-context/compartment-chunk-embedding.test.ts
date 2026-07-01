@@ -138,7 +138,13 @@ describe("compartment chunk embedding core", () => {
         expect(whole[0]).toMatchObject({ windowIndex: 0, startOrdinal: 1, endOrdinal: 3 });
         expect(whole[0]?.text).toBe(text);
 
-        const windowed = chunkCanonicalText(text, 1, 3, 1);
+        // Budget that fits any single line but not two together → one window per
+        // line on line boundaries. effectiveMax = floor(budget * 0.9); each line is
+        // ~7 tokens, so a budget of ~9 (effective 8) holds exactly one line.
+        const perLineBudget = Math.ceil(
+            (estimateTokens("[1] U: alpha beta gamma") + 1) / CHUNK_WINDOW_SAFETY_RATIO,
+        );
+        const windowed = chunkCanonicalText(text, 1, 3, perLineBudget);
         expect(windowed.map((window) => window.windowIndex)).toEqual([1, 2, 3]);
         expect(windowed.map((window) => [window.startOrdinal, window.endOrdinal])).toEqual([
             [1, 1],
@@ -165,6 +171,50 @@ describe("compartment chunk embedding core", () => {
             // configured ceiling.
             expect(estimateTokens(window.text)).toBeLessThanOrEqual(effective);
         }
+    });
+
+    test("splits a single oversized canonical line so no window exceeds the budget (#206)", () => {
+        // One canonical line (a single A: span) far larger than the budget — e.g.
+        // a big file dump rendered into one message. The old chunker emitted this
+        // whole, producing one window that blew past the provider's context window.
+        const maxInputTokens = 200;
+        const effective = Math.floor(maxInputTokens * CHUNK_WINDOW_SAFETY_RATIO);
+        const huge = Array.from(
+            { length: 4000 },
+            (_, i) => `word${i} alpha beta gamma delta epsilon`,
+        ).join(" ");
+        const line = `[1] A: ${huge}`;
+        expect(estimateTokens(line)).toBeGreaterThan(effective * 10); // genuinely oversized
+
+        const windows = chunkCanonicalText(line, 1, 1, maxInputTokens);
+
+        expect(windows.length).toBeGreaterThan(1);
+        // The invariant that #206 violated: NO window may exceed the budget.
+        for (const window of windows) {
+            expect(estimateTokens(window.text)).toBeLessThanOrEqual(effective);
+        }
+        // Sub-windows all carry the owning line's ordinal range.
+        for (const window of windows) {
+            expect(window.startOrdinal).toBe(1);
+            expect(window.endOrdinal).toBe(1);
+        }
+        // windowIndex stays 1-based and contiguous (stable chunk identity).
+        expect(windows.map((w) => w.windowIndex)).toEqual(windows.map((_, i) => i + 1));
+    });
+
+    test("mixes split sub-windows with normal line windows without index gaps", () => {
+        const maxInputTokens = 200;
+        const effective = Math.floor(maxInputTokens * CHUNK_WINDOW_SAFETY_RATIO);
+        const huge = Array.from({ length: 2000 }, (_, i) => `tok${i}`).join(" ");
+        const text = ["[1] U: short opener", `[2] A: ${huge}`, "[3] U: short closer"].join("\n");
+
+        const windows = chunkCanonicalText(text, 1, 3, maxInputTokens);
+
+        expect(windows.length).toBeGreaterThan(2);
+        for (const window of windows) {
+            expect(estimateTokens(window.text)).toBeLessThanOrEqual(effective);
+        }
+        expect(windows.map((w) => w.windowIndex)).toEqual(windows.map((_, i) => i + 1));
     });
 
     test("storage replaces chunks idempotently and clearSession removes rows", () => {

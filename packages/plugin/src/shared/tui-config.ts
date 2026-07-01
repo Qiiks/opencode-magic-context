@@ -1,6 +1,11 @@
 /**
- * Auto-configure tui.json with magic-context TUI plugin entry.
- * Called from the server plugin at startup so the TUI sidebar loads on next restart.
+ * Configure tui.json with the magic-context TUI plugin entry.
+ *
+ * Called ONLY from the CLI setup wizard and `doctor` (via the core export) —
+ * never at plugin startup. Startup injection would re-add the entry on every
+ * launch, so a user who deliberately removed the sidebar could never keep it
+ * removed; opting in/out of the sidebar is the user's call, made explicitly
+ * through setup or doctor.
  */
 
 import {

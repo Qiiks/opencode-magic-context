@@ -5,6 +5,8 @@ description: Persist the OpenCode sidebar's collapsed state, reorder it, rename 
 
 In OpenCode's TUI, Magic Context renders a live sidebar — context breakdown, historian status, memory counts, queue and dreamer state. Click the header (`▼ Magic Context`) to collapse it to a compact summary, or expand it again.
 
+The sidebar is enabled by the setup wizard, which adds the TUI plugin entry to `~/.config/opencode/tui.jsonc`. If you removed it (or skipped setup), run `npx @cortexkit/magic-context@latest doctor` to add it back. Removing the entry from `tui.jsonc` disables the sidebar permanently — Magic Context never re-adds it on its own.
+
 By default the sidebar reopens expanded every time you restart. To make the collapsed state (and a few other preferences) stick, add a `magic-context` entry to a **shared** TUI preferences file.
 
 :::note
