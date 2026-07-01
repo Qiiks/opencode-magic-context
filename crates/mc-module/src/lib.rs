@@ -19,6 +19,8 @@
 pub mod boundary;
 pub mod compartment_coverage;
 pub mod decay_render;
+pub mod historian;
+pub mod historian_validate;
 pub mod injection;
 pub mod m0_compose;
 pub mod m1_compose;
