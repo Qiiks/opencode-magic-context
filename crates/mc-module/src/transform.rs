@@ -441,6 +441,13 @@ fn apply_once(
             // coverage end — they must not desync).
             if let Some((_, ord)) = m1.new_coverage {
                 meta.coverage_ordinal = Some(ord);
+                // A coverage advance folds items out of the tail, so frozen red:*
+                // units targeting them must go WITH the coverage. Only the HARD arm
+                // rebuilds the frozen set (surviving_red_units); without this prune a
+                // covered reduction would survive a coverage-extending SOFT as silent
+                // bloat — and a later re-decide of that target with different bytes
+                // would false-fire the monotonicity conflict guard.
+                prune_covered_red_units(&mut core, &live, meta.coverage_ordinal);
             }
             meta.m1_revision = current_m1_digest;
         }
@@ -620,6 +627,30 @@ fn effective_reductions(
             .or_insert_with(|| (r.kind.clone(), r.payload.clone()));
     }
     eff
+}
+
+/// Drop frozen `red:*` units whose target is now COVERED (ordinal at/below the new
+/// coverage). Runs on a coverage-extending SOFT, where the tail shrinks but the frozen
+/// set is otherwise kept: a reduction whose target left the tail can never be applied
+/// again (`build_output` trims covered items first), so keeping it is pure bloat and a
+/// false-conflict trap if the same target id is ever re-decided after a revert.
+fn prune_covered_red_units(
+    core: &mut mc_core::CoreState,
+    live: &[&CkItemWire],
+    new_coverage: Option<u64>,
+) {
+    let live_ord: BTreeMap<&str, u64> = live.iter().map(|i| (i.id(), i.ordinal())).collect();
+    core.frozen_units.retain(|u| {
+        let Some(target) = u.key.strip_prefix("red:") else {
+            return true; // non-reduction units are coverage-independent
+        };
+        match live_ord.get(target) {
+            Some(&ord) => is_tail(ord, new_coverage),
+            // Target absent from the live array: leave it to the HARD-fold orphan GC,
+            // which sees the authoritative post-revert array.
+            None => true,
+        }
+    });
 }
 
 /// The `red:*` units that SURVIVE a HARD rebuild: a target that is COVERED (folded into
@@ -1140,6 +1171,83 @@ mod tests {
             revert.reconcile_pending,
             "revert below b1 → reconcile pending"
         );
+    }
+
+    #[test]
+    fn coverage_extending_soft_prunes_covered_red_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // m0 folds C1 (covers 1..=10); t11/t12 are live tail items.
+        s.replace_compartments("ses", &[comp(1, 1, 10, "m10", "S1")])
+            .unwrap();
+        let items_v1 = vec![
+            item("m10", 10, "raw"),
+            item("t11", 11, "tool output"),
+            item("t12", 12, "tail"),
+        ];
+        run(&s, &req("ses", "cfg0", items_v1.clone()), &spine());
+
+        // A SOFT freezes a reduction on t11 (still in the tail).
+        let reduced = run(
+            &s,
+            &req("ses", "cfg0", items_v1.clone()),
+            &with_reductions(vec![reduce("t11", "drop", "[dropped]")]),
+        );
+        assert_eq!(reduced.action, "SOFT");
+        assert_eq!(tail_bytes(&reduced, "t11"), "[dropped]");
+
+        // C2 publishes covering through t12 → the next SOFT extends coverage past
+        // t11's ordinal. The frozen red:t11 must be pruned WITH the coverage: its
+        // target left the tail, so keeping it is bloat and a false-conflict trap
+        // if a post-revert tail ever reuses the id with different bytes.
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 12, "t12", "S2")],
+        )
+        .unwrap();
+        let items_v2 = vec![
+            item("m10", 10, "raw"),
+            item("t11", 11, "tool output"),
+            item("t12", 12, "tail"),
+            item("t13", 13, "newest"),
+        ];
+        let folded = run(&s, &req("ses", "cfg0", items_v2.clone()), &spine());
+        assert_eq!(folded.action, "SOFT", "new compartment rides a SOFT");
+        assert_eq!(tail_ids(&folded), vec!["t13"], "coverage trimmed t11/t12");
+
+        // The invariant (fail-loud form): after a coverage advance, no frozen red:*
+        // unit may target a covered ordinal.
+        let loaded = s.load("ses").unwrap();
+        let core = loaded.core;
+        let coverage = loaded.meta.coverage_ordinal.expect("coverage advanced");
+        let covered_ordinals: std::collections::BTreeMap<&str, u64> = items_v2
+            .iter()
+            .map(|i| (i.id.as_str(), i.ordinal))
+            .collect();
+        for unit in &core.frozen_units {
+            let Some(target) = unit.key.strip_prefix("red:") else {
+                continue;
+            };
+            if let Some(&ord) = covered_ordinals.get(target) {
+                assert!(
+                    ord > coverage,
+                    "frozen {} survived its target's coverage (ord {ord} <= coverage {coverage})",
+                    unit.key
+                );
+            }
+        }
+        // And the pruned unit is gone specifically.
+        assert!(
+            core.frozen_units.iter().all(|u| u.key != "red:t11"),
+            "red:t11 must be pruned by the coverage-extending SOFT"
+        );
+
+        // Defer replays byte-identical after the prune (the prune itself must not
+        // perturb replay).
+        let defer = run(&s, &req("ses", "cfg0", items_v2), &spine());
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(m1_bytes(&defer), m1_bytes(&folded));
+        assert_eq!(m0_bytes(&defer), m0_bytes(&folded));
     }
 
     #[test]
