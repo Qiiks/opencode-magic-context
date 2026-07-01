@@ -400,6 +400,7 @@ dependencies = [
  "mc-core",
  "mc-store",
  "mc-tokenizer",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
