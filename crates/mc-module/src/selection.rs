@@ -972,7 +972,8 @@ mod tests {
     #[test]
     fn selection_golden_matches_ts_selectors() {
         let raw = include_str!("../testdata/selection-golden.json");
-        let cases: Vec<GoldenCase> = serde_json::from_str(raw).expect("parse selection-golden.json");
+        let cases: Vec<GoldenCase> =
+            serde_json::from_str(raw).expect("parse selection-golden.json");
         assert!(!cases.is_empty(), "empty selection golden");
 
         for case in &cases {
@@ -1164,7 +1165,17 @@ mod tests {
 
     #[test]
     fn payload_purity_independent_of_pressure() {
-        // The same target under two different pressure/pass contexts → identical payload.
+        // The cache-critical monotonicity pin: a payload = f(id, immutable block bytes)
+        // with ZERO pass-varying state, so a frozen target can never be re-emitted with
+        // different bytes. Prove it EMPIRICALLY by holding c1 an edit_marker in TWO
+        // genuinely different contexts and asserting a byte-identical payload.
+        //
+        // c1/c2/c3 are all edits to a.ts; c3 (newest) stays full, c1+c2 are older →
+        // edit_marker candidates. Context B varies agent_drop_ids (drops UNRELATED c9,
+        // so the produced set genuinely differs) plus the pressure/latch fields, chosen
+        // so c1 stays an edit_marker in BOTH (last_execute_ordinal stays 0, so c1 is
+        // never a two-pass FullDrop that would change its shape). A payload fn that
+        // accidentally read ctx would diverge here; a pure one cannot.
         let items = vec![
             tool_call(
                 "c1",
@@ -1182,24 +1193,87 @@ mod tests {
                 500,
             ),
             tool_result("c2", 2, "edit", 100),
+            tool_call(
+                "c3",
+                3,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","content":"q".repeat(80)}),
+                500,
+            ),
+            tool_result("c3", 3, "edit", 100),
+            tool_call("c9", 9, "read", serde_json::json!({}), 50),
+            tool_result("c9", 9, "read", 300),
         ];
-        let payload_at = |last_exec: u64| -> Option<String> {
-            let mut ctx = base_ctx(PassClass::Execute);
-            ctx.last_execute_ordinal = last_exec;
+        let c1_marker_payload = |ctx: &SelectionContext| -> Option<String> {
             let out = select_reductions(
                 &items,
                 &HashSet::new(),
-                &ctx,
+                ctx,
                 &SelectionConfig { smart_drops: true },
             );
             out.iter()
                 .find(|d| d.target_id == "c1#call" && d.kind == "edit_marker")
                 .map(|d| d.payload.clone())
         };
-        // c1 edit_marker payload must be identical regardless of the (irrelevant) watermark.
-        assert_eq!(payload_at(0), payload_at(0));
-        let a = payload_at(0);
-        assert!(a.is_some(), "c1 should be an edit_marker");
+
+        // Context A: no agent drops, zero pressure fields.
+        let ctx_a = base_ctx(PassClass::Execute);
+        // Context B: a genuinely different produced set — an unrelated agent drop (c9)
+        // plus non-zero pressure/latch fields. last_execute_ordinal stays 0 so c1 is NOT
+        // a two-pass drop candidate (keeps it an edit_marker in both).
+        let ctx_b = SelectionContext {
+            agent_drop_ids: vec!["c9#result".to_string()],
+            current_total_input_tokens: 123_456.0,
+            ceiling_tokens: 200_000.0,
+            protected_cutoff_ordinal: 2,
+            prior_input_sample: 99_000.0,
+            has_prior_drop: true,
+            ..base_ctx(PassClass::Execute)
+        };
+
+        // Non-vacuity guard: prove the two contexts genuinely produce DIFFERENT sets
+        // (c9 is dropped in B via the agent-drop, absent in A), so the payload equality
+        // below is a real invariance across a differing pass, not f(x)==f(x).
+        let set_a = select_reductions(
+            &items,
+            &HashSet::new(),
+            &ctx_a,
+            &SelectionConfig { smart_drops: true },
+        );
+        let set_b = select_reductions(
+            &items,
+            &HashSet::new(),
+            &ctx_b,
+            &SelectionConfig { smart_drops: true },
+        );
+        assert!(
+            !set_a.iter().any(|d| d.target_id == "c9#result"),
+            "context A must NOT drop c9"
+        );
+        assert!(
+            set_b.iter().any(|d| d.target_id == "c9#result"),
+            "context B MUST drop c9 (the sets genuinely differ)"
+        );
+
+        let pa = c1_marker_payload(&ctx_a);
+        let pb = c1_marker_payload(&ctx_b);
+        assert!(pa.is_some(), "c1 must be an edit_marker in context A");
+        assert!(pb.is_some(), "c1 must be an edit_marker in context B");
+        assert_eq!(
+            pa, pb,
+            "edit_marker payload must NOT vary with the differing context"
+        );
+        // And it equals the direct pure-fn output over the immutable input bytes.
+        assert_eq!(
+            pa.as_deref(),
+            Some(
+                edit_marker_payload(
+                    &serde_json::json!({"filePath":"a.ts","oldString":"z".repeat(80)})
+                )
+                .as_str()
+            ),
+            "payload must be exactly the pure fn of the block's input bytes"
+        );
     }
 
     #[test]
