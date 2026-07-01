@@ -7,15 +7,20 @@
  * else.
  *
  * Why this exists: Magic Context's main entry (`./index.ts`) registers
- * historian, dreamer, transform pipeline, nudges, system-prompt
- * injection, command palette, and agent_end cleanup. Loading that full
- * extension in subagents would:
- *   1. Cause recursion (subagent's own historian fires, spawning another
- *      subagent, etc.) — exactly the failure mode `--no-extensions`
- *      was originally added to avoid.
- *   2. Waste startup time on resource discovery and timer wiring.
- *   3. Inject prompt content the subagent prompt doesn't expect (key
- *      files, project docs, user profile, session history, etc.).
+ * historian, dreamer, transform pipeline, nudges, system-prompt injection,
+ * command palette, and agent_end cleanup. Pi child processes now keep extension
+ * discovery ON so provider extensions can register models and AFT can register
+ * its tools. Recursion is prevented by the child environment instead:
+ * `MAGIC_CONTEXT_PI_SUBAGENT=1` makes the full Magic Context entry return before
+ * it registers anything. This lean explicit entry is not guarded because it is
+ * the only Magic Context code children should run.
+ *
+ * Loading the full entry in subagents would still be wrong because it would:
+ *   1. Wire historian/dreamer/event handlers that can recursively spawn more
+ *      subagents.
+ *   2. Waste startup time on DB work, resource discovery, and timer wiring.
+ *   3. Inject prompt content the subagent prompt doesn't expect (key files,
+ *      project docs, user profile, session history, etc.).
  *
  * What this entry registers for `--no-session` children:
  *   - `ctx_search` — read-only search over shared memories/messages/git
@@ -30,13 +35,15 @@
  * tool surface — that's it.
  *
  * How parent passes this entry to the child:
- *   pi --print --no-extensions \
+ *   MAGIC_CONTEXT_PI_SUBAGENT=1 pi --print \
  *     --extension /absolute/path/to/dist/subagent-entry.js \
+ *     --tools <agent-specific allow-list> \
  *     [other flags...]
  *
- * `--no-extensions` skips Pi's discovered-extensions scan but still
- * loads explicit `--extension` paths. The result: subagent gets the scoped
- * Magic Context tools without full-extension overhead or recursion risk.
+ * Discovery remains enabled. The full Magic Context entry no-ops under the env
+ * guard; this explicit lean entry supplies the scoped Magic Context tools; and
+ * the per-agent `--tools` allow-list strips every built-in or extension tool not
+ * named for that child agent.
  *
  * Tool/action allowlists via Pi flags:
  *   --magic-context-dreamer-actions  Register ctx_memory with the dreamer

@@ -136,9 +136,10 @@ describe("subagent-runner pure helpers", () => {
 			// and the session picker (uses Pi's
 			// SessionManager.inMemory()).
 			"--no-session",
-			"--no-extensions",
 			"--no-skills",
 			"--no-prompt-templates",
+			"--tools",
+			"read,grep,find,ls,aft_search",
 			"--system-prompt",
 			"system guidance",
 			"--model",
@@ -149,6 +150,17 @@ describe("subagent-runner pure helpers", () => {
 			// historian.thinking_level in their Pi magic-context.jsonc.
 			"summarize this session",
 		]);
+	});
+
+	it("keeps extension discovery enabled so provider and AFT extensions can load", () => {
+		const args = __test.buildArgs({
+			...baseOptions,
+			model: "google/antigravity-gemini-3.5-flash",
+		});
+
+		expect(args).not.toContain("--no-extensions");
+		expect(args).toContain("--no-skills");
+		expect(args).toContain("--no-prompt-templates");
 	});
 
 	it("always includes --no-session so child sessions don't appear in pi resume", () => {
@@ -229,11 +241,21 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--no-tools");
 	});
 
-	it("does NOT apply a strict tool allow-list to historian/sidekick", () => {
-		for (const agent of ["historian", "sidekick"]) {
-			const args = __test.buildArgs({ ...baseOptions, agent });
-			expect(args).not.toContain("--tools");
-		}
+	it("locks historian and sidekick to explicit read-only allow-lists", () => {
+		const historianArgs = __test.buildArgs({
+			...baseOptions,
+			agent: "historian",
+		});
+		expect(historianArgs).toEqual(
+			expect.arrayContaining(["--tools", "read,grep,find,ls,aft_search"]),
+		);
+		const sidekickArgs = __test.buildArgs({
+			...baseOptions,
+			agent: "sidekick",
+		});
+		expect(sidekickArgs).toEqual(
+			expect.arrayContaining(["--tools", "read,grep,find,ls,ctx_search"]),
+		);
 	});
 
 	it("locks base dreamer (curate) to --tools ctx_memory, stripping all built-ins", () => {
@@ -294,7 +316,24 @@ describe("subagent-runner pure helpers", () => {
 		}
 	});
 
-	it("locks dreamer-docs to {read,grep,find,ls,write,edit,bash} with no ctx_memory and no extension", () => {
+	it("emits an explicit tool gate for every known Pi subagent agent", () => {
+		for (const agent of __test.KNOWN_PI_SUBAGENT_AGENTS) {
+			const args = __test.buildArgs({ ...baseOptions, agent });
+			const hasTools = args.includes("--tools");
+			const hasNoTools = args.includes("--no-tools");
+			expect(__test.STRICT_TOOL_ALLOWLIST.has(agent)).toBe(true);
+			expect(hasTools || hasNoTools).toBe(true);
+			expect(hasTools && hasNoTools).toBe(false);
+		}
+	});
+
+	it("fails closed to --no-tools for unknown agent ids", () => {
+		const args = __test.buildArgs({ ...baseOptions, agent: "future-agent" });
+		expect(args).toContain("--no-tools");
+		expect(args).not.toContain("--tools");
+	});
+
+	it("locks dreamer-docs to file tools plus optional AFT read tools, with no ctx_memory and no extension", () => {
 		const args = __test.buildArgs({
 			...baseOptions,
 			agent: "dreamer-docs",
@@ -302,7 +341,9 @@ describe("subagent-runner pure helpers", () => {
 		});
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
-		expect(args[idx + 1]).toBe("read,grep,find,ls,write,edit,bash");
+		expect(args[idx + 1]).toBe(
+			"read,grep,find,ls,bash,write,edit,aft_outline,aft_zoom,aft_search",
+		);
 		expect(args).not.toContain("--no-tools");
 		// Edits docs, never the memory store: no ctx_memory, and the lean extension
 		// (which would register it) is not loaded for this agent.
@@ -321,7 +362,7 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--magic-context-dreamer-actions");
 	});
 
-	it("locks dreamer-primer-investigator to read-only {read,grep,find,ls,ctx_search} with no write/ctx_memory", () => {
+	it("locks dreamer-primer-investigator to read-only built-ins, AFT read tools, and ctx_search", () => {
 		const args = __test.buildArgs({
 			...baseOptions,
 			agent: "dreamer-primer-investigator",
@@ -329,24 +370,60 @@ describe("subagent-runner pure helpers", () => {
 		});
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
-		expect(args[idx + 1]).toBe("read,grep,find,ls,ctx_search");
+		expect(args[idx + 1]).toBe(
+			"read,grep,find,ls,aft_outline,aft_zoom,aft_search,ctx_search",
+		);
 		expect(args).not.toContain("--no-tools");
 		// Source-safety + cache-neutrality: no write/edit/bash, and crucially no
 		// ctx_memory (its mutations bump the project memory epoch → bust m[0]).
 		const toolList = args[idx + 1];
-		for (const denied of [
-			"write",
-			"edit",
-			"bash",
-			"ctx_memory",
-			"ctx_note",
-			"aft_search",
-		]) {
+		for (const denied of ["write", "edit", "bash", "ctx_memory", "ctx_note"]) {
 			expect(toolList).not.toContain(denied);
 		}
 		// The lean extension loads (so ctx_search is registered to be gated), but
 		// the dreamer-actions flag (which adds ctx_memory) must NOT be present.
 		expect(args).not.toContain("--magic-context-dreamer-actions");
+	});
+
+	it("adds AFT read tools exactly to the intended Pi child allow-lists", () => {
+		const toolListFor = (agent: string) => {
+			const args = __test.buildArgs({ ...baseOptions, agent });
+			const idx = args.indexOf("--tools");
+			return idx >= 0 ? args[idx + 1].split(",") : [];
+		};
+		const aftReadSet = ["aft_outline", "aft_zoom", "aft_search"];
+
+		for (const agent of [
+			"dreamer-memory-mapper",
+			"dreamer-primer-investigator",
+			"dreamer-docs",
+		]) {
+			expect(toolListFor(agent)).toEqual(expect.arrayContaining(aftReadSet));
+		}
+
+		for (const agent of [
+			"magic-context-historian",
+			"historian",
+			"historian-recomp",
+			"historian-editor",
+		]) {
+			const tools = toolListFor(agent);
+			expect(tools).toContain("aft_search");
+			expect(tools).not.toContain("aft_outline");
+			expect(tools).not.toContain("aft_zoom");
+		}
+
+		for (const agent of [
+			"dreamer",
+			"magic-context-dreamer",
+			"dreamer-classifier",
+			"dreamer-reviewer",
+			"smart-note-compiler",
+			"dreamer-retrospective",
+		]) {
+			const tools = toolListFor(agent);
+			expect(tools.some((tool) => tool.startsWith("aft_"))).toBe(false);
+		}
 	});
 
 	it("parses JSON event lines and normalizes parse errors", () => {
@@ -370,12 +447,11 @@ describe("subagent-runner pure helpers", () => {
 	// running source via Bun directly, the dev fallback (no --extension)
 	// kicks in. Both shapes are valid and locked in.
 
-	it("dev mode (no bundle): does NOT pass --extension flag, so subagents run without Magic Context tools", () => {
+	it("dev mode (no bundle): does NOT pass --extension flag, so ctx_* tools are unavailable", () => {
 		// In dev mode (running .ts source), there's no dist/subagent-entry.js
 		// next to subagent-runner.ts, so resolveSubagentEntryPath() returns
-		// undefined and we skip the --extension flag. This matches the
-		// original pre-tools behavior where subagents ran with
-		// `--no-extensions` and no Magic Context tools at all.
+		// undefined and we skip the --extension flag. Discovered provider/AFT
+		// extensions still load; only Magic Context's explicit ctx_* entry is absent.
 		const args = __test.buildArgs({
 			...baseOptions,
 			agent: "historian",
@@ -510,6 +586,10 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			expect.arrayContaining(["--model", "anthropic/claude-sonnet"]),
 			expect.objectContaining({
 				cwd: "/tmp/project",
+				env: expect.objectContaining({
+					MAGIC_CONTEXT_PI_SUBAGENT: "1",
+					PATH: process.env.PATH,
+				}),
 				stdio: ["ignore", "pipe", "pipe"],
 			}),
 		);
@@ -836,15 +916,14 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
-	it("passes fallback models, cwd, and prompt arguments through spawn", async () => {
+	it("passes fallback models, cwd, prompt arguments, and merged subagent env through spawn", async () => {
 		const child = createMockChild();
 		const { runner, spawnImpl } = runnerWith(child);
 
 		const resultPromise = runner.run({
 			...baseOptions,
-			// historian takes no strict tool allow-list, so this asserts the plain
-			// spawn plumbing (model/cwd/prompt passthrough) without the per-task
-			// --tools noise that scoped dreamer agents now add.
+			// Historian now has an explicit read-only --tools allow-list; this asserts
+			// that spawn plumbing still passes model/cwd/prompt/env through around it.
 			agent: "historian",
 			model: "anthropic/primary",
 			fallbackModels: ["openai/fallback"],
@@ -866,9 +945,10 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				"--mode",
 				"json",
 				"--no-session",
-				"--no-extensions",
 				"--no-skills",
 				"--no-prompt-templates",
+				"--tools",
+				"read,grep,find,ls,aft_search",
 				"--system-prompt",
 				"system guidance",
 				"--model",
@@ -876,8 +956,18 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				// No --thinking: thinkingLevel not set in options above.
 				"summarize this session",
 			],
-			expect.objectContaining({ cwd: "/workspace/project", env: process.env }),
+			expect.objectContaining({
+				cwd: "/workspace/project",
+				env: expect.objectContaining({
+					...process.env,
+					MAGIC_CONTEXT_PI_SUBAGENT: "1",
+				}),
+			}),
 		);
+		const spawnOptions = spawnImpl.mock.calls[0]?.[2] as
+			| { env?: NodeJS.ProcessEnv }
+			| undefined;
+		expect(spawnOptions?.env).not.toBe(process.env);
 	});
 
 	it("does not let a post-terminal child signal override captured success", async () => {

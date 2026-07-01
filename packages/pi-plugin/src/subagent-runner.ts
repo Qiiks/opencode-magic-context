@@ -127,7 +127,7 @@ function resolvePiInvocation(): PiInvocation {
  * Falls back to undefined if the file isn't found at the expected
  * location — caller should treat that as a soft signal to skip the
  * `-x` flag (subagent will run without Magic Context tools, which is
- * what the original `--no-extensions` behavior gave us).
+ * acceptable for ctx_*-using agents in dev/test before the bundle exists).
  */
 function resolveSubagentEntryPath(): string | undefined {
 	try {
@@ -162,6 +162,12 @@ const SUBAGENT_ENTRY_PATH = resolveSubagentEntryPath();
  * unhappy path we SIGTERM and recover the assembled result we already have.
  */
 const TERMINAL_DRAIN_GRACE_MS = 2_000;
+
+export const MAGIC_CONTEXT_PI_SUBAGENT_ENV = "MAGIC_CONTEXT_PI_SUBAGENT";
+
+const PI_READ_ONLY_BUILTINS = ["read", "grep", "find", "ls"] as const;
+const PI_AFT_READ_TOOLS = ["aft_outline", "aft_zoom", "aft_search"] as const;
+const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS, "aft_search"] as const;
 
 /**
  * Set of subagent agent ids that get ctx_memory in the lean child extension.
@@ -198,11 +204,33 @@ const SEARCH_ONLY_SUBAGENT_TOOL_AGENTS: ReadonlySet<string> = new Set([
  * OpenCode's per-agent locked allow-list — every dreamer TASK agent runs under a
  * tight, per-task tool budget. The allow-list only KEEPS an existing
  * registration; for the ctx_* tools the lean extension must still have registered
- * them (see the *_SUBAGENT_TOOL_AGENTS sets above).
+ * them (see the *_SUBAGENT_TOOL_AGENTS sets above). For aft_* tools, Pi tolerates
+ * names that no extension registered: unknown names are absent from the registry
+ * after filtering, so listing optional AFT read tools is safe when AFT is not
+ * installed while still allowing them when an AFT provider extension is present.
  */
-const STRICT_TOOL_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map([
+const STRICT_TOOL_ALLOWLIST_ENTRIES: readonly (readonly [
+	string,
+	readonly string[],
+])[] = [
 	["dreamer-retrospective", ["ctx_search"]],
 	["smart-note-compiler", []],
+	// Pi's live historian runner uses this Magic Context-specific id for first
+	// pass, repair, two-pass editor, recomp, and memory-migration prompts. It
+	// summarizes/offloads host-rendered input and may inspect local files, but it
+	// must not mutate source or memory. Keep only read-only Pi built-ins plus
+	// aft_search (no aft_outline/aft_zoom, no ctx_* tools).
+	["magic-context-historian", PI_HISTORIAN_TOOLS],
+	// Shared OpenCode agent ids that can be passed by tests or future Pi callers.
+	// Same historian surface as magic-context-historian: local read/search only,
+	// optional aft_search, never writes or ctx_* tools.
+	["historian", PI_HISTORIAN_TOOLS],
+	["historian-recomp", PI_HISTORIAN_TOOLS],
+	["historian-editor", PI_HISTORIAN_TOOLS],
+	// Sidekick augments the user's prompt by retrieving memory. It needs the lean
+	// ctx_search registration plus Pi's read-only built-ins for safe local context,
+	// but no write/bash/ctx_memory surface.
+	["sidekick", [...PI_READ_ONLY_BUILTINS, "ctx_search"]],
 	// classify-memories: a pure metadata transform (prompt in → XML out). ZERO
 	// tools — it scores from the memory text and the host applies the columns.
 	["dreamer-classifier", []],
@@ -211,23 +239,27 @@ const STRICT_TOOL_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map([
 	// classifier). Not in any *_SUBAGENT_TOOL_AGENTS set → no extension loaded.
 	["dreamer-reviewer", []],
 	// refresh-primers code investigator: read-only investigation of the CURRENT
-	// source. Pi's own canonical read-only set is exactly {read, grep, find, ls}
-	// (createReadOnlyToolDefinitions) — NO bash/edit/write — plus our ctx_search.
-	// NO aft_* (OpenCode-only; never registered in Pi). The allow-list strips
-	// every built-in not named here, so this is the structural source-safety +
-	// cache-neutrality guarantee (no write, no ctx_memory) on the Pi side.
-	["dreamer-primer-investigator", ["read", "grep", "find", "ls", "ctx_search"]],
+	// source. Pi's own canonical read-only set is {read, grep, find, ls}
+	// (createReadOnlyToolDefinitions), plus ctx_search and the optional AFT read
+	// navigation tools OpenCode grants. NO bash/edit/write and NO ctx_memory.
+	[
+		"dreamer-primer-investigator",
+		[...PI_READ_ONLY_BUILTINS, ...PI_AFT_READ_TOOLS, "ctx_search"],
+	],
 	// map-memories / verify reader: read-only check against the CURRENT LOCAL
-	// source. Same read-only lock as the primer investigator but WITHOUT
-	// ctx_search — these tasks read local code, not cross-session recall. The host
-	// applies the manifest's DB writes, so no ctx_memory is needed.
-	["dreamer-memory-mapper", ["read", "grep", "find", "ls"]],
+	// source. Same read-only lock as the primer investigator but WITHOUT ctx_search
+	// — these tasks read local code, not cross-session recall. The host applies the
+	// manifest's DB writes, so no ctx_memory is needed.
+	["dreamer-memory-mapper", [...PI_READ_ONLY_BUILTINS, ...PI_AFT_READ_TOOLS]],
 	// maintain-docs: explores the codebase and writes ARCHITECTURE.md/STRUCTURE.md.
-	// All 7 Pi built-ins (read/grep/find/ls + write/edit + bash; git runs via
-	// bash, there is no separate git tool), and deliberately NO ctx_memory — it
-	// edits docs, never the memory store. Not in any *_SUBAGENT_TOOL_AGENTS set,
-	// so the lean extension is never loaded and ctx_memory cannot leak in.
-	["dreamer-docs", ["read", "grep", "find", "ls", "write", "edit", "bash"]],
+	// All 7 Pi built-ins (read/grep/find/ls + bash/write/edit; git runs via bash),
+	// plus optional AFT read navigation. Deliberately NO ctx_memory/ctx_search — it
+	// edits docs, never the memory store. Not in any *_SUBAGENT_TOOL_AGENTS set, so
+	// the lean extension is never loaded and ctx_memory cannot leak in.
+	[
+		"dreamer-docs",
+		[...PI_READ_ONLY_BUILTINS, "bash", "write", "edit", ...PI_AFT_READ_TOOLS],
+	],
 	// curate (base `dreamer`): memory-pool hygiene via ctx_memory ONLY. It is in
 	// DREAMER_ACTION_AGENTS so the lean extension registers ctx_memory; this
 	// allow-list then strips ALL 7 built-ins, leaving only the extension-provided
@@ -237,7 +269,28 @@ const STRICT_TOOL_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map([
 	// Same ctx_memory-only lock as `dreamer`; must stay in sync with
 	// DREAMER_ACTION_AGENTS (every member needs a strict entry).
 	["magic-context-dreamer", ["ctx_memory"]],
-]);
+];
+
+const STRICT_TOOL_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map(
+	STRICT_TOOL_ALLOWLIST_ENTRIES,
+);
+
+const KNOWN_PI_SUBAGENT_AGENTS = [
+	"magic-context-historian",
+	"historian",
+	"historian-recomp",
+	"historian-editor",
+	"sidekick",
+	"dreamer-retrospective",
+	"smart-note-compiler",
+	"dreamer-classifier",
+	"dreamer-reviewer",
+	"dreamer-primer-investigator",
+	"dreamer-memory-mapper",
+	"dreamer-docs",
+	"dreamer",
+	"magic-context-dreamer",
+] as const;
 
 function inferAccountingSubagent(agent: string): SubagentKind {
 	if (agent.includes("sidekick")) return "sidekick";
@@ -471,10 +524,13 @@ export class PiSubagentRunner implements SubagentRunner {
 					[...this.invocation.prefixArgs, ...args],
 					{
 						cwd: options.cwd,
-						// Inherit env so OAuth tokens (~/.pi/agent/auth.json),
-						// API key env vars, and PATH all flow through. The Pi
-						// CLI reads its own auth state from disk on startup.
-						env: process.env,
+						// Merge over the parent env so PATH/HOME/auth variables flow
+						// through for provider extensions. The guard only disables Magic
+						// Context's full entry; it must not replace the process env.
+						env: {
+							...process.env,
+							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
+						},
 						// stdout = JSON events; stderr = diagnostics. stdin is a pipe
 						// ONLY on the large-prompt path (we write the message then end
 						// it); otherwise it stays closed because the message rides in
@@ -989,47 +1045,38 @@ export function buildArgs(
 		// historian etc. stay invisible to the user even though they're
 		// real LLM rounds the user pays for.
 		"--no-session",
-		// Disable extension/skill/template discovery in the spawned child
-		// for two reasons:
-		//   (1) Recursion: without this, every historian/sidekick/dreamer
-		//       subagent process loads the magic-context plugin again,
-		//       which itself can register its own historian trigger that
-		//       fires on the child's brief turn — leading to nested spawn
-		//       cycles that just waste API calls and tokens.
-		//   (2) Performance: skill/template discovery scans the filesystem
-		//       at startup. Subagents don't need any of that — they have
-		//       a focused system prompt and one user message.
-		"--no-extensions",
+		// Keep extension discovery ON for child processes. Provider extensions
+		// (anthropic-auth, google-antigravity, OpenAI/Codex variants, etc.) must
+		// load so their models resolve, and AFT's Pi extension must load so optional
+		// aft_* read tools can register. Recursion is prevented at the Magic Context
+		// entry point instead: the child env sets MAGIC_CONTEXT_PI_SUBAGENT=1, and
+		// the full entry no-ops before registering hooks/tools/timers. Skills and
+		// prompt templates remain disabled because they are pure startup overhead for
+		// focused one-shot subagents.
 		"--no-skills",
 		"--no-prompt-templates",
-		// --no-tools is intentionally NOT set: historian and dreamer use
-		// Pi's built-in tools (Edit, Write, etc.) for some maintenance
-		// tasks. Sidekick uses ctx_search via the lean subagent extension
-		// loaded with `-x` below.
+		// --no-tools is applied below only for unknown or explicitly zero-tool agents.
+		// Every known Magic Context child gets an explicit --tools allow-list so Pi's
+		// discovered extension registry cannot leak unrelated tools into subagents.
 	];
 
-	// Load Magic Context's lean subagent extension entry alongside
-	// `--no-extensions`. Verified at pi-coding-agent
-	// resource-loader.js:272-274: `--no-extensions` skips Pi's
-	// discovered-extensions scan but still loads explicit `--extension`
-	// paths, so sidekick gets ctx_search and dreamer gets ctx_search + ctx_memory
-	// without recursion risk (the lean entry never registers
-	// historian, dreamer, transform, or any other event handler that
-	// could spawn further subagents). When the bundle isn't present
-	// (e.g. running source from src/ without a build), skip the flag —
-	// the subagent will run without Magic Context tools, matching the
-	// original `--no-extensions` behavior.
+	// Load Magic Context's lean subagent extension entry in children that need the
+	// scoped ctx_* tools. Discovered extensions are now intentionally enabled so
+	// provider/AFT extensions can register, while the full Magic Context entry sees
+	// MAGIC_CONTEXT_PI_SUBAGENT=1 and returns before wiring recursive hooks. The
+	// lean entry is explicitly loaded via --extension and is NOT guarded; it only
+	// registers subagent-scoped tools and never historian/dreamer/event handlers.
+	// When the bundle isn't present (e.g. running source from src/ without a build),
+	// skip the flag — the affected subagent simply lacks Magic Context ctx_* tools.
 	//
 	// We use the long form `--extension` (not the `-e` short form) to
 	// avoid clashes with extension-registered flags. Older Pi versions
 	// also exposed `-x`, but that alias was removed in 0.71+ — newer
 	// versions hard-fail with "Unknown option: -x".
-	// Do not load the lean Magic Context extension for historian/compressor
-	// style subagents. In e2e/prod the parent Pi process can run under Bun while
-	// the spawned Pi CLI resolves to Node; loading our extension there pulls in
-	// better-sqlite3's Bun-built native module and hard-fails before the model
-	// call. Historian/compressor do not need ctx_* tools, so keep them extension-
-	// free. Tool-using agents (sidekick/dreamer) still receive the lean entry.
+	// Do not load the lean Magic Context extension for historian/compressor style
+	// subagents. They do not use ctx_* tools, and loading the entry would add
+	// startup cost and an avoidable tool-registration surface. Tool-using agents
+	// (sidekick/dreamer) still receive the lean entry.
 	const shouldLoadSubagentExtension =
 		SUBAGENT_ENTRY_PATH &&
 		(SEARCH_ONLY_SUBAGENT_TOOL_AGENTS.has(options.agent) ||
@@ -1045,13 +1092,19 @@ export function buildArgs(
 		}
 	}
 
-	// HARD tool isolation: privacy-critical agents (dreamer-retrospective) run
-	// under `--tools <names>`, Pi's registry-build allow-list. This strips ALL
-	// built-ins (read/bash/edit/write) and every non-listed extension tool, so
-	// even if the lean extension exposed more, only the named tools survive. NOT
-	// `--no-tools` (that disables EVERYTHING, including the ctx_search we need).
+	// HARD tool isolation: every Magic Context child runs under either
+	// `--tools <names>` or `--no-tools`. Pi applies this allow-list while building
+	// the registry, so it strips ALL non-listed built-ins and every non-listed
+	// extension tool. Unknown agent ids fail closed to --no-tools; discovery is on
+	// for provider/AFT extensions, but the subagent registry is still per-agent.
 	const strictTools = STRICT_TOOL_ALLOWLIST.get(options.agent);
-	if (strictTools) {
+	if (strictTools === undefined) {
+		sessionLog(
+			options.accountingSessionId ?? "pi-subagent",
+			`Pi subagent agent "${options.agent}" has no strict tool allow-list; forcing --no-tools`,
+		);
+		args.push("--no-tools");
+	} else {
 		if (strictTools.length > 0) {
 			args.push("--tools", strictTools.join(","));
 		} else {
@@ -1224,5 +1277,6 @@ export const __test = {
 	parsePiEventLine,
 	terminateChild,
 	DREAMER_ACTION_AGENTS,
+	KNOWN_PI_SUBAGENT_AGENTS,
 	STRICT_TOOL_ALLOWLIST,
 };

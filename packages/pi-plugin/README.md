@@ -147,7 +147,7 @@ This package is part of the [magic-context monorepo](https://github.com/cortexki
 | Pi-specific module | Responsibility |
 |---|---|
 | `context-handler.ts` | Pi `pi.on("context", ...)` adapter — tags, drops, runs nudges and auto-search |
-| `subagent-runner.ts` | Spawns `pi --print --mode json --no-extensions --extension <lean-entry> ...` for historian/sidekick/dreamer subagents, with a 2-second drain after the terminal `message_end` so child processes don't keep the parent waiting |
+| `subagent-runner.ts` | Spawns `pi --print --mode json --no-session ...` for historian/sidekick/dreamer subagents, keeps extension discovery on for provider/AFT extensions, sets `MAGIC_CONTEXT_PI_SUBAGENT=1` so the full Magic Context entry no-ops, and applies a per-agent `--tools`/`--no-tools` allow-list plus a 2-second terminal drain |
 | `tools/` | Pi `pi.registerTool` wrappers around the shared tool implementations |
 | `commands/` | Pi `pi.registerCommand` wrappers for the five `/ctx-*` slash commands |
 | `dreamer/` | Pi-side adapter for the shared dreamer scheduler |

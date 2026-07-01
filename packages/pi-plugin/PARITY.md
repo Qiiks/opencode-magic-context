@@ -543,7 +543,27 @@ channel) — it reflects `task_schedule_state` read-only.
 
 ---
 
-## 20. Refresh-primers investigation toolset: OpenCode has `aft_*`, Pi does not
+## 20. Pi subagents discover extensions, then fail closed with per-agent tools
+
+Pi child agents are spawned as `pi --print --mode json --no-session` subprocesses.
+They deliberately keep extension discovery **enabled** so auth/provider extensions
+can register models (for example `google-antigravity/*`) and the AFT Pi extension
+can register read tools. Recursion is blocked at the Magic Context entry point
+instead: every child environment includes `MAGIC_CONTEXT_PI_SUBAGENT=1`, and the
+full `index.ts` entry returns before registering tools, event handlers, DB work,
+or timers. Children that need Magic Context's scoped `ctx_*` tools still load the
+explicit lean `subagent-entry.js`; that entry is not guarded.
+
+Because discovery is on, every child also receives an explicit registry gate:
+known agents get `--tools <agent-specific allow-list>`, zero-tool agents get
+`--no-tools`, and unknown agent ids fail closed to `--no-tools` with a warning.
+Pi applies `--tools` during registry construction across both built-ins and
+extension-registered tools, so non-listed extension tools (including write-capable
+AFT tools) do not enter the child registry.
+
+---
+
+## 21. Refresh-primers investigation toolset includes optional AFT read tools
 
 The open-book `refresh-primers` task runs a locked, read-only code-investigation
 agent (`dreamer-primer-investigator`) that digs into the CURRENT source to ground
@@ -552,22 +572,21 @@ a primer's answer. The agent is intentionally read-only — no `write`/`edit`/
 bumps the project memory epoch and busts m[0], breaking the primers cache-neutral
 contract).
 
-The investigation TOOLSET differs by harness, and this is a deliberate,
-documented divergence — NOT a parity bug:
+The investigation TOOLSET now matches OpenCode's read-navigation intent while
+staying Pi-safe:
 
 - **OpenCode** allow-list: `read, grep, glob, aft_outline, aft_zoom, aft_search,
   ctx_search` — including AST-aware navigation (`aft_*`).
-- **Pi** strict `--tools` allow-list: `read, grep, find, ls, ctx_search` — Pi's
-  own canonical read-only built-in set (`createReadOnlyToolDefinitions`) plus
-  `ctx_search`. The `aft_*` tools are OpenCode-only and are never registered in
-  Pi; adding them to the lean child extension would also risk the documented
-  Bun/Node native-module collision that keeps historian out of the extension.
+- **Pi** strict `--tools` allow-list: `read, grep, find, ls, aft_outline,
+  aft_zoom, aft_search, ctx_search` — Pi's canonical read-only built-in set
+  (`createReadOnlyToolDefinitions`) plus optional AFT read tools and `ctx_search`.
+  If the AFT extension is not installed, Pi silently omits those unknown names
+  from the registry.
 
-So Pi's investigation is structurally weaker (no AST-aware navigation) but
-equally safe (same read-only + cache-neutral guarantee, enforced by the
-registry-build allow-list). The agent is in `SEARCH_ONLY_SUBAGENT_TOOL_AGENTS`
-(loads the lean extension so `ctx_search` is registered) but NOT in
-`DREAMER_ACTION_AGENTS` (which would add `ctx_memory`).
+The agent remains read-only and cache-neutral: no `write`/`edit`/`bash`, no
+`ctx_memory`/`ctx_note`. It is in `SEARCH_ONLY_SUBAGENT_TOOL_AGENTS` (loads the
+lean extension so `ctx_search` is registered) but NOT in `DREAMER_ACTION_AGENTS`
+(which would add `ctx_memory`).
 
 Origin-tag emission (the historian tagging each primer candidate with its origin
 compartment) IS mirrored across both harness historian runners — that part is
@@ -575,27 +594,29 @@ true parity.
 
 ---
 
-## 21. Dreamer map-memories / verify prompts vs Pi tool names
+## 22. Dreamer map-memories / verify prompts vs Pi tool names
 
 Shared dreamer task prompts for **map-memories** and **verify** (and related
 read-only code checks) were authored against OpenCode's tool surface: they mention
 names like `glob`, `aft_search`, `aft_outline`, and `aft_zoom`. On Pi those agents
-run under a strict `--tools` allow-list of Pi's own read-only built-ins only:
-`read`, `grep`, `find`, `ls` (see `dreamer-memory-mapper` in
-`subagent-runner.ts`). Pi never registers `glob` or any `aft_*` tool in child
-subagent processes.
+run under a strict `--tools` allow-list of Pi's read-only built-ins plus optional
+AFT read tools: `read`, `grep`, `find`, `ls`, `aft_outline`, `aft_zoom`, and
+`aft_search` (see `dreamer-memory-mapper` in `subagent-runner.ts`). Pi still has
+no `glob`; the closest built-in is `find`.
 
 This is intentional — we do **not** fork the shared prompts per harness. The model
-simply ignores tool names in the prompt that are not in its registry and uses
-whatever read-only tools it actually has. That behavior is harmless for these
-tasks (local code read + structured manifest output; the host applies DB writes).
+uses the registered read-only tools it actually has; if AFT is absent, Pi ignores
+the listed-but-unregistered `aft_*` names and the task falls back to the built-ins.
+That behavior is harmless for these tasks (local code read + structured manifest
+output; the host applies DB writes).
 
-Same pattern as §20 (refresh-primers investigator): OpenCode gets richer
-navigation tools; Pi gets an equally safe, narrower built-in set.
+Same safety pattern as §21 (refresh-primers investigator): OpenCode and Pi both
+stay read-only; Pi maps `glob` to its `find`/`ls` built-ins and optionally gains
+AFT navigation when the AFT extension is installed.
 
 ---
 
-## 22. Shrinking model-switch overflow: OpenCode arms proactively; Pi is covered by the forward-pressure floor
+## 23. Shrinking model-switch overflow: OpenCode arms proactively; Pi is covered by the forward-pressure floor
 
 When a session switches mid-conversation from a large-context model to a smaller
 one (e.g. 512k → 272k) while carrying more history than the new model's window,
@@ -631,7 +652,7 @@ firmly outside this edge. If it ever surfaces, the clean Pi fix is
 
 ---
 
-## 23. `ctx_memory` registration: OpenCode gates on launch config; Pi always registers + relies on the per-call guard
+## 24. `ctx_memory` registration: OpenCode gates on launch config; Pi always registers + relies on the per-call guard
 
 When `memory.enabled` is false, the `<project-memory>` block is never injected,
 so an agent's `ctx_memory` writes can never resurface. Both harnesses drop the
