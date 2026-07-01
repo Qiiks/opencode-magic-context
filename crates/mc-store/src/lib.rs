@@ -18,6 +18,7 @@ use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Migration namespace for the cache-state domain (one DB can host several
 /// independent namespaces; this is ours).
@@ -224,6 +225,174 @@ impl StoredMemoryMutation {
     }
 }
 
+/// The durable historian single-flight phase. The phase lives in [`ModuleMeta`] so
+/// the same row-version CAS that guards cache-state commits also guards writer
+/// orchestration: a stale producer can never publish against a newer module state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorianPhase {
+    #[default]
+    Idle,
+    Firing,
+    AwaitingProducer,
+    Validating,
+    Publishing,
+}
+
+impl HistorianPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HistorianPhase::Idle => "idle",
+            HistorianPhase::Firing => "firing",
+            HistorianPhase::AwaitingProducer => "awaiting_producer",
+            HistorianPhase::Validating => "validating",
+            HistorianPhase::Publishing => "publishing",
+        }
+    }
+}
+
+/// Inclusive ordinal range pinned for one historian run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistorianChunkRange {
+    pub from_ordinal: u64,
+    pub to_ordinal: u64,
+}
+
+/// The durable historian state stored inside [`ModuleMeta`]. Idle keeps
+/// `firing_seq` as the monotonic last-issued sequence and clears the in-flight
+/// identifiers; abandon paths additionally set `failure_backoff_at_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistorianDurableState {
+    #[serde(default)]
+    pub state: HistorianPhase,
+    #[serde(default)]
+    pub firing_seq: u64,
+    #[serde(default)]
+    pub chunk_range: Option<HistorianChunkRange>,
+    #[serde(default)]
+    pub chunk_fingerprint: String,
+    #[serde(default)]
+    pub producer_session_id: Option<String>,
+    #[serde(default)]
+    pub producer_run_id: Option<String>,
+    #[serde(default)]
+    pub fired_at_ms: Option<i64>,
+    #[serde(default)]
+    pub failure_backoff_at_ms: Option<i64>,
+}
+
+impl Default for HistorianDurableState {
+    fn default() -> Self {
+        HistorianDurableState {
+            state: HistorianPhase::Idle,
+            firing_seq: 0,
+            chunk_range: None,
+            chunk_fingerprint: String::new(),
+            producer_session_id: None,
+            producer_run_id: None,
+            fired_at_ms: None,
+            failure_backoff_at_ms: None,
+        }
+    }
+}
+
+/// A validated historian fact that may become a project memory. Validation owns
+/// category semantics; the store performs only durable exact-content de-duplication.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FactCandidate {
+    pub category: String,
+    pub content: String,
+    pub importance: Option<i32>,
+    pub expires_at: Option<i64>,
+    pub source_session_id: Option<String>,
+}
+
+/// A newly promoted project-memory row, returned so post-commit embedding can target
+/// exactly the additive rows created by the publication transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotedRef {
+    pub memory_id: i64,
+    pub content: String,
+}
+
+/// The stale-producer predicate checked inside the publish transaction before any
+/// additive writes occur. Every field must match the durable state row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorianPublishPredicate {
+    pub firing_seq: u64,
+    pub producer_run_id: String,
+    pub chunk_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorianPublishResult {
+    pub row_version: u64,
+    pub promoted_refs: Vec<PromotedRef>,
+}
+
+pub struct HistorianPublishRequest<'a> {
+    pub session_id: &'a str,
+    pub expected_row_version: Option<u64>,
+    pub predicate: &'a HistorianPublishPredicate,
+    pub project_path: &'a str,
+    pub compartments: &'a [StoredCompartment],
+    pub facts: &'a [FactCandidate],
+    pub publication_floor_ordinal: u64,
+}
+
+/// Typed publish failures. CAS and state mismatches are deliberately separate so a
+/// caller can tell "another writer already committed" from "this producer is stale."
+#[derive(Debug)]
+pub enum HistorianPublishError {
+    Store(McStoreError),
+    CasConflict {
+        expected: Option<u64>,
+        found: u64,
+    },
+    StateMismatch {
+        expected: Box<HistorianPublishPredicate>,
+        found: Box<HistorianDurableState>,
+    },
+    InvalidState {
+        state: String,
+    },
+    Serde(String),
+}
+
+impl std::fmt::Display for HistorianPublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HistorianPublishError::Store(e) => write!(f, "store: {e}"),
+            HistorianPublishError::CasConflict { expected, found } => {
+                write!(f, "publish CAS conflict: expected {expected:?}, found {found}")
+            }
+            HistorianPublishError::StateMismatch { expected, found } => write!(
+                f,
+                "historian publish state mismatch: expected seq {} run {} fingerprint {}, found {:?}",
+                expected.firing_seq, expected.producer_run_id, expected.chunk_fingerprint, found
+            ),
+            HistorianPublishError::InvalidState { state } => {
+                write!(f, "historian publish invalid state: {state}")
+            }
+            HistorianPublishError::Serde(e) => write!(f, "serde: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for HistorianPublishError {}
+
+impl From<McStoreError> for HistorianPublishError {
+    fn from(e: McStoreError) -> Self {
+        HistorianPublishError::Store(e)
+    }
+}
+
+impl From<StoreError> for HistorianPublishError {
+    fn from(e: StoreError) -> Self {
+        HistorianPublishError::Store(McStoreError::Store(e))
+    }
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -272,6 +441,20 @@ pub struct ModuleMeta {
     /// 0 before the first HARD.
     #[serde(default)]
     pub expiry_cutoff_ms: i64,
+
+    // --- historian writer orchestration ---
+    /// Durable single-flight state for the background historian. It is intentionally
+    /// colocated with the cache meta blob: publish can CAS the state row and append
+    /// rows in one SQLite transaction without introducing a second concurrency token.
+    /// These fields never feed render bytes; they only decide whether a producer may
+    /// publish or be reattached after restart.
+    #[serde(default)]
+    pub historian: HistorianDurableState,
+    /// The trigger-only protected-tail floor advanced by a successful publication.
+    /// This is distinct from `coverage_ordinal`: coverage drives render/splice output,
+    /// while this floor only anchors future historian trigger selection.
+    #[serde(default)]
+    pub publication_floor_ordinal: Option<u64>,
 }
 
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
@@ -366,6 +549,14 @@ impl From<StoreError> for McStoreError {
 enum CommitOutcome {
     Committed(u64),
     CasConflict(u64),
+}
+
+enum PublishTxnOutcome {
+    Committed(HistorianPublishResult),
+    CasConflict(u64),
+    StateMismatch(HistorianDurableState),
+    InvalidState(String),
+    Serde(String),
 }
 
 /// The Magic Context cache-state store: one single-writer SQLite handle for the
@@ -573,6 +764,138 @@ impl McStore {
             Ok(())
         })?;
         Ok(())
+    }
+
+    /// Append compartments at the current tail without renumbering existing rows.
+    /// The incoming `sequence` values are treated as producer-local hints; durable
+    /// sequences are assigned contiguously after the current max so concurrent readers
+    /// never observe gaps or rewritten history.
+    pub fn append_compartments(
+        &self,
+        session_id: &str,
+        compartments: &[StoredCompartment],
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            append_compartments_tx(tx, session_id, compartments)?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Promote validated historian facts into project memories using exact-content
+    /// de-duplication against the active render set. This path is additive only: it
+    /// inserts new `mc_memories` rows and never writes mutation-log rows, so the next
+    /// m1/materialization pass observes the rows solely through the max-memory-id
+    /// watermark.
+    pub fn promote_facts(
+        &self,
+        project_path: &str,
+        facts: &[FactCandidate],
+    ) -> Result<Vec<PromotedRef>, McStoreError> {
+        let promoted = self
+            .inner
+            .with_conn_fenced(|tx| promote_facts_tx(tx, project_path, facts))?;
+        Ok(promoted)
+    }
+
+    /// Publish a validated historian chunk in one CAS-gated transaction. The publish
+    /// predicate proves the producer still matches the exact firing that created the
+    /// chunk; stale reattaches or a second racing publisher fail before any rows are
+    /// appended. The transaction intentionally leaves render state (`CoreState`,
+    /// `coverage_ordinal`, watermarks, and m1 revision) untouched: new rows become
+    /// visible only through the existing store watermarks on a later materializing pass.
+    pub fn publish_historian_chunk(
+        &self,
+        request: HistorianPublishRequest<'_>,
+    ) -> Result<HistorianPublishResult, HistorianPublishError> {
+        let session_id = request.session_id;
+        let expected_row_version = request.expected_row_version;
+        let predicate = request.predicate;
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+
+            let Some((current, meta_json)) = row else {
+                return Ok(PublishTxnOutcome::InvalidState("missing".to_string()));
+            };
+
+            let cas_ok = match expected_row_version {
+                Some(v) => current == v as i64,
+                None => current == NO_ROW,
+            };
+            if !cas_ok {
+                return Ok(PublishTxnOutcome::CasConflict(current.max(0) as u64));
+            }
+
+            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+                Ok(meta) => meta,
+                Err(e) => return Ok(PublishTxnOutcome::Serde(e.to_string())),
+            };
+
+            if !matches!(
+                meta.historian.state,
+                HistorianPhase::Publishing | HistorianPhase::AwaitingProducer
+            ) {
+                return Ok(PublishTxnOutcome::InvalidState(
+                    meta.historian.state.as_str().to_string(),
+                ));
+            }
+
+            let predicate_matches = meta.historian.firing_seq == predicate.firing_seq
+                && meta.historian.producer_run_id.as_deref()
+                    == Some(predicate.producer_run_id.as_str())
+                && meta.historian.chunk_fingerprint == predicate.chunk_fingerprint;
+            if !predicate_matches {
+                return Ok(PublishTxnOutcome::StateMismatch(meta.historian));
+            }
+
+            append_compartments_tx(tx, session_id, request.compartments)?;
+            let promoted_refs = promote_facts_tx(tx, request.project_path, request.facts)?;
+
+            meta.publication_floor_ordinal = Some(
+                meta.publication_floor_ordinal
+                    .unwrap_or(1)
+                    .max(request.publication_floor_ordinal.max(1)),
+            );
+            meta.historian = idle_historian_after_success(meta.historian.firing_seq);
+
+            let next = current as u64 + 1;
+            let meta_json = match serde_json::to_string(&meta) {
+                Ok(json) => json,
+                Err(e) => return Ok(PublishTxnOutcome::Serde(e.to_string())),
+            };
+            tx.execute(
+                "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
+                 WHERE session_id = ?1 AND row_version = ?4",
+                params![session_id, next as i64, meta_json, current],
+            )?;
+
+            Ok(PublishTxnOutcome::Committed(HistorianPublishResult {
+                row_version: next,
+                promoted_refs,
+            }))
+        })?;
+
+        match outcome {
+            PublishTxnOutcome::Committed(result) => Ok(result),
+            PublishTxnOutcome::CasConflict(found) => Err(HistorianPublishError::CasConflict {
+                expected: expected_row_version,
+                found,
+            }),
+            PublishTxnOutcome::StateMismatch(found) => Err(HistorianPublishError::StateMismatch {
+                expected: Box::new(predicate.clone()),
+                found: Box::new(found),
+            }),
+            PublishTxnOutcome::InvalidState(state) => {
+                Err(HistorianPublishError::InvalidState { state })
+            }
+            PublishTxnOutcome::Serde(e) => Err(HistorianPublishError::Serde(e)),
+        }
     }
 
     /// Load a project's render-eligible memories: `active` + `permanent`, excluding
@@ -1040,6 +1363,140 @@ impl McStore {
             Ok(())
         })?;
         Ok(())
+    }
+}
+
+fn insert_compartment_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    sequence: i64,
+    c: &StoredCompartment,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO mc_compartments
+           (session_id, sequence, start_message, end_message, start_message_id,
+            end_message_id, title, content, p1, p2, p3, p4, importance,
+            episode_type, legacy, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        params![
+            session_id,
+            sequence,
+            c.start_message,
+            c.end_message,
+            &c.start_message_id,
+            &c.end_message_id,
+            &c.title,
+            &c.content,
+            c.p1.as_deref(),
+            c.p2.as_deref(),
+            c.p3.as_deref(),
+            c.p4.as_deref(),
+            c.importance as i64,
+            c.episode_type.as_deref(),
+            c.legacy as i64,
+            c.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_compartments_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    compartments: &[StoredCompartment],
+) -> rusqlite::Result<()> {
+    if compartments.is_empty() {
+        return Ok(());
+    }
+    let tail: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    for (idx, compartment) in compartments.iter().enumerate() {
+        insert_compartment_tx(tx, session_id, tail + idx as i64 + 1, compartment)?;
+    }
+    Ok(())
+}
+
+fn promote_facts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_path: &str,
+    facts: &[FactCandidate],
+) -> rusqlite::Result<Vec<PromotedRef>> {
+    let mut active_content = HashSet::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT content FROM mc_memories
+             WHERE project_path = ?1 AND status IN ('active', 'permanent')",
+        )?;
+        let rows = stmt.query_map(params![project_path], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            active_content.insert(row?);
+        }
+    }
+
+    let mut next_nonce: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM mc_memories",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut promoted = Vec::new();
+
+    for fact in facts {
+        if fact.category.trim().is_empty() || fact.content.trim().is_empty() {
+            continue;
+        }
+        if active_content.contains(&fact.content) {
+            continue;
+        }
+
+        let normalized_hash = format!(
+            "historian-exact:{:016x}:{next_nonce}",
+            stable_content_hash(&fact.content)
+        );
+        tx.execute(
+            "INSERT INTO mc_memories
+               (project_path, category, content, normalized_hash, importance,
+                source_session_id, source_type, seen_count, retrieval_count,
+                first_seen_at, created_at, updated_at, last_seen_at, status,
+                expires_at, verification_status)
+             VALUES (?1,?2,?3,?4,?5,?6,'historian',1,0,0,0,0,0,'active',?7,'unverified')",
+            params![
+                project_path,
+                &fact.category,
+                &fact.content,
+                normalized_hash,
+                fact.importance.map(i64::from),
+                fact.source_session_id.as_deref(),
+                fact.expires_at,
+            ],
+        )?;
+        let memory_id = tx.last_insert_rowid();
+        active_content.insert(fact.content.clone());
+        promoted.push(PromotedRef {
+            memory_id,
+            content: fact.content.clone(),
+        });
+        next_nonce += 1;
+    }
+
+    Ok(promoted)
+}
+
+fn stable_content_hash(content: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn idle_historian_after_success(firing_seq: u64) -> HistorianDurableState {
+    HistorianDurableState {
+        firing_seq,
+        ..HistorianDurableState::default()
     }
 }
 
@@ -1585,5 +2042,246 @@ mod tests {
             .resolve_workspace_membership("git:loner")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn append_compartments_preserves_existing_rows_and_assigns_tail_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let c1 = StoredCompartment {
+            sequence: 1,
+            start_message: 1,
+            end_message: 2,
+            end_message_id: "m2".into(),
+            title: "old-1".into(),
+            content: "old one".into(),
+            ..Default::default()
+        };
+        let c2 = StoredCompartment {
+            sequence: 2,
+            start_message: 3,
+            end_message: 4,
+            end_message_id: "m4".into(),
+            title: "old-2".into(),
+            content: "old two".into(),
+            ..Default::default()
+        };
+        store
+            .replace_compartments("ses", &[c1.clone(), c2.clone()])
+            .unwrap();
+
+        let appended = StoredCompartment {
+            sequence: 99,
+            start_message: 5,
+            end_message: 6,
+            end_message_id: "m6".into(),
+            title: "new".into(),
+            content: "new tail".into(),
+            ..Default::default()
+        };
+        store.append_compartments("ses", &[appended]).unwrap();
+
+        let rows = store.load_compartments("ses").unwrap();
+        let seqs: Vec<i64> = rows.iter().map(|c| c.sequence).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        assert_eq!(rows[0].title, c1.title);
+        assert_eq!(rows[1].title, c2.title);
+        assert_eq!(rows[2].title, "new");
+    }
+
+    #[test]
+    fn promote_facts_exact_dedup_skips_duplicates_and_advances_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .seed_memory(1, "git:proj", "ARCHITECTURE", "already active", 70)
+            .unwrap();
+        let before = store.max_memory_id(&["git:proj".to_string()]).unwrap();
+
+        let promoted = store
+            .promote_facts(
+                "git:proj",
+                &[
+                    FactCandidate {
+                        category: "ARCHITECTURE".into(),
+                        content: "already active".into(),
+                        ..Default::default()
+                    },
+                    FactCandidate {
+                        category: "ARCHITECTURE".into(),
+                        content: "new fact".into(),
+                        importance: Some(80),
+                        ..Default::default()
+                    },
+                    FactCandidate {
+                        category: "CONSTRAINTS".into(),
+                        content: "new fact".into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(before, 1);
+        assert_eq!(promoted.len(), 1, "duplicate active content is skipped");
+        assert_eq!(promoted[0].content, "new fact");
+        let after = store.max_memory_id(&["git:proj".to_string()]).unwrap();
+        assert_eq!(after, promoted[0].memory_id);
+        assert!(after > before, "additive insert advances max_memory_id");
+        let active = store.load_active_memories("git:proj", 0).unwrap();
+        let contents: Vec<&str> = active.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["new fact", "already active"]);
+    }
+
+    fn publishing_meta() -> ModuleMeta {
+        ModuleMeta {
+            historian: HistorianDurableState {
+                state: HistorianPhase::Publishing,
+                firing_seq: 7,
+                chunk_range: Some(HistorianChunkRange {
+                    from_ordinal: 10,
+                    to_ordinal: 20,
+                }),
+                chunk_fingerprint: "fp".into(),
+                producer_session_id: Some("producer-session".into()),
+                producer_run_id: Some("run-1".into()),
+                fired_at_ms: Some(123),
+                failure_backoff_at_ms: Some(456),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn publish_predicate() -> HistorianPublishPredicate {
+        HistorianPublishPredicate {
+            firing_seq: 7,
+            producer_run_id: "run-1".into(),
+            chunk_fingerprint: "fp".into(),
+        }
+    }
+
+    fn publish_compartment() -> StoredCompartment {
+        StoredCompartment {
+            start_message: 10,
+            end_message: 20,
+            end_message_id: "m20".into(),
+            title: "published".into(),
+            content: "published summary".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn publish_historian_chunk_is_cas_gated_and_double_publish_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        let loaded = store.load("ses").unwrap();
+        let expected = loaded.row_version;
+
+        let first = store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[FactCandidate {
+                    category: "ARCHITECTURE".into(),
+                    content: "published fact".into(),
+                    ..Default::default()
+                }],
+                publication_floor_ordinal: 21,
+            })
+            .unwrap();
+        assert_eq!(first.row_version, 2);
+
+        let err = store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[],
+                publication_floor_ordinal: 21,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, HistorianPublishError::CasConflict { .. }),
+            "second racing publisher must hit the row-version CAS: {err:?}"
+        );
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(loaded.meta.historian.firing_seq, 7);
+        assert_eq!(loaded.meta.publication_floor_ordinal, Some(21));
+        assert_eq!(store.max_memory_id(&["git:proj".to_string()]).unwrap(), 1);
+    }
+
+    #[test]
+    fn publish_historian_chunk_rejects_wrong_fingerprint_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        let expected = store.load("ses").unwrap().row_version;
+        let wrong = HistorianPublishPredicate {
+            chunk_fingerprint: "different".into(),
+            ..publish_predicate()
+        };
+
+        let err = store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                predicate: &wrong,
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[FactCandidate {
+                    category: "ARCHITECTURE".into(),
+                    content: "should not insert".into(),
+                    ..Default::default()
+                }],
+                publication_floor_ordinal: 21,
+            })
+            .unwrap_err();
+        assert!(matches!(err, HistorianPublishError::StateMismatch { .. }));
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        assert_eq!(store.max_memory_id(&["git:proj".to_string()]).unwrap(), 0);
+        assert_eq!(
+            store.load("ses").unwrap().meta.historian.state,
+            HistorianPhase::Publishing
+        );
+    }
+
+    #[test]
+    fn publish_historian_chunk_fails_loud_from_non_publish_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &ModuleMeta::default())
+            .unwrap();
+        let expected = store.load("ses").unwrap().row_version;
+
+        let err = store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[],
+                publication_floor_ordinal: 21,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, HistorianPublishError::InvalidState { ref state } if state == "idle"),
+            "idle state must fail loudly: {err:?}"
+        );
+        assert!(store.load_compartments("ses").unwrap().is_empty());
     }
 }
