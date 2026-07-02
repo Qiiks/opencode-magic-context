@@ -317,7 +317,7 @@ impl TriggerReason {
 }
 
 /// Pure trigger result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TriggerDecision {
     /// True when the historian should fire.
     pub fire: bool,
@@ -325,6 +325,9 @@ pub struct TriggerDecision {
     pub reason: Option<TriggerReason>,
     /// Last raw-message ordinal the run may consume, always before the protected tail.
     pub consume_through_ordinal: Option<u64>,
+    /// The exact boundary snapshot that produced a fire decision. The assembler consumes
+    /// this object directly so the trigger and chunk snapshot cannot resolve different ranges.
+    pub boundary: Option<BoundaryResolution>,
 }
 
 /// Flatten grouped messages to the block-level form used by chunk measurement.
@@ -720,6 +723,7 @@ fn no_fire() -> TriggerDecision {
         fire: false,
         reason: None,
         consume_through_ordinal: None,
+        boundary: None,
     }
 }
 
@@ -733,6 +737,7 @@ fn fire(reason: TriggerReason, boundary: &BoundaryResolution) -> TriggerDecision
         fire: true,
         reason: Some(reason),
         consume_through_ordinal,
+        boundary: Some(boundary.clone()),
     }
 }
 

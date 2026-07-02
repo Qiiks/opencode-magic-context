@@ -215,9 +215,24 @@ pub struct TransformResponse {
     pub committed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub historian: Option<HistorianDiagnostics>,
     /// The actual output messages for this pass: synthetic m0 and m1 messages followed
     /// by the tail messages, all expressed as bare CK messages.
     pub ck_messages: Vec<CkWireMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistorianDiagnostics {
+    pub fired: bool,
+    pub reason: Option<String>,
+    pub no_fire: Option<String>,
+    pub state: String,
+}
+
+pub struct TransformWithProjection {
+    pub response: TransformResponse,
+    pub projection: FlatProjection,
 }
 
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
@@ -341,6 +356,15 @@ pub fn transform(
     ctx: &ProducerContext<'_>,
     deciders: &DeciderInputs,
 ) -> Result<TransformResponse, TransformError> {
+    transform_with_projection(store, req, ctx, deciders).map(|result| result.response)
+}
+
+pub fn transform_with_projection(
+    store: &McStore,
+    req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
+    deciders: &DeciderInputs,
+) -> Result<TransformWithProjection, TransformError> {
     apply_once_with_estimator(store, req, ctx, deciders, mc_tokenizer::estimate_tokens)
 }
 
@@ -353,7 +377,7 @@ fn apply_once_with_estimator(
     ctx: &ProducerContext<'_>,
     deciders: &DeciderInputs,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
-) -> Result<TransformResponse, TransformError> {
+) -> Result<TransformWithProjection, TransformError> {
     let mut attempt = 0;
     loop {
         match apply_once(store, req, ctx, deciders, estimate_tokens) {
@@ -374,7 +398,7 @@ fn apply_once(
     ctx: &ProducerContext<'_>,
     deciders: &DeciderInputs,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
-) -> Result<TransformResponse, TransformError> {
+) -> Result<TransformWithProjection, TransformError> {
     // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
     let projection = project_messages(&req.messages)?;
     if let Some(id) = duplicate_ids(&projection.blocks) {
@@ -681,15 +705,19 @@ fn apply_once(
         loaded.row_version.unwrap_or(0)
     };
 
-    Ok(TransformResponse {
-        action: result_action,
-        boundary_id: core.boundary_id.clone(),
-        reconcile_pending: core.reconcile_pending,
-        version: core.version,
-        row_version,
-        committed: changed,
-        coverage_ordinal: meta.coverage_ordinal,
-        ck_messages,
+    Ok(TransformWithProjection {
+        projection,
+        response: TransformResponse {
+            action: result_action,
+            boundary_id: core.boundary_id.clone(),
+            reconcile_pending: core.reconcile_pending,
+            version: core.version,
+            row_version,
+            committed: changed,
+            coverage_ordinal: meta.coverage_ordinal,
+            historian: None,
+            ck_messages,
+        },
     })
 }
 
@@ -3832,7 +3860,7 @@ mod tests {
             counting,
         )
         .unwrap();
-        assert_eq!(boot.action, "HARD");
+        assert_eq!(boot.response.action, "HARD");
         assert!(
             calls.get() > 0,
             "the HARD m0 compose must exercise the estimator (budget guard)"
@@ -3858,7 +3886,7 @@ mod tests {
             counting,
         )
         .unwrap();
-        assert_eq!(soft.action, "SOFT");
+        assert_eq!(soft.response.action, "SOFT");
         assert_eq!(
             calls.get(),
             0,
@@ -3875,7 +3903,7 @@ mod tests {
             counting,
         )
         .unwrap();
-        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(defer.response.action, "SOFT+");
         assert_eq!(
             calls.get(),
             0,

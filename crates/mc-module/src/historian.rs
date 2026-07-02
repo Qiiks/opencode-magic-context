@@ -463,8 +463,8 @@ impl From<McStoreError> for HistorianDriveError {
     }
 }
 
-#[subc_client_rs::async_trait(?Send)]
-pub trait HistorianProducerDriver {
+#[subc_client_rs::async_trait]
+pub trait HistorianProducerDriver: Send {
     async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError>;
     async fn start(
         &mut self,
@@ -482,7 +482,7 @@ pub trait HistorianProducerDriver {
     async fn close(&mut self);
 }
 
-#[subc_client_rs::async_trait(?Send)]
+#[subc_client_rs::async_trait]
 impl HistorianProducerDriver for HistorianProducer {
     async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
         HistorianProducer::bind_session(self, session_id.to_string());
@@ -1087,7 +1087,7 @@ mod tests {
         }
     }
 
-    #[subc_client_rs::async_trait(?Send)]
+    #[subc_client_rs::async_trait]
     impl HistorianProducerDriver for ScriptedProducer {
         async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
             self.observed_sessions.push(session_id.to_string());

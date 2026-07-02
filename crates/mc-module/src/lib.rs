@@ -18,6 +18,7 @@
 
 pub mod boundary;
 pub mod compartment_coverage;
+pub mod config;
 pub mod decay_render;
 pub mod historian;
 pub mod historian_chunk;
@@ -33,15 +34,25 @@ pub mod scheduler;
 pub mod selection;
 pub mod transform;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
-use mc_store::McStore;
+use mc_store::{HistorianPhase, McStore};
 use serde_json::{json, Value};
 use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest};
 
+use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
+use config::{ConfigCache, McModuleConfig};
+use historian::{reattach_historian_producer, run_historian_firing, HistorianProducerDriver};
+use historian_chunk::{
+    assemble_historian_firing, AssembleHistorianFiringOutcome, AssembledHistorianFiring,
+    HistorianAssemblerConfig,
+};
+use historian_producer::{HistorianProducer, HistorianProducerConfig, HistorianProducerError};
+use selection::SelKind;
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
@@ -49,7 +60,7 @@ use subc_protocol::{
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
-use transform::{transform, DeciderInputs, TransformRequest};
+use transform::{transform_with_projection, DeciderInputs, HistorianDiagnostics, TransformRequest};
 
 /// The per-route session binding: the project + session a route channel is bound to, plus
 /// the render budget frozen at bind. Established once at `on_bind` (the daemon relays the
@@ -86,21 +97,124 @@ pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
 /// Storage namespace for the cache-state domain.
 const STORAGE_NAMESPACE: &str = "mc_cache";
+/// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
+const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
+/// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
+const DEFAULT_MIN_COMMIT_CLUSTERS: usize = 3;
+/// Mirrors packages/plugin/src/hooks/magic-context/derive-budgets.ts with the default
+/// 128K historian context fallback: clamp(128_000 × 0.25, 8_000, 50_000) = 32_000.
+const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
+/// Secondary assembler guard; TS trigger sizing is authoritative, this only rejects tiny chunks.
+const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
 
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (channel → {project, session}).
 pub struct McHandler {
-    store: OnceLock<McStore>,
+    store: OnceLock<Arc<McStore>>,
+    producer_factory: Arc<dyn HistorianProducerFactory>,
+    config: Mutex<ConfigCache>,
+    #[cfg(test)]
+    fixed_config: Option<McModuleConfig>,
+    reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     /// Route channel → its session binding. Populated at `on_bind`, removed at
     /// `on_route_gone`. A `Mutex<HashMap>` (not a lock-free map) because writes are
     /// rare (once per route open/close) and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
 }
 
+#[async_trait]
+pub trait HistorianProducerFactory: Send + Sync {
+    async fn connect(
+        &self,
+        project_root: &Path,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError>;
+}
+
+struct RealHistorianProducerFactory {
+    connection_file: PathBuf,
+}
+
+#[async_trait]
+impl HistorianProducerFactory for RealHistorianProducerFactory {
+    async fn connect(
+        &self,
+        project_root: &Path,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        Ok(Box::new(
+            HistorianProducer::connect(HistorianProducerConfig {
+                handshake_timeout: Duration::from_secs(2),
+                ..HistorianProducerConfig::new(
+                    self.connection_file.clone(),
+                    project_root,
+                    "opencode",
+                )
+            })
+            .await?,
+        ))
+    }
+}
+
+struct MissingProducerFactory;
+
+#[async_trait]
+impl HistorianProducerFactory for MissingProducerFactory {
+    async fn connect(
+        &self,
+        _project_root: &Path,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        Err(HistorianProducerError::NoEndpoint {
+            path: PathBuf::from("<missing --subc>"),
+        })
+    }
+}
+
 impl McHandler {
     pub fn new() -> Self {
+        Self::new_with_connection_file(None)
+    }
+
+    pub fn new_with_connection_file(connection_file: Option<PathBuf>) -> Self {
+        let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file.clone() {
+            Some(path) => Arc::new(RealHistorianProducerFactory {
+                connection_file: path,
+            }),
+            None => Arc::new(MissingProducerFactory),
+        };
         McHandler {
             store: OnceLock::new(),
+            producer_factory,
+            config: Mutex::new(ConfigCache::default()),
+            #[cfg(test)]
+            fixed_config: None,
+            reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
+            bindings: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn with_producer_factory(factory: Arc<dyn HistorianProducerFactory>) -> Self {
+        Self::with_producer_factory_and_config(
+            factory,
+            McModuleConfig {
+                model_chain: vec!["test/model".to_string()],
+                execute_threshold_percentage: 65.0,
+                memory_enabled: true,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn with_producer_factory_and_config(
+        factory: Arc<dyn HistorianProducerFactory>,
+        config: McModuleConfig,
+    ) -> Self {
+        McHandler {
+            store: OnceLock::new(),
+            producer_factory: factory,
+            config: Mutex::new(ConfigCache::default()),
+            fixed_config: Some(config),
+            reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             bindings: Mutex::new(HashMap::new()),
         }
     }
@@ -141,6 +255,352 @@ impl McHandler {
         }
         Ok(binding.clone())
     }
+
+    fn effective_config(&self, project_root: &Path) -> McModuleConfig {
+        #[cfg(test)]
+        if let Some(config) = &self.fixed_config {
+            return config.clone();
+        }
+        self.config
+            .lock()
+            .expect("config mutex")
+            .effective_for_project(project_root)
+    }
+
+    fn maybe_spawn_reattach(
+        &self,
+        store: Arc<McStore>,
+        parsed: &TransformRequest,
+        project_path: String,
+        projection: &transform::ck_wire::FlatProjection,
+        now: i64,
+    ) {
+        let Ok(loaded) = store.load(&parsed.session_id) else {
+            return;
+        };
+        if loaded.meta.historian.state != HistorianPhase::AwaitingProducer {
+            return;
+        }
+        let mut latch = self.reattaching_sessions.lock().expect("reattach mutex");
+        if !latch.insert(parsed.session_id.clone()) {
+            return;
+        }
+        drop(latch);
+
+        let session_id = parsed.session_id.clone();
+        let factory = Arc::clone(&self.producer_factory);
+        let latch = Arc::clone(&self.reattaching_sessions);
+        let project_root = PathBuf::from(&project_path);
+        let live: Vec<_> = projection
+            .blocks
+            .iter()
+            .filter(|b| !b.synthetic)
+            .cloned()
+            .collect();
+        let Some(range) = loaded.meta.historian.chunk_range.clone() else {
+            self.reattaching_sessions
+                .lock()
+                .expect("reattach mutex")
+                .remove(&session_id);
+            return;
+        };
+        let chunk = historian_chunk::build_historian_chunk(
+            parsed.messages.as_slice(),
+            &live,
+            range.from_ordinal,
+            DEFAULT_HISTORIAN_CHUNK_TOKENS,
+            range.to_ordinal.saturating_add(1),
+        );
+        let prior_compartments = match store.load_compartments(&session_id) {
+            Ok(cs) => cs
+                .iter()
+                .map(historian_chunk::stored_range)
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        let fingerprint_items: Vec<_> = chunk.snapshot.iter().map(|item| item.as_item()).collect();
+        let observed = historian::compute_chunk_fingerprint(&fingerprint_items);
+        tokio::spawn(async move {
+            let result = async {
+                let mut producer = factory.connect(&project_root).await?;
+                reattach_historian_producer(
+                    &mut *producer,
+                    historian::HistorianReattachRequest {
+                        store: &store,
+                        session_id: &session_id,
+                        project_path: &project_path,
+                        observed_chunk_fingerprint: &observed,
+                        validation_chunk: &chunk.chunk,
+                        prior_compartments: &prior_compartments,
+                        validate_options: historian_validate::ValidateOptions {
+                            sequence_offset: prior_compartments.len() as u64 + 1,
+                            in_emergency: false,
+                        },
+                        publication_floor_ordinal: range.to_ordinal,
+                        now_ms: now,
+                        failure_backoff_at_ms: now + 60_000,
+                    },
+                )
+                .await
+            }
+            .await;
+            if let Err(e) = result {
+                eprintln!("mc-module: historian reattach failed for {session_id}: {e}");
+            }
+            latch.lock().expect("reattach mutex").remove(&session_id);
+        });
+    }
+
+    fn maybe_spawn_historian_fire(
+        &self,
+        store: Arc<McStore>,
+        parsed: &TransformRequest,
+        binding: &SessionBinding,
+        project_path: String,
+        projection: &transform::ck_wire::FlatProjection,
+        now: i64,
+    ) -> HistorianDiagnostics {
+        let loaded = match store.load(&parsed.session_id) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                return HistorianDiagnostics {
+                    fired: false,
+                    reason: None,
+                    no_fire: Some(format!("state_load_failed:{e}")),
+                    state: "unknown".to_string(),
+                }
+            }
+        };
+        let state = loaded.meta.historian.state.as_str().to_string();
+        let cfg = self.effective_config(&binding.project_root);
+        let boundary_messages = boundary_messages(parsed, projection);
+        let last_compartment_end_ordinal = store
+            .load_compartments(&parsed.session_id)
+            .map(|cs| cs.iter().map(|c| c.end_message as u64).max().unwrap_or(0))
+            .unwrap_or(0);
+        let (context_limit, input_tokens, usage_percentage) = usage_numbers(parsed.usage.as_ref());
+        let trigger = boundary::check_compartment_trigger(
+            &boundary_messages,
+            &TriggerContext {
+                boundary: BoundaryContext {
+                    context_limit,
+                    execute_threshold_percentage: cfg.execute_threshold_percentage,
+                    usage_percentage,
+                    usage_input_tokens: input_tokens,
+                    last_compartment_end_ordinal,
+                    prior_boundary_ordinal: last_compartment_end_ordinal,
+                    migration_floor_active: last_compartment_end_ordinal > 0,
+                    emergency_tail_scale: None,
+                    trigger_budget: None,
+                },
+                projected_post_drop_percentage: None,
+                compartment_in_progress: loaded.meta.historian.state != HistorianPhase::Idle,
+                commit_cluster_trigger_enabled: DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED,
+                min_commit_clusters: DEFAULT_MIN_COMMIT_CLUSTERS,
+            },
+        );
+        if !trigger.fire {
+            return HistorianDiagnostics {
+                fired: false,
+                reason: None,
+                no_fire: Some(if loaded.meta.historian.state == HistorianPhase::Idle {
+                    "trigger_false".to_string()
+                } else {
+                    "busy".to_string()
+                }),
+                state,
+            };
+        }
+        if cfg.model_chain.is_empty() {
+            return HistorianDiagnostics {
+                fired: false,
+                reason: trigger.reason.map(|r| r.as_str().to_string()),
+                no_fire: Some("no_models".to_string()),
+                state,
+            };
+        }
+        let Some(boundary) = trigger.boundary.clone() else {
+            return HistorianDiagnostics {
+                fired: false,
+                reason: None,
+                no_fire: Some("missing_boundary".to_string()),
+                state,
+            };
+        };
+        let live: Vec<_> = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .cloned()
+            .collect();
+        let project_slug = project_slug(&binding.project_root);
+        let assemble = assemble_historian_firing(
+            &store,
+            &parsed.messages,
+            &live,
+            HistorianAssemblerConfig {
+                session_id: parsed.session_id.clone(),
+                project_path: project_path.clone(),
+                project_slug: project_slug.clone(),
+                model_chain: cfg.model_chain.clone(),
+                token_budget: DEFAULT_HISTORIAN_CHUNK_TOKENS,
+                boundary,
+                memory_enabled: cfg.memory_enabled,
+                extraction_free: false,
+                in_emergency: usage_percentage >= 95.0,
+                failure_backoff_at_ms: now + 60_000,
+                min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
+            },
+            now,
+        );
+        let firing = match assemble {
+            Ok(AssembleHistorianFiringOutcome::Fire(firing)) => *firing,
+            Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
+                return HistorianDiagnostics {
+                    fired: false,
+                    reason: trigger.reason.map(|r| r.as_str().to_string()),
+                    no_fire: Some(format!("assemble:{reason:?}")),
+                    state,
+                }
+            }
+            Err(e) => {
+                return HistorianDiagnostics {
+                    fired: false,
+                    reason: trigger.reason.map(|r| r.as_str().to_string()),
+                    no_fire: Some(format!("assemble_failed:{e}")),
+                    state,
+                }
+            }
+        };
+        self.spawn_historian_firing(
+            store,
+            parsed.session_id.clone(),
+            project_path,
+            binding.project_root.clone(),
+            project_slug,
+            firing,
+        );
+        HistorianDiagnostics {
+            fired: true,
+            reason: trigger.reason.map(|r| r.as_str().to_string()),
+            no_fire: None,
+            state,
+        }
+    }
+
+    fn spawn_historian_firing(
+        &self,
+        store: Arc<McStore>,
+        session_id: String,
+        project_path: String,
+        project_root: PathBuf,
+        project_slug: String,
+        firing: AssembledHistorianFiring,
+    ) {
+        let factory = Arc::clone(&self.producer_factory);
+        tokio::spawn(async move {
+            let result = async {
+                let mut producer = factory.connect(&project_root).await?;
+                let request =
+                    firing.as_fire_request(&store, &session_id, &project_path, &project_slug);
+                run_historian_firing(&mut *producer, request).await
+            }
+            .await;
+            match result {
+                Ok(outcome) => {
+                    eprintln!("mc-module: historian firing finished for {session_id}: {outcome:?}")
+                }
+                Err(e) => eprintln!("mc-module: historian firing failed for {session_id}: {e}"),
+            }
+        });
+    }
+
+    async fn handle_transform_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => {
+                return HandlerOutcome::Error {
+                    code: "store_unavailable".to_string(),
+                    message: "store not opened (no HELLO_ACK storage seam)".to_string(),
+                }
+            }
+        };
+        let parsed: TransformRequest = match serde_json::from_value(request.clone()) {
+            Ok(req) => req,
+            Err(e) => {
+                return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message: e.to_string(),
+                }
+            }
+        };
+        let binding = match self.resolve_binding(channel, &parsed.session_id) {
+            Ok(b) => b,
+            Err(BindingError::Unbound) => {
+                return HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: "transform on a channel with no session binding".to_string(),
+                }
+            }
+            Err(BindingError::SessionMismatch) => {
+                return HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                }
+            }
+        };
+        let deciders: DeciderInputs = match request.get("_decider") {
+            Some(d) => match serde_json::from_value(d.clone()) {
+                Ok(d) => d,
+                Err(e) => {
+                    return HandlerOutcome::Error {
+                        code: "bad_request".to_string(),
+                        message: format!("_decider: {e}"),
+                    }
+                }
+            },
+            None => DeciderInputs::default(),
+        };
+        let project_path = binding.project_root.to_string_lossy();
+        let producer_ctx = transform::ProducerContext {
+            project_path: &project_path,
+            project_directory: &project_path,
+            history_budget_tokens: binding.history_budget_tokens,
+            now_ms: now_ms(),
+        };
+        let pass_now = producer_ctx.now_ms;
+        match transform_with_projection(&store, &parsed, &producer_ctx, &deciders) {
+            Ok(mut result) => {
+                self.maybe_spawn_reattach(
+                    Arc::clone(&store),
+                    &parsed,
+                    project_path.to_string(),
+                    &result.projection,
+                    pass_now,
+                );
+                let diagnostics = self.maybe_spawn_historian_fire(
+                    Arc::clone(&store),
+                    &parsed,
+                    &binding,
+                    project_path.to_string(),
+                    &result.projection,
+                    pass_now,
+                );
+                result.response.historian = Some(diagnostics);
+                respond(serde_json::to_value(result.response).unwrap_or(Value::Null))
+            }
+            Err(e) => HandlerOutcome::Error {
+                code: "transform_failed".to_string(),
+                message: e.to_string(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    async fn handle_transform_for_test(&self, channel: u16, request: Value) -> HandlerOutcome {
+        self.handle_transform_value(channel, request).await
+    }
 }
 
 impl Default for McHandler {
@@ -167,7 +627,7 @@ impl ModuleHandler for McHandler {
         let descriptor = resolve_descriptor(ack.storage.as_ref());
         match McStore::open(&descriptor) {
             Ok(store) => {
-                let _ = self.store.set(store);
+                let _ = self.store.set(Arc::new(store));
             }
             Err(e) => {
                 eprintln!("mc-module: store open failed: {e}");
@@ -223,82 +683,7 @@ impl ModuleHandler for McHandler {
                 },
             },
             // The CK-in/CK-out cache-stability spine.
-            Some("transform") => {
-                let store = match self.store.get() {
-                    Some(store) => store,
-                    None => {
-                        return HandlerOutcome::Error {
-                            code: "store_unavailable".to_string(),
-                            message: "store not opened (no HELLO_ACK storage seam)".to_string(),
-                        }
-                    }
-                };
-                let parsed: TransformRequest = match serde_json::from_value(request.clone()) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        return HandlerOutcome::Error {
-                            code: "bad_request".to_string(),
-                            message: e.to_string(),
-                        }
-                    }
-                };
-                // Resolve the project from the route channel the request arrived on
-                // (ctx.channel(), the identity subc authenticated at route.bind), NEVER
-                // the session_id in the request body (caller-claimed, spoofable). Fail
-                // loud two ways: Unbound (no on_bind for this channel, or it was torn
-                // down) and SessionMismatch (the body's session_id != the session this
-                // channel was bound for — a request can't drive a session its route
-                // wasn't bound for). Both reject before any transform work. The resolved
-                // project_root is not consumed yet (the Hard/Soft arms will read the
-                // store under it); resolving + rejecting here produces identical output
-                // for a correctly-bound request, so it changes no cached bytes.
-                let binding = match self.resolve_binding(ctx.channel(), &parsed.session_id) {
-                    Ok(b) => b,
-                    Err(BindingError::Unbound) => {
-                        return HandlerOutcome::Error {
-                            code: "route_unbound".to_string(),
-                            message: "transform on a channel with no session binding".to_string(),
-                        }
-                    }
-                    Err(BindingError::SessionMismatch) => {
-                        return HandlerOutcome::Error {
-                            code: "session_mismatch".to_string(),
-                            message:
-                                "request session_id does not match the channel's bound session"
-                                    .to_string(),
-                        }
-                    }
-                };
-                // The `_decider` wire field now carries ONLY the tail reductions (their
-                // selection producer is not yet implemented in its final location). The
-                // m0/m1 CONTENT is composed from the store — never from the request.
-                let deciders: DeciderInputs = match request.get("_decider") {
-                    Some(d) => match serde_json::from_value(d.clone()) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            return HandlerOutcome::Error {
-                                code: "bad_request".to_string(),
-                                message: format!("_decider: {e}"),
-                            }
-                        }
-                    },
-                    None => DeciderInputs::default(),
-                };
-                let project_path = binding.project_root.to_string_lossy();
-                let producer_ctx = transform::ProducerContext {
-                    project_path: &project_path,
-                    project_directory: &project_path,
-                    history_budget_tokens: binding.history_budget_tokens,
-                    now_ms: now_ms(),
-                };
-                match transform(store, &parsed, &producer_ctx, &deciders) {
-                    Ok(response) => respond(serde_json::to_value(response).unwrap_or(Value::Null)),
-                    Err(e) => HandlerOutcome::Error {
-                        code: "transform_failed".to_string(),
-                        message: e.to_string(),
-                    },
-                }
-            }
+            Some("transform") => self.handle_transform_value(ctx.channel(), request).await,
             // Default: echo (proves the wire round-trips).
             _ => respond(json!({ "ok": true, "echo": request })),
         }
@@ -323,6 +708,79 @@ fn respond(value: Value) -> HandlerOutcome {
             message: e.to_string(),
         },
     }
+}
+
+fn boundary_messages(
+    parsed: &TransformRequest,
+    projection: &transform::ck_wire::FlatProjection,
+) -> Vec<BoundaryMsg> {
+    parsed
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic && message.ck.role != "system")
+        .map(|message| BoundaryMsg {
+            message_ordinal: message.ordinal,
+            message_id: message.mid.clone(),
+            role: Role::from_provider(&message.ck.role),
+            blocks: projection
+                .blocks
+                .iter()
+                .filter(|block| block.mid == message.mid && !block.synthetic)
+                .map(|block| BoundaryBlock {
+                    id: block.id.clone(),
+                    ordinal: block.ordinal,
+                    kind: sel_kind_for_flat(block),
+                    provider_executed: block.provider_executed,
+                    byte_size: block.bytes.len(),
+                    arc_id: block.arc_id.clone(),
+                    original: block.bytes.clone(),
+                    rendered: None,
+                    ignored: false,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn sel_kind_for_flat(block: &transform::ck_wire::FlatBlock) -> SelKind {
+    match block.kind_tag.as_str() {
+        "tool_call" => SelKind::ToolCall {
+            name: block.name.clone().unwrap_or_default(),
+            input: block.tool_input.clone().unwrap_or(Value::Null),
+        },
+        "tool_result" => SelKind::ToolResult {
+            tool_name: block.name.clone().unwrap_or_default(),
+        },
+        "reasoning" => SelKind::Reasoning,
+        "redacted_reasoning" => SelKind::RedactedReasoning,
+        "media" => SelKind::Media,
+        "opaque" => SelKind::Opaque,
+        _ => SelKind::Text,
+    }
+}
+
+fn usage_numbers(usage: Option<&mc_store::ModuleUsage>) -> (f64, f64, f64) {
+    let input = usage
+        .map(|u| u.current_total_input_tokens as f64)
+        .unwrap_or(0.0);
+    let limit = usage
+        .map(|u| u.context_limit_tokens as f64)
+        .filter(|limit| *limit > 0.0)
+        .unwrap_or(200_000.0);
+    let pct = if limit > 0.0 {
+        input / limit * 100.0
+    } else {
+        0.0
+    };
+    (limit, input, pct)
+}
+
+fn project_slug(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("project")
+        .to_string()
 }
 
 /// Resolve the storage descriptor: prefer the daemon-provided `ack.storage`, else
@@ -400,6 +858,15 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use historian_producer::{ProducerOutput, RunHandle, RunState};
+    use mc_store::{HistorianChunkRange, HistorianDurableState, ModuleUsage};
+    use tokio::sync::Notify;
+    use transform::ck_wire::{
+        CkIngressMessage, CkKind, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
+    };
 
     #[test]
     fn dev_descriptor_used_when_ack_has_no_storage() {
@@ -496,5 +963,394 @@ mod tests {
             resolved_root(&h, 5, "s1"),
             Err(BindingError::SessionMismatch)
         );
+    }
+
+    #[derive(Default)]
+    struct ProducerState {
+        starts: AtomicUsize,
+        binds: AtomicUsize,
+        statuses: AtomicUsize,
+        await_outputs: AtomicUsize,
+        block_output: std::sync::atomic::AtomicBool,
+        notify: Notify,
+        outputs: Mutex<VecDeque<String>>,
+    }
+
+    struct TestProducerFactory {
+        state: Arc<ProducerState>,
+    }
+
+    #[async_trait]
+    impl HistorianProducerFactory for TestProducerFactory {
+        async fn connect(
+            &self,
+            _project_root: &Path,
+        ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+            Ok(Box::new(TestProducer {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    struct TestProducer {
+        state: Arc<ProducerState>,
+    }
+
+    #[async_trait]
+    impl HistorianProducerDriver for TestProducer {
+        async fn bind_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
+            self.state.binds.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn start(
+            &mut self,
+            _session_id: &str,
+            _system: &str,
+            prompt: &str,
+            _model: &str,
+        ) -> Result<RunHandle, HistorianProducerError> {
+            let n = self.state.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state
+                .outputs
+                .lock()
+                .expect("outputs mutex")
+                .push_back(historian_output_for_prompt(prompt));
+            Ok(RunHandle {
+                run_id: format!("run-{n}"),
+            })
+        }
+
+        async fn await_output(
+            &mut self,
+            _run_id: &str,
+        ) -> Result<ProducerOutput, HistorianProducerError> {
+            self.state.await_outputs.fetch_add(1, Ordering::SeqCst);
+            while self.state.block_output.load(Ordering::SeqCst) {
+                self.state.notify.notified().await;
+            }
+            let text = self
+                .state
+                .outputs
+                .lock()
+                .expect("outputs mutex")
+                .pop_front()
+                .unwrap_or_else(|| historian_output(1, 3, "reattached summary"));
+            Ok(ProducerOutput { text })
+        }
+
+        async fn status(&mut self, _run_id: &str) -> Result<RunState, HistorianProducerError> {
+            self.state.statuses.fetch_add(1, Ordering::SeqCst);
+            Ok(RunState::Active)
+        }
+
+        async fn cancel(&mut self, _run_id: &str) -> Result<(), HistorianProducerError> {
+            Ok(())
+        }
+
+        async fn close(&mut self) {}
+    }
+
+    fn handler_with_store(
+        state: Arc<ProducerState>,
+        config: McModuleConfig,
+    ) -> (McHandler, Arc<McStore>, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let store =
+            Arc::new(McStore::open(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
+        let handler = McHandler::with_producer_factory_and_config(
+            Arc::new(TestProducerFactory { state }),
+            config,
+        );
+        handler.store.set(Arc::clone(&store)).ok().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        handler.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+        (handler, store, dir, project)
+    }
+
+    fn default_test_config() -> McModuleConfig {
+        McModuleConfig {
+            model_chain: vec!["test/model".to_string()],
+            execute_threshold_percentage: 65.0,
+            memory_enabled: true,
+        }
+    }
+
+    fn ck(mid: &str, ordinal: u64, text: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![CkWireBlock::bare(CkKind::Text { text: text.into() })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn big_messages() -> Vec<CkIngressMessage> {
+        (1..=80)
+            .map(|n| {
+                ck(
+                    &format!("m{n}"),
+                    n,
+                    &format!("message {n} {}", "word ".repeat(800)),
+                )
+            })
+            .collect()
+    }
+
+    fn request(messages: Vec<CkIngressMessage>) -> Value {
+        json!({
+            "kind": "transform",
+            "session_id": "ses",
+            "render_config": "cfg0",
+            "usage": ModuleUsage { current_total_input_tokens: 45_000, context_limit_tokens: 50_000 },
+            "messages": messages,
+        })
+    }
+
+    async fn call_transform(handler: &McHandler, messages: Vec<CkIngressMessage>) -> Value {
+        match handler
+            .handle_transform_for_test(7, request(messages))
+            .await
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        }
+    }
+
+    fn historian_output_for_prompt(prompt: &str) -> String {
+        let (start, end) = prompt_ordinal_range(prompt).unwrap_or((1, 3));
+        historian_output(start, end, "autonomous summary")
+    }
+
+    fn historian_output(start: u64, end: u64, p1: &str) -> String {
+        format!(
+            r#"<output><compartments><compartment start="{start}" end="{end}" title="autonomous arc" episode_type="feature" importance="60"><p1>{p1}</p1><p2>short summary</p2><p3>arc</p3><p4 /></compartment></compartments><meta><messages_processed>{start}-{end}</messages_processed><unprocessed_from>{}</unprocessed_from></meta></output>"#,
+            end + 1
+        )
+    }
+
+    fn prompt_ordinal_range(prompt: &str) -> Option<(u64, u64)> {
+        let mut ordinals = Vec::new();
+        let bytes = prompt.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'[' {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    if let Ok(value) = prompt[i + 1..j].parse::<u64>() {
+                        ordinals.push(value);
+                    }
+                    if j < bytes.len() && bytes[j] == b'-' {
+                        let mut k = j + 1;
+                        while k < bytes.len() && bytes[k].is_ascii_digit() {
+                            k += 1;
+                        }
+                        if k > j + 1 {
+                            if let Ok(value) = prompt[j + 1..k].parse::<u64>() {
+                                ordinals.push(value);
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        Some((*ordinals.iter().min()?, *ordinals.iter().max()?))
+    }
+
+    async fn wait_for_idle(store: &McStore) {
+        for _ in 0..200 {
+            if store.load("ses").unwrap().meta.historian.state == HistorianPhase::Idle {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("historian did not return to idle");
+    }
+
+    async fn wait_for_count(value: &AtomicUsize, expected: usize) {
+        for _ in 0..200 {
+            if value.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("counter did not reach {expected}");
+    }
+
+    fn m0_text(response: &Value) -> String {
+        response["ck_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["meta"]["synthetic"] == json!(true))
+            .and_then(|message| message["content"][0]["kind"]["text"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_full_autonomous_cycle_fires_publishes_and_next_pass_folds() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+
+        let first = call_transform(&handler, messages.clone()).await;
+        assert_eq!(first["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+        let compartments = store.load_compartments("ses").unwrap();
+        assert_eq!(compartments.len(), 1);
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+
+        let second = call_transform(&handler, messages).await;
+        assert_eq!(second["action"], "HARD");
+        assert!(second["boundary_id"]
+            .as_str()
+            .unwrap_or_default()
+            .contains('#'));
+        assert!(m0_text(&second).contains("autonomous summary"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_busy_dedups_while_firing_is_in_progress() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+
+        let first = call_transform(&handler, messages.clone()).await;
+        assert_eq!(first["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+
+        let busy = call_transform(&handler, messages).await;
+        assert_eq!(busy["historian"]["no_fire"], "busy");
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        wait_for_idle(&store).await;
+    }
+
+    fn seed_awaiting(store: &McStore, messages: &[CkIngressMessage]) {
+        let live = transform::ck_wire::project_messages(messages)
+            .unwrap()
+            .blocks;
+        let chunk = historian_chunk::build_historian_chunk(
+            messages,
+            &live,
+            1,
+            DEFAULT_HISTORIAN_CHUNK_TOKENS,
+            4,
+        );
+        let fingerprint_items: Vec<_> = chunk.snapshot.iter().map(|item| item.as_item()).collect();
+        let fingerprint = historian::compute_chunk_fingerprint(&fingerprint_items);
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.historian = HistorianDurableState {
+            state: HistorianPhase::AwaitingProducer,
+            firing_seq: 1,
+            chunk_range: Some(HistorianChunkRange {
+                from_ordinal: 1,
+                to_ordinal: 3,
+            }),
+            chunk_fingerprint: fingerprint,
+            producer_session_id: Some("producer-session".to_string()),
+            producer_run_id: Some("run-reattach".to_string()),
+            fired_at_ms: Some(1),
+            failure_backoff_at_ms: None,
+        };
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_reattach_is_single_flight_and_latch_releases() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        producer
+            .outputs
+            .lock()
+            .unwrap()
+            .push_back(historian_output(1, 3, "reattached summary"));
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+        seed_awaiting(&store, &messages);
+
+        let _ = call_transform(&handler, messages.clone()).await;
+        let _ = call_transform(&handler, messages.clone()).await;
+        wait_for_count(&producer.binds, 1).await;
+        assert_eq!(producer.binds.load(Ordering::SeqCst), 1);
+        wait_for_count(&producer.statuses, 1).await;
+        assert_eq!(producer.statuses.load(Ordering::SeqCst), 1);
+
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        wait_for_idle(&store).await;
+
+        producer.block_output.store(true, Ordering::SeqCst);
+        producer
+            .outputs
+            .lock()
+            .unwrap()
+            .push_back(historian_output(1, 3, "reattached again"));
+        seed_awaiting(&store, &messages);
+        let _ = call_transform(&handler, messages).await;
+        wait_for_count(&producer.statuses, 2).await;
+        assert_eq!(producer.statuses.load(Ordering::SeqCst), 2);
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn defer_pass_historian_diagnostics_are_byte_pure_and_non_vacuous() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        let (handler, store, _dir, _project) = handler_with_store(producer, config);
+        let messages = big_messages();
+
+        let _ = call_transform(&handler, messages.clone()).await;
+        let with_historian = call_transform(&handler, messages.clone()).await;
+        assert_eq!(with_historian["action"], "SOFT+");
+        assert_eq!(with_historian["historian"]["no_fire"], "no_models");
+        assert!(with_historian["historian"]["reason"].is_string());
+
+        let req: TransformRequest = serde_json::from_value(request(messages)).unwrap();
+        let project_path = handler.resolve_binding(7, "ses").unwrap().project_root;
+        let project_path_string = project_path.to_string_lossy().to_string();
+        let response_without_historian = transform::transform(
+            &store,
+            &req,
+            &transform::ProducerContext {
+                project_path: &project_path_string,
+                project_directory: &project_path_string,
+                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+                now_ms: now_ms(),
+            },
+            &DeciderInputs::default(),
+        )
+        .unwrap();
+        let without_value = serde_json::to_value(response_without_historian).unwrap();
+        assert_eq!(with_historian["ck_messages"], without_value["ck_messages"]);
     }
 }

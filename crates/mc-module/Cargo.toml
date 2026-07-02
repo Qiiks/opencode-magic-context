@@ -36,3 +36,4 @@ subc-core = { workspace = true }
 # mutations). The feature is gated so the writers never reach production builds.
 mc-store = { workspace = true, features = ["test-support"] }
 tempfile = "3"
+filetime = "0.2"

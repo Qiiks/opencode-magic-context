@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::error::Error;
+use std::path::PathBuf;
 
 use mc_module::{manifest, McHandler, DEFAULT_MODULE_ID};
 
@@ -17,6 +18,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
 
-    subc_client_rs::serve(manifest(&module_id), McHandler::new()).await?;
+    let connection_file = parse_subc_arg(std::env::args_os().skip(1))?;
+    subc_client_rs::serve_with(
+        &connection_file,
+        manifest(&module_id),
+        McHandler::new_with_connection_file(Some(connection_file.clone())),
+    )
+    .await?;
     Ok(())
+}
+
+fn parse_subc_arg<I>(mut args: I) -> Result<PathBuf, Box<dyn Error + Send + Sync>>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    while let Some(arg) = args.next() {
+        if arg == "--subc" {
+            return args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--subc requires a connection-file path".into());
+        }
+    }
+    Err("missing --subc <connection-file>".into())
 }

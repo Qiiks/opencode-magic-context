@@ -31,7 +31,7 @@ pub struct ChunkSnapshotOwnedItem {
 }
 
 impl ChunkSnapshotOwnedItem {
-    fn as_item(&self) -> ChunkSnapshotItem<'_> {
+    pub fn as_item(&self) -> ChunkSnapshotItem<'_> {
         ChunkSnapshotItem {
             id: &self.id,
             kind: &self.kind,
@@ -581,7 +581,7 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
     )
 }
 
-fn stored_range(c: &StoredCompartment) -> StoredCompartmentRange {
+pub(crate) fn stored_range(c: &StoredCompartment) -> StoredCompartmentRange {
     StoredCompartmentRange {
         start_message: c.start_message as u64,
         end_message: c.end_message as u64,
