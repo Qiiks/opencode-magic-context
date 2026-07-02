@@ -27,7 +27,13 @@ const DEFAULT_LLM_RUNNER_MODULE_ID: &str = "llm-runner";
 const HISTORIAN_MAX_OUTPUT_TOKENS: u32 = 32_000;
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long to wait for a summarization run to finish. A historian pass legitimately
+/// generates 10k+ output tokens and can run several minutes on a flash-class model; a
+/// 120s window abandoned a run on the rig WHILE it was still successfully finishing
+/// (the terminal arrived moments after the waiter gave up). A fold is a background
+/// operation, never latency-sensitive: waiting longer and publishing always beats
+/// abandoning a completed run and re-firing the whole 50k-input pass.
+const DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunHandle {
