@@ -2,11 +2,14 @@
 //! the deterministic `mc_synthetic_todo_<hash>` call id, the byte-exact injected
 //! pair, and the bust-only freeze / defer-replay transition.
 //!
-//! The functions in this module are deliberately pure. The caller supplies the
-//! newest observed todo state and the currently frozen synthetic unit; this module
-//! returns the next state transition without reading stores, clocks, or the live
-//! conversation history.
+//! The functions that build the deterministic call id and byte-exact injected pair, and
+//! the transition logic, are deliberately pure: the caller supplies the persisted todo
+//! state and the currently frozen synthetic unit. The capture helper mutates only the
+//! caller-owned [`mc_store::ModuleMeta`] so the change can be committed in the same pass
+//! as the cache-state transition.
 
+use crate::selection::{SelItem, SelKind};
+use mc_store::ModuleMeta;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -229,6 +232,54 @@ pub fn is_synthetic_todo_id(id: &str) -> bool {
     id.starts_with(SYNTHETIC_CALL_ID_PREFIX)
 }
 
+/// Capture the newest `todowrite` ToolCall from the visible tail into session metadata.
+///
+/// Capture happens only on bust passes. If no valid todowrite call is present, the
+/// previous metadata value is left intact because an older todowrite may already be saved
+/// in this session. An explicit empty or all-terminal todowrite is still captured so the
+/// next step can clear any frozen synthetic unit when the real todo state is terminal.
+pub fn capture_todo_state_on_bust(
+    meta: &mut ModuleMeta,
+    tail: &[SelItem],
+    is_bust_pass: bool,
+) -> bool {
+    if !is_bust_pass {
+        return false;
+    }
+    let Some(state_json) = newest_todowrite_state_json(tail) else {
+        return false;
+    };
+    meta.last_todo_state = Some(state_json);
+    true
+}
+
+/// Compose the synthetic-todo transition from [`ModuleMeta::last_todo_state`].
+///
+/// The metadata is per-session durable state, so an aged-out todowrite continues to
+/// inject until another bust captures a new view. Defer passes ignore the metadata and
+/// replay the frozen unit verbatim.
+pub fn advance_injection_from_meta(
+    meta: &ModuleMeta,
+    frozen: Option<&FrozenInjection>,
+    is_bust_pass: bool,
+) -> InjectionOutcome {
+    advance_injection(meta.last_todo_state.as_deref(), frozen, is_bust_pass)
+}
+
+/// Capture (if this is a bust pass) before composing the synthetic-todo transition.
+///
+/// This ordering lets a first-ever todowrite be captured and injected in the same cache
+/// bust instead of lagging one pass behind.
+pub fn advance_injection_after_capture(
+    meta: &mut ModuleMeta,
+    tail: &[SelItem],
+    frozen: Option<&FrozenInjection>,
+    is_bust_pass: bool,
+) -> InjectionOutcome {
+    capture_todo_state_on_bust(meta, tail, is_bust_pass);
+    advance_injection_from_meta(meta, frozen, is_bust_pass)
+}
+
 /// Advance the frozen synthetic-todo unit for one pass without mutating storage.
 ///
 /// Bust passes may replace or clear the frozen unit. Defer passes never build
@@ -329,6 +380,37 @@ fn is_title_done_status(status: &str) -> bool {
     TITLE_DONE_STATUSES.contains(&status)
 }
 
+fn newest_todowrite_state_json(tail: &[SelItem]) -> Option<String> {
+    let mut latest: Option<(u64, usize, String)> = None;
+    for (index, item) in tail.iter().enumerate() {
+        let SelKind::ToolCall { name, input } = &item.kind else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case(TODO_TOOL_NAME) {
+            continue;
+        }
+        let Some(state_json) = todo_state_from_input(input) else {
+            continue;
+        };
+        let replace = latest
+            .as_ref()
+            .map(|(ordinal, seen_index, _)| {
+                item.ordinal > *ordinal || (item.ordinal == *ordinal && index > *seen_index)
+            })
+            .unwrap_or(true);
+        if replace {
+            latest = Some((item.ordinal, index, state_json));
+        }
+    }
+    latest.map(|(_, _, state_json)| state_json)
+}
+
+fn todo_state_from_input(input: &serde_json::Value) -> Option<String> {
+    let todos = input.get("todos").unwrap_or(input);
+    let todos_json = serde_json::to_string(todos).ok()?;
+    normalize_todo_state_json(&todos_json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +471,21 @@ mod tests {
         FrozenInjection::from(
             build_synthetic_todo_pair(state_json).expect("state builds synthetic todo"),
         )
+    }
+
+    fn todowrite_tail_item(id: &str, ordinal: u64, state_json: &str) -> SelItem {
+        let todos: serde_json::Value = serde_json::from_str(state_json).expect("todo state JSON");
+        SelItem {
+            id: id.to_string(),
+            ordinal,
+            kind: SelKind::ToolCall {
+                name: TODO_TOOL_NAME.to_string(),
+                input: serde_json::json!({ "todos": todos }),
+            },
+            provider_executed: false,
+            byte_size: 0,
+            arc_id: Some(id.to_string()),
+        }
     }
 
     #[test]
@@ -492,6 +589,110 @@ mod tests {
             advance_injection(Some(&state), Some(&frozen), true),
             InjectionOutcome::Keep
         );
+    }
+
+    #[test]
+    fn bust_captures_todowrite_before_composing() {
+        let older = active_state("older visible todo");
+        let newest = active_state("newest visible todo");
+        let mut meta = ModuleMeta::default();
+        let tail = vec![
+            todowrite_tail_item("m-old#0", 1, &older),
+            todowrite_tail_item("m-new#0", 2, &newest),
+        ];
+
+        let outcome = advance_injection_after_capture(&mut meta, &tail, None, true);
+
+        assert_eq!(meta.last_todo_state.as_deref(), Some(newest.as_str()));
+        assert!(matches!(
+            outcome,
+            InjectionOutcome::Replace(todo)
+                if todo.state_json == newest && todo.call_id == synthetic_call_id(&newest)
+        ));
+    }
+
+    #[test]
+    fn aged_out_todowrite_injects_from_module_meta() {
+        let state = active_state("aged out but persisted");
+        let mut meta = ModuleMeta {
+            last_todo_state: Some(state.clone()),
+            ..Default::default()
+        };
+
+        let outcome = advance_injection_after_capture(&mut meta, &[], None, true);
+
+        assert_eq!(meta.last_todo_state.as_deref(), Some(state.as_str()));
+        assert!(matches!(
+            outcome,
+            InjectionOutcome::Replace(todo) if todo.state_json == state
+        ));
+    }
+
+    #[test]
+    fn explicit_empty_todowrite_clears_terminal_state() {
+        let active = active_state("will be cleared");
+        let frozen = frozen_for(&active);
+        let mut meta = ModuleMeta {
+            last_todo_state: Some(active),
+            ..Default::default()
+        };
+        let tail = vec![todowrite_tail_item("m-clear#0", 9, "[]")];
+
+        let outcome = advance_injection_after_capture(&mut meta, &tail, Some(&frozen), true);
+
+        assert_eq!(meta.last_todo_state.as_deref(), Some("[]"));
+        assert_eq!(outcome, InjectionOutcome::Clear);
+    }
+
+    #[test]
+    fn defer_after_capture_replays_frozen_bytes() {
+        let captured = active_state("captured before defer");
+        let mut meta = ModuleMeta::default();
+        let first = advance_injection_after_capture(
+            &mut meta,
+            &[todowrite_tail_item("m-first#0", 1, &captured)],
+            None,
+            true,
+        );
+        let InjectionOutcome::Replace(todo) = first else {
+            panic!("first bust should freeze a synthetic todo");
+        };
+        let frozen = FrozenInjection::from(&todo);
+        let frozen_before = frozen.clone();
+        let defer_visible = active_state("visible only on defer");
+
+        let outcome = advance_injection_after_capture(
+            &mut meta,
+            &[todowrite_tail_item("m-defer#0", 2, &defer_visible)],
+            Some(&frozen),
+            false,
+        );
+
+        assert_eq!(outcome, InjectionOutcome::Keep);
+        assert_eq!(meta.last_todo_state.as_deref(), Some(captured.as_str()));
+        assert_eq!(
+            frozen, frozen_before,
+            "defer must replay frozen bytes verbatim"
+        );
+    }
+
+    #[test]
+    fn persisted_last_todo_state_survives_restart_without_tail() {
+        let state = active_state("persisted across restart");
+        let meta_json = serde_json::to_string(&ModuleMeta {
+            last_todo_state: Some(state.clone()),
+            ..Default::default()
+        })
+        .expect("serialize meta");
+        let mut restarted: ModuleMeta = serde_json::from_str(&meta_json).expect("load meta");
+
+        let outcome = advance_injection_after_capture(&mut restarted, &[], None, true);
+
+        assert_eq!(restarted.last_todo_state.as_deref(), Some(state.as_str()));
+        assert!(matches!(
+            outcome,
+            InjectionOutcome::Replace(todo) if todo.state_json == state
+        ));
     }
 
     #[test]

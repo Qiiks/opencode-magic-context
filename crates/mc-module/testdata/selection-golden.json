@@ -3,7 +3,7 @@
     "label": "supersession: todowrite keep-1",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -13,10 +13,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -25,10 +25,10 @@
         },
         "provider_executed": false,
         "byte_size": 100,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c2#call",
+        "id": "c2#0",
         "ordinal": 2,
         "kind": {
           "ToolCall": {
@@ -38,10 +38,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c2#result",
+        "id": "c2#1",
         "ordinal": 2,
         "kind": {
           "ToolResult": {
@@ -50,10 +50,10 @@
         },
         "provider_executed": false,
         "byte_size": 100,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c3#call",
+        "id": "c3#0",
         "ordinal": 3,
         "kind": {
           "ToolCall": {
@@ -63,10 +63,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c3#result",
+        "id": "c3#1",
         "ordinal": 3,
         "kind": {
           "ToolResult": {
@@ -75,7 +75,7 @@
         },
         "provider_executed": false,
         "byte_size": 100,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       }
     ],
     "ctx": {
@@ -91,15 +91,15 @@
     "smart_drops": true,
     "frozen": [],
     "expected": {
-      "c2": "drop",
-      "c1": "drop"
+      "c2#0": "drop",
+      "c1#0": "drop"
     }
   },
   {
     "label": "supersession: ctx_reduce keep-5",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -109,10 +109,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -121,10 +121,10 @@
         },
         "provider_executed": false,
         "byte_size": 40,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c2#call",
+        "id": "c2#0",
         "ordinal": 2,
         "kind": {
           "ToolCall": {
@@ -134,10 +134,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c2#result",
+        "id": "c2#1",
         "ordinal": 2,
         "kind": {
           "ToolResult": {
@@ -146,10 +146,10 @@
         },
         "provider_executed": false,
         "byte_size": 40,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c3#call",
+        "id": "c3#0",
         "ordinal": 3,
         "kind": {
           "ToolCall": {
@@ -159,10 +159,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c3#result",
+        "id": "c3#1",
         "ordinal": 3,
         "kind": {
           "ToolResult": {
@@ -171,10 +171,10 @@
         },
         "provider_executed": false,
         "byte_size": 40,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c4#call",
+        "id": "c4#0",
         "ordinal": 4,
         "kind": {
           "ToolCall": {
@@ -184,10 +184,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c4"
+        "arc_id": "c4#0"
       },
       {
-        "id": "c4#result",
+        "id": "c4#1",
         "ordinal": 4,
         "kind": {
           "ToolResult": {
@@ -196,10 +196,10 @@
         },
         "provider_executed": false,
         "byte_size": 40,
-        "arc_id": "c4"
+        "arc_id": "c4#0"
       },
       {
-        "id": "c5#call",
+        "id": "c5#0",
         "ordinal": 5,
         "kind": {
           "ToolCall": {
@@ -209,10 +209,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c5"
+        "arc_id": "c5#0"
       },
       {
-        "id": "c5#result",
+        "id": "c5#1",
         "ordinal": 5,
         "kind": {
           "ToolResult": {
@@ -221,10 +221,10 @@
         },
         "provider_executed": false,
         "byte_size": 40,
-        "arc_id": "c5"
+        "arc_id": "c5#0"
       },
       {
-        "id": "c6#call",
+        "id": "c6#0",
         "ordinal": 6,
         "kind": {
           "ToolCall": {
@@ -234,10 +234,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c6"
+        "arc_id": "c6#0"
       },
       {
-        "id": "c6#result",
+        "id": "c6#1",
         "ordinal": 6,
         "kind": {
           "ToolResult": {
@@ -246,10 +246,10 @@
         },
         "provider_executed": false,
         "byte_size": 40,
-        "arc_id": "c6"
+        "arc_id": "c6#0"
       },
       {
-        "id": "c7#call",
+        "id": "c7#0",
         "ordinal": 7,
         "kind": {
           "ToolCall": {
@@ -259,10 +259,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c7"
+        "arc_id": "c7#0"
       },
       {
-        "id": "c7#result",
+        "id": "c7#1",
         "ordinal": 7,
         "kind": {
           "ToolResult": {
@@ -271,7 +271,7 @@
         },
         "provider_executed": false,
         "byte_size": 40,
-        "arc_id": "c7"
+        "arc_id": "c7#0"
       }
     ],
     "ctx": {
@@ -287,15 +287,15 @@
     "smart_drops": true,
     "frozen": [],
     "expected": {
-      "c2": "drop",
-      "c1": "drop"
+      "c2#0": "drop",
+      "c1#0": "drop"
     }
   },
   {
     "label": "supersession: zero-value meta drop-all",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -305,10 +305,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -317,10 +317,10 @@
         },
         "provider_executed": false,
         "byte_size": 30,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c2#call",
+        "id": "c2#0",
         "ordinal": 2,
         "kind": {
           "ToolCall": {
@@ -330,10 +330,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c2#result",
+        "id": "c2#1",
         "ordinal": 2,
         "kind": {
           "ToolResult": {
@@ -342,10 +342,10 @@
         },
         "provider_executed": false,
         "byte_size": 30,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c3#call",
+        "id": "c3#0",
         "ordinal": 3,
         "kind": {
           "ToolCall": {
@@ -355,10 +355,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c3#result",
+        "id": "c3#1",
         "ordinal": 3,
         "kind": {
           "ToolResult": {
@@ -367,7 +367,7 @@
         },
         "provider_executed": false,
         "byte_size": 30,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       }
     ],
     "ctx": {
@@ -383,15 +383,15 @@
     "smart_drops": true,
     "frozen": [],
     "expected": {
-      "c2": "drop",
-      "c1": "drop"
+      "c2#0": "drop",
+      "c1#0": "drop"
     }
   },
   {
     "label": "supersession: ctx_note read+dismiss drop, write keep",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -403,10 +403,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -415,10 +415,10 @@
         },
         "provider_executed": false,
         "byte_size": 50,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c2#call",
+        "id": "c2#0",
         "ordinal": 2,
         "kind": {
           "ToolCall": {
@@ -430,10 +430,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c2#result",
+        "id": "c2#1",
         "ordinal": 2,
         "kind": {
           "ToolResult": {
@@ -442,10 +442,10 @@
         },
         "provider_executed": false,
         "byte_size": 50,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c3#call",
+        "id": "c3#0",
         "ordinal": 3,
         "kind": {
           "ToolCall": {
@@ -458,10 +458,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c3#result",
+        "id": "c3#1",
         "ordinal": 3,
         "kind": {
           "ToolResult": {
@@ -470,7 +470,7 @@
         },
         "provider_executed": false,
         "byte_size": 50,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       }
     ],
     "ctx": {
@@ -486,15 +486,15 @@
     "smart_drops": true,
     "frozen": [],
     "expected": {
-      "c2": "drop",
-      "c1": "drop"
+      "c2#0": "drop",
+      "c1#0": "drop"
     }
   },
   {
     "label": "edit: older-per-file → edit_marker, newest full",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -508,10 +508,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -520,10 +520,10 @@
         },
         "provider_executed": false,
         "byte_size": 500,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c2#call",
+        "id": "c2#0",
         "ordinal": 2,
         "kind": {
           "ToolCall": {
@@ -537,10 +537,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c2#result",
+        "id": "c2#1",
         "ordinal": 2,
         "kind": {
           "ToolResult": {
@@ -549,10 +549,10 @@
         },
         "provider_executed": false,
         "byte_size": 500,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c3#call",
+        "id": "c3#0",
         "ordinal": 3,
         "kind": {
           "ToolCall": {
@@ -565,10 +565,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c3#result",
+        "id": "c3#1",
         "ordinal": 3,
         "kind": {
           "ToolResult": {
@@ -577,7 +577,7 @@
         },
         "provider_executed": false,
         "byte_size": 500,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       }
     ],
     "ctx": {
@@ -593,14 +593,14 @@
     "smart_drops": true,
     "frozen": [],
     "expected": {
-      "c1": "edit_marker"
+      "c1#0": "edit_marker"
     }
   },
   {
     "label": "edit: no filePath → skip (fail-safe)",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -613,10 +613,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -625,10 +625,10 @@
         },
         "provider_executed": false,
         "byte_size": 500,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c2#call",
+        "id": "c2#0",
         "ordinal": 2,
         "kind": {
           "ToolCall": {
@@ -641,10 +641,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c2#result",
+        "id": "c2#1",
         "ordinal": 2,
         "kind": {
           "ToolResult": {
@@ -653,7 +653,7 @@
         },
         "provider_executed": false,
         "byte_size": 500,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       }
     ],
     "ctx": {
@@ -674,7 +674,7 @@
     "label": "two_pass: drop tools at/under watermark",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -684,10 +684,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -696,10 +696,10 @@
         },
         "provider_executed": false,
         "byte_size": 200,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c2#call",
+        "id": "c2#0",
         "ordinal": 2,
         "kind": {
           "ToolCall": {
@@ -709,10 +709,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c2#result",
+        "id": "c2#1",
         "ordinal": 2,
         "kind": {
           "ToolResult": {
@@ -721,10 +721,10 @@
         },
         "provider_executed": false,
         "byte_size": 200,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c3#call",
+        "id": "c3#0",
         "ordinal": 3,
         "kind": {
           "ToolCall": {
@@ -734,10 +734,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c3#result",
+        "id": "c3#1",
         "ordinal": 3,
         "kind": {
           "ToolResult": {
@@ -746,10 +746,10 @@
         },
         "provider_executed": false,
         "byte_size": 200,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c4#call",
+        "id": "c4#0",
         "ordinal": 4,
         "kind": {
           "ToolCall": {
@@ -759,10 +759,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c4"
+        "arc_id": "c4#0"
       },
       {
-        "id": "c4#result",
+        "id": "c4#1",
         "ordinal": 4,
         "kind": {
           "ToolResult": {
@@ -771,10 +771,10 @@
         },
         "provider_executed": false,
         "byte_size": 200,
-        "arc_id": "c4"
+        "arc_id": "c4#0"
       },
       {
-        "id": "c5#call",
+        "id": "c5#0",
         "ordinal": 5,
         "kind": {
           "ToolCall": {
@@ -784,10 +784,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c5"
+        "arc_id": "c5#0"
       },
       {
-        "id": "c5#result",
+        "id": "c5#1",
         "ordinal": 5,
         "kind": {
           "ToolResult": {
@@ -796,7 +796,7 @@
         },
         "provider_executed": false,
         "byte_size": 200,
-        "arc_id": "c5"
+        "arc_id": "c5#0"
       }
     ],
     "ctx": {
@@ -812,16 +812,16 @@
     "smart_drops": false,
     "frozen": [],
     "expected": {
-      "c1": "drop",
-      "c2": "drop",
-      "c3": "drop"
+      "c1#0": "drop",
+      "c2#0": "drop",
+      "c3#0": "drop"
     }
   },
   {
     "label": "emergency: tier order T3→T2→T1 to headroom",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -831,10 +831,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -843,10 +843,10 @@
         },
         "provider_executed": false,
         "byte_size": 40000,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c2#call",
+        "id": "c2#0",
         "ordinal": 2,
         "kind": {
           "ToolCall": {
@@ -856,10 +856,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c2#result",
+        "id": "c2#1",
         "ordinal": 2,
         "kind": {
           "ToolResult": {
@@ -868,10 +868,10 @@
         },
         "provider_executed": false,
         "byte_size": 40000,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c3#call",
+        "id": "c3#0",
         "ordinal": 3,
         "kind": {
           "ToolCall": {
@@ -881,10 +881,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c3#result",
+        "id": "c3#1",
         "ordinal": 3,
         "kind": {
           "ToolResult": {
@@ -893,10 +893,10 @@
         },
         "provider_executed": false,
         "byte_size": 40000,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c4#call",
+        "id": "c4#0",
         "ordinal": 4,
         "kind": {
           "ToolCall": {
@@ -906,10 +906,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c4"
+        "arc_id": "c4#0"
       },
       {
-        "id": "c4#result",
+        "id": "c4#1",
         "ordinal": 4,
         "kind": {
           "ToolResult": {
@@ -918,7 +918,7 @@
         },
         "provider_executed": false,
         "byte_size": 40000,
-        "arc_id": "c4"
+        "arc_id": "c4#0"
       }
     ],
     "ctx": {
@@ -934,15 +934,15 @@
     "smart_drops": false,
     "frozen": [],
     "expected": {
-      "c3": "drop",
-      "c4": "drop"
+      "c3#0": "drop",
+      "c4#0": "drop"
     }
   },
   {
     "label": "emergency: protected tail excluded",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -952,10 +952,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -964,10 +964,10 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c2#call",
+        "id": "c2#0",
         "ordinal": 2,
         "kind": {
           "ToolCall": {
@@ -977,10 +977,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c2#result",
+        "id": "c2#1",
         "ordinal": 2,
         "kind": {
           "ToolResult": {
@@ -989,10 +989,10 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
-        "arc_id": "c2"
+        "arc_id": "c2#0"
       },
       {
-        "id": "c3#call",
+        "id": "c3#0",
         "ordinal": 3,
         "kind": {
           "ToolCall": {
@@ -1002,10 +1002,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c3#result",
+        "id": "c3#1",
         "ordinal": 3,
         "kind": {
           "ToolResult": {
@@ -1014,10 +1014,10 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
-        "arc_id": "c3"
+        "arc_id": "c3#0"
       },
       {
-        "id": "c4#call",
+        "id": "c4#0",
         "ordinal": 4,
         "kind": {
           "ToolCall": {
@@ -1027,10 +1027,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c4"
+        "arc_id": "c4#0"
       },
       {
-        "id": "c4#result",
+        "id": "c4#1",
         "ordinal": 4,
         "kind": {
           "ToolResult": {
@@ -1039,7 +1039,7 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
-        "arc_id": "c4"
+        "arc_id": "c4#0"
       }
     ],
     "ctx": {
@@ -1055,15 +1055,15 @@
     "smart_drops": false,
     "frozen": [],
     "expected": {
-      "c1": "drop",
-      "c2": "drop"
+      "c1#0": "drop",
+      "c2#0": "drop"
     }
   },
   {
     "label": "emergency: idempotence latch (same sample → noop)",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -1073,10 +1073,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -1085,7 +1085,7 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       }
     ],
     "ctx": {
@@ -1106,7 +1106,7 @@
     "label": "emergency: reclaim below min → noop",
     "items": [
       {
-        "id": "c1#call",
+        "id": "c1#0",
         "ordinal": 1,
         "kind": {
           "ToolCall": {
@@ -1116,10 +1116,10 @@
         },
         "provider_executed": false,
         "byte_size": 0,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       },
       {
-        "id": "c1#result",
+        "id": "c1#1",
         "ordinal": 1,
         "kind": {
           "ToolResult": {
@@ -1128,7 +1128,7 @@
         },
         "provider_executed": false,
         "byte_size": 8000,
-        "arc_id": "c1"
+        "arc_id": "c1#0"
       }
     ],
     "ctx": {

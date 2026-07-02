@@ -430,6 +430,11 @@ pub struct ModuleMeta {
     /// The terminal covered ordinal as of the last baseline. Monotonic-absolute,
     /// never positional; can DECREASE on a revert-Hard.
     pub coverage_ordinal: Option<u64>,
+    /// Last normalized `todowrite` view captured on a bust pass. This is deliberately
+    /// session-scoped: a todo list is the working state of one conversation, not a
+    /// project-shared memory or preference.
+    #[serde(default)]
+    pub last_todo_state: Option<String>,
     /// The content-digest revision the frozen m1 block was last rendered from. The
     /// classifier compares the incoming m1 content's revision against this to decide
     /// whether an m1 delta rides (Soft) WITHOUT rendering. 0 = placeholder (no delta).
@@ -1608,6 +1613,9 @@ mod tests {
             initialized: true,
             last_render_config: "cfg1".into(),
             coverage_ordinal: Some(42),
+            last_todo_state: Some(
+                r#"[{"content":"persist me","status":"pending","priority":"high"}]"#.into(),
+            ),
             m1_revision: 0,
             ..Default::default()
         };

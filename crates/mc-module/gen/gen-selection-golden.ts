@@ -18,9 +18,10 @@
  *
  * TS→CK mapping: one TS tool tag → one CK arc. tag.byteSize → ToolResult bytes,
  * tag.inputByteSize → ToolCall bytes, tag.reasoningByteSize → a Reasoning block.
- * tag.tagNumber → the block ordinal (age key). arc_id = the tag's messageId; the
- * ToolCall block id = `<arc_id>#call`, ToolResult = `<arc_id>#result`. So the arc's
- * reclaim bytes (call+result+reasoning) == the TS tagReclaimBytes exactly.
+ * tag.tagNumber → the block ordinal (age key). FlatBlock ids use the ingress
+ * `mid#block_index` vocabulary for every block: ToolCall = `<mid>#0`, ToolResult =
+ * `<mid>#1`, Reasoning = `<mid>#2`. arc_id is the paired ToolCall FlatBlock id, so
+ * the arc's reclaim bytes (call+result+reasoning) == the TS tagReclaimBytes exactly.
  *
  * Run:  bun crates/mc-module/gen/gen-selection-golden.ts
  * (resolves the TS selectors from packages/plugin, like the tokenizer generators).
@@ -46,7 +47,7 @@ const { openDatabase, closeDatabase, insertTag } = storage as {
 // --- fixture types ---
 
 interface TagFixture {
-    /** messageId / arc id (c1, c2, …). */
+    /** Fixture `mid`; the generated ToolCall id and arc_id are `${id}#0`. */
     id: string;
     toolName: string;
     /** age key (tag number → block ordinal). */
@@ -82,7 +83,7 @@ interface CaseSpec {
         priorInputSample?: number;
         hasPriorDrop?: boolean;
     };
-    /** ids already frozen (excluded). Flat block ids (e.g. "c2#result"). */
+    /** ids already frozen (excluded). Flat block ids (e.g. "c2#1"). */
     frozen?: string[];
 }
 
@@ -119,6 +120,52 @@ function makeTarget(input: Record<string, unknown> | undefined) {
     };
 }
 
+function callBlockId(arcId: string): string {
+    return `${arcId}#0`;
+}
+
+function resultBlockId(arcId: string): string {
+    return `${arcId}#1`;
+}
+
+function reasoningBlockId(arcId: string): string {
+    return `${arcId}#2`;
+}
+
+function remapLegacyBlockId(id: string): string {
+    if (id.endsWith("#call")) return `${id.slice(0, -"#call".length)}#0`;
+    if (id.endsWith("#result")) return `${id.slice(0, -"#result".length)}#1`;
+    if (id.endsWith("#reasoning")) return `${id.slice(0, -"#reasoning".length)}#2`;
+    return id;
+}
+
+function remapExpectedArcs(expected: Record<string, string>): Record<string, string> {
+    const remapped: Record<string, string> = {};
+    for (const [legacyArc, kind] of Object.entries(expected)) {
+        remapped[callBlockId(legacyArc)] = kind;
+    }
+    return remapped;
+}
+
+function assertDecisionSetIdentity(
+    label: string,
+    legacy: Record<string, string>,
+    remapped: Record<string, string>,
+) {
+    for (const [legacyArc, kind] of Object.entries(legacy)) {
+        const flatArc = callBlockId(legacyArc);
+        if (remapped[flatArc] !== kind) {
+            throw new Error(`${label}: remap changed decision for ${legacyArc} → ${flatArc}`);
+        }
+    }
+    if (Object.keys(legacy).length !== Object.keys(remapped).length) {
+        throw new Error(`${label}: remap changed decision count`);
+    }
+    if (Object.keys(legacy).length > 0 && JSON.stringify(legacy) === JSON.stringify(remapped)) {
+        throw new Error(`${label}: remap was vacuous; arc ids did not change to FlatBlock ids`);
+    }
+}
+
 /** Build the flat CK tail from the fixture: each tag → a ToolCall + ToolResult (+ Reasoning). */
 function buildItems(tags: TagFixture[]): SelItemJson[] {
     const items: SelItemJson[] = [];
@@ -126,31 +173,31 @@ function buildItems(tags: TagFixture[]): SelItemJson[] {
         const providerExecuted = t.providerExecuted ?? false;
         // ToolCall block
         items.push({
-            id: `${t.id}#call`,
+            id: callBlockId(t.id),
             ordinal: t.n,
             kind: { ToolCall: { name: t.toolName, input: t.input ?? {} } },
             provider_executed: providerExecuted,
             byte_size: t.inputByteSize ?? 0,
-            arc_id: t.id,
+            arc_id: callBlockId(t.id),
         });
         // ToolResult block
         items.push({
-            id: `${t.id}#result`,
+            id: resultBlockId(t.id),
             ordinal: t.n,
             kind: { ToolResult: { tool_name: t.toolName } },
             provider_executed: providerExecuted,
             byte_size: t.byteSize,
-            arc_id: t.id,
+            arc_id: callBlockId(t.id),
         });
         // optional Reasoning block adjacent to the call
         if ((t.reasoningByteSize ?? 0) > 0) {
             items.push({
-                id: `${t.id}#reasoning`,
+                id: reasoningBlockId(t.id),
                 ordinal: t.n,
                 kind: "Reasoning",
                 provider_executed: false,
                 byte_size: t.reasoningByteSize ?? 0,
-                arc_id: t.id,
+                arc_id: callBlockId(t.id),
             });
         }
     }
@@ -393,13 +440,15 @@ const cases: CaseSpec[] = [
 ];
 
 const golden: GoldenCase[] = cases.map((spec) => {
-    const expected = runTsSelector(spec);
+    const legacyExpected = runTsSelector(spec);
+    const expected = remapExpectedArcs(legacyExpected);
+    assertDecisionSetIdentity(spec.label, legacyExpected, expected);
     return {
         label: spec.label,
         items: buildItems(spec.tags),
         ctx: buildCtx(spec),
         smart_drops: spec.smartDrops,
-        frozen: spec.frozen ?? [],
+        frozen: (spec.frozen ?? []).map(remapLegacyBlockId),
         expected,
     };
 });

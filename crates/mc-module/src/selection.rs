@@ -112,11 +112,10 @@ pub enum SelKind {
     Opaque,
 }
 
-/// A flat, block-granular reducible item — one per CK#1 `ContentBlock`. `id` is the
-/// module-owned stable reduction id (tool blocks: `<tool_call_id>#call` /
-/// `<tool_call_id>#result`; id-less blocks: a module-derived id, leg-dependent —
-/// `msg<N>#blk<i>` placeholder in tests). Extension of the wire item with the typed
-/// fields selection reads.
+/// A flat, block-granular reducible item, one per content block from the provider. The
+/// `id` is this module's stable reduction identifier in `mid#block_index` form for every
+/// block, including tool calls and tool results. This struct adds the typed fields that
+/// the selection logic needs on top of the raw incoming item.
 #[derive(Debug, Clone)]
 pub struct SelItem {
     pub id: String,
@@ -126,9 +125,10 @@ pub struct SelItem {
     pub provider_executed: bool,
     /// Bytes this block contributes to reclaim accounting (output/content bytes).
     pub byte_size: usize,
-    /// The arc this block belongs to, for arc-atomic emission: tool blocks carry the
-    /// `tool_call_id`; a Reasoning block adjacent to a tool call carries that tool's
-    /// `tool_call_id`; non-arc blocks carry `None`.
+    /// The arc this block belongs to, for arc-atomic emission: every block in a tool
+    /// arc carries the paired ToolCall block's `mid#block_index`; non-arc blocks carry
+    /// `None`. The raw provider tool-call id is only a pairing hint at ingress and is
+    /// never an identity key here.
     pub arc_id: Option<String>,
 }
 
@@ -185,10 +185,10 @@ struct ToolArc {
     ordinal: u64,
     provider_executed: bool,
     input: serde_json::Value,
-    /// `<tool_call_id>#call`.
+    /// FlatBlock id of the ToolCall block (`mid#block_index`).
     call_id: Option<String>,
     call_bytes: usize,
-    /// `<tool_call_id>#result` (absent if the result hasn't arrived).
+    /// FlatBlock id of the paired ToolResult block (absent if the result hasn't arrived).
     result_id: Option<String>,
     result_bytes: usize,
     /// Adjacent Reasoning block ids dropped with the arc, + their bytes.
@@ -816,15 +816,28 @@ mod tests {
 
     // --- helpers to build a flat CK tail ---
 
+    fn call_block_id(mid: &str) -> String {
+        format!("{mid}#0")
+    }
+
+    fn result_block_id(mid: &str) -> String {
+        format!("{mid}#1")
+    }
+
+    fn reasoning_block_id(mid: &str) -> String {
+        format!("{mid}#2")
+    }
+
     fn tool_call(
-        arc: &str,
+        mid: &str,
         ordinal: u64,
         name: &str,
         input: serde_json::Value,
         bytes: usize,
     ) -> SelItem {
+        let id = call_block_id(mid);
         SelItem {
-            id: format!("{arc}#call"),
+            id: id.clone(),
             ordinal,
             kind: SelKind::ToolCall {
                 name: name.to_string(),
@@ -832,29 +845,71 @@ mod tests {
             },
             provider_executed: false,
             byte_size: bytes,
-            arc_id: Some(arc.to_string()),
+            arc_id: Some(id),
         }
     }
-    fn tool_result(arc: &str, ordinal: u64, name: &str, bytes: usize) -> SelItem {
+
+    fn tool_result(mid: &str, ordinal: u64, name: &str, bytes: usize) -> SelItem {
         SelItem {
-            id: format!("{arc}#result"),
+            id: result_block_id(mid),
             ordinal,
             kind: SelKind::ToolResult {
                 tool_name: name.to_string(),
             },
             provider_executed: false,
             byte_size: bytes,
-            arc_id: Some(arc.to_string()),
+            arc_id: Some(call_block_id(mid)),
         }
     }
-    fn reasoning(arc: &str, ordinal: u64, bytes: usize) -> SelItem {
+
+    fn reasoning(mid: &str, ordinal: u64, bytes: usize) -> SelItem {
         SelItem {
-            id: format!("{arc}#reasoning"),
+            id: reasoning_block_id(mid),
             ordinal,
             kind: SelKind::Reasoning,
             provider_executed: false,
             byte_size: bytes,
-            arc_id: Some(arc.to_string()),
+            arc_id: Some(call_block_id(mid)),
+        }
+    }
+
+    fn tool_call_with_ids(
+        id: &str,
+        arc_id: &str,
+        ordinal: u64,
+        name: &str,
+        input: serde_json::Value,
+        bytes: usize,
+    ) -> SelItem {
+        SelItem {
+            id: id.to_string(),
+            ordinal,
+            kind: SelKind::ToolCall {
+                name: name.to_string(),
+                input,
+            },
+            provider_executed: false,
+            byte_size: bytes,
+            arc_id: Some(arc_id.to_string()),
+        }
+    }
+
+    fn tool_result_with_ids(
+        id: &str,
+        arc_id: &str,
+        ordinal: u64,
+        name: &str,
+        bytes: usize,
+    ) -> SelItem {
+        SelItem {
+            id: id.to_string(),
+            ordinal,
+            kind: SelKind::ToolResult {
+                tool_name: name.to_string(),
+            },
+            provider_executed: false,
+            byte_size: bytes,
+            arc_id: Some(arc_id.to_string()),
         }
     }
 
@@ -879,17 +934,24 @@ mod tests {
         items: &[SelItem],
         out: &[ReductionDecision],
     ) -> std::collections::BTreeMap<String, String> {
-        let id_to_arc: HashMap<&str, &str> = items
+        let id_to_arc_and_kind: HashMap<&str, (&str, bool)> = items
             .iter()
-            .filter_map(|i| i.arc_id.as_deref().map(|a| (i.id.as_str(), a)))
+            .filter_map(|i| {
+                i.arc_id.as_deref().map(|a| {
+                    (
+                        i.id.as_str(),
+                        (a, matches!(&i.kind, SelKind::ToolCall { .. })),
+                    )
+                })
+            })
             .collect();
         let mut m = std::collections::BTreeMap::new();
         for d in out {
-            let Some(arc) = id_to_arc.get(d.target_id.as_str()) else {
+            let Some((arc, is_call)) = id_to_arc_and_kind.get(d.target_id.as_str()) else {
                 continue;
             };
             // The arc's decision is defined by its CALL block's kind.
-            if d.target_id.ends_with("#call") {
+            if *is_call {
                 let arc_kind = match d.kind.as_str() {
                     "edit_marker" => "edit_marker",
                     _ => "drop", // skeleton or drop → arc-level "drop"
@@ -975,6 +1037,9 @@ mod tests {
         let cases: Vec<GoldenCase> =
             serde_json::from_str(raw).expect("parse selection-golden.json");
         assert!(!cases.is_empty(), "empty selection golden");
+        let mut seen_reduction_kinds = HashSet::new();
+        let mut saw_t1_tool = false;
+        let mut saw_t2_tool = false;
 
         for case in &cases {
             let items: Vec<SelItem> = case
@@ -989,6 +1054,33 @@ mod tests {
                     arc_id: i.arc_id.clone(),
                 })
                 .collect();
+            let call_ids: HashSet<&str> = items
+                .iter()
+                .filter(|i| matches!(&i.kind, SelKind::ToolCall { .. }))
+                .map(|i| i.id.as_str())
+                .collect();
+            for item in &items {
+                assert!(
+                    !item.id.ends_with("#call")
+                        && !item.id.ends_with("#result")
+                        && !item.id.ends_with("#reasoning"),
+                    "golden item '{}' still uses the pre-FlatBlock tool suffix vocabulary",
+                    item.id
+                );
+                if let SelKind::ToolCall { name, .. } = &item.kind {
+                    let tier = resolve_tool_tier(name);
+                    saw_t1_tool |= tier == 1;
+                    saw_t2_tool |= tier == 2;
+                }
+            }
+            for arc in case.expected.keys() {
+                assert!(
+                    call_ids.contains(arc.as_str()),
+                    "case '{}' expected arc '{}' is not the ToolCall FlatBlock id",
+                    case.label,
+                    arc
+                );
+            }
             let pass = match case.ctx.pass_class.as_str() {
                 "EmergencyForce" => PassClass::EmergencyForce,
                 "Defer" => PassClass::Defer,
@@ -1009,6 +1101,7 @@ mod tests {
             };
             let frozen: HashSet<String> = case.frozen.iter().cloned().collect();
             let out = select_reductions(&items, &frozen, &ctx, &cfg);
+            seen_reduction_kinds.extend(out.iter().map(|d| d.kind.clone()));
             let got = arc_decisions(&items, &out);
             assert_eq!(
                 got, case.expected,
@@ -1016,6 +1109,15 @@ mod tests {
                 case.label
             );
         }
+
+        for kind in ["drop", "skeleton", "edit_marker"] {
+            assert!(
+                seen_reduction_kinds.contains(kind),
+                "selection golden stopped exercising reduction kind '{kind}'"
+            );
+        }
+        assert!(saw_t1_tool, "selection golden stopped exercising T1 tools");
+        assert!(saw_t2_tool, "selection golden stopped exercising T2 tools");
     }
 
     // --- CK-model unit tests (no TS equivalent) ---
@@ -1029,8 +1131,9 @@ mod tests {
             tool_call("c2", 2, "web_search", serde_json::json!({}), 200),
             tool_result("c2", 2, "web_search", 200),
         ];
+        let c2_arc = call_block_id("c2");
         for it in items.iter_mut() {
-            if it.arc_id.as_deref() == Some("c2") {
+            if it.arc_id.as_deref() == Some(c2_arc.as_str()) {
                 it.provider_executed = true;
             }
         }
@@ -1038,9 +1141,12 @@ mod tests {
         ctx.last_execute_ordinal = 2; // both arcs at/under watermark
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         let arcs = arc_decisions(&items, &out);
-        assert_eq!(arcs.get("c1").map(String::as_str), Some("drop"));
+        assert_eq!(
+            arcs.get(&call_block_id("c1")).map(String::as_str),
+            Some("drop")
+        );
         assert!(
-            !arcs.contains_key("c2"),
+            !arcs.contains_key(&c2_arc),
             "provider_executed arc must be skipped"
         );
     }
@@ -1056,7 +1162,7 @@ mod tests {
         ];
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 2;
-        let frozen: HashSet<String> = ["c1#result".to_string()].into_iter().collect();
+        let frozen: HashSet<String> = [result_block_id("c1")].into_iter().collect();
         let out = select_reductions(&items, &frozen, &ctx, &SelectionConfig::default());
         assert!(
             out.iter().all(|d| !d.target_id.starts_with("c1")),
@@ -1081,7 +1187,52 @@ mod tests {
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         let ids: HashSet<&str> = out.iter().map(|d| d.target_id.as_str()).collect();
         assert!(
-            ids.contains("c1#call") && ids.contains("c1#result") && ids.contains("c1#reasoning"),
+            ids.contains(call_block_id("c1").as_str())
+                && ids.contains(result_block_id("c1").as_str())
+                && ids.contains(reasoning_block_id("c1").as_str()),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn reused_provider_call_id_does_not_merge_cross_turn_arcs() {
+        // Some providers reuse bare tool-call ids such as "call_0" across turns. The
+        // grouping key is the session-injective ToolCall FlatBlock id, so two turns with
+        // the same provider id still reduce as two independent arcs.
+        let items = vec![
+            tool_call_with_ids(
+                "turn1#0",
+                "turn1#0",
+                1,
+                "bash",
+                serde_json::json!({"provider_call_id":"call_0"}),
+                50,
+            ),
+            tool_result_with_ids("turn1-tool#0", "turn1#0", 1, "bash", 300),
+            tool_call_with_ids(
+                "turn2#0",
+                "turn2#0",
+                2,
+                "bash",
+                serde_json::json!({"provider_call_id":"call_0"}),
+                50,
+            ),
+            tool_result_with_ids("turn2-tool#0", "turn2#0", 2, "bash", 300),
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = 2;
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        let arcs = arc_decisions(&items, &out);
+        assert_eq!(arcs.get("turn1#0").map(String::as_str), Some("drop"));
+        assert_eq!(arcs.get("turn2#0").map(String::as_str), Some("drop"));
+
+        let ids: HashSet<&str> = out.iter().map(|d| d.target_id.as_str()).collect();
+        assert!(
+            ids.contains("turn1#0") && ids.contains("turn1-tool#0"),
+            "{ids:?}"
+        );
+        assert!(
+            ids.contains("turn2#0") && ids.contains("turn2-tool#0"),
             "{ids:?}"
         );
     }
@@ -1105,7 +1256,7 @@ mod tests {
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         let call_kind = |arc: &str| -> String {
             out.iter()
-                .find(|d| d.target_id == format!("{arc}#call"))
+                .find(|d| d.target_id == call_block_id(arc))
                 .map(|d| d.kind.clone())
                 .unwrap_or_default()
         };
@@ -1147,7 +1298,7 @@ mod tests {
         );
         let c1_call = out
             .iter()
-            .find(|d| d.target_id == "c1#call")
+            .find(|d| d.target_id == call_block_id("c1"))
             .map(|d| d.kind.clone());
         // Drop wins: the arc is on the DROP path (skeleton in-window, or full-drop
         // older), NEVER edit_marker. With only 2 arcs c1 is in the skeleton window, so
@@ -1212,7 +1363,7 @@ mod tests {
                 &SelectionConfig { smart_drops: true },
             );
             out.iter()
-                .find(|d| d.target_id == "c1#call" && d.kind == "edit_marker")
+                .find(|d| d.target_id == call_block_id("c1") && d.kind == "edit_marker")
                 .map(|d| d.payload.clone())
         };
 
@@ -1222,7 +1373,7 @@ mod tests {
         // plus non-zero pressure/latch fields. last_execute_ordinal stays 0 so c1 is NOT
         // a two-pass drop candidate (keeps it an edit_marker in both).
         let ctx_b = SelectionContext {
-            agent_drop_ids: vec!["c9#result".to_string()],
+            agent_drop_ids: vec![result_block_id("c9")],
             current_total_input_tokens: 123_456.0,
             ceiling_tokens: 200_000.0,
             protected_cutoff_ordinal: 2,
@@ -1247,11 +1398,11 @@ mod tests {
             &SelectionConfig { smart_drops: true },
         );
         assert!(
-            !set_a.iter().any(|d| d.target_id == "c9#result"),
+            !set_a.iter().any(|d| d.target_id == result_block_id("c9")),
             "context A must NOT drop c9"
         );
         assert!(
-            set_b.iter().any(|d| d.target_id == "c9#result"),
+            set_b.iter().any(|d| d.target_id == result_block_id("c9")),
             "context B MUST drop c9 (the sets genuinely differ)"
         );
 
@@ -1283,11 +1434,11 @@ mod tests {
             tool_result("c1", 1, "read", 300),
         ];
         let mut ctx = base_ctx(PassClass::Execute);
-        ctx.agent_drop_ids = vec!["c1#result".to_string()];
+        ctx.agent_drop_ids = vec![result_block_id("c1")];
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(out
             .iter()
-            .any(|d| d.target_id == "c1#result" && d.kind == "drop"));
+            .any(|d| d.target_id == result_block_id("c1") && d.kind == "drop"));
     }
 
     #[test]
@@ -1298,7 +1449,7 @@ mod tests {
         ];
         let mut ctx = base_ctx(PassClass::Defer);
         ctx.last_execute_ordinal = 1;
-        ctx.agent_drop_ids = vec!["c1#result".to_string()];
+        ctx.agent_drop_ids = vec![result_block_id("c1")];
         let out = select_reductions(
             &items,
             &HashSet::new(),
