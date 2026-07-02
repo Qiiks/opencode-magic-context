@@ -28,6 +28,13 @@ pub struct MessageRange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkLine {
     pub ordinal: u64,
+    /// CONTRACT: the FLAT BLOCK ID (`<mid>#<index>`) of the line's last block — never a
+    /// bare harness/CK message id. This value becomes the published compartment's
+    /// end_message_id and, when that compartment folds, the coverage boundary anchor.
+    /// Boundary presence is checked against live flat block ids, so any other vocabulary
+    /// mints an anchor that can never be present (the transform's mint-absent guard then
+    /// fails the fold loudly). The production chunk builder must derive this from the
+    /// flattened projection, not from the raw CK message id.
     pub message_id: String,
 }
 

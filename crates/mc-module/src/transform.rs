@@ -249,6 +249,12 @@ pub enum TransformError {
     SyntheticTodoAnchorMissing(String),
     /// A frozen reduction still names a live message, but that exact block disappeared.
     FrozenRedTargetVanish(String),
+    /// A bust folded/advanced coverage from a compartment, but the anchor it minted (the
+    /// last covered block's id) is empty or absent from the live input this pass. The
+    /// anchor can then never be present, so reconcile can never clear and the pass loops
+    /// as an unbounded phantom HARD. Fail loud: it signals an empty or wrong-vocabulary
+    /// compartment end_message_id (the anchor must be a flat block id, `<mid>#<index>`).
+    BoundaryNotPresent(String),
 }
 
 impl std::fmt::Display for TransformError {
@@ -279,6 +285,9 @@ impl std::fmt::Display for TransformError {
                     f,
                     "frozen reduction target vanished while its message is live: {id}"
                 )
+            }
+            TransformError::BoundaryNotPresent(m) => {
+                write!(f, "minted boundary not present: {m}")
             }
         }
     }
@@ -509,6 +518,32 @@ fn apply_once(
                 }
             }
 
+            // Mint-absent guard (fresh mints only): when this fold takes its anchor from a
+            // compartment (coverage present), the minted boundary must be a block id that
+            // exists in the live input THIS pass — the anchor is the last covered block,
+            // which the producer always sends (trimming happens in our OUTPUT, and a
+            // producer-side coverage trim keeps ordinals >= coverage_ordinal, so the
+            // boundary block itself is never trimmed away). An empty or absent mint means
+            // the compartment's end_message_id is empty or in the wrong vocabulary (it
+            // must be the flat block id `<mid>#<index>`, not a bare message id): such an
+            // anchor can NEVER be present on any later pass, so reconcile can never clear
+            // and every pass re-materializes — an unbounded phantom-HARD loop. Fail loud
+            // instead. A reconcile-rematerialize is excluded: it re-mints while the
+            // boundary is legitimately absent (a revert removed it), which is exactly its
+            // job — and a bad-vocabulary anchor can only ENTER via a fresh mint, where
+            // this guard already caught it.
+            if !loaded.core.reconcile_pending && comp.coverage_ordinal.is_some() {
+                let minted = comp.boundary_id.as_str();
+                if minted.is_empty() || !live.iter().any(|i| i.id() == minted) {
+                    return Err(TransformError::BoundaryNotPresent(format!(
+                        "fold minted anchor {minted:?} from the folded compartment's \
+                         end_message_id, but no live block carries that id; the anchor \
+                         must be the flat block id (`<mid>#<index>`) of the last covered \
+                         block"
+                    )));
+                }
+            }
+
             // The reductions that SURVIVE the fold: m0 is now a compartment SUMMARY (not
             // covered raw bytes), so a reduction on a now-covered item simply drops with
             // it (no "fold reduced bytes into m0"); a target still in the new tail is kept;
@@ -569,6 +604,21 @@ fn apply_once(
             // A coverage-extending SOFT advances the boundary anchor (the bound core
             // primitive); a memory-only SOFT leaves it put (None).
             let new_boundary_id = m1.new_coverage.as_ref().map(|(id, _)| id.clone());
+            // Mint-absent guard, SOFT arm (same invariant as the fold's guard above): an
+            // advanced anchor must exist in the live input this pass, or presence can
+            // never hold afterward and the session decays into a reconcile-HARD loop. A
+            // SOFT can only reach here with reconcile clear (the classifier routes a
+            // pending reconcile to defer/HARD), so every advance is a fresh mint and the
+            // check is unconditional.
+            if let Some(id) = &new_boundary_id {
+                if id.is_empty() || !live.iter().any(|i| i.id() == id) {
+                    return Err(TransformError::BoundaryNotPresent(format!(
+                        "coverage-extending delta advanced the anchor to {id:?}, but no \
+                         live block carries that id; the anchor must be the flat block id \
+                         (`<mid>#<index>`) of the last covered block"
+                    )));
+                }
+            }
             core.step(PassInput {
                 proposed: Some(mc_core::Action::Soft),
                 boundary_present: boundary_token,
@@ -1900,6 +1950,156 @@ mod tests {
             "{}",
             m1_bytes(&second)
         );
+    }
+
+    #[test]
+    fn fold_minting_wrong_vocabulary_anchor_fails_loud_instead_of_looping() {
+        // A compartment whose end_message_id is a BARE message id ("m1") instead of the
+        // flat block id ("m1#0"). Presence checks live flat block ids, so a fold that
+        // mints the bare id produces an anchor that can NEVER be present: the next pass
+        // reads boundary-absent, sets reconcile, HARDs, re-mints the same bare id — an
+        // unbounded phantom-HARD loop (each HARD byte-identical, so it is invisible to
+        // the provider cache but burns a version bump + full recompose every pass). The
+        // guard must fail the MINTING pass loudly instead.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(
+            "ses",
+            &[StoredCompartment {
+                sequence: 0,
+                start_message: 1,
+                end_message: 1,
+                end_message_id: "m1".to_string(), // bare mid — wrong vocabulary
+                title: "C0".to_string(),
+                content: "S".to_string(),
+                p1: Some("S".to_string()),
+                importance: 50,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let live = vec![item("m1", 1, "raw"), item("t2", 2, "tail")];
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let err = transform(&s, &req("ses", "cfg0", live.clone()), &ctx, &spine());
+        match err {
+            Err(TransformError::BoundaryNotPresent(_)) => {}
+            other => panic!("expected BoundaryNotPresent, got {other:?}"),
+        }
+        // Nothing committed → the error stays visible on retry, never a silent loop.
+        let retry = transform(&s, &req("ses", "cfg0", live), &ctx, &spine());
+        assert!(matches!(retry, Err(TransformError::BoundaryNotPresent(_))));
+    }
+
+    #[test]
+    fn fold_minting_empty_anchor_with_coverage_fails_loud() {
+        // An empty end_message_id with real coverage would mint boundary_id="" — the
+        // reserved no-boundary sentinel — while compartments exist. The first-fold
+        // trigger (empty boundary + compartments present) would then re-fire a HARD on
+        // every pass forever. The guard catches the empty mint at the source.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(
+            "ses",
+            &[StoredCompartment {
+                sequence: 0,
+                start_message: 1,
+                end_message: 1,
+                end_message_id: String::new(), // empty — never presentable
+                title: "C0".to_string(),
+                content: "S".to_string(),
+                p1: Some("S".to_string()),
+                importance: 50,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let live = vec![item("m1", 1, "raw")];
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let err = transform(&s, &req("ses", "cfg0", live), &ctx, &spine());
+        assert!(matches!(err, Err(TransformError::BoundaryNotPresent(_))));
+    }
+
+    #[test]
+    fn coverage_extending_soft_minting_absent_anchor_fails_loud() {
+        // Same invariant on the OTHER mint site: a second compartment publishing with a
+        // wrong-vocabulary end_message_id rides a coverage-extending SOFT — the advanced
+        // anchor must exist in the live array or the session decays into the same
+        // reconcile-HARD loop one pass later.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // Healthy first fold (flat vocabulary).
+        s.replace_compartments("ses", &[comp(0, 1, 1, "a", "S0")])
+            .unwrap();
+        let live = vec![item("a", 1, "raw"), item("t2", 2, "turn two")];
+        let boot = run(&s, &req("ses", "cfg0", live.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(boot.boundary_id, "a#0");
+
+        // Second compartment publishes with a BARE end_message_id → the SOFT advance
+        // must fail loud, not mint an unpresentable anchor.
+        s.replace_compartments(
+            "ses",
+            &[
+                comp(0, 1, 1, "a", "S0"),
+                StoredCompartment {
+                    sequence: 1,
+                    start_message: 2,
+                    end_message: 2,
+                    end_message_id: "t2".to_string(), // bare mid — wrong vocabulary
+                    title: "C1".to_string(),
+                    content: "S1".to_string(),
+                    p1: Some("S1".to_string()),
+                    importance: 50,
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let err = transform(&s, &req("ses", "cfg0", live), &ctx, &spine());
+        assert!(matches!(err, Err(TransformError::BoundaryNotPresent(_))));
+    }
+
+    #[test]
+    fn reconcile_rematerialize_after_revert_is_not_blocked_by_the_mint_guard() {
+        // The exclusion arm: a reconcile-rematerialize legitimately re-mints while the
+        // boundary is absent (a revert removed it) — the guard must NOT fire there. The
+        // historian re-cuts compartments after a revert, so the rematerialize composes
+        // from the re-cut store; here the re-cut store still has a compartment whose
+        // anchor IS present in the post-revert live array (partial revert: the covered
+        // head survived, only the tail past it reverted).
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(
+            "ses",
+            &[comp(0, 1, 1, "a", "S0"), comp(1, 2, 2, "t2", "S1")],
+        )
+        .unwrap();
+        let live_full = vec![
+            item("a", 1, "raw"),
+            item("t2", 2, "turn two"),
+            item("t3", 3, "tail"),
+        ];
+        let boot = run(&s, &req("ses", "cfg0", live_full), &spine());
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(boot.boundary_id, "t2#0");
+
+        // Revert removes t2 (the boundary) and t3; the historian re-cuts to just C0.
+        let live_reverted = vec![item("a", 1, "raw"), item("t4", 4, "new turn")];
+        let revert = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
+        assert_eq!(revert.action, "SOFT+", "revert never busts on sight");
+        assert!(revert.reconcile_pending);
+
+        s.replace_compartments("ses", &[comp(0, 1, 1, "a", "S0")])
+            .unwrap();
+        let remat = run(&s, &req("ses", "cfg0", live_reverted), &spine());
+        assert_eq!(
+            remat.action, "HARD",
+            "reconcile rematerializes without tripping the mint guard"
+        );
+        assert_eq!(remat.boundary_id, "a#0", "re-minted from the re-cut store");
+        assert!(!remat.reconcile_pending);
+        assert_eq!(tail_ids(&remat), vec!["t4"]);
     }
 
     #[test]
