@@ -180,6 +180,7 @@ pub fn fire(
         producer_run_id: None,
         fired_at_ms: Some(fired_at_ms),
         failure_backoff_at_ms: None,
+        last_failure: current.last_failure.clone(),
     }))
 }
 
@@ -193,6 +194,8 @@ pub fn producer_started(
     next.state = HistorianPhase::AwaitingProducer;
     next.producer_session_id = Some(producer_session_id);
     next.producer_run_id = Some(producer_run_id);
+    // A producer run is established: any failure detail from a prior firing is resolved.
+    next.last_failure = None;
     Ok(next)
 }
 
@@ -237,10 +240,22 @@ pub fn abandon(
     current: &HistorianDurableState,
     failure_backoff_at_ms: i64,
 ) -> HistorianDurableState {
+    abandon_with_detail(current, failure_backoff_at_ms, None)
+}
+
+/// Abandon while recording WHY. The detail lands in durable state because the firing
+/// runs in a spawned task whose stderr a supervised deployment never captures; without
+/// this, a connect/bind failure is indistinguishable from any other in a state dump.
+pub fn abandon_with_detail(
+    current: &HistorianDurableState,
+    failure_backoff_at_ms: i64,
+    detail: Option<String>,
+) -> HistorianDurableState {
     HistorianDurableState {
         state: HistorianPhase::Idle,
         firing_seq: current.firing_seq,
         failure_backoff_at_ms: Some(failure_backoff_at_ms),
+        last_failure: detail.or_else(|| current.last_failure.clone()),
         ..HistorianDurableState::default()
     }
 }
@@ -615,7 +630,11 @@ where
                 persist_historian_state(
                     request.store,
                     request.session_id,
-                    abandon(&fired, request.failure_backoff_at_ms),
+                    abandon_with_detail(
+                        &fired,
+                        request.failure_backoff_at_ms,
+                        Some(format!("producer start ({model}): {err:?}")),
+                    ),
                 )?;
                 producer.close().await;
                 if retry {
@@ -639,7 +658,11 @@ where
                 persist_historian_state(
                     request.store,
                     request.session_id,
-                    abandon(&awaiting, request.failure_backoff_at_ms),
+                    abandon_with_detail(
+                        &awaiting,
+                        request.failure_backoff_at_ms,
+                        Some(format!("producer output ({model}): {err:?}")),
+                    ),
                 )?;
                 producer.close().await;
                 if retry {
@@ -1205,6 +1228,7 @@ mod tests {
             producer_run_id: Some("run-3".into()),
             fired_at_ms: Some(10),
             failure_backoff_at_ms: None,
+            last_failure: None,
         }
     }
 
@@ -1215,7 +1239,7 @@ mod tests {
         seed_prior_compartment(&main_store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let models = vec!["model-a".to_string()];
+        let models = vec!["prov/model-a".to_string()];
         let text = historian_xml("second arc full and exact");
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-1")))
@@ -1231,7 +1255,7 @@ mod tests {
         let HistorianDriveOutcome::Completed(success) = outcome else {
             panic!("expected completed outcome");
         };
-        assert_eq!(success.model, "model-a");
+        assert_eq!(success.model, "prov/model-a");
         assert_eq!(success.producer_session_id, "mc-historian:proj:1");
         assert_eq!(producer.observed_starts.len(), 1);
         assert_eq!(producer.observed_starts[0].0, "mc-historian:proj:1");
@@ -1265,7 +1289,7 @@ mod tests {
         seed_prior_compartment(&fallback_store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Err(HistorianProducerError::retryable_model_failure(
                 "provider overloaded",
@@ -1288,12 +1312,18 @@ mod tests {
         let HistorianDriveOutcome::Completed(success) = outcome else {
             panic!("expected completed fallback outcome");
         };
-        assert_eq!(success.model, "model-b");
+        assert_eq!(success.model, "prov/model-b");
         assert_eq!(
             producer.observed_starts,
             vec![
-                ("mc-historian:proj:1".to_string(), "model-a".to_string()),
-                ("mc-historian:proj:2".to_string(), "model-b".to_string()),
+                (
+                    "mc-historian:proj:1".to_string(),
+                    "prov/model-a".to_string()
+                ),
+                (
+                    "mc-historian:proj:2".to_string(),
+                    "prov/model-b".to_string()
+                ),
             ],
             "fallback retries author a new session/run instead of resuming under another model"
         );
@@ -1471,7 +1501,7 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let models = vec!["model-a".to_string()];
+        let models = vec!["prov/model-a".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-1")))
             .with_output(Err(HistorianProducerError::TimedOut));
@@ -1487,6 +1517,58 @@ mod tests {
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
         assert_eq!(state.failure_backoff_at_ms, Some(999));
+        let detail = state.last_failure.expect("failure detail recorded");
+        assert!(
+            detail.contains("producer output") && detail.contains("prov/model-a"),
+            "durable failure detail names the phase and model: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn producer_start_failure_records_durable_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut producer = ScriptedProducer::default().with_start(Err(
+            HistorianProducerError::Subc(subc_protocol::ErrorBody {
+                code: "route_rejected".to_string(),
+                message: "no such module".to_string(),
+            }),
+        ));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        let detail = state.last_failure.expect("failure detail recorded");
+        assert!(
+            detail.contains("producer start") && detail.contains("route_rejected"),
+            "connect/bind-class failures are diagnosable from the state dump alone: {detail}"
+        );
+
+        // A later firing that establishes its run clears the stale detail.
+        let mut ok_producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-2")))
+            .with_output(Ok(producer_output(historian_xml("recovery summary"))));
+        run_historian_firing(
+            &mut ok_producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            state.last_failure, None,
+            "success clears the failure detail"
+        );
     }
 
     #[tokio::test]
@@ -1496,7 +1578,7 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-1")))
             .with_output(Err(HistorianProducerError::RunPaused {
@@ -1514,7 +1596,10 @@ mod tests {
         assert!(matches!(err, HistorianDriveError::Producer(_)));
         assert_eq!(
             producer.observed_starts,
-            vec![("mc-historian:proj:1".to_string(), "model-a".to_string())],
+            vec![(
+                "mc-historian:proj:1".to_string(),
+                "prov/model-a".to_string()
+            )],
             "paused runs abandon the slot instead of retrying the next model"
         );
         assert_eq!(producer.cancels, vec!["run-1"]);
@@ -1602,7 +1687,7 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let models = vec!["model-a".to_string()];
+        let models = vec!["prov/model-a".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-1")))
             .with_output(Ok(producer_output(
@@ -1704,6 +1789,7 @@ mod tests {
             producer_run_id: Some("run-1".into()),
             fired_at_ms: Some(1),
             failure_backoff_at_ms: None,
+            last_failure: None,
         };
         let rv = store
             .commit(

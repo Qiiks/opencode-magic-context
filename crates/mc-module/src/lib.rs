@@ -446,10 +446,12 @@ impl McHandler {
                     no_fire: Some(format!("state_load_failed:{e}")),
                     state: "unknown".to_string(),
                     progress: None,
+                    last_failure: None,
                 }
             }
         };
         let state = loaded.meta.historian.state.as_str().to_string();
+        let last_failure = loaded.meta.historian.last_failure.clone();
         if self
             .live_historian_sessions
             .lock()
@@ -462,6 +464,7 @@ impl McHandler {
                 no_fire: Some("busy".to_string()),
                 state,
                 progress: None,
+                last_failure: last_failure.clone(),
             };
         }
         if loaded.meta.historian.state != HistorianPhase::Idle {
@@ -480,6 +483,7 @@ impl McHandler {
                 no_fire: Some(no_fire.to_string()),
                 state,
                 progress: None,
+                last_failure: last_failure.clone(),
             };
         }
         let cfg = self.effective_config(&binding.project_root);
@@ -529,6 +533,7 @@ impl McHandler {
                 }),
                 state,
                 progress,
+                last_failure,
             };
         }
         if cfg.model_chain.is_empty() {
@@ -538,6 +543,7 @@ impl McHandler {
                 no_fire: Some("no_models".to_string()),
                 state,
                 progress: progress.clone(),
+                last_failure: last_failure.clone(),
             };
         }
         let Some(boundary) = trigger.boundary.clone() else {
@@ -547,6 +553,7 @@ impl McHandler {
                 no_fire: Some("missing_boundary".to_string()),
                 state,
                 progress: progress.clone(),
+                last_failure: last_failure.clone(),
             };
         };
         let live: Vec<_> = projection
@@ -584,6 +591,7 @@ impl McHandler {
                     no_fire: Some(format!("assemble:{reason:?}")),
                     state,
                     progress: progress.clone(),
+                    last_failure: last_failure.clone(),
                 }
             }
             Err(e) => {
@@ -593,6 +601,7 @@ impl McHandler {
                     no_fire: Some(format!("assemble_failed:{e}")),
                     state,
                     progress: progress.clone(),
+                    last_failure: last_failure.clone(),
                 }
             }
         };
@@ -608,6 +617,7 @@ impl McHandler {
                     no_fire: Some("busy".to_string()),
                     state,
                     progress: progress.clone(),
+                    last_failure: last_failure.clone(),
                 };
             }
             SessionSetGuard {
@@ -630,6 +640,7 @@ impl McHandler {
             no_fire: None,
             state,
             progress,
+            last_failure,
         }
     }
 
@@ -1420,6 +1431,7 @@ mod tests {
             producer_run_id: Some("run-reattach".to_string()),
             fired_at_ms: Some(1),
             failure_backoff_at_ms: None,
+            last_failure: None,
         };
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)
@@ -1441,6 +1453,7 @@ mod tests {
             producer_run_id: Some("run-stale".to_string()),
             fired_at_ms: Some(1),
             failure_backoff_at_ms: None,
+            last_failure: None,
         };
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)

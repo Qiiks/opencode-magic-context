@@ -327,10 +327,26 @@ impl HistorianProducer {
         // into the user prompt: the historian's parse/validate contract assumes the
         // model saw its role guidance as a system message. Empty means absent, matching
         // the wire's empty-as-absent rule, so we omit the field entirely.
+        //
+        // The params shape mirrors llm-runner's SendParams (llmr-module-serve wire.rs):
+        // `model` is a nested {provider, model} object, split from our canonical
+        // "provider/model" string at the FIRST slash so multi-slash model names keep
+        // their remainder intact. The server decodes strictly enough that a flat model
+        // string fails the whole send with invalid_params, which a live rig drive
+        // surfaced as firings dying before any producer run existed.
+        let (provider, model_name) = model.split_once('/').ok_or_else(|| {
+            HistorianProducerError::Subc(ErrorBody {
+                code: "invalid_model".to_string(),
+                message: format!("model '{model}' is not in canonical provider/model form"),
+            })
+        })?;
         let mut params = serde_json::Map::new();
         params.insert("prompt".into(), json!(prompt));
-        params.insert("model".into(), json!(model));
-        params.insert("tool_providers".into(), json!([]));
+        params.insert(
+            "model".into(),
+            json!({ "provider": provider, "model": model_name }),
+        );
+        params.insert("tools".into(), json!([]));
         if !system.is_empty() {
             params.insert("system".into(), json!(system));
         }
@@ -969,7 +985,12 @@ mod tests {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
         let mut client = client(&server).await;
         let handle = client
-            .start("mc-historian:proj:1", "role guidance", "prompt", "model-a")
+            .start(
+                "mc-historian:proj:1",
+                "role guidance",
+                "prompt",
+                "prov/model-a",
+            )
             .await
             .unwrap();
         assert_eq!(handle.run_id, "run-1");
@@ -983,8 +1004,12 @@ mod tests {
             log.sends[0].get("session").is_none(),
             "session id lives in BindIdentity, not params"
         );
-        assert_eq!(log.sends[0]["model"], json!("model-a"));
-        assert_eq!(log.sends[0]["tool_providers"], json!([]));
+        assert_eq!(
+            log.sends[0]["model"],
+            json!({ "provider": "prov", "model": "model-a" }),
+            "model is llm-runner's nested ModelParams object, split at the FIRST slash"
+        );
+        assert_eq!(log.sends[0]["tools"], json!([]));
         assert_eq!(
             log.sends[0]["system"],
             json!("role guidance"),
@@ -1000,7 +1025,7 @@ mod tests {
         let server = fake_server(json!({"state":"active","run_id":"run-9"}), Vec::new()).await;
         let mut client = client(&server).await;
         client
-            .start("mc-historian:proj:9", "", "prompt", "model-a")
+            .start("mc-historian:proj:9", "", "prompt", "prov/model-a")
             .await
             .unwrap();
         client.close().await;
@@ -1025,7 +1050,7 @@ mod tests {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
         let mut client = client(&server).await;
         client
-            .start("mc-historian:proj:2", "", "prompt", "model-a")
+            .start("mc-historian:proj:2", "", "prompt", "prov/model-a")
             .await
             .unwrap();
         let output = client.await_output("run-1").await.unwrap();
@@ -1055,7 +1080,7 @@ mod tests {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
         let mut client = client(&server).await;
         client
-            .start("mc-historian:proj:3", "", "prompt", "model-a")
+            .start("mc-historian:proj:3", "", "prompt", "prov/model-a")
             .await
             .unwrap();
 
@@ -1078,7 +1103,7 @@ mod tests {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
         let mut client = client(&server).await;
         client
-            .start("mc-historian:proj:4", "", "prompt", "model-a")
+            .start("mc-historian:proj:4", "", "prompt", "prov/model-a")
             .await
             .unwrap();
 

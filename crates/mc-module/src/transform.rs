@@ -233,6 +233,11 @@ pub struct HistorianDiagnostics {
     /// observational: lets a rig drive see eligible content approach the fire bar per pass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<HistorianTriggerProgress>,
+    /// Detail of the most recent failed firing, from durable state. Present until a later
+    /// firing establishes its producer run; supervised deployments have no stderr capture,
+    /// so this is the only place the failure reason is visible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

@@ -604,6 +604,12 @@ pub struct HistorianDurableState {
     pub fired_at_ms: Option<i64>,
     #[serde(default)]
     pub failure_backoff_at_ms: Option<i64>,
+    /// Human-readable detail of the most recent failed firing. The producer runs in a
+    /// spawned task whose stderr a supervised deployment never captures, so the error
+    /// must live in durable state to be diagnosable from a state dump. Cleared when a
+    /// later firing establishes its producer run.
+    #[serde(default)]
+    pub last_failure: Option<String>,
 }
 
 impl Default for HistorianDurableState {
@@ -617,6 +623,7 @@ impl Default for HistorianDurableState {
             producer_run_id: None,
             fired_at_ms: None,
             failure_backoff_at_ms: None,
+            last_failure: None,
         }
     }
 }
@@ -2591,6 +2598,7 @@ mod tests {
                 producer_run_id: Some("run-1".into()),
                 fired_at_ms: Some(123),
                 failure_backoff_at_ms: Some(456),
+                last_failure: None,
             },
             ..Default::default()
         }
