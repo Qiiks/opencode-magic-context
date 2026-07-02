@@ -116,13 +116,13 @@ async fn mc_transform_spine_through_real_daemon() {
         &consumer,
         json!({
             "session_id": "spine", "render_config": "cfg0",
-            "items": [ck("m10", 10, "raw covered"), ck("t11", 11, "tail")]
+            "messages": [ck("m10", 10, "raw covered"), ck("t11", 11, "tail")]
         }),
     )
     .await;
     assert_eq!(r["action"], "HARD", "bootstrap must fold Hard");
     assert_eq!(
-        r["boundary_id"], "m10",
+        r["boundary_id"], "m10#0",
         "anchor = the compartment's end message id"
     );
     assert!(
@@ -148,15 +148,24 @@ async fn mc_transform_spine_through_real_daemon() {
     for n in 11..=14u64 {
         let mut items = vec![ck("m10", 10, "raw covered")];
         for k in 11..=n {
-            items.push(ck(&format!("t{k}"), k, &format!("tail{k}")));
+            let bytes = if k == 11 {
+                "tail".to_string()
+            } else {
+                format!("tail{k}")
+            };
+            items.push(ck(&format!("t{k}"), k, &bytes));
         }
         let d = call(
             &consumer,
-            json!({ "session_id": "spine", "render_config": "cfg0", "items": items }),
+            json!({ "session_id": "spine", "render_config": "cfg0", "messages": items }),
         )
         .await;
         assert_eq!(d["action"], "SOFT+", "defer must not bust");
-        assert_eq!(d["committed"], false, "pure defer must not write");
+        assert_eq!(
+            d["committed"],
+            json!(n > 11),
+            "only first-seen tail mids persist identity vectors"
+        );
         if let Some(p) = &prev_m0 {
             assert_eq!(&m0(&d), p, "m0 changed on defer over the wire");
         }
@@ -170,7 +179,7 @@ async fn mc_transform_spine_through_real_daemon() {
         &consumer,
         json!({
             "session_id": "spine", "render_config": "cfg1",
-            "items": [ck("m10", 10, "raw covered")]
+            "messages": [ck("m10", 10, "raw covered")]
         }),
     )
     .await;
@@ -180,7 +189,7 @@ async fn mc_transform_spine_through_real_daemon() {
     // revert removes the boundary "m10" (array no longer contains it) → defer+reconcile.
     let rev = call(
         &consumer,
-        json!({ "session_id": "spine", "render_config": "cfg1", "items": [ck("z", 90, "other")] }),
+        json!({ "session_id": "spine", "render_config": "cfg1", "messages": [ck("z", 90, "other")] }),
     )
     .await;
     assert_eq!(rev["action"], "SOFT+", "revert pass must not bust");
@@ -194,7 +203,7 @@ async fn mc_transform_spine_through_real_daemon() {
     // once to clear the flag but the prefix stays byte-identical (still SOFT+, not a bust).
     let reconciled = call(
         &consumer,
-        json!({ "session_id": "spine", "render_config": "cfg1", "items": [ck("m10", 10, "raw covered")] }),
+        json!({ "session_id": "spine", "render_config": "cfg1", "messages": [ck("m10", 10, "raw covered")] }),
     )
     .await;
     assert_eq!(
@@ -209,7 +218,7 @@ async fn mc_transform_spine_through_real_daemon() {
     // composes m0 with that memory in the <project-memory> block. =====
     let boot = call(
         &consumer,
-        json!({ "session_id": "soft", "render_config": "cfg0", "items": [ck("m10", 10, "raw")] }),
+        json!({ "session_id": "soft", "render_config": "cfg0", "messages": [ck("m10", 10, "raw")] }),
     )
     .await;
     assert_eq!(boot["action"], "HARD");
@@ -230,7 +239,7 @@ async fn mc_transform_spine_through_real_daemon() {
     // m0 reproduces byte-identical across the restart (the lineage baseline is durable).
     let after = call(
         &consumer,
-        json!({ "session_id": "spine", "render_config": "cfg1", "items": [ck("m10", 10, "raw covered")] }),
+        json!({ "session_id": "spine", "render_config": "cfg1", "messages": [ck("m10", 10, "raw covered")] }),
     )
     .await;
     assert_eq!(after["action"], "SOFT+", "restart must not bust");
@@ -255,7 +264,7 @@ fn seed_store(data_home: &Path) {
         sequence: seq,
         start_message: start,
         end_message: end,
-        end_message_id: end_id.to_string(),
+        end_message_id: format!("{end_id}#0"),
         title: format!("C{seq}"),
         content: p1.to_string(),
         p1: Some(p1.to_string()),
@@ -282,23 +291,33 @@ fn seed_store(data_home: &Path) {
 const M1_PLACEHOLDER: &str = "(no new content since last materialization)";
 
 fn ck(id: &str, ordinal: u64, bytes: &str) -> Value {
-    json!({ "id": id, "ordinal": ordinal, "bytes": bytes })
+    json!({
+        "mid": id,
+        "ordinal": ordinal,
+        "ck": {
+            "role": "user",
+            "content": [{ "kind": { "type": "text", "text": bytes } }],
+            "meta": { "harness_id": id }
+        }
+    })
 }
 
-/// The m0 synthetic block bytes from a response's ck_messages.
+/// The m0 synthetic message bytes from a response's ck_messages.
 fn m0(r: &Value) -> String {
-    block_bytes(r, "mc_m0")
+    synthetic_bytes(r, 0)
 }
 fn m1(r: &Value) -> String {
-    block_bytes(r, "mc_m1")
+    synthetic_bytes(r, 1)
 }
-fn block_bytes(r: &Value, id: &str) -> String {
-    r["ck_messages"]
+fn synthetic_bytes(r: &Value, index: usize) -> String {
+    let msg = r["ck_messages"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["id"] == id)
-        .unwrap_or_else(|| panic!("no {id} block in ck_messages: {r}"))["bytes"]
+        .filter(|m| m["meta"]["synthetic"] == json!(true))
+        .nth(index)
+        .unwrap_or_else(|| panic!("no synthetic message {index} in ck_messages: {r}"));
+    msg["content"][0]["kind"]["text"]
         .as_str()
         .unwrap()
         .to_string()
@@ -309,8 +328,8 @@ fn tail_ids(r: &Value) -> Vec<String> {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|i| i["synthetic"] != json!(true))
-        .map(|i| i["id"].as_str().unwrap().to_string())
+        .filter(|m| m["meta"]["synthetic"] != json!(true))
+        .map(|m| m["meta"]["harness_id"].as_str().unwrap_or("").to_string())
         .collect()
 }
 // ---- helpers (adapted from subc-client-rs/tests/real_daemon.rs) ----

@@ -442,7 +442,8 @@ mod tests {
     use mc_store::{ModuleMeta, StoredCompartment};
 
     use crate::transform::{
-        transform, CkItemWire, DeciderInputs, ProducerContext, TransformRequest,
+        ck_wire::{self, CkIngressMessage, CkWireMessage},
+        transform, DeciderInputs, ProducerContext, TransformRequest,
     };
 
     fn store(dir: &std::path::Path) -> McStore {
@@ -457,20 +458,38 @@ mod tests {
         .unwrap()
     }
 
-    fn item(id: &str, ordinal: u64, bytes: &str) -> CkItemWire {
-        CkItemWire {
-            id: id.to_string(),
+    fn text_message(id: &str, text: &str) -> CkWireMessage {
+        CkWireMessage::from_parts(
+            "user",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: text.to_string(),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some(id.to_string()),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn item(id: &str, ordinal: u64, bytes: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: id.to_string(),
             ordinal,
-            bytes: bytes.to_string(),
-            synthetic: false,
+            ck: text_message(id, bytes),
         }
     }
 
-    fn req(items: Vec<CkItemWire>) -> TransformRequest {
+    fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
+            kind: "transform".to_string(),
+            v: 1,
             session_id: "ses".to_string(),
             render_config: "cfg".to_string(),
-            items,
+            messages,
+            usage: None,
+            agent_drop_ids: Vec::new(),
         }
     }
 
@@ -483,7 +502,7 @@ mod tests {
         }
     }
 
-    fn run_transform(store: &McStore, request: &TransformRequest) -> Vec<CkItemWire> {
+    fn run_transform(store: &McStore, request: &TransformRequest) -> Vec<CkWireMessage> {
         transform(store, request, &pctx(), &DeciderInputs::default())
             .unwrap()
             .ck_messages
@@ -494,7 +513,7 @@ mod tests {
             sequence: seq,
             start_message: start,
             end_message: end,
-            end_message_id: end_id.to_string(),
+            end_message_id: format!("{end_id}#0"),
             title: format!("C{seq}"),
             content: p1.to_string(),
             p1: Some(p1.to_string()),

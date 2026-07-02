@@ -18,7 +18,7 @@ use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// Migration namespace for the cache-state domain (one DB can host several
 /// independent namespaces; this is ours).
@@ -393,6 +393,32 @@ impl From<StoreError> for HistorianPublishError {
     }
 }
 
+/// Persisted provider-usage ground truth used to keep pressure bands stable across
+/// retries and restarts. A request-supplied non-zero value replaces this value; an
+/// absent or all-zero request falls back to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleUsage {
+    #[serde(default)]
+    pub current_total_input_tokens: u64,
+    #[serde(default)]
+    pub context_limit_tokens: u64,
+}
+
+impl ModuleUsage {
+    pub fn is_non_zero(&self) -> bool {
+        self.current_total_input_tokens != 0 || self.context_limit_tokens != 0
+    }
+}
+
+/// The durable identity fingerprint for one block of a message. The transform records
+/// the ordered vector per `mid` and rejects later drift instead of silently applying
+/// frozen reductions to a different block list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockIdentity {
+    pub kind_tag: String,
+    pub byte_fingerprint: String,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -455,6 +481,17 @@ pub struct ModuleMeta {
     /// while this floor only anchors future historian trigger selection.
     #[serde(default)]
     pub publication_floor_ordinal: Option<u64>,
+
+    /// Ordered block identity vectors keyed by producer message id. Each vector stores
+    /// the block kind and a fingerprint of the canonical reduction-accounting bytes, so
+    /// a later request that changes a live message's block layout fails closed.
+    #[serde(default)]
+    pub block_identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
+    /// Last non-zero provider usage reported by the caller. Used when a retry or restart
+    /// sends absent/zero usage, but overwritten by any later non-zero usage even when it
+    /// decreases after reclaim.
+    #[serde(default)]
+    pub last_usage: Option<ModuleUsage>,
 }
 
 /// A stored compartment row (the m0/m1 history source). `sequence` is the

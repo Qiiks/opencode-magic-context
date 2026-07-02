@@ -14,54 +14,36 @@
 //! coverage / tail computation (PRIMARY), and the `mc_*` id namespace is reserved
 //! (BACKSTOP) so a synthetic block can never masquerade as the real boundary.
 
+#[path = "ck_wire.rs"]
+pub mod ck_wire;
+
 use crate::compartment_coverage::{fold_m0_content_epoch, M0ContentEpoch};
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{compose_m1_from_store, m1_revision_signal};
 use crate::memory_render::M1_PLACEHOLDER;
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
-use mc_store::{McStore, McStoreError, ModuleMeta};
+use mc_store::{McStore, McStoreError, ModuleMeta, ModuleUsage};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use ck_wire::{
+    duplicate_ids, project_messages, reduced_block, split_block_id, CkIngressMessage, CkWireError,
+    CkWireMessage, FlatBlock, FlatProjection,
+};
 
 /// Max CAS retries before surfacing the conflict (the module is the single writer in
 /// the daemon case, so this rarely loops; the shared-store case re-loads and re-steps).
 const MAX_CAS_RETRIES: u32 = 8;
 
 /// Reserved synthetic-block ids (never carried by a real conversation item).
+#[cfg(test)]
 const M0_ID: &str = "mc_m0";
-const M1_ID: &str = "mc_m1";
 /// The reserved id prefix: a non-synthetic item bearing it is a contract violation.
 const RESERVED_ID_PREFIX: &str = "mc_";
 const SYNTH_REGION_KIND: &str = "synthesized-region";
 /// Frozen-unit key prefix for a tail reduction (a reduced tool output / superseded edit).
 /// `red:<target_id>` — the target is the real tail item whose bytes are replaced.
 const RED_KEY_PREFIX: &str = "red:";
-
-/// A CK item on the wire: opaque id + monotonic ordinal + byte-complete rendering +
-/// the synthetic-block flag (wire-envelope metadata, NOT part of the frozen bytes).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CkItemWire {
-    pub id: String,
-    pub ordinal: u64,
-    pub bytes: String,
-    #[serde(default)]
-    pub synthetic: bool,
-}
-
-impl CkItem for CkItemWire {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn ordinal(&self) -> u64 {
-        self.ordinal
-    }
-    fn bytes(&self) -> &str {
-        &self.bytes
-    }
-    fn synthetic(&self) -> bool {
-        self.synthetic
-    }
-}
 
 /// The m1 delta content + its byte-affecting digest. `revision` is a digest over ALL
 /// byte-affecting m1 render inputs such that `render` is a pure function of what the
@@ -104,6 +86,17 @@ pub struct DeciderInputs {
     pub reductions: Vec<ReductionDecision>,
 }
 
+/// Legacy flat request item accepted only for backward compatibility with older
+/// request fixtures. New callers send `messages` and receive bare CK messages.
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyCkItemWire {
+    pub id: String,
+    pub ordinal: u64,
+    pub bytes: String,
+    #[serde(default)]
+    pub synthetic: bool,
+}
+
 /// The project context the module composes m0/m1 FROM. Resolved once per request from the
 /// authenticated route binding (never a request body field) and threaded into the
 /// transform. Production ALWAYS supplies it; it carries the frozen render inputs (budget,
@@ -125,16 +118,92 @@ pub struct ProducerContext<'a> {
 /// A transform pass request. `boundary_present` is deliberately NOT a field: it is a
 /// cache-correctness decision (replay-frozen vs reconcile) that the module computes
 /// from its own durable state, never caller-supplied (a caller-supplied value would be
-/// a poison surface — a crafted array could force a wrong replay or reconcile).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// a poison surface — a crafted array could force a wrong replay or reconcile). The
+/// wire carries full CK messages; the module flattens them at ingress and groups them
+/// back to CK messages at egress.
+#[derive(Debug, Clone, Serialize)]
 pub struct TransformRequest {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default = "default_wire_version")]
+    pub v: u32,
     pub session_id: String,
     pub render_config: String,
-    pub items: Vec<CkItemWire>,
+    pub messages: Vec<CkIngressMessage>,
+    #[serde(default)]
+    pub usage: Option<ModuleUsage>,
+    #[serde(default)]
+    pub agent_drop_ids: Vec<String>,
 }
 
-/// A transform pass result.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+fn default_wire_version() -> u32 {
+    1
+}
+
+#[derive(Deserialize)]
+struct TransformRequestWire {
+    #[serde(default)]
+    kind: String,
+    #[serde(default = "default_wire_version")]
+    v: u32,
+    session_id: String,
+    render_config: String,
+    #[serde(default)]
+    messages: Vec<CkIngressMessage>,
+    #[serde(default)]
+    items: Vec<LegacyCkItemWire>,
+    #[serde(default)]
+    usage: Option<ModuleUsage>,
+    #[serde(default)]
+    agent_drop_ids: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for TransformRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TransformRequestWire::deserialize(deserializer)?;
+        let messages = if wire.messages.is_empty() && !wire.items.is_empty() {
+            wire.items.into_iter().map(legacy_item_to_message).collect()
+        } else {
+            wire.messages
+        };
+        Ok(Self {
+            kind: wire.kind,
+            v: wire.v,
+            session_id: wire.session_id,
+            render_config: wire.render_config,
+            messages,
+            usage: wire.usage,
+            agent_drop_ids: wire.agent_drop_ids,
+        })
+    }
+}
+
+fn legacy_item_to_message(item: LegacyCkItemWire) -> CkIngressMessage {
+    CkIngressMessage {
+        mid: item.id.clone(),
+        ordinal: item.ordinal,
+        ck: CkWireMessage::from_parts(
+            "user",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: item.bytes,
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some(item.id),
+                synthetic: item.synthetic,
+                ..Default::default()
+            },
+        ),
+    }
+}
+
+/// A transform pass result. Diagnostics remain alongside the CK array, but the response
+/// messages themselves are bare CK messages: no request-only `mid` or `ordinal` sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransformResponse {
     pub action: String,
     pub boundary_id: String,
@@ -142,8 +211,11 @@ pub struct TransformResponse {
     pub version: u64,
     pub row_version: u64,
     pub committed: bool,
-    /// THE REAL OUTPUT: `[m0, m1] ++ tail`.
-    pub ck_messages: Vec<CkItemWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_ordinal: Option<u64>,
+    /// The actual output messages for this pass: synthetic m0 and m1 messages followed
+    /// by the tail messages, all expressed as bare CK messages.
+    pub ck_messages: Vec<CkWireMessage>,
 }
 
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
@@ -165,6 +237,14 @@ pub enum TransformError {
     /// The stored compartments don't tile contiguously — a raw message is covered by no
     /// compartment, so composing m0/m1 would silently drop it from the tail. Fail loud.
     CoverageGap(String),
+    /// CK ingress rejected an unsupported or unpairable block before any partial projection.
+    CkWire(CkWireError),
+    /// Two flattened blocks produced the same `mid#block_index` id in one request.
+    DuplicateBlockId(String),
+    /// A live message's block-kind/fingerprint vector changed after first sight.
+    IdentityDrift(String),
+    /// A frozen reduction still names a live message, but that exact block disappeared.
+    FrozenRedTargetVanish(String),
 }
 
 impl std::fmt::Display for TransformError {
@@ -181,10 +261,28 @@ impl std::fmt::Display for TransformError {
                 "decider re-supplied an already-frozen reduction target with different bytes"
             ),
             TransformError::CoverageGap(m) => write!(f, "{m}"),
+            TransformError::CkWire(e) => write!(f, "ck wire: {e}"),
+            TransformError::DuplicateBlockId(id) => write!(f, "duplicate flattened block id: {id}"),
+            TransformError::IdentityDrift(mid) => {
+                write!(f, "CK message block identity drift for mid {mid}")
+            }
+            TransformError::FrozenRedTargetVanish(id) => {
+                write!(
+                    f,
+                    "frozen reduction target vanished while its message is live: {id}"
+                )
+            }
         }
     }
 }
 impl std::error::Error for TransformError {}
+
+impl From<CkWireError> for TransformError {
+    fn from(e: CkWireError) -> Self {
+        TransformError::CkWire(e)
+    }
+}
+
 impl From<McStoreError> for TransformError {
     fn from(e: McStoreError) -> Self {
         TransformError::Store(e)
@@ -260,30 +358,40 @@ fn apply_once(
     deciders: &DeciderInputs,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<TransformResponse, TransformError> {
-    // --- ingress: strip synthetic, reserve mc_*, validate ordinals (over live source) ---
-    let live: Vec<&CkItemWire> = req.items.iter().filter(|i| !i.synthetic()).collect();
+    // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
+    let projection = project_messages(&req.messages)?;
+    if let Some(id) = duplicate_ids(&projection.blocks) {
+        return Err(TransformError::DuplicateBlockId(id));
+    }
+    let live: Vec<&FlatBlock> = projection
+        .blocks
+        .iter()
+        .filter(|i| !i.synthetic())
+        .collect();
     for item in &live {
         if item.id().starts_with(RESERVED_ID_PREFIX) {
             return Err(TransformError::ReservedId);
         }
     }
     let mut prev: Option<u64> = None;
-    for item in &live {
+    for msg in req.messages.iter().filter(|m| !m.ck.meta.synthetic) {
         if let Some(p) = prev {
-            if item.ordinal() <= p {
+            if msg.ordinal <= p {
                 return Err(TransformError::OrdinalViolation);
             }
         }
-        prev = Some(item.ordinal());
+        prev = Some(msg.ordinal);
     }
 
     let loaded = store.load(&req.session_id)?;
+    enforce_block_identity(&loaded.meta, &projection, &loaded.core)?;
+    let effective_deciders = merge_agent_drops(req, deciders, &live, &loaded.core);
 
     // Fail-loud monotonicity guard, BEFORE classify and on EVERY pass: a frozen
     // reduction target re-supplied with different bytes breaks the immutable contract,
     // and the set-membership trigger would silently skip it (already frozen) and serve
     // the stale bytes — including on a defer. Error here instead.
-    validate_reduction_monotonicity(&loaded.core, deciders)?;
+    validate_reduction_monotonicity(&loaded.core, &effective_deciders)?;
 
     // --- boundary presence: computed over live source vs durable boundary_id ---
     let boundary_present = !loaded.core.boundary_id.is_empty()
@@ -309,8 +417,12 @@ fn apply_once(
     // The cheap m1-change digest (watermark triple). Computed every pass to gate SOFT vs
     // defer WITHOUT composing the body; the body composes only on the bust arm below.
     let current_m1_digest = m1_revision_signal(store, ctx.project_path, &req.session_id)?;
-    let reductions_pending_now =
-        reductions_pending(&loaded.core, deciders, &live, loaded.meta.coverage_ordinal);
+    let reductions_pending_now = reductions_pending(
+        &loaded.core,
+        &effective_deciders,
+        &live,
+        loaded.meta.coverage_ordinal,
+    );
     let plan = classify(&ClassifierInput {
         initialized: loaded.meta.initialized,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
@@ -330,6 +442,7 @@ fn apply_once(
 
     let mut core = loaded.core.clone();
     let mut meta = loaded.meta.clone();
+    apply_ingress_meta(&mut meta, req, &projection);
 
     match plan {
         PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
@@ -373,7 +486,7 @@ fn apply_once(
             // covered raw bytes), so a reduction on a now-covered item simply drops with
             // it (no "fold reduced bytes into m0"); a target still in the new tail is kept;
             // a reverted-away target is an orphan. apply_units can't delete → rebuild.
-            let effective = effective_reductions(&core, deciders);
+            let effective = effective_reductions(&core, &effective_deciders);
             let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
             core.frozen_units.clear();
             core.pending_changes.clear();
@@ -422,7 +535,7 @@ fn apply_once(
             let mut rendered = vec![render_m1_body(&m1.body)];
             rendered.extend(new_reduction_units(
                 &core,
-                deciders,
+                &effective_deciders,
                 &live,
                 loaded.meta.coverage_ordinal,
             ));
@@ -472,7 +585,7 @@ fn apply_once(
         loaded.row_version.unwrap_or(0)
     };
 
-    let ck_messages = build_output(&core, &meta, &live);
+    let ck_messages = build_output(&core, &meta, &projection, req);
 
     Ok(TransformResponse {
         action: result_action,
@@ -481,8 +594,84 @@ fn apply_once(
         version: core.version,
         row_version,
         committed: changed,
+        coverage_ordinal: meta.coverage_ordinal,
         ck_messages,
     })
+}
+
+fn enforce_block_identity(
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    core: &CoreState,
+) -> Result<(), TransformError> {
+    for (mid, vector) in &projection.identity_by_mid {
+        if let Some(stored) = meta.block_identity_by_mid.get(mid) {
+            if stored != vector {
+                return Err(TransformError::IdentityDrift(mid.clone()));
+            }
+        }
+    }
+
+    let live_ids: BTreeSet<&str> = projection
+        .blocks
+        .iter()
+        .filter(|block| !block.synthetic)
+        .map(|block| block.id.as_str())
+        .collect();
+    let live_mids: BTreeSet<&str> = projection
+        .identity_by_mid
+        .keys()
+        .map(String::as_str)
+        .collect();
+    for target in frozen_red_targets(core) {
+        let Some((mid, _)) = split_block_id(&target) else {
+            continue;
+        };
+        if live_mids.contains(mid) && !live_ids.contains(target.as_str()) {
+            return Err(TransformError::FrozenRedTargetVanish(target));
+        }
+    }
+    Ok(())
+}
+
+fn apply_ingress_meta(meta: &mut ModuleMeta, req: &TransformRequest, projection: &FlatProjection) {
+    for (mid, vector) in &projection.identity_by_mid {
+        meta.block_identity_by_mid
+            .entry(mid.clone())
+            .or_insert_with(|| vector.clone());
+    }
+    if let Some(usage) = req.usage.as_ref().filter(|usage| usage.is_non_zero()) {
+        meta.last_usage = Some(usage.clone());
+    }
+}
+
+fn merge_agent_drops(
+    req: &TransformRequest,
+    deciders: &DeciderInputs,
+    live: &[&FlatBlock],
+    core: &CoreState,
+) -> DeciderInputs {
+    let mut merged = deciders.clone();
+    let frozen = frozen_red_targets(core);
+    let mut existing: BTreeSet<String> = merged
+        .reductions
+        .iter()
+        .map(|r| r.target_id.clone())
+        .collect();
+    for target in &req.agent_drop_ids {
+        if frozen.contains(target) || existing.contains(target) {
+            continue;
+        }
+        if let Some(block) = live.iter().find(|block| block.id() == target) {
+            existing.insert(target.clone());
+            merged.reductions.push(ReductionDecision {
+                target_id: target.clone(),
+                kind: "agent_drop".to_string(),
+                payload: format!("[dropped {}]", block.bytes().len()),
+            });
+        }
+    }
+    merged
 }
 
 // --- shape predicates (mc-module reads the concrete frozen set; mc-core stays blind) ---
@@ -566,7 +755,7 @@ fn validate_reduction_monotonicity(
 fn reductions_pending(
     core: &CoreState,
     deciders: &DeciderInputs,
-    live: &[&CkItemWire],
+    live: &[&FlatBlock],
     coverage: Option<u64>,
 ) -> bool {
     let frozen = frozen_red_targets(core);
@@ -586,7 +775,7 @@ fn reductions_pending(
 fn new_reduction_units(
     core: &CoreState,
     deciders: &DeciderInputs,
-    live: &[&CkItemWire],
+    live: &[&FlatBlock],
     coverage: Option<u64>,
 ) -> Vec<FrozenUnit> {
     let frozen = frozen_red_targets(core);
@@ -636,7 +825,7 @@ fn effective_reductions(
 /// false-conflict trap if the same target id is ever re-decided after a revert.
 fn prune_covered_red_units(
     core: &mut mc_core::CoreState,
-    live: &[&CkItemWire],
+    live: &[&FlatBlock],
     new_coverage: Option<u64>,
 ) {
     let live_ord: BTreeMap<&str, u64> = live.iter().map(|i| (i.id(), i.ordinal())).collect();
@@ -659,7 +848,7 @@ fn prune_covered_red_units(
 /// live array AND still in the tail after the fold.
 fn surviving_red_units(
     effective: &BTreeMap<String, (String, String)>,
-    live: &[&CkItemWire],
+    live: &[&FlatBlock],
     new_coverage: Option<u64>,
 ) -> Vec<FrozenUnit> {
     let live_ord: BTreeMap<&str, u64> = live.iter().map(|i| (i.id(), i.ordinal())).collect();
@@ -699,49 +888,63 @@ fn synth_region(key: &str, payload: String) -> FrozenUnit {
 
 // --- output splice: [m0, m1] ++ tail(by coverage_ordinal) ---
 
-fn build_output(core: &CoreState, meta: &ModuleMeta, live: &[&CkItemWire]) -> Vec<CkItemWire> {
-    let mut out = Vec::with_capacity(2 + live.len());
+fn build_output(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    req: &TransformRequest,
+) -> Vec<CkWireMessage> {
+    let mut out = Vec::with_capacity(2 + req.messages.len());
     if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m0") {
-        out.push(synth_wire(M0_ID, &u.frozen_payload));
+        out.push(CkWireMessage::synthetic_user_text(u.frozen_payload.clone()));
     }
     if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m1") {
-        out.push(synth_wire(M1_ID, &u.frozen_payload));
+        out.push(CkWireMessage::synthetic_user_text(u.frozen_payload.clone()));
     }
-    // Tail: live items strictly after the coverage watermark (disjoint from covered).
-    // A tail item with a frozen `red:<id>` emits the FROZEN reduced payload as its bytes
-    // (same id, same ordinal, still a real item — just reduced); the frozen payload is
-    // authoritative, never re-derived from the live bytes. Reductions interleave with
-    // non-reduced live items; per-item byte-stability holds the contiguous-prefix cache.
-    let cutoff = meta.coverage_ordinal;
-    for item in live {
-        if is_tail(item.ordinal(), cutoff) {
-            match frozen_red_payload(core, item.id()) {
-                Some(reduced) => out.push(synth_reduced_wire(item, reduced)),
-                None => out.push((*item).clone()),
+
+    let blocks_by_mid = projection_blocks_by_mid(projection);
+    // Tail messages are strictly after the coverage watermark. A message with no
+    // reduced block is returned unchanged; only messages containing a reduced block are
+    // rebuilt. Tool results must appear next to their assistant message without
+    // interleaving outside that span; a producer that interleaves beyond adjacency
+    // violates the message format rules.
+    for msg in req.messages.iter().filter(|m| !m.ck.meta.synthetic) {
+        if !is_tail(msg.ordinal, meta.coverage_ordinal) {
+            continue;
+        }
+        let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) else {
+            continue;
+        };
+        let reduced: BTreeMap<usize, &str> = blocks
+            .iter()
+            .filter_map(|block| {
+                frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
+            })
+            .collect();
+        if reduced.is_empty() {
+            out.push(msg.ck.clone());
+            continue;
+        }
+
+        let mut rebuilt = msg.ck.clone();
+        rebuilt.mark_modified();
+        for block in blocks {
+            if let Some(payload) = reduced.get(&block.block_index) {
+                rebuilt.content[block.block_index] =
+                    reduced_block(&block.wire, payload, block.file_path.as_deref());
             }
         }
+        out.push(rebuilt);
     }
     out
 }
 
-/// A tail item rendered with its frozen reduced bytes — same id + ordinal, NOT synthetic
-/// (still a real conversation item), just byte-reduced.
-fn synth_reduced_wire(item: &CkItemWire, reduced: &str) -> CkItemWire {
-    CkItemWire {
-        id: item.id.clone(),
-        ordinal: item.ordinal,
-        bytes: reduced.to_string(),
-        synthetic: false,
+fn projection_blocks_by_mid(projection: &FlatProjection) -> BTreeMap<&str, Vec<&FlatBlock>> {
+    let mut by_mid: BTreeMap<&str, Vec<&FlatBlock>> = BTreeMap::new();
+    for block in &projection.blocks {
+        by_mid.entry(block.mid.as_str()).or_default().push(block);
     }
-}
-
-fn synth_wire(id: &str, bytes: &str) -> CkItemWire {
-    CkItemWire {
-        id: id.to_string(),
-        ordinal: 0,
-        bytes: bytes.to_string(),
-        synthetic: true,
-    }
+    by_mid
 }
 
 fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
@@ -760,6 +963,7 @@ mod tests {
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
     use mc_store::StoredCompartment;
+    use serde_json::{json, Value};
 
     fn store(dir: &std::path::Path) -> McStore {
         McStore::open(&StorageDescriptor {
@@ -773,20 +977,50 @@ mod tests {
         .unwrap()
     }
 
-    fn item(id: &str, ordinal: u64, bytes: &str) -> CkItemWire {
-        CkItemWire {
-            id: id.to_string(),
+    fn text_message(id: &str, text: &str) -> CkWireMessage {
+        CkWireMessage::from_parts(
+            "user",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: text.to_string(),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some(id.to_string()),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn item(id: &str, ordinal: u64, bytes: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: id.to_string(),
             ordinal,
-            bytes: bytes.to_string(),
-            synthetic: false,
+            ck: text_message(id, bytes),
         }
     }
 
-    fn req(session: &str, cfg: &str, items: Vec<CkItemWire>) -> TransformRequest {
+    fn flat_id(mid: &str) -> String {
+        format!("{mid}#0")
+    }
+
+    fn target_id(id: &str) -> String {
+        if id.contains('#') {
+            id.to_string()
+        } else {
+            flat_id(id)
+        }
+    }
+
+    fn req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
+            kind: "transform".to_string(),
+            v: 1,
             session_id: session.to_string(),
             render_config: cfg.to_string(),
-            items,
+            messages,
+            usage: None,
+            agent_drop_ids: Vec::new(),
         }
     }
 
@@ -801,7 +1035,7 @@ mod tests {
             sequence: seq,
             start_message: start,
             end_message: end,
-            end_message_id: end_id.to_string(),
+            end_message_id: target_id(end_id),
             title: format!("C{seq}"),
             content: p1.to_string(),
             p1: Some(p1.to_string()),
@@ -828,18 +1062,402 @@ mod tests {
         transform(s, req, &pctx("git:proj", "/nonexistent-docs", 0), d).unwrap()
     }
 
+    fn synthetic_text(r: &TransformResponse, index: usize) -> &str {
+        ck_wire::text_from_message(
+            r.ck_messages
+                .iter()
+                .filter(|m| m.meta.synthetic)
+                .nth(index)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
     fn m0_bytes(r: &TransformResponse) -> &str {
-        &r.ck_messages.iter().find(|i| i.id == M0_ID).unwrap().bytes
+        synthetic_text(r, 0)
     }
     fn m1_bytes(r: &TransformResponse) -> &str {
-        &r.ck_messages.iter().find(|i| i.id == M1_ID).unwrap().bytes
+        synthetic_text(r, 1)
     }
     fn tail_ids(r: &TransformResponse) -> Vec<&str> {
         r.ck_messages
             .iter()
-            .filter(|i| !i.synthetic)
-            .map(|i| i.id.as_str())
+            .filter(|m| !m.meta.synthetic)
+            .map(|m| m.meta.harness_id.as_deref().unwrap_or(""))
             .collect()
+    }
+
+    fn ingress_from_ck(messages: Vec<CkWireMessage>) -> Vec<CkIngressMessage> {
+        messages
+            .into_iter()
+            .enumerate()
+            .map(|(i, ck)| CkIngressMessage {
+                mid: format!("m{i}"),
+                ordinal: i as u64 + 1,
+                ck,
+            })
+            .collect()
+    }
+
+    fn assistant_tool_call(mid: &str, ordinal: u64, call_id: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: call_id.to_string(),
+                    name: "read".to_string(),
+                    input: json!({ "path": "a.txt" }),
+                    provider_executed: false,
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn tool_result(mid: &str, ordinal: u64, call_id: &str, text: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "tool",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolResult {
+                    id: call_id.to_string(),
+                    tool_name: "read".to_string(),
+                    output: ck_wire::CkToolOutput::bare(ck_wire::CkOutputKind::Text {
+                        text: text.to_string(),
+                    }),
+                    provider_executed: false,
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn ck_wire_golden_projects_to_flat_blocks() {
+        let ck: Vec<CkWireMessage> =
+            serde_json::from_str(include_str!("../testdata/ck_wire_golden.json")).unwrap();
+        let projection = project_messages(&ingress_from_ck(ck)).unwrap();
+        let actual = serde_json::to_value(&projection.blocks).unwrap();
+        let expected: Value =
+            serde_json::from_str(include_str!("../testdata/ingress-projection-golden.json"))
+                .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn arc_identity_is_session_injective_for_reused_tool_ids() {
+        let messages = vec![
+            assistant_tool_call("turn1_call", 1, "call_0"),
+            tool_result("turn1_result", 2, "call_0", "one"),
+            assistant_tool_call("turn2_call", 3, "call_0"),
+            tool_result("turn2_result", 4, "call_0", "two"),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        let result_arcs: Vec<_> = projection
+            .blocks
+            .iter()
+            .filter(|b| b.kind_tag == "tool_result")
+            .map(|b| b.arc_id.as_deref().unwrap())
+            .collect();
+        assert_eq!(result_arcs, vec!["turn1_call#0", "turn2_call#0"]);
+        assert_ne!(result_arcs[0], result_arcs[1]);
+    }
+
+    #[test]
+    fn unsupported_opaque_and_media_fail_loud_at_ingress() {
+        let opaque = CkIngressMessage {
+            mid: "opaque".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(
+                    ck_wire::OpaqueBlock {
+                        source: json!({ "source": "wire", "family": "test" }),
+                        kind: "native".to_string(),
+                        raw: json!({ "x": 1 }),
+                        arc: None,
+                    },
+                ))],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta::default(),
+            ),
+        };
+        assert!(matches!(
+            project_messages(&[opaque]),
+            Err(CkWireError::UnsupportedBlock { .. })
+        ));
+
+        let media = CkIngressMessage {
+            mid: "media".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Media(
+                    ck_wire::MediaBlock {
+                        kind: ck_wire::MediaKind::Image,
+                        media_type: "image/png".to_string(),
+                        filename: None,
+                        source: json!({ "source": "url", "url": "file://x" }),
+                    },
+                ))],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta::default(),
+            ),
+        };
+        assert!(matches!(
+            project_messages(&[media]),
+            Err(CkWireError::UnsupportedBlock { .. })
+        ));
+    }
+
+    #[test]
+    fn enforcement_rejects_drift_duplicates_and_vanished_reduction_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        run(&s, &req("ses", "cfg0", vec![item("a", 1, "one")]), &spine());
+        let drift = transform(
+            &s,
+            &req("ses", "cfg0", vec![item("a", 1, "two")]),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+            &spine(),
+        )
+        .unwrap_err();
+        assert!(matches!(drift, TransformError::IdentityDrift(mid) if mid == "a"));
+
+        let dup = transform(
+            &s,
+            &req(
+                "dup",
+                "cfg0",
+                vec![item("same", 1, "x"), item("same", 2, "y")],
+            ),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+            &spine(),
+        )
+        .unwrap_err();
+        assert!(matches!(dup, TransformError::DuplicateBlockId(id) if id == "same#0"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let one_block = vec![item("live", 1, "only block")];
+        let projection = project_messages(&one_block).unwrap();
+        let core = CoreState {
+            frozen_units: vec![
+                synth_region("m0", "BASE".into()),
+                synth_region("m1", M1_PLACEHOLDER.into()),
+                red_unit("live#1", "drop", "[dropped 1]"),
+            ],
+            ..Default::default()
+        };
+        let meta = ModuleMeta {
+            initialized: true,
+            block_identity_by_mid: projection.identity_by_mid,
+            ..Default::default()
+        };
+        s.commit("vanish", None, &core, &meta).unwrap();
+        let vanished = transform(
+            &s,
+            &req("vanish", "cfg0", one_block),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+            &spine(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            vanished,
+            TransformError::FrozenRedTargetVanish(id) if id == "live#1"
+        ));
+    }
+
+    #[test]
+    fn usage_non_zero_wins_and_absent_or_zero_falls_back_to_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut first = req("usage", "cfg0", vec![item("a", 1, "x")]);
+        first.usage = Some(ModuleUsage {
+            current_total_input_tokens: 100,
+            context_limit_tokens: 1000,
+        });
+        run(&s, &first, &spine());
+        assert_eq!(
+            s.load("usage").unwrap().meta.last_usage,
+            Some(ModuleUsage {
+                current_total_input_tokens: 100,
+                context_limit_tokens: 1000,
+            })
+        );
+
+        let mut lower = req("usage", "cfg0", vec![item("a", 1, "x")]);
+        lower.usage = Some(ModuleUsage {
+            current_total_input_tokens: 50,
+            context_limit_tokens: 1000,
+        });
+        run(&s, &lower, &spine());
+        assert_eq!(
+            s.load("usage")
+                .unwrap()
+                .meta
+                .last_usage
+                .unwrap()
+                .current_total_input_tokens,
+            50,
+            "a non-zero decrease is accepted instead of max-merged"
+        );
+
+        let absent = req("usage", "cfg0", vec![item("a", 1, "x")]);
+        run(&s, &absent, &spine());
+        assert_eq!(
+            s.load("usage")
+                .unwrap()
+                .meta
+                .last_usage
+                .unwrap()
+                .current_total_input_tokens,
+            50,
+            "absent usage keeps the persisted value for restart continuity"
+        );
+
+        let mut zero = req("usage", "cfg0", vec![item("a", 1, "x")]);
+        zero.usage = Some(ModuleUsage {
+            current_total_input_tokens: 0,
+            context_limit_tokens: 0,
+        });
+        run(&s, &zero, &spine());
+        assert_eq!(
+            s.load("usage")
+                .unwrap()
+                .meta
+                .last_usage
+                .unwrap()
+                .current_total_input_tokens,
+            50,
+            "all-zero usage also falls back to persisted"
+        );
+    }
+
+    #[test]
+    fn response_shape_is_bare_ck_messages_and_reduced_tool_result_stays_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![
+            assistant_tool_call("call", 1, "call_0"),
+            tool_result("result", 2, "call_0", "large output"),
+        ];
+        let r = run(
+            &s,
+            &req("shape", "cfg0", messages),
+            &with_reductions(vec![reduce("result#0", "drop", "[dropped 12]")]),
+        );
+        let value = serde_json::to_value(&r).unwrap();
+        assert!(value.get("coverage_ordinal").is_none());
+        let ck_messages = value["ck_messages"].as_array().unwrap();
+        assert!(ck_messages.iter().all(|m| m.get("mid").is_none()));
+        assert!(ck_messages.iter().all(|m| m.get("ordinal").is_none()));
+        assert_eq!(ck_messages[0]["role"], "user");
+        assert_eq!(ck_messages[0]["meta"]["synthetic"], true);
+        assert_eq!(ck_messages[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(ck_messages[1]["meta"]["synthetic"], true);
+        let reduced_tool = ck_messages.last().unwrap();
+        assert_eq!(reduced_tool["content"][0]["kind"]["type"], "tool_result");
+        assert_eq!(
+            reduced_tool["content"][0]["kind"]["output"]["kind"]["text"],
+            "[dropped 12]"
+        );
+    }
+
+    #[test]
+    fn unreduced_golden_messages_are_passed_through_by_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let ck: Vec<CkWireMessage> =
+            serde_json::from_str(include_str!("../testdata/ck_wire_golden.json")).unwrap();
+        let inbound = ingress_from_ck(ck);
+        let r = run(&s, &req("identity", "cfg0", inbound.clone()), &spine());
+        let tail: Vec<_> = r.ck_messages.iter().filter(|m| !m.meta.synthetic).collect();
+        assert_eq!(tail.len(), inbound.len());
+        for (input, output) in inbound.iter().zip(tail) {
+            assert_eq!(
+                serde_json::to_vec(&input.ck).unwrap(),
+                serde_json::to_vec(output).unwrap(),
+                "unreduced mid {} must be returned by identity",
+                input.mid
+            );
+        }
+    }
+
+    #[test]
+    fn pure_passthrough_defer_round_trips_tail_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let ck: Vec<CkWireMessage> =
+            serde_json::from_str(include_str!("../testdata/ck_wire_golden.json")).unwrap();
+        let inbound = ingress_from_ck(ck);
+        s.replace_compartments("roundtrip", &[comp(1, 1, 1, "m0", "SUMMARY")])
+            .unwrap();
+        run(&s, &req("roundtrip", "cfg0", inbound.clone()), &spine());
+        let r = run(&s, &req("roundtrip", "cfg0", inbound.clone()), &spine());
+        assert_eq!(r.action, "SOFT+");
+        assert!(!r.committed);
+        let tail: Vec<_> = r.ck_messages.iter().filter(|m| !m.meta.synthetic).collect();
+        for (input, output) in inbound.iter().skip(1).zip(tail) {
+            assert_eq!(
+                serde_json::to_vec(&input.ck).unwrap(),
+                serde_json::to_vec(output).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn agent_drop_ids_freeze_add_only_through_flat_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = req("agent-drop", "cfg0", vec![item("a", 1, "drop me")]);
+        request.agent_drop_ids = vec!["a#0".to_string()];
+        let r = run(&s, &request, &spine());
+        assert_eq!(tail_bytes(&r, "a"), "[dropped 41]");
+        assert!(s
+            .load("agent-drop")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:a#0"));
+        let again = run(&s, &request, &spine());
+        assert_eq!(again.action, "SOFT+");
+        assert_eq!(tail_bytes(&again, "a"), "[dropped 41]");
+    }
+
+    #[test]
+    fn transform_request_parses_full_flat_wire_envelope() {
+        let value = json!({
+            "kind": "transform",
+            "v": 1,
+            "session_id": "ses",
+            "render_config": "cfg",
+            "messages": [{ "mid": "m", "ordinal": 7, "ck": text_message("m", "hello") }],
+            "usage": { "current_total_input_tokens": 1, "context_limit_tokens": 2 },
+            "agent_drop_ids": ["m#0"]
+        });
+        let parsed: TransformRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.kind, "transform");
+        assert_eq!(parsed.v, 1);
+        assert_eq!(parsed.messages[0].mid, "m");
+        assert_eq!(parsed.usage.unwrap().context_limit_tokens, 2);
+        assert_eq!(parsed.agent_drop_ids, vec!["m#0"]);
     }
 
     // ===== Module-integration tests: STORE STATE in → compose+core bytes out.
@@ -885,7 +1503,7 @@ mod tests {
         let r = run(&s, &req("ses", "cfg0", items), &spine());
         assert_eq!(r.action, "HARD");
         assert_eq!(
-            r.boundary_id, "m10",
+            r.boundary_id, "m10#0",
             "anchor = the compartment's end message id"
         );
         // m0 is the decay-rendered SUMMARY, not the raw covered bytes
@@ -957,7 +1575,10 @@ mod tests {
             }
             let r = run(&s, &req("ses", "cfg0", items), &spine());
             assert_eq!(r.action, "SOFT+", "no delta → pure defer");
-            assert!(!r.committed, "pure defer must not write");
+            assert!(
+                r.committed,
+                "first-seen tail mids persist identity vectors even on a defer"
+            );
             if let Some(p) = &prev_m0 {
                 assert_eq!(m0_bytes(&r), p, "m0 changed on defer");
             }
@@ -1120,7 +1741,7 @@ mod tests {
             ),
             &spine(),
         );
-        assert_eq!(boot.boundary_id, "m10");
+        assert_eq!(boot.boundary_id, "m10#0");
         assert_eq!(tail_ids(&boot), vec!["t11"]);
 
         // C2 (covers 11..=20, end "m20") publishes → it rides m1 at P1 AND extends coverage
@@ -1137,7 +1758,7 @@ mod tests {
         let soft = run(&s, &req("ses", "cfg0", items.clone()), &spine());
         assert_eq!(soft.action, "SOFT", "a new compartment rides a SOFT");
         assert_eq!(
-            soft.boundary_id, "m20",
+            soft.boundary_id, "m20#0",
             "the anchor ADVANCED on the SOFT (b0→b1)"
         );
         assert!(
@@ -1197,9 +1818,11 @@ mod tests {
         assert_eq!(tail_bytes(&reduced, "t11"), "[dropped]");
 
         // C2 publishes covering through t12 → the next SOFT extends coverage past
-        // t11's ordinal. The frozen red:t11 must be pruned WITH the coverage: its
-        // target left the tail, so keeping it is bloat and a false-conflict trap
-        // if a post-revert tail ever reuses the id with different bytes.
+        // When the next compartment extends coverage past t11's ordinal, the frozen
+        // reduction red:t11#0 must be removed in the same update. Its target message
+        // is no longer in the tail, so retaining the reduction would waste space and
+        // could create spurious conflicts if a later revert reuses the same message id
+        // with different content.
         s.replace_compartments(
             "ses",
             &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 12, "t12", "S2")],
@@ -1220,9 +1843,9 @@ mod tests {
         let loaded = s.load("ses").unwrap();
         let core = loaded.core;
         let coverage = loaded.meta.coverage_ordinal.expect("coverage advanced");
-        let covered_ordinals: std::collections::BTreeMap<&str, u64> = items_v2
+        let covered_ordinals: std::collections::BTreeMap<String, u64> = items_v2
             .iter()
-            .map(|i| (i.id.as_str(), i.ordinal))
+            .map(|i| (target_id(&i.mid), i.ordinal))
             .collect();
         for unit in &core.frozen_units {
             let Some(target) = unit.key.strip_prefix("red:") else {
@@ -1238,8 +1861,8 @@ mod tests {
         }
         // And the pruned unit is gone specifically.
         assert!(
-            core.frozen_units.iter().all(|u| u.key != "red:t11"),
-            "red:t11 must be pruned by the coverage-extending SOFT"
+            core.frozen_units.iter().all(|u| u.key != "red:t11#0"),
+            "red:t11#0 must be pruned by the coverage-extending SOFT"
         );
 
         // Defer replays byte-identical after the prune (the prune itself must not
@@ -1334,7 +1957,7 @@ mod tests {
             &spine(),
         );
         assert_eq!(before.action, "HARD");
-        assert_eq!(before.boundary_id, "m10");
+        assert_eq!(before.boundary_id, "m10#0");
 
         // revert removed the boundary message m10 — array no longer contains it
         let revert = run(
@@ -1369,7 +1992,7 @@ mod tests {
         // seed a legacy single-"baseline"-unit state directly, initialized
         let legacy_core = CoreState {
             version: 1,
-            boundary_id: "a".into(),
+            boundary_id: "a#0".into(),
             frozen_units: vec![synth_region("baseline", "OLD".into())],
             pending_changes: vec![],
             reconcile_pending: false,
@@ -1390,14 +2013,10 @@ mod tests {
             r.action, "HARD",
             "legacy shape migrates via clear-then-Hard"
         );
-        // no "baseline" residue: exactly [m0, m1] synthetic blocks, m0 re-composed from store
-        let synth_ids: Vec<&str> = r
-            .ck_messages
-            .iter()
-            .filter(|i| i.synthetic)
-            .map(|i| i.id.as_str())
-            .collect();
-        assert_eq!(synth_ids, vec![M0_ID, M1_ID]);
+        // After a stored legacy baseline is cleared and rebuilt as the current m0/m1
+        // shape, the response has no leftover baseline state: it contains exactly two
+        // synthetic messages, and m0 was re-composed from store data.
+        assert_eq!(r.ck_messages.iter().filter(|m| m.meta.synthetic).count(), 2);
         assert!(
             m0_bytes(&r).contains("FRESH-SUMMARY"),
             "m0 re-composed: {}",
@@ -1417,7 +2036,7 @@ mod tests {
         let s = store(dir.path());
         let weird = CoreState {
             version: 1,
-            boundary_id: "a".into(),
+            boundary_id: "a#0".into(),
             frozen_units: vec![synth_region("junk", "??".into())],
             pending_changes: vec![],
             reconcile_pending: false,
@@ -1479,16 +2098,9 @@ mod tests {
             &spine(),
         );
         // feed our own synthetic m0 back in alongside the real array
-        let items = vec![
-            CkItemWire {
-                id: M0_ID.into(),
-                ordinal: 0,
-                bytes: "STALE".into(),
-                synthetic: true,
-            },
-            item("m1msg", 1, "raw"),
-            item("t2", 2, "tail2"),
-        ];
+        let mut stale = item(M0_ID, 0, "STALE");
+        stale.ck.meta.synthetic = true;
+        let items = vec![stale, item("m1msg", 1, "raw"), item("t2", 2, "tail2")];
         let r = run(&s, &req("ses", "cfg0", items), &spine());
         // boundary m1msg still found (synthetic stripped), tail filter uncorrupted
         assert_eq!(r.action, "SOFT+");
@@ -1545,7 +2157,7 @@ mod tests {
 
     fn reduce(target: &str, kind: &str, payload: &str) -> ReductionDecision {
         ReductionDecision {
-            target_id: target.to_string(),
+            target_id: target_id(target),
             kind: kind.to_string(),
             payload: payload.to_string(),
         }
@@ -1553,13 +2165,24 @@ mod tests {
     fn with_reductions(rs: Vec<ReductionDecision>) -> DeciderInputs {
         DeciderInputs { reductions: rs }
     }
+    fn first_block_text(block: &ck_wire::CkWireBlock) -> Option<&str> {
+        match &block.kind {
+            ck_wire::CkKind::Text { text } => Some(text.as_str()),
+            ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
+                ck_wire::CkOutputKind::Text { text } => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     /// The bytes of a tail item (non-synthetic) by id.
     fn tail_bytes<'a>(r: &'a TransformResponse, id: &str) -> &'a str {
-        &r.ck_messages
+        let msg = r
+            .ck_messages
             .iter()
-            .find(|i| i.id == id && !i.synthetic)
-            .unwrap_or_else(|| panic!("no tail item {id}"))
-            .bytes
+            .find(|m| !m.meta.synthetic && m.meta.harness_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("no tail item {id}"));
+        first_block_text(msg.content.first().unwrap()).unwrap()
     }
 
     /// Bootstrap a session whose m0 covers ordinal 1 (compartment ends at id "a"), so the
@@ -1629,7 +2252,10 @@ mod tests {
                 r.action, "SOFT+",
                 "an aged-but-unchanged reduction set defers"
             );
-            assert!(!r.committed);
+            assert!(
+                r.committed,
+                "first-seen tail mids persist identity vectors even on a defer"
+            );
             assert_eq!(
                 tail_bytes(&r, "t2"),
                 "[dropped 99999]",
@@ -1692,7 +2318,8 @@ mod tests {
 
         // a compartment now covers ordinal 2 (t2 is summarized); a HARD (render_config
         // change) re-composes m0 over both compartments — coverage advances to 2, so
-        // surviving_red_units GCs red:t2 (its ordinal is now covered).
+        // A compartment now covers ordinal 2, summarizing t2. A later HARD pass
+        // re-composes m0 and removes red:t2#0 because its ordinal is now covered.
         s.replace_compartments(
             "ses",
             &[comp(1, 1, 1, "a", "S1"), comp(2, 2, 2, "t2", "S2")],
@@ -1708,7 +2335,7 @@ mod tests {
             &d,
         );
         assert_eq!(r.action, "HARD");
-        assert_eq!(r.boundary_id, "t2", "anchor = last compartment end id");
+        assert_eq!(r.boundary_id, "t2#0", "anchor = last compartment end id");
         assert!(
             m0_bytes(&r).contains("S2"),
             "m0 is the summary, not [dropped 1]: {}",
@@ -1720,7 +2347,11 @@ mod tests {
         );
         let reloaded = s.load("ses").unwrap();
         assert!(
-            !reloaded.core.frozen_units.iter().any(|u| u.key == "red:t2"),
+            !reloaded
+                .core
+                .frozen_units
+                .iter()
+                .any(|u| u.key == "red:t2#0"),
             "covered reduction GC'd"
         );
         assert!(tail_ids(&r).is_empty(), "both items covered, tail empty");
@@ -1786,7 +2417,9 @@ mod tests {
         assert!(revert.reconcile_pending);
 
         // reconcile-HARD rematerializes; the compartment is gone too (the historian re-cut),
-        // so m0 is the empty-history baseline and the orphaned red:t2 is GC'd.
+        // When compartments are cleared, the history summary is recomputed with no
+        // compartments left, so m0 becomes the empty baseline and the reduction for
+        // t2#0 is removed because it no longer targets a live tail block.
         s.replace_compartments("ses", &[]).unwrap();
         let remat = run(
             &s,
@@ -1800,8 +2433,12 @@ mod tests {
         );
         let reloaded = s.load("ses").unwrap();
         assert!(
-            !reloaded.core.frozen_units.iter().any(|u| u.key == "red:t2"),
-            "orphan red:t2 GC'd"
+            !reloaded
+                .core
+                .frozen_units
+                .iter()
+                .any(|u| u.key == "red:t2#0"),
+            "orphan red:t2#0 GC'd"
         );
     }
 
@@ -1870,10 +2507,10 @@ mod tests {
         // an initialized state with m0 + a red:* but NO m1 → unknown shape, reject
         let bad = CoreState {
             version: 1,
-            boundary_id: "a".into(),
+            boundary_id: "a#0".into(),
             frozen_units: vec![
                 synth_region("m0", "BASE".into()),
-                red_unit("t2", "drop", "[dropped 1]"),
+                red_unit("t2#0", "drop", "[dropped 1]"),
             ],
             pending_changes: vec![],
             reconcile_pending: false,
@@ -1903,11 +2540,11 @@ mod tests {
         // phantom delta from a mismatched digest).
         let good = CoreState {
             version: 1,
-            boundary_id: "a".into(),
+            boundary_id: "a#0".into(),
             frozen_units: vec![
                 synth_region("m0", "BASE".into()),
                 synth_region("m1", M1_PLACEHOLDER.into()),
-                red_unit("t2", "drop", "[dropped 1]"),
+                red_unit("t2#0", "drop", "[dropped 1]"),
             ],
             pending_changes: vec![],
             reconcile_pending: false,
