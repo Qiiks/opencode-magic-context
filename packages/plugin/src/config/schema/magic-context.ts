@@ -171,7 +171,9 @@ export const DreamerConfigSchema = AgentOverrideConfigSchema.merge(
         inject_docs: z
             .boolean()
             .default(true)
-            .describe("Inject ARCHITECTURE.md and STRUCTURE.md into system prompt"),
+            .describe(
+                "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
+            ),
         thinking_level: PiThinkingLevelSchema.describe(
             "Pi only: default thinking level for dreamer subagent invocations. See historian.thinking_level.",
         ),

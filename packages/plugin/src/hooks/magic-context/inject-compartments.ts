@@ -655,6 +655,8 @@ export interface M0M1RenderOptions {
     state: M0M1State;
     projectPath?: string;
     projectDirectory?: string;
+    /** Defaults true. When false, m[0] omits the <project-docs> block and stores an empty docs hash. */
+    injectDocs?: boolean;
     memoryInjectionBudgetTokens?: number;
     historyBudgetTokens?: number;
     userProfileBudgetTokens?: number;
@@ -735,6 +737,15 @@ export const DEFAULT_USER_PROFILE_BUDGET_TOKENS = 4_000;
 const M0_EMPTY_BODY = "<session-history></session-history>";
 const M1_EMPTY_PLACEHOLDER =
     "<session-history-since>(no new content since last materialization)</session-history-since>";
+
+type ProjectDocsRender = { renderedBlock: string; canonicalHash: string };
+const EMPTY_PROJECT_DOCS: ProjectDocsRender = { renderedBlock: "", canonicalHash: "" };
+
+function readProjectDocsForM0(projectDirectory: string, injectDocs?: boolean): ProjectDocsRender {
+    return projectDirectory && injectDocs !== false
+        ? readProjectDocsCanonical(projectDirectory)
+        : EMPTY_PROJECT_DOCS;
+}
 
 export interface WorkspaceRenderContext {
     identities: string[];
@@ -926,6 +937,7 @@ export function readCurrentM0SnapshotMarkers(args: {
     sessionId: string;
     projectPath?: string;
     projectDirectory?: string;
+    injectDocs?: boolean;
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
 }): M0SnapshotMarkers {
@@ -957,7 +969,10 @@ export function readCurrentM0SnapshotMarkers(args: {
             : args.projectPath
               ? (getMaxMemoryMutationId(args.db, args.projectPath) ?? 0)
               : 0,
-        projectDocsHash: projectDirectory ? computeProjectDocsHash(projectDirectory) : "",
+        projectDocsHash:
+            projectDirectory && args.injectDocs !== false
+                ? computeProjectDocsHash(projectDirectory)
+                : "",
         materializedAt: Date.now(),
         sessionFactsVersion: getSessionFactsVersion(args.db, args.sessionId),
         upgradeState: getUpgradeState(args.db, args.sessionId),
@@ -1016,6 +1031,7 @@ export function mustMaterialize(args: {
     projectDirectory?: string;
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
+    injectDocs?: boolean;
 }): MaterializeDecision {
     if (!args.state.cachedM0Bytes) return { value: true, reason: "first_render" };
     if (!args.state.cachedM1Bytes) return { value: true, reason: "cached_m1_missing" };
@@ -1513,15 +1529,14 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             sessionId: options.sessionId,
             projectPath,
             projectDirectory,
+            injectDocs: options.injectDocs,
             hardSignals: options.hardSignals,
             workspaceIdentitySet: {
                 identities: workspace.identities,
                 namesByIdentity: workspace.namesByIdentity,
             },
         });
-        docs = projectDirectory
-            ? readProjectDocsCanonical(projectDirectory)
-            : { renderedBlock: "", canonicalHash: "" };
+        docs = readProjectDocsForM0(projectDirectory, options.injectDocs);
         snapshotMarkers.projectDocsHash = docs.canonicalHash;
         compartments = readM0Compartments(options.db, options.sessionId);
         // v2 faithful facts: session_facts is retired as a render source (facts
@@ -1609,7 +1624,10 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     const m0Bytes = Buffer.from(m0Text, "utf8");
     snapshotMarkers.materializedAt = foldMaterializedAt;
     const renderedMemoryIds = trimmed.renderOrder.map((m) => m.id);
-    const phase3ProjectDocsHash = projectDirectory ? computeProjectDocsHash(projectDirectory) : "";
+    const phase3ProjectDocsHash = readProjectDocsForM0(
+        projectDirectory,
+        options.injectDocs,
+    ).canonicalHash;
 
     options.beforePhase3ForTest?.();
 
@@ -2208,14 +2226,13 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         sessionId: options.sessionId,
         projectPath,
         projectDirectory,
+        injectDocs: options.injectDocs,
         workspaceIdentitySet: {
             identities: workspace.identities,
             namesByIdentity: workspace.namesByIdentity,
         },
     });
-    const docs = projectDirectory
-        ? readProjectDocsCanonical(projectDirectory)
-        : { renderedBlock: "", canonicalHash: "" };
+    const docs = readProjectDocsForM0(projectDirectory ?? "", options.injectDocs);
     snapshotMarkers.projectDocsHash = docs.canonicalHash;
     // CACHE STABILITY: materializedAt feeds the m[1] memory-expiry cutoff
     // (renderM1). It MUST be stable across consecutive fallback passes, or two
@@ -2326,6 +2343,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         projectDirectory: options.projectDirectory,
         hardSignals: options.hardSignals,
         workspaceIdentitySet: options.workspaceIdentitySet,
+        injectDocs: options.injectDocs,
     });
     let rematerialized = false;
     let contentionExhausted = false;

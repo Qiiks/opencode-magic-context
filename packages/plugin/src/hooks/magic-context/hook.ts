@@ -557,6 +557,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         internalChildSessions,
         client: deps.client,
         directory: deps.directory,
+        injectDocs: deps.config.dreamer?.inject_docs !== false,
         memoryConfig: deps.config.memory
             ? {
                   enabled: deps.config.memory.enabled,
@@ -814,11 +815,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
         memoryEnabled: deps.config.memory?.enabled !== false,
         language: deps.config.language,
-        injectDocs: deps.config.dreamer?.inject_docs !== false,
-        directory: deps.directory,
         // System-prompt-hash handler reads systemPromptRefreshSessions to
-        // decide whether to re-read disk-backed adjuncts (docs, profile,
-        // key files, sticky date), and adds to all three sets when it
+        // decide whether to re-read disk-backed adjuncts (profile, key files,
+        // sticky date), and adds to all three sets when it
         // detects a real prompt-content change.
         historyRefreshSessions,
         systemPromptRefreshSessions,

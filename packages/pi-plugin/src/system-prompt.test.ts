@@ -24,7 +24,6 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 				cwd: tempDir("pi-guidance-"),
 				sessionId: "ses-guidance",
 				memoryEnabled: true,
-				injectDocs: true,
 				includeGuidance: true,
 			});
 
@@ -51,7 +50,6 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 				cwd,
 				sessionId: "ses-v2-system",
 				memoryEnabled: true,
-				injectDocs: true,
 				includeGuidance: true,
 				userMemoriesEnabled: true,
 			});
@@ -75,7 +73,6 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 				cwd,
 				sessionId: "ses-no-guidance",
 				memoryEnabled: true,
-				injectDocs: true,
 				includeGuidance: false,
 				userMemoriesEnabled: true,
 				pinKeyFilesEnabled: true,
@@ -95,7 +92,6 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 				cwd: tempDir("pi-guidance-dedup-"),
 				sessionId: "ses-guidance-dedup",
 				memoryEnabled: false,
-				injectDocs: false,
 				includeGuidance: true,
 				existingSystemPrompt: "base\n## Magic Context\nalready present",
 			});
@@ -114,7 +110,6 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 				cwd: tempDir("pi-noreduce-"),
 				sessionId: "ses-noreduce",
 				memoryEnabled: false,
-				injectDocs: false,
 				includeGuidance: true,
 				ctxReduceEnabled: false,
 			});
@@ -135,7 +130,6 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 				cwd: tempDir("pi-language-baseline-"),
 				sessionId: "ses-language-baseline",
 				memoryEnabled: true,
-				injectDocs: false,
 				includeGuidance: true,
 			});
 			const unset = buildMagicContextBlock({
@@ -143,7 +137,6 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 				cwd: tempDir("pi-language-unset-"),
 				sessionId: "ses-language-unset",
 				memoryEnabled: true,
-				injectDocs: false,
 				includeGuidance: true,
 				language: " ",
 			});
@@ -152,7 +145,6 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 				cwd: tempDir("pi-language-set-"),
 				sessionId: "ses-language-set",
 				memoryEnabled: true,
-				injectDocs: false,
 				includeGuidance: true,
 				language: "es",
 			});

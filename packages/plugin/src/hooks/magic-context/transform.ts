@@ -308,6 +308,8 @@ export interface TransformDeps {
          *  still write memories explicitly via `ctx_memory write`. Issue #44. */
         autoPromote: boolean;
     };
+    /** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
+    injectDocs?: boolean;
     ensureProjectRegistered?: (directory: string, db: ContextDatabase) => Promise<void>;
     /**
      * Returns the historian chunk budget. Called at each historian spawn site
@@ -1759,6 +1761,7 @@ export function createTransform(deps: TransformDeps) {
                 // disable those.
                 projectPath: projectIdentity,
                 projectDirectory: sessionDirectory,
+                injectDocs: deps.injectDocs,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
                 hardSignals: m0HardSignals,

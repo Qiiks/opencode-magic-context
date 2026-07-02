@@ -969,7 +969,7 @@
         },
         "inject_docs": {
           "default": true,
-          "description": "Inject ARCHITECTURE.md and STRUCTURE.md into system prompt",
+          "description": "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
           "type": "boolean"
         },
         "thinking_level": {

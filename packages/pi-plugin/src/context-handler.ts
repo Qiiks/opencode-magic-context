@@ -682,8 +682,10 @@ export interface PiHeuristicsOptions {
 /** <session-history> injection config — writes compartments+facts+memories into message[0]. */
 export interface PiInjectionOptions {
 	/** When false (config `memory.enabled=false`), project memories are NOT read
-	 *  or rendered into m[0]/m[1]. Docs still render. */
+	 *  or rendered into m[0]/m[1]. Docs are controlled by injectDocs. */
 	memoryEnabled?: boolean;
+	/** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
+	injectDocs?: boolean;
 	injectionBudgetTokens: number;
 	temporalAwareness?: boolean;
 }
@@ -3297,8 +3299,10 @@ interface RunPipelineArgs {
 	/** Memory-injection config — when omitted, no <session-history> injection runs. */
 	injection?: {
 		/** When false (config `memory.enabled=false`), project memories are NOT
-		 *  read or rendered into m[0]/m[1]. Docs still render. */
+		 *  read or rendered into m[0]/m[1]. Docs are controlled by injectDocs. */
 		memoryEnabled?: boolean;
+		/** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
+		injectDocs?: boolean;
 		injectionBudgetTokens: number;
 		/** v2 decay-render history budget (~60K), distinct from the memory
 		 *  injection budget. Drives compartment tier demotion in renderM0Pi. */
@@ -4257,10 +4261,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// NOTE: do NOT clear the m[0]/m[1] cache on a cache-busting pass. A new
 			// compartment is an m[1] DELTA (SOFT), not an m[0] re-materialization
 			// (HARD) — clearing forced mustMaterializePi to first_render and folded
-			// m[0] every history-refresh pass, defeating the whole m[0]/m[1] split
-			// (parity with the OpenCode max_compartment_seq removal). injectM0M1Pi
-			// now keeps cached m[0] and soft-refreshes m[1] with the new compartment;
-			// HARD triggers (model/system/ttl/epoch/docs/upgrade/mutation) still
+			// m[0] every history-refresh pass, defeating the whole m[0]/m[1] split.
+			// This matches OpenCode's rule that a new compartment sequence alone is not
+			// a HARD trigger. injectM0M1Pi now keeps cached m[0] and soft-refreshes m[1];
+			// HARD triggers (model/system/ttl/epoch/upgrade/mutation) still
 			// re-materialize inside mustMaterializePi when genuinely needed.
 			injectionResult = injectM0M1Pi(
 				{
@@ -4268,6 +4272,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					projectIdentity: args.projectIdentity,
 					projectDirectory: args.projectDirectory,
 					memoryEnabled: args.injection.memoryEnabled,
+					injectDocs: args.injection.injectDocs,
 					injectionBudgetTokens: args.injection.injectionBudgetTokens,
 					historyBudgetTokens: args.injection.historyBudgetTokens,
 					hardSignals: piHardSignals,

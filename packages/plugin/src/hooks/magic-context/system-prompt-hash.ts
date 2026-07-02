@@ -128,13 +128,9 @@ export function createSystemPromptHashHandler(deps: {
     memoryEnabled?: boolean;
     /** Optional language from user config for the main agent's generated text. */
     language?: string;
-    /** When true + dreamerEnabled, inject ARCHITECTURE.md and STRUCTURE.md into system prompt */
-    injectDocs: boolean;
-    /** Project root directory for reading doc files */
-    directory: string;
     /**
-     * One-shot signal that disk-backed adjuncts (project docs, user
-     * profile, key files, sticky date) need to be re-read on this pass.
+     * One-shot signal that disk-backed adjuncts (user profile, key files,
+     * sticky date) need to be re-read on this pass.
      * Drained at the end of the handler regardless of whether anything
      * actually refreshed — defer passes after this point MUST hit cached
      * values to keep the system prompt cache-stable.

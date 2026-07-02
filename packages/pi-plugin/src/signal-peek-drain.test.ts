@@ -327,9 +327,11 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 		expect(code).not.toContain("^todo.*write");
 	});
 
-	test("project-docs injection is gated on dreamer.disable", () => {
-		expect(code).toContain("isDreamerRunnable(config) &&");
-		expect(code).toContain("(config.dreamer?.inject_docs ?? true)");
+	test("project-docs m0 injection uses the flag independent of dreamer.disable", () => {
+		expect(code).toContain("injectDocs: cfg.dreamer?.inject_docs !== false");
+		expect(code).not.toContain(
+			"isDreamerRunnable(config) && (config.dreamer?.inject_docs",
+		);
 	});
 
 	test("hash-change path remains eager for all three refresh sets", () => {

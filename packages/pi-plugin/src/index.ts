@@ -657,6 +657,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		},
 		injection: {
 			memoryEnabled: cfg.memory.enabled,
+			injectDocs: cfg.dreamer?.inject_docs !== false,
 			injectionBudgetTokens: cfg.memory.injection_budget_tokens,
 			temporalAwareness: cfg.temporal_awareness === true,
 		},
@@ -1092,16 +1093,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			const effectiveDreamerRunnable = switchedProject
 				? isDreamerRunnable(effectiveConfig)
 				: isDreamerRunnable(config);
-			const injectDocs = switchedProject
-				? effectiveDreamerRunnable &&
-					(effectiveConfig.dreamer?.inject_docs ?? true)
-				: isDreamerRunnable(config) && (config.dreamer?.inject_docs ?? true);
 			const block = buildMagicContextBlock({
 				db,
 				cwd: currentProject.projectDir,
 				sessionId,
 				memoryEnabled: effectiveConfig.memory.enabled,
-				injectDocs,
 				includeGuidance: true,
 				protectedTags: effectiveConfig.protected_tags,
 				ctxReduceEnabled: effectiveConfig.ctx_reduce_enabled,

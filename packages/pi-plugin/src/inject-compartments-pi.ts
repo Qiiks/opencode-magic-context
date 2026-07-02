@@ -452,8 +452,10 @@ const EMPTY_MAX_COMPARTMENT_SEQ = -1;
 
 type PiCompartment = ReturnType<typeof getCompartments>[number];
 
+type PiProjectDocsRender = ReturnType<typeof readProjectDocsCanonical>;
+
 interface FrozenM0Inputs {
-	docs: ReturnType<typeof readProjectDocsCanonical>;
+	docs: PiProjectDocsRender;
 	markers: PiM0SnapshotMarkers;
 	compartments: PiCompartment[];
 	memories: Memory[];
@@ -497,9 +499,10 @@ export interface PiM0M1State {
 	/** When false, project memories are NOT read or rendered into m[0]/m[1]
 	 *  (config `memory.enabled=false`). Mirrors OpenCode, which passes
 	 *  `projectPath: undefined` in that case so every memory read short-circuits.
-	 *  Docs still render (they key off projectDirectory, not memory).
-	 *  Unset/true keeps memory on. */
+	 *  Docs are controlled independently by injectDocs. Unset/true keeps memory on. */
 	memoryEnabled?: boolean;
+	/** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
+	injectDocs?: boolean;
 	/** Memory-block trim budget (~4K). Bounds the <project-memory> block. */
 	injectionBudgetTokens?: number;
 	/** v2 decay-render history budget (~60K). Drives compartment tier demotion.
@@ -513,11 +516,22 @@ export interface PiM0M1State {
 	hardSignals?: PiM0HardSignals;
 }
 
+const EMPTY_PI_PROJECT_DOCS: PiProjectDocsRender = {
+	renderedBlock: "",
+	canonicalHash: "",
+};
+
+function readProjectDocsForPiM0(state: PiM0M1State): PiProjectDocsRender {
+	return state.injectDocs !== false
+		? readProjectDocsCanonical(state.projectDirectory)
+		: EMPTY_PI_PROJECT_DOCS;
+}
+
 /**
  * The project path used for MEMORY reads only. Returns undefined when
  * `memory.enabled=false`, so every memory read short-circuits to its empty
- * value (mirrors OpenCode passing `projectPath: undefined`). Docs + key-files
- * use `projectDirectory` directly and are unaffected.
+ * value (mirrors OpenCode passing `projectPath: undefined`). Project docs use
+ * the independent injectDocs flag.
  */
 function memoryProjectPath(state: PiM0M1State): string | undefined {
 	return state.memoryEnabled === false ? undefined : state.projectIdentity;
@@ -846,8 +860,7 @@ function readCurrentMarkersFromCompartments(
 			: null,
 		projectUserProfileVersion: globalState?.projectUserProfileVersion ?? 0,
 		projectDocsHash:
-			projectDocsHash ??
-			readProjectDocsCanonical(state.projectDirectory).canonicalHash,
+			projectDocsHash ?? readProjectDocsForPiM0(state).canonicalHash,
 		sessionFactsVersion: getSessionFactsVersion(db, state.sessionId),
 		materializedAt: Date.now(),
 		// Dynamic upgrade state (parity with OpenCode getUpgradeState): suffix
@@ -992,7 +1005,7 @@ function renderUserProfileBlock(
 export function renderM0Pi(
 	state: PiM0M1State,
 	db: ContextDatabase,
-	projectDocs = readProjectDocsCanonical(state.projectDirectory).renderedBlock,
+	projectDocs = readProjectDocsForPiM0(state).renderedBlock,
 	decayPressureMultiplier = 1,
 	// Atomic-snapshot override: when materializeM0Pi reads markers + memories in
 	// one transaction, it passes the SAME memory set here so the rendered m[0]
@@ -1169,7 +1182,7 @@ export class PiMaterializeContentionError extends Error {
 function readFrozenM0InputsPi(
 	state: PiM0M1State,
 	db: ContextDatabase,
-	docs = readProjectDocsCanonical(state.projectDirectory),
+	docs = readProjectDocsForPiM0(state),
 	memoryCutoff?: number,
 ): FrozenM0Inputs {
 	// Read every render source and its corresponding watermark as one short DB
@@ -1254,7 +1267,7 @@ function renderFreshM0PiNonPersisted(
 	snapshotMarkers: PiM0SnapshotMarkers;
 	renderedMemoryIds: number[];
 } {
-	const docs = readProjectDocsCanonical(state.projectDirectory);
+	const docs = readProjectDocsForPiM0(state);
 	const cachedMaterializedAt =
 		getOrCreateSessionMeta(db, state.sessionId).cachedM0MaterializedAt ?? 0;
 	const frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
@@ -1317,7 +1330,7 @@ export function materializeM0Pi(
 } {
 	// Phase 1 (no lock): read markers + render. Rendering can be slow, so we do
 	// it OUTSIDE the write lock to keep the BEGIN IMMEDIATE critical section tiny.
-	const docs = readProjectDocsCanonical(state.projectDirectory);
+	const docs = readProjectDocsForPiM0(state);
 	const foldMaterializedAt = Date.now();
 	const frozen = readFrozenM0InputsPi(state, db, docs, foldMaterializedAt);
 	const snapshotMarkers = frozen.markers;
@@ -1368,9 +1381,7 @@ export function materializeM0Pi(
 		attempts += 1;
 	}
 	const m0Bytes = Buffer.from(m0, "utf8");
-	const phase3ProjectDocsHash = readProjectDocsCanonical(
-		state.projectDirectory,
-	).canonicalHash;
+	const phase3ProjectDocsHash = readProjectDocsForPiM0(state).canonicalHash;
 
 	// Phase 2 + 3 (locked): re-read markers under BEGIN IMMEDIATE; if anything
 	// changed since Phase 1, the rendered bytes are stale — roll back and let the

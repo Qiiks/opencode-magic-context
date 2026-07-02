@@ -76,8 +76,6 @@ function buildHandler(opts?: {
     injectionEnabled?: boolean;
     injectionSkipSignatures?: string[];
     dreamerEnabled?: boolean;
-    injectDocs?: boolean;
-    directory?: string;
     experimentalUserMemories?: boolean;
     internalChildSessions?: Set<string>;
     ctxReduceEnabled?: boolean;
@@ -89,8 +87,6 @@ function buildHandler(opts?: {
         ctxReduceEnabled: opts?.ctxReduceEnabled ?? true,
         language: opts?.language,
         dreamerEnabled: opts?.dreamerEnabled ?? false,
-        injectDocs: opts?.injectDocs ?? false,
-        directory: opts?.directory ?? "/tmp",
         historyRefreshSessions: opts?.historyRefreshSessions ?? new Set<string>(),
         systemPromptRefreshSessions: opts?.systemPromptRefreshSessions ?? new Set<string>(),
         pendingMaterializationSessions: opts?.pendingMaterializationSessions ?? new Set<string>(),
@@ -280,8 +276,6 @@ describe("system-prompt-hash v2 system prompt contents", () => {
         const sessionId = "ses-v2-adjuncts-out";
         const { handler } = buildHandler({
             dreamerEnabled: true,
-            injectDocs: true,
-            directory,
             experimentalUserMemories: true,
         });
 

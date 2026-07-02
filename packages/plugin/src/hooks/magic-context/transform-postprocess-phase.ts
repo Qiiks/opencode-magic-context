@@ -199,6 +199,7 @@ interface RunPostTransformPhaseArgs {
     m0M1?: {
         projectPath?: string;
         projectDirectory?: string;
+        injectDocs?: boolean;
         memoryInjectionBudgetTokens?: number;
         historyBudgetTokens?: number;
         hardSignals?: M0HardSignals;
@@ -794,6 +795,7 @@ export async function runPostTransformPhase(
                 state: args.sessionMeta as M0M1State,
                 projectPath: args.m0M1.projectPath,
                 projectDirectory: args.m0M1.projectDirectory,
+                injectDocs: args.m0M1.injectDocs,
                 memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                 historyBudgetTokens: args.m0M1.historyBudgetTokens,
                 isCacheBustingPass,

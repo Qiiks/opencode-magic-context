@@ -11,6 +11,7 @@ import {
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
 	getCompartments,
+	getOrCreateSessionMeta,
 	queueMemoryMutation,
 	setProjectState,
 } from "@magic-context/core/features/magic-context/storage";
@@ -381,6 +382,70 @@ describe("injectM0M1Pi", () => {
 				"<session-history-since>(no new content since last materialization)</session-history-since>",
 			);
 		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("gates project docs block and hash with injectDocs=false", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-docs-gate-"));
+		try {
+			writeFileSync(
+				join(cwd, "ARCHITECTURE.md"),
+				"# PI_FLAG_OFF_ARCH_DOCS\nArchitecture bytes must stay out.\n",
+			);
+			writeFileSync(
+				join(cwd, "STRUCTURE.md"),
+				"# PI_FLAG_OFF_STRUCTURE_DOCS\nStructure bytes must stay out.\n",
+			);
+			const state = { ...piState("ses-pi-docs-off", cwd), injectDocs: false };
+
+			const first = [userMessage("hello", 10)];
+			const firstResult = injectM0M1Pi(state, db, first as never);
+			const firstM0 = textOf(first[0] as never);
+			const firstM1 = textOf(first[1] as never);
+
+			expect(firstResult.m0Materialized).toBe(true);
+			expect(firstM0).not.toContain("<project-docs>");
+			expect(firstM0).not.toContain("PI_FLAG_OFF_ARCH_DOCS");
+			expect(firstM0).not.toContain("PI_FLAG_OFF_STRUCTURE_DOCS");
+			expect(
+				getOrCreateSessionMeta(db, state.sessionId).cachedM0ProjectDocsHash,
+			).toBe("");
+			expect(mustMaterializePi(state, db)).toEqual({
+				value: false,
+				reason: null,
+			});
+
+			const second = [userMessage("hello again", 11)];
+			const secondResult = injectM0M1Pi(
+				state,
+				db,
+				second as never,
+				undefined,
+				false,
+			);
+
+			expect(secondResult.m0Materialized).toBe(false);
+			expect(textOf(second[0] as never)).toBe(firstM0);
+			expect(textOf(second[1] as never)).toBe(firstM1);
+
+			const enabledState = piState("ses-pi-docs-on", cwd);
+			const enabled = [userMessage("hello docs", 12)];
+			injectM0M1Pi(enabledState, db, enabled as never);
+			expect(textOf(enabled[0] as never)).toContain("<project-docs>");
+			expect(textOf(enabled[0] as never)).toContain("PI_FLAG_OFF_ARCH_DOCS");
+			expect(textOf(enabled[0] as never)).toContain(
+				"PI_FLAG_OFF_STRUCTURE_DOCS",
+			);
+			expect(
+				mustMaterializePi({ ...enabledState, injectDocs: false }, db),
+			).toEqual({
+				value: false,
+				reason: null,
+			});
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
 			closeQuietly(db);
 		}
 	});

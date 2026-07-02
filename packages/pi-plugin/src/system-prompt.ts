@@ -35,8 +35,6 @@ export interface BuildMagicContextBlockOptions {
 	sessionId?: string;
 	/** Reserved for compatibility; project memories now live in m[0]/m[1]. */
 	memoryEnabled: boolean;
-	/** Reserved for compatibility; project docs now live in m[0]. */
-	injectDocs: boolean;
 	memoryBudgetChars?: number;
 	/** When true (default), emit the `## Magic Context` guidance section. */
 	includeGuidance?: boolean;

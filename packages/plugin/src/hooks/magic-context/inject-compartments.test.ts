@@ -692,6 +692,75 @@ describe("m[0]/m[1] materialization", () => {
         ).toEqual({ value: false, reason: null });
     });
 
+    it("omits project docs with injectDocs=false and replays byte-identical defer bytes", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        writeFileSync(
+            join(projectDirectory, "ARCHITECTURE.md"),
+            "# FLAG_OFF_ARCH_DOCS\nArchitecture bytes must stay out.\n",
+        );
+        writeFileSync(
+            join(projectDirectory, "STRUCTURE.md"),
+            "# FLAG_OFF_STRUCTURE_DOCS\nStructure bytes must stay out.\n",
+        );
+        const state = readStateFromMeta();
+        const hardSignals = {
+            systemHash: "sys-docs-off",
+            modelKey: "model-docs-off",
+            cacheExpired: false,
+            lastResponseTime: 0,
+        };
+
+        const first = [userMessage("m1", "hello")];
+        const firstResult = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: first,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            hardSignals,
+        });
+        const firstM0 = renderedText(first[0]);
+        const firstM1 = renderedText(first[1]);
+
+        expect(firstResult.m0RematerializedThisPass).toBe(true);
+        expect(firstM0).not.toContain("<project-docs>");
+        expect(firstM0).not.toContain("FLAG_OFF_ARCH_DOCS");
+        expect(firstM0).not.toContain("FLAG_OFF_STRUCTURE_DOCS");
+        expect(state.cachedM0ProjectDocsHash).toBe("");
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+                injectDocs: false,
+                hardSignals,
+            }),
+        ).toEqual({ value: false, reason: null });
+
+        const second = [userMessage("m2", "hello again")];
+        const secondResult = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: second,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            hardSignals,
+        });
+
+        expect(secondResult.m0RematerializedThisPass).toBe(false);
+        expect(renderedText(second[0])).toBe(firstM0);
+        expect(renderedText(second[1])).toBe(firstM1);
+        expect(renderedText(second[0])).not.toContain("FLAG_OFF_ARCH_DOCS");
+        expect(renderedText(second[0])).not.toContain("FLAG_OFF_STRUCTURE_DOCS");
+    });
+
     it("folds current project docs on the next natural HARD materialization", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
@@ -713,6 +782,22 @@ describe("m[0]/m[1] materialization", () => {
             },
         });
         expect(renderedText(first[0])).toContain("Old architecture");
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+                injectDocs: false,
+                hardSignals: {
+                    systemHash: "sys-v1",
+                    modelKey: "model-v1",
+                    cacheExpired: false,
+                    lastResponseTime: 0,
+                },
+            }),
+        ).toEqual({ value: false, reason: null });
 
         writeFileSync(
             join(projectDirectory, "ARCHITECTURE.md"),

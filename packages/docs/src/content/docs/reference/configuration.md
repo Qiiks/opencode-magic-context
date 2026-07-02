@@ -199,7 +199,7 @@ Off-hours maintenance (Dreamer) and on-demand prompt augmentation (Sidekick).
 | `dreamer.tasks.refresh-primers.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
 | `dreamer.tasks.refresh-primers.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` | — | Pi only: per-task thinking level |
 | `dreamer.tasks.refresh-primers.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
-| `dreamer.inject_docs` | boolean | `true` | Inject ARCHITECTURE.md and STRUCTURE.md into system prompt |
+| `dreamer.inject_docs` | boolean | `true` | Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true) |
 | `dreamer.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` | — | Pi only: default thinking level for dreamer subagent invocations. See historian.thinking_level. |
 | `sidekick` | object | — | Optional sidekick agent configuration for session-start memory retrieval |
 | `sidekick.model` | string | — | Primary model ID (e.g. 'claude-sonnet-4-6') |
