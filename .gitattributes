@@ -1,0 +1,5 @@
+# Vendored cross-language golden fixtures must stay LF-deterministic across
+# platforms so byte-compare drift checks (and any byte-level fixture assertions)
+# behave identically on Windows. Mirrors the producer-side .gitattributes that
+# pins ck_wire_golden.json to LF.
+crates/mc-module/testdata/*.json text eol=lf
