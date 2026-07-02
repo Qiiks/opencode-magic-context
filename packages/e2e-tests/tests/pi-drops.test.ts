@@ -3,6 +3,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
+import { openTestDb } from "../src/test-db";
 
 let h: PiTestHarness;
 
@@ -38,7 +39,7 @@ describe("pi drops", () => {
         expect(first.sessionId).toBeTruthy();
         await h.waitFor(() => h.countTags(first.sessionId!) > 0, { label: "tag ready" });
 
-        const writable = new Database(h.contextDbPath());
+        const writable = openTestDb(h.contextDbPath());
         try {
             writable
                 .prepare(

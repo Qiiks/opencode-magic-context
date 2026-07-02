@@ -13,6 +13,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
+import { openTestDb } from "../src/test-db";
 
 let h: PiTestHarness;
 
@@ -85,7 +86,7 @@ describe("pi tag-owner collision repro (v3.3.1 Layer C)", () => {
 
   it("two Pi tool rows with same callId + different owners coexist via composite UNIQUE", async () => {
     const sessionId = "pi-ses-collision-repro";
-    const writable = new Database(h.contextDbPath());
+    const writable = openTestDb(h.contextDbPath());
     try {
       const insert = writable.prepare(
         "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, harness) VALUES (?, ?, 'tool', ?, ?, 'read', ?, 'pi')",
@@ -121,7 +122,7 @@ describe("pi tag-owner collision repro (v3.3.1 Layer C)", () => {
 
   it("legacy NULL-owner Pi rows for the same callId still coexist", async () => {
     const sessionId = "pi-ses-legacy-null";
-    const writable = new Database(h.contextDbPath());
+    const writable = openTestDb(h.contextDbPath());
     try {
       const insert = writable.prepare(
         "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, harness) VALUES (?, ?, 'tool', ?, ?, 'read', NULL, 'pi')",
@@ -142,7 +143,7 @@ describe("pi tag-owner collision repro (v3.3.1 Layer C)", () => {
 
   it("dropping one Pi owner leaves the colliding owner active", async () => {
     const sessionId = "pi-ses-drop-isolation";
-    const writable = new Database(h.contextDbPath());
+    const writable = openTestDb(h.contextDbPath());
     try {
       const insert = writable.prepare(
         "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, status, harness) VALUES (?, ?, 'tool', ?, ?, 'read', ?, 'active', 'pi')",

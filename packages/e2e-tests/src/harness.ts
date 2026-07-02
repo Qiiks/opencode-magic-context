@@ -98,15 +98,38 @@ export class TestHarness {
 
     /** Create a session bound to the isolated workdir. Throws on failure. */
     async createSession(): Promise<string> {
-        const res = await this.client.session.create({
-            query: { directory: this.opencode.env.workdir },
-        });
-        if (!res.data) {
+        return this.createSessionWithRetry(
+            () => this.client.session.create({ query: { directory: this.opencode.env.workdir } }),
+            "session.create",
+        );
+    }
+
+    /**
+     * Post a session.create and retry the transient warmup failure where the
+     * server reports ready on `/doc` but its session route briefly returns an
+     * empty body under load (no `res.data`). This is harness readiness gating,
+     * not a product retry: no session exists yet, so nothing under test has run.
+     * A persistent failure (server actually down) still throws with captured
+     * stderr/stdout after the attempts are exhausted.
+     */
+    private async createSessionWithRetry(
+        attempt: () => Promise<{ data?: { id: string } | null }>,
+        label: string,
+    ): Promise<string> {
+        const maxAttempts = 5;
+        for (let i = 1; i <= maxAttempts; i++) {
+            const res = await attempt();
+            if (res.data) return res.data.id;
+            if (i < maxAttempts) {
+                await Bun.sleep(200 * i);
+                continue;
+            }
             throw new Error(
-                `session.create failed. stderr:\n${this.opencode.stderr()}\nstdout:\n${this.opencode.stdout()}`,
+                `${label} failed after ${maxAttempts} attempts. stderr:\n${this.opencode.stderr()}\nstdout:\n${this.opencode.stdout()}`,
             );
         }
-        return res.data.id;
+        // Unreachable: the loop either returns an id or throws.
+        throw new Error(`${label} failed`);
     }
 
     /**
@@ -120,16 +143,14 @@ export class TestHarness {
      * nudges, no §N§ prefix injection.
      */
     async createChildSession(parentId: string, title?: string): Promise<string> {
-        const res = await this.client.session.create({
-            query: { directory: this.opencode.env.workdir },
-            body: { parentID: parentId, ...(title ? { title } : {}) },
-        });
-        if (!res.data) {
-            throw new Error(
-                `child session.create failed. stderr:\n${this.opencode.stderr()}\nstdout:\n${this.opencode.stdout()}`,
-            );
-        }
-        return res.data.id;
+        return this.createSessionWithRetry(
+            () =>
+                this.client.session.create({
+                    query: { directory: this.opencode.env.workdir },
+                    body: { parentID: parentId, ...(title ? { title } : {}) },
+                }),
+            "child session.create",
+        );
     }
 
     /**

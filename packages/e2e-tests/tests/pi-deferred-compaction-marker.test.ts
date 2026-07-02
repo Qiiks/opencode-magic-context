@@ -5,6 +5,7 @@ import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { PiTestHarness } from "../src/pi-harness";
+import { openTestDb } from "../src/test-db";
 
 /**
  * Pi compaction marker behavior (Phase 2 deferred-marker design).
@@ -78,7 +79,7 @@ function findOrdinalRange(body: Record<string, unknown>): { start: number; end: 
 }
 
 function readMarkerRow(h: PiTestHarness, sessionId: string): MarkerRow | null {
-    const db = new Database(h.contextDbPath(), { readonly: true });
+    const db = openTestDb(h.contextDbPath(), { readonly: true });
     try {
         return db
             .prepare(
@@ -126,7 +127,7 @@ function readCompactionEntries(h: PiTestHarness): Array<Record<string, unknown>>
  * a reliable indicator that the publish transaction committed.
  */
 function readCompartmentCount(h: PiTestHarness, sessionId: string): number {
-    const db = new Database(h.contextDbPath(), { readonly: true });
+    const db = openTestDb(h.contextDbPath(), { readonly: true });
     try {
         const row = db
             .prepare(

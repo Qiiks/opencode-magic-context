@@ -5,6 +5,7 @@ import { describe, expect, it } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PiTestHarness } from "../src/pi-harness";
+import { openTestDb } from "../src/test-db";
 
 interface HarnessOptions {
     magicContextConfig?: Record<string, unknown>;
@@ -24,11 +25,11 @@ async function withPiHarness<T>(
 }
 
 function openWritableDb(h: PiTestHarness): Database {
-    return new Database(h.contextDbPath(), { readwrite: true });
+    return openTestDb(h.contextDbPath(), { readwrite: true });
 }
 
 function readDb<T>(h: PiTestHarness, fn: (db: Database) => T): T {
-    const db = new Database(h.contextDbPath(), { readonly: true });
+    const db = openTestDb(h.contextDbPath(), { readonly: true });
     try {
         return fn(db);
     } finally {

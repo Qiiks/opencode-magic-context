@@ -32,6 +32,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import { openTestDb } from "../src/test-db";
 
 let h: TestHarness;
 
@@ -99,13 +100,12 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
         // read-only.
         const sessionId = "ses-collision-repro";
         const dbPath = h.contextDb().filename;
-        const writable = new Database(dbPath);
+        const writable = openTestDb(dbPath);
         // Mirror production (storage-db.ts initializeDatabase): wait out a
         // concurrent writer instead of throwing SQLITE_BUSY immediately. The
         // live plugin process holds the write lock during its startup
         // migration (which can take several seconds on slow CI disks), so a
         // pragma-less handle hits "database is locked" before it can insert.
-        writable.exec("PRAGMA busy_timeout=5000");
         try {
             // Two tool tags: same callID `read:32`, different owners.
             // With composite identity these are DISTINCT rows. Pre-fix
@@ -161,13 +161,12 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
         // adoption can clean them up over time.
         const sessionId = "ses-legacy-null";
         const dbPath = h.contextDb().filename;
-        const writable = new Database(dbPath);
+        const writable = openTestDb(dbPath);
         // Mirror production (storage-db.ts initializeDatabase): wait out a
         // concurrent writer instead of throwing SQLITE_BUSY immediately. The
         // live plugin process holds the write lock during its startup
         // migration (which can take several seconds on slow CI disks), so a
         // pragma-less handle hits "database is locked" before it can insert.
-        writable.exec("PRAGMA busy_timeout=5000");
         try {
             const insert = writable.prepare(
                 "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, harness) VALUES (?, ?, 'tool', ?, ?, 'read', NULL, 'opencode')",
@@ -193,13 +192,12 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
         // the second turn's tag is a separate row and stays active.
         const sessionId = "ses-drop-isolation";
         const dbPath = h.contextDb().filename;
-        const writable = new Database(dbPath);
+        const writable = openTestDb(dbPath);
         // Mirror production (storage-db.ts initializeDatabase): wait out a
         // concurrent writer instead of throwing SQLITE_BUSY immediately. The
         // live plugin process holds the write lock during its startup
         // migration (which can take several seconds on slow CI disks), so a
         // pragma-less handle hits "database is locked" before it can insert.
-        writable.exec("PRAGMA busy_timeout=5000");
         try {
             const insert = writable.prepare(
                 "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, status, harness) VALUES (?, ?, 'tool', ?, ?, 'read', ?, 'active', 'opencode')",

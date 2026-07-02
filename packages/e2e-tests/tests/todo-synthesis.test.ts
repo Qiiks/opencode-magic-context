@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { TestHarness } from "../src/harness";
 import type { MockUsage } from "../src/mock-provider/server";
+import { openTestDb } from "../src/test-db";
 
 type Todo = { content: string; status: string; priority: string };
 
@@ -137,9 +138,8 @@ function contextDbPath(): string {
 }
 
 function updateTodoMeta(sessionId: string, sql: string): void {
-    const db = new Database(contextDbPath());
+    const db = openTestDb(contextDbPath());
     try {
-        db.query("PRAGMA busy_timeout = 5000").run();
         db.prepare(sql).run(sessionId);
     } finally {
         db.close();

@@ -3,6 +3,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
+import { openTestDb } from "../src/test-db";
 
 /**
  * Pi parity port of `thinking-block-safety.test.ts`.
@@ -61,7 +62,7 @@ interface RequestWithMessages {
 }
 
 function openWritableDb(): Database {
-    return new Database(h.contextDbPath(), { readwrite: true });
+    return openTestDb(h.contextDbPath(), { readwrite: true });
 }
 
 function asAnthropic(req: { body: { messages?: Array<{ role: string; content: unknown }> } }): RequestWithMessages {

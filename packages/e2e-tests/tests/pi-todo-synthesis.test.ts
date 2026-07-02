@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { PiTestHarness } from "../src/pi-harness";
 import type { MockUsage } from "../src/mock-provider/server";
+import { openTestDb } from "../src/test-db";
 
 /**
  * Pi parity port of `todo-synthesis.test.ts`.
@@ -178,9 +179,8 @@ function readTodoMeta(sessionId: string): SessionMetaTodoRow | null {
 }
 
 function updateTodoMeta(sessionId: string, sql: string): void {
-	const db = new Database(h.contextDbPath(), { readwrite: true });
+	const db = openTestDb(h.contextDbPath(), { readwrite: true });
 	try {
-		db.query("PRAGMA busy_timeout = 5000").run();
 		db.prepare(sql).run(sessionId);
 	} finally {
 		db.close();
@@ -491,7 +491,7 @@ describe("pi synthetic todowrite e2e", () => {
 	it("skips todowrite capture and synthetic injection for subagents", async () => {
 		const sessionId = await newSessionId();
 
-		const db = new Database(h.contextDbPath(), { readwrite: true });
+		const db = openTestDb(h.contextDbPath(), { readwrite: true });
 		try {
 			db.prepare(
 				"UPDATE session_meta SET is_subagent = 1 WHERE session_id = ?",

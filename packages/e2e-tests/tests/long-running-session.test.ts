@@ -9,6 +9,7 @@ import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { TestHarness } from "../src/harness";
 import type { MockUsage } from "../src/mock-provider/server";
+import { openTestDb } from "../src/test-db";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
@@ -197,9 +198,8 @@ function contextDbPath(): string {
 }
 
 function writeDb(fn: (db: Database) => void): void {
-    const db = new Database(contextDbPath(), { readwrite: true });
+    const db = openTestDb(contextDbPath(), { readwrite: true });
     try {
-        db.query("PRAGMA busy_timeout = 5000").run();
         fn(db);
     } finally {
         db.close();
@@ -275,8 +275,7 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
             // Open opencode's session DB directly (Database is imported at top of file)
             try {
                 const ocDbPath = join(h.opencode.env.dataDir, "opencode", "opencode.db");
-                const ocDb = new Database(ocDbPath, { readonly: true });
-                ocDb.query("PRAGMA busy_timeout = 1000").run();
+                const ocDb = openTestDb(ocDbPath, { readonly: true });
                 // Get latest messages in the session
                 const rows = ocDb.prepare(
                     "SELECT id, json_extract(data, '$.role') AS role, json_extract(data, '$.finish') AS finish, json_extract(data, '$.summary') AS summary FROM message WHERE session_id = ? ORDER BY id DESC LIMIT 6",
@@ -289,8 +288,7 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
                 // Dump parts of the TOP 3 newest messages — reveals source of mystery user messages
                 // (compaction marker? autocontinue text? tool result? synthetic ignored notification?)
                 try {
-                    const ocDb2 = new Database(ocDbPath, { readonly: true });
-                    ocDb2.query("PRAGMA busy_timeout = 1000").run();
+                    const ocDb2 = openTestDb(ocDbPath, { readonly: true });
                     const topIds = rows.slice(0, 3).map((r) => r.id);
                     for (const msgId of topIds) {
                         const parts = ocDb2.prepare(

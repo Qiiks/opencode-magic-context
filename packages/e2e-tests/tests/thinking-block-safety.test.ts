@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { TestHarness } from "../src/harness";
+import { openTestDb } from "../src/test-db";
 
 /**
  * E2E regression suite for the Anthropic 400 error family:
@@ -72,11 +73,10 @@ afterAll(async () => {
 function openContextDbWritable(): Database {
     // Plugin v0.16+ — shared cortexkit/magic-context path.
     const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
-    const db = new Database(dbPath, { readwrite: true });
+    const db = openTestDb(dbPath, { readwrite: true });
     // The live plugin holds this same DB during the test; under loaded CI a write
     // here can collide with it. Wait for the lock instead of failing immediately
     // (SQLITE_BUSY), matching the other e2e tests that share the context DB.
-    db.query("PRAGMA busy_timeout = 5000").run();
     return db;
 }
 

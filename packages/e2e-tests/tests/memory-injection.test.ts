@@ -11,6 +11,7 @@ import { TestHarness } from "../src/harness";
 // test aligned with whatever the plugin does at runtime.
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
+import { openTestDb } from "../src/test-db";
 
 /**
  * Memory injection — regression test for v0.9.1.
@@ -61,7 +62,7 @@ function computeDirIdentity(directory: string): string {
 function seedMemory(h: TestHarness, projectIdentity: string, content: string): void {
     // Plugin v0.16+ — shared cortexkit/magic-context path.
     const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
-    const db = new Database(dbPath);
+    const db = openTestDb(dbPath);
     try {
         const now = Date.now();
         // Use the production hash helper so this matches the value the plugin

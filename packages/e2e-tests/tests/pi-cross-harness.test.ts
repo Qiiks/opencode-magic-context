@@ -8,6 +8,7 @@ import { computeNormalizedHash } from "../../plugin/src/features/magic-context/m
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { TestHarness } from "../src/harness";
 import { PiTestHarness } from "../src/pi-harness";
+import { openTestDb } from "../src/test-db";
 
 let oc: TestHarness | null = null;
 let pi: PiTestHarness | null = null;
@@ -20,9 +21,8 @@ afterAll(async () => {
 async function insertMemory(dbPath: string, projectIdentity: string, sessionId: string | null, content: string) {
     const deadline = Date.now() + 10_000;
     while (true) {
-        const db = new Database(dbPath);
+        const db = openTestDb(dbPath);
         try {
-            db.exec("PRAGMA busy_timeout = 1000");
             const now = Date.now();
             db.prepare(
                 `INSERT INTO memories (

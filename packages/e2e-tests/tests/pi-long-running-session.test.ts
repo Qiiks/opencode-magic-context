@@ -9,6 +9,7 @@ import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { PiTestHarness } from "../src/pi-harness";
 import type { MockUsage } from "../src/mock-provider/server";
+import { openTestDb } from "../src/test-db";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
@@ -155,9 +156,8 @@ function readMeta<T>(h: PiTestHarness, sessionId: string, columns: string): T | 
 }
 
 function writeDb(h: PiTestHarness, fn: (db: Database) => void): void {
-    const db = new Database(h.contextDbPath(), { readwrite: true });
+    const db = openTestDb(h.contextDbPath(), { readwrite: true });
     try {
-        db.query("PRAGMA busy_timeout = 5000").run();
         fn(db);
     } finally {
         db.close();

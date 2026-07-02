@@ -7,6 +7,7 @@ import { resolve as pathResolve } from "node:path";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { PiTestHarness } from "../src/pi-harness";
+import { openTestDb } from "../src/test-db";
 
 let h: PiTestHarness;
 
@@ -19,7 +20,7 @@ afterAll(async () => {
 });
 
 function seedMemory(content: string): void {
-    const db = new Database(h.contextDbPath());
+    const db = openTestDb(h.contextDbPath());
     try {
         const now = Date.now();
         db.prepare(

@@ -41,6 +41,7 @@ import {
     mainAgentRequests,
 } from "../src/cache-analysis";
 import { TestHarness } from "../src/harness";
+import { openTestDb } from "../src/test-db";
 import type { MockUsage } from "../src/mock-provider/server";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
@@ -185,9 +186,8 @@ function projectIdentity(): string {
 
 function writeContextDb<T>(fn: (db: Database) => T): T {
     const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
-    const db = new Database(dbPath);
+    const db = openTestDb(dbPath);
     try {
-        db.query("PRAGMA busy_timeout = 5000").run();
         return fn(db);
     } finally {
         db.close();
