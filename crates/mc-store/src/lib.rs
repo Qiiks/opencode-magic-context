@@ -610,6 +610,12 @@ pub struct HistorianDurableState {
     /// later firing establishes its producer run.
     #[serde(default)]
     pub last_failure: Option<String>,
+    /// Why the most recent pass declined to fire (reason discriminant only, no numbers,
+    /// so steady-state passes rewrite nothing). The twin of `last_failure` for the
+    /// pre-fire half: a supervised rig cannot read the transform response's diagnostics
+    /// block, so the skip branch must be readable from the state dump. Cleared on fire.
+    #[serde(default)]
+    pub last_no_fire: Option<String>,
 }
 
 impl Default for HistorianDurableState {
@@ -624,6 +630,7 @@ impl Default for HistorianDurableState {
             fired_at_ms: None,
             failure_backoff_at_ms: None,
             last_failure: None,
+            last_no_fire: None,
         }
     }
 }
@@ -2599,6 +2606,7 @@ mod tests {
                 fired_at_ms: Some(123),
                 failure_backoff_at_ms: Some(456),
                 last_failure: None,
+                last_no_fire: None,
             },
             ..Default::default()
         }

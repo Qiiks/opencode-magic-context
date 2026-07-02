@@ -523,20 +523,25 @@ impl McHandler {
                 protected_start_ordinal: p.protected_start_ordinal,
             });
         if !trigger.fire {
+            let reason = if loaded.meta.historian.state == HistorianPhase::Idle {
+                "trigger_false"
+            } else {
+                "busy"
+            };
+            if reason == "trigger_false" {
+                self.record_no_fire(&store, &parsed.session_id, &loaded, reason);
+            }
             return HistorianDiagnostics {
                 fired: false,
                 reason: None,
-                no_fire: Some(if loaded.meta.historian.state == HistorianPhase::Idle {
-                    "trigger_false".to_string()
-                } else {
-                    "busy".to_string()
-                }),
+                no_fire: Some(reason.to_string()),
                 state,
                 progress,
                 last_failure,
             };
         }
         if cfg.model_chain.is_empty() {
+            self.record_no_fire(&store, &parsed.session_id, &loaded, "no_models");
             return HistorianDiagnostics {
                 fired: false,
                 reason: trigger.reason.map(|r| r.as_str().to_string()),
@@ -547,6 +552,7 @@ impl McHandler {
             };
         }
         let Some(boundary) = trigger.boundary.clone() else {
+            self.record_no_fire(&store, &parsed.session_id, &loaded, "missing_boundary");
             return HistorianDiagnostics {
                 fired: false,
                 reason: None,
@@ -585,6 +591,12 @@ impl McHandler {
         let firing = match assemble {
             Ok(AssembleHistorianFiringOutcome::Fire(firing)) => *firing,
             Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
+                self.record_no_fire(
+                    &store,
+                    &parsed.session_id,
+                    &loaded,
+                    &format!("assemble:{reason:?}"),
+                );
                 return HistorianDiagnostics {
                     fired: false,
                     reason: trigger.reason.map(|r| r.as_str().to_string()),
@@ -592,9 +604,15 @@ impl McHandler {
                     state,
                     progress: progress.clone(),
                     last_failure: last_failure.clone(),
-                }
+                };
             }
             Err(e) => {
+                self.record_no_fire(
+                    &store,
+                    &parsed.session_id,
+                    &loaded,
+                    &format!("assemble_failed:{e}"),
+                );
                 return HistorianDiagnostics {
                     fired: false,
                     reason: trigger.reason.map(|r| r.as_str().to_string()),
@@ -602,7 +620,7 @@ impl McHandler {
                     state,
                     progress: progress.clone(),
                     last_failure: last_failure.clone(),
-                }
+                };
             }
         };
         let live_guard = {
@@ -642,6 +660,26 @@ impl McHandler {
             progress,
             last_failure,
         }
+    }
+
+    /// Persist the skip-branch discriminant so a supervised rig can read WHY the
+    /// historian declined to fire from the state dump (the transform response's
+    /// diagnostics block never reaches disk). Change-gated: steady-state passes that
+    /// skip for the same reason write nothing, so this stays off the hot path. A CAS
+    /// conflict just drops the diagnostic; it must never fail a pass.
+    fn record_no_fire(
+        &self,
+        store: &McStore,
+        session_id: &str,
+        loaded: &mc_store::LoadedState,
+        reason: &str,
+    ) {
+        if loaded.meta.historian.last_no_fire.as_deref() == Some(reason) {
+            return;
+        }
+        let mut meta = loaded.meta.clone();
+        meta.historian.last_no_fire = Some(reason.to_string());
+        let _ = store.commit(session_id, loaded.row_version, &loaded.core, &meta);
     }
 
     fn spawn_historian_firing(&self, task: HistorianFiringTask) {
@@ -1435,6 +1473,7 @@ mod tests {
             fired_at_ms: Some(1),
             failure_backoff_at_ms: None,
             last_failure: None,
+            last_no_fire: None,
         };
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)
@@ -1457,6 +1496,7 @@ mod tests {
             fired_at_ms: Some(1),
             failure_backoff_at_ms: None,
             last_failure: None,
+            last_no_fire: None,
         };
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)
@@ -1576,6 +1616,53 @@ mod tests {
         producer.block_output.store(false, Ordering::SeqCst);
         producer.notify.notify_waiters();
         wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_fire_reason_is_durable_change_gated_and_cleared_by_fire() {
+        // Skip branch writes the discriminant durably (supervised rigs read state, not
+        // responses), a repeat of the same reason writes nothing, and a real fire clears it.
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), config.clone());
+        let messages = big_messages();
+
+        let _ = call_transform(&handler, messages.clone()).await;
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(
+            loaded.meta.historian.last_no_fire.as_deref(),
+            Some("no_models")
+        );
+        let version_after_first = loaded.row_version;
+
+        let _ = call_transform(&handler, messages.clone()).await;
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(
+            loaded.row_version, version_after_first,
+            "an unchanged skip reason must not rewrite the row"
+        );
+
+        // Same store, models restored: the fire must clear the stale skip reason.
+        config.model_chain = vec!["prov/model-a".to_string()];
+        let handler2 = McHandler::with_producer_factory_and_config(
+            Arc::new(TestProducerFactory {
+                state: Arc::clone(&producer),
+            }),
+            config,
+        );
+        handler2.store.set(Arc::clone(&store)).ok().unwrap();
+        handler2.bind_route(7, binding(_project.to_str().unwrap(), "ses"));
+        let fired = call_transform(&handler2, messages).await;
+        assert_eq!(fired["historian"]["fired"], true);
+        // The clearing write happens in the spawned firing's persist. Durable state is
+        // still Idle until that task runs, so gate on the producer actually starting
+        // first (otherwise wait_for_idle returns before the firing began).
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.historian.last_no_fire, None);
     }
 
     #[tokio::test(flavor = "current_thread")]

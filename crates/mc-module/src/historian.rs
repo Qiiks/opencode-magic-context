@@ -181,6 +181,8 @@ pub fn fire(
         fired_at_ms: Some(fired_at_ms),
         failure_backoff_at_ms: None,
         last_failure: current.last_failure.clone(),
+        // A fire resolves whatever skip reason preceded it.
+        last_no_fire: None,
     }))
 }
 
@@ -1241,6 +1243,7 @@ mod tests {
             fired_at_ms: Some(10),
             failure_backoff_at_ms: None,
             last_failure: None,
+            last_no_fire: None,
         }
     }
 
@@ -1835,6 +1838,7 @@ mod tests {
             fired_at_ms: Some(1),
             failure_backoff_at_ms: None,
             last_failure: None,
+            last_no_fire: None,
         };
         let rv = store
             .commit(
