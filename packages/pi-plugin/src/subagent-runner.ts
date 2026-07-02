@@ -1,6 +1,7 @@
 import * as childProcess from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -368,10 +369,12 @@ export class PiSubagentRunner implements SubagentRunner {
 	 */
 	private readonly invocation: PiInvocation;
 	private readonly spawnImpl: typeof childProcess.spawn;
+	private readonly platform: NodeJS.Platform;
 
 	constructor(
 		options: {
 			piBinary?: string;
+			platform?: NodeJS.Platform;
 			/** Test seam for subprocess lifecycle tests. Production uses child_process.spawn. */
 			spawnImpl?: typeof childProcess.spawn;
 		} = {},
@@ -380,6 +383,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			? { command: options.piBinary, prefixArgs: [] }
 			: resolvePiInvocation();
 		this.spawnImpl = options.spawnImpl ?? childProcess.spawn;
+		this.platform = options.platform ?? process.platform;
 	}
 
 	async run(options: SubagentRunOptions): Promise<SubagentRunResult> {
@@ -464,15 +468,66 @@ export class PiSubagentRunner implements SubagentRunner {
 			}
 			return result;
 		}
+		const failBeforeSpawn = (
+			reason: Extract<SubagentRunResult, { ok: false }>["reason"],
+			error: string,
+		): SubagentRunResult => {
+			const result: SubagentRunResult = {
+				ok: false,
+				reason,
+				error,
+				durationMs: Date.now() - startTime,
+			};
+			try {
+				recordAccounting(result);
+			} catch (err) {
+				sessionLog(
+					options.accountingSessionId ?? "subagent",
+					`subagent accounting failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+			return result;
+		};
+
 		// Large prompts (e.g. a ~50K-token historian chunk ≈ 200 KB) overflow
 		// Linux's per-argv-entry limit (MAX_ARG_STRLEN, 128 KiB) and make spawn()
-		// fail with E2BIG. Above PROMPT_ARGV_MAX_BYTES, deliver the prompt via
-		// piped stdin (Pi's print mode concatenates stdin into the initial
-		// message) and omit the positional argv to avoid duplicating it.
+		// fail with E2BIG. Windows is stricter: CreateProcess caps the ENTIRE
+		// command line at 32,767 chars, so even small user prompts should stay out
+		// of argv there to leave room for flags and the temp-file system prompt.
+		// Pi's print mode concatenates stdin into the initial message, so when we
+		// pipe the prompt we must omit the positional argv to avoid duplication.
 		const promptBytes = Buffer.byteLength(options.userMessage, "utf8");
-		const deliverViaStdin = promptBytes > PROMPT_ARGV_MAX_BYTES;
+		const deliverViaStdin =
+			promptBytes > PROMPT_ARGV_MAX_BYTES || this.platform === "win32";
+		let systemPromptTempDir: string | undefined;
+		let systemPromptPath: string | undefined;
+		const cleanupSystemPromptFile = () => {
+			if (!systemPromptTempDir) return;
+			const tempDir = systemPromptTempDir;
+			systemPromptTempDir = undefined;
+			systemPromptPath = undefined;
+			try {
+				rmSync(tempDir, { recursive: true, force: true });
+			} catch {
+				// Temp-file cleanup is best-effort and must never mask the run result.
+			}
+		};
+		if (options.systemPrompt.length > 0) {
+			try {
+				systemPromptTempDir = mkdtempSync(join(tmpdir(), "mc-pi-prompt-"));
+				systemPromptPath = join(systemPromptTempDir, "system-prompt.txt");
+				writeFileSync(systemPromptPath, options.systemPrompt, "utf8");
+			} catch (error) {
+				cleanupSystemPromptFile();
+				return failBeforeSpawn(
+					"spawn_failed",
+					`failed to prepare pi system prompt file: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 		const args = buildArgs(options, {
 			omitPositionalMessage: deliverViaStdin,
+			systemPromptPath,
 		});
 
 		// The model spec is `provider/model` — Pi accepts that directly via
@@ -490,6 +545,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			const settle = (result: SubagentRunResult) => {
 				if (settled) return;
 				settled = true;
+				cleanupSystemPromptFile();
 				// recordAccounting must never block resolution: a throw here (e.g.
 				// a DB write failure during token accounting) would leave the
 				// promise unresolved and hang the caller (historian/dreamer/
@@ -532,14 +588,15 @@ export class PiSubagentRunner implements SubagentRunner {
 							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
 						},
 						// stdout = JSON events; stderr = diagnostics. stdin is a pipe
-						// ONLY on the large-prompt path (we write the message then end
-						// it); otherwise it stays closed because the message rides in
-						// argv and print-mode would otherwise block reading an open,
-						// idle stdin.
+						// when we deliver the user message there (always on Windows, or
+						// for oversized prompts elsewhere). Otherwise it stays closed
+						// because the message rides in argv and print-mode would block
+						// reading an open, idle stdin.
 						stdio: [deliverViaStdin ? "pipe" : "ignore", "pipe", "pipe"],
 					},
 				);
 			} catch (error) {
+				cleanupSystemPromptFile();
 				settle({
 					ok: false,
 					reason: "spawn_failed",
@@ -562,7 +619,7 @@ export class PiSubagentRunner implements SubagentRunner {
 
 			emitProgress({ type: "spawned", argv: args, pid: child.pid });
 
-			// Large-prompt path: feed the message through stdin, then close it so
+			// Stdin-delivery path: feed the message through stdin, then close it so
 			// Pi's print-mode stdin read resolves (it waits for EOF). Guarded by
 			// child.stdin presence (only opened when deliverViaStdin).
 			if (deliverViaStdin && child.stdin) {
@@ -1023,13 +1080,13 @@ export const PROMPT_ARGV_MAX_BYTES = 96 * 1024;
  * messages, so the user prompt must come last.
  *
  * When `omitPositionalMessage` is set, the user prompt is NOT appended as a
- * positional — the caller delivers it via piped stdin instead (large-prompt
- * path; see PROMPT_ARGV_MAX_BYTES). Pi concatenates stdin + positional, so the
+ * positional — the caller delivers it via piped stdin instead (oversized prompt
+ * path, or all win32 runs). Pi concatenates stdin + positional, so the
  * positional MUST be omitted when piping or the prompt would be duplicated.
  */
 export function buildArgs(
 	options: SubagentRunOptions,
-	opts?: { omitPositionalMessage?: boolean },
+	opts?: { omitPositionalMessage?: boolean; systemPromptPath?: string },
 ): string[] {
 	const args: string[] = [
 		"--print",
@@ -1055,6 +1112,10 @@ export function buildArgs(
 		// focused one-shot subagents.
 		"--no-skills",
 		"--no-prompt-templates",
+		// Hidden one-shot subagents must receive EXACTLY the system prompt we built.
+		// Pi otherwise appends AGENTS.md / CLAUDE.md project context files, which
+		// pollutes the prompt and adds avoidable startup work.
+		"--no-context-files",
 		// --no-tools is applied below only for unknown or explicitly zero-tool agents.
 		// Every known Magic Context child gets an explicit --tools allow-list so Pi's
 		// discovered extension registry cannot leak unrelated tools into subagents.
@@ -1112,13 +1173,17 @@ export function buildArgs(
 		}
 	}
 
-	if (options.systemPrompt && options.systemPrompt.length > 0) {
+	if (opts?.systemPromptPath) {
 		// We intentionally use --system-prompt (replace) rather than
 		// --append-system-prompt (chain) because subagents are one-shot
 		// and have their own focused system prompt. Mixing in Pi's
 		// default coding-assistant prompt would dilute the historian
-		// / dreamer / sidekick role guidance.
-		args.push("--system-prompt", options.systemPrompt);
+		// / dreamer / sidekick role guidance. The runner always writes that
+		// prompt to a temp file and passes the ABSOLUTE path here because
+		// Windows CreateProcess caps the whole command line at 32,767 chars
+		// and the historian prompt alone is ~60 KB. A temp file also avoids
+		// Pi's existsSync ambiguity because we always hand it a path we created.
+		args.push("--system-prompt", opts.systemPromptPath);
 	}
 
 	if (typeof options.model === "string" && options.model.length > 0) {
@@ -1148,8 +1213,9 @@ export function buildArgs(
 	// a `--` sentinel; newer builds hard-fail on that sentinel as an unknown
 	// option, so pass the prompt directly.
 	//
-	// Omitted on the large-prompt path: the caller pipes the message via stdin
-	// (Pi concatenates stdin + positional, so including both would duplicate it).
+	// Omitted whenever the caller pipes the message via stdin (oversized prompt
+	// path, or all win32 runs). Pi concatenates stdin + positional, so including
+	// both would duplicate it.
 	if (!opts?.omitPositionalMessage) {
 		args.push(options.userMessage);
 	}

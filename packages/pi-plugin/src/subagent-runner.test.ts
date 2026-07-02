@@ -1,5 +1,7 @@
 import { describe, expect, it, mock } from "bun:test";
 import { EventEmitter } from "node:events";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { PassThrough } from "node:stream";
 import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-runner";
 
@@ -10,13 +12,23 @@ const baseOptions: SubagentRunOptions = {
 	systemPrompt: "system guidance",
 	userMessage: "summarize this session",
 };
+const TEST_SYSTEM_PROMPT_PATH = "/tmp/mc-pi-system-prompt.txt";
 
 type MockChild = ReturnType<typeof createMockChild>;
 
 function createMockChild({ stdout = true }: { stdout?: boolean } = {}) {
 	const events = new EventEmitter();
+	const stdinStream = new PassThrough();
+	stdinStream.setEncoding("utf8");
 	const stdoutStream = stdout ? new PassThrough() : null;
 	const stderrStream = new PassThrough();
+	let stdinText = "";
+	const stdinEnded = new Promise<void>((resolve) => {
+		stdinStream.on("data", (chunk) => {
+			stdinText += chunk;
+		});
+		stdinStream.on("end", () => resolve());
+	});
 	let killed = false;
 	let exitCode: number | null = null;
 	let signalCode: NodeJS.Signals | null = null;
@@ -24,6 +36,7 @@ function createMockChild({ stdout = true }: { stdout?: boolean } = {}) {
 
 	const child = {
 		pid: 42,
+		stdin: stdinStream,
 		stdout: stdoutStream,
 		stderr: stderrStream,
 		get killed() {
@@ -34,6 +47,9 @@ function createMockChild({ stdout = true }: { stdout?: boolean } = {}) {
 		},
 		get signalCode() {
 			return signalCode;
+		},
+		get stdinText() {
+			return stdinText;
 		},
 		kill: mock((signal?: NodeJS.Signals | number) => {
 			killSignals.push(signal);
@@ -50,6 +66,7 @@ function createMockChild({ stdout = true }: { stdout?: boolean } = {}) {
 			signalCode = signal;
 			stdoutStream?.end();
 			stderrStream.end();
+			if (!stdinStream.writableEnded) stdinStream.end();
 			setTimeout(() => events.emit("close", code, signal), 0);
 		},
 		emitExit: (
@@ -58,6 +75,7 @@ function createMockChild({ stdout = true }: { stdout?: boolean } = {}) {
 		) => {
 			exitCode = code;
 			signalCode = signal;
+			if (!stdinStream.writableEnded) stdinStream.end();
 			events.emit("exit", code, signal);
 		},
 		emitError: (error: Error) => events.emit("error", error),
@@ -72,19 +90,42 @@ function createMockChild({ stdout = true }: { stdout?: boolean } = {}) {
 		writeStderr: (text: string) => {
 			stderrStream.write(text);
 		},
+		waitForStdinEnd: () => stdinEnded,
 		killSignals,
 	};
 
 	return child;
 }
 
-function runnerWith(child: MockChild, piBinary = "pi-test") {
+function runnerWith(
+	child: MockChild,
+	{
+		piBinary = "pi-test",
+		platform,
+	}: { piBinary?: string; platform?: NodeJS.Platform } = {},
+) {
 	const spawnImpl = mock(() => child as never);
 	const runner = new PiSubagentRunner({
 		piBinary,
+		platform,
 		spawnImpl: spawnImpl as never,
 	});
 	return { runner, spawnImpl };
+}
+
+function buildArgsForTest(
+	options: SubagentRunOptions,
+	opts?: Parameters<typeof __test.buildArgs>[1],
+) {
+	return __test.buildArgs(options, {
+		systemPromptPath: TEST_SYSTEM_PROMPT_PATH,
+		...opts,
+	});
+}
+
+function requirePromptPath(promptPath: string | undefined): string {
+	if (!promptPath) throw new Error("expected system prompt path");
+	return promptPath;
 }
 
 function agentEnd(messages: unknown[]) {
@@ -123,7 +164,7 @@ describe("subagent-runner pure helpers", () => {
 
 	it("builds argv with system prompt, primary model, and prompt last", () => {
 		expect(
-			__test.buildArgs({
+			buildArgsForTest({
 				...baseOptions,
 				model: "anthropic/claude-sonnet",
 			}),
@@ -138,10 +179,11 @@ describe("subagent-runner pure helpers", () => {
 			"--no-session",
 			"--no-skills",
 			"--no-prompt-templates",
+			"--no-context-files",
 			"--tools",
 			"read,grep,find,ls,aft_search",
 			"--system-prompt",
-			"system guidance",
+			TEST_SYSTEM_PROMPT_PATH,
 			"--model",
 			"anthropic/claude-sonnet",
 			// No --thinking flag: thinkingLevel not set in baseOptions,
@@ -153,7 +195,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("keeps extension discovery enabled so provider and AFT extensions can load", () => {
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			model: "google/antigravity-gemini-3.5-flash",
 		});
@@ -163,12 +205,24 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).toContain("--no-prompt-templates");
 	});
 
+	it("disables project context files so hidden subagents see only our prompt", () => {
+		const args = buildArgsForTest({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+		});
+
+		expect(args).toContain("--no-context-files");
+		expect(args.indexOf("--no-context-files")).toBeLessThan(
+			args.indexOf("--tools"),
+		);
+	});
+
 	it("always includes --no-session so child sessions don't appear in pi resume", () => {
 		// Pinned-down regression: the user-visible promise of magic-context
 		// hidden subagents is that historian/sidekick/dreamer runs never
 		// pollute Pi's session list. If this assertion ever fails, the
 		// child sessions WILL show up in `pi resume` again.
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			model: "anthropic/claude-sonnet",
 		});
@@ -181,7 +235,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("builds a single --model; runner handles fallback with fresh children", () => {
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			model: "anthropic/primary",
 			fallbackModels: ["openai/fallback", "google/last"],
@@ -198,10 +252,10 @@ describe("subagent-runner pure helpers", () => {
 		// Shared config stores canonical ids; Pi names two auth-plugin providers
 		// differently. The spawned --model must carry Pi's form.
 		expect(
-			__test.buildArgs({ ...baseOptions, model: "openai/gpt-5.5" }),
+			buildArgsForTest({ ...baseOptions, model: "openai/gpt-5.5" }),
 		).toEqual(expect.arrayContaining(["--model", "openai-codex/gpt-5.5"]));
 		expect(
-			__test.buildArgs({
+			buildArgsForTest({
 				...baseOptions,
 				model: "google/antigravity-gemini-3.5-flash",
 			}),
@@ -213,12 +267,12 @@ describe("subagent-runner pure helpers", () => {
 		);
 		// Anthropic and other providers pass through unchanged.
 		expect(
-			__test.buildArgs({ ...baseOptions, model: "anthropic/claude-opus-4-8" }),
+			buildArgsForTest({ ...baseOptions, model: "anthropic/claude-opus-4-8" }),
 		).toEqual(expect.arrayContaining(["--model", "anthropic/claude-opus-4-8"]));
 	});
 
 	it("passes prompt last without a -- sentinel", () => {
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			model: "anthropic/claude-sonnet",
 			userMessage: "ordinary prompt",
@@ -229,7 +283,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("locks dreamer-retrospective to --tools ctx_search (no built-ins) and never --no-tools", () => {
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer-retrospective",
 			model: "anthropic/claude-sonnet",
@@ -242,14 +296,14 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("locks historian and sidekick to explicit read-only allow-lists", () => {
-		const historianArgs = __test.buildArgs({
+		const historianArgs = buildArgsForTest({
 			...baseOptions,
 			agent: "historian",
 		});
 		expect(historianArgs).toEqual(
 			expect.arrayContaining(["--tools", "read,grep,find,ls,aft_search"]),
 		);
-		const sidekickArgs = __test.buildArgs({
+		const sidekickArgs = buildArgsForTest({
 			...baseOptions,
 			agent: "sidekick",
 		});
@@ -259,7 +313,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("locks base dreamer (curate) to --tools ctx_memory, stripping all built-ins", () => {
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer",
 			model: "anthropic/claude-sonnet",
@@ -287,7 +341,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("locks magic-context-dreamer (Pi facade default) to --tools ctx_memory only", () => {
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "magic-context-dreamer",
 			model: "anthropic/claude-sonnet",
@@ -318,7 +372,7 @@ describe("subagent-runner pure helpers", () => {
 
 	it("emits an explicit tool gate for every known Pi subagent agent", () => {
 		for (const agent of __test.KNOWN_PI_SUBAGENT_AGENTS) {
-			const args = __test.buildArgs({ ...baseOptions, agent });
+			const args = buildArgsForTest({ ...baseOptions, agent });
 			const hasTools = args.includes("--tools");
 			const hasNoTools = args.includes("--no-tools");
 			expect(__test.STRICT_TOOL_ALLOWLIST.has(agent)).toBe(true);
@@ -328,13 +382,13 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("fails closed to --no-tools for unknown agent ids", () => {
-		const args = __test.buildArgs({ ...baseOptions, agent: "future-agent" });
+		const args = buildArgsForTest({ ...baseOptions, agent: "future-agent" });
 		expect(args).toContain("--no-tools");
 		expect(args).not.toContain("--tools");
 	});
 
 	it("locks dreamer-docs to file tools plus optional AFT read tools, with no ctx_memory and no extension", () => {
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer-docs",
 			model: "anthropic/claude-sonnet",
@@ -352,7 +406,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("locks dreamer-reviewer to --no-tools (pure JSON reviewer, zero tools)", () => {
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer-reviewer",
 			model: "anthropic/claude-sonnet",
@@ -363,7 +417,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("locks dreamer-primer-investigator to read-only built-ins, AFT read tools, and ctx_search", () => {
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer-primer-investigator",
 			model: "anthropic/claude-sonnet",
@@ -387,7 +441,7 @@ describe("subagent-runner pure helpers", () => {
 
 	it("adds AFT read tools exactly to the intended Pi child allow-lists", () => {
 		const toolListFor = (agent: string) => {
-			const args = __test.buildArgs({ ...baseOptions, agent });
+			const args = buildArgsForTest({ ...baseOptions, agent });
 			const idx = args.indexOf("--tools");
 			return idx >= 0 ? args[idx + 1].split(",") : [];
 		};
@@ -452,7 +506,7 @@ describe("subagent-runner pure helpers", () => {
 		// next to subagent-runner.ts, so resolveSubagentEntryPath() returns
 		// undefined and we skip the --extension flag. Discovered provider/AFT
 		// extensions still load; only Magic Context's explicit ctx_* entry is absent.
-		const args = __test.buildArgs({
+		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "historian",
 			model: "anthropic/claude-sonnet",
@@ -471,7 +525,7 @@ describe("subagent-runner pure helpers", () => {
 		// receive ctx_memory in the child extension. Historian, sidekick,
 		// compressor etc. stay without the dreamer flag.
 		for (const agent of ["historian", "sidekick", "compressor", "recomp"]) {
-			const args = __test.buildArgs({
+			const args = buildArgsForTest({
 				...baseOptions,
 				agent,
 				model: "anthropic/claude-sonnet",
@@ -559,7 +613,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 
 	it("spawns pi, parses stdout, trims assistant text, and captures stderr", async () => {
 		const child = createMockChild();
-		const { runner, spawnImpl } = runnerWith(child, "custom-pi");
+		const { runner, spawnImpl } = runnerWith(child, { piBinary: "custom-pi" });
 
 		const resultPromise = runner.run({
 			...baseOptions,
@@ -758,6 +812,174 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
+	it("writes the system prompt to a temp file path and removes it after success", async () => {
+		const child = createMockChild();
+		let promptPath: string | undefined;
+		const spawnImpl = mock((_command: string, args: string[]) => {
+			const promptFlagIndex = args.indexOf("--system-prompt");
+			expect(promptFlagIndex).toBeGreaterThan(-1);
+			promptPath = args[promptFlagIndex + 1];
+			const systemPromptPath = requirePromptPath(promptPath);
+			expect(systemPromptPath).not.toBe(baseOptions.systemPrompt);
+			expect(isAbsolute(systemPromptPath)).toBe(true);
+			expect(existsSync(systemPromptPath)).toBe(true);
+			expect(readFileSync(systemPromptPath, "utf8")).toBe(
+				baseOptions.systemPrompt,
+			);
+			return child as never;
+		});
+		const runner = new PiSubagentRunner({
+			piBinary: "pi-test",
+			spawnImpl: spawnImpl as never,
+		});
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+		});
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "ok" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose(0);
+
+		expect(await resultPromise).toEqual({
+			ok: true,
+			assistantText: "ok",
+			toolCallCount: 0,
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined },
+		});
+		const systemPromptPath = requirePromptPath(promptPath);
+		expect(existsSync(systemPromptPath)).toBe(false);
+	});
+
+	it("removes the temp system prompt file when spawn throws", async () => {
+		let promptPath: string | undefined;
+		const spawnImpl = mock((_command: string, args: string[]) => {
+			const promptFlagIndex = args.indexOf("--system-prompt");
+			expect(promptFlagIndex).toBeGreaterThan(-1);
+			promptPath = args[promptFlagIndex + 1];
+			expect(existsSync(requirePromptPath(promptPath))).toBe(true);
+			throw new Error("ENOENT pi");
+		});
+		const runner = new PiSubagentRunner({
+			piBinary: "pi-test",
+			spawnImpl: spawnImpl as never,
+		});
+
+		expect(await runner.run(baseOptions)).toEqual({
+			ok: false,
+			reason: "spawn_failed",
+			error: "ENOENT pi",
+			durationMs: expect.any(Number),
+		});
+		const systemPromptPath = requirePromptPath(promptPath);
+		expect(existsSync(systemPromptPath)).toBe(false);
+	});
+
+	it("pipes small win32 user messages through stdin instead of argv", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, { platform: "win32" });
+		const userMessage = "small win32 prompt";
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+			userMessage,
+		});
+		await child.waitForStdinEnd();
+
+		const spawnArgs = spawnImpl.mock.calls[0]?.[1] as string[] | undefined;
+		const spawnOptions = spawnImpl.mock.calls[0]?.[2] as
+			| { stdio?: [string, string, string] }
+			| undefined;
+		expect(spawnArgs).not.toContain(userMessage);
+		expect(child.stdinText).toBe(userMessage);
+		expect(spawnOptions?.stdio).toEqual(["pipe", "pipe", "pipe"]);
+
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose(0);
+		await resultPromise;
+	});
+
+	it("keeps small linux user messages positional", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, { platform: "linux" });
+		const userMessage = "small linux prompt";
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+			userMessage,
+		});
+
+		const spawnArgs = spawnImpl.mock.calls[0]?.[1] as string[] | undefined;
+		const spawnOptions = spawnImpl.mock.calls[0]?.[2] as
+			| { stdio?: [string, string, string] }
+			| undefined;
+		expect(spawnArgs?.at(-1)).toBe(userMessage);
+		expect(child.stdinText).toBe("");
+		expect(spawnOptions?.stdio).toEqual(["ignore", "pipe", "pipe"]);
+
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose(0);
+		await resultPromise;
+	});
+
+	it("keeps win32 argv well under the CreateProcess limit with a large system prompt", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, { platform: "win32" });
+		const systemPrompt = "h".repeat(60 * 1024);
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+			systemPrompt,
+			userMessage: "hi",
+		});
+		await child.waitForStdinEnd();
+
+		const spawnArgs = spawnImpl.mock.calls[0]?.[1] as string[] | undefined;
+		expect(spawnArgs).toBeDefined();
+		expect(spawnArgs?.join(" ").length ?? 0).toBeLessThan(32_767);
+		expect(spawnArgs).not.toContain(systemPrompt);
+		expect(spawnArgs).not.toContain("hi");
+
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose(0);
+		await resultPromise;
+	});
+
 	it("returns spawn_failed when the child emits an error", async () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);
@@ -940,22 +1162,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 
 		expect(spawnImpl).toHaveBeenCalledWith(
 			"pi-test",
-			[
-				"--print",
-				"--mode",
-				"json",
-				"--no-session",
-				"--no-skills",
-				"--no-prompt-templates",
-				"--tools",
-				"read,grep,find,ls,aft_search",
-				"--system-prompt",
-				"system guidance",
-				"--model",
-				"anthropic/primary",
-				// No --thinking: thinkingLevel not set in options above.
-				"summarize this session",
-			],
+			expect.any(Array),
 			expect.objectContaining({
 				cwd: "/workspace/project",
 				env: expect.objectContaining({
@@ -964,6 +1171,24 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				}),
 			}),
 		);
+		const spawnArgs = spawnImpl.mock.calls[0]?.[1] as string[] | undefined;
+		expect(spawnArgs).toEqual([
+			"--print",
+			"--mode",
+			"json",
+			"--no-session",
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-context-files",
+			"--tools",
+			"read,grep,find,ls,aft_search",
+			"--system-prompt",
+			expect.stringMatching(/system-prompt\.txt$/),
+			"--model",
+			"anthropic/primary",
+			// No --thinking: thinkingLevel not set in options above.
+			"summarize this session",
+		]);
 		const spawnOptions = spawnImpl.mock.calls[0]?.[2] as
 			| { env?: NodeJS.ProcessEnv }
 			| undefined;
