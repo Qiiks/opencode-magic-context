@@ -1017,15 +1017,15 @@ mod tests {
             lines: vec![
                 ChunkLine {
                     ordinal: 2,
-                    message_id: "m2".into(),
+                    message_id: "m2#0".into(),
                 },
                 ChunkLine {
                     ordinal: 3,
-                    message_id: "m3".into(),
+                    message_id: "m3#0".into(),
                 },
                 ChunkLine {
                     ordinal: 4,
-                    message_id: "m4".into(),
+                    message_id: "m4#0".into(),
                 },
             ],
             tool_only_ranges: vec![],
@@ -1238,7 +1238,7 @@ mod tests {
             "prior C1 preserved and historian C2 appended"
         );
         let c2 = comps.last().unwrap();
-        assert_eq!(c2.end_message_id, "m3");
+        assert_eq!(c2.end_message_id, "m3#0");
         assert_eq!(c2.p1.as_deref(), Some("second arc full and exact"));
         assert_eq!(c2.created_at, 123);
     }
@@ -1645,15 +1645,15 @@ mod tests {
             lines: vec![
                 ChunkLine {
                     ordinal: 2,
-                    message_id: "m2".into(),
+                    message_id: "m2#0".into(),
                 },
                 ChunkLine {
                     ordinal: 3,
-                    message_id: "m3".into(),
+                    message_id: "m3#0".into(),
                 },
                 ChunkLine {
                     ordinal: 4,
-                    message_id: "m4".into(),
+                    message_id: "m4#0".into(),
                 },
             ],
             tool_only_ranges: vec![],
@@ -1673,7 +1673,7 @@ mod tests {
         )
         .expect("validation succeeds");
         assert_eq!(validated.compartments.len(), 1);
-        assert_eq!(validated.compartments[0].end_message_id, "m3");
+        assert_eq!(validated.compartments[0].end_message_id, "m3#0");
 
         // Drive the state machine to a publishing row and publish the validated chunk.
         let mut meta = store.load("ses").unwrap().meta;
@@ -1724,7 +1724,7 @@ mod tests {
         let comps = store.load_compartments("ses").unwrap();
         assert_eq!(comps.len(), 2, "C1 preserved, C2 appended");
         let c2 = comps.last().unwrap();
-        assert_eq!(c2.end_message_id, "m3");
+        assert_eq!(c2.end_message_id, "m3#0");
         assert_eq!(c2.p1.as_deref(), Some("second arc full and exact"));
         assert_eq!(c2.legacy, 0);
         assert_eq!(c2.created_at, 123);

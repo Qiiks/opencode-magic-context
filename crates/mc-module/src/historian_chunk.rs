@@ -17,7 +17,7 @@ use crate::historian_prompt::{
 use crate::historian_validate::{
     ChunkLine, HistorianChunk, MessageRange, StoredCompartmentRange, ValidateOptions,
 };
-use crate::transform::ck_wire::{CkKind, FlatBlock};
+use crate::transform::ck_wire::{block_id, CkIngressMessage, CkKind, FlatBlock};
 
 const MAX_COMMITS_PER_BLOCK: usize = 5;
 const SYSTEM_DIRECTIVE_PREFIX: &str = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT";
@@ -59,6 +59,7 @@ struct MessageMeta {
 
 #[derive(Debug, Clone)]
 struct FlatMessage<'a> {
+    mid: &'a str,
     ordinal: u64,
     role: &'a str,
     blocks: Vec<&'a FlatBlock>,
@@ -291,43 +292,52 @@ impl Builder {
 }
 
 pub fn build_historian_chunk(
-    live: &[FlatBlock],
+    messages: &[CkIngressMessage],
+    blocks: &[FlatBlock],
     start_ordinal: u64,
     token_budget: usize,
     eligible_end_ordinal: u64,
 ) -> HistorianBuiltChunk {
-    let live_count = live
+    let total_messages = messages
         .iter()
-        .filter(|block| !block.synthetic)
-        .map(|block| (block.ordinal, block.mid.as_str()))
-        .collect::<std::collections::BTreeSet<_>>()
-        .len() as u64;
-    let total_count = live
+        .filter(|message| !message.ck.meta.synthetic)
+        .count() as u64;
+    let total_count = messages
         .iter()
-        .filter(|block| !block.synthetic)
-        .map(|block| block.ordinal)
+        .filter(|message| !message.ck.meta.synthetic)
+        .map(|message| message.ordinal)
         .max()
         .unwrap_or(0)
-        .max(live_count);
+        .max(total_messages);
     let start = start_ordinal.max(1);
-    let tool_call_summaries = build_tool_call_summary_lookup(live);
+    let tool_call_summaries = build_tool_call_summary_lookup(blocks);
     let mut builder = Builder::new(token_budget, start, tool_call_summaries);
-    let messages = grouped_messages(live);
-    for message in messages {
+    let blocks_by_mid = grouped_blocks_by_mid(blocks);
+    for message in messages.iter().filter(|message| !message.ck.meta.synthetic) {
         if message.ordinal >= eligible_end_ordinal {
             break;
         }
-        if message.ordinal < start || message.role == "system" {
+        let role = message.ck.role.as_str();
+        if message.ordinal < start || role == "system" {
             continue;
         }
-        if !builder.push_message(&message) {
+        let flat_message = FlatMessage {
+            mid: message.mid.as_str(),
+            ordinal: message.ordinal,
+            role,
+            blocks: blocks_by_mid
+                .get(message.mid.as_str())
+                .cloned()
+                .unwrap_or_default(),
+        };
+        if !builder.push_message(&flat_message) {
             break;
         }
     }
     let _ = builder.flush_current_block();
     let tool_only_ranges = merge_tool_only_ranges(&builder.tool_only_ranges);
     let end = builder.last_ordinal;
-    let snapshot = live
+    let snapshot = blocks
         .iter()
         .filter(|block| {
             !block.synthetic
@@ -436,6 +446,7 @@ pub enum AssembleHistorianFiringOutcome {
 
 pub fn assemble_historian_firing(
     store: &McStore,
+    messages: &[CkIngressMessage],
     live: &[FlatBlock],
     config: HistorianAssemblerConfig,
     now_ms: i64,
@@ -462,7 +473,13 @@ pub fn assemble_historian_firing(
             },
         ));
     }
-    let chunk = build_historian_chunk(live, chunk_start, config.token_budget, eligible_end);
+    let chunk = build_historian_chunk(
+        messages,
+        live,
+        chunk_start,
+        config.token_budget,
+        eligible_end,
+    );
     if chunk.text.is_empty() || chunk.chunk.lines.is_empty() {
         return Ok(AssembleHistorianFiringOutcome::NoFire(
             HistorianNoFireReason::EmptyChunk,
@@ -522,15 +539,42 @@ pub fn assemble_historian_firing(
     )))
 }
 
+const HISTORIAN_TRUNCATION_MARKER: &str =
+    "\n[… tokens truncated by Magic Context to fit the historian window …]";
+
 pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> String {
-    let tokens = estimate_tokens(input);
-    if tokens <= token_budget || input.is_empty() {
+    if estimate_tokens(input) <= token_budget {
         return input.to_string();
     }
-    let keep_chars = ((input.chars().count() as f64) * (token_budget as f64 / tokens as f64) * 0.95)
-        .floor()
-        .max(0.0) as usize;
-    input.chars().take(keep_chars).collect::<String>()
+
+    // TypeScript slices by UTF-16 code units. Rust strings cannot be sliced at
+    // arbitrary UTF-16 offsets, so this port uses Unicode scalar-value indices
+    // while preserving the marker bytes, `<=` budget checks, and midpoint math.
+    let mut lo = 0usize;
+    let mut hi = input.chars().count();
+    let mut best = 0usize;
+    while lo <= hi {
+        let mid = (lo + hi) >> 1;
+        let candidate = format!(
+            "{}{}",
+            input.chars().take(mid).collect::<String>(),
+            HISTORIAN_TRUNCATION_MARKER
+        );
+        if estimate_tokens(&candidate) <= token_budget {
+            best = mid;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    format!(
+        "{}{}",
+        input.chars().take(best).collect::<String>(),
+        HISTORIAN_TRUNCATION_MARKER
+    )
 }
 
 fn stored_range(c: &StoredCompartment) -> StoredCompartmentRange {
@@ -540,20 +584,12 @@ fn stored_range(c: &StoredCompartment) -> StoredCompartmentRange {
     }
 }
 
-fn grouped_messages(live: &[FlatBlock]) -> Vec<FlatMessage<'_>> {
-    let mut grouped: BTreeMap<(u64, &str), FlatMessage<'_>> = BTreeMap::new();
-    for block in live.iter().filter(|block| !block.synthetic) {
-        grouped
-            .entry((block.ordinal, block.mid.as_str()))
-            .or_insert_with(|| FlatMessage {
-                ordinal: block.ordinal,
-                role: block.role.as_str(),
-                blocks: Vec::new(),
-            })
-            .blocks
-            .push(block);
+fn grouped_blocks_by_mid(blocks: &[FlatBlock]) -> BTreeMap<&str, Vec<&FlatBlock>> {
+    let mut grouped: BTreeMap<&str, Vec<&FlatBlock>> = BTreeMap::new();
+    for block in blocks.iter().filter(|block| !block.synthetic) {
+        grouped.entry(block.mid.as_str()).or_default().push(block);
     }
-    grouped.into_values().collect()
+    grouped
 }
 
 fn last_block_id(message: &FlatMessage<'_>) -> String {
@@ -561,7 +597,7 @@ fn last_block_id(message: &FlatMessage<'_>) -> String {
         .blocks
         .last()
         .map(|block| block.id.clone())
-        .unwrap_or_default()
+        .unwrap_or_else(|| block_id(message.mid, 0))
 }
 
 fn text_parts(message: &FlatMessage<'_>) -> Vec<String> {
@@ -610,12 +646,14 @@ fn extract_tool_result_summaries(
 ) -> Vec<String> {
     let mut summaries = Vec::new();
     for block in &message.blocks {
-        let CkKind::ToolResult { id, tool_name, .. } = &block.wire.kind else {
+        let CkKind::ToolResult { tool_name, .. } = &block.wire.kind else {
             continue;
         };
         summaries.push(
-            tool_call_summaries
-                .get(id)
+            block
+                .arc_id
+                .as_deref()
+                .and_then(|arc_id| tool_call_summaries.get(arc_id))
                 .cloned()
                 .unwrap_or_else(|| format!("TC: {tool_name}")),
         );
@@ -623,17 +661,13 @@ fn extract_tool_result_summaries(
     summaries
 }
 
-fn build_tool_call_summary_lookup(live: &[FlatBlock]) -> HashMap<String, String> {
+fn build_tool_call_summary_lookup(blocks: &[FlatBlock]) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    for block in live.iter().filter(|block| !block.synthetic) {
-        let CkKind::ToolCall {
-            id, name, input, ..
-        } = &block.wire.kind
-        else {
+    for block in blocks.iter().filter(|block| !block.synthetic) {
+        let CkKind::ToolCall { name, input, .. } = &block.wire.kind else {
             continue;
         };
-        out.entry(id.clone())
-            .or_insert_with(|| format_tool_summary(name, input));
+        out.insert(block.id.clone(), format_tool_summary(name, input));
     }
     out
 }
@@ -851,6 +885,8 @@ mod tests {
     #[derive(Deserialize)]
     struct GoldenRoot {
         cases: Vec<GoldenCase>,
+        #[serde(default, rename = "truncationCases")]
+        truncation_cases: Vec<GoldenTruncationCase>,
     }
 
     #[derive(Deserialize)]
@@ -889,6 +925,14 @@ mod tests {
         ordinal: u64,
     }
 
+    #[derive(Deserialize)]
+    struct GoldenTruncationCase {
+        label: String,
+        budget: usize,
+        input: String,
+        expected: String,
+    }
+
     fn msg(mid: &str, ordinal: u64, role: &str, blocks: Vec<CkKind>) -> CkIngressMessage {
         CkIngressMessage {
             mid: mid.to_string(),
@@ -912,24 +956,116 @@ mod tests {
         }
     }
 
+    fn project_and_build(
+        messages: &[CkIngressMessage],
+        offset: u64,
+        budget: usize,
+        eligible_end: u64,
+    ) -> HistorianBuiltChunk {
+        let projection = project_messages(messages).unwrap();
+        build_historian_chunk(messages, &projection.blocks, offset, budget, eligible_end)
+    }
+
     #[test]
     fn chunk_uses_flat_block_ids_and_skips_system_messages() {
-        let projection = project_messages(&[
-            msg("sys", 0, "system", vec![text("identity")]),
+        let messages = vec![
             msg("u1", 1, "user", vec![text("hello")]),
-            msg("a2", 2, "assistant", vec![text("done")]),
-        ])
-        .unwrap();
-        let built = build_historian_chunk(&projection.blocks, 1, 1_000, 3);
-        assert_eq!(built.text, "[1] U: hello\n[2] A: done");
+            msg("sys", 2, "system", vec![text("identity")]),
+            msg("a3", 3, "assistant", vec![text("done")]),
+        ];
+        let built = project_and_build(&messages, 1, 1_000, 4);
+        assert_eq!(built.text, "[1] U: hello\n[3] A: done");
         assert_eq!(built.chunk.start_index, 1);
+        assert!(!built.chunk.lines.iter().any(|line| line.ordinal == 2));
+        assert!(built.chunk.lines.iter().any(|line| line.ordinal == 3));
         assert_eq!(built.chunk.lines[0].message_id, "u1#0");
-        assert_eq!(built.end_message_id, "a2#0");
+        assert_eq!(built.end_message_id, "a3#0");
+    }
+
+    #[test]
+    fn zero_block_messages_are_absorbed_as_pending_noise() {
+        let messages = vec![
+            msg("empty1", 1, "user", vec![]),
+            msg("u2", 2, "user", vec![text("real user text")]),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        assert!(!projection.blocks.iter().any(|block| block.mid == "empty1"));
+        let built = build_historian_chunk(&messages, &projection.blocks, 1, 1_000, 3);
+        assert_eq!(built.text, "[1-2] U: real user text");
+        assert_eq!(
+            built
+                .chunk
+                .lines
+                .iter()
+                .map(|line| line.ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(built.chunk.lines[0].message_id, "empty1#0");
+    }
+
+    #[test]
+    fn duplicate_tool_call_ids_resolve_results_by_arc_id() {
+        let messages = vec![
+            msg(
+                "a1",
+                1,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: "dup".to_string(),
+                    name: "read".to_string(),
+                    input: json!({"path":"one.rs"}),
+                    provider_executed: false,
+                }],
+            ),
+            msg(
+                "t2",
+                2,
+                "tool",
+                vec![CkKind::ToolResult {
+                    id: "dup".to_string(),
+                    tool_name: "read".to_string(),
+                    output: mc_store::CkToolOutput::bare(mc_store::CkOutputKind::Text {
+                        text: "one".to_string(),
+                    }),
+                    provider_executed: false,
+                }],
+            ),
+            msg(
+                "a3",
+                3,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: "dup".to_string(),
+                    name: "read".to_string(),
+                    input: json!({"path":"two.rs"}),
+                    provider_executed: false,
+                }],
+            ),
+            msg(
+                "t4",
+                4,
+                "tool",
+                vec![CkKind::ToolResult {
+                    id: "dup".to_string(),
+                    tool_name: "read".to_string(),
+                    output: mc_store::CkToolOutput::bare(mc_store::CkOutputKind::Text {
+                        text: "two".to_string(),
+                    }),
+                    provider_executed: false,
+                }],
+            ),
+        ];
+        let built = project_and_build(&messages, 1, 1_000, 5);
+        assert_eq!(
+            built.text,
+            "[1-4] A: TC: read(one.rs) / TC: read(one.rs) / TC: read(two.rs) / TC: read(two.rs)"
+        );
     }
 
     #[test]
     fn tool_result_only_message_absorbs_into_preceding_assistant_block() {
-        let projection = project_messages(&[
+        let messages = vec![
             msg(
                 "a1",
                 1,
@@ -958,9 +1094,8 @@ mod tests {
                 }],
             ),
             msg("u3", 3, "user", vec![text("thanks")]),
-        ])
-        .unwrap();
-        let built = build_historian_chunk(&projection.blocks, 1, 1_000, 4);
+        ];
+        let built = project_and_build(&messages, 1, 1_000, 4);
         assert_eq!(
             built.text,
             "[1-2] A: I will inspect it / TC: read(src/lib.rs)\n[3] U: thanks"
@@ -971,7 +1106,7 @@ mod tests {
 
     #[test]
     fn budget_stop_and_tool_only_ranges_are_recorded() {
-        let projection = project_messages(&[
+        let messages = vec![
             msg(
                 "a1",
                 1,
@@ -995,27 +1130,74 @@ mod tests {
                 }],
             ),
             msg("u3", 3, "user", vec![text("narrative")]),
-        ])
-        .unwrap();
-        let built = build_historian_chunk(&projection.blocks, 1, 1_000, 4);
+        ];
+        let built = project_and_build(&messages, 1, 1_000, 4);
         assert_eq!(
             built.chunk.tool_only_ranges,
             vec![MessageRange { start: 1, end: 2 }]
         );
-        let stopped = build_historian_chunk(&projection.blocks, 1, 1, 4);
+        let stopped = project_and_build(&messages, 1, 1, 4);
         assert!(stopped.has_more);
     }
 
     #[test]
+    fn pending_noise_does_not_leak_when_budget_stops_before_next_block() {
+        let messages = vec![
+            msg("u1", 1, "user", vec![text("short")]),
+            msg(
+                "noise2",
+                2,
+                "user",
+                vec![text("<!-- OMO_INTERNAL_INITIATOR -->")],
+            ),
+            msg(
+                "a3",
+                3,
+                "assistant",
+                vec![text(
+                    "this assistant block is intentionally too long for the tiny chunk budget",
+                )],
+            ),
+        ];
+        let built = project_and_build(&messages, 1, 6, 4);
+        assert_eq!(built.chunk.end_index, 1);
+        assert_eq!(
+            built
+                .chunk
+                .lines
+                .iter()
+                .map(|line| line.ordinal)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(built.has_more);
+    }
+
+    #[test]
+    fn truncation_uses_marker_and_keeps_multibyte_boundaries() {
+        let input = "αβγ🙂 historian chunk ".repeat(80);
+        let budget = estimate_tokens(HISTORIAN_TRUNCATION_MARKER) + 12;
+        let truncated = truncate_historian_input_if_needed(&input, budget);
+        assert!(truncated.ends_with(HISTORIAN_TRUNCATION_MARKER));
+        assert!(estimate_tokens(&truncated) <= budget);
+        let prefix = truncated.strip_suffix(HISTORIAN_TRUNCATION_MARKER).unwrap();
+        assert!(input.starts_with(prefix));
+        let next = input
+            .chars()
+            .take(prefix.chars().count() + 1)
+            .collect::<String>();
+        assert!(estimate_tokens(&format!("{next}{HISTORIAN_TRUNCATION_MARKER}")) > budget);
+    }
+
+    #[test]
     fn commit_clusters_follow_assistant_blocks_after_user_turns() {
-        let projection = project_messages(&[
+        let messages = vec![
             msg("u1", 1, "user", vec![text("go")]),
             msg("a2", 2, "assistant", vec![text("committed abcdef1")]),
             msg("u3", 3, "user", vec![text("more")]),
             msg("a4", 4, "assistant", vec![text("commit abcdef2")]),
-        ])
-        .unwrap();
-        let built = build_historian_chunk(&projection.blocks, 1, 1_000, 5);
+        ];
+        let built = project_and_build(&messages, 1, 1_000, 5);
         assert_eq!(built.commit_cluster_count, 2);
         assert!(built.text.contains("commits: abcdef1"));
     }
@@ -1024,9 +1206,10 @@ mod tests {
     fn historian_chunk_golden_fixture_matches_builder() {
         let root: GoldenRoot =
             serde_json::from_str(include_str!("../testdata/historian-chunk-golden.json")).unwrap();
-        for case in root.cases {
+        for case in &root.cases {
             let projection = project_messages(&case.ck).unwrap();
             let built = build_historian_chunk(
+                &case.ck,
                 &projection.blocks,
                 case.offset,
                 case.budget,
@@ -1082,6 +1265,14 @@ mod tests {
             assert_eq!(
                 built.commit_cluster_count, case.expected.commit_cluster_count,
                 "{} commit clusters",
+                case.label
+            );
+        }
+        for case in &root.truncation_cases {
+            assert_eq!(
+                truncate_historian_input_if_needed(&case.input, case.budget),
+                case.expected,
+                "{} truncation",
                 case.label
             );
         }
