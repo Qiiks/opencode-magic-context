@@ -529,7 +529,22 @@ impl McHandler {
                 "busy"
             };
             if reason == "trigger_false" {
-                self.record_no_fire(&store, &parsed.session_id, &loaded, reason);
+                // Carry the measurement, not just the branch: a bare trigger_false is
+                // not actionable from a state dump (is the bar honestly uncrossed, or
+                // is eligible measuring zero against real content?). Sizes quantize to
+                // the nearest 1k so routine content growth keeps the change-gate
+                // effective instead of rewriting the row on every pass.
+                let detail = match trigger.progress.as_ref() {
+                    Some(p) => format!(
+                        "trigger_false{{eligible~{}k,bar~{}k,protected_n~{}k,ctx_limit={}}}",
+                        (p.eligible_chunk_tokens / 1000.0).round(),
+                        (p.tail_size_bar / 1000.0).round(),
+                        (p.n_tokens / 1000.0).round(),
+                        context_limit,
+                    ),
+                    None => "trigger_false".to_string(),
+                };
+                self.record_no_fire(&store, &parsed.session_id, &loaded, &detail);
             }
             return HistorianDiagnostics {
                 fired: false,
@@ -1663,6 +1678,30 @@ mod tests {
         wait_for_idle(&store).await;
         let loaded = store.load("ses").unwrap();
         assert_eq!(loaded.meta.historian.last_no_fire, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trigger_false_no_fire_detail_carries_quantized_numbers() {
+        // Small content: the trigger honestly declines, and the durable discriminant
+        // must carry the measurement (eligible vs bar vs protected N) so a rig can
+        // distinguish "bar uncrossed" from "eligible measuring zero" in one query.
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let messages = vec![ck("m1", 1, "small turn")];
+        let _ = call_transform(&handler, messages.clone()).await;
+        let _ = call_transform(&handler, messages).await;
+        let loaded = store.load("ses").unwrap();
+        let detail = loaded
+            .meta
+            .historian
+            .last_no_fire
+            .expect("trigger_false recorded");
+        assert!(
+            detail.starts_with("trigger_false{")
+                && detail.contains("bar~")
+                && detail.contains("ctx_limit="),
+            "detail carries the numbers: {detail}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
