@@ -18,9 +18,11 @@
 pub mod ck_wire;
 
 use crate::compartment_coverage::{fold_m0_content_epoch, M0ContentEpoch};
+use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{compose_m1_from_store, m1_revision_signal};
 use crate::memory_render::M1_PLACEHOLDER;
+use crate::selection::{SelItem, SelKind};
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{McStore, McStoreError, ModuleMeta, ModuleUsage};
 use serde::{Deserialize, Serialize};
@@ -243,6 +245,8 @@ pub enum TransformError {
     DuplicateBlockId(String),
     /// A live message's block-kind/fingerprint vector changed after first sight.
     IdentityDrift(String),
+    /// A frozen synthetic todo pair could not be replayed at its stored tail anchor.
+    SyntheticTodoAnchorMissing(String),
     /// A frozen reduction still names a live message, but that exact block disappeared.
     FrozenRedTargetVanish(String),
 }
@@ -266,6 +270,10 @@ impl std::fmt::Display for TransformError {
             TransformError::IdentityDrift(mid) => {
                 write!(f, "CK message block identity drift for mid {mid}")
             }
+            TransformError::SyntheticTodoAnchorMissing(mid) => write!(
+                f,
+                "synthetic todo anchor mid {mid} is missing from the live tail"
+            ),
             TransformError::FrozenRedTargetVanish(id) => {
                 write!(
                     f,
@@ -444,6 +452,15 @@ fn apply_once(
     let mut meta = loaded.meta.clone();
     apply_ingress_meta(&mut meta, req, &projection);
 
+    let is_bust_pass = matches!(
+        plan,
+        PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
+    );
+    let tail_for_capture = tail_sel_items(&live, loaded.meta.coverage_ordinal);
+    if is_bust_pass {
+        capture_todo_state_on_bust(&mut meta, &tail_for_capture, true);
+    }
+
     match plan {
         PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
         PassPlan::Hard | PassPlan::MigrateHard => {
@@ -574,18 +591,21 @@ fn apply_once(
         }
     }
 
+    advance_synthetic_todo(&mut meta, is_bust_pass, req);
+
     let result_action = action_str(&plan, &core);
 
-    // Conditional commit: write only when durable state changed (a pure defer with
-    // the boundary present mutates nothing → no write).
+    let ck_messages = build_output(&core, &meta, &projection, req)?;
+
+    // Build the output before committing so a missing synthetic-todo anchor cannot
+    // persist an unusable frozen pair. Only commit when core or meta changed;
+    // otherwise reuse the previous row version without writing.
     let changed = core != loaded.core || meta != loaded.meta;
     let row_version = if changed {
         store.commit(&req.session_id, loaded.row_version, &core, &meta)?
     } else {
         loaded.row_version.unwrap_or(0)
     };
-
-    let ck_messages = build_output(&core, &meta, &projection, req);
 
     Ok(TransformResponse {
         action: result_action,
@@ -886,6 +906,65 @@ fn synth_region(key: &str, payload: String) -> FrozenUnit {
     }
 }
 
+fn sel_item_from_flat(block: &FlatBlock) -> SelItem {
+    let kind = match &block.wire.kind {
+        ck_wire::CkKind::ToolCall { name, input, .. } => SelKind::ToolCall {
+            name: name.clone(),
+            input: input.clone(),
+        },
+        ck_wire::CkKind::ToolResult { tool_name, .. } => SelKind::ToolResult {
+            tool_name: tool_name.clone(),
+        },
+        ck_wire::CkKind::Reasoning { .. } => SelKind::Reasoning,
+        ck_wire::CkKind::Text { .. } => SelKind::Text,
+        ck_wire::CkKind::RedactedReasoning { .. } => SelKind::RedactedReasoning,
+        ck_wire::CkKind::Media(_) => SelKind::Media,
+        ck_wire::CkKind::Opaque(_) => SelKind::Opaque,
+    };
+    SelItem {
+        id: block.id.clone(),
+        ordinal: block.ordinal,
+        kind,
+        provider_executed: block.provider_executed,
+        byte_size: block.bytes.len(),
+        arc_id: block.arc_id.clone(),
+    }
+}
+
+fn tail_sel_items(live: &[&FlatBlock], coverage: Option<u64>) -> Vec<SelItem> {
+    live.iter()
+        .filter(|block| is_tail(block.ordinal(), coverage))
+        .map(|block| sel_item_from_flat(block))
+        .collect()
+}
+
+fn tail_end_mid(req: &TransformRequest, coverage: Option<u64>) -> Option<String> {
+    req.messages
+        .iter()
+        .rfind(|msg| !msg.ck.meta.synthetic && is_tail(msg.ordinal, coverage))
+        .map(|msg| msg.mid.clone())
+}
+
+fn advance_synthetic_todo(meta: &mut ModuleMeta, is_bust_pass: bool, req: &TransformRequest) {
+    let existing = meta.synthetic_todo.clone();
+    let outcome = advance_injection_from_meta(meta, existing.as_ref(), is_bust_pass);
+    match outcome {
+        InjectionOutcome::Replace(next) => {
+            let anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
+            meta.synthetic_todo = Some((*next).freeze_at(anchor_mid));
+        }
+        InjectionOutcome::Clear => meta.synthetic_todo = None,
+        InjectionOutcome::Keep | InjectionOutcome::None => {}
+    }
+}
+
+fn push_synthetic_todo_pair(out: &mut Vec<CkWireMessage>, meta: &ModuleMeta) {
+    if let Some(pair) = &meta.synthetic_todo {
+        out.push(pair.assistant_msg.clone());
+        out.push(pair.tool_msg.clone());
+    }
+}
+
 // --- output splice: [m0, m1] ++ tail(by coverage_ordinal) ---
 
 fn build_output(
@@ -893,8 +972,8 @@ fn build_output(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     req: &TransformRequest,
-) -> Vec<CkWireMessage> {
-    let mut out = Vec::with_capacity(2 + req.messages.len());
+) -> Result<Vec<CkWireMessage>, TransformError> {
+    let mut out = Vec::with_capacity(4 + req.messages.len());
     if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m0") {
         out.push(CkWireMessage::synthetic_user_text(u.frozen_payload.clone()));
     }
@@ -903,40 +982,58 @@ fn build_output(
     }
 
     let blocks_by_mid = projection_blocks_by_mid(projection);
-    // Tail messages are strictly after the coverage watermark. A message with no
-    // reduced block is returned unchanged; only messages containing a reduced block are
-    // rebuilt. Tool results must appear next to their assistant message without
-    // interleaving outside that span; a producer that interleaves beyond adjacency
-    // violates the message format rules.
+    let mut inserted_synthetic_todo = false;
+    // Tail messages are strictly after the coverage watermark. The outer loop is the
+    // inbound message list, not the reduced-block map, so a live tail message with zero
+    // content blocks still passes through instead of disappearing.
     for msg in req.messages.iter().filter(|m| !m.ck.meta.synthetic) {
         if !is_tail(msg.ordinal, meta.coverage_ordinal) {
             continue;
         }
-        let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) else {
-            continue;
-        };
-        let reduced: BTreeMap<usize, &str> = blocks
-            .iter()
-            .filter_map(|block| {
-                frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
-            })
-            .collect();
-        if reduced.is_empty() {
+        if let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) {
+            let reduced: BTreeMap<usize, &str> = blocks
+                .iter()
+                .filter_map(|block| {
+                    frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
+                })
+                .collect();
+            if reduced.is_empty() {
+                out.push(msg.ck.clone());
+            } else {
+                let mut rebuilt = msg.ck.clone();
+                rebuilt.mark_modified();
+                for block in blocks {
+                    if let Some(payload) = reduced.get(&block.block_index) {
+                        rebuilt.content[block.block_index] =
+                            reduced_block(&block.wire, payload, block.file_path.as_deref());
+                    }
+                }
+                out.push(rebuilt);
+            }
+        } else {
             out.push(msg.ck.clone());
-            continue;
         }
 
-        let mut rebuilt = msg.ck.clone();
-        rebuilt.mark_modified();
-        for block in blocks {
-            if let Some(payload) = reduced.get(&block.block_index) {
-                rebuilt.content[block.block_index] =
-                    reduced_block(&block.wire, payload, block.file_path.as_deref());
-            }
+        if meta
+            .synthetic_todo
+            .as_ref()
+            .and_then(|pair| pair.anchor_mid.as_deref())
+            == Some(msg.mid.as_str())
+        {
+            push_synthetic_todo_pair(&mut out, meta);
+            inserted_synthetic_todo = true;
         }
-        out.push(rebuilt);
     }
-    out
+
+    if let Some(pair) = &meta.synthetic_todo {
+        if pair.anchor_mid.is_none() {
+            push_synthetic_todo_pair(&mut out, meta);
+        } else if !inserted_synthetic_todo {
+            let mid = pair.anchor_mid.clone().unwrap_or_default();
+            return Err(TransformError::SyntheticTodoAnchorMissing(mid));
+        }
+    }
+    Ok(out)
 }
 
 fn projection_blocks_by_mid(projection: &FlatProjection) -> BTreeMap<&str, Vec<&FlatBlock>> {
@@ -1143,6 +1240,89 @@ mod tests {
                 },
             ),
         }
+    }
+
+    fn todowrite_call(mid: &str, ordinal: u64, todos: Value) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: format!("call_{mid}"),
+                    name: "todowrite".to_string(),
+                    input: json!({ "todos": todos }),
+                    provider_executed: false,
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn empty_message(mid: &str, ordinal: u64) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "user",
+                Vec::new(),
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn message_index(r: &TransformResponse, harness_id: &str) -> usize {
+        r.ck_messages
+            .iter()
+            .position(|m| !m.meta.synthetic && m.meta.harness_id.as_deref() == Some(harness_id))
+            .unwrap_or_else(|| panic!("message {harness_id} not found"))
+    }
+
+    fn synthetic_todo_index(r: &TransformResponse) -> usize {
+        r.ck_messages
+            .iter()
+            .position(|m| {
+                m.meta.synthetic
+                    && matches!(
+                        m.content.first().map(|block| &block.kind),
+                        Some(ck_wire::CkKind::ToolCall { name, .. }) if name == "todowrite"
+                    )
+            })
+            .expect("synthetic todowrite assistant message not found")
+    }
+
+    fn synthetic_todo_call_id(r: &TransformResponse) -> String {
+        let msg = &r.ck_messages[synthetic_todo_index(r)];
+        match &msg.content[0].kind {
+            ck_wire::CkKind::ToolCall { id, .. } => id.clone(),
+            other => panic!("expected synthetic todowrite ToolCall, got {other:?}"),
+        }
+    }
+
+    fn prefix_through_synthetic_todo(r: &TransformResponse) -> Vec<Vec<u8>> {
+        let end = synthetic_todo_index(r) + 1;
+        r.ck_messages[..=end]
+            .iter()
+            .map(|m| serde_json::to_vec(m).unwrap())
+            .collect()
+    }
+
+    fn synthetic_todo_pair_bytes(r: &TransformResponse) -> (Vec<u8>, Vec<u8>) {
+        let i = synthetic_todo_index(r);
+        (
+            serde_json::to_vec(&r.ck_messages[i]).unwrap(),
+            serde_json::to_vec(&r.ck_messages[i + 1]).unwrap(),
+        )
     }
 
     #[test]
@@ -2108,6 +2288,274 @@ mod tests {
     }
 
     #[test]
+    fn zero_block_tail_message_passes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("zero", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        run(
+            &s,
+            &req("zero", "cfg0", vec![item("a", 1, "raw")]),
+            &spine(),
+        );
+
+        let empty = empty_message("empty", 2);
+        let r = run(
+            &s,
+            &req("zero", "cfg0", vec![item("a", 1, "raw"), empty.clone()]),
+            &spine(),
+        );
+
+        assert_eq!(r.action, "SOFT+");
+        assert_eq!(tail_ids(&r), vec!["empty"]);
+        let emitted = r
+            .ck_messages
+            .iter()
+            .find(|m| !m.meta.synthetic && m.meta.harness_id.as_deref() == Some("empty"))
+            .expect("empty tail message emitted");
+        assert_eq!(
+            serde_json::to_value(emitted).unwrap(),
+            serde_json::to_value(&empty.ck).unwrap()
+        );
+    }
+
+    #[test]
+    fn synthetic_todo_compose_at_bust_freezes_position_across_defer_tail_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("freeze", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let todos = json!([{ "content": "Plan", "status": "pending", "priority": "high" }]);
+        let bust_items = vec![
+            item("a", 1, "raw"),
+            todowrite_call("todo", 2, todos.clone()),
+        ];
+        let bust = run(&s, &req("freeze", "cfg0", bust_items.clone()), &spine());
+
+        assert_eq!(bust.action, "HARD");
+        assert_eq!(
+            synthetic_todo_index(&bust),
+            message_index(&bust, "todo") + 1
+        );
+        let bust_prefix = prefix_through_synthetic_todo(&bust);
+
+        let defer_items = vec![
+            item("a", 1, "raw"),
+            todowrite_call("todo", 2, todos),
+            item("later1", 3, "new tail 1"),
+            item("later2", 4, "new tail 2"),
+        ];
+        let defer = run(&s, &req("freeze", "cfg0", defer_items), &spine());
+
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(
+            synthetic_todo_index(&defer),
+            message_index(&defer, "todo") + 1
+        );
+        assert!(message_index(&defer, "later1") > synthetic_todo_index(&defer) + 1);
+        assert!(message_index(&defer, "later2") > synthetic_todo_index(&defer) + 1);
+        assert_eq!(prefix_through_synthetic_todo(&defer), bust_prefix);
+    }
+
+    #[test]
+    fn synthetic_todo_keep_on_bust_does_not_relocate() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("keep", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let todos = json!([{ "content": "Keep", "status": "pending", "priority": "high" }]);
+        let first_items = vec![
+            item("a", 1, "raw"),
+            todowrite_call("todo", 2, todos.clone()),
+        ];
+        let first = run(&s, &req("keep", "cfg0", first_items), &spine());
+        let first_pair = synthetic_todo_pair_bytes(&first);
+        let first_prefix = prefix_through_synthetic_todo(&first);
+
+        let second_items = vec![
+            item("a", 1, "raw"),
+            todowrite_call("todo", 2, todos),
+            item("later", 3, "tail grew"),
+        ];
+        let second = run(&s, &req("keep", "cfg1", second_items), &spine());
+
+        assert_eq!(second.action, "HARD");
+        assert_eq!(
+            synthetic_todo_index(&second),
+            message_index(&second, "todo") + 1
+        );
+        assert!(message_index(&second, "later") > synthetic_todo_index(&second) + 1);
+        assert_eq!(synthetic_todo_pair_bytes(&second), first_pair);
+        assert_eq!(prefix_through_synthetic_todo(&second), first_prefix);
+    }
+
+    #[test]
+    fn synthetic_todo_replace_relocates_to_new_tail_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("replace", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let first_todos = json!([{ "content": "Old", "status": "pending", "priority": "high" }]);
+        let first = run(
+            &s,
+            &req(
+                "replace",
+                "cfg0",
+                vec![item("a", 1, "raw"), todowrite_call("todo", 2, first_todos)],
+            ),
+            &spine(),
+        );
+        let first_call_id = synthetic_todo_call_id(&first);
+
+        let changed_todos = json!([{ "content": "New", "status": "pending", "priority": "high" }]);
+        let second = run(
+            &s,
+            &req(
+                "replace",
+                "cfg1",
+                vec![
+                    item("a", 1, "raw"),
+                    item("later", 3, "tail before changed todo"),
+                    todowrite_call("todo2", 4, changed_todos),
+                ],
+            ),
+            &spine(),
+        );
+
+        assert_eq!(second.action, "HARD");
+        assert_ne!(synthetic_todo_call_id(&second), first_call_id);
+        assert_eq!(
+            synthetic_todo_index(&second),
+            message_index(&second, "todo2") + 1
+        );
+    }
+
+    #[test]
+    fn synthetic_todo_clear_removes_pair_for_terminal_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("clear", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let active = json!([{ "content": "Active", "status": "pending", "priority": "high" }]);
+        run(
+            &s,
+            &req(
+                "clear",
+                "cfg0",
+                vec![item("a", 1, "raw"), todowrite_call("todo", 2, active)],
+            ),
+            &spine(),
+        );
+
+        let terminal = json!([
+            { "content": "Done", "status": "completed", "priority": "high" },
+            { "content": "Cancelled", "status": "cancelled", "priority": "low" }
+        ]);
+        let cleared = run(
+            &s,
+            &req(
+                "clear",
+                "cfg1",
+                vec![item("a", 1, "raw"), todowrite_call("done", 3, terminal)],
+            ),
+            &spine(),
+        );
+
+        assert_eq!(cleared.action, "HARD");
+        assert!(cleared.ck_messages.iter().all(|m| {
+            !matches!(
+                m.content.first().map(|block| &block.kind),
+                Some(ck_wire::CkKind::ToolCall { name, .. }) if name == "todowrite"
+            ) || !m.meta.synthetic
+        }));
+        assert!(s.load("clear").unwrap().meta.synthetic_todo.is_none());
+    }
+
+    #[test]
+    fn synthetic_todo_aged_out_capture_composes_from_meta_on_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("aged", &[comp(1, 1, 2, "todo", "SUMMARY")])
+            .unwrap();
+        let todos = json!([{ "content": "Persisted", "status": "pending", "priority": "high" }]);
+        run(
+            &s,
+            &req(
+                "aged",
+                "cfg0",
+                vec![item("a", 1, "raw"), todowrite_call("todo", 2, todos)],
+            ),
+            &spine(),
+        );
+        let loaded = s.load("aged").unwrap();
+        let mut meta = loaded.meta;
+        meta.synthetic_todo = None;
+        meta.last_render_config = "force a hard".to_string();
+        s.commit("aged", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
+        let aged = run(
+            &s,
+            &req(
+                "aged",
+                "cfg1",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call(
+                        "todo",
+                        2,
+                        json!([{ "content": "Persisted", "status": "pending", "priority": "high" }]),
+                    ),
+                ],
+            ),
+            &spine(),
+        );
+
+        assert_eq!(aged.action, "HARD");
+        assert_eq!(tail_ids(&aged), Vec::<&str>::new());
+        assert_eq!(
+            synthetic_todo_index(&aged),
+            2,
+            "None anchor appends after m0/m1 when no real tail remains"
+        );
+        assert!(s.load("aged").unwrap().meta.synthetic_todo.is_some());
+    }
+
+    #[test]
+    fn synthetic_todo_defer_anchor_vanished_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("vanished", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let todos = json!([{ "content": "Anchor", "status": "pending", "priority": "high" }]);
+        run(
+            &s,
+            &req(
+                "vanished",
+                "cfg0",
+                vec![item("a", 1, "raw"), todowrite_call("todo", 2, todos)],
+            ),
+            &spine(),
+        );
+        let before = s.load("vanished").unwrap().row_version;
+
+        let err = transform(
+            &s,
+            &req(
+                "vanished",
+                "cfg0",
+                vec![item("a", 1, "raw"), item("later", 3, "tail without anchor")],
+            ),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+            &spine(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, TransformError::SyntheticTodoAnchorMissing(mid) if mid == "todo"));
+        assert_eq!(s.load("vanished").unwrap().row_version, before);
+    }
+
+    #[test]
     fn restart_replays_byte_identical() {
         let dir = tempfile::tempdir().unwrap();
         let bytes_m0;
@@ -2150,6 +2598,7 @@ mod tests {
         assert_eq!(meta.m1_revision, 0);
         assert_eq!(meta.folded_compartment_seq, 0);
         assert_eq!(meta.expiry_cutoff_ms, 0);
+        assert!(meta.synthetic_todo.is_none());
         assert!(meta.initialized);
     }
 

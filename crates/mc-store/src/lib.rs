@@ -17,8 +17,333 @@ use cortexkit_cache_core::CoreState;
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
 use rusqlite::{params, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+
+pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synthetic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageOrigin {
+    pub provider: String,
+    pub model: String,
+    pub api: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CkWireMessage {
+    pub role: String,
+    pub content: Vec<CkWireBlock>,
+    pub origin: Option<MessageOrigin>,
+    pub provider_extras: ProviderExtras,
+    pub meta: HarnessMeta,
+    /// Original parsed JSON for pass-through messages. Pass-through MUST stay
+    /// Value-level: serializing this retained value, never a typed-struct round-trip,
+    /// preserves harmless unknown fields and keeps replay lossless as the CK wire evolves.
+    original: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CkWireMessageData {
+    pub role: String,
+    pub content: Vec<CkWireBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<MessageOrigin>,
+    #[serde(default, skip_serializing_if = "ProviderExtras::is_empty")]
+    pub provider_extras: ProviderExtras,
+    #[serde(default)]
+    pub meta: HarnessMeta,
+}
+
+impl<'de> Deserialize<'de> for CkWireMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let original = Value::deserialize(deserializer)?;
+        let data =
+            CkWireMessageData::deserialize(original.clone()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            role: data.role,
+            content: data.content,
+            origin: data.origin,
+            provider_extras: data.provider_extras,
+            meta: data.meta,
+            original: Some(original),
+        })
+    }
+}
+
+impl Serialize for CkWireMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(original) = &self.original {
+            return original.serialize(serializer);
+        }
+        CkWireMessageData {
+            role: self.role.clone(),
+            content: self.content.clone(),
+            origin: self.origin.clone(),
+            provider_extras: self.provider_extras.clone(),
+            meta: self.meta.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl CkWireMessage {
+    pub fn from_parts(
+        role: impl Into<String>,
+        content: Vec<CkWireBlock>,
+        origin: Option<MessageOrigin>,
+        provider_extras: ProviderExtras,
+        meta: HarnessMeta,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            content,
+            origin,
+            provider_extras,
+            meta,
+            original: None,
+        }
+    }
+
+    pub fn synthetic_user_text(text: impl Into<String>) -> Self {
+        Self::from_parts(
+            "user",
+            vec![CkWireBlock::bare(CkKind::Text { text: text.into() })],
+            None,
+            ProviderExtras::new(),
+            HarnessMeta {
+                synthetic: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn mark_modified(&mut self) {
+        self.original = None;
+    }
+
+    fn mark_fully_typed(&mut self) {
+        self.original = None;
+        for block in &mut self.content {
+            block.mark_modified();
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CkWireBlock {
+    pub kind: CkKind,
+    pub provider_extras: ProviderExtras,
+    /// Original parsed JSON for pass-through blocks. Keep this Value-level for the same
+    /// lossless-pass-through reason as CkWireMessage::original.
+    original: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CkWireBlockData {
+    pub kind: CkKind,
+    #[serde(default, skip_serializing_if = "ProviderExtras::is_empty")]
+    pub provider_extras: ProviderExtras,
+}
+
+impl<'de> Deserialize<'de> for CkWireBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let original = Value::deserialize(deserializer)?;
+        let data =
+            CkWireBlockData::deserialize(original.clone()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            kind: data.kind,
+            provider_extras: data.provider_extras,
+            original: Some(original),
+        })
+    }
+}
+
+impl Serialize for CkWireBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(original) = &self.original {
+            return original.serialize(serializer);
+        }
+        CkWireBlockData {
+            kind: self.kind.clone(),
+            provider_extras: self.provider_extras.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl CkWireBlock {
+    pub fn bare(kind: CkKind) -> Self {
+        Self {
+            kind,
+            provider_extras: ProviderExtras::new(),
+            original: None,
+        }
+    }
+
+    pub fn with_provider_extras(kind: CkKind, provider_extras: ProviderExtras) -> Self {
+        Self {
+            kind,
+            provider_extras,
+            original: None,
+        }
+    }
+
+    fn mark_modified(&mut self) {
+        self.original = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CkKind {
+    Text {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    RedactedReasoning {
+        data: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        input: Value,
+        #[serde(default)]
+        provider_executed: bool,
+    },
+    ToolResult {
+        id: String,
+        tool_name: String,
+        output: CkToolOutput,
+        #[serde(default)]
+        provider_executed: bool,
+    },
+    Media(MediaBlock),
+    Opaque(OpaqueBlock),
+}
+
+impl CkKind {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            CkKind::Text { .. } => "text",
+            CkKind::Reasoning { .. } => "reasoning",
+            CkKind::RedactedReasoning { .. } => "redacted_reasoning",
+            CkKind::ToolCall { .. } => "tool_call",
+            CkKind::ToolResult { .. } => "tool_result",
+            CkKind::Media(_) => "media",
+            CkKind::Opaque(_) => "opaque",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CkToolOutput {
+    pub kind: CkOutputKind,
+    #[serde(default, skip_serializing_if = "ProviderExtras::is_empty")]
+    pub provider_extras: ProviderExtras,
+}
+
+impl CkToolOutput {
+    pub fn bare(kind: CkOutputKind) -> Self {
+        Self {
+            kind,
+            provider_extras: ProviderExtras::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CkOutputKind {
+    Text { text: String },
+    Json { value: Value },
+    ErrorText { text: String },
+    ErrorJson { value: Value },
+    ExecutionDenied { reason: Option<String> },
+    Content { blocks: Vec<ResultBlock> },
+}
+
+impl CkOutputKind {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            CkOutputKind::Text { .. } => "text",
+            CkOutputKind::Json { .. } => "json",
+            CkOutputKind::ErrorText { .. } => "error_text",
+            CkOutputKind::ErrorJson { .. } => "error_json",
+            CkOutputKind::ExecutionDenied { .. } => "execution_denied",
+            CkOutputKind::Content { .. } => "content",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultBlock {
+    pub kind: ResultBlockKind,
+    #[serde(default, skip_serializing_if = "ProviderExtras::is_empty")]
+    pub provider_extras: ProviderExtras,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResultBlockKind {
+    Text { text: String },
+    Media { media: MediaBlock },
+    Opaque { opaque: OpaqueBlock },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpaqueBlock {
+    pub source: Value,
+    pub kind: String,
+    pub raw: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arc: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaBlock {
+    pub kind: MediaKind,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    pub source: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    Image,
+    Audio,
+    Video,
+    File,
+    Document,
+}
 
 /// Migration namespace for the cache-state domain (one DB can host several
 /// independent namespaces; this is ours).
@@ -419,6 +744,56 @@ pub struct BlockIdentity {
     pub byte_fingerprint: String,
 }
 
+/// Frozen CK-native synthetic todowrite pair persisted in module metadata.
+///
+/// The pair is replayed exactly at its stored anchor until the todo content changes.
+/// Rebuilding or moving it would alter the exact prompt bytes seen by the provider,
+/// so both CK messages are stored byte-complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FrozenSyntheticTodoPair {
+    /// Shared synthetic tool-call id used by both the assistant ToolCall and tool result.
+    pub call_id: String,
+    /// Real tail message id the pair is inserted after. None means no real tail existed
+    /// when the pair was frozen, so it is appended at the output end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_mid: Option<String>,
+    /// Frozen assistant-role CK message carrying the synthetic todowrite ToolCall.
+    pub assistant_msg: CkWireMessage,
+    /// Frozen tool-role CK message carrying the matching synthetic todowrite ToolResult.
+    pub tool_msg: CkWireMessage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FrozenSyntheticTodoPairData {
+    call_id: String,
+    #[serde(default)]
+    anchor_mid: Option<String>,
+    assistant_msg: CkWireMessage,
+    tool_msg: CkWireMessage,
+}
+
+impl<'de> Deserialize<'de> for FrozenSyntheticTodoPair {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let data = FrozenSyntheticTodoPairData::deserialize(deserializer)?;
+        let mut assistant_msg = data.assistant_msg;
+        let mut tool_msg = data.tool_msg;
+        // Frozen synthetic todo messages are generated by this crate, not inbound
+        // pass-through messages. Clear the retained Value after loading metadata so
+        // replay uses the same canonical typed serialization as the original freeze.
+        assistant_msg.mark_fully_typed();
+        tool_msg.mark_fully_typed();
+        Ok(Self {
+            call_id: data.call_id,
+            anchor_mid: data.anchor_mid,
+            assistant_msg,
+            tool_msg,
+        })
+    }
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -435,6 +810,11 @@ pub struct ModuleMeta {
     /// project-shared memory or preference.
     #[serde(default)]
     pub last_todo_state: Option<String>,
+    /// Frozen CK-native synthetic todo pair plus the real tail message id it follows.
+    /// Replays keep this exact position; only changed todo content moves it to a new
+    /// tail end.
+    #[serde(default)]
+    pub synthetic_todo: Option<FrozenSyntheticTodoPair>,
     /// The content-digest revision the frozen m1 block was last rendered from. The
     /// classifier compares the incoming m1 content's revision against this to decide
     /// whether an m1 delta rides (Soft) WITHOUT rendering. 0 = placeholder (no delta).

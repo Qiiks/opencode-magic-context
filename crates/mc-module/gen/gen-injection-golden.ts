@@ -4,7 +4,7 @@
  *
  * The generator imports the real TypeScript todo-view helpers from packages/plugin
  * with Bun.resolveSync, feeds them a grid of todo-state shapes, and writes the
- * exact normalized state, call id, and synthetic part bytes that Rust must match.
+ * exact normalized state, call id, and result-state content that Rust must match.
  *
  * Run: bun crates/mc-module/gen/gen-injection-golden.ts
  */
@@ -35,9 +35,7 @@ interface GoldenCase {
     input_json: string;
     normalized: string | null;
     call_id: string | null;
-    invocation_json: string | null;
-    result_json: string | null;
-    part_json: string | null;
+    result_state_json: string | null;
 }
 
 function extractStringConst(name: string): string {
@@ -58,39 +56,9 @@ function extractStringSetConst(name: string): string[] {
     return value;
 }
 
-function todoPartFixtures(part: Record<string, unknown> | null): {
-    invocation_json: string | null;
-    result_json: string | null;
-    part_json: string | null;
-} {
-    if (part === null) {
-        return { invocation_json: null, result_json: null, part_json: null };
-    }
-    const p = part as {
-        callID: string;
-        tool: "todowrite";
-        state: {
-            input: { todos: unknown[] };
-        };
-        syntheticTodoMarker: true;
-    };
-    const invocation = {
-        callID: p.callID,
-        tool: p.tool,
-        input: p.state.input,
-        syntheticTodoMarker: p.syntheticTodoMarker,
-    };
-    const result = {
-        callID: p.callID,
-        tool: p.tool,
-        state: (part as { state: unknown }).state,
-        syntheticTodoMarker: p.syntheticTodoMarker,
-    };
-    return {
-        invocation_json: JSON.stringify(invocation),
-        result_json: JSON.stringify(result),
-        part_json: JSON.stringify(part),
-    };
+function resultStateJson(part: Record<string, unknown> | null): string | null {
+    if (part === null) return null;
+    return JSON.stringify((part as { state: unknown }).state);
 }
 
 const statusValues = ["pending", "in_progress", "completed", "cancelled"];
@@ -175,7 +143,6 @@ if (constantProbeState === null) throw new Error("constant probe failed to norma
 const constantProbePart = buildSyntheticTodoPart(constantProbeState) as {
     tool: string;
     state: { status: string; time: { start: number; end: number } };
-    syntheticTodoMarker: boolean;
 } | null;
 if (constantProbePart === null) throw new Error("constant probe failed to build a part");
 
@@ -187,7 +154,6 @@ const constants = {
     tool_name: constantProbePart.tool,
     completed_status: constantProbePart.state.status,
     synthetic_timestamp: constantProbePart.state.time.start,
-    synthetic_marker: constantProbePart.syntheticTodoMarker,
 };
 if (constantProbePart.state.time.start !== constantProbePart.state.time.end) {
     throw new Error("synthetic timestamp start/end diverged");
@@ -197,13 +163,12 @@ const cases: GoldenCase[] = inputs.map((spec) => {
     const normalized = normalizeTodoStateJson(spec.input);
     const callId = normalized === null ? null : computeSyntheticCallId(normalized);
     const part = normalized === null ? null : buildSyntheticTodoPart(normalized);
-    const fixtures = todoPartFixtures(part);
     return {
         label: spec.label,
         input_json: JSON.stringify(spec.input),
         normalized,
         call_id: callId,
-        ...fixtures,
+        result_state_json: resultStateJson(part),
     };
 });
 

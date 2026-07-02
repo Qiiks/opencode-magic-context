@@ -9,8 +9,13 @@
 //! as the cache-state transition.
 
 use crate::selection::{SelItem, SelKind};
-use mc_store::ModuleMeta;
+use mc_store::{
+    CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage, FrozenSyntheticTodoPair,
+    HarnessMeta, ModuleMeta, ProviderExtras,
+};
 use serde::Serialize;
+#[cfg(test)]
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const SYNTHETIC_CALL_ID_PREFIX: &str = "mc_synthetic_todo_";
@@ -20,7 +25,6 @@ const COMPLETED_STATUS: &str = "completed";
 const TERMINAL_STATUSES: &[&str] = &["completed", "cancelled"];
 const TITLE_DONE_STATUSES: &[&str] = &["completed"];
 const SYNTHETIC_TIMESTAMP: i64 = 0;
-const SYNTHETIC_MARKER: bool = true;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct TodoItem {
@@ -56,95 +60,38 @@ struct SyntheticState {
     time: SyntheticTime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct SyntheticPartWire {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    #[serde(rename = "callID")]
-    call_id: String,
-    tool: &'static str,
-    state: SyntheticState,
-    #[serde(rename = "syntheticTodoMarker")]
-    synthetic_todo_marker: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct SyntheticInvocationWire {
-    #[serde(rename = "callID")]
-    call_id: String,
-    tool: &'static str,
-    input: TodoInput,
-    #[serde(rename = "syntheticTodoMarker")]
-    synthetic_todo_marker: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct SyntheticResultWire {
-    #[serde(rename = "callID")]
-    call_id: String,
-    tool: &'static str,
-    state: SyntheticState,
-    #[serde(rename = "syntheticTodoMarker")]
-    synthetic_todo_marker: bool,
-}
-
-/// The byte-complete synthetic todowrite unit produced from one normalized todo state.
+/// The CK-native synthetic todowrite pair produced from one normalized todo state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticTodo {
     /// Shared synthetic tool-call id used by both halves of the injected pair.
     pub call_id: String,
     /// Canonical todo-state JSON that was hashed to produce [`Self::call_id`].
     pub state_json: String,
-    /// Canonical invocation bytes: the `todowrite` tool name plus `{ todos }` input.
-    pub invocation_json: String,
-    /// Canonical result bytes: the completed todowrite result state and metadata.
-    pub result_json: String,
-    /// Canonical OpenCode combined tool-part bytes: a single part that merges the tool call and its result.
-    pub part_json: String,
+    /// Frozen assistant-role CK ToolCall message.
+    pub assistant_msg: CkWireMessage,
+    /// Frozen tool-role CK ToolResult message.
+    pub tool_msg: CkWireMessage,
 }
 
-/// A previously built synthetic todo unit that callers replay verbatim while it remains current.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrozenInjection {
-    /// Shared synthetic tool-call id; this is the hash key for change detection.
-    pub call_id: String,
-    /// Frozen invocation bytes. Defer-mode callers replay these bytes without rebuilding them.
-    pub invocation_json: String,
-    /// Frozen result bytes. Defer-mode callers replay these bytes without rebuilding them.
-    pub result_json: String,
-    /// Frozen OpenCode combined tool-part bytes for renderers that emit a merged call-and-result part.
-    pub part_json: String,
-}
-
-impl From<SyntheticTodo> for FrozenInjection {
-    fn from(value: SyntheticTodo) -> Self {
-        Self {
-            call_id: value.call_id,
-            invocation_json: value.invocation_json,
-            result_json: value.result_json,
-            part_json: value.part_json,
+impl SyntheticTodo {
+    /// Attach the tail message id present when this todo was composed to produce
+    /// the persisted frozen pair.
+    pub fn freeze_at(self, anchor_mid: Option<String>) -> FrozenSyntheticTodoPair {
+        FrozenSyntheticTodoPair {
+            call_id: self.call_id,
+            anchor_mid,
+            assistant_msg: self.assistant_msg,
+            tool_msg: self.tool_msg,
         }
     }
 }
 
-impl From<&SyntheticTodo> for FrozenInjection {
-    fn from(value: &SyntheticTodo) -> Self {
-        Self {
-            call_id: value.call_id.clone(),
-            invocation_json: value.invocation_json.clone(),
-            result_json: value.result_json.clone(),
-            part_json: value.part_json.clone(),
-        }
-    }
-}
-
-/// The pure state transition for synthetic-todo frozen state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InjectionOutcome {
     /// Keep replaying the currently frozen unit byte-for-byte.
     Keep,
     /// Freeze this newly built unit and replay its bytes from now on.
-    Replace(SyntheticTodo),
+    Replace(Box<SyntheticTodo>),
     /// Remove the currently frozen unit because the current todo state no longer produces synthetic bytes.
     Clear,
     /// No valid state exists, or no frozen unit exists for a no-op transition.
@@ -195,35 +142,50 @@ pub fn build_synthetic_todo_pair(state_json: &str) -> Option<SyntheticTodo> {
     let output = serde_json::to_string_pretty(&todos).ok()?;
     let title = format!("{active_count} todos");
     let state = synthetic_state(todos.clone(), output, title);
+    let input = serde_json::to_value(TodoInput {
+        todos: todos.clone(),
+    })
+    .ok()?;
+    let result_value = serde_json::to_value(state).ok()?;
 
-    let invocation = SyntheticInvocationWire {
-        call_id: call_id.clone(),
-        tool: TODO_TOOL_NAME,
-        input: TodoInput {
-            todos: todos.clone(),
+    let assistant_msg = CkWireMessage::from_parts(
+        "assistant",
+        vec![CkWireBlock::bare(CkKind::ToolCall {
+            id: call_id.clone(),
+            name: TODO_TOOL_NAME.to_string(),
+            input,
+            provider_executed: false,
+        })],
+        None,
+        ProviderExtras::new(),
+        HarnessMeta {
+            synthetic: true,
+            ..Default::default()
         },
-        synthetic_todo_marker: SYNTHETIC_MARKER,
-    };
-    let result = SyntheticResultWire {
-        call_id: call_id.clone(),
-        tool: TODO_TOOL_NAME,
-        state: state.clone(),
-        synthetic_todo_marker: SYNTHETIC_MARKER,
-    };
-    let part = SyntheticPartWire {
-        kind: "tool",
-        call_id: call_id.clone(),
-        tool: TODO_TOOL_NAME,
-        state,
-        synthetic_todo_marker: SYNTHETIC_MARKER,
-    };
+    );
+    let tool_msg = CkWireMessage::from_parts(
+        "tool",
+        vec![CkWireBlock::bare(CkKind::ToolResult {
+            id: call_id.clone(),
+            tool_name: TODO_TOOL_NAME.to_string(),
+            output: CkToolOutput::bare(CkOutputKind::Json {
+                value: result_value,
+            }),
+            provider_executed: false,
+        })],
+        None,
+        ProviderExtras::new(),
+        HarnessMeta {
+            synthetic: true,
+            ..Default::default()
+        },
+    );
 
     Some(SyntheticTodo {
         call_id,
         state_json: state_json.to_string(),
-        invocation_json: serde_json::to_string(&invocation).ok()?,
-        result_json: serde_json::to_string(&result).ok()?,
-        part_json: serde_json::to_string(&part).ok()?,
+        assistant_msg,
+        tool_msg,
     })
 }
 
@@ -260,7 +222,7 @@ pub fn capture_todo_state_on_bust(
 /// replay the frozen unit verbatim.
 pub fn advance_injection_from_meta(
     meta: &ModuleMeta,
-    frozen: Option<&FrozenInjection>,
+    frozen: Option<&FrozenSyntheticTodoPair>,
     is_bust_pass: bool,
 ) -> InjectionOutcome {
     advance_injection(meta.last_todo_state.as_deref(), frozen, is_bust_pass)
@@ -273,7 +235,7 @@ pub fn advance_injection_from_meta(
 pub fn advance_injection_after_capture(
     meta: &mut ModuleMeta,
     tail: &[SelItem],
-    frozen: Option<&FrozenInjection>,
+    frozen: Option<&FrozenSyntheticTodoPair>,
     is_bust_pass: bool,
 ) -> InjectionOutcome {
     capture_todo_state_on_bust(meta, tail, is_bust_pass);
@@ -287,7 +249,7 @@ pub fn advance_injection_after_capture(
 /// return [`InjectionOutcome::Keep`], otherwise there is no unit to replay.
 pub fn advance_injection(
     persisted_state_json: Option<&str>,
-    frozen: Option<&FrozenInjection>,
+    frozen: Option<&FrozenSyntheticTodoPair>,
     is_bust_pass: bool,
 ) -> InjectionOutcome {
     if !is_bust_pass {
@@ -318,7 +280,7 @@ pub fn advance_injection(
     {
         InjectionOutcome::Keep
     } else {
-        InjectionOutcome::Replace(next)
+        InjectionOutcome::Replace(Box::new(next))
     }
 }
 
@@ -339,6 +301,21 @@ fn synthetic_state(todos: Vec<TodoItem>, output: String, title: String) -> Synth
             end: SYNTHETIC_TIMESTAMP,
         },
     }
+}
+
+#[cfg(test)]
+fn synthetic_result_state_value(state_json: &str) -> Option<Value> {
+    let todos = parse_todo_state(state_json)?;
+    if todos.is_empty() || todos.iter().all(|todo| is_terminal_status(&todo.status)) {
+        return None;
+    }
+    let active_count = todos
+        .iter()
+        .filter(|todo| !is_title_done_status(&todo.status))
+        .count();
+    let output = serde_json::to_string_pretty(&todos).ok()?;
+    let title = format!("{active_count} todos");
+    serde_json::to_value(synthetic_state(todos, output, title)).ok()
 }
 
 fn parse_todo_state(state_json: &str) -> Option<Vec<TodoItem>> {
@@ -431,7 +408,6 @@ mod tests {
         tool_name: String,
         completed_status: String,
         synthetic_timestamp: i64,
-        synthetic_marker: bool,
     }
 
     #[derive(Debug, Deserialize)]
@@ -440,9 +416,7 @@ mod tests {
         input_json: String,
         normalized: Option<String>,
         call_id: Option<String>,
-        invocation_json: Option<String>,
-        result_json: Option<String>,
-        part_json: Option<String>,
+        result_state_json: Option<String>,
     }
 
     fn load_golden() -> GoldenFile {
@@ -467,10 +441,10 @@ mod tests {
         .expect("terminal state normalizes")
     }
 
-    fn frozen_for(state_json: &str) -> FrozenInjection {
-        FrozenInjection::from(
-            build_synthetic_todo_pair(state_json).expect("state builds synthetic todo"),
-        )
+    fn frozen_for(state_json: &str) -> FrozenSyntheticTodoPair {
+        build_synthetic_todo_pair(state_json)
+            .expect("state builds synthetic todo")
+            .freeze_at(Some("anchor".to_string()))
     }
 
     fn todowrite_tail_item(id: &str, ordinal: u64, state_json: &str) -> SelItem {
@@ -498,7 +472,6 @@ mod tests {
         assert_eq!(constants.tool_name, TODO_TOOL_NAME);
         assert_eq!(constants.completed_status, COMPLETED_STATUS);
         assert_eq!(constants.synthetic_timestamp, SYNTHETIC_TIMESTAMP);
-        assert_eq!(constants.synthetic_marker, SYNTHETIC_MARKER);
     }
 
     #[test]
@@ -517,34 +490,25 @@ mod tests {
                     "call id: {}",
                     case.label
                 );
-                let part = build_synthetic_todo_pair(&state_json);
+                let result_state = synthetic_result_state_value(&state_json);
+                let expected_state = case
+                    .result_state_json
+                    .as_deref()
+                    .map(|raw| serde_json::from_str::<Value>(raw).expect("golden result state"));
+                assert_eq!(result_state, expected_state, "result state: {}", case.label);
                 assert_eq!(
-                    part.as_ref().map(|p| p.invocation_json.as_str()),
-                    case.invocation_json.as_deref(),
-                    "invocation bytes: {}",
-                    case.label
-                );
-                assert_eq!(
-                    part.as_ref().map(|p| p.result_json.as_str()),
-                    case.result_json.as_deref(),
-                    "result bytes: {}",
-                    case.label
-                );
-                assert_eq!(
-                    part.as_ref().map(|p| p.part_json.as_str()),
-                    case.part_json.as_deref(),
-                    "part bytes: {}",
+                    build_synthetic_todo_pair(&state_json).is_some(),
+                    case.result_state_json.is_some(),
+                    "CK pair build/no-build: {}",
                     case.label
                 );
             } else {
                 assert_eq!(case.call_id, None, "invalid state call id: {}", case.label);
                 assert_eq!(
-                    case.invocation_json, None,
-                    "invalid invocation: {}",
+                    case.result_state_json, None,
+                    "invalid result state: {}",
                     case.label
                 );
-                assert_eq!(case.result_json, None, "invalid result: {}", case.label);
-                assert_eq!(case.part_json, None, "invalid part: {}", case.label);
             }
         }
     }
@@ -657,7 +621,7 @@ mod tests {
         let InjectionOutcome::Replace(todo) = first else {
             panic!("first bust should freeze a synthetic todo");
         };
-        let frozen = FrozenInjection::from(&todo);
+        let frozen = (*todo).clone().freeze_at(Some("m-first".to_string()));
         let frozen_before = frozen.clone();
         let defer_visible = active_state("visible only on defer");
 
@@ -748,7 +712,7 @@ mod tests {
             panic!("expected replacement");
         };
         let rebuilt = build_synthetic_todo_pair(&new_state).expect("new state builds");
-        assert_eq!(todo, rebuilt);
+        assert_eq!(*todo, rebuilt);
     }
 
     #[test]
@@ -764,6 +728,46 @@ mod tests {
 
         assert_eq!(a, b);
         assert_eq!(synthetic_call_id(&a), synthetic_call_id(&b));
+    }
+
+    #[test]
+    fn ck_pair_byte_determinism_golden() {
+        let state = active_state("byte deterministic");
+        let same = active_state("byte deterministic");
+        let changed = active_state("byte changed");
+
+        let first = build_synthetic_todo_pair(&state).expect("state builds");
+        let second = build_synthetic_todo_pair(&same).expect("same state builds");
+        let third = build_synthetic_todo_pair(&changed).expect("changed state builds");
+
+        let first_bytes = (
+            serde_json::to_vec(&first.assistant_msg).unwrap(),
+            serde_json::to_vec(&first.tool_msg).unwrap(),
+        );
+        let second_bytes = (
+            serde_json::to_vec(&second.assistant_msg).unwrap(),
+            serde_json::to_vec(&second.tool_msg).unwrap(),
+        );
+        let third_bytes = (
+            serde_json::to_vec(&third.assistant_msg).unwrap(),
+            serde_json::to_vec(&third.tool_msg).unwrap(),
+        );
+
+        assert_eq!(first.call_id, second.call_id);
+        assert_eq!(first_bytes, second_bytes);
+        assert_ne!(first.call_id, third.call_id);
+        assert_ne!(first_bytes, third_bytes);
+        assert!(first.assistant_msg.meta.synthetic);
+        assert!(first.tool_msg.meta.synthetic);
+        assert!(matches!(
+            first.assistant_msg.content.first().map(|block| &block.kind),
+            Some(CkKind::ToolCall { name, provider_executed: false, .. }) if name == TODO_TOOL_NAME
+        ));
+        assert!(matches!(
+            first.tool_msg.content.first().map(|block| &block.kind),
+            Some(CkKind::ToolResult { tool_name, output, provider_executed: false, .. })
+                if tool_name == TODO_TOOL_NAME && matches!(output.kind, CkOutputKind::Json { .. })
+        ));
     }
 
     #[test]
