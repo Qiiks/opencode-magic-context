@@ -178,7 +178,6 @@ pub fn fire(
         chunk_fingerprint,
         producer_session_id: None,
         producer_run_id: None,
-        producer_cursor: None,
         fired_at_ms: Some(fired_at_ms),
         failure_backoff_at_ms: None,
     }))
@@ -194,21 +193,6 @@ pub fn producer_started(
     next.state = HistorianPhase::AwaitingProducer;
     next.producer_session_id = Some(producer_session_id);
     next.producer_run_id = Some(producer_run_id);
-    next.producer_cursor = None;
-    Ok(next)
-}
-
-pub fn producer_cursor_updated(
-    current: &HistorianDurableState,
-    producer_cursor: String,
-) -> Result<HistorianDurableState, HistorianStateError> {
-    require_phase(
-        current,
-        HistorianPhase::AwaitingProducer,
-        "producer_cursor_updated",
-    )?;
-    let mut next = current.clone();
-    next.producer_cursor = Some(producer_cursor);
     Ok(next)
 }
 
@@ -365,7 +349,6 @@ pub enum RestartAction {
     ReattachProducer {
         producer_session_id: String,
         producer_run_id: String,
-        producer_cursor: Option<String>,
         firing_seq: u64,
         chunk_fingerprint: String,
     },
@@ -401,7 +384,6 @@ pub fn handle_restart_load(
             Ok(RestartAction::ReattachProducer {
                 producer_session_id,
                 producer_run_id,
-                producer_cursor: state.producer_cursor,
                 firing_seq: state.firing_seq,
                 chunk_fingerprint: state.chunk_fingerprint,
             })
@@ -493,7 +475,6 @@ pub trait HistorianProducerDriver {
     async fn await_output(
         &mut self,
         run_id: &str,
-        from_cursor: Option<&str>,
     ) -> Result<ProducerOutput, HistorianProducerError>;
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
@@ -519,9 +500,8 @@ impl HistorianProducerDriver for HistorianProducer {
     async fn await_output(
         &mut self,
         run_id: &str,
-        from_cursor: Option<&str>,
     ) -> Result<ProducerOutput, HistorianProducerError> {
-        HistorianProducer::await_output(self, run_id, from_cursor).await
+        HistorianProducer::await_output(self, run_id).await
     }
 
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError> {
@@ -645,7 +625,7 @@ where
             producer_started(&fired, producer_session_id.clone(), handle.run_id.clone())?;
         persist_historian_state(request.store, request.session_id, awaiting.clone())?;
 
-        let output = match producer.await_output(&handle.run_id, None).await {
+        let output = match producer.await_output(&handle.run_id).await {
             Ok(output) => output,
             Err(err) => {
                 let _ = producer.cancel(&handle.run_id).await;
@@ -710,7 +690,6 @@ where
     let RestartAction::ReattachProducer {
         producer_session_id,
         producer_run_id,
-        producer_cursor,
         firing_seq,
         ..
     } = action
@@ -738,9 +717,8 @@ where
         }
     };
 
-    let from_cursor = match state {
-        RunState::Terminal { .. } => producer_cursor.clone(),
-        RunState::Active { .. } => producer_cursor.clone().or_else(|| Some("live".to_string())),
+    match state {
+        RunState::Terminal | RunState::Active => {}
         RunState::Missing { .. } => {
             abandon_current_state(
                 request.store,
@@ -750,14 +728,11 @@ where
             producer.close().await;
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
-    };
+    }
 
     let loaded = request.store.load(request.session_id)?;
     let awaiting = loaded.meta.historian.clone();
-    let output = match producer
-        .await_output(&producer_run_id, from_cursor.as_deref())
-        .await
-    {
+    let output = match producer.await_output(&producer_run_id).await {
         Ok(output) => output,
         Err(err) => {
             let _ = producer.cancel(&producer_run_id).await;
@@ -819,7 +794,7 @@ fn publish_output_from_awaiting(
         store,
         session_id,
         project_path,
-        mut awaiting,
+        awaiting,
         output,
         observed_chunk_fingerprint,
         validation_chunk,
@@ -829,17 +804,6 @@ fn publish_output_from_awaiting(
         created_at_ms,
         failure_backoff_at_ms,
     } = request;
-    for cursor in output.cursor_history {
-        awaiting = producer_cursor_updated(&awaiting, cursor)?;
-        persist_historian_state(store, session_id, awaiting.clone())?;
-    }
-    if let Some(cursor) = output.terminal_cursor {
-        if awaiting.producer_cursor.as_deref() != Some(cursor.as_str()) {
-            awaiting = producer_cursor_updated(&awaiting, cursor)?;
-            persist_historian_state(store, session_id, awaiting.clone())?;
-        }
-    }
-
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
 
@@ -1100,7 +1064,7 @@ mod tests {
         statuses: VecDeque<Result<RunState, HistorianProducerError>>,
         observed_starts: Vec<(String, String)>,
         observed_sessions: Vec<String>,
-        await_from: Vec<Option<String>>,
+        await_run_ids: Vec<String>,
         cancels: Vec<String>,
         closes: usize,
     }
@@ -1145,10 +1109,9 @@ mod tests {
 
         async fn await_output(
             &mut self,
-            _run_id: &str,
-            from_cursor: Option<&str>,
+            run_id: &str,
         ) -> Result<ProducerOutput, HistorianProducerError> {
-            self.await_from.push(from_cursor.map(str::to_string));
+            self.await_run_ids.push(run_id.to_string());
             self.outputs
                 .pop_front()
                 .expect("scripted output result available")
@@ -1177,11 +1140,7 @@ mod tests {
     }
 
     fn producer_output(text: String) -> ProducerOutput {
-        ProducerOutput {
-            text,
-            terminal_cursor: Some("cursor-2".to_string()),
-            cursor_history: vec!["cursor-1".to_string(), "cursor-2".to_string()],
-        }
+        ProducerOutput { text }
     }
 
     fn fire_request<'a>(
@@ -1241,7 +1200,6 @@ mod tests {
             chunk_fingerprint: "fp".into(),
             producer_session_id: Some("producer-session".into()),
             producer_run_id: Some("run-3".into()),
-            producer_cursor: None,
             fired_at_ms: Some(10),
             failure_backoff_at_ms: None,
         }
@@ -1274,7 +1232,7 @@ mod tests {
         assert_eq!(success.producer_session_id, "mc-historian:proj:1");
         assert_eq!(producer.observed_starts.len(), 1);
         assert_eq!(producer.observed_starts[0].0, "mc-historian:proj:1");
-        assert_eq!(producer.await_from, vec![None]);
+        assert_eq!(producer.await_run_ids, vec!["run-1"]);
 
         let loaded = main_store.load("ses").unwrap();
         assert_eq!(loaded.meta.historian.state, HistorianPhase::Idle);
@@ -1370,7 +1328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reattach_terminal_resubscribes_from_cursor_without_second_send() {
+    async fn reattach_terminal_redrains_from_start_without_second_send() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_prior_compartment(&store);
@@ -1380,11 +1338,7 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_cursor_updated(
-            &producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap(),
-            "cursor-resume".into(),
-        )
-        .unwrap();
+        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
         store
             .commit(
                 "ses",
@@ -1397,9 +1351,7 @@ mod tests {
             )
             .unwrap();
         let mut producer = ScriptedProducer::default()
-            .with_status(Ok(RunState::Terminal {
-                head: Some("head".into()),
-            }))
+            .with_status(Ok(RunState::Terminal))
             .with_output(Ok(producer_output(historian_xml(
                 "terminal replay summary",
             ))));
@@ -1414,9 +1366,51 @@ mod tests {
             "reattach publishes replayed output without a second session.send"
         );
         assert_eq!(producer.observed_sessions, vec!["producer-session"]);
-        assert_eq!(producer.await_from, vec![Some("cursor-resume".to_string())]);
+        assert_eq!(producer.await_run_ids, vec!["run-1"]);
         let c2 = store.load_compartments("ses").unwrap().pop().unwrap();
         assert_eq!(c2.p1.as_deref(), Some("terminal replay summary"));
+    }
+
+    #[tokio::test]
+    async fn reattach_redrains_full_run_from_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 1).unwrap() {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => unreachable!(),
+        };
+        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &ModuleMeta {
+                    historian: awaiting,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Ok(producer_output(historian_xml("full replay summary"))));
+
+        let outcome =
+            reattach_historian_producer(&mut producer, reattach_request(&store, &chunk, &prior))
+                .await
+                .unwrap();
+
+        assert!(matches!(outcome, HistorianReattachOutcome::Published(_)));
+        assert!(
+            producer.observed_starts.is_empty(),
+            "re-draining from the start is a subscribe-only reattach, not a new send"
+        );
+        assert_eq!(producer.await_run_ids, vec!["run-1"]);
+        let c2 = store.load_compartments("ses").unwrap().pop().unwrap();
+        assert_eq!(c2.p1.as_deref(), Some("full replay summary"));
     }
 
     #[tokio::test]
@@ -1487,6 +1481,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_paused_abandons_and_refires() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::RunPaused {
+                run_id: "run-1".into(),
+                reason: Some("auth_required".into()),
+            }));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        assert_eq!(
+            producer.observed_starts,
+            vec![("mc-historian:proj:1".to_string(), "model-a".to_string())],
+            "paused runs abandon the slot instead of retrying the next model"
+        );
+        assert_eq!(producer.cancels, vec!["run-1"]);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, Some(999));
+        assert!(matches!(
+            fire(&state, 2, 4, "fp2".into(), 124).unwrap(),
+            FireOutcome::Fired(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn reattach_fingerprint_mismatch_recovers_to_idle_and_releases_routes() {
         // A tail that changed under the historian makes the observed fingerprint differ
         // from the frozen one at publish time. The mismatch must abandon the firing back
@@ -1501,11 +1533,7 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_cursor_updated(
-            &producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap(),
-            "cursor-resume".into(),
-        )
-        .unwrap();
+        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
         store
             .commit(
                 "ses",
@@ -1518,9 +1546,7 @@ mod tests {
             )
             .unwrap();
         let mut producer = ScriptedProducer::default()
-            .with_status(Ok(RunState::Terminal {
-                head: Some("head".into()),
-            }))
+            .with_status(Ok(RunState::Terminal))
             .with_output(Ok(producer_output(historian_xml(
                 "summary for a changed tail",
             ))));
@@ -1587,43 +1613,6 @@ mod tests {
         );
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
-    }
-
-    #[test]
-    fn cursor_is_persisted_and_returned_for_restart_reattach() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 1).unwrap() {
-            FireOutcome::Fired(state) => state,
-            FireOutcome::Busy(_) => unreachable!(),
-        };
-        let awaiting = producer_cursor_updated(
-            &producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap(),
-            "opaque-cursor".into(),
-        )
-        .unwrap();
-        store
-            .commit(
-                "ses",
-                None,
-                &CoreState::default(),
-                &ModuleMeta {
-                    historian: awaiting,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-        assert_eq!(
-            handle_restart_load(&store, "ses", 999).unwrap(),
-            RestartAction::ReattachProducer {
-                producer_session_id: "producer-session".into(),
-                producer_run_id: "run-1".into(),
-                producer_cursor: Some("opaque-cursor".into()),
-                firing_seq: 1,
-                chunk_fingerprint: "fp".into(),
-            }
-        );
     }
 
     /// The seam-close proof: a real historian output is parsed + validated by the
@@ -1704,7 +1693,6 @@ mod tests {
             chunk_fingerprint: "fp".into(),
             producer_session_id: Some("ps".into()),
             producer_run_id: Some("run-1".into()),
-            producer_cursor: None,
             fired_at_ms: Some(1),
             failure_backoff_at_ms: None,
         };
@@ -1869,7 +1857,6 @@ mod tests {
             RestartAction::ReattachProducer {
                 producer_session_id: "producer-session".into(),
                 producer_run_id: "run-1".into(),
-                producer_cursor: None,
                 firing_seq: 1,
                 chunk_fingerprint: "fp".into(),
             }

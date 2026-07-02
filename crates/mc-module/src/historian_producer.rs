@@ -31,16 +31,12 @@ pub struct RunHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerOutput {
     pub text: String,
-    pub terminal_cursor: Option<String>,
-    /// Every durable control cursor observed while draining. The orchestrator can
-    /// persist these opaque tokens in order; it never needs to inspect their shape.
-    pub cursor_history: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunState {
-    Terminal { head: Option<String> },
-    Active { head: Option<String> },
+    Terminal,
+    Active,
     Missing { detail: Option<String> },
 }
 
@@ -99,6 +95,14 @@ pub enum HistorianProducerError {
     RunFailed {
         run_id: String,
         detail: String,
+    },
+    TerminalRunMismatch {
+        expected: String,
+        found: Option<String>,
+    },
+    RunPaused {
+        run_id: String,
+        reason: Option<String>,
     },
 }
 
@@ -198,6 +202,20 @@ impl fmt::Display for HistorianProducerError {
             HistorianProducerError::RunFailed { run_id, detail } => {
                 write!(f, "run {run_id} failed: {detail}")
             }
+            HistorianProducerError::TerminalRunMismatch { expected, found } => {
+                write!(
+                    f,
+                    "run {expected} received terminal control unit after RunStarted {:?}",
+                    found
+                )
+            }
+            HistorianProducerError::RunPaused { run_id, reason } => {
+                write!(f, "run {run_id} paused")?;
+                if let Some(reason) = reason {
+                    write!(f, ": {reason}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -218,7 +236,9 @@ impl Error for HistorianProducerError {
             | HistorianProducerError::MissingSession
             | HistorianProducerError::UnexpectedStreamEnd
             | HistorianProducerError::TimedOut
-            | HistorianProducerError::RunFailed { .. } => None,
+            | HistorianProducerError::RunFailed { .. }
+            | HistorianProducerError::TerminalRunMismatch { .. }
+            | HistorianProducerError::RunPaused { .. } => None,
         }
     }
 }
@@ -327,11 +347,13 @@ impl HistorianProducer {
     pub async fn await_output(
         &mut self,
         run_id: &str,
-        from_cursor: Option<&str>,
     ) -> Result<ProducerOutput, HistorianProducerError> {
         let route = self.ensure_subscribe_route().await?;
-        let from = cursor_param(from_cursor);
-        let body = json!({ "method": "session.subscribe", "params": { "from": from } });
+        // Subscribe from "start" instead of a cursor. Replay after a cursor is
+        // exclusive, so persisting an advancing cursor can drop units at or before
+        // it on reattach. Re-draining from the start is safe because validation
+        // and compare-and-swap checks during publish are idempotent.
+        let body = json!({ "method": "session.subscribe", "params": { "from": "start" } });
         let corr = self.send_request(route, body).await?;
         match tokio::time::timeout(
             self.config.await_timeout,
@@ -465,8 +487,7 @@ impl HistorianProducer {
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError> {
         let mut text = String::new();
-        let mut cursor_history = Vec::new();
-        let mut terminal_cursor = None;
+        let mut last_run_started: Option<String> = None;
         loop {
             let Some(frame) = read_frame(&mut self.stream).await? else {
                 return Err(HistorianProducerError::UnexpectedStreamEnd);
@@ -477,20 +498,35 @@ impl HistorianProducer {
             match frame.header.ty {
                 FrameType::StreamData => {
                     let event: Value = serde_json::from_slice(&frame.body)?;
-                    let Some((cursor, unit)) = control_unit(&event) else {
+                    let Some(unit) = control_unit(&event) else {
                         continue;
                     };
-                    if let Some(cursor) = cursor {
-                        terminal_cursor = Some(cursor.clone());
-                        cursor_history.push(cursor);
+                    if is_run_started_unit(unit) {
+                        last_run_started = unit_run_id(unit).map(ToString::to_string);
                     }
-                    if unit_run_id(unit).is_some_and(|id| id != run_id) {
+                    let terminal = is_terminal_unit(unit);
+                    if !terminal && unit_run_id(unit).is_some_and(|id| id != run_id) {
                         continue;
+                    }
+                    if is_paused_unit(unit) && unit_run_id(unit) == Some(run_id) {
+                        // A paused run still holds the slot for this historian. Return
+                        // an error so callers stop waiting and retry later instead of
+                        // hanging forever on a run that is paused but not finished.
+                        return Err(HistorianProducerError::RunPaused {
+                            run_id: run_id.to_string(),
+                            reason: paused_reason(unit).map(ToString::to_string),
+                        });
                     }
                     if let Some(piece) = unit_text(unit) {
                         text.push_str(piece);
                     }
-                    if is_terminal_unit(unit) {
+                    if terminal {
+                        if last_run_started.as_deref() != Some(run_id) {
+                            return Err(HistorianProducerError::TerminalRunMismatch {
+                                expected: run_id.to_string(),
+                                found: last_run_started,
+                            });
+                        }
                         if is_error_unit(unit) {
                             return Err(HistorianProducerError::RunFailed {
                                 run_id: run_id.to_string(),
@@ -499,11 +535,7 @@ impl HistorianProducer {
                         }
                         // The run terminal control unit is authoritative. StreamEnd is only
                         // route mechanics and can appear on detach/resubscribe without ending a run.
-                        return Ok(ProducerOutput {
-                            text,
-                            terminal_cursor,
-                            cursor_history,
-                        });
+                        return Ok(ProducerOutput { text });
                     }
                 }
                 FrameType::Error => {
@@ -581,31 +613,8 @@ impl Drop for HistorianProducer {
     }
 }
 
-pub fn cursor_param(cursor: Option<&str>) -> Value {
-    match cursor {
-        None => Value::String("start".to_string()),
-        Some(cursor) => {
-            serde_json::from_str(cursor).unwrap_or_else(|_| Value::String(cursor.to_string()))
-        }
-    }
-}
-
-pub fn cursor_to_opaque_string(cursor: &Value) -> Option<String> {
-    // Always JSON-encode, INCLUDING string cursors. cursor_param re-parses the stored
-    // token with serde_json::from_str, so storing a scalar string bare (e.g. `123` or
-    // `true`) would round-trip back as a JSON number/bool and change the cursor's type
-    // on resubscribe. Encoding every value symmetrically keeps the cursor truly opaque:
-    // whatever llm-runner emitted is re-presented byte-for-byte on the wire.
-    if cursor.is_null() {
-        None
-    } else {
-        serde_json::to_string(cursor).ok()
-    }
-}
-
 fn classify_run_state(run_id: &str, value: &Value) -> RunState {
     let value = value.get("result").unwrap_or(value);
-    let head = value.get("head").and_then(cursor_to_opaque_string);
     let state = value
         .get("state")
         .and_then(Value::as_str)
@@ -622,13 +631,13 @@ fn classify_run_state(run_id: &str, value: &Value) -> RunState {
         || state == "completed"
         || state == "finished"
     {
-        RunState::Terminal { head }
+        RunState::Terminal
     } else if state.contains("active")
         || state.contains("paused")
         || state.contains("pending")
         || state.contains("running")
     {
-        RunState::Active { head }
+        RunState::Active
     } else if state.contains("error") {
         RunState::Missing {
             detail: value
@@ -644,18 +653,16 @@ fn classify_run_state(run_id: &str, value: &Value) -> RunState {
     }
 }
 
-fn control_unit(event: &Value) -> Option<(Option<String>, &Value)> {
+fn control_unit(event: &Value) -> Option<&Value> {
     let kind = event.get("kind").and_then(Value::as_str);
     if kind == Some("display") {
         return None;
     }
     if kind == Some("control") {
-        let cursor = event.get("cursor").and_then(cursor_to_opaque_string);
         let unit = event.get("unit").unwrap_or(event);
-        return Some((cursor, unit));
+        return Some(unit);
     }
-    let cursor = event.get("cursor").and_then(cursor_to_opaque_string);
-    Some((cursor, event.get("unit").unwrap_or(event)))
+    Some(event.get("unit").unwrap_or(event))
 }
 
 fn unit_type(unit: &Value) -> Option<&str> {
@@ -686,6 +693,24 @@ fn is_terminal_unit(unit: &Value) -> bool {
         || ty == "run_terminal"
         || ty == "finished"
         || ty == "error"
+}
+
+fn is_run_started_unit(unit: &Value) -> bool {
+    unit_type(unit)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|ty| ty == "run_started" || ty == "runstarted")
+}
+
+fn is_paused_unit(unit: &Value) -> bool {
+    unit_type(unit)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|ty| ty == "paused")
+}
+
+fn paused_reason(unit: &Value) -> Option<&str> {
+    unit.get("reason")
+        .or_else(|| unit.get("detail"))
+        .and_then(Value::as_str)
 }
 
 fn is_error_unit(unit: &Value) -> bool {
@@ -954,12 +979,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn await_output_uses_control_terminal_not_stream_end_and_tracks_cursors() {
+    async fn await_output_uses_control_terminal_not_stream_end() {
         let terminal_text = r#"<output><compartments><compartment start="1" end="1" title="t"><p1>x</p1></compartment></compartments><meta><messages_processed>1-1</messages_processed></meta></output>"#;
         let events = vec![
             json!({"kind":"display","event":{"type":"text_delta","text":"ignored"}}),
-            json!({"kind":"control","cursor":{"wal_seq":1,"sub_index":0},"unit":{"type":"assistant_message","run_id":"run-1","text":terminal_text}}),
-            json!({"kind":"control","cursor":{"wal_seq":2,"sub_index":0},"unit":{"type":"run_finished","run_id":"run-1","finish_reason":"completed"}}),
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+            json!({"kind":"control","unit":{"type":"assistant_message","run_id":"run-1","text":terminal_text}}),
+            json!({"kind":"control","unit":{"type":"run_finished","finish_reason":"completed"}}),
         ];
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
         let mut client = client(&server).await;
@@ -967,16 +993,11 @@ mod tests {
             .start("mc-historian:proj:2", "prompt", "model-a")
             .await
             .unwrap();
-        let output = client.await_output("run-1", None).await.unwrap();
+        let output = client.await_output("run-1").await.unwrap();
         client.close().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         assert_eq!(output.text, terminal_text);
-        assert_eq!(output.cursor_history.len(), 2);
-        assert_eq!(
-            output.terminal_cursor,
-            output.cursor_history.last().cloned()
-        );
         let log = server.log.lock().await;
         assert_eq!(
             log.route_sessions,
@@ -990,23 +1011,49 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cursor_values_round_trip_opaquely() {
-        let cursor = json!({"wal_seq": 7, "sub_index": 2});
-        let stored = cursor_to_opaque_string(&cursor).unwrap();
-        assert_eq!(cursor_param(Some(&stored)), cursor);
-        assert_eq!(cursor_param(Some("opaque-token")), json!("opaque-token"));
+    #[tokio::test]
+    async fn terminal_without_matching_run_started_fails_loud() {
+        let events = vec![
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"other-run"}}),
+            json!({"kind":"control","unit":{"type":"run_finished","finish_reason":"completed"}}),
+        ];
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:3", "prompt", "model-a")
+            .await
+            .unwrap();
 
-        // A STRING cursor whose text looks numeric/bool must stay a string across the
-        // store→re-present round-trip. Storing it bare would let cursor_param's from_str
-        // reparse it as a number/bool and change the cursor's type on resubscribe.
-        for scalar_string in [json!("123"), json!("true"), json!("null"), json!("")] {
-            let stored = cursor_to_opaque_string(&scalar_string).unwrap();
-            assert_eq!(
-                cursor_param(Some(&stored)),
-                scalar_string,
-                "opaque string cursor changed type on round-trip"
-            );
-        }
+        let err = client.await_output("run-1").await.unwrap_err();
+        assert!(matches!(
+            err,
+            HistorianProducerError::TerminalRunMismatch {
+                expected,
+                found: Some(found),
+            } if expected == "run-1" && found == "other-run"
+        ));
+    }
+
+    #[tokio::test]
+    async fn paused_unit_returns_run_paused() {
+        let events = vec![
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+            json!({"kind":"control","unit":{"type":"paused","run_id":"run-1","reason":"auth_required"}}),
+        ];
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:4", "prompt", "model-a")
+            .await
+            .unwrap();
+
+        let err = client.await_output("run-1").await.unwrap_err();
+        assert!(matches!(
+            err,
+            HistorianProducerError::RunPaused {
+                run_id,
+                reason: Some(reason),
+            } if run_id == "run-1" && reason == "auth_required"
+        ));
     }
 }
