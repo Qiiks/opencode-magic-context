@@ -59,8 +59,8 @@ fn to_store_fact(f: &crate::historian_validate::FactCandidate) -> FactCandidate 
 
 /// One flat item in the pinned chunk snapshot used to guard producer output.
 /// The fingerprint intentionally records byte lengths rather than content bytes:
-/// content edits, insertion/removal, and type/id changes alter the fingerprint,
-/// while unrelated metadata drift cannot stale a snapshot.
+/// insertion/removal and type/id changes alter the fingerprint, while unrelated
+/// metadata drift and same-length content edits do not stale a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkSnapshotItem<'a> {
     pub id: &'a str,
@@ -531,7 +531,6 @@ pub struct HistorianFireRequest<'a> {
     pub validation_chunk: &'a HistorianChunk,
     pub prior_compartments: &'a [StoredCompartmentRange],
     pub validate_options: ValidateOptions,
-    pub publication_floor_ordinal: u64,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
 }
@@ -658,7 +657,6 @@ where
             validation_chunk: request.validation_chunk,
             prior_compartments: request.prior_compartments,
             validate_options: request.validate_options,
-            publication_floor_ordinal: request.publication_floor_ordinal,
             created_at_ms: request.now_ms,
             failure_backoff_at_ms: request.failure_backoff_at_ms,
         });
@@ -758,7 +756,6 @@ where
         validation_chunk: request.validation_chunk,
         prior_compartments: request.prior_compartments,
         validate_options: request.validate_options,
-        publication_floor_ordinal: request.publication_floor_ordinal,
         created_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
     });
@@ -782,7 +779,6 @@ struct PublishOutputRequest<'a> {
     validation_chunk: &'a HistorianChunk,
     prior_compartments: &'a [StoredCompartmentRange],
     validate_options: ValidateOptions,
-    publication_floor_ordinal: u64,
     created_at_ms: i64,
     failure_backoff_at_ms: i64,
 }
@@ -800,7 +796,6 @@ fn publish_output_from_awaiting(
         validation_chunk,
         prior_compartments,
         validate_options,
-        publication_floor_ordinal,
         created_at_ms,
         failure_backoff_at_ms,
     } = request;
@@ -843,7 +838,7 @@ fn publish_output_from_awaiting(
             predicate: &predicate,
             observed_chunk_fingerprint,
             validated: &validated,
-            publication_floor_ordinal,
+            publication_floor_ordinal: validated.unprocessed_from,
             created_at_ms,
             failure_backoff_at_ms,
         },
@@ -1164,7 +1159,6 @@ mod tests {
             validation_chunk: chunk,
             prior_compartments: prior,
             validate_options: validate_options(),
-            publication_floor_ordinal: 4,
             now_ms: 123,
             failure_backoff_at_ms: 999,
         }

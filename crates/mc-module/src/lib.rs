@@ -20,6 +20,7 @@ pub mod boundary;
 pub mod compartment_coverage;
 pub mod decay_render;
 pub mod historian;
+pub mod historian_chunk;
 pub mod historian_producer;
 pub mod historian_prompt;
 pub mod historian_validate;

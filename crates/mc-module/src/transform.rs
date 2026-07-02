@@ -506,7 +506,10 @@ fn apply_once(
             // it would be silently dropped from the tail. resolve_coverage can't see the
             // live array (it's store-pure), so the check lives here where the ordinals are.
             if let Some(first) = comp.first_covered_ordinal {
-                if let Some(stray) = live.iter().find(|i| i.ordinal() < first) {
+                if let Some(stray) = live
+                    .iter()
+                    .find(|i| i.ordinal() < first && i.role != "system")
+                {
                     return Err(TransformError::CoverageGap(format!(
                         "leading coverage gap: live item {} (ordinal {}) sits before the first \
                          compartment start (ordinal {}); composing m0 would silently drop it \
@@ -1254,6 +1257,22 @@ mod tests {
             mid: id.to_string(),
             ordinal,
             ck: text_message(id, bytes),
+        }
+    }
+
+    fn system_item(id: &str, ordinal: u64, bytes: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "system",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: bytes.to_string(),
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta::default(),
+            ),
         }
     }
 
@@ -2261,6 +2280,27 @@ mod tests {
             matches!(err, TransformError::CoverageGap(_)),
             "a leading gap must fail loud, not silently drop the early live item: {err:?}"
         );
+    }
+
+    #[test]
+    fn leading_coverage_gap_exempts_pinned_system_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 2, "m2", "S")])
+            .unwrap();
+        let items = vec![
+            system_item("sys0", 0, "identity lead"),
+            item("m2", 2, "covered"),
+            item("t3", 3, "tail"),
+        ];
+        let out = transform(
+            &s,
+            &req("ses", "cfg0", items),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+            &spine(),
+        )
+        .unwrap();
+        assert_eq!(out.coverage_ordinal, Some(2));
     }
 
     #[test]
