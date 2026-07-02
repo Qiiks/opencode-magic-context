@@ -116,6 +116,7 @@ pub struct McHandler {
     #[cfg(test)]
     fixed_config: Option<McModuleConfig>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
+    live_historian_sessions: Arc<Mutex<HashSet<String>>>,
     /// Route channel → its session binding. Populated at `on_bind`, removed at
     /// `on_route_gone`. A `Mutex<HashMap>` (not a lock-free map) because writes are
     /// rare (once per route open/close) and reads are one cheap lookup per transform.
@@ -156,6 +157,30 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
 
 struct MissingProducerFactory;
 
+struct SessionSetGuard {
+    sessions: Arc<Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for SessionSetGuard {
+    fn drop(&mut self) {
+        self.sessions
+            .lock()
+            .expect("session set mutex")
+            .remove(&self.session_id);
+    }
+}
+
+struct HistorianFiringTask {
+    store: Arc<McStore>,
+    session_id: String,
+    project_path: String,
+    project_root: PathBuf,
+    project_slug: String,
+    firing: AssembledHistorianFiring,
+    live_guard: SessionSetGuard,
+}
+
 #[async_trait]
 impl HistorianProducerFactory for MissingProducerFactory {
     async fn connect(
@@ -187,6 +212,7 @@ impl McHandler {
             #[cfg(test)]
             fixed_config: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
+            live_historian_sessions: Arc::new(Mutex::new(HashSet::new())),
             bindings: Mutex::new(HashMap::new()),
         }
     }
@@ -215,6 +241,7 @@ impl McHandler {
             config: Mutex::new(ConfigCache::default()),
             fixed_config: Some(config),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
+            live_historian_sessions: Arc::new(Mutex::new(HashSet::new())),
             bindings: Mutex::new(HashMap::new()),
         }
     }
@@ -274,81 +301,131 @@ impl McHandler {
         project_path: String,
         projection: &transform::ck_wire::FlatProjection,
         now: i64,
-    ) {
+    ) -> Option<&'static str> {
         let Ok(loaded) = store.load(&parsed.session_id) else {
-            return;
+            return Some("recovery_load_failed");
         };
-        if loaded.meta.historian.state != HistorianPhase::AwaitingProducer {
-            return;
+        let phase = loaded.meta.historian.state.clone();
+        if phase == HistorianPhase::Idle {
+            return Some("recovered");
+        }
+        if self
+            .live_historian_sessions
+            .lock()
+            .expect("live historian mutex")
+            .contains(&parsed.session_id)
+        {
+            return None;
         }
         let mut latch = self.reattaching_sessions.lock().expect("reattach mutex");
         if !latch.insert(parsed.session_id.clone()) {
-            return;
+            return Some(match phase {
+                HistorianPhase::AwaitingProducer => "reattaching",
+                HistorianPhase::Firing
+                | HistorianPhase::Validating
+                | HistorianPhase::Publishing => "recovering",
+                HistorianPhase::Idle => "recovered",
+            });
         }
         drop(latch);
 
         let session_id = parsed.session_id.clone();
-        let factory = Arc::clone(&self.producer_factory);
         let latch = Arc::clone(&self.reattaching_sessions);
-        let project_root = PathBuf::from(&project_path);
-        let live: Vec<_> = projection
-            .blocks
-            .iter()
-            .filter(|b| !b.synthetic)
-            .cloned()
-            .collect();
-        let Some(range) = loaded.meta.historian.chunk_range.clone() else {
-            self.reattaching_sessions
-                .lock()
-                .expect("reattach mutex")
-                .remove(&session_id);
-            return;
+        let guard = SessionSetGuard {
+            sessions: Arc::clone(&latch),
+            session_id: session_id.clone(),
         };
-        let chunk = historian_chunk::build_historian_chunk(
-            parsed.messages.as_slice(),
-            &live,
-            range.from_ordinal,
-            DEFAULT_HISTORIAN_CHUNK_TOKENS,
-            range.to_ordinal.saturating_add(1),
-        );
-        let prior_compartments = match store.load_compartments(&session_id) {
-            Ok(cs) => cs
-                .iter()
-                .map(historian_chunk::stored_range)
-                .collect::<Vec<_>>(),
-            Err(_) => Vec::new(),
-        };
-        let fingerprint_items: Vec<_> = chunk.snapshot.iter().map(|item| item.as_item()).collect();
-        let observed = historian::compute_chunk_fingerprint(&fingerprint_items);
-        tokio::spawn(async move {
-            let result = async {
-                let mut producer = factory.connect(&project_root).await?;
-                reattach_historian_producer(
-                    &mut *producer,
-                    historian::HistorianReattachRequest {
-                        store: &store,
-                        session_id: &session_id,
-                        project_path: &project_path,
-                        observed_chunk_fingerprint: &observed,
-                        validation_chunk: &chunk.chunk,
-                        prior_compartments: &prior_compartments,
-                        validate_options: historian_validate::ValidateOptions {
-                            sequence_offset: prior_compartments.len() as u64 + 1,
-                            in_emergency: false,
-                        },
-                        publication_floor_ordinal: range.to_ordinal,
-                        now_ms: now,
-                        failure_backoff_at_ms: now + 60_000,
-                    },
-                )
-                .await
+
+        match phase {
+            HistorianPhase::AwaitingProducer => {
+                let factory = Arc::clone(&self.producer_factory);
+                let project_root = PathBuf::from(&project_path);
+                let live: Vec<_> = projection
+                    .blocks
+                    .iter()
+                    .filter(|b| !b.synthetic)
+                    .cloned()
+                    .collect();
+                let Some(range) = loaded.meta.historian.chunk_range.clone() else {
+                    drop(guard);
+                    return Some("recovering");
+                };
+                let chunk = historian_chunk::build_historian_chunk(
+                    parsed.messages.as_slice(),
+                    &live,
+                    range.from_ordinal,
+                    DEFAULT_HISTORIAN_CHUNK_TOKENS,
+                    range.to_ordinal.saturating_add(1),
+                );
+                let prior_compartments = match store.load_compartments(&session_id) {
+                    Ok(cs) => cs
+                        .iter()
+                        .map(historian_chunk::stored_range)
+                        .collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                };
+                let fingerprint_items: Vec<_> =
+                    chunk.snapshot.iter().map(|item| item.as_item()).collect();
+                let observed = historian::compute_chunk_fingerprint(&fingerprint_items);
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    let result = async {
+                        let action =
+                            historian::handle_restart_load(&store, &session_id, now + 60_000)?;
+                        match action {
+                            historian::RestartAction::Done => {
+                                return Ok(historian::HistorianReattachOutcome::Done)
+                            }
+                            historian::RestartAction::AbandonedAndRefireEligible { firing_seq } => {
+                                return Ok(historian::HistorianReattachOutcome::RefireEligible {
+                                    firing_seq,
+                                })
+                            }
+                            historian::RestartAction::ReattachProducer { .. } => {}
+                        }
+                        let mut producer = factory.connect(&project_root).await?;
+                        reattach_historian_producer(
+                            &mut *producer,
+                            historian::HistorianReattachRequest {
+                                store: &store,
+                                session_id: &session_id,
+                                project_path: &project_path,
+                                observed_chunk_fingerprint: &observed,
+                                validation_chunk: &chunk.chunk,
+                                prior_compartments: &prior_compartments,
+                                validate_options: historian_validate::ValidateOptions {
+                                    sequence_offset: prior_compartments.len() as u64 + 1,
+                                    in_emergency: false,
+                                },
+                                publication_floor_ordinal: range.to_ordinal,
+                                now_ms: now,
+                                failure_backoff_at_ms: now + 60_000,
+                            },
+                        )
+                        .await
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        eprintln!("mc-module: historian reattach failed for {session_id}: {e}");
+                    }
+                });
+                Some("reattaching")
             }
-            .await;
-            if let Err(e) = result {
-                eprintln!("mc-module: historian reattach failed for {session_id}: {e}");
+            HistorianPhase::Firing | HistorianPhase::Validating | HistorianPhase::Publishing => {
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    if let Err(e) =
+                        historian::handle_restart_load(&store, &session_id, now + 60_000)
+                    {
+                        eprintln!(
+                            "mc-module: historian restart recovery failed for {session_id}: {e}"
+                        );
+                    }
+                });
+                Some("recovering")
             }
-            latch.lock().expect("reattach mutex").remove(&session_id);
-        });
+            HistorianPhase::Idle => Some("recovered"),
+        }
     }
 
     fn maybe_spawn_historian_fire(
@@ -372,6 +449,36 @@ impl McHandler {
             }
         };
         let state = loaded.meta.historian.state.as_str().to_string();
+        if self
+            .live_historian_sessions
+            .lock()
+            .expect("live historian mutex")
+            .contains(&parsed.session_id)
+        {
+            return HistorianDiagnostics {
+                fired: false,
+                reason: None,
+                no_fire: Some("busy".to_string()),
+                state,
+            };
+        }
+        if loaded.meta.historian.state != HistorianPhase::Idle {
+            let no_fire = self
+                .maybe_spawn_reattach(
+                    Arc::clone(&store),
+                    parsed,
+                    project_path.clone(),
+                    projection,
+                    now,
+                )
+                .unwrap_or("busy");
+            return HistorianDiagnostics {
+                fired: false,
+                reason: None,
+                no_fire: Some(no_fire.to_string()),
+                state,
+            };
+        }
         let cfg = self.effective_config(&binding.project_root);
         let boundary_messages = boundary_messages(parsed, projection);
         let last_compartment_end_ordinal = store
@@ -472,14 +579,33 @@ impl McHandler {
                 }
             }
         };
-        self.spawn_historian_firing(
+        let live_guard = {
+            let mut live = self
+                .live_historian_sessions
+                .lock()
+                .expect("live historian mutex");
+            if !live.insert(parsed.session_id.clone()) {
+                return HistorianDiagnostics {
+                    fired: false,
+                    reason: trigger.reason.map(|r| r.as_str().to_string()),
+                    no_fire: Some("busy".to_string()),
+                    state,
+                };
+            }
+            SessionSetGuard {
+                sessions: Arc::clone(&self.live_historian_sessions),
+                session_id: parsed.session_id.clone(),
+            }
+        };
+        self.spawn_historian_firing(HistorianFiringTask {
             store,
-            parsed.session_id.clone(),
+            session_id: parsed.session_id.clone(),
             project_path,
-            binding.project_root.clone(),
+            project_root: binding.project_root.clone(),
             project_slug,
             firing,
-        );
+            live_guard,
+        });
         HistorianDiagnostics {
             fired: true,
             reason: trigger.reason.map(|r| r.as_str().to_string()),
@@ -488,17 +614,19 @@ impl McHandler {
         }
     }
 
-    fn spawn_historian_firing(
-        &self,
-        store: Arc<McStore>,
-        session_id: String,
-        project_path: String,
-        project_root: PathBuf,
-        project_slug: String,
-        firing: AssembledHistorianFiring,
-    ) {
+    fn spawn_historian_firing(&self, task: HistorianFiringTask) {
         let factory = Arc::clone(&self.producer_factory);
         tokio::spawn(async move {
+            let HistorianFiringTask {
+                store,
+                session_id,
+                project_path,
+                project_root,
+                project_slug,
+                firing,
+                live_guard,
+            } = task;
+            let _guard = live_guard;
             let result = async {
                 let mut producer = factory.connect(&project_root).await?;
                 let request =
@@ -572,13 +700,6 @@ impl McHandler {
         let pass_now = producer_ctx.now_ms;
         match transform_with_projection(&store, &parsed, &producer_ctx, &deciders) {
             Ok(mut result) => {
-                self.maybe_spawn_reattach(
-                    Arc::clone(&store),
-                    &parsed,
-                    project_path.to_string(),
-                    &result.projection,
-                    pass_now,
-                );
                 let diagnostics = self.maybe_spawn_historian_fire(
                     Arc::clone(&store),
                     &parsed,
@@ -967,6 +1088,7 @@ mod tests {
 
     #[derive(Default)]
     struct ProducerState {
+        connects: AtomicUsize,
         starts: AtomicUsize,
         binds: AtomicUsize,
         statuses: AtomicUsize,
@@ -986,6 +1108,7 @@ mod tests {
             &self,
             _project_root: &Path,
         ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+            self.state.connects.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(TestProducer {
                 state: Arc::clone(&self.state),
             }))
@@ -1241,7 +1364,10 @@ mod tests {
 
         let busy = call_transform(&handler, messages).await;
         assert_eq!(busy["historian"]["no_fire"], "busy");
+        assert_eq!(producer.connects.load(Ordering::SeqCst), 1);
         assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(producer.binds.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.statuses.load(Ordering::SeqCst), 0);
 
         producer.block_output.store(false, Ordering::SeqCst);
         producer.notify.notify_waiters();
@@ -1279,6 +1405,102 @@ mod tests {
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)
             .unwrap();
+    }
+
+    fn seed_historian_phase(store: &McStore, phase: HistorianPhase) {
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.historian = HistorianDurableState {
+            state: phase,
+            firing_seq: 1,
+            chunk_range: Some(HistorianChunkRange {
+                from_ordinal: 1,
+                to_ordinal: 3,
+            }),
+            chunk_fingerprint: "seeded-fingerprint".to_string(),
+            producer_session_id: Some("producer-session".to_string()),
+            producer_run_id: Some("run-stale".to_string()),
+            fired_at_ms: Some(1),
+            failure_backoff_at_ms: None,
+        };
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+    }
+
+    fn seed_idle(store: &McStore) {
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.historian = HistorianDurableState::default();
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+    }
+
+    async fn assert_seeded_phase_recovers_and_refires(phase: HistorianPhase) {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+        seed_historian_phase(&store, phase.clone());
+
+        let recovering = call_transform(&handler, messages.clone()).await;
+        assert_eq!(recovering["historian"]["state"], phase.as_str());
+        assert_eq!(recovering["historian"]["no_fire"], "recovering");
+        wait_for_idle(&store).await;
+        assert_eq!(producer.connects.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.binds.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.statuses.load(Ordering::SeqCst), 0);
+
+        let fresh = call_transform(&handler, messages).await;
+        assert_eq!(fresh["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_seeded_publishing_recovers_and_next_pass_refires() {
+        assert_seeded_phase_recovers_and_refires(HistorianPhase::Publishing).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_seeded_firing_recovers_and_next_pass_refires() {
+        assert_seeded_phase_recovers_and_refires(HistorianPhase::Firing).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_seeded_validating_recovers_and_next_pass_refires() {
+        assert_seeded_phase_recovers_and_refires(HistorianPhase::Validating).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_stale_reattach_against_idle_is_noop() {
+        let producer = Arc::new(ProducerState::default());
+        producer.outputs.lock().unwrap().push_back(historian_output(
+            1,
+            3,
+            "stale reattach summary",
+        ));
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+        seed_awaiting(&store, &messages);
+
+        let reattaching = call_transform(&handler, messages).await;
+        assert_eq!(reattaching["historian"]["no_fire"], "reattaching");
+        seed_idle(&store);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.historian, HistorianDurableState::default());
+        assert_eq!(producer.connects.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.binds.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.statuses.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.await_outputs.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

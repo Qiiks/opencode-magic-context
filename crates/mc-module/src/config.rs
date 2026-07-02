@@ -13,7 +13,12 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 80.0;
+/// Default execute threshold percentage (65.0). The Rust module reads config without the
+/// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
+pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
+/// Maximum execute threshold percentage (80.0). The Rust module reads config without the
+/// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
+const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 80.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
@@ -129,7 +134,9 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         }
     }
 
-    cfg.execute_threshold_percentage = cfg.execute_threshold_percentage.clamp(1.0, 100.0);
+    cfg.execute_threshold_percentage = cfg
+        .execute_threshold_percentage
+        .clamp(1.0, MAX_EXECUTE_THRESHOLD_PERCENTAGE);
     cfg.model_chain.dedup();
     cfg
 }
@@ -245,7 +252,13 @@ mod tests {
         let user = serde_json::json!({ "execute_threshold_percentage": 70 });
         let project = serde_json::json!({ "execute_threshold_percentage": 90 });
         let cfg = merge_tiers(Some(&user), Some(&project));
-        assert_eq!(cfg.execute_threshold_percentage, 90.0);
+        assert_eq!(cfg.execute_threshold_percentage, 80.0);
+    }
+
+    #[test]
+    fn default_threshold_matches_typescript_schema() {
+        let cfg = merge_tiers(None, None);
+        assert_eq!(cfg.execute_threshold_percentage, 65.0);
     }
 
     #[test]
