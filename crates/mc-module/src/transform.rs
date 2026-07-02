@@ -538,11 +538,19 @@ fn apply_once(
             if comp.coverage_ordinal.is_some() {
                 let minted = comp.boundary_id.as_str();
                 if minted.is_empty() || !live.iter().any(|i| i.id() == minted) {
+                    // Name the exit path per cause: on a reconcile the anchor was present
+                    // once and reverted away (recovery = the historian re-cuts the store);
+                    // on a fresh mint it was never presentable (a producer/vocabulary bug).
+                    let hint = if loaded.core.reconcile_pending {
+                        "the store still covers reverted content; this error repeats until \
+                         the historian re-cuts the compartments for the reverted session"
+                    } else {
+                        "the anchor must be the flat block id (`<mid>#<index>`) of the \
+                         last covered block; check the publisher's end_message_id"
+                    };
                     return Err(TransformError::BoundaryNotPresent(format!(
                         "fold minted anchor {minted:?} from the folded compartment's \
-                         end_message_id, but no live block carries that id; the anchor \
-                         must be the flat block id (`<mid>#<index>`) of the last covered \
-                         block"
+                         end_message_id, but no live block carries that id; {hint}"
                     )));
                 }
             }
