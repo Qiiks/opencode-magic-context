@@ -1761,6 +1761,43 @@ mod tests {
     }
 
     #[test]
+    fn empty_store_bootstrap_then_defers_stably_without_hard_oscillation() {
+        // A session with no compartments keeps boundary_id = "" for its whole
+        // pre-first-compartment life. That empty id is the "no boundary ever minted"
+        // sentinel, NOT a "boundary reverted away" signal, so repeated identical passes
+        // after the bootstrap HARD must stay pure defers — never oscillate back into a
+        // HARD by treating the vacuous boundary as reconcile-pending. (The bytes stay
+        // identical either way, so this guards telemetry honesty + write churn, not a
+        // prefix-cache bust.)
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let items = vec![item("a", 1, "<h>HELLO</h>"), item("b", 2, "world")];
+        let first = run(&s, &req("ses", "cfg0", items.clone()), &spine());
+        assert_eq!(first.action, "HARD", "first pass is the bootstrap HARD");
+        let m0 = m0_bytes(&first).to_string();
+        let m1 = m1_bytes(&first).to_string();
+
+        for _ in 0..4 {
+            let r = run(&s, &req("ses", "cfg0", items.clone()), &spine());
+            assert_eq!(
+                r.action, "SOFT+",
+                "an unseeded-store defer must not oscillate back into a HARD"
+            );
+            assert_eq!(
+                m0_bytes(&r),
+                m0,
+                "m0 must stay byte-identical across defers"
+            );
+            assert_eq!(
+                m1_bytes(&r),
+                m1,
+                "m1 must stay byte-identical across defers"
+            );
+            assert_eq!(tail_ids(&r), vec!["a", "b"]);
+        }
+    }
+
+    #[test]
     fn bootstrap_with_a_compartment_summarizes_it_and_trims_the_covered_tail() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
