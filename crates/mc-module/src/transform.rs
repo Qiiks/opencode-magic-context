@@ -1049,6 +1049,25 @@ fn build_output(
     }
 
     let blocks_by_mid = projection_blocks_by_mid(projection);
+
+    // A synthetic-todo pair with no message anchor (anchor_mid == None) was composed when
+    // the tail was empty (every live message folded under coverage). It is frozen
+    // immediately AFTER the m0/m1 head blocks pushed above and BEFORE the tail loop below
+    // — emitting it HERE, not after that loop, is what keeps its position byte-stable:
+    // later tail growth appends after it, so the [m0, m1, pair] prefix stays identical on
+    // every subsequent defer pass. Emitting it after the loop would let the pair float to
+    // the end of a growing tail, changing the bytes of a cached prefix on every turn — the
+    // exact failure the position-freeze design prevents. (A None anchor also never
+    // relocates on a bust: reanchor_kept_synthetic_todo_if_folded early-returns on None, so
+    // the pair stays right after m0/m1 for its whole life until a Replace or Clear.)
+    if meta
+        .synthetic_todo
+        .as_ref()
+        .is_some_and(|pair| pair.anchor_mid.is_none())
+    {
+        push_synthetic_todo_pair(&mut out, meta);
+    }
+
     let mut inserted_synthetic_todo = false;
     // Tail messages are strictly after the coverage watermark. The outer loop is the
     // inbound message list, not the reduced-block map, so a live tail message with zero
@@ -1092,10 +1111,13 @@ fn build_output(
         }
     }
 
+    // A pair anchored to a real message must have been spliced inside the loop; if its
+    // anchor is absent from the current tail we fail loud rather than silently relocate
+    // (a bust folds the anchor via reanchor_kept_synthetic_todo_if_folded, so reaching
+    // here means the anchor vanished on a defer = a revert/drift invariant violation).
+    // The None-anchor case was already emitted before the loop, so it is not re-checked.
     if let Some(pair) = &meta.synthetic_todo {
-        if pair.anchor_mid.is_none() {
-            push_synthetic_todo_pair(&mut out, meta);
-        } else if !inserted_synthetic_todo {
+        if pair.anchor_mid.is_some() && !inserted_synthetic_todo {
             let mid = pair.anchor_mid.clone().unwrap_or_default();
             return Err(TransformError::SyntheticTodoAnchorMissing(mid));
         }
@@ -2707,6 +2729,88 @@ mod tests {
             "None anchor appends after m0/m1 when no real tail remains"
         );
         assert!(s.load("aged").unwrap().meta.synthetic_todo.is_some());
+    }
+
+    #[test]
+    fn synthetic_todo_none_anchor_stays_before_grown_tail_on_defer() {
+        // A pair frozen with anchor_mid = None (composed when the tail was empty) must be
+        // pinned immediately after m0/m1, NOT floated to the end. A later defer that grows
+        // the tail must leave the [m0, m1, pair] prefix byte-identical, with the new tail
+        // message landing AFTER the pair — otherwise the None-anchor path reintroduces the
+        // always-last floater the position-freeze exists to prevent.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("none-anchor", &[comp(1, 1, 2, "todo", "SUMMARY")])
+            .unwrap();
+        let todos = json!([{ "content": "Persisted", "status": "pending", "priority": "high" }]);
+        run(
+            &s,
+            &req(
+                "none-anchor",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call("todo", 2, todos.clone()),
+                ],
+            ),
+            &spine(),
+        );
+        // Force a HARD with an empty live tail so the composed pair freezes anchor_mid = None.
+        let loaded = s.load("none-anchor").unwrap();
+        let mut meta = loaded.meta;
+        meta.synthetic_todo = None;
+        meta.last_render_config = "force a hard".to_string();
+        s.commit("none-anchor", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let composed = run(
+            &s,
+            &req(
+                "none-anchor",
+                "cfg1",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call("todo", 2, todos.clone()),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(composed.action, "HARD");
+        assert_eq!(tail_ids(&composed), Vec::<&str>::new());
+        assert_eq!(synthetic_todo_index(&composed), 2);
+        assert!(
+            s.load("none-anchor")
+                .unwrap()
+                .meta
+                .synthetic_todo
+                .as_ref()
+                .unwrap()
+                .anchor_mid
+                .is_none(),
+            "the empty-tail compose must freeze anchor_mid = None"
+        );
+        let composed_prefix = prefix_through_synthetic_todo(&composed);
+
+        // A defer that appends a new tail message (ordinal 3, above coverage 2).
+        let defer = run(
+            &s,
+            &req(
+                "none-anchor",
+                "cfg1",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call("todo", 2, todos),
+                    item("t3", 3, "tail grew after the None-anchor compose"),
+                ],
+            ),
+            &spine(),
+        );
+
+        assert_eq!(defer.action, "SOFT+");
+        // The pair stays right after m0/m1; the new tail message lands AFTER it.
+        assert_eq!(synthetic_todo_index(&defer), 2);
+        assert!(message_index(&defer, "t3") > synthetic_todo_index(&defer));
+        // The whole [m0, m1, pair] prefix is byte-identical to the compose pass.
+        assert_eq!(prefix_through_synthetic_todo(&defer), composed_prefix);
     }
 
     #[test]
