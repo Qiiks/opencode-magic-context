@@ -431,17 +431,27 @@ fn apply_once(
         &live,
         loaded.meta.coverage_ordinal,
     );
+    // First-fold HARD trigger: a never-minted boundary (empty boundary_id) means no
+    // compartment has ever folded into m0 (the fold is what mints the boundary). Once the
+    // historian publishes the session's FIRST compartment, it cannot ride m1 as a SOFT
+    // delta — a SOFT delta requires the boundary to be present so the new compartment can
+    // splice onto it, and there is no boundary yet — so without this trigger it strands on
+    // defer forever. Force a HARD to fold it and mint the first boundary. Uses a presence
+    // check, NOT max_compartment_seq (which COALESCEs a missing MAX to 0, indistinguishable
+    // from a real first compartment at sequence 0). Self-limiting: the fold mints a
+    // non-empty boundary_id, so this is false on every subsequent pass and later publishes
+    // correctly ride m1 as a SOFT delta once the boundary is present. The store query runs
+    // only in this rare never-minted window (short-circuited by is_empty), never in steady
+    // state where the boundary is present.
+    let first_fold_due =
+        loaded.core.boundary_id.is_empty() && store.has_compartments(&req.session_id)?;
     let plan = classify(&ClassifierInput {
         initialized: loaded.meta.initialized,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
         valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
         render_config_changed: loaded.meta.initialized
             && effective_render_config != loaded.meta.last_render_config,
-        // No store-sourced HARD trigger yet: new compartments RIDE m1 as a SOFT delta and
-        // fold into m0 on the next natural HARD. A dedicated fold-on-publish trigger lands
-        // when the compartment write path moves in. For now all HARDs come from bootstrap,
-        // a render_config change, or a reconcile.
-        hard_fold_requested: false,
+        hard_fold_requested: first_fold_due,
         boundary_present,
         reconcile_pending: loaded.core.reconcile_pending,
         m1_revision_changed: current_m1_digest != loaded.meta.m1_revision,
@@ -1795,6 +1805,138 @@ mod tests {
             );
             assert_eq!(tail_ids(&r), vec!["a", "b"]);
         }
+    }
+
+    #[test]
+    fn first_compartment_published_after_empty_bootstrap_hard_folds_and_mints_boundary() {
+        // The production historian arc: a fresh session bootstraps EMPTY (boundary_id "" —
+        // never minted), runs turns, THEN the historian publishes the session's FIRST
+        // compartment mid-session. That publish cannot ride m1 as a SOFT delta (a SOFT delta
+        // needs the boundary present so the compartment can splice onto it, and none exists
+        // yet), so without the first-fold HARD trigger it would strand on defer forever. It
+        // must instead HARD-fold and MINT the first boundary.
+        //
+        // The first compartment is at SEQUENCE 0 on purpose: max_compartment_seq COALESCEs a
+        // missing MAX to 0 and folded_compartment_seq defaults to 0, so a seq-comparison
+        // trigger (max > folded) reads 0 > 0 = false and silently misses exactly this case.
+        // The presence-based guard (empty boundary + a compartment exists) catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+
+        // Pass 1: empty store, two live turns → bootstrap HARD, empty boundary, all tail.
+        let live1 = vec![item("a", 1, "<h>first</h>"), item("t2", 2, "turn two")];
+        let boot = run(&s, &req("ses", "cfg0", live1.clone()), &spine());
+        assert_eq!(boot.action, "HARD", "bootstrap HARD");
+        assert_eq!(boot.boundary_id, "", "boundary never minted yet");
+        assert_eq!(tail_ids(&boot), vec!["a", "t2"]);
+
+        // A defer before publish stays a pure defer (the empty-boundary no-oscillation path).
+        let pre = run(&s, &req("ses", "cfg0", live1.clone()), &spine());
+        assert_eq!(pre.action, "SOFT+", "no compartment yet → pure defer");
+
+        // The historian publishes the FIRST compartment at SEQUENCE 0, covering ordinal 1
+        // (raw message "a"). Same live array — "a" is still the raw covered message.
+        s.replace_compartments("ses", &[comp(0, 1, 1, "a", "S0-FIRST")])
+            .unwrap();
+        let fold = run(&s, &req("ses", "cfg0", live1.clone()), &spine());
+        assert_eq!(
+            fold.action, "HARD",
+            "first compartment after an empty bootstrap must HARD-fold, not strand on defer"
+        );
+        assert_eq!(
+            fold.boundary_id, "a#0",
+            "the fold MINTED the first boundary"
+        );
+        assert!(
+            m0_bytes(&fold).contains("S0-FIRST"),
+            "m0 now carries the folded summary: {}",
+            m0_bytes(&fold)
+        );
+        assert_eq!(
+            tail_ids(&fold),
+            vec!["t2"],
+            "covered ordinal 1 trimmed from tail"
+        );
+
+        // ONE-SHOT: with the boundary now minted, a defer stays a pure defer (NOT a repeated
+        // HARD) — the guard is self-limiting.
+        let defer = run(&s, &req("ses", "cfg0", live1), &spine());
+        assert_eq!(
+            defer.action, "SOFT+",
+            "post-fold the boundary is present → defer, never a repeated first-fold HARD"
+        );
+        assert!(!defer.committed, "a settled defer does not write");
+
+        // ONE-SHOT continued: a SECOND compartment publishes → it RIDES m1 as a SOFT delta
+        // (valid now that the boundary exists to splice onto), NOT another first-fold HARD.
+        s.replace_compartments(
+            "ses",
+            &[
+                comp(0, 1, 1, "a", "S0-FIRST"),
+                comp(1, 2, 2, "t2", "S1-SECOND"),
+            ],
+        )
+        .unwrap();
+        let second = run(
+            &s,
+            &req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 1, "<h>first</h>"),
+                    item("t2", 2, "turn two"),
+                    item("t3", 3, "turn three"),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(
+            second.action, "SOFT",
+            "a subsequent publish rides m1 SOFT — the first-fold HARD fires exactly once"
+        );
+        assert_eq!(second.boundary_id, "t2#0", "the SOFT advanced the anchor");
+        assert!(
+            m1_bytes(&second).contains("S1-SECOND"),
+            "{}",
+            m1_bytes(&second)
+        );
+    }
+
+    #[test]
+    fn first_fold_error_leaves_state_unchanged_and_the_hard_retries_visibly() {
+        // Fold-failure retry semantics: if the first-fold HARD fires and the fold itself
+        // errors, the transform returns Err and commits NOTHING, so the persisted boundary
+        // stays empty and the compartment stays present — meaning the next pass re-evaluates
+        // the same guard, fires the HARD again, and surfaces the SAME error. A persistent
+        // fold failure is therefore a stream of VISIBLE transform errors (fail-loud +
+        // retry-by-construction), never a silent defer that buries a stranded compartment.
+        //
+        // The injected failure is a real fail-loud path: a compartment that leaves a LEADING
+        // coverage gap (a live item ordinal-before the first covered ordinal) — compose
+        // refuses to drop live context it cannot account for.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // Compartment covers ordinals 5..=5, but the live array has ordinal 1 before it → gap.
+        s.replace_compartments("ses", &[comp(0, 5, 5, "m5", "S")])
+            .unwrap();
+        let live = vec![
+            item("early", 1, "before coverage"),
+            item("m5", 5, "covered"),
+        ];
+
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let first = transform(&s, &req("ses", "cfg0", live.clone()), &ctx, &spine());
+        assert!(
+            first.is_err(),
+            "first-fold HARD hits the leading-gap fail-loud path"
+        );
+        // The failed pass wrote nothing → the guard re-fires and errors again (visible), it
+        // does NOT silently fall through to a defer that strands the compartment.
+        let retry = transform(&s, &req("ses", "cfg0", live), &ctx, &spine());
+        assert!(
+            retry.is_err(),
+            "state unchanged after the failed fold → the HARD retries and stays visible"
+        );
     }
 
     #[test]

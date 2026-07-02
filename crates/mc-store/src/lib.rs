@@ -1141,6 +1141,25 @@ impl McStore {
         Ok(max)
     }
 
+    /// Whether the session has any compartment at all. This is a presence check, NOT a
+    /// count or a max-sequence read: `max_compartment_seq` COALESCEs a missing MAX to 0,
+    /// which is indistinguishable from a real first compartment at sequence 0, so it
+    /// cannot answer "does a compartment exist". The first-fold HARD trigger needs the
+    /// unambiguous existence answer (empty boundary + a compartment present => the first
+    /// fold is due), so this returns a true/false from `SELECT EXISTS` on the session
+    /// index — O(1), never touches the sequence value.
+    pub fn has_compartments(&self, session_id: &str) -> Result<bool, McStoreError> {
+        let exists = self.inner.with_conn(|conn| {
+            let v: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_compartments WHERE session_id = ?1)",
+                params![session_id],
+                |r| r.get(0),
+            )?;
+            Ok(v)
+        })?;
+        Ok(exists != 0)
+    }
+
     /// Replace a session's entire compartment set in one fenced transaction. The
     /// history producer republishes the full chronological set each time, so a
     /// wholesale delete-then-insert (rather than an incremental upsert) keeps the
