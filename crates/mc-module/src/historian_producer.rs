@@ -19,6 +19,12 @@ use subc_transport::{
 use tokio::net::TcpStream;
 
 const DEFAULT_LLM_RUNNER_MODULE_ID: &str = "llm-runner";
+
+/// Output budget for a historian summarization pass. llm-runner's default (4k) truncated
+/// a real 50k-input chunk mid-XML on the rig: a tiered compartment doc for a full chunk
+/// legitimately needs five figures. The provider clamps to its own per-model limit, so a
+/// generous request costs nothing unless the model actually generates that much.
+const HISTORIAN_MAX_OUTPUT_TOKENS: u32 = 32_000;
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -31,6 +37,10 @@ pub struct RunHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerOutput {
     pub text: String,
+    /// True when any unit in the run reported a length-class finish reason. The run
+    /// terminal can still say completed while a model step hit its output ceiling and
+    /// cut the text mid-document, so validation failures need this to self-diagnose.
+    pub length_capped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,6 +357,10 @@ impl HistorianProducer {
             json!({ "provider": provider, "model": model_name }),
         );
         params.insert("tools".into(), json!([]));
+        params.insert(
+            "generation".into(),
+            json!({ "max_output_tokens": HISTORIAN_MAX_OUTPUT_TOKENS }),
+        );
         if !system.is_empty() {
             params.insert("system".into(), json!(system));
         }
@@ -514,6 +528,7 @@ impl HistorianProducer {
     ) -> Result<ProducerOutput, HistorianProducerError> {
         let mut text = String::new();
         let mut last_run_started: Option<String> = None;
+        let mut length_capped = false;
         loop {
             let Some(frame) = read_frame(&mut self.stream).await? else {
                 return Err(HistorianProducerError::UnexpectedStreamEnd);
@@ -546,6 +561,9 @@ impl HistorianProducer {
                     if let Some(piece) = unit_text(unit) {
                         text.push_str(piece);
                     }
+                    if unit_is_length_capped(unit) {
+                        length_capped = true;
+                    }
                     if terminal {
                         if last_run_started.as_deref() != Some(run_id) {
                             return Err(HistorianProducerError::TerminalRunMismatch {
@@ -561,7 +579,10 @@ impl HistorianProducer {
                         }
                         // The run terminal control unit is authoritative. StreamEnd is only
                         // route mechanics and can appear on detach/resubscribe without ending a run.
-                        return Ok(ProducerOutput { text });
+                        return Ok(ProducerOutput {
+                            text,
+                            length_capped,
+                        });
                     }
                 }
                 FrameType::Error => {
@@ -725,6 +746,18 @@ fn is_run_started_unit(unit: &Value) -> bool {
     unit_type(unit)
         .map(str::to_ascii_lowercase)
         .is_some_and(|ty| ty == "run_started" || ty == "runstarted")
+}
+
+/// A length-class finish reason on ANY unit (step or terminal): providers spell it
+/// "length", "max_tokens", or "max_output_tokens" depending on the wire family.
+fn unit_is_length_capped(unit: &Value) -> bool {
+    unit.get("finish_reason")
+        .or_else(|| unit.get("finishReason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| {
+            let reason = reason.to_ascii_lowercase();
+            reason == "length" || reason == "max_tokens" || reason == "max_output_tokens"
+        })
 }
 
 fn is_paused_unit(unit: &Value) -> bool {
@@ -1010,6 +1043,11 @@ mod tests {
             "model is llm-runner's nested ModelParams object, split at the FIRST slash"
         );
         assert_eq!(log.sends[0]["tools"], json!([]));
+        assert_eq!(
+            log.sends[0]["generation"]["max_output_tokens"],
+            json!(HISTORIAN_MAX_OUTPUT_TOKENS),
+            "an explicit output budget rides every send: llm-runner's default truncated a real summarization pass"
+        );
         assert_eq!(
             log.sends[0]["system"],
             json!("role guidance"),

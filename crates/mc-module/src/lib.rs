@@ -1189,7 +1189,10 @@ mod tests {
                 .expect("outputs mutex")
                 .pop_front()
                 .unwrap_or_else(|| historian_output(1, 3, "reattached summary"));
-            Ok(ProducerOutput { text })
+            Ok(ProducerOutput {
+                text,
+                length_capped: false,
+            })
         }
 
         async fn status(&mut self, _run_id: &str) -> Result<RunState, HistorianProducerError> {

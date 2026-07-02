@@ -838,10 +838,19 @@ fn publish_output_from_awaiting(
     ) {
         Ok(validated) => validated,
         Err(err) => {
+            let cap_hint = if output.length_capped {
+                " [output hit the length cap: raise the output budget or shrink the chunk]"
+            } else {
+                ""
+            };
             persist_historian_state(
                 store,
                 session_id,
-                abandon(&validating, failure_backoff_at_ms),
+                abandon_with_detail(
+                    &validating,
+                    failure_backoff_at_ms,
+                    Some(format!("validate rejected: {err}{cap_hint}")),
+                ),
             )?;
             return Err(HistorianDriveError::Validation(err));
         }
@@ -1166,7 +1175,10 @@ mod tests {
     }
 
     fn producer_output(text: String) -> ProducerOutput {
-        ProducerOutput { text }
+        ProducerOutput {
+            text,
+            length_capped: false,
+        }
     }
 
     fn fire_request<'a>(
@@ -1521,6 +1533,39 @@ mod tests {
         assert!(
             detail.contains("producer output") && detail.contains("prov/model-a"),
             "durable failure detail names the phase and model: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_output_validation_reject_records_cap_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        // A document cut mid-XML with the length flag set, the exact shape a
+        // max-output-capped model step produces under a completed run terminal.
+        let mut truncated = producer_output(historian_xml("truncated summary"));
+        truncated.text.truncate(truncated.text.len() / 2);
+        truncated.length_capped = true;
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-cap")))
+            .with_output(Ok(truncated));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, HistorianDriveError::Validation(_)));
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        let detail = state.last_failure.expect("validate reject records detail");
+        assert!(
+            detail.contains("validate rejected") && detail.contains("length cap"),
+            "truncation self-diagnoses from the state dump: {detail}"
         );
     }
 
