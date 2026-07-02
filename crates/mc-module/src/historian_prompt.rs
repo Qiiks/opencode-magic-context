@@ -86,6 +86,13 @@ pub struct ReferenceBlocks {
     pub session_references: String,
 }
 
+/// The historian SYSTEM prompt constant, sent role-scoped via the producer's `system`
+/// field and never concatenated into the user prompt. The .txt is a vendored copy of
+/// the TypeScript plugin's generated historian prompt, kept byte-identical so both
+/// implementations drive the model with the same role guidance; the generator script
+/// in gen/ re-vendors it and its --check mode fails on drift.
+pub const HISTORIAN_SYSTEM_PROMPT: &str = include_str!("../testdata/historian-system-prompt.txt");
+
 pub struct CompartmentPromptInputs<'a> {
     pub seed_examples: &'a str,
     pub session_references: &'a str,

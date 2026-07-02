@@ -313,6 +313,7 @@ impl HistorianProducer {
     pub async fn start(
         &mut self,
         session_id: &str,
+        system: &str,
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError> {
@@ -320,13 +321,22 @@ impl HistorianProducer {
         let route = self.ensure_command_route().await?;
         // The route identity is the session. Keeping `session` out of this body avoids
         // a second, diverging source of truth for the run lineage.
+        //
+        // `system` rides the role-scoped SendParams.system field (delivered as a leading
+        // system message in the run's durable input, byte-exact) — NEVER concatenated
+        // into the user prompt: the historian's parse/validate contract assumes the
+        // model saw its role guidance as a system message. Empty means absent, matching
+        // the wire's empty-as-absent rule, so we omit the field entirely.
+        let mut params = serde_json::Map::new();
+        params.insert("prompt".into(), json!(prompt));
+        params.insert("model".into(), json!(model));
+        params.insert("tool_providers".into(), json!([]));
+        if !system.is_empty() {
+            params.insert("system".into(), json!(system));
+        }
         let body = json!({
             "method": "session.send",
-            "params": {
-                "prompt": prompt,
-                "model": model,
-                "tool_providers": []
-            }
+            "params": params
         });
         let response = self.unary_json(route, body).await?;
         let run_id = response
@@ -959,7 +969,7 @@ mod tests {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
         let mut client = client(&server).await;
         let handle = client
-            .start("mc-historian:proj:1", "prompt", "model-a")
+            .start("mc-historian:proj:1", "role guidance", "prompt", "model-a")
             .await
             .unwrap();
         assert_eq!(handle.run_id, "run-1");
@@ -975,7 +985,32 @@ mod tests {
         );
         assert_eq!(log.sends[0]["model"], json!("model-a"));
         assert_eq!(log.sends[0]["tool_providers"], json!([]));
+        assert_eq!(
+            log.sends[0]["system"],
+            json!("role guidance"),
+            "system rides the role-scoped SendParams field, byte-exact"
+        );
         assert_eq!(log.goodbyes, vec![10]);
+    }
+
+    #[tokio::test]
+    async fn start_omits_system_param_when_empty() {
+        // Empty means absent on the wire (the field's empty-as-absent rule); omitting it
+        // entirely keeps the send byte-shape identical to pre-system clients.
+        let server = fake_server(json!({"state":"active","run_id":"run-9"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:9", "", "prompt", "model-a")
+            .await
+            .unwrap();
+        client.close().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 1);
+        assert!(
+            log.sends[0].get("system").is_none(),
+            "empty system must be omitted, not sent as \"\""
+        );
     }
 
     #[tokio::test]
@@ -990,7 +1025,7 @@ mod tests {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
         let mut client = client(&server).await;
         client
-            .start("mc-historian:proj:2", "prompt", "model-a")
+            .start("mc-historian:proj:2", "", "prompt", "model-a")
             .await
             .unwrap();
         let output = client.await_output("run-1").await.unwrap();
@@ -1020,7 +1055,7 @@ mod tests {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
         let mut client = client(&server).await;
         client
-            .start("mc-historian:proj:3", "prompt", "model-a")
+            .start("mc-historian:proj:3", "", "prompt", "model-a")
             .await
             .unwrap();
 
@@ -1043,7 +1078,7 @@ mod tests {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
         let mut client = client(&server).await;
         client
-            .start("mc-historian:proj:4", "prompt", "model-a")
+            .start("mc-historian:proj:4", "", "prompt", "model-a")
             .await
             .unwrap();
 

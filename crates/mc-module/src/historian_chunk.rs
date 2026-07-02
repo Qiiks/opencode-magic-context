@@ -423,6 +423,10 @@ impl AssembledHistorianFiring {
             session_id,
             project_path,
             project_slug,
+            // The role-scoped historian system prompt. The assembler builds the USER
+            // prompt (chunk + references); the system prompt is the vendored constant —
+            // per-firing static, byte-identical across firings.
+            system: crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT,
             prompt: &self.prompt,
             model_chain: &self.model_chain,
             from_ordinal: self.from_ordinal,

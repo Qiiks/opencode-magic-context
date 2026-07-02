@@ -469,6 +469,7 @@ pub trait HistorianProducerDriver {
     async fn start(
         &mut self,
         session_id: &str,
+        system: &str,
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError>;
@@ -491,10 +492,11 @@ impl HistorianProducerDriver for HistorianProducer {
     async fn start(
         &mut self,
         session_id: &str,
+        system: &str,
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError> {
-        HistorianProducer::start(self, session_id, prompt, model).await
+        HistorianProducer::start(self, session_id, system, prompt, model).await
     }
 
     async fn await_output(
@@ -522,6 +524,9 @@ pub struct HistorianFireRequest<'a> {
     pub session_id: &'a str,
     pub project_path: &'a str,
     pub project_slug: &'a str,
+    /// The role-scoped historian SYSTEM prompt (HISTORIAN_SYSTEM_PROMPT). Sent via the
+    /// producer's `system` field, never concatenated into `prompt`. Empty means absent.
+    pub system: &'a str,
     pub prompt: &'a str,
     pub model_chain: &'a [String],
     pub from_ordinal: u64,
@@ -599,7 +604,7 @@ where
         let producer_session_id =
             historian_producer_session_id(request.project_slug, fired.firing_seq);
         let handle = match producer
-            .start(&producer_session_id, request.prompt, model)
+            .start(&producer_session_id, request.system, request.prompt, model)
             .await
         {
             Ok(handle) => handle,
@@ -1059,6 +1064,7 @@ mod tests {
         statuses: VecDeque<Result<RunState, HistorianProducerError>>,
         observed_starts: Vec<(String, String)>,
         observed_sessions: Vec<String>,
+        observed_systems: Vec<String>,
         await_run_ids: Vec<String>,
         cancels: Vec<String>,
         closes: usize,
@@ -1091,10 +1097,12 @@ mod tests {
         async fn start(
             &mut self,
             session_id: &str,
+            system: &str,
             _prompt: &str,
             model: &str,
         ) -> Result<RunHandle, HistorianProducerError> {
             self.observed_sessions.push(session_id.to_string());
+            self.observed_systems.push(system.to_string());
             self.observed_starts
                 .push((session_id.to_string(), model.to_string()));
             self.starts
@@ -1150,6 +1158,7 @@ mod tests {
             session_id: "ses",
             project_path: "git:proj",
             project_slug: "proj",
+            system: "role guidance",
             prompt,
             model_chain: models,
             from_ordinal: 2,
@@ -1226,6 +1235,12 @@ mod tests {
         assert_eq!(success.producer_session_id, "mc-historian:proj:1");
         assert_eq!(producer.observed_starts.len(), 1);
         assert_eq!(producer.observed_starts[0].0, "mc-historian:proj:1");
+        assert_eq!(
+            producer.observed_systems,
+            vec!["role guidance".to_string()],
+            "exactly ONE send carries the system prompt; a reattach path never re-sends \
+             (system rides the run's durable input, re-drained not re-sent)"
+        );
         assert_eq!(producer.await_run_ids, vec!["run-1"]);
 
         let loaded = main_store.load("ses").unwrap();
