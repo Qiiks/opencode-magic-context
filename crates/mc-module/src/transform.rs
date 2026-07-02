@@ -591,7 +591,7 @@ fn apply_once(
         }
     }
 
-    advance_synthetic_todo(&mut meta, is_bust_pass, req);
+    advance_synthetic_todo(&mut meta, is_bust_pass, loaded.meta.coverage_ordinal, req)?;
 
     let result_action = action_str(&plan, &core);
 
@@ -945,7 +945,41 @@ fn tail_end_mid(req: &TransformRequest, coverage: Option<u64>) -> Option<String>
         .map(|msg| msg.mid.clone())
 }
 
-fn advance_synthetic_todo(meta: &mut ModuleMeta, is_bust_pass: bool, req: &TransformRequest) {
+fn tail_contains_mid(req: &TransformRequest, coverage: Option<u64>, mid: &str) -> bool {
+    req.messages
+        .iter()
+        .any(|msg| !msg.ck.meta.synthetic && msg.mid == mid && is_tail(msg.ordinal, coverage))
+}
+
+fn coverage_advanced(old: Option<u64>, new: Option<u64>) -> bool {
+    match (old, new) {
+        (Some(old), Some(new)) => new > old,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+fn anchor_folded_by_coverage(
+    req: &TransformRequest,
+    old_coverage: Option<u64>,
+    new_coverage: Option<u64>,
+    anchor_mid: &str,
+) -> bool {
+    coverage_advanced(old_coverage, new_coverage)
+        && req.messages.iter().any(|msg| {
+            !msg.ck.meta.synthetic
+                && msg.mid == anchor_mid
+                && is_tail(msg.ordinal, old_coverage)
+                && !is_tail(msg.ordinal, new_coverage)
+        })
+}
+
+fn advance_synthetic_todo(
+    meta: &mut ModuleMeta,
+    is_bust_pass: bool,
+    old_coverage: Option<u64>,
+    req: &TransformRequest,
+) -> Result<(), TransformError> {
     let existing = meta.synthetic_todo.clone();
     let outcome = advance_injection_from_meta(meta, existing.as_ref(), is_bust_pass);
     match outcome {
@@ -954,8 +988,41 @@ fn advance_synthetic_todo(meta: &mut ModuleMeta, is_bust_pass: bool, req: &Trans
             meta.synthetic_todo = Some((*next).freeze_at(anchor_mid));
         }
         InjectionOutcome::Clear => meta.synthetic_todo = None,
-        InjectionOutcome::Keep | InjectionOutcome::None => {}
+        InjectionOutcome::Keep => {
+            if is_bust_pass {
+                reanchor_kept_synthetic_todo_if_folded(meta, old_coverage, req)?;
+            }
+        }
+        InjectionOutcome::None => {}
     }
+    Ok(())
+}
+
+fn reanchor_kept_synthetic_todo_if_folded(
+    meta: &mut ModuleMeta,
+    old_coverage: Option<u64>,
+    req: &TransformRequest,
+) -> Result<(), TransformError> {
+    let Some(pair) = meta.synthetic_todo.as_mut() else {
+        return Ok(());
+    };
+    let Some(anchor_mid) = pair.anchor_mid.clone() else {
+        return Ok(());
+    };
+    if tail_contains_mid(req, meta.coverage_ordinal, &anchor_mid) {
+        return Ok(());
+    }
+    if !anchor_folded_by_coverage(req, old_coverage, meta.coverage_ordinal, &anchor_mid) {
+        return Err(TransformError::SyntheticTodoAnchorMissing(anchor_mid));
+    }
+
+    // A coverage-advancing bust already changes the rendered m1 bytes and removes the
+    // covered leading tail, so moving an unchanged synthetic todo to the new tail end
+    // rides that unavoidable cache break. The guard above prevents this from becoming
+    // an always-last floater on ordinary tail growth or defer passes.
+    debug_assert!(coverage_advanced(old_coverage, meta.coverage_ordinal));
+    pair.anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
+    Ok(())
 }
 
 fn push_synthetic_todo_pair(out: &mut Vec<CkWireMessage>, meta: &ModuleMeta) {
@@ -2387,6 +2454,127 @@ mod tests {
         assert!(message_index(&second, "later") > synthetic_todo_index(&second) + 1);
         assert_eq!(synthetic_todo_pair_bytes(&second), first_pair);
         assert_eq!(prefix_through_synthetic_todo(&second), first_prefix);
+        assert_eq!(
+            s.load("keep")
+                .unwrap()
+                .meta
+                .synthetic_todo
+                .as_ref()
+                .and_then(|pair| pair.anchor_mid.as_deref()),
+            Some("todo")
+        );
+    }
+
+    #[test]
+    fn synthetic_todo_keep_reanchors_when_coverage_advance_folds_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("keep-fold", &[comp(1, 1, 1, "a", "SUMMARY-1")])
+            .unwrap();
+        let todos = json!([{ "content": "Fold", "status": "pending", "priority": "high" }]);
+        let first = run(
+            &s,
+            &req(
+                "keep-fold",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call("todo", 2, todos.clone()),
+                ],
+            ),
+            &spine(),
+        );
+        let first_pair = synthetic_todo_pair_bytes(&first);
+        let first_call_id = synthetic_todo_call_id(&first);
+
+        s.replace_compartments(
+            "keep-fold",
+            &[
+                comp(1, 1, 1, "a", "SUMMARY-1"),
+                comp(2, 2, 2, "todo", "SUMMARY-2"),
+            ],
+        )
+        .unwrap();
+        let moved = run(
+            &s,
+            &req(
+                "keep-fold",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call("todo", 2, todos),
+                    item("t3", 3, "new tail end"),
+                ],
+            ),
+            &spine(),
+        );
+
+        assert_eq!(moved.action, "SOFT");
+        assert_eq!(synthetic_todo_call_id(&moved), first_call_id);
+        assert_eq!(synthetic_todo_pair_bytes(&moved), first_pair);
+        assert_eq!(
+            synthetic_todo_index(&moved),
+            message_index(&moved, "t3") + 1
+        );
+        assert_eq!(
+            s.load("keep-fold")
+                .unwrap()
+                .meta
+                .synthetic_todo
+                .as_ref()
+                .and_then(|pair| pair.anchor_mid.as_deref()),
+            Some("t3")
+        );
+    }
+
+    #[test]
+    fn synthetic_todo_defer_after_keep_reanchor_replays_at_new_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("keep-fold-defer", &[comp(1, 1, 1, "a", "SUMMARY-1")])
+            .unwrap();
+        let todos = json!([{ "content": "Fold defer", "status": "pending", "priority": "high" }]);
+        run(
+            &s,
+            &req(
+                "keep-fold-defer",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call("todo", 2, todos.clone()),
+                ],
+            ),
+            &spine(),
+        );
+
+        s.replace_compartments(
+            "keep-fold-defer",
+            &[
+                comp(1, 1, 1, "a", "SUMMARY-1"),
+                comp(2, 2, 2, "todo", "SUMMARY-2"),
+            ],
+        )
+        .unwrap();
+        let moved_items = vec![
+            item("a", 1, "raw"),
+            todowrite_call("todo", 2, todos),
+            item("t3", 3, "new tail end"),
+        ];
+        let moved = run(
+            &s,
+            &req("keep-fold-defer", "cfg0", moved_items.clone()),
+            &spine(),
+        );
+        let moved_prefix = prefix_through_synthetic_todo(&moved);
+
+        let defer = run(&s, &req("keep-fold-defer", "cfg0", moved_items), &spine());
+
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(
+            synthetic_todo_index(&defer),
+            message_index(&defer, "t3") + 1
+        );
+        assert_eq!(prefix_through_synthetic_todo(&defer), moved_prefix);
     }
 
     #[test]
