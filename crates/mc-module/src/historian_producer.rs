@@ -591,10 +591,13 @@ pub fn cursor_param(cursor: Option<&str>) -> Value {
 }
 
 pub fn cursor_to_opaque_string(cursor: &Value) -> Option<String> {
+    // Always JSON-encode, INCLUDING string cursors. cursor_param re-parses the stored
+    // token with serde_json::from_str, so storing a scalar string bare (e.g. `123` or
+    // `true`) would round-trip back as a JSON number/bool and change the cursor's type
+    // on resubscribe. Encoding every value symmetrically keeps the cursor truly opaque:
+    // whatever llm-runner emitted is re-presented byte-for-byte on the wire.
     if cursor.is_null() {
         None
-    } else if let Some(s) = cursor.as_str() {
-        Some(s.to_string())
     } else {
         serde_json::to_string(cursor).ok()
     }
@@ -993,5 +996,17 @@ mod tests {
         let stored = cursor_to_opaque_string(&cursor).unwrap();
         assert_eq!(cursor_param(Some(&stored)), cursor);
         assert_eq!(cursor_param(Some("opaque-token")), json!("opaque-token"));
+
+        // A STRING cursor whose text looks numeric/bool must stay a string across the
+        // store→re-present round-trip. Storing it bare would let cursor_param's from_str
+        // reparse it as a number/bool and change the cursor's type on resubscribe.
+        for scalar_string in [json!("123"), json!("true"), json!("null"), json!("")] {
+            let stored = cursor_to_opaque_string(&scalar_string).unwrap();
+            assert_eq!(
+                cursor_param(Some(&stored)),
+                scalar_string,
+                "opaque string cursor changed type on round-trip"
+            );
+        }
     }
 }

@@ -665,7 +665,10 @@ where
             }
         };
 
-        let row_version = publish_output_from_awaiting(PublishOutputRequest {
+        // Always release both routes, whether publish succeeds or the validate/publish
+        // path errors out — an early `?` return here would leak the command + subscribe
+        // routes for this firing on the shared consumer connection.
+        let publish_result = publish_output_from_awaiting(PublishOutputRequest {
             store: request.store,
             session_id: request.session_id,
             project_path: request.project_path,
@@ -678,8 +681,9 @@ where
             publication_floor_ordinal: request.publication_floor_ordinal,
             created_at_ms: request.now_ms,
             failure_backoff_at_ms: request.failure_backoff_at_ms,
-        })?;
+        });
         producer.close().await;
+        let row_version = publish_result?;
         return Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
             row_version,
             producer_session_id,
@@ -767,7 +771,9 @@ where
         }
     };
 
-    let row_version = publish_output_from_awaiting(PublishOutputRequest {
+    // Always release both routes, whether publish succeeds or errors — an early `?`
+    // return would leak the command + subscribe routes for this reattached firing.
+    let publish_result = publish_output_from_awaiting(PublishOutputRequest {
         store: request.store,
         session_id: request.session_id,
         project_path: request.project_path,
@@ -780,8 +786,9 @@ where
         publication_floor_ordinal: request.publication_floor_ordinal,
         created_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
-    })?;
+    });
     producer.close().await;
+    let row_version = publish_result?;
     Ok(HistorianReattachOutcome::Published(HistorianRunSuccess {
         row_version,
         producer_session_id,
@@ -856,7 +863,12 @@ fn publish_output_from_awaiting(
     let publishing = validation_ok(&validating)?;
     persist_historian_state(store, session_id, publishing.clone())?;
     let predicate = publish_predicate(&publishing)?;
-    verify_chunk_fingerprint(&predicate.chunk_fingerprint, observed_chunk_fingerprint)?;
+    // The commit-point fingerprint re-check lives INSIDE publish_validated_chunk, which
+    // abandons the matching firing (resetting the state to Idle+backoff) before returning
+    // the mismatch error. A separate pre-check here would compare the same fingerprints
+    // WITHOUT that abandon, so a mismatch would return early and strand the state in
+    // Publishing forever — a wedged historian that never refires. Rely on the internal
+    // guard as the single source of the check.
     let loaded = store.load(session_id)?;
     let published = publish_validated_chunk(
         store,
@@ -1472,6 +1484,109 @@ mod tests {
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
         assert_eq!(state.failure_backoff_at_ms, Some(999));
+    }
+
+    #[tokio::test]
+    async fn reattach_fingerprint_mismatch_recovers_to_idle_and_releases_routes() {
+        // A tail that changed under the historian makes the observed fingerprint differ
+        // from the frozen one at publish time. The mismatch must abandon the firing back
+        // to Idle (single source of the check lives inside publish_validated_chunk) — the
+        // historian must NOT wedge in Publishing — and both routes must be released.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 1).unwrap() {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => unreachable!(),
+        };
+        let awaiting = producer_cursor_updated(
+            &producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap(),
+            "cursor-resume".into(),
+        )
+        .unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &ModuleMeta {
+                    historian: awaiting,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal {
+                head: Some("head".into()),
+            }))
+            .with_output(Ok(producer_output(historian_xml(
+                "summary for a changed tail",
+            ))));
+
+        // observed fingerprint diverges from the stored "fp" — a tail change since firing.
+        let request = HistorianReattachRequest {
+            store: &store,
+            session_id: "ses",
+            project_path: "git:proj",
+            observed_chunk_fingerprint: "fp-changed",
+            validation_chunk: &chunk,
+            prior_compartments: &prior,
+            validate_options: validate_options(),
+            publication_floor_ordinal: 4,
+            now_ms: 123,
+            failure_backoff_at_ms: 999,
+        };
+        let err = reattach_historian_producer(&mut producer, request)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            HistorianDriveError::State(HistorianStateError::FingerprintMismatch { .. })
+        ));
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            state.state,
+            HistorianPhase::Idle,
+            "fingerprint mismatch must recover to Idle, never wedge in Publishing"
+        );
+        assert_eq!(state.failure_backoff_at_ms, Some(999));
+        assert!(
+            producer.closes >= 1,
+            "routes must be released on the error path"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_path_validation_rejection_releases_routes() {
+        // A publish/validate failure on the fresh firing path must still release the
+        // producer routes — an early `?` return before close would leak them.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["model-a".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(
+                "not a valid historian document".to_string(),
+            )));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, HistorianDriveError::Validation(_)));
+        assert_eq!(
+            producer.closes, 1,
+            "the route must be closed even when validate/publish errors out"
+        );
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
     }
 
     #[test]
