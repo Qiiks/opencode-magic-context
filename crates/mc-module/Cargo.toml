@@ -19,6 +19,8 @@ mc-store = { workspace = true }
 mc-tokenizer = { path = "../mc-tokenizer" }
 cortexkit-store-types = { workspace = true }
 subc-protocol = { workspace = true }
+subc-control = { workspace = true }
+subc-transport = { workspace = true }
 subc-client-rs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -600,6 +600,11 @@ pub struct HistorianDurableState {
     pub producer_session_id: Option<String>,
     #[serde(default)]
     pub producer_run_id: Option<String>,
+    /// Last cursor position from the llm-runner subscription that has been durably
+    /// processed for the current run. Magic Context stores and returns this value
+    /// without parsing its contents.
+    #[serde(default)]
+    pub producer_cursor: Option<String>,
     #[serde(default)]
     pub fired_at_ms: Option<i64>,
     #[serde(default)]
@@ -615,6 +620,7 @@ impl Default for HistorianDurableState {
             chunk_fingerprint: String::new(),
             producer_session_id: None,
             producer_run_id: None,
+            producer_cursor: None,
             fired_at_ms: None,
             failure_backoff_at_ms: None,
         }
@@ -2570,6 +2576,7 @@ mod tests {
                 chunk_fingerprint: "fp".into(),
                 producer_session_id: Some("producer-session".into()),
                 producer_run_id: Some("run-1".into()),
+                producer_cursor: None,
                 fired_at_ms: Some(123),
                 failure_backoff_at_ms: Some(456),
             },

@@ -405,8 +405,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
+ "subc-control",
  "subc-core",
  "subc-protocol",
+ "subc-transport",
  "tempfile",
  "tokio",
 ]
