@@ -222,12 +222,25 @@ pub struct TransformResponse {
     pub ck_messages: Vec<CkWireMessage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HistorianDiagnostics {
     pub fired: bool,
     pub reason: Option<String>,
     pub no_fire: Option<String>,
     pub state: String,
+    /// Tail-size progress numbers from the trigger's boundary resolution, absent when the
+    /// pass never reached boundary resolution (busy, load failure, no messages). Purely
+    /// observational: lets a rig drive see eligible content approach the fire bar per pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<HistorianTriggerProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HistorianTriggerProgress {
+    pub eligible_chunk_tokens: f64,
+    pub tail_size_bar: f64,
+    pub protected_tail_n_tokens: f64,
+    pub protected_start_ordinal: u64,
 }
 
 pub struct TransformWithProjection {

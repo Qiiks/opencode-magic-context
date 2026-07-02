@@ -328,6 +328,24 @@ pub struct TriggerDecision {
     /// The exact boundary snapshot that produced a fire decision. The assembler consumes
     /// this object directly so the trigger and chunk snapshot cannot resolve different ranges.
     pub boundary: Option<BoundaryResolution>,
+    /// Progress toward the tail_size bar, present whenever a boundary was resolved (fire or
+    /// not). Diagnostics-only: rendering it must never influence the decision itself.
+    pub progress: Option<TriggerProgress>,
+}
+
+/// Why the trigger did or did not fire, in numbers. Surfaced through the transform
+/// response's historian diagnostics so a stalled rig drive is diagnosable per pass
+/// (eligible content vs the bar, and how much tail the protected boundary is holding back).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerProgress {
+    /// TC-chunked tokens in the eligible head (what tail_size compares against the bar).
+    pub eligible_chunk_tokens: f64,
+    /// The tail_size fire bar (trigger_budget x multiplier).
+    pub tail_size_bar: f64,
+    /// Protected-tail token target N; shrinks as usage grows.
+    pub n_tokens: f64,
+    /// First protected ordinal (eligible head ends here).
+    pub protected_start_ordinal: u64,
 }
 
 /// Flatten grouped messages to the block-level form used by chunk measurement.
@@ -650,6 +668,12 @@ pub fn check_compartment_trigger(
             commit_cluster_count: 0,
         }
     };
+    let progress = TriggerProgress {
+        eligible_chunk_tokens: chunk.tokens,
+        tail_size_bar: trigger_budget * TAIL_SIZE_TRIGGER_MULTIPLIER,
+        n_tokens: boundary.n_tokens,
+        protected_start_ordinal: boundary.protected_start_ordinal,
+    };
     let is_meaningful = chunk.has_more
         || boundary.true_raw_eligible_tokens >= MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE
         || chunk.tokens >= MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE
@@ -662,10 +686,10 @@ pub fn check_compartment_trigger(
             .projected_post_drop_percentage
             .is_some_and(|pct| pct <= relative_post_drop_target)
         {
-            return no_fire();
+            return no_fire_with_progress(progress);
         }
         if has_runnable_compartment_window(&boundary, ctx.boundary.usage_percentage, None) {
-            return fire(TriggerReason::Force80, &boundary);
+            return fire_with_progress(TriggerReason::Force80, &boundary, progress);
         }
         let scale = if ctx.boundary.usage_percentage >= BLOCK_UNTIL_DONE_PERCENTAGE {
             0.25
@@ -680,42 +704,42 @@ pub fn check_compartment_trigger(
             ctx.boundary.usage_percentage,
             Some(scale),
         ) {
-            return fire(TriggerReason::Force80, &scaled_boundary);
+            return fire_with_progress(TriggerReason::Force80, &scaled_boundary, progress);
         }
-        return no_fire();
+        return no_fire_with_progress(progress);
     }
 
     if ctx.commit_cluster_trigger_enabled
         && chunk.commit_cluster_count >= ctx.min_commit_clusters
         && chunk.tokens >= trigger_budget
     {
-        return fire(TriggerReason::CommitClusters, &boundary);
+        return fire_with_progress(TriggerReason::CommitClusters, &boundary, progress.clone());
     }
 
     if chunk.tokens >= trigger_budget * TAIL_SIZE_TRIGGER_MULTIPLIER
         || (chunk.has_more && chunk.tokens > 0.0)
     {
-        return fire(TriggerReason::TailSize, &boundary);
+        return fire_with_progress(TriggerReason::TailSize, &boundary, progress);
     }
 
     let proactive_trigger_percentage =
         get_proactive_compartment_trigger_percentage(ctx.boundary.execute_threshold_percentage);
     if ctx.boundary.usage_percentage < proactive_trigger_percentage {
-        return no_fire();
+        return no_fire_with_progress(progress);
     }
 
     if ctx
         .projected_post_drop_percentage
         .is_some_and(|pct| pct <= relative_post_drop_target)
     {
-        return no_fire();
+        return no_fire_with_progress(progress);
     }
 
     if !has_protected_eligible_head || !is_meaningful {
-        return no_fire();
+        return no_fire_with_progress(progress);
     }
 
-    fire(TriggerReason::ProjectedHeadroom, &boundary)
+    fire_with_progress(TriggerReason::ProjectedHeadroom, &boundary, progress)
 }
 
 fn no_fire() -> TriggerDecision {
@@ -724,6 +748,14 @@ fn no_fire() -> TriggerDecision {
         reason: None,
         consume_through_ordinal: None,
         boundary: None,
+        progress: None,
+    }
+}
+
+fn no_fire_with_progress(progress: TriggerProgress) -> TriggerDecision {
+    TriggerDecision {
+        progress: Some(progress),
+        ..no_fire()
     }
 }
 
@@ -738,6 +770,18 @@ fn fire(reason: TriggerReason, boundary: &BoundaryResolution) -> TriggerDecision
         reason: Some(reason),
         consume_through_ordinal,
         boundary: Some(boundary.clone()),
+        progress: None,
+    }
+}
+
+fn fire_with_progress(
+    reason: TriggerReason,
+    boundary: &BoundaryResolution,
+    progress: TriggerProgress,
+) -> TriggerDecision {
+    TriggerDecision {
+        progress: Some(progress),
+        ..fire(reason, boundary)
     }
 }
 

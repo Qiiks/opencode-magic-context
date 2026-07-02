@@ -445,6 +445,7 @@ impl McHandler {
                     reason: None,
                     no_fire: Some(format!("state_load_failed:{e}")),
                     state: "unknown".to_string(),
+                    progress: None,
                 }
             }
         };
@@ -460,6 +461,7 @@ impl McHandler {
                 reason: None,
                 no_fire: Some("busy".to_string()),
                 state,
+                progress: None,
             };
         }
         if loaded.meta.historian.state != HistorianPhase::Idle {
@@ -477,6 +479,7 @@ impl McHandler {
                 reason: None,
                 no_fire: Some(no_fire.to_string()),
                 state,
+                progress: None,
             };
         }
         let cfg = self.effective_config(&binding.project_root);
@@ -506,6 +509,15 @@ impl McHandler {
                 min_commit_clusters: DEFAULT_MIN_COMMIT_CLUSTERS,
             },
         );
+        let progress = trigger
+            .progress
+            .as_ref()
+            .map(|p| transform::HistorianTriggerProgress {
+                eligible_chunk_tokens: p.eligible_chunk_tokens,
+                tail_size_bar: p.tail_size_bar,
+                protected_tail_n_tokens: p.n_tokens,
+                protected_start_ordinal: p.protected_start_ordinal,
+            });
         if !trigger.fire {
             return HistorianDiagnostics {
                 fired: false,
@@ -516,6 +528,7 @@ impl McHandler {
                     "busy".to_string()
                 }),
                 state,
+                progress,
             };
         }
         if cfg.model_chain.is_empty() {
@@ -524,6 +537,7 @@ impl McHandler {
                 reason: trigger.reason.map(|r| r.as_str().to_string()),
                 no_fire: Some("no_models".to_string()),
                 state,
+                progress: progress.clone(),
             };
         }
         let Some(boundary) = trigger.boundary.clone() else {
@@ -532,6 +546,7 @@ impl McHandler {
                 reason: None,
                 no_fire: Some("missing_boundary".to_string()),
                 state,
+                progress: progress.clone(),
             };
         };
         let live: Vec<_> = projection
@@ -568,6 +583,7 @@ impl McHandler {
                     reason: trigger.reason.map(|r| r.as_str().to_string()),
                     no_fire: Some(format!("assemble:{reason:?}")),
                     state,
+                    progress: progress.clone(),
                 }
             }
             Err(e) => {
@@ -576,6 +592,7 @@ impl McHandler {
                     reason: trigger.reason.map(|r| r.as_str().to_string()),
                     no_fire: Some(format!("assemble_failed:{e}")),
                     state,
+                    progress: progress.clone(),
                 }
             }
         };
@@ -590,6 +607,7 @@ impl McHandler {
                     reason: trigger.reason.map(|r| r.as_str().to_string()),
                     no_fire: Some("busy".to_string()),
                     state,
+                    progress: progress.clone(),
                 };
             }
             SessionSetGuard {
@@ -611,6 +629,7 @@ impl McHandler {
             reason: trigger.reason.map(|r| r.as_str().to_string()),
             no_fire: None,
             state,
+            progress,
         }
     }
 
@@ -1556,6 +1575,12 @@ mod tests {
         assert_eq!(with_historian["action"], "SOFT+");
         assert_eq!(with_historian["historian"]["no_fire"], "no_models");
         assert!(with_historian["historian"]["reason"].is_string());
+        // Progress numbers surface on every boundary-resolving pass so a stalled rig
+        // drive can watch eligible content approach the fire bar.
+        let progress = &with_historian["historian"]["progress"];
+        assert!(progress["tail_size_bar"].as_f64().unwrap() > 0.0);
+        assert!(progress["protected_tail_n_tokens"].as_f64().unwrap() > 0.0);
+        assert!(progress["eligible_chunk_tokens"].is_number());
 
         let req: TransformRequest = serde_json::from_value(request(messages)).unwrap();
         let project_path = handler.resolve_binding(7, "ses").unwrap().project_root;
