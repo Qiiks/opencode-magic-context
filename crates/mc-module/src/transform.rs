@@ -518,21 +518,24 @@ fn apply_once(
                 }
             }
 
-            // Mint-absent guard (fresh mints only): when this fold takes its anchor from a
-            // compartment (coverage present), the minted boundary must be a block id that
-            // exists in the live input THIS pass — the anchor is the last covered block,
-            // which the producer always sends (trimming happens in our OUTPUT, and a
-            // producer-side coverage trim keeps ordinals >= coverage_ordinal, so the
-            // boundary block itself is never trimmed away). An empty or absent mint means
-            // the compartment's end_message_id is empty or in the wrong vocabulary (it
-            // must be the flat block id `<mid>#<index>`, not a bare message id): such an
-            // anchor can NEVER be present on any later pass, so reconcile can never clear
-            // and every pass re-materializes — an unbounded phantom-HARD loop. Fail loud
-            // instead. A reconcile-rematerialize is excluded: it re-mints while the
-            // boundary is legitimately absent (a revert removed it), which is exactly its
-            // job — and a bad-vocabulary anchor can only ENTER via a fresh mint, where
-            // this guard already caught it.
-            if !loaded.core.reconcile_pending && comp.coverage_ordinal.is_some() {
+            // Mint-absent guard: when this fold takes its anchor from a compartment
+            // (coverage present), the minted boundary must be a block id that exists in
+            // the live input THIS pass — the anchor is the last covered block, which the
+            // producer always sends (trimming happens in our OUTPUT, and a producer-side
+            // coverage trim keeps ordinals >= coverage_ordinal, so the boundary block
+            // itself is never trimmed away). An empty or absent mint means either the
+            // compartment's end_message_id is empty or in the wrong vocabulary (it must
+            // be the flat block id `<mid>#<index>`, not a bare message id), or the store
+            // still covers messages a revert removed and has not been re-cut. Committing
+            // such an anchor makes presence impossible on every later pass, so reconcile
+            // can never clear and every pass re-materializes — an unbounded phantom-HARD
+            // loop serving summaries of content that may no longer exist. Fail loud
+            // instead, on EVERY hard including a reconcile-rematerialize: a rematerialize
+            // that cannot mint a presentable anchor has no path to clearing reconcile
+            // either, and the loud error repeats until the store is re-cut. A revert that
+            // clears the compartments entirely stays legitimate: coverage is then None
+            // and the fold mints the reserved empty anchor without entering this guard.
+            if comp.coverage_ordinal.is_some() {
                 let minted = comp.boundary_id.as_str();
                 if minted.is_empty() || !live.iter().any(|i| i.id() == minted) {
                     return Err(TransformError::BoundaryNotPresent(format!(
@@ -2062,10 +2065,9 @@ mod tests {
 
     #[test]
     fn reconcile_rematerialize_after_revert_is_not_blocked_by_the_mint_guard() {
-        // The exclusion arm: a reconcile-rematerialize legitimately re-mints while the
-        // boundary is absent (a revert removed it) — the guard must NOT fire there. The
-        // historian re-cuts compartments after a revert, so the rematerialize composes
-        // from the re-cut store; here the re-cut store still has a compartment whose
+        // A reconcile-rematerialize composes from the RE-CUT store (the historian re-cuts
+        // compartments after a revert), so its minted anchor is presentable again and the
+        // mint guard must not false-fire. Here the re-cut store keeps a compartment whose
         // anchor IS present in the post-revert live array (partial revert: the covered
         // head survived, only the tail past it reverted).
         let dir = tempfile::tempdir().unwrap();
@@ -2100,6 +2102,58 @@ mod tests {
         assert_eq!(remat.boundary_id, "a#0", "re-minted from the re-cut store");
         assert!(!remat.reconcile_pending);
         assert_eq!(tail_ids(&remat), vec!["t4"]);
+    }
+
+    #[test]
+    fn reconcile_rematerialize_with_unrecut_store_fails_loud_not_a_silent_hard_loop() {
+        // The reconcile path is NOT exempt from the mint guard: if a revert removed the
+        // boundary but the store was never re-cut (it still covers the reverted-away
+        // messages), the rematerialize would re-mint the same absent anchor — committing
+        // it yields a byte-identical HARD every pass forever, silently serving summaries
+        // of content that no longer exists. The guard must fail the rematerialize loudly
+        // on every attempt until the store is re-cut. This also covers bad state persisted
+        // by an earlier writer: any reconcile re-mint of an unpresentable anchor errors
+        // instead of looping.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(0, 1, 2, "t2", "S0")])
+            .unwrap();
+        let live_full = vec![item("t2", 2, "turn two"), item("t3", 3, "tail")];
+        let boot = run(&s, &req("ses", "cfg0", live_full), &spine());
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(boot.boundary_id, "t2#0");
+
+        // Revert removes the boundary message; the store is NOT re-cut.
+        let live_reverted = vec![item("t9", 9, "post-revert")];
+        let revert = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
+        assert_eq!(revert.action, "SOFT+", "revert never busts on sight");
+        assert!(revert.reconcile_pending);
+
+        // The reconcile-rematerialize would re-mint "t2#0" — absent. Fail loud.
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let err = transform(
+            &s,
+            &req("ses", "cfg0", live_reverted.clone()),
+            &ctx,
+            &spine(),
+        );
+        assert!(matches!(err, Err(TransformError::BoundaryNotPresent(_))));
+        // Nothing committed → the error repeats visibly (no silent loop, no stale serve).
+        let retry = transform(
+            &s,
+            &req("ses", "cfg0", live_reverted.clone()),
+            &ctx,
+            &spine(),
+        );
+        assert!(matches!(retry, Err(TransformError::BoundaryNotPresent(_))));
+
+        // Once the store IS re-cut (here: cleared — everything covered was reverted), the
+        // rematerialize proceeds: coverage None mints the reserved empty anchor.
+        s.replace_compartments("ses", &[]).unwrap();
+        let remat = run(&s, &req("ses", "cfg0", live_reverted), &spine());
+        assert_eq!(remat.action, "HARD");
+        assert_eq!(remat.boundary_id, "");
+        assert!(!remat.reconcile_pending);
     }
 
     #[test]
