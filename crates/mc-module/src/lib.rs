@@ -131,6 +131,11 @@ pub struct McHandler {
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     #[cfg(test)]
     reduction_injection: Mutex<HashMap<String, Vec<ReductionDecision>>>,
+    /// Test-only interleave seam: runs once between the request's transform and the
+    /// Emergency95 prepare, where a concurrent publish is otherwise impossible to place
+    /// deterministically.
+    #[cfg(test)]
+    between_transform_and_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Route channel → its session binding. Populated at `on_bind`, removed at
     /// `on_route_gone`. A `Mutex<HashMap>` (not a lock-free map) because writes are
     /// rare (once per route open/close) and reads are one cheap lookup per transform.
@@ -283,6 +288,8 @@ impl McHandler {
             scheduler_observations: Mutex::new(HashMap::new()),
             #[cfg(test)]
             reduction_injection: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            between_transform_and_prepare: Mutex::new(None),
             bindings: Mutex::new(HashMap::new()),
         }
     }
@@ -316,6 +323,7 @@ impl McHandler {
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             scheduler_observations: Mutex::new(HashMap::new()),
             reduction_injection: Mutex::new(HashMap::new()),
+            between_transform_and_prepare: Mutex::new(None),
             bindings: Mutex::new(HashMap::new()),
         }
     }
@@ -1093,6 +1101,24 @@ impl McHandler {
                 }
             }
         };
+        let mut emergency_pre_floor =
+            if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
+                store
+                    .load(&parsed.session_id)
+                    .map(|state| state.meta.publication_floor_ordinal)
+                    .unwrap_or(None)
+            } else {
+                None
+            };
+        #[cfg(test)]
+        if let Some(hook) = self
+            .between_transform_and_prepare
+            .lock()
+            .expect("interleave hook mutex")
+            .take()
+        {
+            hook();
+        }
         let diagnostics = if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
             match self.prepare_historian_fire(
                 Arc::clone(&store),
@@ -1117,6 +1143,10 @@ impl McHandler {
                                 }
                             }
                         };
+                        emergency_pre_floor = store
+                            .load(&parsed.session_id)
+                            .map(|state| state.meta.publication_floor_ordinal)
+                            .unwrap_or(None);
                         match self.prepare_historian_fire(
                             Arc::clone(&store),
                             &parsed,
@@ -1140,6 +1170,10 @@ impl McHandler {
                                                 }
                                             }
                                         };
+                                        emergency_pre_floor = store
+                                            .load(&parsed.session_id)
+                                            .map(|state| state.meta.publication_floor_ordinal)
+                                            .unwrap_or(None);
                                         diagnostics
                                     }
                                     Err(_) => self.refresh_historian_diagnostics(
@@ -1167,6 +1201,10 @@ impl McHandler {
                                     }
                                 }
                             };
+                            emergency_pre_floor = store
+                                .load(&parsed.session_id)
+                                .map(|state| state.meta.publication_floor_ordinal)
+                                .unwrap_or(None);
                             diagnostics
                         }
                         Err(_) => self.refresh_historian_diagnostics(
@@ -1195,6 +1233,32 @@ impl McHandler {
                 }
             }
         };
+        // Emergency passes must return the freshest fold obtainable in this request: an
+        // active run can publish between this request's transform and any of the arms
+        // above (live entry already released, inline attempt failed, busy wait timed
+        // out). One final check catches every such interleaving — a PUBLISH is the only
+        // event that advances the publication floor (an abandon also bumps the row
+        // version, so row advancement alone would re-run spuriously after a failed
+        // inline drive); if the floor moved past what this request's transform saw,
+        // re-run once so the response carries the published fold instead of pre-fold
+        // bytes.
+        if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
+            let floor_advanced = store
+                .load(&parsed.session_id)
+                .map(|state| state.meta.publication_floor_ordinal != emergency_pre_floor)
+                .unwrap_or(false);
+            if floor_advanced {
+                result = match run_transform() {
+                    Ok(result) => result,
+                    Err(e) => {
+                        return HandlerOutcome::Error {
+                            code: "transform_failed".to_string(),
+                            message: e.to_string(),
+                        }
+                    }
+                };
+            }
+        }
         let mut response = result.response;
         response.historian = Some(diagnostics);
         self.record_response_observation(&parsed.session_id, now_ms());
@@ -2166,6 +2230,62 @@ mod tests {
         assert!(response["action"].is_string());
         assert!(m0_text(&response).contains("autonomous summary"));
         wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handler_emergency_refolds_when_active_run_publishes_before_live_wait_capture() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        let messages = big_messages();
+
+        let first = call_transform(&handler, messages.clone()).await;
+        assert_eq!(first["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+
+        // Place the publish in the exact race window: the interleave seam runs between
+        // the request's (pre-fold) transform and the Emergency95 prepare, so by the time
+        // prepare checks the live map the run has published and released its entry —
+        // the Complete arm's row-advance check is the only thing that can fold this
+        // response.
+        {
+            let producer = Arc::clone(&producer);
+            let store_for_hook = Arc::clone(&store);
+            *handler
+                .between_transform_and_prepare
+                .lock()
+                .expect("interleave hook mutex") = Some(Box::new(move || {
+                producer.block_output.store(false, Ordering::SeqCst);
+                producer.notify.notify_waiters();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let idle = store_for_hook
+                        .load("ses")
+                        .map(|s| s.meta.historian.state == HistorianPhase::Idle)
+                        .unwrap_or(false);
+                    if idle {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "active run must publish within the hook window"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }));
+        }
+
+        let response = call_transform_with_usage(&handler, messages, 48_000, 50_000).await;
+        assert!(
+            m0_text(&response).contains("autonomous summary"),
+            "a fold published between the transform and the live-map check must land in this response"
+        );
+        // A second producer start is legitimate here: after the first fold publishes,
+        // this fixture still has enough eligible content to cross the trigger bar, and
+        // an emergency pass drains continuously. The load-bearing assertion is the fold
+        // in the response, not the run count.
     }
 
     #[tokio::test(flavor = "current_thread")]
