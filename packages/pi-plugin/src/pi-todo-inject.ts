@@ -61,6 +61,7 @@ type PiAssistantMessage = {
 	content: Array<Record<string, unknown>>;
 	responseId?: string;
 	timestamp?: number;
+	stopReason?: string;
 };
 
 type PiToolResultMessage = {
@@ -88,6 +89,18 @@ function getMessageId(message: PiAssistantMessage): string {
 	// would defeat replay byte-stability. Caller is expected to filter
 	// these out, but return a stable empty marker just in case.
 	return "";
+}
+
+/**
+ * Pi's provider serializers (`transform-messages.ts`) skip errored/aborted
+ * assistant messages entirely when building the wire request, but pass
+ * top-level toolResult messages through unconditionally. Anchoring the
+ * synthetic pair to such an assistant therefore ships an orphaned
+ * function_call_output with no matching function_call, which OpenAI-family
+ * providers reject with a 400 on every subsequent turn.
+ */
+function isReplayableAnchor(message: PiAssistantMessage): boolean {
+	return message.stopReason !== "aborted" && message.stopReason !== "error";
 }
 
 function hasToolCallWithId(
@@ -167,6 +180,7 @@ function injectByAssistantId(
 		if ((m as { role?: unknown }).role !== "assistant") continue;
 		const assistant = m as PiAssistantMessage;
 		if (getMessageId(assistant) !== messageId) continue;
+		if (!isReplayableAnchor(assistant)) return false;
 		if (hasToolCallWithId(assistant, part.callID)) {
 			// Already injected — verify the result is also still next to it.
 			if (findToolResultAfter(messages, i, part.callID) >= 0) return true;
@@ -200,6 +214,7 @@ function injectIntoLatestAssistant(
 		if (!m || typeof m !== "object") continue;
 		if ((m as { role?: unknown }).role !== "assistant") continue;
 		const assistant = m as PiAssistantMessage;
+		if (!isReplayableAnchor(assistant)) continue;
 		const id = getMessageId(assistant);
 		if (id.length === 0) continue;
 		if (hasToolCallWithId(assistant, part.callID)) {
