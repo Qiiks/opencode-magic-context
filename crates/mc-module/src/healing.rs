@@ -107,6 +107,28 @@ pub const fn coverage(profile: SerializerProfile) -> HealingCoverage {
     }
 }
 
+/// Whether the consumer applies the module's TAIL mutations to the real context.
+///
+/// A byte-splice consumer (the Claude Code leg) replaces only the summary PREFIX in
+/// the original request and keeps the tail bytes verbatim, so any module-side tail
+/// mutation would be silently discarded wire-side while the module freezes it
+/// durably: pressure accounting would believe tokens were reclaimed that the real
+/// context still carries (phantom reclaim). For such profiles every tail mutator is
+/// disabled — reduction selection, agent-drop DRAIN (append stays accepted; the
+/// queue is durable and drains if the session ever runs under a tail-reclaim
+/// profile, where the profile change is itself a HARD bust), synthetic-todo
+/// injection, and the emergency tail-eviction arms. The emergency FOLD arm stays
+/// on: prefix compaction is the byte-splice consumer's designed operation and its
+/// only >=95% reclaim.
+pub const fn tail_reclaim(profile: SerializerProfile) -> bool {
+    match profile {
+        SerializerProfile::ClaudeCodeAnthropic => false,
+        SerializerProfile::OwnedLlmRunner
+        | SerializerProfile::Pi
+        | SerializerProfile::OpencodeAiSdk => true,
+    }
+}
+
 pub const fn quirk_residual(profile: SerializerProfile) -> QuirkResidual {
     match profile {
         SerializerProfile::OpencodeAiSdk => QuirkResidual {

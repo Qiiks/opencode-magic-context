@@ -16,7 +16,7 @@
 
 use crate::ck_wire;
 use crate::compartment_coverage::{fold_m0_content_epoch, M0ContentEpoch};
-use crate::healing::{quirk_residual, SerializerProfile};
+use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{compose_m1_from_store, m1_revision_signal};
@@ -616,13 +616,21 @@ fn apply_once(
         loaded.meta.initialized && effective_render_config != loaded.meta.last_render_config;
     let reconcile_hard_due = loaded.core.reconcile_pending && !boundary_present;
     let hard_fold_requested = first_fold_due || scheduler_outcome.idle_ttl_fired;
-    let producer_gate = producer_gate(
-        scheduler_outcome.pass,
-        !loaded.meta.initialized
-            || render_config_changed
-            || reconcile_hard_due
-            || hard_fold_requested,
-    );
+    // Tail mutations are disabled wholesale for profiles whose consumer keeps tail
+    // bytes verbatim (byte-splice legs): mutating a tail the consumer discards would
+    // freeze reclaims that never reached the real context. The producer gate is the
+    // single choke point for selection AND agent-drop consumption, so one AND covers
+    // both; todo capture/advance and the watermark stamps are gated separately below.
+    let tail_reclaim_enabled =
+        SerializerProfile::parse(&req.serializer_profile).is_none_or(healing::tail_reclaim);
+    let producer_gate = tail_reclaim_enabled
+        && producer_gate(
+            scheduler_outcome.pass,
+            !loaded.meta.initialized
+                || render_config_changed
+                || reconcile_hard_due
+                || hard_fold_requested,
+        );
     let selection_class = if producer_gate {
         selection_pass_class(scheduler_outcome.pass)
     } else {
@@ -703,7 +711,7 @@ fn apply_once(
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
     );
     let tail_for_capture = tail_for_selection.clone();
-    if is_bust_pass {
+    if is_bust_pass && tail_reclaim_enabled {
         capture_todo_state_on_bust(&mut meta, &tail_for_capture, true);
     }
 
@@ -849,7 +857,7 @@ fn apply_once(
             meta.last_render_config = effective_render_config;
             coverage_shrunk_on_bust =
                 coverage_shrank(loaded.meta.coverage_ordinal, comp.coverage_ordinal);
-            if coverage_shrunk_on_bust {
+            if coverage_shrunk_on_bust && tail_reclaim_enabled {
                 let post_truncate_tail = tail_sel_items(&live, comp.coverage_ordinal);
                 capture_todo_state_on_bust(&mut meta, &post_truncate_tail, true);
             }
@@ -944,7 +952,8 @@ fn apply_once(
     // be the only meta change on the pass — a metadata-only commit with byte-identical
     // output, not a cache bust. Held back under reconcile (the watermark may be stale-high
     // against a store about to be re-cut; the re-cut arm re-clamps it).
-    let scheduler_execute_class = !matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer);
+    let scheduler_execute_class =
+        tail_reclaim_enabled && !matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer);
     if scheduler_execute_class && !loaded.core.reconcile_pending {
         meta.last_execute_ordinal = tail_for_selection
             .iter()
@@ -958,13 +967,15 @@ fn apply_once(
         meta.has_prior_emergency_drop = true;
     }
 
-    advance_synthetic_todo(
-        &mut meta,
-        is_bust_pass,
-        loaded.meta.coverage_ordinal,
-        coverage_shrunk_on_bust,
-        req,
-    )?;
+    if tail_reclaim_enabled {
+        advance_synthetic_todo(
+            &mut meta,
+            is_bust_pass,
+            loaded.meta.coverage_ordinal,
+            coverage_shrunk_on_bust,
+            req,
+        )?;
+    }
 
     let result_action = action_str(&plan, &core);
 
@@ -1564,6 +1575,27 @@ fn build_output(
         .is_some_and(|pair| pair.anchor_mid.is_none())
     {
         push_synthetic_todo_pair(&mut out, meta);
+    }
+
+    // System messages are never trimmed, regardless of ordinal: the chunk builder
+    // exempts system-role from summarization (system content is pinned; its hash rides
+    // render_config), so trimming one here would drop content the fold never
+    // summarized. The trim exempts exactly what the chunk builder exempts — a covered
+    // system message is re-emitted at the head, BEFORE m0/m1, preserving its
+    // lead position for consumers that render the returned array directly.
+    let covered_system: Vec<&CkIngressMessage> = req
+        .messages
+        .iter()
+        .filter(|m| {
+            !m.ck.meta.synthetic
+                && m.ck.role == "system"
+                && !is_tail(m.ordinal, meta.coverage_ordinal)
+        })
+        .collect();
+    if !covered_system.is_empty() {
+        let mut head: Vec<CkWireMessage> = covered_system.iter().map(|m| m.ck.clone()).collect();
+        head.append(&mut out);
+        out = head;
     }
 
     let mut inserted_synthetic_todo = false;
@@ -2309,7 +2341,17 @@ mod tests {
         let r = run(&s, &req("roundtrip", "cfg0", inbound.clone()), &spine());
         assert_eq!(r.action, "SOFT+");
         assert!(!r.committed);
-        let tail: Vec<_> = r.messages().iter().filter(|m| !m.meta.synthetic).collect();
+        // The fixture's first message is system-role and the seeded compartment
+        // covers its ordinal. The trim exempts system-role messages (matching the
+        // chunk builder, which never summarizes them), so the message survives at
+        // the head of the output ahead of the synthetic prefix and is excluded
+        // from the tail we compare against the input.
+        assert_eq!(r.messages()[0].role, "system");
+        let tail: Vec<_> = r
+            .messages()
+            .iter()
+            .filter(|m| !m.meta.synthetic && m.role != "system")
+            .collect();
         for (input, output) in inbound.iter().skip(1).zip(tail) {
             assert_eq!(
                 serde_json::to_vec(&input.ck).unwrap(),
@@ -4941,6 +4983,137 @@ mod tests {
             calls.get(),
             0,
             "a defer replays frozen m0/m1 → estimator must NOT be called"
+        );
+    }
+    fn cc_req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
+        let mut r = req(session, cfg, messages);
+        r.serializer_profile = "claude-code-anthropic".to_string();
+        r
+    }
+
+    /// The byte-splice consumer keeps tail bytes verbatim, so the module must not
+    /// mutate the tail for its profile under ANY pass class: mutations it froze
+    /// would never reach the real context (phantom reclaim). Drives execute-class
+    /// and emergency-class passes over reclaim-eligible content and asserts the
+    /// output tail is byte-identical to the input on every pass.
+    #[test]
+    fn verbatim_tail_profile_never_mutates_tail_bytes_on_any_pass_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1", "SUMMARY")])
+            .unwrap();
+
+        let tail = vec![
+            item("m1", 1, "covered raw"),
+            assistant_tool_call("m2", 2, "call_old"),
+            tool_result("m3", 3, "call_old", "big old tool output that age-drops"),
+            todowrite_call(
+                "m4",
+                4,
+                serde_json::json!([{ "content": "x", "status": "done" }]),
+            ),
+            item("m9", 9, "newest user text"),
+        ];
+        // A queued agent drop targeting the old tool result: appendable always,
+        // consumable never (for this profile).
+        s.append_pending_agent_drops("ses", &["m3#0".to_string()], 1)
+            .unwrap();
+
+        let expected_tail: Vec<Vec<u8>> = tail[1..]
+            .iter()
+            .map(|m| serde_json::to_vec(&m.ck).unwrap())
+            .collect();
+
+        // Bootstrap fold (HARD), then execute-class (70%) and emergency-class (96%)
+        // passes: each must leave tail bytes untouched and consume nothing.
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        for (usage, limit) in [(1u64, 100u64), (70, 100), (96, 100)] {
+            let r = transform(
+                &s,
+                &with_usage(cc_req("ses", "cfg0", tail.clone()), usage, limit),
+                &ctx,
+            )
+            .unwrap();
+            let out_tail: Vec<Vec<u8>> = r
+                .messages()
+                .iter()
+                .filter(|m| !m.meta.synthetic)
+                .map(|m| serde_json::to_vec(m).unwrap())
+                .collect();
+            assert_eq!(
+                out_tail, expected_tail,
+                "tail bytes must be verbatim at usage {usage}%"
+            );
+        }
+
+        let loaded = s.load("ses").unwrap();
+        assert!(
+            loaded
+                .core
+                .frozen_units
+                .iter()
+                .all(|u| !u.key.starts_with("red:")),
+            "no reduction may freeze under a verbatim-tail profile"
+        );
+        assert!(
+            loaded.meta.synthetic_todo.is_none(),
+            "no synthetic todo may be captured under a verbatim-tail profile"
+        );
+        assert_eq!(
+            s.load_pending_agent_drops("ses").unwrap().len(),
+            1,
+            "queued agent drops stay durable (append accepted, drain gated)"
+        );
+        // The FOLD is not a tail mutation: the prefix compacted normally.
+        assert!(loaded.core.frozen_units.iter().any(|u| u.key == "m0"));
+    }
+
+    /// A leading system message is exempt from the coverage trim: the chunk builder
+    /// never summarizes system content, so trimming it would drop content the fold
+    /// never captured. It re-emits at the head, before m0/m1.
+    #[test]
+    fn covered_system_message_is_never_trimmed_and_leads_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 2, "m2", "SUMMARY")])
+            .unwrap();
+        let items = vec![
+            system_item("sys0", 0, "identity lead"),
+            item("m2", 2, "covered"),
+            item("t3", 3, "tail"),
+        ];
+        let r = run(&s, &req("ses", "cfg0", items), &spine());
+        assert_eq!(r.coverage_ordinal, Some(2));
+        let msgs = r.messages();
+        assert_eq!(msgs[0].role, "system", "system leads the output");
+        assert!(
+            serde_json::to_string(&msgs[0])
+                .unwrap()
+                .contains("identity lead"),
+            "system content passes through untrimmed"
+        );
+        assert!(
+            msgs[1].meta.synthetic,
+            "m0 follows the exempted system lead"
+        );
+        // Re-running the transform on identical input (a defer pass) must produce
+        // byte-identical output, with the exempted system lead in the same position.
+        let again = run(
+            &s,
+            &req(
+                "ses",
+                "cfg0",
+                vec![
+                    system_item("sys0", 0, "identity lead"),
+                    item("m2", 2, "covered"),
+                    item("t3", 3, "tail"),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(
+            serde_json::to_vec(&again.ck_messages).unwrap(),
+            serde_json::to_vec(&r.ck_messages).unwrap()
         );
     }
 }
