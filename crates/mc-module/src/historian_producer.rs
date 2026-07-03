@@ -25,6 +25,14 @@ const DEFAULT_LLM_RUNNER_MODULE_ID: &str = "llm-runner";
 /// legitimately needs five figures. The provider clamps to its own per-model limit, so a
 /// generous request costs nothing unless the model actually generates that much.
 const HISTORIAN_MAX_OUTPUT_TOKENS: u32 = 32_000;
+
+/// Sampling temperature for historian runs. The prompt and this value were calibrated
+/// TOGETHER: at provider-default temperature (1.0) flash-class models drift past the
+/// prompt's exclusion rules and copy the format template and rotating-seed reference
+/// compartments into their output (observed live on the rig with the calibration model
+/// itself), while at 0.1 the same prompt extracts cleanly. Sending the prompt without
+/// the temperature is running half the calibration.
+const HISTORIAN_TEMPERATURE: f64 = 0.1;
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for a summarization run to finish. A historian pass legitimately
@@ -365,7 +373,10 @@ impl HistorianProducer {
         params.insert("tools".into(), json!([]));
         params.insert(
             "generation".into(),
-            json!({ "max_output_tokens": HISTORIAN_MAX_OUTPUT_TOKENS }),
+            json!({
+                "max_output_tokens": HISTORIAN_MAX_OUTPUT_TOKENS,
+                "temperature": HISTORIAN_TEMPERATURE,
+            }),
         );
         if !system.is_empty() {
             params.insert("system".into(), json!(system));
@@ -1053,6 +1064,11 @@ mod tests {
             log.sends[0]["generation"]["max_output_tokens"],
             json!(HISTORIAN_MAX_OUTPUT_TOKENS),
             "an explicit output budget rides every send: llm-runner's default truncated a real summarization pass"
+        );
+        assert_eq!(
+            log.sends[0]["generation"]["temperature"],
+            json!(HISTORIAN_TEMPERATURE),
+            "the calibrated temperature rides every send: prompt and sampling were calibrated together"
         );
         assert_eq!(
             log.sends[0]["system"],
