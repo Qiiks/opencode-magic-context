@@ -576,7 +576,7 @@ impl HistorianProducer {
                         });
                     }
                     if let Some(piece) = unit_text(unit) {
-                        text.push_str(piece);
+                        text.push_str(&piece);
                     }
                     if unit_is_length_capped(unit) {
                         length_capped = true;
@@ -741,11 +741,31 @@ fn unit_run_id(unit: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn unit_text(unit: &Value) -> Option<&str> {
+/// Extract the assistant TEXT from a control unit. llm-runner's assistant_message
+/// unit nests an assembled message with a content-block array; only `text` blocks are
+/// the historian's output. `reasoning` blocks are deliberately EXCLUDED: a reasoning
+/// model's thinking legitimately restates the prompt's format template and walks the
+/// seed examples, so folding it into the output would corrupt the parse with
+/// template/seed prose. Flat `text`/`content` fields are kept as a fallback for
+/// simpler unit shapes.
+fn unit_text(unit: &Value) -> Option<String> {
+    if let Some(blocks) = unit
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    {
+        let text: String = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect();
+        return (!text.is_empty()).then_some(text);
+    }
     unit.get("text")
         .or_else(|| unit.get("content"))
         .or_else(|| unit.get("message").and_then(|m| m.get("text")))
         .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn is_terminal_unit(unit: &Value) -> bool {
@@ -1104,7 +1124,10 @@ mod tests {
         let events = vec![
             json!({"kind":"display","event":{"type":"text_delta","text":"ignored"}}),
             json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
-            json!({"kind":"control","unit":{"type":"assistant_message","run_id":"run-1","text":terminal_text}}),
+            json!({"kind":"control","unit":{"type":"assistant_message","message":{"message_id":"m-1","content":[
+                {"type":"reasoning","text":"planning prose that restates start=\"FIRST\" and walks the seed examples"},
+                {"type":"text","text":terminal_text}
+            ]}}}),
             json!({"kind":"control","unit":{"type":"run_finished","finish_reason":"completed"}}),
         ];
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
