@@ -740,10 +740,12 @@ export class PiSubagentRunner implements SubagentRunner {
 				if (line.length === 0) return;
 				const parsed = parsePiEventLine(line);
 				if (!parsed.ok) {
-					// Malformed event line — record but don't abort yet,
-					// so we can still consume the final message_end if it
-					// arrives intact later. If we never see one, this
-					// becomes parse_failed.
+					// Non-JSON stdout noise from co-loaded extensions is
+					// skipped silently. A malformed JSON event line is
+					// recorded but doesn't abort yet, so we can still
+					// consume the final message_end if it arrives intact
+					// later. If we never see one, this becomes parse_failed.
+					if ("noise" in parsed) return;
 					parseError = parsed.error;
 					return;
 				}
@@ -1307,7 +1309,20 @@ export function countToolCalls(messages: unknown[]): number {
 
 export function parsePiEventLine(
 	line: string,
-): { ok: true; event: unknown } | { ok: false; error: string } {
+):
+	| { ok: true; event: unknown }
+	| { ok: false; error: string }
+	| { ok: false; noise: true } {
+	// Pi's --print JSON event stream emits one JSON OBJECT per line. Since
+	// subagent children load the user's full extension set (v0.30.4 dropped
+	// --no-extensions), any co-loaded extension that writes plain text to
+	// stdout (e.g. "[Worker] Ready") interleaves with the event stream.
+	// Such lines are noise to skip, not protocol corruption — only a line
+	// that CLAIMS to be an event (starts with "{") but fails to parse is a
+	// real error worth recording.
+	if (!line.trimStart().startsWith("{")) {
+		return { ok: false, noise: true };
+	}
 	try {
 		return { ok: true, event: JSON.parse(line) };
 	} catch (error) {

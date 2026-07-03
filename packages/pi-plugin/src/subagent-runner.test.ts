@@ -488,9 +488,44 @@ describe("subagent-runner pure helpers", () => {
 
 		const parsed = __test.parsePiEventLine("{not-json");
 		expect(parsed.ok).toBe(false);
-		if (!parsed.ok) {
+		if (!parsed.ok && "error" in parsed) {
 			expect(parsed.error).toContain("failed to parse event");
 			expect(parsed.error).toContain("line={not-json");
+		} else {
+			throw new Error("malformed JSON must be an error, not noise");
+		}
+
+		// Plain-text stdout from co-loaded extensions (issue #211:
+		// "[Worker] Ready") is noise to skip, never a recorded error.
+		const noise = __test.parsePiEventLine("[Worker] Ready");
+		expect(noise.ok).toBe(false);
+		if (!noise.ok) expect("noise" in noise).toBe(true);
+	});
+
+	// Issue #211: a co-loaded Pi extension printing "[Worker] Ready" to
+	// stdout interleaved with the event stream and failed the whole run as
+	// parse_failed even though the terminal message_end arrived intact.
+	it("ignores non-JSON stdout noise from co-loaded extensions", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+
+		const resultPromise = runner.run(baseOptions);
+		child.writeRawStdoutLine("[Worker] Ready");
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				stopReason: "stop",
+			},
+		});
+		child.writeRawStdoutLine("[Worker] Shutting down");
+		child.emitClose(0);
+
+		const result = await resultPromise;
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.assistantText).toBe("done");
 		}
 	});
 
