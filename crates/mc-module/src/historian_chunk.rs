@@ -397,6 +397,7 @@ pub struct AssembledHistorianFiring {
     pub model_chain: Vec<String>,
     pub chunk: HistorianBuiltChunk,
     pub chunk_fingerprint: String,
+    pub expected_revert_epoch: u64,
     pub prior_compartments: Vec<StoredCompartmentRange>,
     pub validate_options: ValidateOptions,
     pub from_ordinal: u64,
@@ -427,6 +428,7 @@ impl AssembledHistorianFiring {
             from_ordinal: self.from_ordinal,
             to_ordinal: self.to_ordinal,
             chunk_fingerprint: &self.chunk_fingerprint,
+            expected_revert_epoch: self.expected_revert_epoch,
             observed_chunk_fingerprint: &self.chunk_fingerprint,
             validation_chunk: &self.chunk.chunk,
             prior_compartments: &self.prior_compartments,
@@ -455,7 +457,9 @@ pub fn assemble_historian_firing(
             HistorianNoFireReason::NoModels,
         ));
     }
-    let compartments = store.load_compartments(&config.session_id)?;
+    let snapshot = store.load_historian_assembly_snapshot(&config.session_id)?;
+    let compartments = snapshot.compartments;
+    let expected_revert_epoch = snapshot.revert_epoch;
     let eligible_end = config.boundary.eligible_head.end;
     let chunk_start =
         if let Some(last_end) = compartments.iter().map(|c| c.end_message as u64).max() {
@@ -537,6 +541,7 @@ pub fn assemble_historian_firing(
             from_ordinal: chunk.chunk.start_index,
             to_ordinal: chunk.chunk.end_index,
             chunk_fingerprint,
+            expected_revert_epoch,
             prior_compartments,
             validate_options: ValidateOptions {
                 sequence_offset,

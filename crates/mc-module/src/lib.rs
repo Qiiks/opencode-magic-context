@@ -1677,6 +1677,7 @@ mod tests {
             producer_session_id: Some("producer-session".to_string()),
             producer_run_id: Some("run-reattach".to_string()),
             fired_at_ms: Some(1),
+            expected_revert_epoch: 0,
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -1700,6 +1701,7 @@ mod tests {
             producer_session_id: Some("producer-session".to_string()),
             producer_run_id: Some("run-stale".to_string()),
             fired_at_ms: Some(1),
+            expected_revert_epoch: 0,
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -1725,6 +1727,7 @@ mod tests {
             1,
             3,
             "seeded-fingerprint".to_string(),
+            0,
             1,
         )
         .unwrap()

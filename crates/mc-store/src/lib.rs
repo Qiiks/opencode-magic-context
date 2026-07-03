@@ -602,6 +602,11 @@ pub struct HistorianDurableState {
     pub producer_run_id: Option<String>,
     #[serde(default)]
     pub fired_at_ms: Option<i64>,
+    /// Session-level revert epoch observed when the chunk was assembled. It is copied
+    /// into the firing state so a producer reattached after restart publishes against the
+    /// same epoch it originally saw, not the session's current epoch.
+    #[serde(default)]
+    pub expected_revert_epoch: u64,
     #[serde(default)]
     pub failure_backoff_at_ms: Option<i64>,
     /// Human-readable detail of the most recent failed firing. The producer runs in a
@@ -628,6 +633,7 @@ impl Default for HistorianDurableState {
             producer_session_id: None,
             producer_run_id: None,
             fired_at_ms: None,
+            expected_revert_epoch: 0,
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -669,9 +675,28 @@ pub struct HistorianPublishResult {
     pub promoted_refs: Vec<PromotedRef>,
 }
 
+/// Session data read atomically for historian assembly. The epoch must be snapped
+/// with the compartment set that determines the chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorianAssemblySnapshot {
+    pub compartments: Vec<StoredCompartment>,
+    pub revert_epoch: u64,
+}
+
+/// Result of a deterministic revert re-cut. The caller must use the returned
+/// row_version for the subsequent pass commit and patch the returned metadata fields
+/// into the whole-blob ModuleMeta it commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncateOutcome {
+    pub revert_epoch: u64,
+    pub last_recut: Option<String>,
+    pub row_version: u64,
+}
+
 pub struct HistorianPublishRequest<'a> {
     pub session_id: &'a str,
     pub expected_row_version: Option<u64>,
+    pub expected_revert_epoch: u64,
     pub predicate: &'a HistorianPublishPredicate,
     pub project_path: &'a str,
     pub compartments: &'a [StoredCompartment],
@@ -687,6 +712,7 @@ pub enum HistorianPublishError {
     CasConflict {
         expected: Option<u64>,
         found: u64,
+        reason: Option<String>,
     },
     StateMismatch {
         expected: Box<HistorianPublishPredicate>,
@@ -702,8 +728,19 @@ impl std::fmt::Display for HistorianPublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HistorianPublishError::Store(e) => write!(f, "store: {e}"),
-            HistorianPublishError::CasConflict { expected, found } => {
-                write!(f, "publish CAS conflict: expected {expected:?}, found {found}")
+            HistorianPublishError::CasConflict {
+                expected,
+                found,
+                reason,
+            } => {
+                if let Some(reason) = reason {
+                    write!(
+                        f,
+                        "publish CAS conflict: expected {expected:?}, found {found}: {reason}"
+                    )
+                } else {
+                    write!(f, "publish CAS conflict: expected {expected:?}, found {found}")
+                }
             }
             HistorianPublishError::StateMismatch { expected, found } => write!(
                 f,
@@ -824,6 +861,15 @@ pub struct ModuleMeta {
     /// project-shared memory or preference.
     #[serde(default)]
     pub last_todo_state: Option<String>,
+    /// Monotonic session-level epoch bumped atomically with a revert re-cut. Historian
+    /// firings carry the epoch observed at assembly so stale publishers cannot append
+    /// rows after the covered prefix has been truncated.
+    #[serde(default)]
+    pub revert_epoch: u64,
+    /// Diagnostic for the most recent deterministic re-cut. It is stored with the epoch
+    /// bump so state dumps explain which suffix was dropped without retaining history.
+    #[serde(default)]
+    pub last_recut: Option<String>,
     /// Frozen CK-native synthetic todo pair plus the real tail message id it follows.
     /// Replays keep this exact position; only changed todo content moves it to a new
     /// tail end.
@@ -989,9 +1035,15 @@ enum CommitOutcome {
 
 enum PublishTxnOutcome {
     Committed(HistorianPublishResult),
-    CasConflict(u64),
+    CasConflict { found: u64, reason: Option<String> },
     StateMismatch(HistorianDurableState),
     InvalidState(String),
+    Serde(String),
+}
+
+enum TruncateTxnOutcome {
+    Committed(TruncateOutcome),
+    CasConflict(u64),
     Serde(String),
 }
 
@@ -1139,6 +1191,62 @@ impl McStore {
         Ok(rows)
     }
 
+    /// Read the compartment rows and session revert epoch in one store snapshot for
+    /// historian assembly. The epoch is the fence carried by the firing until publish.
+    pub fn load_historian_assembly_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<HistorianAssemblySnapshot, McStoreError> {
+        let (meta_json, compartments) = self.inner.with_conn(|conn| {
+            let meta_json = conn
+                .query_row(
+                    "SELECT meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let mut stmt = conn.prepare(
+                "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
+                        title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at
+                 FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
+            )?;
+            let compartments = stmt
+                .query_map(params![session_id], |r| {
+                    Ok(StoredCompartment {
+                        sequence: r.get(0)?,
+                        start_message: r.get(1)?,
+                        end_message: r.get(2)?,
+                        start_message_id: r.get(3)?,
+                        end_message_id: r.get(4)?,
+                        title: r.get(5)?,
+                        content: r.get(6)?,
+                        p1: r.get(7)?,
+                        p2: r.get(8)?,
+                        p3: r.get(9)?,
+                        p4: r.get(10)?,
+                        importance: r.get::<_, Option<i64>>(11)?.unwrap_or(50) as i32,
+                        episode_type: r.get(12)?,
+                        legacy: r.get::<_, Option<i64>>(13)?.unwrap_or(0) as i32,
+                        created_at: r.get(14)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((meta_json, compartments))
+        })?;
+        let revert_epoch = match meta_json {
+            Some(json) => {
+                serde_json::from_str::<ModuleMeta>(&json)
+                    .map_err(|e| McStoreError::Serde(e.to_string()))?
+                    .revert_epoch
+            }
+            None => 0,
+        };
+        Ok(HistorianAssemblySnapshot {
+            compartments,
+            revert_epoch,
+        })
+    }
+
     /// The highest compartment `sequence` for a session (0 when none). A cheap read the
     /// transform does every pass to detect "a new compartment was published" without
     /// loading the full compartment rows (those load only on the pass that actually
@@ -1221,6 +1329,127 @@ impl McStore {
         Ok(())
     }
 
+    /// Delete every compartment after `keep_through_seq` and bump the session revert
+    /// epoch under the same row-version CAS. A no-op truncation returns the current
+    /// epoch/version without rewriting the meta blob.
+    pub fn truncate_compartments_for_revert(
+        &self,
+        session_id: &str,
+        keep_through_seq: i64,
+        expected_row_version: Option<u64>,
+    ) -> Result<TruncateOutcome, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((current, meta_json)) = row else {
+                return Ok(TruncateTxnOutcome::CasConflict(0));
+            };
+
+            let cas_ok = match expected_row_version {
+                Some(v) => current == v as i64,
+                None => current == NO_ROW,
+            };
+            if !cas_ok {
+                return Ok(TruncateTxnOutcome::CasConflict(current.max(0) as u64));
+            }
+
+            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+                Ok(meta) => meta,
+                Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
+            };
+
+            let (dropped_count, dropped_min, dropped_max): (i64, Option<i64>, Option<i64>) = tx
+                .query_row(
+                    "SELECT COUNT(*), MIN(sequence), MAX(sequence)
+                     FROM mc_compartments WHERE session_id = ?1 AND sequence > ?2",
+                    params![session_id, keep_through_seq],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            if dropped_count == 0 {
+                return Ok(TruncateTxnOutcome::Committed(TruncateOutcome {
+                    revert_epoch: meta.revert_epoch,
+                    last_recut: meta.last_recut,
+                    row_version: current.max(0) as u64,
+                }));
+            }
+
+            let surviving_tail = tx
+                .query_row(
+                    "SELECT sequence, end_message_id FROM mc_compartments
+                     WHERE session_id = ?1 AND sequence <= ?2
+                     ORDER BY sequence DESC LIMIT 1",
+                    params![session_id, keep_through_seq],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let surviving_head_id = tx
+                .query_row(
+                    "SELECT start_message_id FROM mc_compartments
+                     WHERE session_id = ?1 AND sequence <= ?2
+                     ORDER BY sequence ASC LIMIT 1",
+                    params![session_id, keep_through_seq],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+
+            let next_epoch = meta.revert_epoch.saturating_add(1);
+            let dropped_range = match (dropped_min, dropped_max) {
+                (Some(min), Some(max)) if min == max => min.to_string(),
+                (Some(min), Some(max)) => format!("{min}..{max}"),
+                _ => "unknown".to_string(),
+            };
+            let surviving_seq = surviving_tail
+                .as_ref()
+                .map(|(seq, _)| seq.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let live_head = surviving_head_id.unwrap_or_else(|| "none".to_string());
+            let live_tail = surviving_tail
+                .as_ref()
+                .map(|(_, id)| id.clone())
+                .unwrap_or_else(|| "none".to_string());
+            let last_recut = Some(format!(
+                "dropped seq {dropped_range}; surviving seq {surviving_seq}; live head {live_head}; live tail {live_tail}; epoch {next_epoch}"
+            ));
+            meta.revert_epoch = next_epoch;
+            meta.last_recut = last_recut.clone();
+            let meta_json = match serde_json::to_string(&meta) {
+                Ok(json) => json,
+                Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
+            };
+
+            tx.execute(
+                "DELETE FROM mc_compartments WHERE session_id = ?1 AND sequence > ?2",
+                params![session_id, keep_through_seq],
+            )?;
+            let next = current as u64 + 1;
+            tx.execute(
+                "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
+                 WHERE session_id = ?1 AND row_version = ?4",
+                params![session_id, next as i64, meta_json, current],
+            )?;
+
+            Ok(TruncateTxnOutcome::Committed(TruncateOutcome {
+                revert_epoch: next_epoch,
+                last_recut,
+                row_version: next,
+            }))
+        })?;
+
+        match outcome {
+            TruncateTxnOutcome::Committed(outcome) => Ok(outcome),
+            TruncateTxnOutcome::CasConflict(found) => Err(McStoreError::CasConflict {
+                expected: expected_row_version,
+                found,
+            }),
+            TruncateTxnOutcome::Serde(e) => Err(McStoreError::Serde(e)),
+        }
+    }
+
     /// Append compartments at the current tail without renumbering existing rows.
     /// The incoming `sequence` values are treated as producer-local hints; durable
     /// sequences are assigned contiguously after the current max so concurrent readers
@@ -1284,7 +1513,10 @@ impl McStore {
                 None => current == NO_ROW,
             };
             if !cas_ok {
-                return Ok(PublishTxnOutcome::CasConflict(current.max(0) as u64));
+                return Ok(PublishTxnOutcome::CasConflict {
+                    found: current.max(0) as u64,
+                    reason: None,
+                });
             }
 
             let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
@@ -1307,6 +1539,15 @@ impl McStore {
                 && meta.historian.chunk_fingerprint == predicate.chunk_fingerprint;
             if !predicate_matches {
                 return Ok(PublishTxnOutcome::StateMismatch(meta.historian));
+            }
+
+            if meta.revert_epoch != request.expected_revert_epoch {
+                return Ok(PublishTxnOutcome::CasConflict {
+                    found: current.max(0) as u64,
+                    reason: Some(
+                        "revert epoch mismatch (session was re-cut mid-firing)".to_string(),
+                    ),
+                });
             }
 
             append_compartments_tx(tx, session_id, request.compartments)?;
@@ -1338,10 +1579,13 @@ impl McStore {
 
         match outcome {
             PublishTxnOutcome::Committed(result) => Ok(result),
-            PublishTxnOutcome::CasConflict(found) => Err(HistorianPublishError::CasConflict {
-                expected: expected_row_version,
-                found,
-            }),
+            PublishTxnOutcome::CasConflict { found, reason } => {
+                Err(HistorianPublishError::CasConflict {
+                    expected: expected_row_version,
+                    found,
+                    reason,
+                })
+            }
             PublishTxnOutcome::StateMismatch(found) => Err(HistorianPublishError::StateMismatch {
                 expected: Box::new(predicate.clone()),
                 found: Box::new(found),
@@ -2604,6 +2848,7 @@ mod tests {
                 producer_session_id: Some("producer-session".into()),
                 producer_run_id: Some("run-1".into()),
                 fired_at_ms: Some(123),
+                expected_revert_epoch: 0,
                 failure_backoff_at_ms: Some(456),
                 last_failure: None,
                 last_no_fire: None,
@@ -2645,6 +2890,7 @@ mod tests {
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: expected,
+                expected_revert_epoch: 0,
                 predicate: &publish_predicate(),
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
@@ -2662,6 +2908,7 @@ mod tests {
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: expected,
+                expected_revert_epoch: 0,
                 predicate: &publish_predicate(),
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
@@ -2698,6 +2945,7 @@ mod tests {
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: expected,
+                expected_revert_epoch: 0,
                 predicate: &wrong,
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
@@ -2731,6 +2979,7 @@ mod tests {
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: expected,
+                expected_revert_epoch: 0,
                 predicate: &publish_predicate(),
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
@@ -2743,5 +2992,125 @@ mod tests {
             "idle state must fail loudly: {err:?}"
         );
         assert!(store.load_compartments("ses").unwrap().is_empty());
+    }
+    fn recut_comp(seq: i64, start: i64, end: i64, end_id: &str) -> StoredCompartment {
+        StoredCompartment {
+            sequence: seq,
+            start_message: start,
+            end_message: end,
+            start_message_id: format!("m{start}#0"),
+            end_message_id: end_id.to_string(),
+            title: format!("C{seq}"),
+            content: format!("summary {seq}"),
+            p1: Some(format!("summary {seq}")),
+            importance: 50,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn truncate_compartments_for_revert_deletes_suffix_and_bumps_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let meta = ModuleMeta {
+            coverage_ordinal: Some(3),
+            folded_compartment_seq: 3,
+            ..Default::default()
+        };
+        let rv = store
+            .commit("ses", None, &CoreState::default(), &meta)
+            .unwrap();
+        store
+            .replace_compartments(
+                "ses",
+                &[
+                    recut_comp(1, 1, 1, "a#0"),
+                    recut_comp(2, 2, 2, "b#0"),
+                    recut_comp(3, 3, 3, "c#0"),
+                ],
+            )
+            .unwrap();
+
+        let outcome = store
+            .truncate_compartments_for_revert("ses", 1, Some(rv))
+            .unwrap();
+        assert_eq!(outcome.revert_epoch, 1);
+        assert_eq!(outcome.row_version, rv + 1);
+        assert!(outcome
+            .last_recut
+            .as_deref()
+            .unwrap()
+            .contains("dropped seq 2..3"));
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.revert_epoch, 1);
+        assert_eq!(loaded.meta.last_recut, outcome.last_recut);
+        let compartments = store.load_compartments("ses").unwrap();
+        assert_eq!(compartments.len(), 1);
+        assert_eq!(compartments[0].sequence, 1);
+
+        let no_op = store
+            .truncate_compartments_for_revert("ses", 1, Some(outcome.row_version))
+            .unwrap();
+        assert_eq!(no_op.revert_epoch, 1);
+        assert_eq!(no_op.row_version, outcome.row_version);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn assembly_snapshot_reads_compartments_and_revert_epoch_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let meta = ModuleMeta {
+            revert_epoch: 4,
+            ..Default::default()
+        };
+        store
+            .commit("ses", None, &CoreState::default(), &meta)
+            .unwrap();
+        store
+            .replace_compartments("ses", &[recut_comp(1, 1, 1, "a#0")])
+            .unwrap();
+
+        let snapshot = store.load_historian_assembly_snapshot("ses").unwrap();
+        assert_eq!(snapshot.revert_epoch, 4);
+        assert_eq!(snapshot.compartments.len(), 1);
+        assert_eq!(snapshot.compartments[0].end_message_id, "a#0");
+    }
+
+    #[test]
+    fn publish_historian_chunk_rejects_recut_epoch_mismatch_as_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let mut meta = publishing_meta();
+        meta.revert_epoch = 1;
+        store
+            .commit("ses", None, &CoreState::default(), &meta)
+            .unwrap();
+        let expected = store.load("ses").unwrap().row_version;
+
+        let err = store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                expected_revert_epoch: 0,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[],
+                publication_floor_ordinal: 21,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            HistorianPublishError::CasConflict {
+                reason: Some(ref reason),
+                ..
+            } if reason == "revert epoch mismatch (session was re-cut mid-firing)"
+        ));
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        assert_eq!(
+            store.load("ses").unwrap().meta.historian.state,
+            HistorianPhase::Publishing
+        );
     }
 }

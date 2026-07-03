@@ -156,6 +156,7 @@ pub fn fire(
     from_ordinal: u64,
     to_ordinal: u64,
     chunk_fingerprint: String,
+    expected_revert_epoch: u64,
     fired_at_ms: i64,
 ) -> Result<FireOutcome, HistorianStateError> {
     if from_ordinal > to_ordinal {
@@ -179,6 +180,7 @@ pub fn fire(
         producer_session_id: None,
         producer_run_id: None,
         fired_at_ms: Some(fired_at_ms),
+        expected_revert_epoch,
         failure_backoff_at_ms: current.failure_backoff_at_ms,
         last_failure: current.last_failure.clone(),
         // A fire resolves whatever skip reason preceded it.
@@ -308,6 +310,7 @@ pub struct ValidatedPublishRequest<'a> {
     pub session_id: &'a str,
     pub project_path: &'a str,
     pub expected_row_version: Option<u64>,
+    pub expected_revert_epoch: u64,
     pub predicate: &'a HistorianPublishPredicate,
     pub observed_chunk_fingerprint: &'a str,
     pub validated: &'a ValidatedChunk,
@@ -331,11 +334,12 @@ pub fn publish_validated_chunk(
     request: ValidatedPublishRequest<'_>,
 ) -> Result<HistorianPublishResult, HistorianStateError> {
     if request.predicate.chunk_fingerprint != request.observed_chunk_fingerprint {
-        abandon_matching_run(
+        abandon_matching_run_with_detail(
             store,
             request.session_id,
             request.predicate,
             request.failure_backoff_at_ms,
+            None,
         )?;
         return Err(HistorianStateError::FingerprintMismatch {
             expected: request.predicate.chunk_fingerprint.clone(),
@@ -351,15 +355,43 @@ pub fn publish_validated_chunk(
         .collect();
     let facts: Vec<FactCandidate> = request.validated.facts.iter().map(to_store_fact).collect();
 
-    Ok(store.publish_historian_chunk(HistorianPublishRequest {
+    match store.publish_historian_chunk(HistorianPublishRequest {
         session_id: request.session_id,
         expected_row_version: request.expected_row_version,
+        expected_revert_epoch: request.expected_revert_epoch,
         predicate: request.predicate,
         project_path: request.project_path,
         compartments: &compartments,
         facts: &facts,
         publication_floor_ordinal: request.publication_floor_ordinal,
-    })?)
+    }) {
+        Ok(result) => Ok(result),
+        Err(HistorianPublishError::CasConflict {
+            expected,
+            found,
+            reason,
+        }) => {
+            let detail = reason
+                .clone()
+                .map(|reason| format!("publish rejected: {reason}"))
+                .or_else(|| Some("publish rejected: row-version CAS conflict".to_string()));
+            abandon_matching_run_with_detail(
+                store,
+                request.session_id,
+                request.predicate,
+                request.failure_backoff_at_ms,
+                detail,
+            )?;
+            Err(HistorianStateError::Publish(
+                HistorianPublishError::CasConflict {
+                    expected,
+                    found,
+                    reason,
+                },
+            ))
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,6 +596,7 @@ pub struct HistorianFireRequest<'a> {
     pub from_ordinal: u64,
     pub to_ordinal: u64,
     pub chunk_fingerprint: &'a str,
+    pub expected_revert_epoch: u64,
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
     pub prior_compartments: &'a [StoredCompartmentRange],
@@ -634,6 +667,7 @@ where
             request.from_ordinal,
             request.to_ordinal,
             request.chunk_fingerprint.to_string(),
+            request.expected_revert_epoch,
             request.now_ms,
         )? {
             FireOutcome::Busy(state) => return Ok(HistorianDriveOutcome::Busy(state)),
@@ -918,6 +952,7 @@ fn publish_output_from_awaiting(
             session_id,
             project_path,
             expected_row_version: loaded.row_version,
+            expected_revert_epoch: publishing.expected_revert_epoch,
             predicate: &predicate,
             observed_chunk_fingerprint,
             validated: &validated,
@@ -965,11 +1000,12 @@ fn idle_after_success(firing_seq: u64) -> HistorianDurableState {
     }
 }
 
-fn abandon_matching_run(
+fn abandon_matching_run_with_detail(
     store: &McStore,
     session_id: &str,
     predicate: &HistorianPublishPredicate,
     failure_backoff_at_ms: i64,
+    detail: Option<String>,
 ) -> Result<Option<u64>, HistorianStateError> {
     let loaded = store.load(session_id)?;
     let state = &loaded.meta.historian;
@@ -981,7 +1017,7 @@ fn abandon_matching_run(
     }
 
     let mut meta = loaded.meta.clone();
-    meta.historian = abandon(state, failure_backoff_at_ms);
+    meta.historian = abandon_with_detail(state, failure_backoff_at_ms, detail);
     let row_version = store.commit(session_id, loaded.row_version, &loaded.core, &meta)?;
     Ok(Some(row_version))
 }
@@ -1245,6 +1281,7 @@ mod tests {
             from_ordinal: 2,
             to_ordinal: 4,
             chunk_fingerprint: "fp",
+            expected_revert_epoch: 0,
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
             prior_compartments: prior,
@@ -1285,6 +1322,7 @@ mod tests {
             producer_session_id: Some("producer-session".into()),
             producer_run_id: Some("run-3".into()),
             fired_at_ms: Some(10),
+            expected_revert_epoch: 0,
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -1432,7 +1470,8 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 1).unwrap() {
+        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
@@ -1476,7 +1515,8 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 1).unwrap() {
+        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
@@ -1515,7 +1555,8 @@ mod tests {
     async fn reattach_missing_abandons_and_releases_single_flight() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 1).unwrap() {
+        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
@@ -1548,7 +1589,7 @@ mod tests {
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
         assert!(matches!(
-            fire(&state, 2, 4, "fp2".into(), 2).unwrap(),
+            fire(&state, 2, 4, "fp2".into(), 0, 2).unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -1771,7 +1812,7 @@ mod tests {
         assert_eq!(state.state, HistorianPhase::Idle);
         assert_eq!(state.failure_backoff_at_ms, Some(999));
         assert!(matches!(
-            fire(&state, 2, 4, "fp2".into(), 124).unwrap(),
+            fire(&state, 2, 4, "fp2".into(), 0, 124).unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -1787,7 +1828,8 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 1).unwrap() {
+        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
@@ -1952,6 +1994,7 @@ mod tests {
             producer_session_id: Some("ps".into()),
             producer_run_id: Some("run-1".into()),
             fired_at_ms: Some(1),
+            expected_revert_epoch: 0,
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -1972,6 +2015,7 @@ mod tests {
                 session_id: "ses",
                 project_path: "git:proj",
                 expected_row_version: Some(rv),
+                expected_revert_epoch: 0,
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &validated,
@@ -2029,14 +2073,14 @@ mod tests {
     #[test]
     fn pure_state_machine_happy_path_and_single_flight() {
         let idle = HistorianDurableState::default();
-        let fired = match fire(&idle, 2, 5, "fp".into(), 100).unwrap() {
+        let fired = match fire(&idle, 2, 5, "fp".into(), 0, 100).unwrap() {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
         assert_eq!(fired.state, HistorianPhase::Firing);
         assert_eq!(fired.firing_seq, 1);
         assert!(matches!(
-            fire(&fired, 6, 7, "other".into(), 101).unwrap(),
+            fire(&fired, 6, 7, "other".into(), 0, 101).unwrap(),
             FireOutcome::Busy(_)
         ));
 
@@ -2055,7 +2099,7 @@ mod tests {
             last_failure: Some("stale failure".into()),
             ..HistorianDurableState::default()
         };
-        let fired = match fire(&idle, 2, 5, "fp".into(), 100).unwrap() {
+        let fired = match fire(&idle, 2, 5, "fp".into(), 0, 100).unwrap() {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
@@ -2084,6 +2128,7 @@ mod tests {
                 session_id: "ses",
                 project_path: "git:proj",
                 expected_row_version: loaded.row_version,
+                expected_revert_epoch: 0,
                 predicate: &predicate,
                 observed_chunk_fingerprint: "different-fingerprint",
                 validated: &ValidatedChunk::default(),
@@ -2102,9 +2147,123 @@ mod tests {
         assert_eq!(after.state, HistorianPhase::Idle);
         assert_eq!(after.failure_backoff_at_ms, Some(999));
         assert!(matches!(
-            fire(&after, 6, 7, "new".into(), 1000).unwrap(),
+            fire(&after, 6, 7, "new".into(), 0, 1000).unwrap(),
             FireOutcome::Fired(_)
         ));
+    }
+
+    #[test]
+    fn fire_persists_expected_revert_epoch_for_reattach() {
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            5,
+            "fp".into(),
+            42,
+            100,
+        )
+        .unwrap()
+        {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => panic!("idle state must fire"),
+        };
+        assert_eq!(fired.expected_revert_epoch, 42);
+        let awaiting = producer_started(&fired, "ps".into(), "run".into()).unwrap();
+        assert_eq!(awaiting.expected_revert_epoch, 42);
+    }
+
+    #[test]
+    fn epoch_mismatch_publish_abandons_to_idle_with_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let meta = ModuleMeta {
+            revert_epoch: 1,
+            historian: publishing_state(),
+            ..Default::default()
+        };
+        store
+            .commit("ses", None, &CoreState::default(), &meta)
+            .unwrap();
+        let loaded = store.load("ses").unwrap();
+        let predicate = publish_predicate(&loaded.meta.historian).unwrap();
+
+        let err = publish_validated_chunk(
+            &store,
+            ValidatedPublishRequest {
+                session_id: "ses",
+                project_path: "git:proj",
+                expected_row_version: loaded.row_version,
+                expected_revert_epoch: 0,
+                predicate: &predicate,
+                observed_chunk_fingerprint: "fp",
+                validated: &ValidatedChunk::default(),
+                publication_floor_ordinal: 5,
+                created_at_ms: 0,
+                failure_backoff_at_ms: 999,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            HistorianStateError::Publish(HistorianPublishError::CasConflict { .. })
+        ));
+
+        let after = store.load("ses").unwrap().meta.historian;
+        assert_eq!(after.state, HistorianPhase::Idle);
+        assert_eq!(after.failure_backoff_at_ms, Some(999));
+        assert_eq!(
+            after.last_failure.as_deref(),
+            Some("publish rejected: revert epoch mismatch (session was re-cut mid-firing)")
+        );
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reattach_carries_durable_revert_epoch_to_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 7, 1).unwrap()
+        {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => unreachable!(),
+        };
+        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &ModuleMeta {
+                    revert_epoch: 8,
+                    historian: awaiting,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Ok(producer_output(historian_xml("stale epoch summary"))));
+
+        let err =
+            reattach_historian_producer(&mut producer, reattach_request(&store, &chunk, &prior))
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            HistorianDriveError::State(HistorianStateError::Publish(
+                HistorianPublishError::CasConflict { .. }
+            ))
+        ));
+        let after = store.load("ses").unwrap().meta.historian;
+        assert_eq!(after.state, HistorianPhase::Idle);
+        assert_eq!(
+            after.last_failure.as_deref(),
+            Some("publish rejected: revert epoch mismatch (session was re-cut mid-firing)")
+        );
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
     }
 
     #[test]
@@ -2112,7 +2271,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let awaiting = producer_started(
-            &match fire(&HistorianDurableState::default(), 1, 3, "fp".into(), 10).unwrap() {
+            &match fire(&HistorianDurableState::default(), 1, 3, "fp".into(), 0, 10).unwrap() {
                 FireOutcome::Fired(state) => state,
                 FireOutcome::Busy(_) => unreachable!(),
             },
@@ -2162,6 +2321,7 @@ mod tests {
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: loaded.row_version,
+                expected_revert_epoch: 0,
                 predicate: &predicate,
                 project_path: "git:proj",
                 compartments: &[comp(1, 2, 4, "m4", "summary")],
@@ -2220,6 +2380,7 @@ mod tests {
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: Some(row_version),
+                expected_revert_epoch: 0,
                 predicate: &predicate,
                 project_path: "git:proj",
                 compartments: &[],

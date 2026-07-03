@@ -24,7 +24,7 @@ use crate::m1_compose::{compose_m1_from_store, m1_revision_signal};
 use crate::memory_render::M1_PLACEHOLDER;
 use crate::selection::{SelItem, SelKind};
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
-use mc_store::{McStore, McStoreError, ModuleMeta, ModuleUsage};
+use mc_store::{McStore, McStoreError, ModuleMeta, ModuleUsage, StoredCompartment};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -475,7 +475,7 @@ fn apply_once(
     );
     // The cheap m1-change digest (watermark triple). Computed every pass to gate SOFT vs
     // defer WITHOUT composing the body; the body composes only on the bust arm below.
-    let current_m1_digest = m1_revision_signal(store, ctx.project_path, &req.session_id)?;
+    let mut current_m1_digest = m1_revision_signal(store, ctx.project_path, &req.session_id)?;
     let reductions_pending_now = reductions_pending(
         &loaded.core,
         &effective_deciders,
@@ -511,6 +511,7 @@ fn apply_once(
 
     let mut core = loaded.core.clone();
     let mut meta = loaded.meta.clone();
+    let mut commit_expected = loaded.row_version;
     apply_ingress_meta(&mut meta, req, &projection);
 
     let is_bust_pass = matches!(
@@ -522,6 +523,8 @@ fn apply_once(
         capture_todo_state_on_bust(&mut meta, &tail_for_capture, true);
     }
 
+    let mut coverage_shrunk_on_bust = false;
+
     match plan {
         PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
         PassPlan::Hard | PassPlan::MigrateHard => {
@@ -529,7 +532,7 @@ fn apply_once(
             // the expiry cutoff into meta so every later in-epoch SOFT/defer reads the
             // SAME memory set (a memory expiring mid-epoch stays rendered until the next
             // HARD re-freezes the cutoff — the byte-stability tradeoff).
-            let comp = compose_m0_from_store(
+            let mut comp = compose_m0_from_store(
                 store,
                 &crate::m0_compose::M0ComposeInputs {
                     session_id: &req.session_id,
@@ -585,20 +588,49 @@ fn apply_once(
             if comp.coverage_ordinal.is_some() {
                 let minted = comp.boundary_id.as_str();
                 if minted.is_empty() || !live.iter().any(|i| i.id() == minted) {
-                    // Name the exit path per cause: on a reconcile the anchor was present
-                    // once and reverted away (recovery = the historian re-cuts the store);
-                    // on a fresh mint it was never presentable (a producer/vocabulary bug).
-                    let hint = if loaded.core.reconcile_pending {
-                        "the store still covers reverted content; this error repeats until \
-                         the historian re-cuts the compartments for the reverted session"
+                    if loaded.core.reconcile_pending {
+                        let compartments = store.load_compartments(&req.session_id)?;
+                        let keep_through_seq = surviving_revert_prefix_seq(&compartments, &live);
+                        let outcome = store.truncate_compartments_for_revert(
+                            &req.session_id,
+                            keep_through_seq,
+                            commit_expected,
+                        )?;
+                        commit_expected = Some(outcome.row_version);
+                        meta.revert_epoch = outcome.revert_epoch;
+                        meta.last_recut = outcome.last_recut;
+                        current_m1_digest =
+                            m1_revision_signal(store, ctx.project_path, &req.session_id)?;
+                        comp = compose_m0_from_store(
+                            store,
+                            &crate::m0_compose::M0ComposeInputs {
+                                session_id: &req.session_id,
+                                project_path: ctx.project_path,
+                                project_directory: ctx.project_directory,
+                                now_ms: ctx.now_ms,
+                                history_budget_tokens: ctx.history_budget_tokens,
+                            },
+                            estimate_tokens,
+                        )?;
+
+                        if comp.coverage_ordinal.is_some() {
+                            let reminted = comp.boundary_id.as_str();
+                            if reminted.is_empty() || !live.iter().any(|i| i.id() == reminted) {
+                                return Err(TransformError::BoundaryNotPresent(format!(
+                                    "re-cut kept compartments through sequence {keep_through_seq}, \
+                                     but the fold still minted absent anchor {reminted:?}; \
+                                     the publisher must write flat end_message_id block ids"
+                                )));
+                            }
+                        }
                     } else {
-                        "the anchor must be the flat block id (`<mid>#<index>`) of the \
-                         last covered block; check the publisher's end_message_id"
-                    };
-                    return Err(TransformError::BoundaryNotPresent(format!(
-                        "fold minted anchor {minted:?} from the folded compartment's \
-                         end_message_id, but no live block carries that id; {hint}"
-                    )));
+                        return Err(TransformError::BoundaryNotPresent(format!(
+                            "fold minted anchor {minted:?} from the folded compartment's \
+                             end_message_id, but no live block carries that id; the anchor \
+                             must be the flat block id (`<mid>#<index>`) of the last covered \
+                             block; check the publisher's end_message_id"
+                        )));
+                    }
                 }
             }
 
@@ -628,6 +660,12 @@ fn apply_once(
             });
             meta.initialized = true;
             meta.last_render_config = effective_render_config;
+            coverage_shrunk_on_bust =
+                coverage_shrank(loaded.meta.coverage_ordinal, comp.coverage_ordinal);
+            if coverage_shrunk_on_bust {
+                let post_truncate_tail = tail_sel_items(&live, comp.coverage_ordinal);
+                capture_todo_state_on_bust(&mut meta, &post_truncate_tail, true);
+            }
             meta.coverage_ordinal = comp.coverage_ordinal;
             meta.folded_compartment_seq = comp.folded_compartment_seq;
             meta.rendered_memory_ids = comp.rendered_memory_ids;
@@ -709,7 +747,13 @@ fn apply_once(
         }
     }
 
-    advance_synthetic_todo(&mut meta, is_bust_pass, loaded.meta.coverage_ordinal, req)?;
+    advance_synthetic_todo(
+        &mut meta,
+        is_bust_pass,
+        loaded.meta.coverage_ordinal,
+        coverage_shrunk_on_bust,
+        req,
+    )?;
 
     let result_action = action_str(&plan, &core);
 
@@ -720,7 +764,7 @@ fn apply_once(
     // otherwise reuse the previous row version without writing.
     let changed = core != loaded.core || meta != loaded.meta;
     let row_version = if changed {
-        store.commit(&req.session_id, loaded.row_version, &core, &meta)?
+        store.commit(&req.session_id, commit_expected, &core, &meta)?
     } else {
         loaded.row_version.unwrap_or(0)
     };
@@ -1081,6 +1125,24 @@ fn coverage_advanced(old: Option<u64>, new: Option<u64>) -> bool {
     }
 }
 
+fn coverage_shrank(old: Option<u64>, new: Option<u64>) -> bool {
+    match (old, new) {
+        (Some(old), Some(new)) => new < old,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn surviving_revert_prefix_seq(compartments: &[StoredCompartment], live: &[&FlatBlock]) -> i64 {
+    let live_ids: BTreeSet<&str> = live.iter().map(|block| block.id()).collect();
+    compartments
+        .iter()
+        .take_while(|compartment| live_ids.contains(compartment.end_message_id.as_str()))
+        .map(|compartment| compartment.sequence)
+        .last()
+        .unwrap_or(-1)
+}
+
 fn anchor_folded_by_coverage(
     req: &TransformRequest,
     old_coverage: Option<u64>,
@@ -1100,6 +1162,7 @@ fn advance_synthetic_todo(
     meta: &mut ModuleMeta,
     is_bust_pass: bool,
     old_coverage: Option<u64>,
+    coverage_shrunk_on_bust: bool,
     req: &TransformRequest,
 ) -> Result<(), TransformError> {
     let existing = meta.synthetic_todo.clone();
@@ -1112,7 +1175,12 @@ fn advance_synthetic_todo(
         InjectionOutcome::Clear => meta.synthetic_todo = None,
         InjectionOutcome::Keep => {
             if is_bust_pass {
-                reanchor_kept_synthetic_todo_if_folded(meta, old_coverage, req)?;
+                reanchor_kept_synthetic_todo_if_folded_or_shrunk(
+                    meta,
+                    old_coverage,
+                    coverage_shrunk_on_bust,
+                    req,
+                )?;
             }
         }
         InjectionOutcome::None => {}
@@ -1120,9 +1188,10 @@ fn advance_synthetic_todo(
     Ok(())
 }
 
-fn reanchor_kept_synthetic_todo_if_folded(
+fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
     meta: &mut ModuleMeta,
     old_coverage: Option<u64>,
+    coverage_shrunk_on_bust: bool,
     req: &TransformRequest,
 ) -> Result<(), TransformError> {
     let Some(pair) = meta.synthetic_todo.as_mut() else {
@@ -1134,15 +1203,17 @@ fn reanchor_kept_synthetic_todo_if_folded(
     if tail_contains_mid(req, meta.coverage_ordinal, &anchor_mid) {
         return Ok(());
     }
-    if !anchor_folded_by_coverage(req, old_coverage, meta.coverage_ordinal, &anchor_mid) {
+    let folded_by_advance =
+        anchor_folded_by_coverage(req, old_coverage, meta.coverage_ordinal, &anchor_mid);
+    if !folded_by_advance && !coverage_shrunk_on_bust {
         return Err(TransformError::SyntheticTodoAnchorMissing(anchor_mid));
     }
 
-    // A coverage-advancing bust already changes the rendered m1 bytes and removes the
-    // covered leading tail, so moving an unchanged synthetic todo to the new tail end
-    // rides that unavoidable cache break. The guard above prevents this from becoming
-    // an always-last floater on ordinary tail growth or defer passes.
-    debug_assert!(coverage_advanced(old_coverage, meta.coverage_ordinal));
+    // A coverage-moving bust already changes the rendered bytes: advance folds the old
+    // anchor into history, while shrink means the old anchor was in reverted-away tail. In
+    // both cases an unchanged synthetic todo can move to the new tail end without turning
+    // into an always-last floater on ordinary tail growth or defer passes.
+    debug_assert!(folded_by_advance || coverage_shrunk_on_bust);
     pair.anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
     Ok(())
 }
@@ -2162,7 +2233,7 @@ mod tests {
         assert_eq!(boot.boundary_id, "t2#0");
 
         // Revert removes t2 (the boundary) and t3; the historian re-cuts to just C0.
-        let live_reverted = vec![item("a", 1, "raw"), item("t4", 4, "new turn")];
+        let live_reverted = vec![item("a", 1, "raw"), item("t4", 2, "new turn")];
         let revert = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
         assert_eq!(revert.action, "SOFT+", "revert never busts on sight");
         assert!(revert.reconcile_pending);
@@ -2180,55 +2251,90 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_rematerialize_with_unrecut_store_fails_loud_not_a_silent_hard_loop() {
-        // The reconcile path is NOT exempt from the mint guard: if a revert removed the
-        // boundary but the store was never re-cut (it still covers the reverted-away
-        // messages), the rematerialize would re-mint the same absent anchor — committing
-        // it yields a byte-identical HARD every pass forever, silently serving summaries
-        // of content that no longer exists. The guard must fail the rematerialize loudly
-        // on every attempt until the store is re-cut. This also covers bad state persisted
-        // by an earlier writer: any reconcile re-mint of an unpresentable anchor errors
-        // instead of looping.
+    fn reconcile_rematerialize_with_unrecut_store_truncates_and_refolds_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(0, 1, 2, "t2", "S0")])
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 1, "a", "S0"), comp(2, 2, 2, "t2", "S1")],
+        )
+        .unwrap();
+        let live_full = vec![
+            item("a", 1, "raw"),
+            item("t2", 2, "turn two"),
+            item("t3", 3, "tail"),
+        ];
+        let boot = run(&s, &req("ses", "cfg0", live_full), &spine());
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(boot.boundary_id, "t2#0");
+
+        let live_reverted = vec![item("a", 1, "raw"), item("t4", 2, "new turn")];
+        let revert = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
+        assert_eq!(revert.action, "SOFT+", "revert never busts on sight");
+        assert!(revert.reconcile_pending);
+        let before_recut = s.load("ses").unwrap().row_version.unwrap();
+
+        let remat = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
+        assert_eq!(remat.action, "HARD");
+        assert_eq!(
+            remat.boundary_id, "a#0",
+            "the surviving prefix is re-minted"
+        );
+        assert_eq!(remat.coverage_ordinal, Some(1));
+        assert!(!remat.reconcile_pending);
+        assert_eq!(tail_ids(&remat), vec!["t4"]);
+        let loaded = s.load("ses").unwrap();
+        assert_eq!(loaded.meta.revert_epoch, 1);
+        assert!(loaded
+            .meta
+            .last_recut
+            .as_deref()
+            .unwrap()
+            .contains("dropped seq 2"));
+        assert_eq!(loaded.meta.folded_compartment_seq, 1);
+        assert_eq!(loaded.row_version.unwrap(), before_recut + 2);
+        assert_eq!(s.load_compartments("ses").unwrap().len(), 1);
+
+        s.append_compartments("ses", &[comp(3, 2, 2, "t4", "S2")])
+            .unwrap();
+        let folded_again = run(&s, &req("ses", "cfg0", live_reverted), &spine());
+        assert_eq!(folded_again.action, "SOFT");
+        assert_eq!(folded_again.boundary_id, "t4#0");
+        assert_eq!(folded_again.coverage_ordinal, Some(2));
+        assert_eq!(tail_ids(&folded_again), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn reconcile_recut_nothing_survives_bootstraps_without_first_fold_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 2, "t2", "S0")])
             .unwrap();
         let live_full = vec![item("t2", 2, "turn two"), item("t3", 3, "tail")];
         let boot = run(&s, &req("ses", "cfg0", live_full), &spine());
         assert_eq!(boot.action, "HARD");
         assert_eq!(boot.boundary_id, "t2#0");
 
-        // Revert removes the boundary message; the store is NOT re-cut.
         let live_reverted = vec![item("t9", 9, "post-revert")];
         let revert = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
-        assert_eq!(revert.action, "SOFT+", "revert never busts on sight");
+        assert_eq!(revert.action, "SOFT+");
         assert!(revert.reconcile_pending);
 
-        // The reconcile-rematerialize would re-mint "t2#0" — absent. Fail loud.
-        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        let err = transform(
-            &s,
-            &req("ses", "cfg0", live_reverted.clone()),
-            &ctx,
-            &spine(),
-        );
-        assert!(matches!(err, Err(TransformError::BoundaryNotPresent(_))));
-        // Nothing committed → the error repeats visibly (no silent loop, no stale serve).
-        let retry = transform(
-            &s,
-            &req("ses", "cfg0", live_reverted.clone()),
-            &ctx,
-            &spine(),
-        );
-        assert!(matches!(retry, Err(TransformError::BoundaryNotPresent(_))));
-
-        // Once the store IS re-cut (here: cleared — everything covered was reverted), the
-        // rematerialize proceeds: coverage None mints the reserved empty anchor.
-        s.replace_compartments("ses", &[]).unwrap();
-        let remat = run(&s, &req("ses", "cfg0", live_reverted), &spine());
+        let remat = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
         assert_eq!(remat.action, "HARD");
         assert_eq!(remat.boundary_id, "");
+        assert_eq!(remat.coverage_ordinal, None);
         assert!(!remat.reconcile_pending);
+        assert_eq!(tail_ids(&remat), vec!["t9"]);
+        assert!(s.load_compartments("ses").unwrap().is_empty());
+        assert_eq!(s.load("ses").unwrap().meta.revert_epoch, 1);
+
+        let defer = run(&s, &req("ses", "cfg0", live_reverted), &spine());
+        assert_eq!(defer.action, "SOFT+");
+        assert!(
+            !defer.committed,
+            "an empty re-cut must not leave a first-fold trigger"
+        );
     }
 
     #[test]
@@ -3079,6 +3185,83 @@ mod tests {
     }
 
     #[test]
+    fn crash_reentry_after_recut_uses_coverage_shrink_for_todo_reanchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("shrink", &[comp(1, 1, 1, "a", "SUMMARY-1")])
+            .unwrap();
+        let todos = json!([{ "content": "Shrink", "status": "pending", "priority": "high" }]);
+        let first = run(
+            &s,
+            &req(
+                "shrink",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call("todo", 2, todos.clone()),
+                ],
+            ),
+            &spine(),
+        );
+        let first_pair = synthetic_todo_pair_bytes(&first);
+        let first_call_id = synthetic_todo_call_id(&first);
+
+        let loaded = s.load("shrink").unwrap();
+        s.replace_compartments(
+            "shrink",
+            &[
+                comp(1, 1, 1, "a", "SUMMARY-1"),
+                comp(2, 2, 2, "todo", "SUMMARY-2"),
+                comp(3, 3, 3, "gone", "SUMMARY-3"),
+            ],
+        )
+        .unwrap();
+        let mut core = loaded.core;
+        core.boundary_id = "gone#0".to_string();
+        core.reconcile_pending = true;
+        let mut meta = loaded.meta;
+        meta.coverage_ordinal = Some(3);
+        meta.folded_compartment_seq = 3;
+        meta.synthetic_todo
+            .as_mut()
+            .expect("first bust freezes a synthetic todo")
+            .anchor_mid = Some("gone".to_string());
+        let rv = s
+            .commit("shrink", loaded.row_version, &core, &meta)
+            .unwrap();
+
+        s.truncate_compartments_for_revert("shrink", 1, Some(rv))
+            .unwrap();
+        let recovered = run(
+            &s,
+            &req(
+                "shrink",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call("todo", 2, todos),
+                    item("tail", 4, "new post-revert tail"),
+                ],
+            ),
+            &spine(),
+        );
+
+        assert_eq!(recovered.action, "HARD");
+        assert_eq!(recovered.boundary_id, "a#0");
+        assert_eq!(synthetic_todo_call_id(&recovered), first_call_id);
+        assert_eq!(synthetic_todo_pair_bytes(&recovered), first_pair);
+        assert_eq!(
+            s.load("shrink")
+                .unwrap()
+                .meta
+                .synthetic_todo
+                .as_ref()
+                .and_then(|pair| pair.anchor_mid.as_deref()),
+            Some("tail")
+        );
+    }
+
+    #[test]
     fn synthetic_todo_defer_after_keep_reanchor_replays_at_new_position() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -3419,6 +3602,9 @@ mod tests {
         assert_eq!(meta.m1_revision, 0);
         assert_eq!(meta.folded_compartment_seq, 0);
         assert_eq!(meta.expiry_cutoff_ms, 0);
+        assert_eq!(meta.revert_epoch, 0);
+        assert!(meta.last_recut.is_none());
+        assert_eq!(meta.historian.expected_revert_epoch, 0);
         assert!(meta.synthetic_todo.is_none());
         assert!(meta.initialized);
     }
