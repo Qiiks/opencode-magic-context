@@ -38,6 +38,7 @@ export {
     type GitSweepLeaseResult,
     getGitSweepCoordinatorState,
     markGitSweepSuccessAndRelease,
+    parkGitSweepNonIndexable,
     releaseGitSweepLease,
     renewGitSweepLease,
 } from "./sweep-coordinator";

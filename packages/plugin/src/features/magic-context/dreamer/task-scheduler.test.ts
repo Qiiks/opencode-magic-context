@@ -56,6 +56,69 @@ function seedActiveMemory(d: Database, project = PROJECT): void {
     });
 }
 
+describe("task-scheduler — manual lease wait", () => {
+    it("manual run waits for a briefly-held domain lease instead of reporting busy", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const leaseKey = leaseKeyFor("curate", PROJECT);
+        const otherHolder = "other-process";
+        expect(acquireLease(db, otherHolder, leaseKey)).toBe(true);
+        // Free the lease shortly after the manual run starts waiting.
+        setTimeout(() => releaseLease(db as Database, otherHolder, leaseKey), 150);
+
+        let executed = 0;
+        const executor = async (): Promise<TaskExecOutcome> => {
+            executed += 1;
+            return { status: "completed" };
+        };
+        const result = await runManualDream({
+            db,
+            projectIdentity: PROJECT,
+            tasks: [cfg("curate", "0 4 * * 0")],
+            executor,
+            task: "curate",
+        });
+        expect(executed).toBe(1);
+        expect(result.ran).toEqual(["curate"]);
+        expect(result.deferredBusy).toEqual([]);
+    });
+
+    it("scheduled ticks do not wait on a busy lease", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const leaseKey = leaseKeyFor("curate", PROJECT);
+        expect(acquireLease(db, "other-process", leaseKey)).toBe(true);
+
+        const now = Date.now();
+        writeTaskScheduleState(db, {
+            projectPath: PROJECT,
+            task: "curate",
+            lastRunAt: null,
+            nextDueAt: now - 1000,
+            schedule: "0 4 * * 0",
+            lastStatus: null,
+            lastError: null,
+            retryCount: 0,
+        });
+        let executed = 0;
+        const executor = async (): Promise<TaskExecOutcome> => {
+            executed += 1;
+            return { status: "completed" };
+        };
+        const started = Date.now();
+        await runDueTasksForProject({
+            db,
+            projectIdentity: PROJECT,
+            tasks: [cfg("curate", "0 4 * * 0")],
+            executor,
+            now,
+        });
+        expect(executed).toBe(0);
+        // No lease-wait loop on the scheduled path: returns immediately.
+        expect(Date.now() - started).toBeLessThan(1500);
+    });
+});
+
 describe("task-scheduler — planDueTasks", () => {
     it("first-seed does NOT fire immediately (next_due in the future)", () => {
         db = freshDb();

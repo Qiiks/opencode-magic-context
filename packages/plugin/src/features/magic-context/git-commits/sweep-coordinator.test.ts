@@ -9,6 +9,7 @@ import {
     GIT_SWEEP_COOLDOWN_MS,
     getGitSweepCoordinatorState,
     markGitSweepSuccessAndRelease,
+    parkGitSweepNonIndexable,
     releaseGitSweepLease,
 } from "./sweep-coordinator";
 
@@ -154,5 +155,29 @@ describe("git sweep coordinator", () => {
         const retry = acquireGitSweepLease(db, projectPath, "holder-b");
         expect(retry.acquired).toBe(true);
         expect(getGitSweepCoordinatorState(db, projectPath)?.leaseHolder).toBe("holder-b");
+    });
+
+    it("parks a non-indexable project on the long re-probe cooldown", () => {
+        const PROJECT = "dir:non-indexable";
+        const holder = "holder-park";
+        const first = acquireGitSweepLease(db, PROJECT, holder);
+        expect(first.acquired).toBe(true);
+
+        expect(parkGitSweepNonIndexable(db, PROJECT, holder)).toBe(true);
+
+        // Immediately after parking: cooldown blocks, far in the future.
+        const blocked = acquireGitSweepLease(db, PROJECT, "holder-2");
+        expect(blocked.acquired).toBe(false);
+        if (!blocked.acquired) {
+            expect(blocked.reason).toBe("cooldown_active");
+            // Re-probe horizon is ~24h out, well past the ordinary 10m cooldown.
+            expect((blocked.nextAllowedAt ?? 0) - Date.now()).toBeGreaterThan(60 * 60 * 1000);
+        }
+
+        // A short custom horizon expires and allows the re-probe.
+        const holder3 = "holder-3";
+        const again = acquireGitSweepLease(db, PROJECT, holder3);
+        expect(again.acquired).toBe(false);
+        expect(parkGitSweepNonIndexable(db, PROJECT, holder3, 1)).toBe(false);
     });
 });

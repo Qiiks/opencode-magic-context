@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { parseGitLogOutput, readGitCommits } from "./git-log-reader";
+import { classifyGitLogFailure, parseGitLogOutput, readGitCommits } from "./git-log-reader";
 
 // Field separator is US (0x1f, ASCII Unit Separator). We deliberately moved
 // off NUL (0x00) because Node's child_process.execFile rejects argv elements
@@ -73,5 +73,30 @@ describe("readGitCommits (smoke)", () => {
     it("returns empty array for a non-git directory without throwing", async () => {
         const commits = await readGitCommits("/tmp", { maxCommits: 5 });
         expect(Array.isArray(commits)).toBe(true);
+    });
+});
+
+describe("classifyGitLogFailure", () => {
+    it("classifies structural failures that cannot succeed on retry", () => {
+        expect(
+            classifyGitLogFailure(
+                "Command failed: git log HEAD\nfatal: not a git repository (or any of the parent directories): .git",
+            ),
+        ).toBe("not_a_repo");
+        expect(
+            classifyGitLogFailure(
+                "Command failed: git log HEAD\nfatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.",
+            ),
+        ).toBe("no_head");
+        expect(
+            classifyGitLogFailure(
+                "fatal: your current branch 'main' does not have any commits yet",
+            ),
+        ).toBe("no_head");
+    });
+
+    it("keeps everything else transient so normal retries continue", () => {
+        expect(classifyGitLogFailure("spawn git ENOENT")).toBe("transient");
+        expect(classifyGitLogFailure("Command failed: git log HEAD (timeout)")).toBe("transient");
     });
 });

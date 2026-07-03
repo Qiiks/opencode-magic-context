@@ -256,10 +256,20 @@ function recordTransientFailure(
 interface DomainGroupCallbacks {
     /** Manual single-task run ignores the post-lease activity gate re-check. */
     forceGate?: boolean;
+    /**
+     * How long a manual run may wait for a busy domain lease before giving
+     * up. Scheduled ticks leave this unset (the next tick retries anyway).
+     */
+    leaseWaitMs?: number;
     onRan?: (task: DreamTaskName) => void;
     onFailed?: (task: DreamTaskName) => void;
     onBusy?: (task: DreamTaskName) => void;
 }
+
+/** Poll cadence while a manual run waits for a busy domain lease. */
+const LEASE_WAIT_POLL_MS = 2_000;
+/** Lease wait budget for manual /ctx-dream runs. */
+export const MANUAL_RUN_LEASE_WAIT_MS = 60_000;
 
 async function runDomainGroup(
     deps: RunDueTasksDeps,
@@ -271,7 +281,20 @@ async function runDomainGroup(
     const leaseKey = leaseKeyFor(group[0].config.task, projectIdentity);
     const holderId = crypto.randomUUID();
 
-    if (!acquireLease(db, holderId, leaseKey)) {
+    let acquired = acquireLease(db, holderId, leaseKey);
+    if (!acquired && cb?.leaseWaitMs) {
+        // Explicit manual run: the lease holder is usually a scheduled
+        // catch-up task on the same domain finishing within seconds. Waiting
+        // briefly turns a confusing "busy, try again" into the run the user
+        // asked for. Scheduled ticks never wait (leaseWaitMs unset) — the next
+        // tick retries anyway.
+        const deadline = Date.now() + cb.leaseWaitMs;
+        while (!acquired && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, LEASE_WAIT_POLL_MS));
+            acquired = acquireLease(db, holderId, leaseKey);
+        }
+    }
+    if (!acquired) {
         // Busy (a long sibling run or another process holds it). Leave next_due_at
         // unchanged so these tasks re-attempt next tick — they run the instant the
         // lease frees. No state write.
@@ -430,6 +453,7 @@ export async function runManualDream(
         [...groups.values()].map((group) =>
             runDomainGroup({ ...deps, executor: deps.executor }, group, {
                 forceGate,
+                leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
                 onRan: (t) => result.ran.push(t),
                 onFailed: (t) => result.failed.push(t),
                 onBusy: (t) => result.deferredBusy.push(t),

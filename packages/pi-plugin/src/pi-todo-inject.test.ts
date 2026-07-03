@@ -174,10 +174,7 @@ describe("injectSyntheticTodowriteForPi", () => {
 
 			// Defer pass: the pair must NOT attach to the aborted anchor (skip
 			// silently, same as an anchor outside the visible window).
-			const deferMessages = [
-				aborted,
-				good,
-			] as unknown as Parameters<
+			const deferMessages = [aborted, good] as unknown as Parameters<
 				typeof injectSyntheticTodowriteForPi
 			>[0]["messages"];
 			injectSyntheticTodowriteForPi({
@@ -200,11 +197,7 @@ describe("injectSyntheticTodowriteForPi", () => {
 				stopReason: "error",
 				timestamp: 3,
 			};
-			const bustMessages = [
-				aborted,
-				good,
-				errored,
-			] as unknown as Parameters<
+			const bustMessages = [aborted, good, errored] as unknown as Parameters<
 				typeof injectSyntheticTodowriteForPi
 			>[0]["messages"];
 			injectSyntheticTodowriteForPi({
@@ -218,8 +211,7 @@ describe("injectSyntheticTodowriteForPi", () => {
 			expect(findOrphanedFunctionCallOutputs(bustMessages)).toEqual([]);
 			const anchor = getPersistedTodoSyntheticAnchor(db, sessionId);
 			expect(anchor?.messageId).toBe("resp_good");
-			const goodContent = (good as { content: Array<{ id?: string }> })
-				.content;
+			const goodContent = (good as { content: Array<{ id?: string }> }).content;
 			expect(goodContent.some((b) => b.id === callId)).toBe(true);
 		} finally {
 			closeQuietly(db);

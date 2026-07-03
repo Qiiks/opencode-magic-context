@@ -103,7 +103,10 @@ export function registerCtxDreamCommand(
 					lines.push(`Skipped (no work): ${result.skippedNoWork.join(", ")}`);
 				if (result.deferredBusy.length > 0)
 					lines.push(
-						`Busy (already running): ${result.deferredBusy.join(", ")}`,
+						// "Busy" means the task's DOMAIN lease is held — usually
+						// a sibling task (e.g. a scheduled verify blocking a
+						// manual curate), not this task itself.
+						`Busy: ${result.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
 					);
 				if (lines.length === 0) lines.push("No enabled dream tasks to run.");
 

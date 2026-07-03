@@ -39,6 +39,28 @@ const DEFAULT_MAX_COMMITS = 5000;
 const RECORD_SEPARATOR = "\x1e";
 const FIELD_SEPARATOR = "\x1f";
 
+/**
+ * Why `git log` produced no commits, when it failed. `not_a_repo` and
+ * `no_head` (a repo with zero commits) are structural: retrying every sweep
+ * tick cannot succeed and only floods the log, so callers put the project on
+ * a long re-probe cooldown instead. `transient` covers everything else
+ * (timeouts, missing git binary, permission errors) and keeps the normal
+ * retry cadence.
+ */
+export type GitLogFailureKind = "not_a_repo" | "no_head" | "transient";
+
+export function classifyGitLogFailure(message: string): GitLogFailureKind {
+    if (message.includes("not a git repository")) return "not_a_repo";
+    if (
+        message.includes("unknown revision or path not in the working tree") ||
+        message.includes("does not have any commits yet") ||
+        message.includes("bad revision")
+    ) {
+        return "no_head";
+    }
+    return "transient";
+}
+
 export interface GitCommit {
     /** Full 40-char SHA. */
     sha: string;
@@ -80,6 +102,19 @@ export async function readGitCommits(
     directory: string,
     options: ReadGitCommitsOptions = {},
 ): Promise<GitCommit[]> {
+    return (await readGitCommitsResult(directory, options)).commits;
+}
+
+/**
+ * Like {@link readGitCommits}, but also reports WHY the read failed so the
+ * sweep can distinguish structurally non-indexable directories (not a repo,
+ * repo with no commits) from transient errors. `failure` is null on success —
+ * including a successful read that matched zero commits.
+ */
+export async function readGitCommitsResult(
+    directory: string,
+    options: ReadGitCommitsOptions = {},
+): Promise<{ commits: GitCommit[]; failure: GitLogFailureKind | null }> {
     // Guard against argument injection: a `branch` value beginning with `-`
     // would be parsed as a git OPTION (not a revision) since it sits ahead of
     // the format/since flags below. No shell is involved (execFile), so this
@@ -124,12 +159,23 @@ export async function readGitCommits(
     } catch (error) {
         // Intentional: git may not be installed, directory may not be a repo,
         // or the invocation may time out. All are "skip indexing this cycle"
-        // conditions, not crashes. We return empty and the next sweep will
-        // retry. We DO log the reason though — a silent empty-result masked a
-        // real cwd / PATH / timeout bug during the v0.14 git-commits rollout.
+        // conditions, not crashes. We return empty; transient failures retry
+        // next sweep, structural ones (classified below) go on a long cooldown.
+        // We DO log the reason though — a silent empty-result masked a real
+        // cwd / PATH / timeout bug during the v0.14 git-commits rollout.
         const message = error instanceof Error ? error.message : String(error);
-        log(`[git-commits] readGitCommits failed for ${projectLabel}: ${message.slice(0, 500)}`);
-        return [];
+        const failure = classifyGitLogFailure(message);
+        if (failure === "transient") {
+            log(
+                `[git-commits] readGitCommits failed for ${projectLabel}: ${message.slice(0, 500)}`,
+            );
+        } else {
+            // One quiet line instead of the full multi-line git error: these
+            // directories fail the same way every sweep and were flooding the
+            // recent-errors section of doctor reports.
+            log(`[git-commits] ${projectLabel} is not indexable (${failure})`);
+        }
+        return { commits: [], failure };
     }
 
     if (stdout.trim().length === 0) {
@@ -138,7 +184,7 @@ export async function readGitCommits(
         );
     }
 
-    return parseGitLogOutput(stdout);
+    return { commits: parseGitLogOutput(stdout), failure: null };
 }
 
 export function parseGitLogOutput(stdout: string): GitCommit[] {

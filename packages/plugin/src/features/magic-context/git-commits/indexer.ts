@@ -13,7 +13,7 @@
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { embedBatchForProject, getProjectEmbeddingSnapshot } from "../memory/embedding";
-import { readGitCommits } from "./git-log-reader";
+import { readGitCommits, readGitCommitsResult } from "./git-log-reader";
 import {
     countEmbeddedCommits,
     loadUnembeddedCommits,
@@ -49,6 +49,12 @@ export interface IndexCommitsResult {
     updated: number;
     evicted: number;
     embedded: number;
+    /**
+     * Set when `git log` failed structurally (directory is not a repo, or the
+     * repo has no commits yet). The sweep uses this to park the project on a
+     * long re-probe cooldown instead of retrying every tick.
+     */
+    nonIndexable: boolean;
 }
 
 /**
@@ -70,6 +76,7 @@ export async function indexCommitsForProject(
         updated: 0,
         evicted: 0,
         embedded: 0,
+        nonIndexable: false,
     };
 
     if (indexInProgress.has(projectPath)) {
@@ -88,12 +95,18 @@ export async function indexCommitsForProject(
                   Math.max(latestIndexed - 60_000, Date.now() - options.sinceDays * MS_PER_DAY)
                 : Date.now() - options.sinceDays * MS_PER_DAY;
 
-        const commits = await readGitCommits(directory, {
+        const read = await readGitCommitsResult(directory, {
             sinceMs,
             maxCommits: options.maxCommits,
             projectIdentity: projectPath,
         });
+        const commits = read.commits;
         result.scanned = commits.length;
+
+        if (read.failure === "not_a_repo" || read.failure === "no_head") {
+            result.nonIndexable = true;
+            return result;
+        }
 
         if (commits.length === 0) {
             // No new commits. Still enforce the cap in case prior runs overflowed.

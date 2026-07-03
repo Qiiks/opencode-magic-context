@@ -286,7 +286,12 @@ function summarizeManualDream(s: ManualDreamSummary): string {
     if (s.failed.length > 0) lines.push(`Failed: ${s.failed.join(", ")}`);
     if (s.skippedNoWork.length > 0) lines.push(`Skipped (no work): ${s.skippedNoWork.join(", ")}`);
     if (s.deferredBusy.length > 0)
-        lines.push(`Busy (already running): ${s.deferredBusy.join(", ")}`);
+        lines.push(
+            // "Busy" means the task's DOMAIN lease is held — usually a sibling
+            // task (e.g. a scheduled verify blocking a manual curate), not
+            // this task itself. Say so, or the message reads as a lie.
+            `Busy: ${s.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
+        );
     if (
         s.ran.length === 0 &&
         s.failed.length === 0 &&

@@ -27,6 +27,7 @@ import {
     GIT_SWEEP_LEASE_RENEWAL_MS,
     indexCommitsForProject,
     markGitSweepSuccessAndRelease,
+    parkGitSweepNonIndexable,
     releaseGitSweepLease,
     renewGitSweepLease,
 } from "../features/magic-context/git-commits";
@@ -465,6 +466,14 @@ async function sweepGitCommits(args: {
             sinceDays: gitCommitIndexing.since_days,
             maxCommits: gitCommitIndexing.max_commits,
         });
+        if (result.nonIndexable) {
+            // Not a repo / repo with no commits: park on the long re-probe
+            // cooldown so the timer doesn't retry (and log) every tick.
+            if (!parkGitSweepNonIndexable(db, projectIdentity, holderId)) {
+                releaseGitSweepLease(db, projectIdentity, holderId);
+            }
+            return;
+        }
         // Drain any remaining embedding backlog from this sweep (indexer caps per run).
         let drainedEmbeddings = 0;
         if (result.embedded > 0) {
