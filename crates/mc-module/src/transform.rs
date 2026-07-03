@@ -545,8 +545,10 @@ fn apply_once(
             // resolve_coverage fails loud on): a live item BELOW the first covered ordinal
             // is covered by no compartment, yet build_output trims everything at/under the
             // coverage end (and the first covered ordinal is itself <= the coverage end), so
-            // it would be silently dropped from the tail. resolve_coverage can't see the
-            // live array (it's store-pure), so the check lives here where the ordinals are.
+            // it would be silently dropped from the tail. Store-pure validators only check
+            // inter-compartment tiling; they cannot know whether the first stored start is
+            // the session's real first ordinal. resolve_coverage can't see the live array,
+            // so the leading-anchor check lives here where the ordinals are.
             if let Some(first) = comp.first_covered_ordinal {
                 if let Some(stray) = live
                     .iter()

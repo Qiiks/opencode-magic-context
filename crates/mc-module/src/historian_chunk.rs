@@ -298,18 +298,13 @@ pub fn build_historian_chunk(
     token_budget: usize,
     eligible_end_ordinal: u64,
 ) -> HistorianBuiltChunk {
-    let total_messages = messages
-        .iter()
-        .filter(|message| !message.ck.meta.synthetic)
-        .count() as u64;
     let total_count = messages
         .iter()
         .filter(|message| !message.ck.meta.synthetic)
         .map(|message| message.ordinal)
         .max()
-        .unwrap_or(0)
-        .max(total_messages);
-    let start = start_ordinal.max(1);
+        .unwrap_or(0);
+    let start = start_ordinal;
     let tool_call_summaries = build_tool_call_summary_lookup(blocks);
     let mut builder = Builder::new(token_budget, start, tool_call_summaries);
     let blocks_by_mid = grouped_blocks_by_mid(blocks);
@@ -461,14 +456,25 @@ pub fn assemble_historian_firing(
         ));
     }
     let compartments = store.load_compartments(&config.session_id)?;
-    let chunk_start = compartments
-        .iter()
-        .map(|c| c.end_message as u64)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1)
-        .max(1);
     let eligible_end = config.boundary.eligible_head.end;
+    let chunk_start =
+        if let Some(last_end) = compartments.iter().map(|c| c.end_message as u64).max() {
+            last_end.saturating_add(1)
+        } else {
+            let Some(first_live_eligible) = messages
+                .iter()
+                .filter(|message| !message.ck.meta.synthetic)
+                .filter(|message| message.ck.role != "system")
+                .map(|message| message.ordinal)
+                .filter(|ordinal| *ordinal < eligible_end)
+                .min()
+            else {
+                return Ok(AssembleHistorianFiringOutcome::NoFire(
+                    HistorianNoFireReason::EmptyChunk,
+                ));
+            };
+            first_live_eligible
+        };
     if chunk_start >= eligible_end {
         return Ok(AssembleHistorianFiringOutcome::NoFire(
             HistorianNoFireReason::EmptyEligibleRange {

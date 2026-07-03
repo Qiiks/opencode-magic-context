@@ -527,13 +527,20 @@ pub fn validate_historian_output(
 }
 
 /// Validate already-persisted ranges before appending new output.
+///
+/// This store-pure check anchors at the first stored compartment: only the live-aware
+/// fold can decide whether that first start matches the session's true first message.
 pub fn validate_stored_compartments(compartments: &[StoredCompartmentRange]) -> Option<String> {
-    if compartments.is_empty() {
-        return None;
+    let first = compartments.first()?;
+    if first.end_message < first.start_message {
+        return Some(format!(
+            "invalid range {}-{}",
+            first.start_message, first.end_message
+        ));
     }
 
-    let mut expected_start = 1;
-    for compartment in compartments {
+    let mut expected_start = first.end_message.saturating_add(1);
+    for compartment in &compartments[1..] {
         if compartment.start_message != expected_start {
             if compartment.start_message < expected_start {
                 return Some(format!(
@@ -1037,6 +1044,49 @@ mod tests {
         let first = validate_historian_output(&text, &chunk, &[], ValidateOptions::default());
         let second = validate_historian_output(&text, &chunk, &[], ValidateOptions::default());
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn stored_compartment_validation_is_basis_agnostic_but_rejects_internal_gaps() {
+        assert_eq!(
+            validate_stored_compartments(&[
+                StoredCompartmentRange {
+                    start_message: 0,
+                    end_message: 4,
+                },
+                StoredCompartmentRange {
+                    start_message: 5,
+                    end_message: 8,
+                },
+            ]),
+            None
+        );
+
+        let gap = validate_stored_compartments(&[
+            StoredCompartmentRange {
+                start_message: 5,
+                end_message: 7,
+            },
+            StoredCompartmentRange {
+                start_message: 9,
+                end_message: 10,
+            },
+        ])
+        .expect("interior gap rejected");
+        assert!(gap.contains("gap before message 9"));
+
+        let overlap = validate_stored_compartments(&[
+            StoredCompartmentRange {
+                start_message: 0,
+                end_message: 4,
+            },
+            StoredCompartmentRange {
+                start_message: 4,
+                end_message: 6,
+            },
+        ])
+        .expect("overlap rejected");
+        assert!(overlap.contains("overlap before message 5"));
     }
 
     #[test]

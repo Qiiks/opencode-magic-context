@@ -172,8 +172,9 @@ pub struct BoundaryContext {
     pub usage_percentage: f64,
     /// Current input token count; fractional inputs are rounded to the nearest token.
     pub usage_input_tokens: f64,
-    /// Last raw message ordinal already published in a compartment.
-    pub last_compartment_end_ordinal: u64,
+    /// Last raw message ordinal already published in a compartment, or `None` before
+    /// the first compartment. Ordinal 0 can be a real published end.
+    pub last_compartment_end_ordinal: Option<u64>,
     /// Previous boundary ordinal from an earlier calculation; retained so that floor can be reapplied.
     pub prior_boundary_ordinal: u64,
     /// Whether the floor based on `prior_boundary_ordinal` is currently active.
@@ -191,7 +192,7 @@ impl Default for BoundaryContext {
             execute_threshold_percentage: 65.0,
             usage_percentage: 0.0,
             usage_input_tokens: 0.0,
-            last_compartment_end_ordinal: 0,
+            last_compartment_end_ordinal: None,
             prior_boundary_ordinal: 1,
             migration_floor_active: false,
             emergency_tail_scale: None,
@@ -387,6 +388,19 @@ pub fn derive_trigger_budget(context_limit: f64, execute_threshold_percentage: f
     derived.clamp(TRIGGER_BUDGET_MIN, TRIGGER_BUDGET_MAX)
 }
 
+fn first_live_message_ordinal(messages: &[BoundaryMsg]) -> Option<u64> {
+    messages.iter().map(|message| message.message_ordinal).min()
+}
+
+fn compartment_offset(
+    last_compartment_end_ordinal: Option<u64>,
+    messages: &[BoundaryMsg],
+) -> Option<u64> {
+    last_compartment_end_ordinal
+        .map(|end| end.saturating_add(1))
+        .or_else(|| first_live_message_ordinal(messages))
+}
+
 /// Derive the protected-tail token target before optional emergency scaling.
 pub fn derive_protected_tail_token_target(ctx: &BoundaryContext) -> ProtectedTailTokenTarget {
     let safe_context_limit = if ctx.context_limit.is_finite() && ctx.context_limit > 0.0 {
@@ -442,7 +456,7 @@ pub fn resolve_protected_tail_boundary(
 ) -> BoundaryResolution {
     let index = TokenIndex::new(messages);
     let raw_message_count = index.raw_message_count;
-    let offset = ctx.last_compartment_end_ordinal.saturating_add(1).max(1);
+    let offset = compartment_offset(ctx.last_compartment_end_ordinal, messages).unwrap_or(1);
     let usage_percentage = clamp_percentage(ctx.usage_percentage);
     let usage_input_tokens = ctx.usage_input_tokens.max(0.0).round();
 
@@ -468,46 +482,30 @@ pub fn resolve_protected_tail_boundary(
     let arcs = build_tool_arcs(messages);
     let mut boundary = index.find_suffix_start_for_tokens(scaled_n);
     let recent_open_arc_cutoff = boundary;
-    let mut boundary_reason = if boundary == 1 {
+    let mut boundary_reason = if boundary == index.first_ordinal {
         "whole-session-smaller-than-tail".to_string()
     } else {
         "size-walk".to_string()
     };
 
     let token_at_boundary = index.token_for_ordinal(boundary);
-    if boundary <= raw_message_count
+    if boundary < index.terminal_ordinal
         && token_at_boundary > (2.0 * scaled_n).max(64_000.0)
-        && boundary < raw_message_count
+        && boundary < index.last_ordinal
     {
         boundary += 1;
         boundary_reason = "huge-message-exception".to_string();
     }
 
-    let first_fence = fence_boundary_for_tool_arcs(
-        boundary,
-        &arcs,
-        ctx.last_compartment_end_ordinal,
-        recent_open_arc_cutoff,
-    );
+    let first_fence = fence_boundary_for_tool_arcs(boundary, &arcs, offset, recent_open_arc_cutoff);
     let mut fenced_by_open_arc = first_fence.open_arc;
     boundary = first_fence.boundary;
 
-    let snapped = semantic_snap_boundary(
-        messages,
-        &index,
-        boundary,
-        scaled_n,
-        ctx.last_compartment_end_ordinal,
-    );
+    let snapped = semantic_snap_boundary(messages, &index, boundary, scaled_n, offset);
     if snapped != boundary {
         boundary_reason = "semantic-snap".to_string();
     }
-    let second_fence = fence_boundary_for_tool_arcs(
-        snapped,
-        &arcs,
-        ctx.last_compartment_end_ordinal,
-        recent_open_arc_cutoff,
-    );
+    let second_fence = fence_boundary_for_tool_arcs(snapped, &arcs, offset, recent_open_arc_cutoff);
     fenced_by_open_arc |= second_fence.open_arc;
     boundary = second_fence.boundary;
 
@@ -519,15 +517,16 @@ pub fn resolve_protected_tail_boundary(
 
     let mut floored_by_live_prompt = false;
     if ctx.emergency_tail_scale.is_none() && usage_percentage < FORCE_COMPARTMENT_PERCENTAGE {
-        let last_meaningful_user = messages
+        if let Some(last_meaningful_user) = messages
             .iter()
             .rev()
             .find(|message| message.role == Role::User && has_meaningful_user_text(&message.blocks))
             .map(|message| message.message_ordinal)
-            .unwrap_or(0);
-        if last_meaningful_user >= offset && protected_tail_start > last_meaningful_user {
-            protected_tail_start = last_meaningful_user;
-            floored_by_live_prompt = true;
+        {
+            if last_meaningful_user >= offset && protected_tail_start > last_meaningful_user {
+                protected_tail_start = last_meaningful_user;
+                floored_by_live_prompt = true;
+            }
         }
     }
 
@@ -536,7 +535,7 @@ pub fn resolve_protected_tail_boundary(
     {
         protected_tail_start = offset;
     }
-    protected_tail_start = clamp_ordinal(protected_tail_start, raw_message_count);
+    protected_tail_start = index.clamp_ordinal(protected_tail_start);
 
     let per_run_cap = select_per_run_cap(
         usage_percentage,
@@ -570,12 +569,13 @@ pub fn resolve_protected_tail_boundary(
 /// Measure TC-chunked content from flat items, using the whole flat tail as eligible.
 pub fn chunked_token_estimate(items: &[FlatItem], budget_stop: f64) -> ChunkEstimate {
     let messages = messages_from_flat(items);
+    let start = first_live_message_ordinal(&messages).unwrap_or(1);
     let total = messages
         .iter()
         .map(|message| message.message_ordinal)
         .max()
         .unwrap_or(0);
-    chunked_message_estimate(&messages, 1, Some(total.saturating_add(1)), budget_stop)
+    chunked_message_estimate(&messages, start, Some(total.saturating_add(1)), budget_stop)
 }
 
 /// Measure TC-chunked content for a message range.
@@ -592,7 +592,6 @@ pub fn chunked_message_estimate(
         .map(|message| message.message_ordinal)
         .max()
         .unwrap_or(ordered.len() as u64);
-    let start_ordinal = start_ordinal.max(1);
     let mut builder = ChunkBuilder::new(budget_stop);
 
     for message in &ordered {
@@ -628,17 +627,14 @@ pub fn check_compartment_trigger(
             ctx.boundary.execute_threshold_percentage,
         )
     });
-    let raw_message_count = messages
+    let offset =
+        compartment_offset(ctx.boundary.last_compartment_end_ordinal, messages).unwrap_or(1);
+    let has_live_at_or_after_offset = messages
         .iter()
         .map(|message| message.message_ordinal)
         .max()
-        .unwrap_or(messages.len() as u64);
-    let offset = ctx
-        .boundary
-        .last_compartment_end_ordinal
-        .saturating_add(1)
-        .max(1);
-    if raw_message_count < offset {
+        .is_some_and(|max_ordinal| max_ordinal >= offset);
+    if !has_live_at_or_after_offset {
         return no_fire();
     }
 
@@ -792,10 +788,6 @@ fn clamp_percentage(value: f64) -> f64 {
     value.clamp(0.0, 100.0)
 }
 
-fn clamp_ordinal(value: u64, raw_message_count: u64) -> u64 {
-    value.max(1).min(raw_message_count.saturating_add(1))
-}
-
 fn get_proactive_compartment_trigger_percentage(execute_threshold_percentage: f64) -> f64 {
     (execute_threshold_percentage - PROACTIVE_TRIGGER_OFFSET_PERCENTAGE).max(0.0)
 }
@@ -853,36 +845,51 @@ fn has_runnable_compartment_window(
 #[derive(Debug)]
 struct TokenIndex {
     raw_message_count: u64,
+    first_ordinal: u64,
+    last_ordinal: u64,
+    terminal_ordinal: u64,
+    ordinals: Vec<u64>,
     prefix: Vec<f64>,
     tokens_by_ordinal: HashMap<u64, f64>,
 }
 
 impl TokenIndex {
     fn new(messages: &[BoundaryMsg]) -> Self {
-        let raw_message_count = messages
-            .iter()
-            .map(|message| message.message_ordinal)
-            .max()
-            .unwrap_or(messages.len() as u64)
-            .max(messages.len() as u64);
-        let mut prefix = vec![0.0; raw_message_count as usize + 1];
-        let mut tokens_by_ordinal = HashMap::new();
+        let mut totals_by_ordinal = BTreeMap::new();
         for message in messages {
             let total = message
                 .blocks
                 .iter()
                 .map(|block| estimate_tokens(&block.original) as f64)
                 .sum::<f64>();
-            tokens_by_ordinal.insert(message.message_ordinal, total);
-            if (1..=raw_message_count).contains(&message.message_ordinal) {
-                prefix[message.message_ordinal as usize] = total;
-            }
+            *totals_by_ordinal
+                .entry(message.message_ordinal)
+                .or_insert(0.0) += total;
         }
-        for idx in 1..prefix.len() {
-            prefix[idx] += prefix[idx - 1];
+
+        let ordinals: Vec<u64> = totals_by_ordinal.keys().copied().collect();
+        let first_ordinal = ordinals.first().copied().unwrap_or(1);
+        let last_ordinal = ordinals.last().copied().unwrap_or(0);
+        let terminal_ordinal = ordinals
+            .last()
+            .map(|ordinal| ordinal.saturating_add(1))
+            .unwrap_or(1);
+        let mut prefix = Vec::with_capacity(ordinals.len() + 1);
+        prefix.push(0.0);
+        let mut tokens_by_ordinal = HashMap::new();
+        for ordinal in &ordinals {
+            let total = totals_by_ordinal.get(ordinal).copied().unwrap_or(0.0);
+            tokens_by_ordinal.insert(*ordinal, total);
+            let previous = prefix.last().copied().unwrap_or(0.0);
+            prefix.push(previous + total);
         }
+
         Self {
-            raw_message_count,
+            raw_message_count: ordinals.len() as u64,
+            first_ordinal,
+            last_ordinal,
+            terminal_ordinal,
+            ordinals,
             prefix,
             tokens_by_ordinal,
         }
@@ -892,40 +899,80 @@ impl TokenIndex {
         self.tokens_by_ordinal.get(&ordinal).copied().unwrap_or(0.0)
     }
 
-    fn suffix_tokens_from_ordinal(&self, ordinal: u64) -> f64 {
-        if ordinal <= 1 {
-            return self.prefix[self.raw_message_count as usize];
+    fn total_tokens(&self) -> f64 {
+        self.prefix.last().copied().unwrap_or(0.0)
+    }
+
+    fn lower_bound(&self, ordinal: u64) -> usize {
+        self.ordinals
+            .partition_point(|candidate| *candidate < ordinal)
+    }
+
+    fn exclusive_end_for_prefix_index(&self, index: usize) -> u64 {
+        if index == 0 {
+            self.first_ordinal
+        } else {
+            self.ordinals[index - 1].saturating_add(1)
         }
-        if ordinal > self.raw_message_count {
+    }
+
+    fn clamp_ordinal(&self, ordinal: u64) -> u64 {
+        if self.ordinals.is_empty() {
+            return ordinal;
+        }
+        ordinal.max(self.first_ordinal).min(self.terminal_ordinal)
+    }
+
+    fn suffix_tokens_from_ordinal(&self, ordinal: u64) -> f64 {
+        if self.ordinals.is_empty() {
             return 0.0;
         }
-        self.prefix[self.raw_message_count as usize] - self.prefix[(ordinal - 1) as usize]
+        if ordinal <= self.first_ordinal {
+            return self.total_tokens();
+        }
+        if ordinal >= self.terminal_ordinal {
+            return 0.0;
+        }
+        let start_index = self.lower_bound(ordinal);
+        self.total_tokens() - self.prefix[start_index]
     }
 
     fn range_tokens(&self, start_inclusive: u64, end_exclusive: u64) -> f64 {
-        let start = start_inclusive.max(1);
-        let end = end_exclusive
-            .max(start)
-            .min(self.raw_message_count.saturating_add(1));
-        self.prefix[(end - 1) as usize] - self.prefix[(start - 1) as usize]
+        if self.ordinals.is_empty() || end_exclusive <= start_inclusive {
+            return 0.0;
+        }
+        let start = start_inclusive.max(self.first_ordinal);
+        let end = end_exclusive.max(start).min(self.terminal_ordinal);
+        if end <= start {
+            return 0.0;
+        }
+        let start_index = self.lower_bound(start);
+        let end_index = self.lower_bound(end);
+        if end_index <= start_index {
+            return 0.0;
+        }
+        self.prefix[end_index] - self.prefix[start_index]
     }
 
     fn find_suffix_start_for_tokens(&self, tokens: f64) -> u64 {
-        if !tokens.is_finite() || tokens <= 0.0 {
-            return self.raw_message_count.saturating_add(1);
-        }
-        let target = tokens.floor().max(0.0);
-        let total = self.prefix[self.raw_message_count as usize];
-        if total < target {
+        if self.ordinals.is_empty() {
             return 1;
         }
+        if !tokens.is_finite() || tokens <= 0.0 {
+            return self.terminal_ordinal;
+        }
+        let target = tokens.floor().max(0.0);
+        let total = self.total_tokens();
+        if total < target {
+            return self.first_ordinal;
+        }
         let cut = total - target;
-        let mut lo = 0_u64;
-        let mut hi = self.raw_message_count;
-        let mut best = 0_u64;
+        let mut lo = 0_usize;
+        let mut hi = self.prefix.len() - 1;
+        let mut best = 0_usize;
         while lo <= hi {
             let mid = (lo + hi) >> 1;
-            if self.prefix[mid as usize] <= cut {
+            if self.prefix[mid] <= cut {
                 best = mid;
                 lo = mid + 1;
             } else if mid == 0 {
@@ -934,7 +981,10 @@ impl TokenIndex {
                 hi = mid - 1;
             }
         }
-        best + 1
+        self.ordinals
+            .get(best)
+            .copied()
+            .unwrap_or(self.terminal_ordinal)
     }
 
     fn find_head_end_for_cap(
@@ -943,24 +993,30 @@ impl TokenIndex {
         end_exclusive: u64,
         cap_tokens: f64,
     ) -> u64 {
+        if self.ordinals.is_empty() {
+            return start_inclusive;
+        }
         let start = start_inclusive
-            .max(1)
-            .min(self.raw_message_count.saturating_add(1));
-        let end = end_exclusive
-            .max(start)
-            .min(self.raw_message_count.saturating_add(1));
+            .max(self.first_ordinal)
+            .min(self.terminal_ordinal);
+        let end = end_exclusive.max(start).min(self.terminal_ordinal);
         if !cap_tokens.is_finite() || cap_tokens <= 0.0 {
             return start;
         }
-        let start_prefix = self.prefix[(start - 1) as usize];
+        let start_index = self.lower_bound(start);
+        let end_index = self.lower_bound(end);
+        if start_index >= end_index {
+            return start;
+        }
+        let start_prefix = self.prefix[start_index];
         let cut = start_prefix + cap_tokens.floor();
-        let mut lo = start;
-        let mut hi = end.saturating_sub(1);
-        let mut best_end = start;
+        let mut lo = start_index;
+        let mut hi = end_index;
+        let mut best_index = start_index;
         while lo <= hi {
             let mid = (lo + hi) >> 1;
-            if self.prefix[mid as usize] <= cut {
-                best_end = mid + 1;
+            if self.prefix[mid] <= cut {
+                best_index = mid;
                 lo = mid + 1;
             } else if mid == 0 {
                 break;
@@ -968,10 +1024,10 @@ impl TokenIndex {
                 hi = mid - 1;
             }
         }
-        if best_end == start && start < end {
-            return start + 1;
+        if best_index == start_index {
+            return self.ordinals[start_index].saturating_add(1).min(end);
         }
-        best_end.min(end)
+        self.exclusive_end_for_prefix_index(best_index).min(end)
     }
 }
 
@@ -1038,7 +1094,7 @@ struct FenceResult {
 fn fence_boundary_for_tool_arcs(
     candidate: u64,
     arcs: &[ToolArc],
-    last_compartment_end_ordinal: u64,
+    publication_floor_ordinal: u64,
     recent_open_arc_cutoff: u64,
 ) -> FenceResult {
     let mut boundary = candidate;
@@ -1052,9 +1108,7 @@ fn fence_boundary_for_tool_arcs(
         if arc.inv_ordinal < recent_open_arc_cutoff {
             continue;
         }
-        if arc.inv_ordinal >= last_compartment_end_ordinal.saturating_add(1)
-            && arc.inv_ordinal < boundary
-        {
+        if arc.inv_ordinal >= publication_floor_ordinal && arc.inv_ordinal < boundary {
             return FenceResult {
                 boundary: arc.inv_ordinal,
                 open_arc: true,
@@ -1078,7 +1132,7 @@ fn semantic_snap_boundary(
     index: &TokenIndex,
     candidate: u64,
     scaled_n: f64,
-    last_compartment_end_ordinal: u64,
+    publication_floor_ordinal: u64,
 ) -> u64 {
     let mut ordered: Vec<&BoundaryMsg> = messages.iter().collect();
     ordered.sort_by_key(|message| message.message_ordinal);
@@ -1087,7 +1141,7 @@ fn semantic_snap_boundary(
         if message.message_ordinal > candidate {
             break;
         }
-        if message.message_ordinal < last_compartment_end_ordinal.saturating_add(1) {
+        if message.message_ordinal < publication_floor_ordinal {
             continue;
         }
         if !is_semantic_boundary_candidate(message) {
@@ -1748,7 +1802,7 @@ mod tests {
         execute_threshold_percentage: f64,
         usage_percentage: f64,
         usage_input_tokens: f64,
-        last_compartment_end_ordinal: u64,
+        last_compartment_end_ordinal: Option<u64>,
         prior_boundary_ordinal: u64,
         migration_floor_active: bool,
         emergency_tail_scale: Option<f64>,
@@ -2103,7 +2157,7 @@ mod tests {
             execute_threshold_percentage: 50.0,
             usage_percentage: 81.0,
             usage_input_tokens: 8_100.0,
-            last_compartment_end_ordinal: 0,
+            last_compartment_end_ordinal: None,
             prior_boundary_ordinal: 1,
             migration_floor_active: false,
             emergency_tail_scale: None,
@@ -2131,7 +2185,7 @@ mod tests {
             text_msg(2, Role::Assistant, &"old ".repeat(800)),
         ];
         let mut ctx = ctx_for_tests();
-        ctx.last_compartment_end_ordinal = 1;
+        ctx.last_compartment_end_ordinal = Some(1);
         let before = resolve_protected_tail_boundary(&tail, &ctx);
         tail.push(text_msg(3, Role::Assistant, &"new ".repeat(1200)));
         let after = resolve_protected_tail_boundary(&tail, &ctx);
@@ -2195,6 +2249,51 @@ mod tests {
         let estimate = chunked_message_estimate(&tail, 1, None, 50.0);
         assert!(estimate.has_more);
         assert!(estimate.tokens >= 50.0);
+    }
+
+    #[test]
+    fn zero_based_trigger_counts_ordinal_zero_content() {
+        let tail = (0..=5)
+            .map(|ord| text_msg(ord, Role::Assistant, &"zero based content ".repeat(4_000)))
+            .collect::<Vec<_>>();
+        let mut trigger = TriggerContext::default();
+        trigger.boundary.context_limit = 20_000.0;
+        trigger.boundary.execute_threshold_percentage = 50.0;
+        trigger.boundary.usage_percentage = 81.0;
+
+        let decision = check_compartment_trigger(&tail, &trigger);
+
+        assert!(
+            decision.fire,
+            "ordinal-0 content contributes to the trigger"
+        );
+        let boundary = decision.boundary.expect("fire carries boundary");
+        assert_eq!(boundary.eligible_head.start, 0);
+        assert!(boundary.true_raw_eligible_tokens > 0.0);
+    }
+
+    #[test]
+    fn compartment_ending_at_ordinal_zero_starts_next_window_at_one() {
+        let tail = (0..=5)
+            .map(|ord| text_msg(ord, Role::Assistant, &"published floor ".repeat(1_000)))
+            .collect::<Vec<_>>();
+        let mut ctx = ctx_for_tests();
+        ctx.last_compartment_end_ordinal = Some(0);
+        ctx.trigger_budget = Some(1_000.0);
+
+        let boundary = resolve_protected_tail_boundary(&tail, &ctx);
+        let chunk = chunked_message_estimate(
+            &tail,
+            boundary.eligible_head.start,
+            Some(boundary.protected_start_ordinal),
+            10_000.0,
+        );
+
+        assert_eq!(boundary.eligible_head.start, 1);
+        assert!(!chunk
+            .formatted_blocks
+            .iter()
+            .any(|block| block.contains("[0]")));
     }
 
     #[test]

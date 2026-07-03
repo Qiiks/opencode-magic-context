@@ -490,8 +490,8 @@ impl McHandler {
         let boundary_messages = boundary_messages(parsed, projection);
         let last_compartment_end_ordinal = store
             .load_compartments(&parsed.session_id)
-            .map(|cs| cs.iter().map(|c| c.end_message as u64).max().unwrap_or(0))
-            .unwrap_or(0);
+            .ok()
+            .and_then(|cs| cs.iter().map(|c| c.end_message as u64).max());
         let (context_limit, input_tokens, usage_percentage) = usage_numbers(parsed.usage.as_ref());
         let trigger = boundary::check_compartment_trigger(
             &boundary_messages,
@@ -502,8 +502,8 @@ impl McHandler {
                     usage_percentage,
                     usage_input_tokens: input_tokens,
                     last_compartment_end_ordinal,
-                    prior_boundary_ordinal: last_compartment_end_ordinal,
-                    migration_floor_active: last_compartment_end_ordinal > 0,
+                    prior_boundary_ordinal: last_compartment_end_ordinal.unwrap_or(0),
+                    migration_floor_active: last_compartment_end_ordinal.unwrap_or(0) > 0,
                     emergency_tail_scale: None,
                     trigger_budget: None,
                 },
@@ -1209,6 +1209,7 @@ mod tests {
         block_output: std::sync::atomic::AtomicBool,
         notify: Notify,
         outputs: Mutex<VecDeque<String>>,
+        prompts: Mutex<Vec<String>>,
     }
 
     struct TestProducerFactory {
@@ -1247,6 +1248,11 @@ mod tests {
             _model: &str,
         ) -> Result<RunHandle, HistorianProducerError> {
             let n = self.state.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state
+                .prompts
+                .lock()
+                .expect("prompts mutex")
+                .push(prompt.to_string());
             self.state
                 .outputs
                 .lock()
@@ -1318,12 +1324,12 @@ mod tests {
         }
     }
 
-    fn ck(mid: &str, ordinal: u64, text: &str) -> CkIngressMessage {
+    fn ck_with_role(mid: &str, ordinal: u64, role: &str, text: &str) -> CkIngressMessage {
         CkIngressMessage {
             mid: mid.to_string(),
             ordinal,
             ck: CkWireMessage::from_parts(
-                "user",
+                role,
                 vec![CkWireBlock::bare(CkKind::Text { text: text.into() })],
                 None,
                 ProviderExtras::new(),
@@ -1335,16 +1341,37 @@ mod tests {
         }
     }
 
-    fn big_messages() -> Vec<CkIngressMessage> {
-        (1..=80)
-            .map(|n| {
+    fn ck(mid: &str, ordinal: u64, text: &str) -> CkIngressMessage {
+        ck_with_role(mid, ordinal, "user", text)
+    }
+
+    fn big_messages_from(start_ordinal: u64) -> Vec<CkIngressMessage> {
+        (0..80)
+            .map(|idx| {
+                let ordinal = start_ordinal + idx;
                 ck(
-                    &format!("m{n}"),
-                    n,
-                    &format!("message {n} {}", "word ".repeat(800)),
+                    &format!("m{ordinal}"),
+                    ordinal,
+                    &format!("message {ordinal} {}", "word ".repeat(800)),
                 )
             })
             .collect()
+    }
+
+    fn big_messages() -> Vec<CkIngressMessage> {
+        big_messages_from(1)
+    }
+
+    fn zero_based_messages_with_system_lead() -> Vec<CkIngressMessage> {
+        let mut messages = vec![ck_with_role("m0", 0, "system", "identity lead")];
+        messages.extend((1..=80).map(|ordinal| {
+            ck(
+                &format!("m{ordinal}"),
+                ordinal,
+                &format!("message {ordinal} {}", "word ".repeat(800)),
+            )
+        }));
+        messages
     }
 
     fn request(messages: Vec<CkIngressMessage>) -> Value {
@@ -1452,9 +1479,12 @@ mod tests {
         let first = call_transform(&handler, messages.clone()).await;
         assert_eq!(first["historian"]["fired"], true);
         wait_for_count(&producer.starts, 1).await;
+        let prompt = producer.prompts.lock().unwrap()[0].clone();
+        assert_eq!(prompt_ordinal_range(&prompt).unwrap().0, 1);
         wait_for_idle(&store).await;
         let compartments = store.load_compartments("ses").unwrap();
         assert_eq!(compartments.len(), 1);
+        assert_eq!(compartments[0].start_message, 1);
         assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
 
         let second = call_transform(&handler, messages).await;
@@ -1463,6 +1493,54 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains('#'));
+        assert!(m0_text(&second).contains("autonomous summary"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_zero_based_autonomous_cycle_covers_ordinal_zero_and_folds() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages_from(0);
+
+        let first = call_transform(&handler, messages.clone()).await;
+        assert_eq!(first["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        let prompt = producer.prompts.lock().unwrap()[0].clone();
+        assert_eq!(prompt_ordinal_range(&prompt).unwrap().0, 0);
+        wait_for_idle(&store).await;
+        let compartments = store.load_compartments("ses").unwrap();
+        assert_eq!(compartments.len(), 1);
+        assert_eq!(compartments[0].start_message, 0);
+
+        let second = call_transform(&handler, messages).await;
+        assert_eq!(second["action"], "HARD");
+        assert!(second["boundary_id"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("#"));
+        assert!(m0_text(&second).contains("autonomous summary"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_zero_based_system_lead_starts_chunk_at_first_user_and_folds() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = zero_based_messages_with_system_lead();
+
+        let first = call_transform(&handler, messages.clone()).await;
+        assert_eq!(first["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        let prompt = producer.prompts.lock().unwrap()[0].clone();
+        assert_eq!(prompt_ordinal_range(&prompt).unwrap().0, 1);
+        wait_for_idle(&store).await;
+        let compartments = store.load_compartments("ses").unwrap();
+        assert_eq!(compartments.len(), 1);
+        assert_eq!(compartments[0].start_message, 1);
+
+        let second = call_transform(&handler, messages).await;
+        assert_eq!(second["action"], "HARD");
         assert!(m0_text(&second).contains("autonomous summary"));
     }
 
