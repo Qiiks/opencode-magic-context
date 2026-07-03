@@ -35,9 +35,13 @@ pub mod selection;
 pub mod transform;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{HistorianPhase, McStore};
@@ -123,7 +127,7 @@ pub struct McHandler {
     #[cfg(test)]
     fixed_config: Option<McModuleConfig>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
-    live_historian_sessions: Arc<Mutex<HashSet<String>>>,
+    live_historian_sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     #[cfg(test)]
     reduction_injection: Mutex<HashMap<String, Vec<ReductionDecision>>>,
@@ -167,18 +171,65 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
 
 struct MissingProducerFactory;
 
-struct SessionSetGuard {
+struct StringSetGuard {
     sessions: Arc<Mutex<HashSet<String>>>,
     session_id: String,
 }
 
-impl Drop for SessionSetGuard {
+impl Drop for StringSetGuard {
     fn drop(&mut self) {
         self.sessions
             .lock()
             .expect("session set mutex")
             .remove(&self.session_id);
     }
+}
+
+type LiveHistorianCompletionWait = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+#[derive(Clone)]
+struct LiveHistorianSession {
+    token: Arc<()>,
+    completion: Arc<Notify>,
+}
+
+struct SessionSetGuard {
+    sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
+    session_id: String,
+    token: Arc<()>,
+    completion: Arc<Notify>,
+}
+
+impl Drop for SessionSetGuard {
+    fn drop(&mut self) {
+        let mut sessions = self.sessions.lock().expect("session set mutex");
+        self.completion.notify_waiters();
+        let matches_current = sessions
+            .get(&self.session_id)
+            .is_some_and(|live| Arc::ptr_eq(&live.token, &self.token));
+        if matches_current {
+            sessions.remove(&self.session_id);
+        }
+    }
+}
+
+enum LiveHistorianSessionClaim {
+    Acquired(SessionSetGuard),
+    Busy(LiveHistorianCompletionWait),
+}
+
+struct PreparedHistorianFiring {
+    diagnostics: HistorianDiagnostics,
+    task: HistorianFiringTask,
+}
+
+enum PreparedHistorianAction {
+    Complete(HistorianDiagnostics),
+    Busy {
+        diagnostics: HistorianDiagnostics,
+        completion: LiveHistorianCompletionWait,
+    },
+    FireReady(Box<PreparedHistorianFiring>),
 }
 
 struct HistorianFiringTask {
@@ -228,7 +279,7 @@ impl McHandler {
             #[cfg(test)]
             fixed_config: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
-            live_historian_sessions: Arc::new(Mutex::new(HashSet::new())),
+            live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             scheduler_observations: Mutex::new(HashMap::new()),
             #[cfg(test)]
             reduction_injection: Mutex::new(HashMap::new()),
@@ -262,7 +313,7 @@ impl McHandler {
             config: Mutex::new(ConfigCache::default()),
             fixed_config: Some(config),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
-            live_historian_sessions: Arc::new(Mutex::new(HashSet::new())),
+            live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             scheduler_observations: Mutex::new(HashMap::new()),
             reduction_injection: Mutex::new(HashMap::new()),
             bindings: Mutex::new(HashMap::new()),
@@ -364,6 +415,46 @@ impl McHandler {
             .insert(session_id.to_string(), reductions);
     }
 
+    fn live_historian_completion_wait(
+        &self,
+        session_id: &str,
+    ) -> Option<LiveHistorianCompletionWait> {
+        let live = self
+            .live_historian_sessions
+            .lock()
+            .expect("live historian mutex");
+        live.get(session_id).map(|entry| {
+            Box::pin(entry.completion.clone().notified_owned()) as LiveHistorianCompletionWait
+        })
+    }
+
+    fn try_claim_live_historian_session(&self, session_id: &str) -> LiveHistorianSessionClaim {
+        let mut live = self
+            .live_historian_sessions
+            .lock()
+            .expect("live historian mutex");
+        if let Some(entry) = live.get(session_id) {
+            return LiveHistorianSessionClaim::Busy(Box::pin(
+                entry.completion.clone().notified_owned(),
+            ));
+        }
+        let token = Arc::new(());
+        let completion = Arc::new(Notify::new());
+        live.insert(
+            session_id.to_string(),
+            LiveHistorianSession {
+                token: Arc::clone(&token),
+                completion: Arc::clone(&completion),
+            },
+        );
+        LiveHistorianSessionClaim::Acquired(SessionSetGuard {
+            sessions: Arc::clone(&self.live_historian_sessions),
+            session_id: session_id.to_string(),
+            token,
+            completion,
+        })
+    }
+
     fn maybe_spawn_reattach(
         &self,
         store: Arc<McStore>,
@@ -383,7 +474,7 @@ impl McHandler {
             .live_historian_sessions
             .lock()
             .expect("live historian mutex")
-            .contains(&parsed.session_id)
+            .contains_key(&parsed.session_id)
         {
             return None;
         }
@@ -401,7 +492,7 @@ impl McHandler {
 
         let session_id = parsed.session_id.clone();
         let latch = Arc::clone(&self.reattaching_sessions);
-        let guard = SessionSetGuard {
+        let guard = StringSetGuard {
             sessions: Arc::clone(&latch),
             session_id: session_id.clone(),
         };
@@ -503,43 +594,41 @@ impl McHandler {
         }
     }
 
-    fn maybe_spawn_historian_fire(
+    fn prepare_historian_fire(
         &self,
         store: Arc<McStore>,
         parsed: &TransformRequest,
         binding: &SessionBinding,
-        project_path: String,
+        project_path: &str,
         projection: &transform::ck_wire::FlatProjection,
         now: i64,
-    ) -> HistorianDiagnostics {
+    ) -> PreparedHistorianAction {
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(e) => {
-                return HistorianDiagnostics {
+                return PreparedHistorianAction::Complete(HistorianDiagnostics {
                     fired: false,
                     reason: None,
                     no_fire: Some(format!("state_load_failed:{e}")),
                     state: "unknown".to_string(),
                     progress: None,
                     last_failure: None,
-                }
+                })
             }
         };
         let state = loaded.meta.historian.state.as_str().to_string();
         let last_failure = loaded.meta.historian.last_failure.clone();
-        if self
-            .live_historian_sessions
-            .lock()
-            .expect("live historian mutex")
-            .contains(&parsed.session_id)
-        {
-            return HistorianDiagnostics {
-                fired: false,
-                reason: None,
-                no_fire: Some("busy".to_string()),
-                state,
-                progress: None,
-                last_failure: last_failure.clone(),
+        if let Some(completion) = self.live_historian_completion_wait(&parsed.session_id) {
+            return PreparedHistorianAction::Busy {
+                diagnostics: HistorianDiagnostics {
+                    fired: false,
+                    reason: None,
+                    no_fire: Some("busy".to_string()),
+                    state,
+                    progress: None,
+                    last_failure,
+                },
+                completion,
             };
         }
         if loaded.meta.historian.state != HistorianPhase::Idle {
@@ -547,19 +636,19 @@ impl McHandler {
                 .maybe_spawn_reattach(
                     Arc::clone(&store),
                     parsed,
-                    project_path.clone(),
+                    project_path.to_string(),
                     projection,
                     now,
                 )
                 .unwrap_or("busy");
-            return HistorianDiagnostics {
+            return PreparedHistorianAction::Complete(HistorianDiagnostics {
                 fired: false,
                 reason: None,
                 no_fire: Some(no_fire.to_string()),
                 state,
                 progress: None,
-                last_failure: last_failure.clone(),
-            };
+                last_failure,
+            });
         }
         let cfg = self.effective_config(&binding.project_root);
         let boundary_messages = boundary_messages(parsed, projection);
@@ -621,36 +710,37 @@ impl McHandler {
                 };
                 self.record_no_fire(&store, &parsed.session_id, &loaded, &detail);
             }
-            return HistorianDiagnostics {
+            return PreparedHistorianAction::Complete(HistorianDiagnostics {
                 fired: false,
                 reason: None,
                 no_fire: Some(reason.to_string()),
                 state,
                 progress,
                 last_failure,
-            };
+            });
         }
+        let trigger_reason = trigger.reason.map(|r| r.as_str().to_string());
         if cfg.model_chain.is_empty() {
             self.record_no_fire(&store, &parsed.session_id, &loaded, "no_models");
-            return HistorianDiagnostics {
+            return PreparedHistorianAction::Complete(HistorianDiagnostics {
                 fired: false,
-                reason: trigger.reason.map(|r| r.as_str().to_string()),
+                reason: trigger_reason,
                 no_fire: Some("no_models".to_string()),
                 state,
                 progress: progress.clone(),
-                last_failure: last_failure.clone(),
-            };
+                last_failure,
+            });
         }
         let Some(boundary) = trigger.boundary.clone() else {
             self.record_no_fire(&store, &parsed.session_id, &loaded, "missing_boundary");
-            return HistorianDiagnostics {
+            return PreparedHistorianAction::Complete(HistorianDiagnostics {
                 fired: false,
                 reason: None,
                 no_fire: Some("missing_boundary".to_string()),
                 state,
                 progress: progress.clone(),
-                last_failure: last_failure.clone(),
-            };
+                last_failure,
+            });
         };
         if loaded
             .meta
@@ -659,14 +749,14 @@ impl McHandler {
             .is_some_and(|backoff_at_ms| now < backoff_at_ms)
         {
             self.record_no_fire(&store, &parsed.session_id, &loaded, "backoff");
-            return HistorianDiagnostics {
+            return PreparedHistorianAction::Complete(HistorianDiagnostics {
                 fired: false,
-                reason: trigger.reason.map(|r| r.as_str().to_string()),
+                reason: trigger_reason,
                 no_fire: Some("backoff".to_string()),
                 state,
                 progress: progress.clone(),
-                last_failure: last_failure.clone(),
-            };
+                last_failure,
+            });
         }
         let live: Vec<_> = projection
             .blocks
@@ -681,7 +771,7 @@ impl McHandler {
             &live,
             HistorianAssemblerConfig {
                 session_id: parsed.session_id.clone(),
-                project_path: project_path.clone(),
+                project_path: project_path.to_string(),
                 project_slug: project_slug.clone(),
                 model_chain: cfg.model_chain.clone(),
                 token_budget: DEFAULT_HISTORIAN_CHUNK_TOKENS,
@@ -703,14 +793,14 @@ impl McHandler {
                     &loaded,
                     &format!("assemble:{reason:?}"),
                 );
-                return HistorianDiagnostics {
+                return PreparedHistorianAction::Complete(HistorianDiagnostics {
                     fired: false,
-                    reason: trigger.reason.map(|r| r.as_str().to_string()),
+                    reason: trigger_reason,
                     no_fire: Some(format!("assemble:{reason:?}")),
                     state,
                     progress: progress.clone(),
-                    last_failure: last_failure.clone(),
-                };
+                    last_failure,
+                });
             }
             Err(e) => {
                 self.record_no_fire(
@@ -719,53 +809,65 @@ impl McHandler {
                     &loaded,
                     &format!("assemble_failed:{e}"),
                 );
-                return HistorianDiagnostics {
+                return PreparedHistorianAction::Complete(HistorianDiagnostics {
                     fired: false,
-                    reason: trigger.reason.map(|r| r.as_str().to_string()),
+                    reason: trigger_reason,
                     no_fire: Some(format!("assemble_failed:{e}")),
                     state,
                     progress: progress.clone(),
-                    last_failure: last_failure.clone(),
-                };
+                    last_failure,
+                });
             }
         };
-        let live_guard = {
-            let mut live = self
-                .live_historian_sessions
-                .lock()
-                .expect("live historian mutex");
-            if !live.insert(parsed.session_id.clone()) {
-                return HistorianDiagnostics {
-                    fired: false,
-                    reason: trigger.reason.map(|r| r.as_str().to_string()),
-                    no_fire: Some("busy".to_string()),
-                    state,
-                    progress: progress.clone(),
-                    last_failure: last_failure.clone(),
-                };
-            }
-            SessionSetGuard {
-                sessions: Arc::clone(&self.live_historian_sessions),
-                session_id: parsed.session_id.clone(),
-            }
-        };
-        self.spawn_historian_firing(HistorianFiringTask {
-            store,
-            session_id: parsed.session_id.clone(),
-            project_path,
-            project_root: binding.project_root.clone(),
-            project_slug,
-            firing,
-            live_guard,
-        });
-        HistorianDiagnostics {
+        let diagnostics = HistorianDiagnostics {
             fired: true,
-            reason: trigger.reason.map(|r| r.as_str().to_string()),
+            reason: trigger_reason,
             no_fire: None,
-            state,
-            progress,
-            last_failure,
+            state: state.clone(),
+            progress: progress.clone(),
+            last_failure: last_failure.clone(),
+        };
+        let live_guard = match self.try_claim_live_historian_session(&parsed.session_id) {
+            LiveHistorianSessionClaim::Acquired(live_guard) => live_guard,
+            LiveHistorianSessionClaim::Busy(completion) => {
+                return PreparedHistorianAction::Busy {
+                    diagnostics: HistorianDiagnostics {
+                        fired: false,
+                        reason: diagnostics.reason,
+                        no_fire: Some("busy".to_string()),
+                        state,
+                        progress,
+                        last_failure,
+                    },
+                    completion,
+                };
+            }
+        };
+        PreparedHistorianAction::FireReady(Box::new(PreparedHistorianFiring {
+            diagnostics,
+            task: HistorianFiringTask {
+                store,
+                session_id: parsed.session_id.clone(),
+                project_path: project_path.to_string(),
+                project_root: binding.project_root.clone(),
+                project_slug,
+                firing,
+                live_guard,
+            },
+        }))
+    }
+
+    fn refresh_historian_diagnostics(
+        &self,
+        store: &McStore,
+        session_id: &str,
+        mut diagnostics: HistorianDiagnostics,
+    ) -> HistorianDiagnostics {
+        if let Ok(loaded) = store.load(session_id) {
+            diagnostics.state = loaded.meta.historian.state.as_str().to_string();
+            diagnostics.last_failure = loaded.meta.historian.last_failure.clone();
         }
+        diagnostics
     }
 
     /// Persist the skip-branch discriminant so a supervised rig can read WHY the
@@ -788,36 +890,60 @@ impl McHandler {
         let _ = store.commit(session_id, loaded.row_version, &loaded.core, &meta);
     }
 
+    async fn execute_historian_firing_task(
+        factory: Arc<dyn HistorianProducerFactory>,
+        task: HistorianFiringTask,
+    ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
+        let HistorianFiringTask {
+            store,
+            session_id,
+            project_path,
+            project_root,
+            project_slug,
+            firing,
+            live_guard,
+        } = task;
+        let _guard = live_guard;
+        let failure_backoff_at_ms = firing.failure_backoff_at_ms;
+        match factory.connect(&project_root).await {
+            Ok(mut producer) => {
+                let request =
+                    firing.as_fire_request(&store, &session_id, &project_path, &project_slug);
+                run_historian_firing(&mut *producer, request).await
+            }
+            Err(err) => {
+                record_historian_connect_failure(
+                    &store,
+                    &session_id,
+                    failure_backoff_at_ms,
+                    &format!("producer connect: {err}"),
+                );
+                Err(historian::HistorianDriveError::Producer(err))
+            }
+        }
+    }
+
+    async fn run_historian_firing_inline(
+        &self,
+        task: HistorianFiringTask,
+    ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
+        Self::execute_historian_firing_task(Arc::clone(&self.producer_factory), task).await
+    }
+
+    async fn await_live_historian_completion(
+        &self,
+        completion: LiveHistorianCompletionWait,
+    ) -> bool {
+        tokio::time::timeout(historian::completion_wait_budget(), completion)
+            .await
+            .is_ok()
+    }
+
     fn spawn_historian_firing(&self, task: HistorianFiringTask) {
         let factory = Arc::clone(&self.producer_factory);
         tokio::spawn(async move {
-            let HistorianFiringTask {
-                store,
-                session_id,
-                project_path,
-                project_root,
-                project_slug,
-                firing,
-                live_guard,
-            } = task;
-            let _guard = live_guard;
-            let failure_backoff_at_ms = firing.failure_backoff_at_ms;
-            let result = match factory.connect(&project_root).await {
-                Ok(mut producer) => {
-                    let request =
-                        firing.as_fire_request(&store, &session_id, &project_path, &project_slug);
-                    run_historian_firing(&mut *producer, request).await
-                }
-                Err(err) => {
-                    record_historian_connect_failure(
-                        &store,
-                        &session_id,
-                        failure_backoff_at_ms,
-                        &format!("producer connect: {err}"),
-                    );
-                    Err(historian::HistorianDriveError::Producer(err))
-                }
-            };
+            let session_id = task.session_id.clone();
+            let result = Self::execute_historian_firing_task(factory, task).await;
             match result {
                 Ok(outcome) => {
                     eprintln!("mc-module: historian firing finished for {session_id}: {outcome:?}")
@@ -934,46 +1060,145 @@ impl McHandler {
                 }
             }
         };
-        let project_path = binding.project_root.to_string_lossy();
+        let project_path = binding.project_root.to_string_lossy().to_string();
         let pass_now = now_ms();
-        let producer_ctx = transform::ProducerContext {
-            project_path: &project_path,
-            project_directory: &project_path,
-            history_budget_tokens: binding.history_budget_tokens,
-            now_ms: pass_now,
-            execute_threshold_percentage: binding.config.execute_threshold_percentage,
-            smart_drops: binding.config.smart_drops,
-            cache_ttl: binding.config.cache_ttl.clone(),
-            model_key: binding.model_key.clone(),
-            observed_last_response_at_ms: self
-                .observed_last_response_at_ms(&store, &parsed.session_id),
-            #[cfg(test)]
-            injected_reductions: self
-                .reduction_injection
-                .lock()
-                .expect("reduction injection mutex")
-                .remove(&parsed.session_id)
-                .unwrap_or_default(),
+        let run_transform = || {
+            let producer_ctx = transform::ProducerContext {
+                project_path: &project_path,
+                project_directory: &project_path,
+                history_budget_tokens: binding.history_budget_tokens,
+                now_ms: pass_now,
+                execute_threshold_percentage: binding.config.execute_threshold_percentage,
+                smart_drops: binding.config.smart_drops,
+                cache_ttl: binding.config.cache_ttl.clone(),
+                model_key: binding.model_key.clone(),
+                observed_last_response_at_ms: self
+                    .observed_last_response_at_ms(&store, &parsed.session_id),
+                #[cfg(test)]
+                injected_reductions: self
+                    .reduction_injection
+                    .lock()
+                    .expect("reduction injection mutex")
+                    .remove(&parsed.session_id)
+                    .unwrap_or_default(),
+            };
+            transform_with_projection(&store, &parsed, &producer_ctx)
         };
-        match transform_with_projection(&store, &parsed, &producer_ctx) {
-            Ok(mut result) => {
-                self.record_response_observation(&parsed.session_id, pass_now);
-                let diagnostics = self.maybe_spawn_historian_fire(
-                    Arc::clone(&store),
-                    &parsed,
-                    &binding,
-                    project_path.to_string(),
-                    &result.projection,
-                    pass_now,
-                );
-                result.response.historian = Some(diagnostics);
-                respond(serde_json::to_value(result.response).unwrap_or(Value::Null))
+        let mut result = match run_transform() {
+            Ok(result) => result,
+            Err(e) => {
+                return HandlerOutcome::Error {
+                    code: "transform_failed".to_string(),
+                    message: e.to_string(),
+                }
             }
-            Err(e) => HandlerOutcome::Error {
-                code: "transform_failed".to_string(),
-                message: e.to_string(),
-            },
-        }
+        };
+        let diagnostics = if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
+            match self.prepare_historian_fire(
+                Arc::clone(&store),
+                &parsed,
+                &binding,
+                &project_path,
+                &result.projection,
+                pass_now,
+            ) {
+                PreparedHistorianAction::Complete(diagnostics) => diagnostics,
+                PreparedHistorianAction::Busy {
+                    diagnostics,
+                    completion,
+                } => {
+                    if self.await_live_historian_completion(completion).await {
+                        result = match run_transform() {
+                            Ok(result) => result,
+                            Err(e) => {
+                                return HandlerOutcome::Error {
+                                    code: "transform_failed".to_string(),
+                                    message: e.to_string(),
+                                }
+                            }
+                        };
+                        match self.prepare_historian_fire(
+                            Arc::clone(&store),
+                            &parsed,
+                            &binding,
+                            &project_path,
+                            &result.projection,
+                            pass_now,
+                        ) {
+                            PreparedHistorianAction::Complete(diagnostics) => diagnostics,
+                            PreparedHistorianAction::Busy { diagnostics, .. } => diagnostics,
+                            PreparedHistorianAction::FireReady(prepared) => {
+                                let diagnostics = prepared.diagnostics.clone();
+                                match self.run_historian_firing_inline(prepared.task).await {
+                                    Ok(_) => {
+                                        result = match run_transform() {
+                                            Ok(result) => result,
+                                            Err(e) => {
+                                                return HandlerOutcome::Error {
+                                                    code: "transform_failed".to_string(),
+                                                    message: e.to_string(),
+                                                }
+                                            }
+                                        };
+                                        diagnostics
+                                    }
+                                    Err(_) => self.refresh_historian_diagnostics(
+                                        &store,
+                                        &parsed.session_id,
+                                        diagnostics,
+                                    ),
+                                }
+                            }
+                        }
+                    } else {
+                        diagnostics
+                    }
+                }
+                PreparedHistorianAction::FireReady(prepared) => {
+                    let diagnostics = prepared.diagnostics.clone();
+                    match self.run_historian_firing_inline(prepared.task).await {
+                        Ok(_) => {
+                            result = match run_transform() {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    return HandlerOutcome::Error {
+                                        code: "transform_failed".to_string(),
+                                        message: e.to_string(),
+                                    }
+                                }
+                            };
+                            diagnostics
+                        }
+                        Err(_) => self.refresh_historian_diagnostics(
+                            &store,
+                            &parsed.session_id,
+                            diagnostics,
+                        ),
+                    }
+                }
+            }
+        } else {
+            match self.prepare_historian_fire(
+                Arc::clone(&store),
+                &parsed,
+                &binding,
+                &project_path,
+                &result.projection,
+                pass_now,
+            ) {
+                PreparedHistorianAction::Complete(diagnostics) => diagnostics,
+                PreparedHistorianAction::Busy { diagnostics, .. } => diagnostics,
+                PreparedHistorianAction::FireReady(prepared) => {
+                    let diagnostics = prepared.diagnostics.clone();
+                    self.spawn_historian_firing(prepared.task);
+                    diagnostics
+                }
+            }
+        };
+        let mut response = result.response;
+        response.historian = Some(diagnostics);
+        self.record_response_observation(&parsed.session_id, now_ms());
+        respond(serde_json::to_value(response).unwrap_or(Value::Null))
     }
 
     #[cfg(test)]
@@ -1435,6 +1660,7 @@ mod tests {
         block_output: std::sync::atomic::AtomicBool,
         notify: Notify,
         connect_errors: Mutex<VecDeque<HistorianProducerError>>,
+        await_results: Mutex<VecDeque<Result<ProducerOutput, HistorianProducerError>>>,
         outputs: Mutex<VecDeque<String>>,
         prompts: Mutex<Vec<String>>,
     }
@@ -1506,6 +1732,15 @@ mod tests {
             self.state.await_outputs.fetch_add(1, Ordering::SeqCst);
             while self.state.block_output.load(Ordering::SeqCst) {
                 self.state.notify.notified().await;
+            }
+            if let Some(result) = self
+                .state
+                .await_results
+                .lock()
+                .expect("await results mutex")
+                .pop_front()
+            {
+                return result;
             }
             let text = self
                 .state
@@ -1612,24 +1847,62 @@ mod tests {
         messages
     }
 
-    fn request(messages: Vec<CkIngressMessage>) -> Value {
+    fn request_with_usage(
+        messages: Vec<CkIngressMessage>,
+        current_total_input_tokens: u64,
+        context_limit_tokens: u64,
+    ) -> Value {
         json!({
             "kind": "transform",
             "session_id": "ses",
             "render_config": "cfg0",
-            "usage": ModuleUsage { current_total_input_tokens: 45_000, context_limit_tokens: 50_000 },
+            "usage": ModuleUsage {
+                current_total_input_tokens,
+                context_limit_tokens,
+            },
             "messages": messages,
         })
     }
 
-    async fn call_transform(handler: &McHandler, messages: Vec<CkIngressMessage>) -> Value {
-        match handler
-            .handle_transform_for_test(7, request(messages))
-            .await
-        {
+    fn request(messages: Vec<CkIngressMessage>) -> Value {
+        request_with_usage(messages, 45_000, 50_000)
+    }
+
+    fn transform_request(
+        messages: Vec<CkIngressMessage>,
+        current_total_input_tokens: u64,
+        context_limit_tokens: u64,
+    ) -> TransformRequest {
+        serde_json::from_value(request_with_usage(
+            messages,
+            current_total_input_tokens,
+            context_limit_tokens,
+        ))
+        .unwrap()
+    }
+
+    async fn call_transform_request(handler: &McHandler, request: Value) -> Value {
+        match handler.handle_transform_for_test(7, request).await {
             HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         }
+    }
+
+    async fn call_transform(handler: &McHandler, messages: Vec<CkIngressMessage>) -> Value {
+        call_transform_request(handler, request(messages)).await
+    }
+
+    async fn call_transform_with_usage(
+        handler: &McHandler,
+        messages: Vec<CkIngressMessage>,
+        current_total_input_tokens: u64,
+        context_limit_tokens: u64,
+    ) -> Value {
+        call_transform_request(
+            handler,
+            request_with_usage(messages, current_total_input_tokens, context_limit_tokens),
+        )
+        .await
     }
 
     fn queue_drop_command(handler: &McHandler, target_id: &str) -> Value {
@@ -1847,6 +2120,196 @@ mod tests {
         producer.block_output.store(false, Ordering::SeqCst);
         producer.notify.notify_waiters();
         wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_emergency_inline_drive_folds_in_the_same_response() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+
+        let response = call_transform_with_usage(&handler, messages, 48_000, 50_000).await;
+
+        assert_eq!(response["action"], "HARD");
+        assert_eq!(response["historian"]["fired"], true);
+        assert!(m0_text(&response).contains("autonomous summary"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_emergency_busy_waits_for_the_active_run_and_then_refolds() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+
+        let first = call_transform(&handler, messages.clone()).await;
+        assert_eq!(first["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+
+        let mut blocked = Box::pin(call_transform_with_usage(
+            &handler, messages, 48_000, 50_000,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), blocked.as_mut())
+                .await
+                .is_err(),
+            ">=95% requests must wait for the active historian run instead of returning early"
+        );
+
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        let response = blocked.await;
+
+        assert!(response["action"].is_string());
+        assert!(m0_text(&response).contains("autonomous summary"));
+        wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_emergency_inline_failure_degrades_to_the_emergency_selection_output() {
+        let producer = Arc::new(ProducerState::default());
+        producer.await_results.lock().unwrap().extend([
+            Err(HistorianProducerError::TimedOut),
+            Err(HistorianProducerError::TimedOut),
+        ]);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+        let (_baseline_handler, baseline_store, _baseline_dir, baseline_project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let expected_request = transform_request(messages.clone(), 48_000, 50_000);
+        let baseline_project_path = baseline_project.to_string_lossy().to_string();
+        let expected = transform::transform(
+            &baseline_store,
+            &expected_request,
+            &transform::ProducerContext {
+                project_path: &baseline_project_path,
+                project_directory: &baseline_project_path,
+                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+                now_ms: now_ms(),
+                execute_threshold_percentage: 65.0,
+                smart_drops: false,
+                cache_ttl: "5m".to_string(),
+                model_key: None,
+                observed_last_response_at_ms: None,
+                injected_reductions: Vec::new(),
+            },
+        )
+        .unwrap();
+        let expected_value = serde_json::to_value(expected).unwrap();
+
+        let response = call_transform_with_usage(&handler, messages, 48_000, 50_000).await;
+
+        assert_eq!(response["action"], expected_value["action"]);
+        assert_eq!(response["ck_messages"], expected_value["ck_messages"]);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert!(
+            state
+                .failure_backoff_at_ms
+                .is_some_and(|backoff_at_ms| backoff_at_ms > now_ms()),
+            "an inline failure must abandon with a future backoff instead of silently clearing state"
+        );
+        assert!(
+            state
+                .last_failure
+                .as_deref()
+                .is_some_and(|detail| detail.contains("timed out")),
+            "the durable failure detail should explain why the inline historian run degraded"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_below_emergency_usage_still_spawns_without_blocking() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(50),
+            call_transform_with_usage(&handler, messages, 45_000, 50_000),
+        )
+        .await
+        .expect("<95% requests should return while the background historian run is still active");
+
+        assert_eq!(response["historian"]["fired"], true);
+        assert!(!m0_text(&response).contains("autonomous summary"));
+        wait_for_count(&producer.starts, 1).await;
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_historian_session_installs_the_completion_notify_before_busy_is_visible() {
+        let handler = McHandler::new();
+        let guard = match handler.try_claim_live_historian_session("ses") {
+            LiveHistorianSessionClaim::Acquired(guard) => guard,
+            LiveHistorianSessionClaim::Busy(_) => panic!("first claim must acquire the live latch"),
+        };
+        let mut completion = match handler.try_claim_live_historian_session("ses") {
+            LiveHistorianSessionClaim::Acquired(_) => {
+                panic!("a second claim must observe the existing live session")
+            }
+            LiveHistorianSessionClaim::Busy(completion) => completion,
+        };
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(50), completion.as_mut())
+            .await
+            .expect("busy observers must always see a completion notify they can await");
+    }
+
+    #[test]
+    fn stale_live_historian_cleanup_cannot_delete_the_next_run_entry() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let old_token = Arc::new(());
+        let old_completion = Arc::new(Notify::new());
+        sessions.lock().unwrap().insert(
+            "ses".to_string(),
+            LiveHistorianSession {
+                token: Arc::clone(&old_token),
+                completion: Arc::clone(&old_completion),
+            },
+        );
+        let old_guard = SessionSetGuard {
+            sessions: Arc::clone(&sessions),
+            session_id: "ses".to_string(),
+            token: Arc::clone(&old_token),
+            completion: Arc::clone(&old_completion),
+        };
+
+        let new_token = Arc::new(());
+        let new_completion = Arc::new(Notify::new());
+        sessions.lock().unwrap().insert(
+            "ses".to_string(),
+            LiveHistorianSession {
+                token: Arc::clone(&new_token),
+                completion: Arc::clone(&new_completion),
+            },
+        );
+
+        drop(old_guard);
+        let entry = sessions
+            .lock()
+            .unwrap()
+            .get("ses")
+            .cloned()
+            .expect("the replacement live entry must survive stale cleanup");
+        assert!(Arc::ptr_eq(&entry.token, &new_token));
+
+        drop(SessionSetGuard {
+            sessions: Arc::clone(&sessions),
+            session_id: "ses".to_string(),
+            token: new_token,
+            completion: new_completion,
+        });
+        assert!(sessions.lock().unwrap().is_empty());
     }
 
     fn seed_awaiting(store: &McStore, messages: &[CkIngressMessage]) {

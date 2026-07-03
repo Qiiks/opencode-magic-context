@@ -6,6 +6,7 @@
 //! render state directly).
 
 use std::fmt;
+use std::time::Duration;
 
 use mc_store::{
     FactCandidate, HistorianChunkRange, HistorianDurableState, HistorianPhase,
@@ -618,9 +619,6 @@ pub struct HistorianReattachRequest<'a> {
     pub failure_backoff_at_ms: i64,
 }
 
-/// Build the llm-runner session id owned by Magic Context for one historian firing.
-/// The firing sequence is part of the id so a fallback model attempt never resumes a
-/// failed run under a different model.
 /// Session-id prefix for the module's own producer (child) sessions. The transform
 /// handler treats any session in this namespace as self-owned and passes it through
 /// untouched: routing a producer request back through the module's own transform
@@ -629,6 +627,14 @@ pub struct HistorianReattachRequest<'a> {
 /// live as template-echo and seed-regurgitation on the calibration model itself).
 pub const MC_CHILD_SESSION_PREFIX: &str = "mc-historian:";
 
+/// Wait budget for a full historian run plus its one short timeout recovery re-drain.
+pub fn completion_wait_budget() -> Duration {
+    Duration::from_secs(660)
+}
+
+/// Build the llm-runner session id owned by Magic Context for one historian firing.
+/// The firing sequence is part of the id so a fallback model attempt never resumes a
+/// failed run under a different model.
 pub fn historian_producer_session_id(project_slug: &str, firing_seq: u64) -> String {
     let slug: String = project_slug
         .chars()

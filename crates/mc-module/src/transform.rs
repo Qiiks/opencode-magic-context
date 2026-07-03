@@ -256,6 +256,7 @@ pub struct HistorianTriggerProgress {
 pub struct TransformWithProjection {
     pub response: TransformResponse,
     pub projection: FlatProjection,
+    pub scheduler_pass: scheduler::PassDecision,
 }
 
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
@@ -911,6 +912,7 @@ fn apply_once(
 
     Ok(TransformWithProjection {
         projection,
+        scheduler_pass: scheduler_outcome.pass,
         response: TransformResponse {
             action: result_action,
             boundary_id: core.boundary_id.clone(),
