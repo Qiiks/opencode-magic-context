@@ -126,7 +126,7 @@ pub fn rendered_tier(
 /// Compute budget pressure for a render pass in a single forward pass. Because
 /// `H ∝ 1/p`, the per-tier compartment counts scale as `1/p`, so `C(p) ≈ C(1)/p`;
 /// setting `p = C(1)/B` gives `C(p) ≈ B`. Overshoots up to ~30% at very tight
-/// budgets (<8K) — use [`compute_budget_pressure_two_pass`] there.
+/// budgets (<8K).
 pub fn compute_budget_pressure(compartments: &[DecayInput], history_budget: f64) -> f64 {
     if history_budget <= 0.0 {
         return 1.0;
@@ -142,27 +142,6 @@ pub fn compute_budget_pressure(compartments: &[DecayInput], history_budget: f64)
         }
     }
     (natural_cost / history_budget).max(P_FLOOR)
-}
-
-/// Two-pass pressure for tight budgets — converges to within ~1% of budget at a tiny
-/// extra cost. Recompute the actual cost at the single-pass pressure and, if it still
-/// overshoots by >10%, scale pressure proportionally.
-pub fn compute_budget_pressure_two_pass(compartments: &[DecayInput], history_budget: f64) -> f64 {
-    if history_budget <= 0.0 {
-        return 1.0;
-    }
-    let mut p = compute_budget_pressure(compartments, history_budget);
-    let mut actual_cost = 0.0;
-    for c in compartments {
-        let actual_tier = tier(c.index, c.importance, p);
-        if actual_tier < 5 {
-            actual_cost += TIER_COST[actual_tier as usize] as f64;
-        }
-    }
-    if actual_cost > history_budget * 1.1 {
-        p *= actual_cost / history_budget;
-    }
-    p.max(P_FLOOR)
 }
 
 #[cfg(test)]
@@ -257,7 +236,6 @@ mod tests {
         importances: Vec<i32>,
         budget: f64,
         one_pass: f64,
-        two_pass: f64,
     }
     #[derive(Deserialize)]
     struct Golden {
@@ -313,17 +291,10 @@ mod tests {
                 })
                 .collect();
             let one = compute_budget_pressure(&comps, c.budget);
-            let two = compute_budget_pressure_two_pass(&comps, c.budget);
             assert!(
                 (one - c.one_pass).abs() < 1e-9,
                 "one-pass pressure mismatch: rust={one} ts={} budget={}",
                 c.one_pass,
-                c.budget
-            );
-            assert!(
-                (two - c.two_pass).abs() < 1e-9,
-                "two-pass pressure mismatch: rust={two} ts={} budget={}",
-                c.two_pass,
                 c.budget
             );
         }

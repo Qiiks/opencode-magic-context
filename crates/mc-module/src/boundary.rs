@@ -132,35 +132,6 @@ pub struct BoundaryMsg {
     pub blocks: Vec<BoundaryBlock>,
 }
 
-/// Flat form of a boundary block with its parent message metadata attached.
-#[derive(Debug, Clone)]
-pub struct FlatItem {
-    /// Absolute raw-session ordinal for the parent message.
-    pub message_ordinal: u64,
-    /// Provider message id for the parent message.
-    pub message_id: String,
-    /// Provider role for the parent message.
-    pub role: Role,
-    /// Stable block id.
-    pub id: String,
-    /// Block ordinal within the flat tail.
-    pub ordinal: u64,
-    /// Typed content kind (`SelKind`, shared with the selection module for cross-module consistency).
-    pub kind: SelKind,
-    /// True for provider/server-executed tool blocks.
-    pub provider_executed: bool,
-    /// Original byte length supplied by the caller.
-    pub byte_size: usize,
-    /// Tool arc id for blocks that belong to the same invocation.
-    pub arc_id: Option<String>,
-    /// Original pre-reduction block bytes used for all measurement.
-    pub original: String,
-    /// Optional rendered reduction text, ignored by decision functions.
-    pub rendered: Option<String>,
-    /// Mirrors OpenCode text parts marked `ignored`.
-    pub ignored: bool,
-}
-
 /// Inputs for resolving the protected-tail boundary.
 #[derive(Debug, Clone)]
 pub struct BoundaryContext {
@@ -347,34 +318,6 @@ pub struct TriggerProgress {
     pub n_tokens: f64,
     /// First protected ordinal (eligible head ends here).
     pub protected_start_ordinal: u64,
-}
-
-/// Flatten grouped messages to the block-level form used by chunk measurement.
-pub fn flatten_messages(messages: &[BoundaryMsg]) -> Vec<FlatItem> {
-    let mut out = Vec::new();
-    for message in messages {
-        for block in &message.blocks {
-            out.push(FlatItem {
-                message_ordinal: message.message_ordinal,
-                message_id: message.message_id.clone(),
-                role: message.role.clone(),
-                id: block.id.clone(),
-                ordinal: if block.ordinal == 0 {
-                    message.message_ordinal
-                } else {
-                    block.ordinal
-                },
-                kind: block.kind.clone(),
-                provider_executed: block.provider_executed,
-                byte_size: block.byte_size,
-                arc_id: block.arc_id.clone(),
-                original: block.original.clone(),
-                rendered: block.rendered.clone(),
-                ignored: block.ignored,
-            });
-        }
-    }
-    out
 }
 
 /// Derive the size-trigger budget from context size and execute threshold.
@@ -564,18 +507,6 @@ pub fn resolve_protected_tail_boundary(
         raw_message_count,
         boundary_reason,
     }
-}
-
-/// Measure TC-chunked content from flat items, using the whole flat tail as eligible.
-pub fn chunked_token_estimate(items: &[FlatItem], budget_stop: f64) -> ChunkEstimate {
-    let messages = messages_from_flat(items);
-    let start = first_live_message_ordinal(&messages).unwrap_or(1);
-    let total = messages
-        .iter()
-        .map(|message| message.message_ordinal)
-        .max()
-        .unwrap_or(0);
-    chunked_message_estimate(&messages, start, Some(total.saturating_add(1)), budget_stop)
 }
 
 /// Measure TC-chunked content for a message range.
@@ -1450,32 +1381,6 @@ impl ChunkBuilder {
 struct CompactedText {
     text: String,
     commit_hashes: Vec<String>,
-}
-
-fn messages_from_flat(items: &[FlatItem]) -> Vec<BoundaryMsg> {
-    let mut grouped: BTreeMap<u64, BoundaryMsg> = BTreeMap::new();
-    for item in items {
-        let entry = grouped
-            .entry(item.message_ordinal)
-            .or_insert_with(|| BoundaryMsg {
-                message_ordinal: item.message_ordinal,
-                message_id: item.message_id.clone(),
-                role: item.role.clone(),
-                blocks: Vec::new(),
-            });
-        entry.blocks.push(BoundaryBlock {
-            id: item.id.clone(),
-            ordinal: item.ordinal,
-            kind: item.kind.clone(),
-            provider_executed: item.provider_executed,
-            byte_size: item.byte_size,
-            arc_id: item.arc_id.clone(),
-            original: item.original.clone(),
-            rendered: item.rendered.clone(),
-            ignored: item.ignored,
-        });
-    }
-    grouped.into_values().collect()
 }
 
 fn has_meaningful_user_text(blocks: &[BoundaryBlock]) -> bool {

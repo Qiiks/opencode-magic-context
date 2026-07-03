@@ -42,6 +42,11 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// operation, never latency-sensitive: waiting longer and publishing always beats
 /// abandoning a completed run and re-firing the whole 50k-input pass.
 const DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long the timeout recovery path gets to re-drain a run after the main
+/// waiter gives up. A completed historian run can land moments after the
+/// 600s wait expires; one short replay salvages that durable output without
+/// letting the fallback path hang for another full production timeout.
+const RECOVERY_REDRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunHandle {
@@ -405,22 +410,16 @@ impl HistorianProducer {
         &mut self,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError> {
-        let route = self.ensure_subscribe_route().await?;
-        // Subscribe from "start" instead of a cursor. Replay after a cursor is
-        // exclusive, so persisting an advancing cursor can drop units at or before
-        // it on reattach. Re-draining from the start is safe because validation
-        // and compare-and-swap checks during publish are idempotent.
-        let body = json!({ "method": "session.subscribe", "params": { "from": "start" } });
-        let corr = self.send_request(route, body).await?;
-        match tokio::time::timeout(
-            self.config.await_timeout,
-            self.drain_subscribe(route, corr, run_id),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(HistorianProducerError::TimedOut),
-        }
+        self.subscribe_from_start(run_id, self.config.await_timeout)
+            .await
+    }
+
+    pub async fn redrain_output(
+        &mut self,
+        run_id: &str,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        self.subscribe_from_start(run_id, RECOVERY_REDRAIN_TIMEOUT)
+            .await
     }
 
     pub async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError> {
@@ -451,6 +450,24 @@ impl HistorianProducer {
         }
         if let Some(route) = self.command_route.take() {
             let _ = self.send_goodbye(route).await;
+        }
+    }
+
+    async fn subscribe_from_start(
+        &mut self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        let route = self.ensure_subscribe_route().await?;
+        // Subscribe from "start" instead of a cursor. Replay after a cursor is
+        // exclusive, so persisting an advancing cursor can drop units at or before
+        // it on reattach. Re-draining from the start is safe because validation
+        // and compare-and-swap checks during publish are idempotent.
+        let body = json!({ "method": "session.subscribe", "params": { "from": "start" } });
+        let corr = self.send_request(route, body).await?;
+        match tokio::time::timeout(timeout, self.drain_subscribe(route, corr, run_id)).await {
+            Ok(result) => result,
+            Err(_) => Err(HistorianProducerError::TimedOut),
         }
     }
 

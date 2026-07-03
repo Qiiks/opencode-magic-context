@@ -106,6 +106,9 @@ const DEFAULT_MIN_COMMIT_CLUSTERS: usize = 3;
 const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
 /// Secondary assembler guard; TS trigger sizing is authoritative, this only rejects tiny chunks.
 const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
+/// After a historian abandon, suppress refires for this long so a persistently
+/// failing model does not burn a full summarization pass on every transform.
+const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
 
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (channel → {project, session}).
@@ -370,8 +373,11 @@ impl McHandler {
                 tokio::spawn(async move {
                     let _guard = guard;
                     let result = async {
-                        let action =
-                            historian::handle_restart_load(&store, &session_id, now + 60_000)?;
+                        let action = historian::handle_restart_load(
+                            &store,
+                            &session_id,
+                            now + HISTORIAN_FAILURE_BACKOFF_MS,
+                        )?;
                         match action {
                             historian::RestartAction::Done => {
                                 return Ok(historian::HistorianReattachOutcome::Done)
@@ -399,7 +405,7 @@ impl McHandler {
                                 },
                                 publication_floor_ordinal: range.to_ordinal,
                                 now_ms: now,
-                                failure_backoff_at_ms: now + 60_000,
+                                failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
                             },
                         )
                         .await
@@ -414,9 +420,11 @@ impl McHandler {
             HistorianPhase::Firing | HistorianPhase::Validating | HistorianPhase::Publishing => {
                 tokio::spawn(async move {
                     let _guard = guard;
-                    if let Err(e) =
-                        historian::handle_restart_load(&store, &session_id, now + 60_000)
-                    {
+                    if let Err(e) = historian::handle_restart_load(
+                        &store,
+                        &session_id,
+                        now + HISTORIAN_FAILURE_BACKOFF_MS,
+                    ) {
                         eprintln!(
                             "mc-module: historian restart recovery failed for {session_id}: {e}"
                         );
@@ -577,6 +585,22 @@ impl McHandler {
                 last_failure: last_failure.clone(),
             };
         };
+        if loaded
+            .meta
+            .historian
+            .failure_backoff_at_ms
+            .is_some_and(|backoff_at_ms| now < backoff_at_ms)
+        {
+            self.record_no_fire(&store, &parsed.session_id, &loaded, "backoff");
+            return HistorianDiagnostics {
+                fired: false,
+                reason: trigger.reason.map(|r| r.as_str().to_string()),
+                no_fire: Some("backoff".to_string()),
+                state,
+                progress: progress.clone(),
+                last_failure: last_failure.clone(),
+            };
+        }
         let live: Vec<_> = projection
             .blocks
             .iter()
@@ -598,7 +622,7 @@ impl McHandler {
                 memory_enabled: cfg.memory_enabled,
                 extraction_free: false,
                 in_emergency: usage_percentage >= 95.0,
-                failure_backoff_at_ms: now + 60_000,
+                failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
                 min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
             },
             now,
@@ -710,13 +734,23 @@ impl McHandler {
                 live_guard,
             } = task;
             let _guard = live_guard;
-            let result = async {
-                let mut producer = factory.connect(&project_root).await?;
-                let request =
-                    firing.as_fire_request(&store, &session_id, &project_path, &project_slug);
-                run_historian_firing(&mut *producer, request).await
-            }
-            .await;
+            let failure_backoff_at_ms = firing.failure_backoff_at_ms;
+            let result = match factory.connect(&project_root).await {
+                Ok(mut producer) => {
+                    let request =
+                        firing.as_fire_request(&store, &session_id, &project_path, &project_slug);
+                    run_historian_firing(&mut *producer, request).await
+                }
+                Err(err) => {
+                    record_historian_connect_failure(
+                        &store,
+                        &session_id,
+                        failure_backoff_at_ms,
+                        &format!("producer connect: {err}"),
+                    );
+                    Err(historian::HistorianDriveError::Producer(err))
+                }
+            };
             match result {
                 Ok(outcome) => {
                     eprintln!("mc-module: historian firing finished for {session_id}: {outcome:?}")
@@ -1017,6 +1051,31 @@ fn project_slug(path: &Path) -> String {
         .to_string()
 }
 
+fn record_historian_connect_failure(
+    store: &McStore,
+    session_id: &str,
+    failure_backoff_at_ms: i64,
+    detail: &str,
+) {
+    let Ok(loaded) = store.load(session_id) else {
+        return;
+    };
+    let mut meta = loaded.meta.clone();
+    if meta.historian.state == HistorianPhase::Idle {
+        if meta.historian.last_failure.as_deref() == Some(detail) {
+            return;
+        }
+        meta.historian.last_failure = Some(detail.to_string());
+    } else {
+        meta.historian = historian::abandon_with_detail(
+            &meta.historian,
+            failure_backoff_at_ms,
+            Some(detail.to_string()),
+        );
+    }
+    let _ = store.commit(session_id, loaded.row_version, &loaded.core, &meta);
+}
+
 /// Resolve the storage descriptor: prefer the daemon-provided `ack.storage`, else
 /// fall back to a local dev path (standalone / no managed storage configured).
 pub fn resolve_descriptor(storage: Option<&Value>) -> StorageDescriptor {
@@ -1208,6 +1267,7 @@ mod tests {
         await_outputs: AtomicUsize,
         block_output: std::sync::atomic::AtomicBool,
         notify: Notify,
+        connect_errors: Mutex<VecDeque<HistorianProducerError>>,
         outputs: Mutex<VecDeque<String>>,
         prompts: Mutex<Vec<String>>,
     }
@@ -1223,6 +1283,15 @@ mod tests {
             _project_root: &Path,
         ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
             self.state.connects.fetch_add(1, Ordering::SeqCst);
+            if let Some(err) = self
+                .state
+                .connect_errors
+                .lock()
+                .expect("connect errors mutex")
+                .pop_front()
+            {
+                return Err(err);
+            }
             Ok(Box::new(TestProducer {
                 state: Arc::clone(&self.state),
             }))
@@ -1458,6 +1527,20 @@ mod tests {
         panic!("counter did not reach {expected}");
     }
 
+    async fn wait_for_historian_state<F>(store: &McStore, predicate: F)
+    where
+        F: Fn(&HistorianDurableState) -> bool,
+    {
+        for _ in 0..200 {
+            let state = store.load("ses").unwrap().meta.historian;
+            if predicate(&state) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("historian state predicate did not become true");
+    }
+
     fn m0_text(response: &Value) -> String {
         response["ck_messages"]
             .as_array()
@@ -1635,7 +1718,38 @@ mod tests {
             .unwrap();
     }
 
-    async fn assert_seeded_phase_recovers_and_refires(phase: HistorianPhase) {
+    fn seed_abandoned_idle(store: &McStore, backoff_at_ms: i64, detail: &str) {
+        let loaded = store.load("ses").unwrap();
+        let fired = match historian::fire(
+            &HistorianDurableState::default(),
+            1,
+            3,
+            "seeded-fingerprint".to_string(),
+            1,
+        )
+        .unwrap()
+        {
+            historian::FireOutcome::Fired(state) => state,
+            historian::FireOutcome::Busy(_) => unreachable!(),
+        };
+        let mut meta = loaded.meta;
+        meta.historian =
+            historian::abandon_with_detail(&fired, backoff_at_ms, Some(detail.to_string()));
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+    }
+
+    fn expire_historian_backoff(store: &McStore) {
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.historian.failure_backoff_at_ms = Some(now_ms() - 1);
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+    }
+
+    async fn assert_seeded_phase_recovers_then_refires_after_backoff(phase: HistorianPhase) {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -1651,6 +1765,12 @@ mod tests {
         assert_eq!(producer.binds.load(Ordering::SeqCst), 0);
         assert_eq!(producer.statuses.load(Ordering::SeqCst), 0);
 
+        let backed_off = call_transform(&handler, messages.clone()).await;
+        assert_eq!(backed_off["historian"]["fired"], false);
+        assert_eq!(backed_off["historian"]["no_fire"], "backoff");
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+
+        expire_historian_backoff(&store);
         let fresh = call_transform(&handler, messages).await;
         assert_eq!(fresh["historian"]["fired"], true);
         wait_for_count(&producer.starts, 1).await;
@@ -1658,18 +1778,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handler_seeded_publishing_recovers_and_next_pass_refires() {
-        assert_seeded_phase_recovers_and_refires(HistorianPhase::Publishing).await;
+    async fn handler_seeded_publishing_recovers_then_refires_after_backoff() {
+        assert_seeded_phase_recovers_then_refires_after_backoff(HistorianPhase::Publishing).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handler_seeded_firing_recovers_and_next_pass_refires() {
-        assert_seeded_phase_recovers_and_refires(HistorianPhase::Firing).await;
+    async fn handler_seeded_firing_recovers_then_refires_after_backoff() {
+        assert_seeded_phase_recovers_then_refires_after_backoff(HistorianPhase::Firing).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handler_seeded_validating_recovers_and_next_pass_refires() {
-        assert_seeded_phase_recovers_and_refires(HistorianPhase::Validating).await;
+    async fn handler_seeded_validating_recovers_then_refires_after_backoff() {
+        assert_seeded_phase_recovers_then_refires_after_backoff(HistorianPhase::Validating).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1739,6 +1859,97 @@ mod tests {
         producer.block_output.store(false, Ordering::SeqCst);
         producer.notify.notify_waiters();
         wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_backoff_blocks_refire_and_records_durable_skip_reason() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+        seed_abandoned_idle(
+            &store,
+            now_ms() + HISTORIAN_FAILURE_BACKOFF_MS,
+            "validate rejected: stale summary",
+        );
+
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["fired"], false);
+        assert_eq!(response["historian"]["no_fire"], "backoff");
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.last_no_fire.as_deref(), Some("backoff"));
+        assert!(
+            state
+                .failure_backoff_at_ms
+                .is_some_and(|backoff_at_ms| backoff_at_ms > now_ms()),
+            "the cooldown remains active until the backoff boundary"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_expired_backoff_refires_and_success_clears_failure_state() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+        seed_abandoned_idle(&store, now_ms() - 1, "validate rejected: stale summary");
+
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.last_failure, None);
+        assert_eq!(state.failure_backoff_at_ms, None);
+        assert_eq!(state.last_no_fire, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_connect_failure_records_durable_detail_without_backoff_and_later_fire_clears_it(
+    ) {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .connect_errors
+            .lock()
+            .unwrap()
+            .push_back(HistorianProducerError::Connect {
+                endpoint: "127.0.0.1:1".to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+            });
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+
+        let first = call_transform(&handler, messages.clone()).await;
+        assert_eq!(first["historian"]["fired"], true);
+        wait_for_count(&producer.connects, 1).await;
+        wait_for_historian_state(&store, |state| {
+            state
+                .last_failure
+                .as_deref()
+                .is_some_and(|detail| detail.contains("producer connect"))
+        })
+        .await;
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, None);
+        assert!(
+            state
+                .last_failure
+                .as_deref()
+                .is_some_and(|detail| detail.contains("producer connect")),
+            "pre-fire connect failures must land in durable state, not only stderr"
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+
+        let second = call_transform(&handler, messages).await;
+        assert_eq!(second["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.last_failure, None);
     }
 
     #[tokio::test(flavor = "current_thread")]

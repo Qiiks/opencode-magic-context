@@ -179,7 +179,7 @@ pub fn fire(
         producer_session_id: None,
         producer_run_id: None,
         fired_at_ms: Some(fired_at_ms),
-        failure_backoff_at_ms: None,
+        failure_backoff_at_ms: current.failure_backoff_at_ms,
         last_failure: current.last_failure.clone(),
         // A fire resolves whatever skip reason preceded it.
         last_no_fire: None,
@@ -196,7 +196,9 @@ pub fn producer_started(
     next.state = HistorianPhase::AwaitingProducer;
     next.producer_session_id = Some(producer_session_id);
     next.producer_run_id = Some(producer_run_id);
-    // A producer run is established: any failure detail from a prior firing is resolved.
+    // A producer run is established: any failure detail or retry cooldown from a
+    // prior firing is resolved.
+    next.failure_backoff_at_ms = None;
     next.last_failure = None;
     Ok(next)
 }
@@ -494,6 +496,12 @@ pub trait HistorianProducerDriver: Send {
         &mut self,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError>;
+    async fn redrain_output(
+        &mut self,
+        run_id: &str,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        self.await_output(run_id).await
+    }
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
     async fn close(&mut self);
@@ -521,6 +529,13 @@ impl HistorianProducerDriver for HistorianProducer {
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError> {
         HistorianProducer::await_output(self, run_id).await
+    }
+
+    async fn redrain_output(
+        &mut self,
+        run_id: &str,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        HistorianProducer::redrain_output(self, run_id).await
     }
 
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError> {
@@ -660,6 +675,27 @@ where
 
         let output = match producer.await_output(&handle.run_id).await {
             Ok(output) => output,
+            Err(HistorianProducerError::TimedOut) => {
+                match producer.redrain_output(&handle.run_id).await {
+                    Ok(output) => output,
+                    Err(recovery_err) => {
+                        let _ = producer.cancel(&handle.run_id).await;
+                        persist_historian_state(
+                        request.store,
+                        request.session_id,
+                        abandon_with_detail(
+                            &awaiting,
+                            request.failure_backoff_at_ms,
+                            Some(format!(
+                                "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
+                            )),
+                        ),
+                    )?;
+                        producer.close().await;
+                        return Err(HistorianDriveError::Producer(recovery_err));
+                    }
+                }
+            }
             Err(err) => {
                 let _ = producer.cancel(&handle.run_id).await;
                 let retry = err.is_retryable_model_failure()
@@ -1518,7 +1554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn producer_timeout_abandons_and_best_effort_cancels() {
+    async fn producer_timeout_redrain_recovers_completed_run_without_abandon() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_prior_compartment(&store);
@@ -1527,6 +1563,40 @@ mod tests {
         let models = vec!["prov/model-a".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::TimedOut))
+            .with_output(Ok(producer_output(historian_xml("recovered summary"))));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, HistorianDriveOutcome::Completed(_)));
+        assert_eq!(producer.await_run_ids, vec!["run-1", "run-1"]);
+        assert!(
+            producer.cancels.is_empty(),
+            "successful recovery must not abandon the run"
+        );
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, None);
+        assert_eq!(state.last_failure, None);
+        let c2 = store.load_compartments("ses").unwrap().pop().unwrap();
+        assert_eq!(c2.p1.as_deref(), Some("recovered summary"));
+    }
+
+    #[tokio::test]
+    async fn producer_timeout_recovery_timeout_abandons_and_best_effort_cancels() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::TimedOut))
             .with_output(Err(HistorianProducerError::TimedOut));
 
         let err = run_historian_firing(
@@ -1536,14 +1606,52 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, HistorianDriveError::Producer(_)));
+        assert_eq!(producer.await_run_ids, vec!["run-1", "run-1"]);
         assert_eq!(producer.cancels, vec!["run-1"]);
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
         assert_eq!(state.failure_backoff_at_ms, Some(999));
         let detail = state.last_failure.expect("failure detail recorded");
         assert!(
-            detail.contains("producer output") && detail.contains("prov/model-a"),
-            "durable failure detail names the phase and model: {detail}"
+            detail.contains("timed out; recovery re-drain also failed")
+                && detail.contains("prov/model-a"),
+            "durable failure detail keeps the timeout + recovery cause: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn producer_timeout_recovery_run_mismatch_abandons() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::TimedOut))
+            .with_output(Err(HistorianProducerError::TerminalRunMismatch {
+                expected: "run-1".into(),
+                found: Some("run-other".into()),
+            }));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        assert_eq!(producer.await_run_ids, vec!["run-1", "run-1"]);
+        assert_eq!(producer.cancels, vec!["run-1"]);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, Some(999));
+        let detail = state.last_failure.expect("failure detail recorded");
+        assert!(
+            detail.contains("timed out; recovery re-drain also failed")
+                && detail.contains("run-1 received terminal control unit"),
+            "a replay terminal for another run id must not publish this firing: {detail}"
         );
     }
 
@@ -1938,6 +2046,23 @@ mod tests {
         let idle_again = tx_committed(&publishing).unwrap();
         assert_eq!(idle_again.state, HistorianPhase::Idle);
         assert_eq!(idle_again.firing_seq, 1);
+    }
+
+    #[test]
+    fn producer_establish_clears_failure_detail_and_backoff() {
+        let idle = HistorianDurableState {
+            failure_backoff_at_ms: Some(999),
+            last_failure: Some("stale failure".into()),
+            ..HistorianDurableState::default()
+        };
+        let fired = match fire(&idle, 2, 5, "fp".into(), 100).unwrap() {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => panic!("idle state must fire"),
+        };
+        assert_eq!(fired.failure_backoff_at_ms, Some(999));
+        let awaiting = producer_started(&fired, "ps".into(), "run".into()).unwrap();
+        assert_eq!(awaiting.failure_backoff_at_ms, None);
+        assert_eq!(awaiting.last_failure, None);
     }
 
     #[test]
