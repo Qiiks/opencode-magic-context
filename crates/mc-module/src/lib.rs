@@ -60,7 +60,9 @@ use subc_protocol::{
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
-use transform::{transform_with_projection, DeciderInputs, HistorianDiagnostics, TransformRequest};
+#[cfg(test)]
+use transform::ReductionDecision;
+use transform::{transform_with_projection, HistorianDiagnostics, TransformRequest};
 
 /// The per-route session binding: the project + session a route channel is bound to, plus
 /// the render budget frozen at bind. Established once at `on_bind` (the daemon relays the
@@ -72,6 +74,8 @@ use transform::{transform_with_projection, DeciderInputs, HistorianDiagnostics, 
 pub struct SessionBinding {
     pub project_root: PathBuf,
     pub session: String,
+    pub model_key: Option<String>,
+    pub config: McModuleConfig,
     /// The history budget (tokens) FROZEN at bind. Byte-affecting (a different budget → a
     /// different m0 trim → different bytes), so it's read once and never per-pass. A
     /// default for now (reading it from config is a later refinement); the freeze-once is
@@ -120,6 +124,9 @@ pub struct McHandler {
     fixed_config: Option<McModuleConfig>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     live_historian_sessions: Arc<Mutex<HashSet<String>>>,
+    scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
+    #[cfg(test)]
+    reduction_injection: Mutex<HashMap<String, Vec<ReductionDecision>>>,
     /// Route channel → its session binding. Populated at `on_bind`, removed at
     /// `on_route_gone`. A `Mutex<HashMap>` (not a lock-free map) because writes are
     /// rare (once per route open/close) and reads are one cheap lookup per transform.
@@ -184,6 +191,12 @@ struct HistorianFiringTask {
     live_guard: SessionSetGuard,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SchedulerObservation {
+    last_response_at_ms: i64,
+    observed_in_process: bool,
+}
+
 #[async_trait]
 impl HistorianProducerFactory for MissingProducerFactory {
     async fn connect(
@@ -216,6 +229,9 @@ impl McHandler {
             fixed_config: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashSet::new())),
+            scheduler_observations: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            reduction_injection: Mutex::new(HashMap::new()),
             bindings: Mutex::new(HashMap::new()),
         }
     }
@@ -229,6 +245,8 @@ impl McHandler {
                 model_chain: vec!["test/model".to_string()],
                 execute_threshold_percentage: 65.0,
                 memory_enabled: true,
+                smart_drops: false,
+                cache_ttl: "5m".to_string(),
             },
         )
     }
@@ -245,6 +263,8 @@ impl McHandler {
             fixed_config: Some(config),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashSet::new())),
+            scheduler_observations: Mutex::new(HashMap::new()),
+            reduction_injection: Mutex::new(HashMap::new()),
             bindings: Mutex::new(HashMap::new()),
         }
     }
@@ -295,6 +315,53 @@ impl McHandler {
             .lock()
             .expect("config mutex")
             .effective_for_project(project_root)
+    }
+
+    fn observed_last_response_at_ms(&self, store: &McStore, session_id: &str) -> Option<i64> {
+        let mut observations = self
+            .scheduler_observations
+            .lock()
+            .expect("scheduler observations mutex");
+        if let Some(observation) = observations.get(session_id) {
+            return observation
+                .observed_in_process
+                .then_some(observation.last_response_at_ms);
+        }
+        let anchor = store
+            .load(session_id)
+            .ok()
+            .map(|state| state.meta.last_committed_pass_at_ms)
+            .unwrap_or(0);
+        observations.insert(
+            session_id.to_string(),
+            SchedulerObservation {
+                last_response_at_ms: anchor,
+                observed_in_process: false,
+            },
+        );
+        None
+    }
+
+    fn record_response_observation(&self, session_id: &str, now: i64) {
+        self.scheduler_observations
+            .lock()
+            .expect("scheduler observations mutex")
+            .insert(
+                session_id.to_string(),
+                SchedulerObservation {
+                    last_response_at_ms: now,
+                    observed_in_process: true,
+                },
+            );
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn inject_reductions_for_test(&self, session_id: &str, reductions: Vec<ReductionDecision>) {
+        self.reduction_injection
+            .lock()
+            .expect("reduction injection mutex")
+            .insert(session_id.to_string(), reductions);
     }
 
     fn maybe_spawn_reattach(
@@ -760,6 +827,48 @@ impl McHandler {
         });
     }
 
+    fn handle_agent_drops_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => {
+                return HandlerOutcome::Error {
+                    code: "store_unavailable".to_string(),
+                    message: "store not opened (no HELLO_ACK storage seam)".to_string(),
+                }
+            }
+        };
+        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "ctx_reduce command requires session_id".to_string(),
+            };
+        };
+        if let Err(e) = self.resolve_binding(channel, session_id) {
+            return match e {
+                BindingError::Unbound => HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: "ctx_reduce on a channel with no session binding".to_string(),
+                },
+                BindingError::SessionMismatch => HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                },
+            };
+        }
+        let drop_ids = drop_ids_from_command(&request);
+        if drop_ids.is_empty() {
+            return respond(json!({ "ok": true, "queued": 0 }));
+        }
+        match store.append_pending_agent_drops(session_id, &drop_ids, now_ms()) {
+            Ok(queued) => respond(json!({ "ok": true, "queued": queued })),
+            Err(e) => HandlerOutcome::Error {
+                code: "store_write_failed".to_string(),
+                message: e.to_string(),
+            },
+        }
+    }
+
     async fn handle_transform_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
@@ -825,28 +934,30 @@ impl McHandler {
                 }
             }
         };
-        let deciders: DeciderInputs = match request.get("_decider") {
-            Some(d) => match serde_json::from_value(d.clone()) {
-                Ok(d) => d,
-                Err(e) => {
-                    return HandlerOutcome::Error {
-                        code: "bad_request".to_string(),
-                        message: format!("_decider: {e}"),
-                    }
-                }
-            },
-            None => DeciderInputs::default(),
-        };
         let project_path = binding.project_root.to_string_lossy();
+        let pass_now = now_ms();
         let producer_ctx = transform::ProducerContext {
             project_path: &project_path,
             project_directory: &project_path,
             history_budget_tokens: binding.history_budget_tokens,
-            now_ms: now_ms(),
+            now_ms: pass_now,
+            execute_threshold_percentage: binding.config.execute_threshold_percentage,
+            smart_drops: binding.config.smart_drops,
+            cache_ttl: binding.config.cache_ttl.clone(),
+            model_key: binding.model_key.clone(),
+            observed_last_response_at_ms: self
+                .observed_last_response_at_ms(&store, &parsed.session_id),
+            #[cfg(test)]
+            injected_reductions: self
+                .reduction_injection
+                .lock()
+                .expect("reduction injection mutex")
+                .remove(&parsed.session_id)
+                .unwrap_or_default(),
         };
-        let pass_now = producer_ctx.now_ms;
-        match transform_with_projection(&store, &parsed, &producer_ctx, &deciders) {
+        match transform_with_projection(&store, &parsed, &producer_ctx) {
             Ok(mut result) => {
+                self.record_response_observation(&parsed.session_id, pass_now);
                 let diagnostics = self.maybe_spawn_historian_fire(
                     Arc::clone(&store),
                     &parsed,
@@ -907,11 +1018,14 @@ impl ModuleHandler for McHandler {
     /// project from the daemon-controlled channel (never a per-pass request field). Accept
     /// every route — project resolution, not authorization, is the concern here.
     async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
+        let config = self.effective_config(&req.identity.project_root);
         self.bind_route(
             req.route_channel,
             SessionBinding {
                 project_root: req.identity.project_root.clone(),
                 session: req.identity.session.clone(),
+                model_key: None,
+                config,
                 // Frozen at bind. Currently a default constant (reading it from config is a
                 // later refinement); the load-bearing part is the freeze-once — a different
                 // budget would change the rendered m0 bytes, so it can't move mid-session.
@@ -929,7 +1043,11 @@ impl ModuleHandler for McHandler {
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-        match request.get("kind").and_then(Value::as_str) {
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .or_else(|| request.get("kind").and_then(Value::as_str));
+        match method {
             // Proves the store opened end-to-end: load a sentinel session through the
             // real opened handle and report its presence/state.
             Some("health") => match self.store.get() {
@@ -952,6 +1070,9 @@ impl ModuleHandler for McHandler {
             },
             // The CK-in/CK-out cache-stability spine.
             Some("transform") => self.handle_transform_value(ctx.channel(), request).await,
+            Some("ctx_reduce" | "append_agent_drops" | "agent_drops.append") => {
+                self.handle_agent_drops_value(ctx.channel(), request)
+            }
             // Default: echo (proves the wire round-trips).
             _ => respond(json!({ "ok": true, "echo": request })),
         }
@@ -976,6 +1097,25 @@ fn respond(value: Value) -> HandlerOutcome {
             message: e.to_string(),
         },
     }
+}
+
+fn drop_ids_from_command(request: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    for key in ["drop_ids", "agent_drop_ids", "ids"] {
+        if let Some(values) = request.get(key).and_then(Value::as_array) {
+            ids.extend(
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned),
+            );
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn boundary_messages(
@@ -1121,11 +1261,18 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
         provides: vec![ProviderRole::ToolProvider {
-            tools: vec![Tool {
-                name: "transform".to_string(),
-                execution_mode: ExecutionMode::Pure,
-                schema: json!({ "type": "object" }),
-            }],
+            tools: vec![
+                Tool {
+                    name: "transform".to_string(),
+                    execution_mode: ExecutionMode::Pure,
+                    schema: json!({ "type": "object" }),
+                },
+                Tool {
+                    name: "ctx_reduce".to_string(),
+                    execution_mode: ExecutionMode::Pure,
+                    schema: json!({ "type": "object" }),
+                },
+            ],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
             concurrency: Concurrency::ModuleManaged,
             emits_push: false,
@@ -1201,6 +1348,8 @@ mod tests {
         SessionBinding {
             project_root: PathBuf::from(root),
             session: session.to_string(),
+            model_key: None,
+            config: default_test_config(),
             history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
         }
     }
@@ -1390,6 +1539,8 @@ mod tests {
             model_chain: vec!["test/model".to_string()],
             execute_threshold_percentage: 65.0,
             memory_enabled: true,
+            smart_drops: false,
+            cache_ttl: "5m".to_string(),
         }
     }
 
@@ -1458,6 +1609,20 @@ mod tests {
             .handle_transform_for_test(7, request(messages))
             .await
         {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        }
+    }
+
+    fn queue_drop_command(handler: &McHandler, target_id: &str) -> Value {
+        match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "kind": "ctx_reduce",
+                "session_id": "ses",
+                "drop_ids": [target_id],
+            }),
+        ) {
             HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         }
@@ -1625,6 +1790,21 @@ mod tests {
         let second = call_transform(&handler, messages).await;
         assert_eq!(second["action"], "HARD");
         assert!(m0_text(&second).contains("autonomous summary"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_command_appends_and_transform_drains_queue() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let queued = queue_drop_command(&handler, "a#0");
+        assert_eq!(queued["queued"].as_u64(), Some(1));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+
+        let response = call_transform(&handler, vec![ck("a", 1, "drop me")]).await;
+        assert!(serde_json::to_string(&response)
+            .unwrap()
+            .contains("[dropped]"));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2087,8 +2267,13 @@ mod tests {
                 project_directory: &project_path_string,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
                 now_ms: now_ms(),
+                execute_threshold_percentage: 65.0,
+                smart_drops: false,
+                cache_ttl: "5m".to_string(),
+                model_key: None,
+                observed_last_response_at_ms: None,
+                injected_reductions: Vec::new(),
             },
-            &DeciderInputs::default(),
         )
         .unwrap();
         let without_value = serde_json::to_value(response_without_historian).unwrap();

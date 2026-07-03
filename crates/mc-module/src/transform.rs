@@ -22,11 +22,19 @@ use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, 
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{compose_m1_from_store, m1_revision_signal};
 use crate::memory_render::M1_PLACEHOLDER;
-use crate::selection::{SelItem, SelKind};
+use crate::scheduler::{
+    self, BoundaryBypass, ContextUsage, DeferredExecute, ExecuteThresholdConfig, LatchState,
+    SchedulerConfig, SchedulerInputs, SessionMeta, TailState,
+};
+use crate::selection::{
+    select_reductions, PassClass, SelItem, SelKind, SelectionConfig, SelectionContext,
+};
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
-use mc_store::{McStore, McStoreError, ModuleMeta, ModuleUsage, StoredCompartment};
+use mc_store::{
+    DeferredExecuteState, McStore, McStoreError, ModuleMeta, ModuleUsage, StoredCompartment,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ck_wire::{
     duplicate_ids, project_messages, reduced_block, split_block_id, CkIngressMessage, CkWireError,
@@ -71,23 +79,6 @@ pub struct ReductionDecision {
     pub payload: String,
 }
 
-/// The tail-reduction decisions for a pass. The producer that SELECTS reductions (the
-/// supersession / ctx_reduce / emergency / smart-drops heuristics) is not yet implemented
-/// in its final location, so these still arrive via the test-only `_decider` request field
-/// — the one remaining such seam, which goes away when that producer lands. The m0/m1
-/// content is NO LONGER here: it is composed from the store (see [`ProducerContext`]).
-/// `Deserialize` with field defaults so a partial `_decider` body fills the rest.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct DeciderInputs {
-    /// The FULL current tail-reduction set, re-derived each pass. A target NOT yet
-    /// frozen + present in the live tail is a NEW reduction to freeze (a SOFT trigger).
-    /// An already-frozen target's payload here is IGNORED (the frozen payload wins);
-    /// supplying a DIFFERENT payload for a frozen target is a monotonicity-contract
-    /// violation that fails loud (see `validate_reduction_monotonicity`).
-    pub reductions: Vec<ReductionDecision>,
-}
-
 /// Legacy flat request item accepted only for backward compatibility with older
 /// request fixtures. New callers send `messages` and receive bare CK messages.
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +106,20 @@ pub struct ProducerContext<'a> {
     /// a HARD (the first materialization freezes it); every later pass reads the frozen
     /// meta value, never this, so expiry never drifts the bytes between passes.
     pub now_ms: i64,
+    /// Execute threshold frozen at route bind for scheduler and selection headroom.
+    pub execute_threshold_percentage: f64,
+    /// Smart-drop selector gate frozen at route bind.
+    pub smart_drops: bool,
+    /// Cache TTL string from SessionMeta config; defaults to `5m`.
+    pub cache_ttl: String,
+    /// Provider/model key for threshold lookup. Per-model overrides are deferred, so
+    /// production currently supplies None.
+    pub model_key: Option<String>,
+    /// In-process response observation. None disables TTL-hard even if durable metadata
+    /// has an older sparse commit anchor.
+    pub observed_last_response_at_ms: Option<i64>,
+    #[cfg(test)]
+    pub injected_reductions: Vec<ReductionDecision>,
 }
 
 /// A transform pass request. `boundary_present` is deliberately NOT a field: it is a
@@ -135,7 +140,7 @@ pub struct TransformRequest {
     #[serde(default)]
     pub usage: Option<ModuleUsage>,
     #[serde(default)]
-    pub agent_drop_ids: Vec<String>,
+    pub provider_error: Option<String>,
 }
 
 fn default_wire_version() -> u32 {
@@ -157,7 +162,7 @@ struct TransformRequestWire {
     #[serde(default)]
     usage: Option<ModuleUsage>,
     #[serde(default)]
-    agent_drop_ids: Vec<String>,
+    provider_error: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for TransformRequest {
@@ -178,7 +183,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             render_config: wire.render_config,
             messages,
             usage: wire.usage,
-            agent_drop_ids: wire.agent_drop_ids,
+            provider_error: wire.provider_error,
         })
     }
 }
@@ -359,8 +364,8 @@ impl From<crate::m1_compose::M1ComposeError> for TransformError {
 
 /// Apply one transform pass, retrying the whole load→classify→step→commit cycle on a
 /// CAS conflict (re-classification depends on the freshly-loaded state). `ctx` is the
-/// resolved project producer context (m0/m1 are composed from its store reads);
-/// `deciders` now carries ONLY the tail reductions (the m0/m1 content is store-produced).
+/// resolved project producer context (m0/m1 are composed from its store reads). Tail
+/// reductions are produced inside the pass from the scheduler-gated selector.
 ///
 /// The real Claude token estimator ([`mc_tokenizer::estimate_tokens`]) is injected into
 /// the m0 compose (the decay renderer's budget guard). It is reached ONLY on the
@@ -372,18 +377,16 @@ pub fn transform(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
-    deciders: &DeciderInputs,
 ) -> Result<TransformResponse, TransformError> {
-    transform_with_projection(store, req, ctx, deciders).map(|result| result.response)
+    transform_with_projection(store, req, ctx).map(|result| result.response)
 }
 
 pub fn transform_with_projection(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
-    deciders: &DeciderInputs,
 ) -> Result<TransformWithProjection, TransformError> {
-    apply_once_with_estimator(store, req, ctx, deciders, mc_tokenizer::estimate_tokens)
+    apply_once_with_estimator(store, req, ctx, mc_tokenizer::estimate_tokens)
 }
 
 /// The retry wrapper around [`apply_once`], parameterized by the token estimator so tests
@@ -393,12 +396,11 @@ fn apply_once_with_estimator(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
-    deciders: &DeciderInputs,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<TransformWithProjection, TransformError> {
     let mut attempt = 0;
     loop {
-        match apply_once(store, req, ctx, deciders, estimate_tokens) {
+        match apply_once(store, req, ctx, estimate_tokens) {
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
                 if attempt < MAX_CAS_RETRIES =>
             {
@@ -414,7 +416,6 @@ fn apply_once(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
-    deciders: &DeciderInputs,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<TransformWithProjection, TransformError> {
     // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
@@ -444,13 +445,7 @@ fn apply_once(
 
     let loaded = store.load(&req.session_id)?;
     enforce_block_identity(&loaded.meta, &projection, &loaded.core)?;
-    let effective_deciders = merge_agent_drops(req, deciders, &live, &loaded.core);
-
-    // Fail-loud monotonicity guard, BEFORE classify and on EVERY pass: a frozen
-    // reduction target re-supplied with different bytes breaks the immutable contract,
-    // and the set-membership trigger would silently skip it (already frozen) and serve
-    // the stale bytes — including on a defer. Error here instead.
-    validate_reduction_monotonicity(&loaded.core, &effective_deciders)?;
+    let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
 
     // --- boundary presence: computed over live source vs durable boundary_id ---
     let boundary_present = !loaded.core.boundary_id.is_empty()
@@ -476,12 +471,43 @@ fn apply_once(
     // The cheap m1-change digest (watermark triple). Computed every pass to gate SOFT vs
     // defer WITHOUT composing the body; the body composes only on the bust arm below.
     let mut current_m1_digest = m1_revision_signal(store, ctx.project_path, &req.session_id)?;
-    let reductions_pending_now = reductions_pending(
-        &loaded.core,
-        &effective_deciders,
-        &live,
-        loaded.meta.coverage_ordinal,
-    );
+    let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
+    let context_limit_tokens = effective_context_limit_tokens(&effective_usage);
+    let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
+    let usage_percentage = if context_limit_tokens > 0.0 {
+        usage_input_tokens / context_limit_tokens * 100.0
+    } else {
+        0.0
+    };
+    let scheduler_outcome = scheduler::decide(&SchedulerInputs {
+        config: scheduler_config(ctx.execute_threshold_percentage),
+        usage: ContextUsage {
+            percentage: usage_percentage,
+            input_tokens: usage_input_tokens,
+        },
+        session: SessionMeta {
+            last_response_time_ms: ctx
+                .observed_last_response_at_ms
+                .map(|ts| ts.max(0) as u64)
+                .unwrap_or(0),
+            cache_ttl: ctx.cache_ttl.clone(),
+        },
+        now_ms: ctx.now_ms.max(0) as u64,
+        model_key: ctx.model_key.clone(),
+        context_limit: Some(context_limit_tokens),
+        tail_state: tail_state_from_live(&live),
+        deferred_execute: loaded
+            .meta
+            .deferred_execute_state
+            .as_ref()
+            .map(deferred_from_meta),
+        boundary_bypass: BoundaryBypass {
+            explicit_bust: false,
+            subagent: false,
+        },
+        drain_latch: latch_from_meta(&loaded.meta),
+        overflow_error_text: req.provider_error.clone(),
+    });
     // First-fold HARD trigger: a never-minted boundary (empty boundary_id) means no
     // compartment has ever folded into m0 (the fold is what mints the boundary). Once the
     // historian publishes the session's FIRST compartment, it cannot ride m1 as a SOFT
@@ -496,13 +522,80 @@ fn apply_once(
     // state where the boundary is present.
     let first_fold_due =
         loaded.core.boundary_id.is_empty() && store.has_compartments(&req.session_id)?;
+    let render_config_changed =
+        loaded.meta.initialized && effective_render_config != loaded.meta.last_render_config;
+    let reconcile_hard_due = loaded.core.reconcile_pending && !boundary_present;
+    let hard_fold_requested = first_fold_due || scheduler_outcome.idle_ttl_fired;
+    let producer_gate = producer_gate(
+        scheduler_outcome.pass,
+        !loaded.meta.initialized
+            || render_config_changed
+            || reconcile_hard_due
+            || hard_fold_requested,
+    );
+    let selection_class = if producer_gate {
+        selection_pass_class(scheduler_outcome.pass)
+    } else {
+        PassClass::Defer
+    };
+    let tail_for_selection = tail_sel_items(&live, loaded.meta.coverage_ordinal);
+    let selected_reductions = if producer_gate {
+        let frozen = frozen_red_targets(&loaded.core);
+        let agent_drop_ids = pending_agent_drops
+            .iter()
+            .map(|drop| drop.target_id.clone())
+            .collect::<Vec<_>>();
+        select_reductions(
+            &tail_for_selection,
+            &frozen,
+            &SelectionContext {
+                pass_class: selection_class,
+                current_total_input_tokens: usage_input_tokens,
+                ceiling_tokens: context_limit_tokens
+                    * ctx.execute_threshold_percentage.clamp(1.0, 100.0)
+                    / 100.0,
+                protected_cutoff_ordinal: 0,
+                last_execute_ordinal: if loaded.core.reconcile_pending {
+                    0
+                } else {
+                    loaded.meta.last_execute_ordinal
+                },
+                prior_input_sample: loaded.meta.last_emergency_input_sample,
+                has_prior_drop: loaded.meta.has_prior_emergency_drop,
+                agent_drop_ids,
+            },
+            &SelectionConfig {
+                smart_drops: ctx.smart_drops,
+            },
+        )
+    } else {
+        Vec::new()
+    };
+    #[cfg(test)]
+    let selected_reductions = if ctx.injected_reductions.is_empty() {
+        selected_reductions
+    } else {
+        ctx.injected_reductions.clone()
+    };
+
+    // Fail-loud monotonicity guard, BEFORE classify and on EVERY pass: a frozen
+    // reduction target re-supplied with different bytes breaks the immutable contract,
+    // and the set-membership trigger would silently skip it (already frozen) and serve
+    // the stale bytes — including on a defer. Error here instead.
+    validate_reduction_monotonicity(&loaded.core, &selected_reductions)?;
+
+    let reductions_pending_now = reductions_pending(
+        &loaded.core,
+        &selected_reductions,
+        &live,
+        loaded.meta.coverage_ordinal,
+    );
     let plan = classify(&ClassifierInput {
         initialized: loaded.meta.initialized,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
         valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
-        render_config_changed: loaded.meta.initialized
-            && effective_render_config != loaded.meta.last_render_config,
-        hard_fold_requested: first_fold_due,
+        render_config_changed,
+        hard_fold_requested,
         boundary_present,
         reconcile_pending: loaded.core.reconcile_pending,
         m1_revision_changed: current_m1_digest != loaded.meta.m1_revision,
@@ -513,12 +606,13 @@ fn apply_once(
     let mut meta = loaded.meta.clone();
     let mut commit_expected = loaded.row_version;
     apply_ingress_meta(&mut meta, req, &projection);
+    apply_scheduler_meta(&mut meta, &scheduler_outcome);
 
     let is_bust_pass = matches!(
         plan,
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
     );
-    let tail_for_capture = tail_sel_items(&live, loaded.meta.coverage_ordinal);
+    let tail_for_capture = tail_for_selection.clone();
     if is_bust_pass {
         capture_todo_state_on_bust(&mut meta, &tail_for_capture, true);
     }
@@ -612,6 +706,9 @@ fn apply_once(
                             },
                             estimate_tokens,
                         )?;
+                        meta.last_execute_ordinal = meta
+                            .last_execute_ordinal
+                            .min(comp.coverage_ordinal.unwrap_or(0));
 
                         if comp.coverage_ordinal.is_some() {
                             let reminted = comp.boundary_id.as_str();
@@ -638,7 +735,7 @@ fn apply_once(
             // covered raw bytes), so a reduction on a now-covered item simply drops with
             // it (no "fold reduced bytes into m0"); a target still in the new tail is kept;
             // a reverted-away target is an orphan. apply_units can't delete → rebuild.
-            let effective = effective_reductions(&core, &effective_deciders);
+            let effective = effective_reductions(&core, &selected_reductions);
             let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
             core.frozen_units.clear();
             core.pending_changes.clear();
@@ -693,7 +790,7 @@ fn apply_once(
             let mut rendered = vec![render_m1_body(&m1.body)];
             rendered.extend(new_reduction_units(
                 &core,
-                &effective_deciders,
+                &selected_reductions,
                 &live,
                 loaded.meta.coverage_ordinal,
             ));
@@ -747,6 +844,23 @@ fn apply_once(
         }
     }
 
+    if is_bust_pass && reductions_pending_now {
+        match selection_class {
+            PassClass::Execute if !loaded.core.reconcile_pending => {
+                meta.last_execute_ordinal = tail_for_selection
+                    .iter()
+                    .map(|item| item.ordinal)
+                    .max()
+                    .unwrap_or(0);
+            }
+            PassClass::EmergencyForce => {
+                meta.last_emergency_input_sample = usage_input_tokens;
+                meta.has_prior_emergency_drop = true;
+            }
+            _ => {}
+        }
+    }
+
     advance_synthetic_todo(
         &mut meta,
         is_bust_pass,
@@ -764,7 +878,26 @@ fn apply_once(
     // otherwise reuse the previous row version without writing.
     let changed = core != loaded.core || meta != loaded.meta;
     let row_version = if changed {
-        store.commit(&req.session_id, commit_expected, &core, &meta)?
+        meta.last_committed_pass_at_ms = ctx.now_ms;
+        let consumed_drop_ids = if is_bust_pass && producer_gate {
+            pending_agent_drops
+                .iter()
+                .map(|drop| drop.id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if consumed_drop_ids.is_empty() {
+            store.commit(&req.session_id, commit_expected, &core, &meta)?
+        } else {
+            store.commit_with_consumed_drops(
+                &req.session_id,
+                commit_expected,
+                &core,
+                &meta,
+                &consumed_drop_ids,
+            )?
+        }
     } else {
         loaded.row_version.unwrap_or(0)
     };
@@ -831,33 +964,105 @@ fn apply_ingress_meta(meta: &mut ModuleMeta, req: &TransformRequest, projection:
     }
 }
 
-fn merge_agent_drops(
-    req: &TransformRequest,
-    deciders: &DeciderInputs,
-    live: &[&FlatBlock],
-    core: &CoreState,
-) -> DeciderInputs {
-    let mut merged = deciders.clone();
-    let frozen = frozen_red_targets(core);
-    let mut existing: BTreeSet<String> = merged
-        .reductions
-        .iter()
-        .map(|r| r.target_id.clone())
-        .collect();
-    for target in &req.agent_drop_ids {
-        if frozen.contains(target) || existing.contains(target) {
-            continue;
-        }
-        if let Some(block) = live.iter().find(|block| block.id() == target) {
-            existing.insert(target.clone());
-            merged.reductions.push(ReductionDecision {
-                target_id: target.clone(),
-                kind: "agent_drop".to_string(),
-                payload: format!("[dropped {}]", block.bytes().len()),
-            });
-        }
+fn effective_usage(request: Option<&ModuleUsage>, persisted: Option<&ModuleUsage>) -> ModuleUsage {
+    request
+        .filter(|usage| usage.is_non_zero())
+        .or(persisted)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn effective_context_limit_tokens(usage: &ModuleUsage) -> f64 {
+    if usage.context_limit_tokens > 0 {
+        usage.context_limit_tokens as f64
+    } else {
+        200_000.0
     }
-    merged
+}
+
+fn scheduler_config(execute_threshold_percentage: f64) -> SchedulerConfig {
+    SchedulerConfig {
+        execute_threshold_percentage: ExecuteThresholdConfig::Percentage(
+            execute_threshold_percentage,
+        ),
+        execute_threshold_tokens: None,
+    }
+}
+
+fn producer_gate(pass: scheduler::PassDecision, hard_advisory: bool) -> bool {
+    !matches!(pass, scheduler::PassDecision::Defer) || hard_advisory
+}
+
+fn selection_pass_class(pass: scheduler::PassDecision) -> PassClass {
+    match pass {
+        scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95 => {
+            PassClass::EmergencyForce
+        }
+        scheduler::PassDecision::Defer | scheduler::PassDecision::Execute => PassClass::Execute,
+    }
+}
+
+fn deferred_from_meta(state: &DeferredExecuteState) -> DeferredExecute {
+    DeferredExecute {
+        reason: state.reason.clone(),
+    }
+}
+
+fn deferred_to_meta(state: DeferredExecute) -> DeferredExecuteState {
+    DeferredExecuteState {
+        reason: state.reason,
+    }
+}
+
+fn latch_from_meta(meta: &ModuleMeta) -> LatchState {
+    LatchState {
+        active_since_ms: meta
+            .emergency_drain_active
+            .then_some(meta.emergency_drain_entered_at_ms.max(0) as u64),
+    }
+}
+
+fn apply_scheduler_meta(meta: &mut ModuleMeta, outcome: &scheduler::SchedulerOutcome) {
+    meta.deferred_execute_state = if matches!(outcome.pass, scheduler::PassDecision::Defer) {
+        outcome.deferred_execute.clone().map(deferred_to_meta)
+    } else {
+        None
+    };
+    meta.emergency_drain_active = outcome.drain_latch.active_since_ms.is_some();
+    meta.emergency_drain_entered_at_ms = outcome
+        .drain_latch
+        .active_since_ms
+        .map(|ts| ts as i64)
+        .unwrap_or(0);
+}
+
+fn tail_state_from_live(live: &[&FlatBlock]) -> TailState {
+    let Some(newest_assistant_ordinal) = live
+        .iter()
+        .filter(|block| block.role == "assistant")
+        .map(|block| block.ordinal())
+        .max()
+    else {
+        return TailState {
+            mid_tool_use: false,
+        };
+    };
+    let completed_arcs: HashSet<&str> = live
+        .iter()
+        .filter(|block| block.kind_tag == "tool_result" && !block.provider_executed)
+        .filter_map(|block| block.arc_id.as_deref())
+        .collect();
+    let mid_tool_use = live.iter().any(|block| {
+        block.role == "assistant"
+            && block.ordinal() == newest_assistant_ordinal
+            && block.kind_tag == "tool_call"
+            && !block.provider_executed
+            && block
+                .arc_id
+                .as_deref()
+                .is_some_and(|arc| !completed_arcs.contains(arc))
+    });
+    TailState { mid_tool_use }
 }
 
 // --- shape predicates (mc-module reads the concrete frozen set; mc-core stays blind) ---
@@ -918,15 +1123,15 @@ fn red_unit(target: &str, kind: &str, payload: &str) -> FrozenUnit {
     }
 }
 
-/// Fail-loud monotonicity guard (runs EVERY pass, before classify). If the decider
+/// Fail-loud monotonicity guard (runs EVERY pass, before classify). If the selector
 /// supplies a reduction whose target is ALREADY frozen with DIFFERENT bytes, that
 /// breaks the immutable-once-frozen contract — and the set-membership trigger would
 /// SILENTLY skip it (already in keys) and serve the stale frozen payload. Error instead.
 fn validate_reduction_monotonicity(
     core: &CoreState,
-    deciders: &DeciderInputs,
+    reductions: &[ReductionDecision],
 ) -> Result<(), TransformError> {
-    for r in &deciders.reductions {
+    for r in reductions {
         if let Some(frozen) = frozen_red_payload(core, &r.target_id) {
             if frozen != r.payload {
                 return Err(TransformError::ReductionConflict);
@@ -936,11 +1141,11 @@ fn validate_reduction_monotonicity(
     Ok(())
 }
 
-/// Is there a NEW reduction to freeze: a decider reduction whose target is in the live
+/// Is there a NEW reduction to freeze: a selected reduction whose target is in the live
 /// tail AND not yet frozen. Pure id set-membership — the SOFT trigger.
 fn reductions_pending(
     core: &CoreState,
-    deciders: &DeciderInputs,
+    reductions: &[ReductionDecision],
     live: &[&FlatBlock],
     coverage: Option<u64>,
 ) -> bool {
@@ -950,17 +1155,16 @@ fn reductions_pending(
         .filter(|i| is_tail(i.ordinal(), coverage))
         .map(|i| i.id())
         .collect();
-    deciders
-        .reductions
+    reductions
         .iter()
         .any(|r| tail.contains(r.target_id.as_str()) && !frozen.contains(&r.target_id))
 }
 
-/// The `red:*` units to freeze on a SOFT: each NEW decider reduction (target in the live
+/// The `red:*` units to freeze on a SOFT: each NEW selected reduction (target in the live
 /// tail, not yet frozen), deduped by target, deterministic order.
 fn new_reduction_units(
     core: &CoreState,
-    deciders: &DeciderInputs,
+    reductions: &[ReductionDecision],
     live: &[&FlatBlock],
     coverage: Option<u64>,
 ) -> Vec<FrozenUnit> {
@@ -971,7 +1175,7 @@ fn new_reduction_units(
         .map(|i| i.id())
         .collect();
     let mut by_target: BTreeMap<String, FrozenUnit> = BTreeMap::new();
-    for r in &deciders.reductions {
+    for r in reductions {
         if tail.contains(r.target_id.as_str()) && !frozen.contains(&r.target_id) {
             by_target
                 .entry(r.target_id.clone())
@@ -982,11 +1186,11 @@ fn new_reduction_units(
 }
 
 /// The reductions in EFFECT this pass, snapshotted BEFORE any frozen-set mutation (the
-/// HARD-fold snapshot): every frozen `red:*` (authoritative payload) ∪ every NEW decider
+/// HARD-fold snapshot): every frozen `red:*` (authoritative payload) ∪ every NEW selected
 /// reduction (target not yet frozen). Keyed by target_id → (kind, payload), deterministic.
 fn effective_reductions(
     core: &CoreState,
-    deciders: &DeciderInputs,
+    reductions: &[ReductionDecision],
 ) -> BTreeMap<String, (String, String)> {
     let mut eff: BTreeMap<String, (String, String)> = BTreeMap::new();
     for u in &core.frozen_units {
@@ -997,7 +1201,7 @@ fn effective_reductions(
             );
         }
     }
-    for r in &deciders.reductions {
+    for r in reductions {
         eff.entry(r.target_id.clone())
             .or_insert_with(|| (r.kind.clone(), r.payload.clone()));
     }
@@ -1415,12 +1619,12 @@ mod tests {
             render_config: cfg.to_string(),
             messages,
             usage: None,
-            agent_drop_ids: Vec::new(),
+            provider_error: None,
         }
     }
 
-    fn spine() -> DeciderInputs {
-        DeciderInputs::default()
+    fn spine() -> Vec<ReductionDecision> {
+        Vec::new()
     }
 
     /// A store compartment covering raw ordinals `start..=end`, ending at message id
@@ -1448,13 +1652,51 @@ mod tests {
             project_directory: dir,
             history_budget_tokens: 60_000.0,
             now_ms,
+            execute_threshold_percentage: 65.0,
+            smart_drops: false,
+            cache_ttl: "5m".to_string(),
+            model_key: None,
+            observed_last_response_at_ms: None,
+            injected_reductions: Vec::new(),
         }
+    }
+
+    fn smart_pctx<'a>() -> ProducerContext<'a> {
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.smart_drops = true;
+        ctx
+    }
+
+    fn with_usage(
+        mut request: TransformRequest,
+        current_total_input_tokens: u64,
+        context_limit_tokens: u64,
+    ) -> TransformRequest {
+        request.usage = Some(ModuleUsage {
+            current_total_input_tokens,
+            context_limit_tokens,
+        });
+        request
+    }
+
+    fn todowrite_arc(mid: &str, call_ordinal: u64) -> Vec<CkIngressMessage> {
+        vec![
+            todowrite_call(mid, call_ordinal, json!([])),
+            tool_result(
+                &format!("{mid}_result"),
+                call_ordinal + 1,
+                &format!("call_{mid}"),
+                "todo output",
+            ),
+        ]
     }
 
     /// Run a transform with a default producer context (project "git:proj", a nonexistent
     /// docs dir, now_ms=0). Most tests don't vary the context.
-    fn run(s: &McStore, req: &TransformRequest, d: &DeciderInputs) -> TransformResponse {
-        transform(s, req, &pctx("git:proj", "/nonexistent-docs", 0), d).unwrap()
+    fn run(s: &McStore, req: &TransformRequest, d: &[ReductionDecision]) -> TransformResponse {
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.injected_reductions = d.to_vec();
+        transform(s, req, &ctx).unwrap()
     }
 
     fn synthetic_text(r: &TransformResponse, index: usize) -> &str {
@@ -1712,7 +1954,6 @@ mod tests {
             &s,
             &req("ses", "cfg0", vec![item("a", 1, "two")]),
             &pctx("git:proj", "/nonexistent-docs", 0),
-            &spine(),
         )
         .unwrap_err();
         assert!(matches!(drift, TransformError::IdentityDrift(mid) if mid == "a"));
@@ -1725,7 +1966,6 @@ mod tests {
                 vec![item("same", 1, "x"), item("same", 2, "y")],
             ),
             &pctx("git:proj", "/nonexistent-docs", 0),
-            &spine(),
         )
         .unwrap_err();
         assert!(matches!(dup, TransformError::DuplicateBlockId(id) if id == "same#0"));
@@ -1752,7 +1992,6 @@ mod tests {
             &s,
             &req("vanish", "cfg0", one_block),
             &pctx("git:proj", "/nonexistent-docs", 0),
-            &spine(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1903,10 +2142,11 @@ mod tests {
     fn agent_drop_ids_freeze_add_only_through_flat_ids() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        let mut request = req("agent-drop", "cfg0", vec![item("a", 1, "drop me")]);
-        request.agent_drop_ids = vec!["a#0".to_string()];
+        let request = req("agent-drop", "cfg0", vec![item("a", 1, "drop me")]);
+        s.append_pending_agent_drops("agent-drop", &["a#0".to_string()], 1)
+            .unwrap();
         let r = run(&s, &request, &spine());
-        assert_eq!(tail_bytes(&r, "a"), "[dropped 41]");
+        assert_eq!(tail_bytes(&r, "a"), "[dropped]");
         assert!(s
             .load("agent-drop")
             .unwrap()
@@ -1914,9 +2154,278 @@ mod tests {
             .frozen_units
             .iter()
             .any(|unit| unit.key == "red:a#0"));
+        assert!(s.load_pending_agent_drops("agent-drop").unwrap().is_empty());
         let again = run(&s, &request, &spine());
         assert_eq!(again.action, "SOFT+");
-        assert_eq!(tail_bytes(&again, "a"), "[dropped 41]");
+        assert_eq!(tail_bytes(&again, "a"), "[dropped]");
+        s.append_pending_agent_drops("agent-drop", &["a#0".to_string()], 2)
+            .unwrap();
+        let mut hard_request = request.clone();
+        hard_request.render_config = "cfg1".to_string();
+        let hard = run(&s, &hard_request, &spine());
+        assert_eq!(hard.action, "HARD");
+        assert_eq!(tail_bytes(&hard, "a"), "[dropped]");
+        assert!(s.load_pending_agent_drops("agent-drop").unwrap().is_empty());
+    }
+
+    #[test]
+    fn producer_gate_runs_on_execute_force_and_hard_advisory_never_plain_defer() {
+        let ctx = smart_pctx();
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let mut messages = vec![item("a", 1, "raw")];
+        messages.extend(todowrite_arc("old", 2));
+        messages.extend(todowrite_arc("new", 4));
+        let defer = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(defer.action, "SOFT+");
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .all(|unit| !unit.key.starts_with("red:old")));
+
+        let execute = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(execute.action, "SOFT");
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:old#0"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let huge = "x".repeat(50_000);
+        let force_messages = vec![
+            item("a", 1, "raw"),
+            assistant_tool_call("force_old", 2, "force_old_call"),
+            tool_result("force_old_result", 3, "force_old_call", &huge),
+            assistant_tool_call("force_new", 4, "force_new_call"),
+            tool_result("force_new_result", 5, "force_new_call", &huge),
+        ];
+        let force = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", force_messages), 90_000, 100_000),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(force.action, "SOFT");
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:force_old#0"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let mut hard_messages = vec![item("a", 1, "raw")];
+        hard_messages.extend(todowrite_arc("hard_old", 2));
+        hard_messages.extend(todowrite_arc("hard_new", 4));
+        let hard = transform(
+            &s,
+            &with_usage(req("ses", "cfg1", hard_messages), 10, 100),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(hard.action, "HARD");
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:hard_old#0"));
+    }
+
+    #[test]
+    fn coverage_filtered_pool_never_selects_covered_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let ctx = smart_pctx();
+        let mut messages = todowrite_arc("a", 1);
+        s.replace_compartments("ses", &[comp(1, 1, 2, "a_result", "SUMMARY")])
+            .unwrap();
+        let boot = transform(&s, &req("ses", "cfg0", messages.clone()), &ctx).unwrap();
+        assert_eq!(boot.action, "HARD");
+        messages.extend(todowrite_arc("tail_old", 3));
+        messages.extend(todowrite_arc("tail_new", 5));
+        let response =
+            transform(&s, &with_usage(req("ses", "cfg0", messages), 70, 100), &ctx).unwrap();
+        assert_eq!(response.action, "SOFT");
+        let loaded = s.load("ses").unwrap();
+        assert!(loaded
+            .core
+            .frozen_units
+            .iter()
+            .all(|unit| unit.key != "red:a#0"));
+        assert!(loaded
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:tail_old#0"));
+    }
+
+    #[test]
+    fn provider_executed_open_arc_does_not_defer_execute_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let mut ctx = smart_pctx();
+        ctx.observed_last_response_at_ms = Some(1);
+        let mut messages = vec![item("a", 1, "raw")];
+        messages.extend(todowrite_arc("old", 2));
+        messages.extend(todowrite_arc("new", 4));
+        messages.push(CkIngressMessage {
+            mid: "server_tool".to_string(),
+            ordinal: 6,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: "server_call".to_string(),
+                    name: "web_search".to_string(),
+                    input: json!({}),
+                    provider_executed: true,
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("server_tool".to_string()),
+                    ..Default::default()
+                },
+            ),
+        });
+        let response =
+            transform(&s, &with_usage(req("ses", "cfg0", messages), 70, 100), &ctx).unwrap();
+        assert_eq!(response.action, "SOFT");
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:old#0"));
+    }
+
+    #[test]
+    fn ttl_hard_requires_in_process_observation_not_durable_anchor_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.last_committed_pass_at_ms = 1;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 10 * 60 * 1000);
+        ctx.cache_ttl = "5m".to_string();
+        ctx.observed_last_response_at_ms = None;
+        let no_observation =
+            transform(&s, &req("ses", "cfg0", vec![item("a", 1, "raw")]), &ctx).unwrap();
+        assert_eq!(no_observation.action, "SOFT+");
+        assert!(!no_observation.committed);
+
+        ctx.observed_last_response_at_ms = Some(1);
+        let observed = transform(&s, &req("ses", "cfg0", vec![item("a", 1, "raw")]), &ctx).unwrap();
+        assert_eq!(observed.action, "HARD");
+    }
+
+    #[test]
+    fn reconcile_pending_disables_two_pass_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let loaded = s.load("ses").unwrap();
+        let mut core = loaded.core.clone();
+        let mut meta = loaded.meta.clone();
+        core.boundary_id = "missing#0".to_string();
+        core.reconcile_pending = true;
+        meta.last_execute_ordinal = 99;
+        s.commit("ses", loaded.row_version, &core, &meta).unwrap();
+
+        let messages = vec![
+            item("a", 1, "raw"),
+            assistant_tool_call("old", 2, "old_call"),
+            tool_result("old_result", 3, "old_call", "old output"),
+        ];
+        let response = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages), 70, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(response.action, "HARD");
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .all(|unit| unit.key != "red:old#0"));
+    }
+
+    #[test]
+    fn execute_with_zero_delta_is_defer_shaped_and_does_not_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let boot_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 90, 100);
+        let boot = run(&s, &boot_req, &spine());
+        assert_eq!(boot.action, "HARD");
+        let before = serde_json::to_vec(&boot.ck_messages).unwrap();
+        let row_before = boot.row_version;
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.observed_last_response_at_ms = Some(0);
+        let execute = transform(&s, &boot_req, &ctx).unwrap();
+        assert_eq!(execute.action, "SOFT+");
+        assert!(!execute.committed);
+        assert_eq!(execute.row_version, row_before);
+        assert_eq!(serde_json::to_vec(&execute.ck_messages).unwrap(), before);
+    }
+
+    #[test]
+    fn pure_defer_with_scheduler_fields_present_keeps_row_version_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.deferred_execute_state = None;
+        loaded.meta.emergency_drain_active = false;
+        loaded.meta.emergency_drain_entered_at_ms = 0;
+        loaded.meta.last_execute_ordinal = 2;
+        loaded.meta.has_prior_emergency_drop = true;
+        loaded.meta.last_emergency_input_sample = 50.0;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let row_before = s.load("ses").unwrap().row_version.unwrap();
+        let response = transform(
+            &s,
+            &req("ses", "cfg0", vec![item("a", 1, "raw")]),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(response.action, "SOFT+");
+        assert!(!response.committed);
+        assert_eq!(s.load("ses").unwrap().row_version.unwrap(), row_before);
     }
 
     #[test]
@@ -1928,14 +2437,14 @@ mod tests {
             "render_config": "cfg",
             "messages": [{ "mid": "m", "ordinal": 7, "ck": text_message("m", "hello") }],
             "usage": { "current_total_input_tokens": 1, "context_limit_tokens": 2 },
-            "agent_drop_ids": ["m#0"]
+            "provider_error": "prompt is too long"
         });
         let parsed: TransformRequest = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.kind, "transform");
         assert_eq!(parsed.v, 1);
         assert_eq!(parsed.messages[0].mid, "m");
         assert_eq!(parsed.usage.unwrap().context_limit_tokens, 2);
-        assert_eq!(parsed.agent_drop_ids, vec!["m#0"]);
+        assert_eq!(parsed.provider_error.as_deref(), Some("prompt is too long"));
     }
 
     // ===== Module-integration tests: STORE STATE in → compose+core bytes out.
@@ -2129,13 +2638,13 @@ mod tests {
         .unwrap();
         let live = vec![item("m1", 1, "raw"), item("t2", 2, "tail")];
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        let err = transform(&s, &req("ses", "cfg0", live.clone()), &ctx, &spine());
+        let err = transform(&s, &req("ses", "cfg0", live.clone()), &ctx);
         match err {
             Err(TransformError::BoundaryNotPresent(_)) => {}
             other => panic!("expected BoundaryNotPresent, got {other:?}"),
         }
         // Nothing committed → the error stays visible on retry, never a silent loop.
-        let retry = transform(&s, &req("ses", "cfg0", live), &ctx, &spine());
+        let retry = transform(&s, &req("ses", "cfg0", live), &ctx);
         assert!(matches!(retry, Err(TransformError::BoundaryNotPresent(_))));
     }
 
@@ -2164,7 +2673,7 @@ mod tests {
         .unwrap();
         let live = vec![item("m1", 1, "raw")];
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        let err = transform(&s, &req("ses", "cfg0", live), &ctx, &spine());
+        let err = transform(&s, &req("ses", "cfg0", live), &ctx);
         assert!(matches!(err, Err(TransformError::BoundaryNotPresent(_))));
     }
 
@@ -2205,7 +2714,7 @@ mod tests {
         )
         .unwrap();
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        let err = transform(&s, &req("ses", "cfg0", live), &ctx, &spine());
+        let err = transform(&s, &req("ses", "cfg0", live), &ctx);
         assert!(matches!(err, Err(TransformError::BoundaryNotPresent(_))));
     }
 
@@ -2272,6 +2781,11 @@ mod tests {
         let revert = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
         assert_eq!(revert.action, "SOFT+", "revert never busts on sight");
         assert!(revert.reconcile_pending);
+        let loaded = s.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.last_execute_ordinal = 99;
+        s.commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
         let before_recut = s.load("ses").unwrap().row_version.unwrap();
 
         let remat = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
@@ -2292,6 +2806,7 @@ mod tests {
             .unwrap()
             .contains("dropped seq 2"));
         assert_eq!(loaded.meta.folded_compartment_seq, 1);
+        assert_eq!(loaded.meta.last_execute_ordinal, 1);
         assert_eq!(loaded.row_version.unwrap(), before_recut + 2);
         assert_eq!(s.load_compartments("ses").unwrap().len(), 1);
 
@@ -2360,14 +2875,14 @@ mod tests {
         ];
 
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        let first = transform(&s, &req("ses", "cfg0", live.clone()), &ctx, &spine());
+        let first = transform(&s, &req("ses", "cfg0", live.clone()), &ctx);
         assert!(
             first.is_err(),
             "first-fold HARD hits the leading-gap fail-loud path"
         );
         // The failed pass wrote nothing → the guard re-fires and errors again (visible), it
         // does NOT silently fall through to a defer that strands the compartment.
-        let retry = transform(&s, &req("ses", "cfg0", live), &ctx, &spine());
+        let retry = transform(&s, &req("ses", "cfg0", live), &ctx);
         assert!(
             retry.is_err(),
             "state unchanged after the failed fold → the HARD retries and stays visible"
@@ -2427,7 +2942,6 @@ mod tests {
             &s,
             &req("ses", "cfg0", items),
             &pctx("git:proj", "/nonexistent-docs", 0),
-            &spine(),
         )
         .unwrap_err();
         assert!(
@@ -2451,7 +2965,6 @@ mod tests {
             &s,
             &req("ses", "cfg0", items),
             &pctx("git:proj", "/nonexistent-docs", 0),
-            &spine(),
         )
         .unwrap();
         assert_eq!(out.coverage_ordinal, Some(2));
@@ -2793,7 +3306,6 @@ mod tests {
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &pctx("git:proj", "/nonexistent-docs", 500),
-            &spine(),
         )
         .unwrap();
 
@@ -2807,7 +3319,6 @@ mod tests {
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &pctx("git:proj", "/nonexistent-docs", 2000),
-            &spine(),
         )
         .unwrap();
         assert_eq!(soft.action, "SOFT");
@@ -2956,7 +3467,6 @@ mod tests {
             &s,
             &req("ses", "cfg0", vec![item("a", 1, "X")]),
             &pctx("git:proj", "/nonexistent-docs", 0),
-            &spine(),
         )
         .unwrap_err();
         assert!(matches!(err, TransformError::UnknownShape(_)));
@@ -2972,12 +3482,7 @@ mod tests {
         let dc = pctx("git:proj", "/nonexistent-docs", 0);
 
         // a non-synthetic item with a reserved mc_* id (a pre-load ingress guard)
-        let reserved = transform(
-            &s,
-            &req("ses", "cfg0", vec![item("mc_m0", 2, "x")]),
-            &dc,
-            &spine(),
-        );
+        let reserved = transform(&s, &req("ses", "cfg0", vec![item("mc_m0", 2, "x")]), &dc);
         assert!(matches!(reserved, Err(TransformError::ReservedId)));
 
         // non-monotonic ordinals
@@ -2985,7 +3490,6 @@ mod tests {
             &s,
             &req("ses", "cfg0", vec![item("a", 5, "x"), item("b", 5, "y")]),
             &dc,
-            &spine(),
         );
         assert!(matches!(bad, Err(TransformError::OrdinalViolation)));
     }
@@ -3551,7 +4055,6 @@ mod tests {
                 vec![item("a", 1, "raw"), item("later", 3, "tail without anchor")],
             ),
             &pctx("git:proj", "/nonexistent-docs", 0),
-            &spine(),
         )
         .unwrap_err();
 
@@ -3618,8 +4121,8 @@ mod tests {
             payload: payload.to_string(),
         }
     }
-    fn with_reductions(rs: Vec<ReductionDecision>) -> DeciderInputs {
-        DeciderInputs { reductions: rs }
+    fn with_reductions(rs: Vec<ReductionDecision>) -> Vec<ReductionDecision> {
+        rs
     }
     fn first_block_text(block: &ck_wire::CkWireBlock) -> Option<&str> {
         match &block.kind {
@@ -3912,13 +4415,9 @@ mod tests {
         // re-supply t2 with DIFFERENT bytes (a contract violation) → fail loud, not a
         // silent skip-and-serve-stale. Tested on a defer (the silent-miss surface).
         let bad = with_reductions(vec![reduce("t2", "drop", "[dropped DIFFERENT]")]);
-        let err = transform(
-            &s,
-            &req("ses", "cfg0", items),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-            &bad,
-        )
-        .unwrap_err();
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.injected_reductions = bad;
+        let err = transform(&s, &req("ses", "cfg0", items), &ctx).unwrap_err();
         assert!(matches!(err, TransformError::ReductionConflict));
     }
 
@@ -3978,13 +4477,7 @@ mod tests {
             ..Default::default()
         };
         s.commit("ses", None, &bad, &meta).unwrap();
-        let err = transform(
-            &s,
-            &req("ses", "cfg0", vec![item("a", 1, "BASE")]),
-            &dc,
-            &spine(),
-        )
-        .unwrap_err();
+        let err = transform(&s, &req("ses", "cfg0", vec![item("a", 1, "BASE")]), &dc).unwrap_err();
         assert!(
             matches!(err, TransformError::UnknownShape(_)),
             "missing m1 rejects"
@@ -4021,13 +4514,7 @@ mod tests {
             ..Default::default()
         };
         s.commit("ses2", None, &good, &good_meta).unwrap();
-        let ok = transform(
-            &s,
-            &req("ses2", "cfg0", vec![item("a", 1, "BASE")]),
-            &dc,
-            &spine(),
-        )
-        .unwrap();
+        let ok = transform(&s, &req("ses2", "cfg0", vec![item("a", 1, "BASE")]), &dc).unwrap();
         assert_eq!(ok.action, "SOFT+", "m0+m1+red is a valid shape");
     }
 
@@ -4062,7 +4549,6 @@ mod tests {
                 vec![item("m10", 10, "raw"), item("t11", 11, "tail")],
             ),
             &ctx,
-            &spine(),
             counting,
         )
         .unwrap();
@@ -4084,14 +4570,9 @@ mod tests {
             item("m20", 20, "raw2"),
             item("t21", 21, "tail"),
         ];
-        let soft = apply_once_with_estimator(
-            &s,
-            &req("ses", "cfg0", soft_items.clone()),
-            &ctx,
-            &spine(),
-            counting,
-        )
-        .unwrap();
+        let soft =
+            apply_once_with_estimator(&s, &req("ses", "cfg0", soft_items.clone()), &ctx, counting)
+                .unwrap();
         assert_eq!(soft.response.action, "SOFT");
         assert_eq!(
             calls.get(),
@@ -4101,14 +4582,8 @@ mod tests {
 
         // defer: replays frozen m0/m1, composes nothing.
         calls.set(0);
-        let defer = apply_once_with_estimator(
-            &s,
-            &req("ses", "cfg0", soft_items),
-            &ctx,
-            &spine(),
-            counting,
-        )
-        .unwrap();
+        let defer =
+            apply_once_with_estimator(&s, &req("ses", "cfg0", soft_items), &ctx, counting).unwrap();
         assert_eq!(defer.response.action, "SOFT+");
         assert_eq!(
             calls.get(),

@@ -1033,7 +1033,7 @@ mod tests {
 
     use crate::transform::{
         ck_wire::{self, CkIngressMessage, CkWireMessage},
-        transform, DeciderInputs, ProducerContext, TransformRequest,
+        transform, ProducerContext, TransformRequest,
     };
 
     fn store(dir: &std::path::Path) -> McStore {
@@ -1079,7 +1079,7 @@ mod tests {
             render_config: "cfg".to_string(),
             messages,
             usage: None,
-            agent_drop_ids: Vec::new(),
+            provider_error: None,
         }
     }
 
@@ -1089,13 +1089,17 @@ mod tests {
             project_directory: "/nonexistent-docs",
             history_budget_tokens: 60_000.0,
             now_ms: 0,
+            execute_threshold_percentage: 65.0,
+            smart_drops: false,
+            cache_ttl: "5m".to_string(),
+            model_key: None,
+            observed_last_response_at_ms: None,
+            injected_reductions: Vec::new(),
         }
     }
 
     fn run_transform(store: &McStore, request: &TransformRequest) -> Vec<CkWireMessage> {
-        transform(store, request, &pctx(), &DeciderInputs::default())
-            .unwrap()
-            .ck_messages
+        transform(store, request, &pctx()).unwrap().ck_messages
     }
 
     fn comp(seq: i64, start: i64, end: i64, end_id: &str, p1: &str) -> StoredCompartment {

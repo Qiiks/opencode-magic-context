@@ -1,8 +1,7 @@
 //! Tail-reduction SELECTION — decides WHICH tail items to reduce and produces
 //! their [`ReductionDecision`]s, which slice-3's mechanics freeze/replay/fold.
 //!
-//! This is the module-produced replacement for the test-only `_decider.reductions`
-//! stand-in. It is a PURE, DETERMINISTIC function over the flat, block-granular
+//! This is the module-owned reduction producer. It is a PURE, DETERMINISTIC function over the flat, block-granular
 //! typed tail (CK#1's `ContentKind` projected 1:1 per block into [`SelItem`]).
 //! Determinism is the cache invariant: same (items, frozen_keys, ctx, cfg) → same
 //! decisions → the slice-3 freeze/replay stays byte-identical.
@@ -138,7 +137,7 @@ pub struct SelItem {
 #[derive(Debug, Clone)]
 pub struct SelectionContext {
     pub pass_class: PassClass,
-    /// Current total input tokens (module-derived over composed m0+m1+tail).
+    /// Provider-reported current total input tokens from the request usage sample.
     pub current_total_input_tokens: f64,
     /// ceiling = contextLimit × executeThreshold%.
     pub ceiling_tokens: f64,

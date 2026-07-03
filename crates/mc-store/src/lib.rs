@@ -510,6 +510,22 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_workspace_members(project_path);
     ",
     },
+    Migration {
+        version: 7,
+        // Durable ctx_reduce arrival queue. Rows are removed only by the same fenced
+        // transaction that commits the busting pass consuming them.
+        statements: "
+        CREATE TABLE IF NOT EXISTS pending_agent_drops (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL,
+            target_id   TEXT NOT NULL,
+            queued_at   INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(session_id, target_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_agent_drops_session
+            ON pending_agent_drops(session_id, queued_at, id);
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -786,6 +802,11 @@ impl ModuleUsage {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredExecuteState {
+    pub reason: String,
+}
+
 /// The durable identity fingerprint for one block of a message. The transform records
 /// the ordered vector per `mid` and rejects later drift instead of silently applying
 /// frozen reductions to a different block list.
@@ -846,7 +867,7 @@ impl<'de> Deserialize<'de> for FrozenSyntheticTodoPair {
 }
 
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
     /// A baseline has been materialized at least once. Gates the bootstrap-Hard rule.
     pub initialized: bool,
@@ -937,6 +958,35 @@ pub struct ModuleMeta {
     /// decreases after reclaim.
     #[serde(default)]
     pub last_usage: Option<ModuleUsage>,
+
+    /// Highest tail ordinal observed on an execute pass that actually froze reductions.
+    #[serde(default)]
+    pub last_execute_ordinal: u64,
+    /// Provider input-token sample from the prior emergency drop-producing pass.
+    #[serde(default)]
+    pub last_emergency_input_sample: f64,
+    /// Whether the emergency idempotence sample is valid.
+    #[serde(default)]
+    pub has_prior_emergency_drop: bool,
+    /// Execute intent recorded when mid-turn tool-use defers a scheduler execute.
+    #[serde(default)]
+    pub deferred_execute_state: Option<DeferredExecuteState>,
+    /// Emergency drain latch active bit.
+    #[serde(default)]
+    pub emergency_drain_active: bool,
+    /// Unix milliseconds when the drain latch was entered; 0 when inactive.
+    #[serde(default)]
+    pub emergency_drain_entered_at_ms: i64,
+    /// Sparse response-recency anchor, piggybacked only on passes already committing.
+    #[serde(default)]
+    pub last_committed_pass_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAgentDrop {
+    pub id: i64,
+    pub target_id: String,
+    pub queued_at_ms: i64,
 }
 
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
@@ -1097,6 +1147,59 @@ impl McStore {
         }
     }
 
+    /// Append flat block ids requested by ctx_reduce to the durable per-session queue.
+    /// Duplicate pending ids are ignored so repeated command delivery is harmless.
+    pub fn append_pending_agent_drops(
+        &self,
+        session_id: &str,
+        target_ids: &[String],
+        queued_at_ms: i64,
+    ) -> Result<usize, McStoreError> {
+        let mut inserted = 0usize;
+        self.inner.with_conn_fenced(|tx| {
+            for target_id in target_ids {
+                let target_id = target_id.trim();
+                if target_id.is_empty() {
+                    continue;
+                }
+                inserted += tx.execute(
+                    "INSERT OR IGNORE INTO pending_agent_drops (session_id, target_id, queued_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![session_id, target_id, queued_at_ms],
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(inserted)
+    }
+
+    /// Load queued ctx_reduce drops in the deterministic drain order.
+    pub fn load_pending_agent_drops(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PendingAgentDrop>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, target_id, queued_at
+                 FROM pending_agent_drops
+                 WHERE session_id = ?1
+                 ORDER BY queued_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id], |r| {
+                Ok(PendingAgentDrop {
+                    id: r.get(0)?,
+                    target_id: r.get(1)?,
+                    queued_at_ms: r.get(2)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?)
+    }
+
     /// Commit new state under the row_version CAS, inside the epoch-fenced txn.
     ///
     /// `expected` is the row_version from [`load`] (`None` = expect no row → INSERT).
@@ -1110,6 +1213,18 @@ impl McStore {
         expected: Option<u64>,
         core: &CoreState,
         meta: &ModuleMeta,
+    ) -> Result<u64, McStoreError> {
+        self.commit_with_consumed_drops(session_id, expected, core, meta, &[])
+    }
+
+    /// Commit cache state and delete consumed ctx_reduce queue rows in one fenced tx.
+    pub fn commit_with_consumed_drops(
+        &self,
+        session_id: &str,
+        expected: Option<u64>,
+        core: &CoreState,
+        meta: &ModuleMeta,
+        consumed_drop_ids: &[i64],
     ) -> Result<u64, McStoreError> {
         let core_json =
             serde_json::to_string(core).map_err(|e| McStoreError::Serde(e.to_string()))?;
@@ -1144,6 +1259,12 @@ impl McStore {
                      meta        = excluded.meta",
                 params![session_id, next as i64, core_json, meta_json],
             )?;
+            for drop_id in consumed_drop_ids {
+                tx.execute(
+                    "DELETE FROM pending_agent_drops WHERE session_id = ?1 AND id = ?2",
+                    params![session_id, drop_id],
+                )?;
+            }
             Ok(CommitOutcome::Committed(next))
         })?;
 
@@ -2306,6 +2427,37 @@ mod tests {
             }
             other => panic!("expected CasConflict, got {other}"),
         }
+    }
+
+    #[test]
+    fn pending_agent_drops_delete_only_inside_successful_commit_tx() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        assert_eq!(
+            store
+                .append_pending_agent_drops("ses", &["a#0".to_string(), "a#0".to_string()], 7)
+                .unwrap(),
+            1,
+            "duplicate pending ids are ignored while still queued"
+        );
+        let queued = store.load_pending_agent_drops("ses").unwrap();
+        assert_eq!(queued.len(), 1);
+
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        let conflict =
+            store.commit_with_consumed_drops("ses", Some(99), &core, &meta, &[queued[0].id]);
+        assert!(matches!(conflict, Err(McStoreError::CasConflict { .. })));
+        assert_eq!(
+            store.load_pending_agent_drops("ses").unwrap().len(),
+            1,
+            "a failed fenced commit leaves queued drops for retry"
+        );
+
+        store
+            .commit_with_consumed_drops("ses", None, &core, &meta, &[queued[0].id])
+            .unwrap();
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[test]

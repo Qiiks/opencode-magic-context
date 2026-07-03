@@ -25,6 +25,8 @@ pub struct McModuleConfig {
     pub model_chain: Vec<String>,
     pub execute_threshold_percentage: f64,
     pub memory_enabled: bool,
+    pub smart_drops: bool,
+    pub cache_ttl: String,
 }
 
 impl Default for McModuleConfig {
@@ -33,6 +35,8 @@ impl Default for McModuleConfig {
             model_chain: Vec::new(),
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
             memory_enabled: true,
+            smart_drops: false,
+            cache_ttl: "5m".to_string(),
         }
     }
 }
@@ -121,6 +125,14 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = user.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
         }
+        if let Some(enabled) = user.pointer("/smart_drops").and_then(Value::as_bool) {
+            cfg.smart_drops = enabled;
+        }
+        if let Some(cache_ttl) = user.pointer("/cache_ttl").and_then(Value::as_str) {
+            if !cache_ttl.trim().is_empty() {
+                cfg.cache_ttl = cache_ttl.trim().to_string();
+            }
+        }
     }
 
     if let Some(project) = project {
@@ -131,6 +143,9 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         }
         if let Some(enabled) = project.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
+        }
+        if let Some(enabled) = project.pointer("/smart_drops").and_then(Value::as_bool) {
+            cfg.smart_drops = enabled;
         }
     }
 
