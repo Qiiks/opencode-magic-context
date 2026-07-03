@@ -262,8 +262,8 @@ fn decode_tool_part(
     if matches!(status.as_deref(), Some("completed" | "error")) {
         let output_text = part
             .get("state")
-            .and_then(|state| state.get("output"))
-            .or_else(|| part.get("output"))
+            .and_then(|state| state.get("output").or_else(|| state.get("error")))
+            .or_else(|| part.get("output").or_else(|| part.get("error")))
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
@@ -502,7 +502,14 @@ fn update_part_from_block(part: &mut Value, block: &CkWireBlock) {
             let (status, text) = output_status_text(output);
             set_string(part, "type", "tool");
             set_nested_value(part, "state", "status", Value::String(status.to_string()));
-            set_nested_value(part, "state", "output", Value::String(text));
+            if status == "error"
+                && nested_has(part, "state", "error")
+                && !nested_has(part, "state", "output")
+            {
+                set_nested_value(part, "state", "error", Value::String(text));
+            } else {
+                set_nested_value(part, "state", "output", Value::String(text));
+            }
         }
         CkKind::Media(media) => {
             *part = render_media_part(media);
@@ -720,6 +727,13 @@ fn set_value(value: &mut Value, key: &str, next: Value) {
     if let Some(obj) = value.as_object_mut() {
         obj.insert(key.to_string(), next);
     }
+}
+
+fn nested_has(value: &Value, object_key: &str, key: &str) -> bool {
+    value
+        .get(object_key)
+        .and_then(Value::as_object)
+        .is_some_and(|obj| obj.contains_key(key))
 }
 
 fn set_nested_value(value: &mut Value, object_key: &str, key: &str, next: Value) {

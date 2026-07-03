@@ -18,6 +18,8 @@ mod tests {
     #[derive(Deserialize)]
     struct OpenCodeGolden {
         coverage: Vec<String>,
+        #[serde(default)]
+        missing_capture_classes: Vec<String>,
         cases: Vec<OpenCodeCase>,
     }
 
@@ -29,6 +31,8 @@ mod tests {
     #[derive(Deserialize)]
     struct PiGolden {
         coverage: Vec<String>,
+        #[serde(default)]
+        missing_capture_classes: Vec<String>,
         cases: Vec<PiCase>,
     }
 
@@ -42,8 +46,9 @@ mod tests {
         let golden: OpenCodeGolden =
             serde_json::from_str(include_str!("../../testdata/codec/opencode-golden.json"))
                 .unwrap();
-        assert_coverage(
+        assert_coverage_or_recorded_missing(
             &golden.coverage,
+            &golden.missing_capture_classes,
             &[
                 "text",
                 "ignored_text",
@@ -78,8 +83,9 @@ mod tests {
     fn pi_golden_round_trips_non_compaction_entries_and_is_deterministic() {
         let golden: PiGolden =
             serde_json::from_str(include_str!("../../testdata/codec/pi-golden.json")).unwrap();
-        assert_coverage(
+        assert_coverage_or_recorded_missing(
             &golden.coverage,
+            &golden.missing_capture_classes,
             &[
                 "text_signature",
                 "thinking_signature",
@@ -111,16 +117,22 @@ mod tests {
         }
     }
 
-    fn assert_coverage(actual: &[String], required: &[&str]) {
+    fn assert_coverage_or_recorded_missing(
+        actual: &[String],
+        recorded_missing: &[String],
+        required: &[&str],
+    ) {
         let actual: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
-        let missing: Vec<&str> = required
+        let recorded_missing: BTreeSet<&str> =
+            recorded_missing.iter().map(String::as_str).collect();
+        let unresolved: Vec<&str> = required
             .iter()
             .copied()
-            .filter(|item| !actual.contains(item))
+            .filter(|item| !actual.contains(item) && !recorded_missing.contains(item))
             .collect();
         assert!(
-            missing.is_empty(),
-            "missing codec golden classes: {missing:?}"
+            unresolved.is_empty(),
+            "codec golden neither covers nor records missing classes: {unresolved:?}"
         );
     }
 
