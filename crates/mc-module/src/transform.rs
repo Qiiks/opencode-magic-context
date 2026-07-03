@@ -844,21 +844,28 @@ fn apply_once(
         }
     }
 
-    if is_bust_pass && reductions_pending_now {
-        match selection_class {
-            PassClass::Execute if !loaded.core.reconcile_pending => {
-                meta.last_execute_ordinal = tail_for_selection
-                    .iter()
-                    .map(|item| item.ordinal)
-                    .max()
-                    .unwrap_or(0);
-            }
-            PassClass::EmergencyForce => {
-                meta.last_emergency_input_sample = usage_input_tokens;
-                meta.has_prior_emergency_drop = true;
-            }
-            _ => {}
-        }
+    // The two-pass watermark advances on EVERY scheduler execute-class decision
+    // (Execute/Force85/Emergency95), not only on passes that froze reductions: this
+    // execute's tail is the NEXT execute's age-drop candidate set, so a zero-drop execute
+    // must still stamp the max ordinal or completed arcs never age in. It does NOT advance
+    // when the producer gate opened via a hard advisory on a scheduler-Defer pass
+    // (first-fold, render-config change): those busts are not execute cadence, and
+    // stamping there would age the current tail into the very next execute. The write may
+    // be the only meta change on the pass — a metadata-only commit with byte-identical
+    // output, not a cache bust. Held back under reconcile (the watermark may be stale-high
+    // against a store about to be re-cut; the re-cut arm re-clamps it).
+    let scheduler_execute_class = !matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer);
+    if scheduler_execute_class && !loaded.core.reconcile_pending {
+        meta.last_execute_ordinal = tail_for_selection
+            .iter()
+            .map(|item| item.ordinal)
+            .max()
+            .unwrap_or(0)
+            .max(meta.last_execute_ordinal);
+    }
+    if is_bust_pass && reductions_pending_now && selection_class == PassClass::EmergencyForce {
+        meta.last_emergency_input_sample = usage_input_tokens;
+        meta.has_prior_emergency_drop = true;
     }
 
     advance_synthetic_todo(
@@ -2383,7 +2390,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_with_zero_delta_is_defer_shaped_and_does_not_commit() {
+    fn execute_with_zero_delta_is_defer_shaped_and_byte_identical() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -2392,14 +2399,74 @@ mod tests {
         let boot = run(&s, &boot_req, &spine());
         assert_eq!(boot.action, "HARD");
         let before = serde_json::to_vec(&boot.ck_messages).unwrap();
-        let row_before = boot.row_version;
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.observed_last_response_at_ms = Some(0);
         let execute = transform(&s, &boot_req, &ctx).unwrap();
+        // A zero-drop execute is byte-identical (no bust) but MAY commit metadata: the
+        // two-pass watermark stamps this tail as the next execute's candidate set.
         assert_eq!(execute.action, "SOFT+");
-        assert!(!execute.committed);
-        assert_eq!(execute.row_version, row_before);
         assert_eq!(serde_json::to_vec(&execute.ck_messages).unwrap(), before);
+        let meta = s.load("ses").unwrap().meta;
+        assert_eq!(
+            meta.last_execute_ordinal, 1,
+            "zero-drop execute still advances the two-pass watermark"
+        );
+        // And the pass after it, with an unchanged tail, is a true no-write defer.
+        let again = transform(&s, &boot_req, &ctx).unwrap();
+        assert!(!again.committed);
+        assert_eq!(serde_json::to_vec(&again.ck_messages).unwrap(), before);
+    }
+
+    #[test]
+    fn zero_drop_execute_watermark_ages_arcs_into_next_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // Two-pass aging requires a FOLDED session: a new reduction can only freeze on
+        // a SOFT pass, and the classifier admits a SOFT only when a boundary is present.
+        // Seed one compartment covering ordinal 1 and fold it, then drive executes over
+        // the post-coverage tail.
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let msgs = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("m1", 2, "call_age"),
+            tool_result("m2", 3, "call_age", "big tool output payload"),
+            item("m9", 9, "newest user text"),
+        ];
+        let boot = run(&s, &req("ses", "cfg0", msgs.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+        // Execute pass 1 over the completed tool arc: nothing to drop yet (the arc is
+        // newer than the 0 watermark), but the watermark must stamp its ordinal.
+        // 70% usage: above the execute threshold (65) but below Force85, so the
+        // scheduler classes the pass Execute and the two-pass selector runs.
+        let exec_req = with_usage(req("ses", "cfg0", msgs.clone()), 70, 100);
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.observed_last_response_at_ms = Some(0);
+        let _ = transform(&s, &exec_req, &ctx).unwrap();
+        let after_first = s.load("ses").unwrap();
+        assert!(
+            after_first
+                .core
+                .frozen_units
+                .iter()
+                .all(|unit| !unit.key.starts_with("red:m1#") && !unit.key.starts_with("red:m2#")),
+            "first execute has no candidates old enough to drop"
+        );
+        assert!(
+            after_first.meta.last_execute_ordinal >= 9,
+            "watermark stamped from the execute tail"
+        );
+        // Execute pass 2: the same arc is now at-or-below the watermark → age-drops.
+        let _ = transform(&s, &exec_req, &ctx).unwrap();
+        let after_second = s.load("ses").unwrap();
+        assert!(
+            after_second
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key.starts_with("red:m1#") || unit.key.starts_with("red:m2#")),
+            "completed arc aged in by the prior execute's watermark must freeze a drop"
+        );
     }
 
     #[test]

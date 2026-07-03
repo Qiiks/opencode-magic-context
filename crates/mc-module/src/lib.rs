@@ -1038,7 +1038,25 @@ impl ModuleHandler for McHandler {
     /// Drop the route's binding on teardown so a reused channel can't resolve a stale
     /// project and the map doesn't leak.
     async fn on_route_gone(&self, channel: u16) {
+        let gone_session = {
+            let bindings = self.bindings.lock().expect("bindings mutex");
+            bindings.get(&channel).map(|b| b.session.clone())
+        };
         self.unbind_route(channel);
+        // Evict the scheduler observation when the session's LAST route closes —
+        // the map is otherwise unbounded across a long-lived daemon's session churn.
+        if let Some(session) = gone_session {
+            let still_bound = {
+                let bindings = self.bindings.lock().expect("bindings mutex");
+                bindings.values().any(|b| b.session == session)
+            };
+            if !still_bound {
+                self.scheduler_observations
+                    .lock()
+                    .expect("scheduler observations mutex")
+                    .remove(&session);
+            }
+        }
     }
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
