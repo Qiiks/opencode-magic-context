@@ -20,6 +20,7 @@ pub mod boundary;
 pub mod compartment_coverage;
 pub mod config;
 pub mod decay_render;
+pub mod healing;
 pub mod historian;
 pub mod historian_chunk;
 pub mod historian_producer;
@@ -50,6 +51,7 @@ use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx, Rou
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use config::{ConfigCache, McModuleConfig};
+use healing::SerializerProfile;
 use historian::{reattach_historian_producer, run_historian_firing, HistorianProducerDriver};
 use historian_chunk::{
     assemble_historian_firing, AssembleHistorianFiringOutcome, AssembledHistorianFiring,
@@ -1029,15 +1031,6 @@ impl McHandler {
     }
 
     async fn handle_transform_value(&self, channel: u16, request: Value) -> HandlerOutcome {
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
-            None => {
-                return HandlerOutcome::Error {
-                    code: "store_unavailable".to_string(),
-                    message: "store not opened (no HELLO_ACK storage seam)".to_string(),
-                }
-            }
-        };
         let parsed: TransformRequest = match serde_json::from_value(request.clone()) {
             Ok(req) => req,
             Err(e) => {
@@ -1047,6 +1040,12 @@ impl McHandler {
                 }
             }
         };
+        if SerializerProfile::parse(&parsed.serializer_profile).is_none() {
+            return unknown_serializer_profile_error();
+        }
+        if parsed.tail_delta.is_some() {
+            return need_full_sync_response(parsed.full_array_fingerprint.clone());
+        }
         // The module's own producer sessions must NEVER be transformed: the historian's
         // request is a raw structured-extraction call whose [system, user] shape is part
         // of the prompt calibration. Identity pass-through, no store reads, no historian
@@ -1055,28 +1054,23 @@ impl McHandler {
             .session_id
             .starts_with(historian::MC_CHILD_SESSION_PREFIX)
         {
-            return HandlerOutcome::Response(
-                match serde_json::to_vec(&transform::TransformResponse {
-                    action: "PASSTHROUGH".to_string(),
-                    boundary_id: String::new(),
-                    reconcile_pending: false,
-                    version: 0,
-                    row_version: 0,
-                    committed: false,
-                    coverage_ordinal: None,
-                    historian: None,
-                    ck_messages: parsed.messages.into_iter().map(|m| m.ck).collect(),
-                }) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return HandlerOutcome::Error {
-                            code: "internal".to_string(),
-                            message: e.to_string(),
-                        }
-                    }
-                },
+            return respond(
+                serde_json::to_value(transform::TransformResponse::passthrough(
+                    parsed.messages.into_iter().map(|m| m.ck).collect(),
+                    parsed.full_array_fingerprint,
+                ))
+                .unwrap_or(Value::Null),
             );
         }
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => {
+                return HandlerOutcome::Error {
+                    code: "store_unavailable".to_string(),
+                    message: "store not opened (no HELLO_ACK storage seam)".to_string(),
+                }
+            }
+        };
         let binding = match self.resolve_binding(channel, &parsed.session_id) {
             Ok(b) => b,
             Err(BindingError::Unbound) => {
@@ -1419,6 +1413,22 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn unknown_serializer_profile_error() -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "unknown_serializer_profile".to_string(),
+        message: "missing or unknown serializer_profile".to_string(),
+    }
+}
+
+fn need_full_sync_response(full_array_fingerprint: Option<String>) -> HandlerOutcome {
+    respond(
+        serde_json::to_value(transform::TransformResponse::need_full_sync(
+            full_array_fingerprint,
+        ))
+        .unwrap_or(Value::Null),
+    )
 }
 
 fn respond(value: Value) -> HandlerOutcome {
@@ -1943,6 +1953,8 @@ mod tests {
     ) -> Value {
         json!({
             "kind": "transform",
+            "v": 2,
+            "serializer_profile": "owned-llmrunner",
             "session_id": "ses",
             "render_config": "cfg0",
             "usage": ModuleUsage {
@@ -1977,8 +1989,112 @@ mod tests {
         }
     }
 
+    async fn call_transform_outcome(handler: &McHandler, request: Value) -> HandlerOutcome {
+        handler.handle_transform_for_test(7, request).await
+    }
+
+    fn error_code(outcome: HandlerOutcome) -> String {
+        match outcome {
+            HandlerOutcome::Error { code, .. } => code,
+            other => panic!("expected error outcome, got {other:?}"),
+        }
+    }
+
     async fn call_transform(handler: &McHandler, messages: Vec<CkIngressMessage>) -> Value {
         call_transform_request(handler, request(messages)).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v2_wire_echoes_fingerprint_on_normal_and_child_passthrough() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let mut normal_req = request_with_usage(vec![ck("m1", 1, "hello")], 1, 100);
+        normal_req["full_array_fingerprint"] = json!("fp-normal");
+        let normal = call_transform_request(&handler, normal_req).await;
+        assert_eq!(normal["status"], "ok");
+        assert_eq!(normal["served_from"], "transform");
+        assert_eq!(normal["full_array_fingerprint"], "fp-normal");
+
+        let child_session = format!("{}child", historian::MC_CHILD_SESSION_PREFIX);
+        let child = call_transform_request(
+            &handler,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "owned-llmrunner",
+                "session_id": child_session,
+                "render_config": "cfg0",
+                "full_array_fingerprint": "fp-child",
+                "messages": [ck("child-msg", 1, "raw child prompt")],
+            }),
+        )
+        .await;
+        assert_eq!(child["status"], "ok");
+        assert_eq!(child["served_from"], "transform");
+        assert_eq!(child["full_array_fingerprint"], "fp-child");
+        assert_eq!(child["action"], "PASSTHROUGH");
+        assert_eq!(child["ck_messages"].as_array().unwrap().len(), 1);
+        assert_eq!(child["ck_messages"][0]["role"], "user");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_or_unknown_serializer_profile_is_typed_and_does_not_write_store() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let mut missing = request(vec![ck("m1", 1, "hello")]);
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("serializer_profile");
+        let before_missing = store.load("ses").unwrap().row_version;
+        assert_eq!(
+            error_code(call_transform_outcome(&handler, missing).await),
+            "unknown_serializer_profile"
+        );
+        assert_eq!(store.load("ses").unwrap().row_version, before_missing);
+
+        let mut unknown = request(vec![ck("m2", 2, "hello")]);
+        unknown["serializer_profile"] = json!("not-a-profile");
+        let before_unknown = store.load("ses").unwrap().row_version;
+        assert_eq!(
+            error_code(call_transform_outcome(&handler, unknown).await),
+            "unknown_serializer_profile"
+        );
+        assert_eq!(store.load("ses").unwrap().row_version, before_unknown);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tail_delta_returns_need_full_sync_success_without_store_write() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let mut delta = request(vec![ck("m1", 1, "hello")]);
+        delta["tail_delta"] = json!({ "after": "fp-old", "messages": [ck("m2", 2, "tail")] });
+        delta["full_array_fingerprint"] = json!("fp-delta");
+        let before = store.load("ses").unwrap().row_version;
+        let response = call_transform_request(&handler, delta).await;
+
+        assert_eq!(response["status"], "need_full_sync");
+        assert_eq!(response["served_from"], "transform");
+        assert_eq!(response["full_array_fingerprint"], "fp-delta");
+        assert_eq!(response["ck_messages"].as_array().unwrap().len(), 0);
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fingerprint_absent_success_omits_echo_field() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let response = call_transform_request(
+            &handler,
+            request_with_usage(vec![ck("m1", 1, "hello")], 1, 100),
+        )
+        .await;
+        assert_eq!(response["status"], "ok");
+        assert!(response.get("full_array_fingerprint").is_none());
     }
 
     async fn call_transform_with_usage(
@@ -2821,6 +2937,8 @@ mod tests {
         let messages = [ck("m1", 1, "seed block + new_messages payload")];
         let req = serde_json::json!({
             "kind": "transform",
+            "v": 2,
+            "serializer_profile": "owned-llmrunner",
             "session_id": session,
             "render_config": "cfg0",
             "messages": messages.iter().map(|m| serde_json::to_value(m).unwrap()).collect::<Vec<_>>(),

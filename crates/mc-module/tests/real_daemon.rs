@@ -116,10 +116,15 @@ async fn mc_transform_spine_through_real_daemon() {
         &consumer,
         json!({
             "session_id": "spine", "render_config": "cfg0",
+            "serializer_profile": "owned-llmrunner",
+            "full_array_fingerprint": "fp-spine-bootstrap",
             "messages": [ck("m10", 10, "raw covered"), ck("t11", 11, "tail")]
         }),
     )
     .await;
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["served_from"], "transform");
+    assert_eq!(r["full_array_fingerprint"], "fp-spine-bootstrap");
     assert_eq!(r["action"], "HARD", "bootstrap must fold Hard");
     assert_eq!(
         r["boundary_id"], "m10#0",
@@ -335,10 +340,13 @@ fn tail_ids(r: &Value) -> Vec<String> {
 // ---- helpers (adapted from subc-client-rs/tests/real_daemon.rs) ----
 
 async fn call(consumer: &SubcConsumer, mut body: Value) -> Value {
-    // The handler dispatches on `kind`; tag the envelope as a transform op. The
-    // TransformRequest struct ignores this extra field.
+    // The handler dispatches on `kind`; tag the envelope as a v2 transform op and
+    // supply the serializer profile all production transform requests must carry.
     if let Value::Object(map) = &mut body {
         map.insert("kind".to_string(), Value::String("transform".to_string()));
+        map.entry("v".to_string()).or_insert_with(|| json!(2));
+        map.entry("serializer_profile".to_string())
+            .or_insert_with(|| Value::String("owned-llmrunner".to_string()));
     }
     // Route per logical session: the identity's session MUST equal the body's session_id
     // (the module's channel-keyed cross-check rejects a mismatch), and one stable identity

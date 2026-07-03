@@ -18,6 +18,7 @@
 pub mod ck_wire;
 
 use crate::compartment_coverage::{fold_m0_content_epoch, M0ContentEpoch};
+use crate::healing::{quirk_residual, SerializerProfile};
 use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{compose_m1_from_store, m1_revision_signal};
@@ -34,11 +35,12 @@ use mc_store::{
     DeferredExecuteState, McStore, McStoreError, ModuleMeta, ModuleUsage, StoredCompartment,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ck_wire::{
-    duplicate_ids, project_messages, reduced_block, split_block_id, CkIngressMessage, CkWireError,
-    CkWireMessage, FlatBlock, FlatProjection,
+    duplicate_ids, project_messages, reduced_block, split_block_id, CkIngressMessage, CkWireBlock,
+    CkWireError, CkWireMessage, FlatBlock, FlatProjection,
 };
 
 /// Max CAS retries before surfacing the conflict (the module is the single writer in
@@ -134,9 +136,21 @@ pub struct TransformRequest {
     pub kind: String,
     #[serde(default = "default_wire_version")]
     pub v: u32,
+    /// Required on the v2 wire. It is a plain string at the parse layer so a missing
+    /// or unknown value can be reported with the typed contract error instead of serde's
+    /// generic malformed-request path.
+    pub serializer_profile: String,
     pub session_id: String,
     pub render_config: String,
+    /// Caller-owned identity for the full raw array. The module treats it as opaque and
+    /// only echoes it on success-shaped responses so consumers can validate cached bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_array_fingerprint: Option<String>,
     pub messages: Vec<CkIngressMessage>,
+    /// Future delta optimization. Parsed explicitly so a delta-shaped request is rejected
+    /// with flow-control bytes rather than silently treated as an empty/full payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_delta: Option<Value>,
     #[serde(default)]
     pub usage: Option<ModuleUsage>,
     #[serde(default)]
@@ -144,7 +158,7 @@ pub struct TransformRequest {
 }
 
 fn default_wire_version() -> u32 {
-    1
+    2
 }
 
 #[derive(Deserialize)]
@@ -153,12 +167,18 @@ struct TransformRequestWire {
     kind: String,
     #[serde(default = "default_wire_version")]
     v: u32,
+    #[serde(default)]
+    serializer_profile: Option<String>,
     session_id: String,
     render_config: String,
+    #[serde(default)]
+    full_array_fingerprint: Option<String>,
     #[serde(default)]
     messages: Vec<CkIngressMessage>,
     #[serde(default)]
     items: Vec<LegacyCkItemWire>,
+    #[serde(default)]
+    tail_delta: Option<Value>,
     #[serde(default)]
     usage: Option<ModuleUsage>,
     #[serde(default)]
@@ -179,9 +199,12 @@ impl<'de> Deserialize<'de> for TransformRequest {
         Ok(Self {
             kind: wire.kind,
             v: wire.v,
+            serializer_profile: wire.serializer_profile.unwrap_or_default(),
             session_id: wire.session_id,
             render_config: wire.render_config,
+            full_array_fingerprint: wire.full_array_fingerprint,
             messages,
+            tail_delta: wire.tail_delta,
             usage: wire.usage,
             provider_error: wire.provider_error,
         })
@@ -208,10 +231,28 @@ fn legacy_item_to_message(item: LegacyCkItemWire) -> CkIngressMessage {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransformStatus {
+    Ok,
+    NeedFullSync,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServedFrom {
+    Transform,
+    DaemonLkg,
+}
+
 /// A transform pass result. Diagnostics remain alongside the CK array, but the response
 /// messages themselves are bare CK messages: no request-only `mid` or `ordinal` sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransformResponse {
+    pub status: TransformStatus,
+    pub served_from: ServedFrom,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_array_fingerprint: Option<String>,
     pub action: String,
     pub boundary_id: String,
     pub reconcile_pending: bool,
@@ -225,6 +266,45 @@ pub struct TransformResponse {
     /// The actual output messages for this pass: synthetic m0 and m1 messages followed
     /// by the tail messages, all expressed as bare CK messages.
     pub ck_messages: Vec<CkWireMessage>,
+}
+
+impl TransformResponse {
+    pub fn need_full_sync(full_array_fingerprint: Option<String>) -> Self {
+        Self {
+            status: TransformStatus::NeedFullSync,
+            served_from: ServedFrom::Transform,
+            full_array_fingerprint,
+            action: "NEED_FULL_SYNC".to_string(),
+            boundary_id: String::new(),
+            reconcile_pending: false,
+            version: 0,
+            row_version: 0,
+            committed: false,
+            coverage_ordinal: None,
+            historian: None,
+            ck_messages: Vec::new(),
+        }
+    }
+
+    pub fn passthrough(
+        ck_messages: Vec<CkWireMessage>,
+        full_array_fingerprint: Option<String>,
+    ) -> Self {
+        Self {
+            status: TransformStatus::Ok,
+            served_from: ServedFrom::Transform,
+            full_array_fingerprint,
+            action: "PASSTHROUGH".to_string(),
+            boundary_id: String::new(),
+            reconcile_pending: false,
+            version: 0,
+            row_version: 0,
+            committed: false,
+            coverage_ordinal: None,
+            historian: None,
+            ck_messages,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -914,6 +994,9 @@ fn apply_once(
         projection,
         scheduler_pass: scheduler_outcome.pass,
         response: TransformResponse {
+            status: TransformStatus::Ok,
+            served_from: ServedFrom::Transform,
+            full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: result_action,
             boundary_id: core.boundary_id.clone(),
             reconcile_pending: core.reconcile_pending,
@@ -1528,7 +1611,83 @@ fn build_output(
             return Err(TransformError::SyntheticTodoAnchorMissing(mid));
         }
     }
+    if let Some(profile) = SerializerProfile::parse(&req.serializer_profile) {
+        apply_serializer_residuals(profile, &mut out);
+    }
     Ok(out)
+}
+
+fn apply_serializer_residuals(profile: SerializerProfile, messages: &mut [CkWireMessage]) -> usize {
+    if quirk_residual(profile).strips_reasoning_from_merged_assistants {
+        strip_reasoning_from_merged_assistants(messages)
+    } else {
+        0
+    }
+}
+
+fn strip_reasoning_from_merged_assistants(messages: &mut [CkWireMessage]) -> usize {
+    let mut stripped = 0;
+    let mut prev_assistant = false;
+    let mut kept_reasoning_in_run = false;
+
+    for message in messages {
+        if message.role != "assistant" {
+            prev_assistant = false;
+            kept_reasoning_in_run = false;
+            continue;
+        }
+
+        let first_in_run = !prev_assistant;
+        if first_in_run {
+            kept_reasoning_in_run = false;
+        }
+
+        let mut keep_index = None;
+        if first_in_run && !kept_reasoning_in_run {
+            for (idx, block) in message.content.iter().enumerate() {
+                if is_empty_text_block(block) {
+                    continue;
+                }
+                if is_reasoning_block(block) {
+                    keep_index = Some(idx);
+                }
+                break;
+            }
+        }
+
+        let mut modified = false;
+        for (idx, block) in message.content.iter_mut().enumerate() {
+            if !is_reasoning_block(block) {
+                continue;
+            }
+            if Some(idx) == keep_index {
+                kept_reasoning_in_run = true;
+                continue;
+            }
+            *block = CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: String::new(),
+            });
+            stripped += 1;
+            modified = true;
+        }
+        if modified {
+            message.mark_modified();
+        }
+        prev_assistant = true;
+    }
+
+    stripped
+}
+
+fn is_reasoning_block(block: &CkWireBlock) -> bool {
+    matches!(
+        &block.kind,
+        ck_wire::CkKind::Reasoning { .. } | ck_wire::CkKind::RedactedReasoning { .. }
+    )
+}
+
+fn is_empty_text_block(block: &CkWireBlock) -> bool {
+    matches!(&block.kind, ck_wire::CkKind::Text { text } if text.is_empty())
 }
 
 fn projection_blocks_by_mid(projection: &FlatProjection) -> BTreeMap<&str, Vec<&FlatBlock>> {
@@ -1623,10 +1782,13 @@ mod tests {
     fn req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             kind: "transform".to_string(),
-            v: 1,
+            v: 2,
+            serializer_profile: "owned-llmrunner".to_string(),
             session_id: session.to_string(),
             render_config: cfg.to_string(),
+            full_array_fingerprint: None,
             messages,
+            tail_delta: None,
             usage: None,
             provider_error: None,
         }
@@ -2501,19 +2663,131 @@ mod tests {
     fn transform_request_parses_full_flat_wire_envelope() {
         let value = json!({
             "kind": "transform",
-            "v": 1,
+            "v": 2,
+            "serializer_profile": "owned-llmrunner",
             "session_id": "ses",
             "render_config": "cfg",
+            "full_array_fingerprint": "fp-full-array",
             "messages": [{ "mid": "m", "ordinal": 7, "ck": text_message("m", "hello") }],
             "usage": { "current_total_input_tokens": 1, "context_limit_tokens": 2 },
             "provider_error": "prompt is too long"
         });
         let parsed: TransformRequest = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.kind, "transform");
-        assert_eq!(parsed.v, 1);
+        assert_eq!(parsed.v, 2);
+        assert_eq!(parsed.serializer_profile, "owned-llmrunner");
+        assert_eq!(
+            parsed.full_array_fingerprint.as_deref(),
+            Some("fp-full-array")
+        );
         assert_eq!(parsed.messages[0].mid, "m");
         assert_eq!(parsed.usage.unwrap().context_limit_tokens, 2);
         assert_eq!(parsed.provider_error.as_deref(), Some("prompt is too long"));
+    }
+
+    #[test]
+    fn transform_request_legacy_items_shim_parses_with_v2_profile() {
+        let value = json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "owned-llmrunner",
+            "session_id": "ses",
+            "render_config": "cfg",
+            "items": [{ "id": "legacy", "ordinal": 3, "bytes": "hello" }]
+        });
+        let parsed: TransformRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].mid, "legacy");
+        assert_eq!(parsed.messages[0].ordinal, 3);
+        assert_eq!(
+            ck_wire::text_from_message(&parsed.messages[0].ck),
+            Some("hello")
+        );
+        assert_eq!(parsed.serializer_profile, "owned-llmrunner");
+    }
+
+    #[test]
+    fn v2_defer_replays_ck_messages_byte_identically_and_echoes_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = req("v2-defer", "cfg0", vec![item("a", 1, "raw")]);
+        request.full_array_fingerprint = Some("fp-v2-defer".to_string());
+
+        let first = run(&s, &request, &spine());
+        let second = run(&s, &request, &spine());
+
+        assert_eq!(first.status, TransformStatus::Ok);
+        assert_eq!(first.served_from, ServedFrom::Transform);
+        assert_eq!(first.full_array_fingerprint.as_deref(), Some("fp-v2-defer"));
+        assert_eq!(second.action, "SOFT+");
+        assert_eq!(
+            second.full_array_fingerprint.as_deref(),
+            Some("fp-v2-defer")
+        );
+        assert_eq!(
+            serde_json::to_vec(&first.ck_messages).unwrap(),
+            serde_json::to_vec(&second.ck_messages).unwrap(),
+            "defer replay must keep the CK array byte-identical"
+        );
+    }
+
+    #[test]
+    fn reasoning_strip_residual_is_profile_gated_by_merge_coverage() {
+        fn assistant(mid: &str, reasoning: &str, text: &str) -> CkWireMessage {
+            CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                        text: reasoning.to_string(),
+                        signature: Some(format!("sig-{mid}")),
+                    }),
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: text.to_string(),
+                    }),
+                ],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            )
+        }
+
+        let base = vec![
+            assistant("a1", "keep-first", "answer one"),
+            assistant("a2", "strip-second", "answer two"),
+        ];
+        for profile in [
+            SerializerProfile::OwnedLlmRunner,
+            SerializerProfile::Pi,
+            SerializerProfile::ClaudeCodeAnthropic,
+        ] {
+            let mut messages = base.clone();
+            assert_eq!(apply_serializer_residuals(profile, &mut messages), 0);
+            assert!(matches!(
+                &messages[1].content[0].kind,
+                ck_wire::CkKind::Reasoning { .. }
+            ));
+        }
+
+        assert!(
+            crate::healing::coverage(SerializerProfile::OpencodeAiSdk)
+                .merges_consecutive_assistants
+        );
+        let mut messages = base;
+        assert_eq!(
+            apply_serializer_residuals(SerializerProfile::OpencodeAiSdk, &mut messages),
+            1
+        );
+        assert!(matches!(
+            &messages[0].content[0].kind,
+            ck_wire::CkKind::Reasoning { .. }
+        ));
+        assert!(matches!(
+            &messages[1].content[0].kind,
+            ck_wire::CkKind::Text { text } if text.is_empty()
+        ));
     }
 
     // ===== Module-integration tests: STORE STATE in → compose+core bytes out.

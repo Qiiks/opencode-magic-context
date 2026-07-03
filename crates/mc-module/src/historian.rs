@@ -1095,10 +1095,13 @@ mod tests {
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             kind: "transform".to_string(),
-            v: 1,
+            v: 2,
+            serializer_profile: "owned-llmrunner".to_string(),
             session_id: "ses".to_string(),
             render_config: "cfg".to_string(),
+            full_array_fingerprint: None,
             messages,
+            tail_delta: None,
             usage: None,
             provider_error: None,
         }
