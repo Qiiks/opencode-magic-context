@@ -264,11 +264,22 @@ pub struct TransformResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub historian: Option<HistorianDiagnostics>,
     /// The actual output messages for this pass: synthetic m0 and m1 messages followed
-    /// by the tail messages, all expressed as bare CK messages.
-    pub ck_messages: Vec<CkWireMessage>,
+    /// by the tail messages, all expressed as bare CK messages. `None` (field ABSENT on
+    /// the wire) on a `need_full_sync` response: the consumer discriminates structurally
+    /// on array presence, and an empty array would be a third ambiguous state between
+    /// "transformed to nothing" and "re-send required". Every `ok` response carries
+    /// `Some`, even when legitimately empty.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ck_messages: Option<Vec<CkWireMessage>>,
 }
 
 impl TransformResponse {
+    /// The output array of an `ok`/passthrough response; empty for `need_full_sync`
+    /// (whose wire form omits the field entirely).
+    pub fn messages(&self) -> &[CkWireMessage] {
+        self.ck_messages.as_deref().unwrap_or(&[])
+    }
+
     pub fn need_full_sync(full_array_fingerprint: Option<String>) -> Self {
         Self {
             status: TransformStatus::NeedFullSync,
@@ -282,7 +293,7 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             historian: None,
-            ck_messages: Vec::new(),
+            ck_messages: None,
         }
     }
 
@@ -302,7 +313,7 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             historian: None,
-            ck_messages,
+            ck_messages: Some(ck_messages),
         }
     }
 }
@@ -1005,7 +1016,7 @@ fn apply_once(
             committed: changed,
             coverage_ordinal: meta.coverage_ordinal,
             historian: None,
-            ck_messages,
+            ck_messages: Some(ck_messages),
         },
     })
 }
@@ -1872,7 +1883,7 @@ mod tests {
 
     fn synthetic_text(r: &TransformResponse, index: usize) -> &str {
         ck_wire::text_from_message(
-            r.ck_messages
+            r.messages()
                 .iter()
                 .filter(|m| m.meta.synthetic)
                 .nth(index)
@@ -1888,7 +1899,7 @@ mod tests {
         synthetic_text(r, 1)
     }
     fn tail_ids(r: &TransformResponse) -> Vec<&str> {
-        r.ck_messages
+        r.messages()
             .iter()
             .filter(|m| !m.meta.synthetic)
             .map(|m| m.meta.harness_id.as_deref().unwrap_or(""))
@@ -1993,14 +2004,14 @@ mod tests {
     }
 
     fn message_index(r: &TransformResponse, harness_id: &str) -> usize {
-        r.ck_messages
+        r.messages()
             .iter()
             .position(|m| !m.meta.synthetic && m.meta.harness_id.as_deref() == Some(harness_id))
             .unwrap_or_else(|| panic!("message {harness_id} not found"))
     }
 
     fn synthetic_todo_index(r: &TransformResponse) -> usize {
-        r.ck_messages
+        r.messages()
             .iter()
             .position(|m| {
                 m.meta.synthetic
@@ -2013,7 +2024,7 @@ mod tests {
     }
 
     fn synthetic_todo_call_id(r: &TransformResponse) -> String {
-        let msg = &r.ck_messages[synthetic_todo_index(r)];
+        let msg = &r.messages()[synthetic_todo_index(r)];
         match &msg.content[0].kind {
             ck_wire::CkKind::ToolCall { id, .. } => id.clone(),
             other => panic!("expected synthetic todowrite ToolCall, got {other:?}"),
@@ -2022,7 +2033,7 @@ mod tests {
 
     fn prefix_through_synthetic_todo(r: &TransformResponse) -> Vec<Vec<u8>> {
         let end = synthetic_todo_index(r) + 1;
-        r.ck_messages[..=end]
+        r.messages()[..=end]
             .iter()
             .map(|m| serde_json::to_vec(m).unwrap())
             .collect()
@@ -2031,8 +2042,8 @@ mod tests {
     fn synthetic_todo_pair_bytes(r: &TransformResponse) -> (Vec<u8>, Vec<u8>) {
         let i = synthetic_todo_index(r);
         (
-            serde_json::to_vec(&r.ck_messages[i]).unwrap(),
-            serde_json::to_vec(&r.ck_messages[i + 1]).unwrap(),
+            serde_json::to_vec(&r.messages()[i]).unwrap(),
+            serde_json::to_vec(&r.messages()[i + 1]).unwrap(),
         )
     }
 
@@ -2275,7 +2286,7 @@ mod tests {
             serde_json::from_str(include_str!("../testdata/ck_wire_golden.json")).unwrap();
         let inbound = ingress_from_ck(ck);
         let r = run(&s, &req("identity", "cfg0", inbound.clone()), &spine());
-        let tail: Vec<_> = r.ck_messages.iter().filter(|m| !m.meta.synthetic).collect();
+        let tail: Vec<_> = r.messages().iter().filter(|m| !m.meta.synthetic).collect();
         assert_eq!(tail.len(), inbound.len());
         for (input, output) in inbound.iter().zip(tail) {
             assert_eq!(
@@ -2300,7 +2311,7 @@ mod tests {
         let r = run(&s, &req("roundtrip", "cfg0", inbound.clone()), &spine());
         assert_eq!(r.action, "SOFT+");
         assert!(!r.committed);
-        let tail: Vec<_> = r.ck_messages.iter().filter(|m| !m.meta.synthetic).collect();
+        let tail: Vec<_> = r.messages().iter().filter(|m| !m.meta.synthetic).collect();
         for (input, output) in inbound.iter().skip(1).zip(tail) {
             assert_eq!(
                 serde_json::to_vec(&input.ck).unwrap(),
@@ -3774,7 +3785,7 @@ mod tests {
         // After a stored legacy baseline is cleared and rebuilt as the current m0/m1
         // shape, the response has no leftover baseline state: it contains exactly two
         // synthetic messages, and m0 was re-composed from store data.
-        assert_eq!(r.ck_messages.iter().filter(|m| m.meta.synthetic).count(), 2);
+        assert_eq!(r.messages().iter().filter(|m| m.meta.synthetic).count(), 2);
         assert!(
             m0_bytes(&r).contains("FRESH-SUMMARY"),
             "m0 re-composed: {}",
@@ -3880,7 +3891,7 @@ mod tests {
         assert_eq!(r.action, "SOFT+");
         assert_eq!(tail_ids(&r), vec!["empty"]);
         let emitted = r
-            .ck_messages
+            .messages()
             .iter()
             .find(|m| !m.meta.synthetic && m.meta.harness_id.as_deref() == Some("empty"))
             .expect("empty tail message emitted");
@@ -4231,7 +4242,7 @@ mod tests {
         );
 
         assert_eq!(cleared.action, "HARD");
-        assert!(cleared.ck_messages.iter().all(|m| {
+        assert!(cleared.messages().iter().all(|m| {
             !matches!(
                 m.content.first().map(|block| &block.kind),
                 Some(ck_wire::CkKind::ToolCall { name, .. }) if name == "todowrite"
@@ -4480,7 +4491,7 @@ mod tests {
     /// The bytes of a tail item (non-synthetic) by id.
     fn tail_bytes<'a>(r: &'a TransformResponse, id: &str) -> &'a str {
         let msg = r
-            .ck_messages
+            .messages()
             .iter()
             .find(|m| !m.meta.synthetic && m.meta.harness_id.as_deref() == Some(id))
             .unwrap_or_else(|| panic!("no tail item {id}"));

@@ -1123,7 +1123,10 @@ mod tests {
     }
 
     fn run_transform(store: &McStore, request: &TransformRequest) -> Vec<CkWireMessage> {
-        transform(store, request, &pctx()).unwrap().ck_messages
+        transform(store, request, &pctx())
+            .unwrap()
+            .ck_messages
+            .unwrap_or_default()
     }
 
     fn comp(seq: i64, start: i64, end: i64, end_id: &str, p1: &str) -> StoredCompartment {

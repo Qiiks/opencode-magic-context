@@ -2079,7 +2079,10 @@ mod tests {
         assert_eq!(response["status"], "need_full_sync");
         assert_eq!(response["served_from"], "transform");
         assert_eq!(response["full_array_fingerprint"], "fp-delta");
-        assert_eq!(response["ck_messages"].as_array().unwrap().len(), 0);
+        // The array field must be ABSENT, not empty: the consumer discriminates
+        // structurally on presence, and an empty array would be a third
+        // ambiguous state between "transformed to nothing" and "re-send".
+        assert!(response.get("ck_messages").is_none());
         assert_eq!(store.load("ses").unwrap().row_version, before);
     }
 
