@@ -14,9 +14,7 @@
 //! coverage / tail computation (PRIMARY), and the `mc_*` id namespace is reserved
 //! (BACKSTOP) so a synthetic block can never masquerade as the real boundary.
 
-#[path = "ck_wire.rs"]
-pub mod ck_wire;
-
+use crate::ck_wire;
 use crate::compartment_coverage::{fold_m0_content_epoch, M0ContentEpoch};
 use crate::healing::{quirk_residual, SerializerProfile};
 use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
@@ -38,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use ck_wire::{
+use crate::ck_wire::{
     duplicate_ids, project_messages, reduced_block, split_block_id, CkIngressMessage, CkWireBlock,
     CkWireError, CkWireMessage, FlatBlock, FlatProjection,
 };

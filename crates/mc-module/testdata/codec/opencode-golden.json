@@ -1,0 +1,85 @@
+{
+  "projection_oracle": {
+    "status": "todo",
+    "reason": "The OpenCode SDK serializer is not vendored in the Rust workspace test closure; these goldens assert raw-part identity for wire-reachable parts plus sidecar re-attach, with compaction parts excluded because the codec emits them as a boundary signal. TODO: replace this fallback with toModelMessagesEffect byte projection when the SDK is available to the generator."
+  },
+  "coverage": [
+    "text",
+    "ignored_text",
+    "empty_text",
+    "reasoning_signature",
+    "tool_completed",
+    "tool_error",
+    "file",
+    "step_start",
+    "compaction",
+    "subtask",
+    "step_finish",
+    "patch"
+  ],
+  "cases": [
+    {
+      "name": "dense-wire-and-sidecar-slice",
+      "messages": [
+        {
+          "info": {
+            "id": "oc-user-1",
+            "role": "user",
+            "model": { "providerID": "anthropic", "modelID": "claude-opus-test" }
+          },
+          "parts": [
+            { "type": "text", "text": "[redacted user text 0001]" },
+            { "type": "text", "text": "[redacted ignored text]", "ignored": true },
+            { "type": "text", "text": "" },
+            { "type": "file", "mime": "image/png", "filename": "image.png", "url": "data:image/png;base64,QUJD" },
+            { "type": "compaction", "auto": true },
+            { "type": "step-finish", "reason": "stop" }
+          ]
+        },
+        {
+          "info": {
+            "id": "oc-assistant-1",
+            "role": "assistant",
+            "model": { "providerID": "anthropic", "modelID": "claude-opus-test" }
+          },
+          "parts": [
+            { "type": "step-start" },
+            {
+              "type": "reasoning",
+              "text": "[redacted reasoning text 0001]",
+              "metadata": { "anthropic": { "signature": "sig-reasoning-1" } }
+            },
+            {
+              "type": "text",
+              "text": "[redacted assistant text 0001]",
+              "metadata": { "anthropic": { "signature": "sig-text-1" } }
+            },
+            {
+              "type": "tool",
+              "callID": "call-ok",
+              "tool": "read",
+              "state": {
+                "status": "completed",
+                "input": { "filePath": "src/lib.rs" },
+                "output": "[redacted tool output ok]"
+              },
+              "metadata": { "providerExecuted": true }
+            },
+            {
+              "type": "tool",
+              "callID": "call-err",
+              "tool": "bash",
+              "state": {
+                "status": "error",
+                "input": { "cmd": "false" },
+                "output": "[redacted tool output error]"
+              }
+            },
+            { "type": "subtask", "id": "subtask-1", "title": "[redacted subtask title]" },
+            { "type": "patch", "files": [] }
+          ]
+        }
+      ]
+    }
+  ]
+}

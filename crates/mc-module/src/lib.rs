@@ -17,6 +17,8 @@
 #![forbid(unsafe_code)]
 
 pub mod boundary;
+pub mod ck_wire;
+pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
 pub mod decay_render;
@@ -470,7 +472,7 @@ impl McHandler {
         store: Arc<McStore>,
         parsed: &TransformRequest,
         project_path: String,
-        projection: &transform::ck_wire::FlatProjection,
+        projection: &crate::ck_wire::FlatProjection,
         now: i64,
     ) -> Option<&'static str> {
         let Ok(loaded) = store.load(&parsed.session_id) else {
@@ -610,7 +612,7 @@ impl McHandler {
         parsed: &TransformRequest,
         binding: &SessionBinding,
         project_path: &str,
-        projection: &transform::ck_wire::FlatProjection,
+        projection: &crate::ck_wire::FlatProjection,
         now: i64,
     ) -> PreparedHistorianAction {
         let loaded = match store.load(&parsed.session_id) {
@@ -1462,7 +1464,7 @@ fn drop_ids_from_command(request: &Value) -> Vec<String> {
 
 fn boundary_messages(
     parsed: &TransformRequest,
-    projection: &transform::ck_wire::FlatProjection,
+    projection: &crate::ck_wire::FlatProjection,
 ) -> Vec<BoundaryMsg> {
     parsed
         .messages
@@ -1492,7 +1494,7 @@ fn boundary_messages(
         .collect()
 }
 
-fn sel_kind_for_flat(block: &transform::ck_wire::FlatBlock) -> SelKind {
+fn sel_kind_for_flat(block: &crate::ck_wire::FlatBlock) -> SelKind {
     match block.kind_tag.as_str() {
         "tool_call" => SelKind::ToolCall {
             name: block.name.clone().unwrap_or_default(),
@@ -1643,12 +1645,12 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::ck_wire::{
+        CkIngressMessage, CkKind, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
+    };
     use historian_producer::{ProducerOutput, RunHandle, RunState};
     use mc_store::{HistorianChunkRange, HistorianDurableState, ModuleUsage};
     use tokio::sync::Notify;
-    use transform::ck_wire::{
-        CkIngressMessage, CkKind, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
-    };
 
     #[test]
     fn dev_descriptor_used_when_ack_has_no_storage() {
@@ -2587,9 +2589,7 @@ mod tests {
     }
 
     fn seed_awaiting(store: &McStore, messages: &[CkIngressMessage]) {
-        let live = transform::ck_wire::project_messages(messages)
-            .unwrap()
-            .blocks;
+        let live = crate::ck_wire::project_messages(messages).unwrap().blocks;
         let chunk = historian_chunk::build_historian_chunk(
             messages,
             &live,

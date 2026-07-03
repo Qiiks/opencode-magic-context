@@ -1,0 +1,115 @@
+{
+  "projection_oracle": {
+    "status": "todo",
+    "reason": "The Pi provider serializer entry points are not vendored in the Rust workspace test closure; these goldens assert AgentMessage/session-entry round-trip identity for non-compaction entries. TODO: replace this fallback with provider serializer byte projection when the Pi SDK is available to the generator."
+  },
+  "coverage": [
+    "text_signature",
+    "thinking_signature",
+    "redacted_thinking",
+    "image",
+    "tool_call_split_pipe",
+    "thought_signature",
+    "tool_result",
+    "tool_result_details",
+    "custom_message",
+    "compaction",
+    "aborted_assistant",
+    "response_id_mid",
+    "timestamp_fallback_mid"
+  ],
+  "cases": [
+    {
+      "name": "pi-session-entry-slice",
+      "entries": [
+        {
+          "type": "message",
+          "id": "entry-user-1",
+          "parentId": null,
+          "timestamp": "2026-06-28T10:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": [
+              { "type": "text", "text": "[redacted user text 0001]", "textSignature": "txt-sig-user" },
+              { "type": "image", "data": "QUJD", "mimeType": "image/png" }
+            ],
+            "timestamp": 1800000000000
+          }
+        },
+        {
+          "type": "message",
+          "id": "entry-assistant-1",
+          "parentId": "entry-user-1",
+          "timestamp": "2026-06-28T10:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              { "type": "text", "text": "[redacted assistant text 0001]", "textSignature": "txt-sig-assistant" },
+              { "type": "thinking", "thinking": "[redacted thinking text]", "thinkingSignature": "think-sig-1" },
+              { "type": "thinking", "thinking": "", "thinkingSignature": "redacted-payload-1", "redacted": true },
+              { "type": "toolCall", "id": "call-1|item-1", "name": "lookup", "arguments": { "q": "[redacted query]" }, "thoughtSignature": "thought-sig-1" }
+            ],
+            "api": "openai-responses",
+            "provider": "openai",
+            "model": "gpt-test",
+            "responseId": "resp-1",
+            "usage": { "input": 1, "output": 1 },
+            "stopReason": "toolUse",
+            "timestamp": 1800000000001
+          }
+        },
+        {
+          "type": "message",
+          "id": "entry-tool-1",
+          "parentId": "entry-assistant-1",
+          "timestamp": "2026-06-28T10:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1|item-1",
+            "toolName": "lookup",
+            "content": [
+              { "type": "text", "text": "[redacted tool result]" }
+            ],
+            "details": { "debug": "harness-only" },
+            "isError": false,
+            "timestamp": 1800000000002
+          }
+        },
+        {
+          "type": "custom_message",
+          "id": "entry-custom-1",
+          "parentId": "entry-tool-1",
+          "timestamp": "2026-06-28T10:00:03.000Z",
+          "content": { "type": "notice", "text": "[redacted custom message]" }
+        },
+        {
+          "type": "compaction",
+          "id": "entry-compaction-1",
+          "parentId": "entry-custom-1",
+          "timestamp": "2026-06-28T10:00:04.000Z",
+          "summary": "[redacted compaction summary]",
+          "firstKeptEntryId": "entry-assistant-2",
+          "tokensBefore": 100,
+          "fromHook": true,
+          "details": { "source": "magic-context" }
+        },
+        {
+          "type": "message",
+          "id": "entry-assistant-2",
+          "parentId": "entry-compaction-1",
+          "timestamp": "2026-06-28T10:00:05.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [],
+            "api": "openai-responses",
+            "provider": "openai",
+            "model": "gpt-test",
+            "usage": {},
+            "stopReason": "aborted",
+            "timestamp": 1800000000005
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -9,6 +9,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::boundary::BoundaryResolution;
+use crate::ck_wire::{block_id, CkIngressMessage, CkKind, FlatBlock};
 use crate::historian::{compute_chunk_fingerprint, ChunkSnapshotItem, HistorianFireRequest};
 use crate::historian_prompt::{
     build_compartment_agent_prompt, build_reference_blocks_from_stored,
@@ -17,7 +18,6 @@ use crate::historian_prompt::{
 use crate::historian_validate::{
     ChunkLine, HistorianChunk, MessageRange, StoredCompartmentRange, ValidateOptions,
 };
-use crate::transform::ck_wire::{block_id, CkIngressMessage, CkKind, FlatBlock};
 
 const MAX_COMMITS_PER_BLOCK: usize = 5;
 const SYSTEM_DIRECTIVE_PREFIX: &str = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT";
@@ -890,7 +890,7 @@ fn space_before_punct_regex() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::ck_wire::{
+    use crate::ck_wire::{
         project_messages, CkIngressMessage, CkWireBlock, CkWireMessage, HarnessMeta,
     };
     use mc_store::{CkKind, ProviderExtras};

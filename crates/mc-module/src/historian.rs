@@ -1052,10 +1052,8 @@ mod tests {
     use mc_core::CoreState;
     use mc_store::{ModuleMeta, StoredCompartment};
 
-    use crate::transform::{
-        ck_wire::{self, CkIngressMessage, CkWireMessage},
-        transform, ProducerContext, TransformRequest,
-    };
+    use crate::ck_wire::{self, CkIngressMessage, CkWireMessage};
+    use crate::transform::{transform, ProducerContext, TransformRequest};
 
     fn store(dir: &std::path::Path) -> McStore {
         McStore::open(&StorageDescriptor {
