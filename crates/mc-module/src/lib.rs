@@ -745,6 +745,36 @@ impl McHandler {
                 }
             }
         };
+        // The module's own producer sessions must NEVER be transformed: the historian's
+        // request is a raw structured-extraction call whose [system, user] shape is part
+        // of the prompt calibration. Identity pass-through, no store reads, no historian
+        // evaluation (a transform here would recurse the historian into itself).
+        if parsed
+            .session_id
+            .starts_with(historian::MC_CHILD_SESSION_PREFIX)
+        {
+            return HandlerOutcome::Response(
+                match serde_json::to_vec(&transform::TransformResponse {
+                    action: "PASSTHROUGH".to_string(),
+                    boundary_id: String::new(),
+                    reconcile_pending: false,
+                    version: 0,
+                    row_version: 0,
+                    committed: false,
+                    coverage_ordinal: None,
+                    historian: None,
+                    ck_messages: parsed.messages.into_iter().map(|m| m.ck).collect(),
+                }) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return HandlerOutcome::Error {
+                            code: "internal".to_string(),
+                            message: e.to_string(),
+                        }
+                    }
+                },
+            );
+        }
         let binding = match self.resolve_binding(channel, &parsed.session_id) {
             Ok(b) => b,
             Err(BindingError::Unbound) => {
@@ -1678,6 +1708,36 @@ mod tests {
         wait_for_idle(&store).await;
         let loaded = store.load("ses").unwrap();
         assert_eq!(loaded.meta.historian.last_no_fire, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn own_producer_sessions_pass_through_untransformed() {
+        // The historian's own llm-runner run must never be re-transformed: prepending
+        // m0/m1 framing ahead of the historian system prompt restructures the calibrated
+        // request and makes the model treat the seed examples as session content.
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let session = historian::historian_producer_session_id("proj", 3);
+        handler.bind_route(9, binding("/tmp/nonexistent-proj", &session));
+        let messages = [ck("m1", 1, "seed block + new_messages payload")];
+        let req = serde_json::json!({
+            "kind": "transform",
+            "session_id": session,
+            "render_config": "cfg0",
+            "messages": messages.iter().map(|m| serde_json::to_value(m).unwrap()).collect::<Vec<_>>(),
+        });
+        let out = handler.handle_transform_value(9, req).await;
+        let HandlerOutcome::Response(bytes) = out else {
+            panic!("pass-through must be a response");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["action"], "PASSTHROUGH");
+        let out_msgs = v["ck_messages"].as_array().unwrap();
+        assert_eq!(out_msgs.len(), 1, "no m0/m1 prepends, no drops");
+        // No store row was created and no historian evaluation ran for the child session.
+        assert!(store.load(&session).unwrap().row_version.is_none());
+        assert!(v.get("historian").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
