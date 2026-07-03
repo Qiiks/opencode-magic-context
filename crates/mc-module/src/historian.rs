@@ -632,6 +632,21 @@ pub fn completion_wait_budget() -> Duration {
     Duration::from_secs(660)
 }
 
+/// The transform-call deadline a consumer sets, VERBATIM, for requests to this module —
+/// margin included, no consumer-side arithmetic on top (adding local margin would
+/// double-count and drift the number per consumer; this module owns the margin).
+///
+/// Derivation: a ≥95% (Emergency95) request may legitimately block until compaction
+/// lands, and its worst case nests both emergency arms sequentially — busy-await of an
+/// active run (one `completion_wait_budget`, 660s) followed by an inline refire (a
+/// second 660s) plus transform re-runs — ≈ 1350s, rounded up with margin. A consumer
+/// deadline below this false-trips on legitimate work and forwards a RAW array at the
+/// exact pressure where raw risks provider context-overflow; a trip at THIS value means
+/// the module violated its own per-arm bounds (a bug), making forward-raw-and-discard
+/// the least-bad recovery. If per-arm semantics grow, bump this constant and re-sync
+/// the consumers.
+pub const MAX_EMERGENCY_REQUEST_BUDGET: Duration = Duration::from_secs(1500);
+
 /// Build the llm-runner session id owned by Magic Context for one historian firing.
 /// The firing sequence is part of the id so a fallback model attempt never resumes a
 /// failed run under a different model.
