@@ -2171,22 +2171,31 @@ mod tests {
         Some((*ordinals.iter().min()?, *ordinals.iter().max()?))
     }
 
+    /// Wall-clock budget for test waits on spawned-task progress. Iteration-bounded
+    /// yield loops flake under parallel test load: 200 bare yields are microseconds,
+    /// and a spawned task that loses the CPU race for that window fails the wait even
+    /// though it completes fine. Time-bounded polling makes the wait load-immune.
+    const TEST_WAIT_BUDGET: Duration = Duration::from_secs(10);
+    const TEST_WAIT_POLL: Duration = Duration::from_millis(2);
+
     async fn wait_for_idle(store: &McStore) {
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + TEST_WAIT_BUDGET;
+        while std::time::Instant::now() < deadline {
             if store.load("ses").unwrap().meta.historian.state == HistorianPhase::Idle {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(TEST_WAIT_POLL).await;
         }
         panic!("historian did not return to idle");
     }
 
     async fn wait_for_count(value: &AtomicUsize, expected: usize) {
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + TEST_WAIT_BUDGET;
+        while std::time::Instant::now() < deadline {
             if value.load(Ordering::SeqCst) >= expected {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(TEST_WAIT_POLL).await;
         }
         panic!("counter did not reach {expected}");
     }
@@ -2195,12 +2204,13 @@ mod tests {
     where
         F: Fn(&HistorianDurableState) -> bool,
     {
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + TEST_WAIT_BUDGET;
+        while std::time::Instant::now() < deadline {
             let state = store.load("ses").unwrap().meta.historian;
             if predicate(&state) {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(TEST_WAIT_POLL).await;
         }
         panic!("historian state predicate did not become true");
     }
