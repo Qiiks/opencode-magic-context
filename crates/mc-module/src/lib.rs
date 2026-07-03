@@ -931,11 +931,36 @@ impl McHandler {
         }
     }
 
+    /// Drive a firing for an emergency pass, bounded by the completion-wait budget.
+    ///
+    /// The firing runs as a SPAWNED task and this method awaits its JoinHandle with a
+    /// timeout, for two reasons:
+    /// - The drive's own wall clock is bounded only per model attempt (producer await +
+    ///   recovery re-drain), so a fallback chain could hold the request open for
+    ///   attempt-budget × chain-length. Transform consumers need a hard per-request
+    ///   ceiling to set their call deadlines against.
+    /// - On timeout the spawned firing KEEPS RUNNING (a JoinHandle timeout does not
+    ///   cancel the task): the request degrades to its already-computed emergency
+    ///   output and a later pass picks up the published fold. Cancelling mid-drive
+    ///   would instead strand durable state for crash recovery to repair.
     async fn run_historian_firing_inline(
         &self,
         task: HistorianFiringTask,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
-        Self::execute_historian_firing_task(Arc::clone(&self.producer_factory), task).await
+        let factory = Arc::clone(&self.producer_factory);
+        let handle = tokio::spawn(Self::execute_historian_firing_task(factory, task));
+        match tokio::time::timeout(historian::completion_wait_budget(), handle).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(join_err)) => Err(historian::HistorianDriveError::Producer(
+                HistorianProducerError::RunFailed {
+                    run_id: String::new(),
+                    detail: format!("inline firing task panicked: {join_err}"),
+                },
+            )),
+            Err(_elapsed) => Err(historian::HistorianDriveError::Producer(
+                HistorianProducerError::TimedOut,
+            )),
+        }
     }
 
     async fn await_live_historian_completion(
