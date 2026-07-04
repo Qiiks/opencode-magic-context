@@ -175,34 +175,39 @@ const server: Plugin = async (ctx) => {
         }
     }
 
-    setTimeout(() => {
-        try {
-            const db = openDatabase();
-            if (!db || !isDatabasePersisted(db)) return;
-            const ocDb = openOpenCodeDb();
-            if (!ocDb) return;
+    // Gated like the v22 backfill above: a conflict-disabled plugin must not
+    // touch storage at all (openDatabase() would CREATE context.db, breaking
+    // the disabled-path invariant that no state is written).
+    if (pluginConfig.enabled && hooks.magicContext) {
+        setTimeout(() => {
             try {
-                const sessions = ocDb
-                    .prepare(
-                        "SELECT id, COALESCE(directory, '') AS directory FROM session ORDER BY id ASC",
-                    )
-                    .all() as Array<{ id: string; directory: string }>;
-                void runSessionProjectBackfill(
-                    db,
-                    sessions.map((session) => ({
-                        sessionId: session.id,
-                        directory: session.directory,
-                    })),
-                ).catch((err) => {
-                    log(`[session-projects] background runner failed: ${err}`);
-                });
-            } finally {
-                closeQuietly(ocDb);
+                const db = openDatabase();
+                if (!db || !isDatabasePersisted(db)) return;
+                const ocDb = openOpenCodeDb();
+                if (!ocDb) return;
+                try {
+                    const sessions = ocDb
+                        .prepare(
+                            "SELECT id, COALESCE(directory, '') AS directory FROM session ORDER BY id ASC",
+                        )
+                        .all() as Array<{ id: string; directory: string }>;
+                    void runSessionProjectBackfill(
+                        db,
+                        sessions.map((session) => ({
+                            sessionId: session.id,
+                            directory: session.directory,
+                        })),
+                    ).catch((err) => {
+                        log(`[session-projects] background runner failed: ${err}`);
+                    });
+                } finally {
+                    closeQuietly(ocDb);
+                }
+            } catch (err) {
+                log(`[session-projects] failed to start background runner: ${err}`);
             }
-        } catch (err) {
-            log(`[session-projects] failed to start background runner: ${err}`);
-        }
-    }, 0);
+        }, 0);
+    }
 
     // Resolve storage dir up front. Used by the RPC server below AND by
     // the auto-update checker (for cross-process dedup of npm hits when
