@@ -1,68 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Mutex, OnceLock};
 
 use magic_context_dashboard_lib::project_identity::{
-    clear_cache_for_tests, logical_absolute, normalize_stored_project_path,
-    resolve_project_identity, resolve_project_identity_strict, IdentityErrorClass,
+    logical_absolute, normalize_stored_project_path,
 };
 use serde::Deserialize;
-
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn env_lock() -> &'static Mutex<()> {
-    ENV_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn git_available() -> bool {
-    Command::new("git")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
 
 fn expected_dir_identity(path: &Path) -> String {
     let digest = md5::compute(path.to_string_lossy().as_bytes());
     let hex = format!("{digest:x}");
     format!("dir:{}", &hex[..12])
-}
-
-#[cfg(unix)]
-fn write_mock_git(script: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(script, body).expect("write mock git");
-    let mut perms = std::fs::metadata(script)
-        .expect("mock git metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(script, perms).expect("chmod mock git");
-}
-
-#[cfg(unix)]
-fn with_mock_git_path<T>(bin_dir: &Path, run: impl FnOnce() -> T) -> T {
-    let _guard = env_lock().lock().expect("env lock");
-    clear_cache_for_tests();
-
-    let old_path = std::env::var_os("PATH");
-    let joined = match old_path.as_ref() {
-        Some(old) => {
-            let mut paths = vec![bin_dir.to_path_buf()];
-            paths.extend(std::env::split_paths(old));
-            std::env::join_paths(paths).expect("join PATH")
-        }
-        None => bin_dir.as_os_str().to_os_string(),
-    };
-    std::env::set_var("PATH", joined);
-    let result = run();
-    if let Some(old) = old_path {
-        std::env::set_var("PATH", old);
-    } else {
-        std::env::remove_var("PATH");
-    }
-    clear_cache_for_tests();
-    result
 }
 
 #[test]
@@ -89,191 +35,21 @@ fn logical_absolute_matches_node_path_resolve_matrix() {
 }
 
 #[test]
-fn resolve_project_identity_on_git_repo_returns_root_commit_hash() {
-    let _guard = env_lock().lock().expect("env lock");
-    if !git_available() {
-        return;
-    }
-
-    clear_cache_for_tests();
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    assert!(Command::new("git")
-        .arg("init")
-        .current_dir(dir.path())
-        .output()
-        .expect("git init")
-        .status
-        .success());
-    std::fs::write(dir.path().join("README.md"), "hello\n").expect("write readme");
-    assert!(Command::new("git")
-        .args(["add", "README.md"])
-        .current_dir(dir.path())
-        .output()
-        .expect("git add")
-        .status
-        .success());
-    assert!(Command::new("git")
-        .args([
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Magic Context Test",
-            "commit",
-            "-m",
-            "init",
-        ])
-        .current_dir(dir.path())
-        .output()
-        .expect("git commit")
-        .status
-        .success());
-
-    let expected = String::from_utf8(
-        Command::new("git")
-            .args(["rev-list", "--max-parents=0", "HEAD"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git rev-list")
-            .stdout,
-    )
-    .expect("utf8")
-    .lines()
-    .next()
-    .expect("root hash")
-    .trim()
-    .to_string();
-
+fn normalize_stored_project_path_preserves_identity_values() {
+    assert_eq!(normalize_stored_project_path("git:abc123"), "git:abc123");
     assert_eq!(
-        resolve_project_identity(dir.path()),
-        format!("git:{expected}")
+        normalize_stored_project_path("dir:deadbeef0000"),
+        "dir:deadbeef0000"
     );
 }
 
 #[test]
-fn resolve_project_identity_on_non_git_directory_returns_md5_12_dir_identity() {
-    let _guard = env_lock().lock().expect("env lock");
-    if !git_available() {
-        return;
-    }
-
-    clear_cache_for_tests();
-
+fn normalize_stored_project_path_hashes_raw_paths_as_directory_fallback() {
     let dir = tempfile::tempdir().expect("tempdir");
     assert_eq!(
-        resolve_project_identity(dir.path()),
+        normalize_stored_project_path(dir.path().to_str().expect("utf8 tempdir")),
         expected_dir_identity(dir.path())
     );
-}
-
-#[test]
-fn strict_non_git_directory_returns_not_git_repo() {
-    let _guard = env_lock().lock().expect("env lock");
-    if !git_available() {
-        return;
-    }
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    assert_eq!(
-        resolve_project_identity_strict(dir.path()),
-        Err(IdentityErrorClass::NotGitRepo)
-    );
-}
-
-#[test]
-fn strict_missing_directory_returns_path_inaccessible() {
-    // A missing/unreachable directory is a DETERMINISTIC failure (same path
-    // always reproduces it), so it classifies as PathInaccessible and is a
-    // cacheable dir: fallback — distinct from transient classes (git
-    // missing/timeout/permission/unknown) which must not be cached. Mirrors the
-    // TS resolver's "Unable to access project directory" → directory fallback.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let missing = dir.path().join("does-not-exist");
-    assert_eq!(
-        resolve_project_identity_strict(&missing),
-        Err(IdentityErrorClass::PathInaccessible)
-    );
-}
-
-#[test]
-#[cfg(unix)]
-fn strict_git_probe_times_out_on_slow_git() {
-    let bin_dir = tempfile::tempdir().expect("bin dir");
-    write_mock_git(
-        &bin_dir.path().join("git"),
-        "#!/bin/sh\nsleep 10\necho abcdef1234567890\n",
-    );
-    let cwd = tempfile::tempdir().expect("cwd");
-
-    with_mock_git_path(bin_dir.path(), || {
-        let started = std::time::Instant::now();
-        let result = resolve_project_identity_strict(cwd.path());
-        assert_eq!(result, Err(IdentityErrorClass::GitTimeout));
-        assert!(started.elapsed() < std::time::Duration::from_secs(8));
-    });
-}
-
-#[test]
-#[cfg(unix)]
-fn strict_git_probe_sets_c_locale_environment() {
-    let bin_dir = tempfile::tempdir().expect("bin dir");
-    let sha = "abcdef1234567890abcdef1234567890abcdef12";
-    write_mock_git(
-        &bin_dir.path().join("git"),
-        &format!(
-            "#!/bin/sh\nif [ \"$LC_ALL\" = C ] && [ \"$LANG\" = C ]; then echo {sha}; exit 0; fi\necho 'not a git repository: locale mismatch' >&2\nexit 1\n"
-        ),
-    );
-    let cwd = tempfile::tempdir().expect("cwd");
-
-    with_mock_git_path(bin_dir.path(), || {
-        assert_eq!(
-            resolve_project_identity_strict(cwd.path()),
-            Ok(format!("git:{sha}"))
-        );
-    });
-}
-
-#[test]
-#[cfg(unix)]
-fn normalize_stored_project_path_short_circuits_identities_without_spawning_git() {
-    let bin_dir = tempfile::tempdir().expect("bin dir");
-    let marker = bin_dir.path().join("spawned");
-    write_mock_git(
-        &bin_dir.path().join("git"),
-        &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
-    );
-
-    with_mock_git_path(bin_dir.path(), || {
-        assert_eq!(normalize_stored_project_path("git:abc123"), "git:abc123");
-        assert_eq!(
-            normalize_stored_project_path("dir:deadbeef0000"),
-            "dir:deadbeef0000"
-        );
-        assert!(
-            !marker.exists(),
-            "git mock should not be invoked for stored identities"
-        );
-    });
-}
-
-#[test]
-#[cfg(unix)]
-fn normalize_stored_project_path_resolves_raw_paths() {
-    let bin_dir = tempfile::tempdir().expect("bin dir");
-    let sha = "1234567890abcdef1234567890abcdef12345678";
-    write_mock_git(
-        &bin_dir.path().join("git"),
-        &format!("#!/bin/sh\necho {sha}\n"),
-    );
-    let cwd = tempfile::tempdir().expect("cwd");
-
-    with_mock_git_path(bin_dir.path(), || {
-        assert_eq!(
-            normalize_stored_project_path(cwd.path().to_str().expect("utf8 tempdir")),
-            format!("git:{sha}")
-        );
-    });
 }
 
 #[derive(Deserialize)]
@@ -285,100 +61,19 @@ struct ParityFixture {
 
 #[test]
 #[cfg(unix)]
-fn cross_language_identity_parity_fixture_matches_ts_contract() {
-    // Fixture outputs are generated from the TypeScript production contract:
-    // path.resolve(input), then createHash("md5").update(resolved).digest("hex").slice(0, 12)
-    // for non-git directories. When Worker B lands shared TS fixtures, this file can be
-    // replaced with their canonical JSON without changing the Rust assertion shape.
+fn cross_language_identity_parity_fixture_matches_directory_fallback_contract() {
+    // Fixture outputs are generated from the TypeScript production contract for
+    // non-git directories: path.resolve(input), then MD5 over the resolved path
+    // string truncated to 12 hex characters.
     let cases: Vec<ParityFixture> =
         serde_json::from_str(include_str!("fixtures/project_identity_parity.json"))
             .expect("parse parity fixture");
 
-    let _guard = env_lock().lock().expect("env lock");
-    clear_cache_for_tests();
-
     for case in cases {
-        std::fs::create_dir_all(&case.resolved).expect("create fixture dir");
         assert_eq!(
             logical_absolute(Path::new(&case.input), Path::new("/ignored")),
             PathBuf::from(&case.resolved)
         );
-        assert_eq!(resolve_project_identity(&case.input), case.identity);
+        assert_eq!(normalize_stored_project_path(&case.input), case.identity);
     }
-}
-
-#[test]
-fn cached_dir_fallback_flips_to_git_after_init_and_commit() {
-    // Regression (P0): a scratch dir resolves to dir:<md5> and that fallback is
-    // cached. After `git init` + first commit, resolve_project_identity must DROP
-    // the cached fallback and re-resolve to git:<root> — not pin the stale dir:
-    // for the whole process (which would make the dashboard read/mutate the wrong
-    // project). Mirrors the TS resolver's hasGitDir re-resolve gate.
-    let _guard = env_lock().lock().expect("env lock");
-    if !git_available() {
-        return;
-    }
-    clear_cache_for_tests();
-
-    let dir = tempfile::tempdir().expect("tempdir");
-
-    // 1. No repo yet → dir: fallback, now cached.
-    assert_eq!(
-        resolve_project_identity(dir.path()),
-        expected_dir_identity(dir.path())
-    );
-
-    // 2. git init + first commit.
-    assert!(Command::new("git")
-        .arg("init")
-        .current_dir(dir.path())
-        .output()
-        .expect("git init")
-        .status
-        .success());
-    std::fs::write(dir.path().join("README.md"), "hello\n").expect("write readme");
-    assert!(Command::new("git")
-        .args(["add", "README.md"])
-        .current_dir(dir.path())
-        .output()
-        .expect("git add")
-        .status
-        .success());
-    assert!(Command::new("git")
-        .args([
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Magic Context Test",
-            "commit",
-            "-m",
-            "init",
-        ])
-        .current_dir(dir.path())
-        .output()
-        .expect("git commit")
-        .status
-        .success());
-
-    let expected_root = String::from_utf8(
-        Command::new("git")
-            .args(["rev-list", "--max-parents=0", "HEAD"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git rev-list")
-            .stdout,
-    )
-    .expect("utf8")
-    .lines()
-    .next()
-    .expect("root hash")
-    .trim()
-    .to_string();
-
-    // 3. WITHOUT clearing the cache: the stale dir: fallback must be dropped and
-    //    the real git: identity returned.
-    assert_eq!(
-        resolve_project_identity(dir.path()),
-        format!("git:{expected_root}")
-    );
 }

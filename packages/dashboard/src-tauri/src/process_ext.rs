@@ -1,8 +1,7 @@
 //! Cross-platform helper to suppress the console window that Windows spawns for
-//! every child process. The dashboard shells out to `git` (once per project when
-//! resolving identities), `opencode`, and `pi`; without `CREATE_NO_WINDOW` each
-//! spawn flashes a console window, so opening the dashboard on Windows can pop a
-//! dozen-plus terminals (issue #115).
+//! every child process. The dashboard shells out to external tools such as
+//! `opencode` and `pi`; without `CREATE_NO_WINDOW` each spawn flashes a console
+//! window, so opening the dashboard on Windows can pop a dozen-plus terminals.
 //!
 //! On non-Windows targets these are no-ops, so call sites stay uniform.
 

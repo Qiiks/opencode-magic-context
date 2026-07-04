@@ -22,6 +22,7 @@ pub fn get_projects(state: State<'_, AppState>) -> Result<Vec<db::ProjectInfo>, 
 }
 
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub fn get_memories(
     state: State<'_, AppState>,
     project: Option<String>,
@@ -1117,6 +1118,7 @@ pub async fn get_available_pi_models() -> Vec<String> {
 ///
 /// 3. 401/403 → `AuthFailed` (specific "credentials rejected" message).
 ///    404/405 → `EndpointUnsupported` (wrong URL / no embeddings API).
+///
 /// Expand an `{env:}`/`{file:}` token in one probe field, mapping a failure to
 /// the matching probe outcome. The embedding fields come from the USER-level
 /// config editor, so expanding the user's own tokens to test their endpoint is

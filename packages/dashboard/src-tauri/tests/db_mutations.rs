@@ -1,14 +1,6 @@
-use std::sync::{Mutex, OnceLock};
-
 use magic_context_dashboard_lib::db;
-use magic_context_dashboard_lib::project_identity::clear_cache_for_tests;
+use magic_context_dashboard_lib::project_identity::normalize_stored_project_path;
 use rusqlite::{params, Connection};
-
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn env_lock() -> &'static Mutex<()> {
-    ENV_LOCK.get_or_init(|| Mutex::new(()))
-}
 
 fn make_db() -> Connection {
     let conn = Connection::open_in_memory().expect("open test db");
@@ -135,9 +127,16 @@ fn memory_epoch(conn: &Connection, project_path: &str) -> i64 {
     .unwrap_or(0)
 }
 
-fn mutation_log_rows(
-    conn: &Connection,
-) -> Vec<(String, String, i64, Option<String>, Option<String>)> {
+type MutationLogRow = (String, String, i64, Option<String>, Option<String>);
+type SessionCacheRow = (
+    String,
+    String,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i64>,
+);
+
+fn mutation_log_rows(conn: &Connection) -> Vec<MutationLogRow> {
     let mut stmt = conn
         .prepare(
             "SELECT project_path, mutation_type, target_memory_id, category, new_content
@@ -535,7 +534,7 @@ fn invalidate_all_memory_block_caches_clears_m0_m1_and_mutation_cursor() {
     let affected = db::invalidate_all_memory_block_caches(&conn).expect("invalidate caches");
 
     assert_eq!(affected, 1);
-    let row: (String, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>) = conn
+    let row: SessionCacheRow = conn
         .query_row(
             "SELECT memory_block_cache, memory_block_ids, cached_m0_bytes, cached_m1_bytes, cached_m0_max_memory_mutation_id FROM session_meta WHERE session_id = 's1'",
             [],
@@ -546,15 +545,7 @@ fn invalidate_all_memory_block_caches_clears_m0_m1_and_mutation_cursor() {
 }
 
 #[test]
-#[cfg(unix)]
-fn raw_path_git_resolution_happens_before_immediate_write_transaction() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    let _guard = env_lock().lock().expect("env lock");
-    clear_cache_for_tests();
-
+fn raw_path_memory_mutation_uses_directory_fallback_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("context.db");
     {
@@ -562,77 +553,17 @@ fn raw_path_git_resolution_happens_before_immediate_write_transaction() {
         create_schema(&conn);
     }
     let raw_project = tempfile::tempdir().expect("raw project");
+    let raw_project_path = raw_project.path().to_str().expect("utf8 path").to_string();
     let memory_id = {
         let conn = Connection::open(&db_path).expect("open db file");
-        insert_memory(
-            &conn,
-            raw_project.path().to_str().expect("utf8 path"),
-            "archived",
-        )
+        insert_memory(&conn, &raw_project_path, "archived")
     };
 
-    let bin_dir = tempfile::tempdir().expect("bin dir");
-    let marker = dir.path().join("git-started");
-    let sha = "abcdef1234567890abcdef1234567890abcdef12";
-    let script = bin_dir.path().join("git");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\ntouch '{}'\nsleep 2\necho {sha}\n",
-            marker.display()
-        ),
-    )
-    .expect("write mock git");
-    let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script, perms).expect("chmod");
+    let mut conn = Connection::open(&db_path).expect("open db file");
+    db::update_memory_status(&mut conn, memory_id, "active").expect("restore memory");
 
-    let old_path = std::env::var_os("PATH");
-    let mut paths = vec![bin_dir.path().to_path_buf()];
-    if let Some(old) = old_path.as_ref() {
-        paths.extend(std::env::split_paths(old));
-    }
-    std::env::set_var("PATH", std::env::join_paths(paths).expect("join path"));
-
-    let worker_db_path = db_path.clone();
-    let handle = thread::spawn(move || {
-        let mut conn = Connection::open(worker_db_path).expect("worker open");
-        conn.pragma_update(None, "busy_timeout", 5000)
-            .expect("busy timeout");
-        db::update_memory_status(&mut conn, memory_id, "active").expect("worker restore");
-    });
-
-    let started = Instant::now();
-    while !marker.exists() && started.elapsed() < Duration::from_secs(2) {
-        thread::sleep(Duration::from_millis(25));
-    }
-    assert!(marker.exists(), "mock git did not start");
-
-    // If Phase B's BEGIN IMMEDIATE had started before git resolution, this write would be locked.
-    let probe = Connection::open(&db_path).expect("probe open");
-    probe
-        .pragma_update(None, "busy_timeout", 100)
-        .expect("probe timeout");
-    probe
-        .execute("INSERT INTO tx_probe (value) VALUES ('during-git')", [])
-        .expect("probe write should succeed while git mock sleeps");
-
-    handle.join().expect("worker joined");
-
-    if let Some(old) = old_path {
-        std::env::set_var("PATH", old);
-    } else {
-        std::env::remove_var("PATH");
-    }
-    clear_cache_for_tests();
-
-    assert_eq!(
-        memory_epoch(
-            &Connection::open(&db_path).expect("open final"),
-            &format!("git:{sha}")
-        ),
-        1
-    );
+    let expected_identity = normalize_stored_project_path(&raw_project_path);
+    assert_eq!(memory_epoch(&conn, &expected_identity), 1);
 }
 
 #[test]
