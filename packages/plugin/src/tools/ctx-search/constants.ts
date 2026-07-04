@@ -7,9 +7,11 @@ Sources (omit for a broad search across all):
 - memory: curated cross-session project knowledge — rules, constraints, conventions.
 - message: the raw conversation behind your compacted history. Hits include message ordinals — expand the surrounding exchange with ctx_expand(start=N-10, end=N+5).
 - git_commit: this repository's commit history.
+- note: parked decisions, follow-ups, and dismissed notes with their recorded text.
 
 Picking sources:
 - "when did this change / was this working before" → ["git_commit", "message"]
 - "did we discuss this earlier" → ["message"]
+- "did we decide something about this / leave a follow-up" → ["note"]
 - "what's our convention / rule for X" → ["memory"]`;
 export const DEFAULT_CTX_SEARCH_LIMIT = 10;

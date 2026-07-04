@@ -20,6 +20,7 @@ import {
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
+import { getNotes, type Note } from "./storage-notes";
 import { getActivePrimers, type Primer } from "./storage-primers";
 import {
     expandWorkspaceIdentitySetWithAliases,
@@ -59,7 +60,7 @@ interface MessageSearchRow {
 const messageSearchStatements = new WeakMap<Database, PreparedStatement>();
 const messageSearchStatementsWithCutoff = new WeakMap<Database, PreparedStatement>();
 
-export type SearchSource = "memory" | "message" | "git_commit" | "primer";
+export type SearchSource = "memory" | "message" | "git_commit" | "primer" | "note";
 
 export interface UnifiedSearchOptions {
     limit?: number;
@@ -161,12 +162,23 @@ export interface PrimerSearchResult {
     matchType: "semantic" | "fts" | "hybrid";
 }
 
+export interface NoteSearchResult {
+    source: "note";
+    content: string;
+    score: number;
+    noteId: number;
+    status: Note["status"];
+    createdAt: number;
+    anchorOrdinal: number | null;
+}
+
 export type UnifiedSearchResult =
     | MemorySearchResult
     | MessageSearchResult
     | CompartmentSearchResult
     | GitCommitSearchResult
-    | PrimerSearchResult;
+    | PrimerSearchResult
+    | NoteSearchResult;
 
 function normalizeLimit(limit?: number): number {
     if (typeof limit !== "number" || !Number.isFinite(limit)) {
@@ -829,6 +841,178 @@ function searchMessages(args: {
     }));
 }
 
+const NOTE_SEARCHABLE_STATUSES: Note["status"][] = ["active", "pending", "ready", "dismissed"];
+
+function noteSearchText(note: Note): string {
+    const reason = note.readyReason?.trim();
+    return reason
+        ? `${note.content}
+Reason: ${reason}`
+        : note.content;
+}
+
+function tokenizeKeywordNeedle(text: string): string[] {
+    const matches = text.toLowerCase().match(/[a-z0-9/._:-]+/g) ?? [];
+    const seen = new Set<string>();
+    const tokens: string[] = [];
+    for (const match of matches) {
+        if (match.length <= 1 || !/[a-z0-9]/.test(match) || seen.has(match)) {
+            continue;
+        }
+        seen.add(match);
+        tokens.push(match);
+    }
+    return tokens;
+}
+
+interface RankedNoteMatch {
+    note: Note;
+    score: number;
+    text: string;
+}
+
+function rankNotesForNeedle(notes: readonly Note[], needle: string): RankedNoteMatch[] {
+    const normalizedNeedle = needle.trim().toLowerCase();
+    if (normalizedNeedle.length === 0) {
+        return [];
+    }
+    const needleTokens = tokenizeKeywordNeedle(normalizedNeedle);
+    const ranked: RankedNoteMatch[] = [];
+    for (const note of notes) {
+        const text = noteSearchText(note);
+        const normalizedText = text.toLowerCase();
+        const noteTokens = new Set(tokenizeKeywordNeedle(normalizedText));
+        const exact = normalizedText.includes(normalizedNeedle);
+        const matchedTokens = needleTokens.filter((token) => noteTokens.has(token)).length;
+        if (!exact && matchedTokens === 0) {
+            continue;
+        }
+        const coverage = needleTokens.length > 0 ? matchedTokens / needleTokens.length : 0;
+        const score =
+            (exact ? 2 : 0) +
+            coverage +
+            (needleTokens.length > 1 && matchedTokens === needleTokens.length ? 0.5 : 0);
+        ranked.push({ note, score, text });
+    }
+    return ranked.sort((left, right) => {
+        if (right.score !== left.score) {
+            return right.score - left.score;
+        }
+        if (right.note.createdAt !== left.note.createdAt) {
+            return right.note.createdAt - left.note.createdAt;
+        }
+        return left.note.id - right.note.id;
+    });
+}
+
+function searchNotes(args: {
+    db: Database;
+    sessionId: string;
+    projectPath: string;
+    query: string;
+    limit: number;
+    probes?: string[];
+}): NoteSearchResult[] {
+    if (args.limit <= 0) {
+        return [];
+    }
+
+    const notes = [
+        ...getNotes(args.db, {
+            sessionId: args.sessionId,
+            type: "session",
+            status: NOTE_SEARCHABLE_STATUSES,
+        }),
+        ...getNotes(args.db, {
+            projectPath: args.projectPath,
+            type: "smart",
+            status: NOTE_SEARCHABLE_STATUSES,
+        }),
+    ];
+    if (notes.length === 0) {
+        return [];
+    }
+
+    const baseList = rankNotesForNeedle(notes, args.query);
+    const probes = args.probes ?? [];
+
+    if (probes.length === 0) {
+        const ranked = baseList.slice(0, args.limit);
+        return ranked.map((entry, rank) => ({
+            source: "note" as const,
+            content: previewText(entry.text),
+            score: linearDecayScore(rank, ranked.length),
+            noteId: entry.note.id,
+            status: entry.note.status,
+            createdAt: entry.note.createdAt,
+            anchorOrdinal: entry.note.anchorOrdinal,
+        }));
+    }
+
+    const queryLists: Array<{ rows: RankedNoteMatch[]; weight: number }> = [];
+    if (baseList.length > 0) {
+        queryLists.push({ rows: baseList, weight: 1 });
+    }
+    const probeWeights = new Map<string, number>();
+    for (const probe of probes) {
+        const rows = rankNotesForNeedle(notes, probe);
+        if (rows.length === 0) {
+            continue;
+        }
+        const weight = probeDiscriminationWeight(rows.length, notes.length);
+        probeWeights.set(probe, weight);
+        queryLists.push({ rows, weight });
+    }
+
+    const fused = new Map<number, { entry: RankedNoteMatch; score: number }>();
+    for (const list of queryLists) {
+        list.rows.forEach((row, rank) => {
+            const rrf = list.weight / (RRF_K + rank);
+            const existing = fused.get(row.note.id);
+            if (existing) {
+                existing.score += rrf;
+            } else {
+                fused.set(row.note.id, { entry: row, score: rrf });
+            }
+        });
+    }
+
+    for (const match of fused.values()) {
+        let best = 0;
+        for (const probe of probes) {
+            const weight = probeWeights.get(probe) ?? 0;
+            if (weight > best && containsProbeVerbatim(match.entry.text, [probe])) {
+                best = weight;
+            }
+        }
+        if (best > 0) {
+            match.score += best * VERBATIM_RANK_BONUS;
+        }
+    }
+
+    const ranked = [...fused.values()]
+        .sort((left, right) => {
+            if (right.score !== left.score) {
+                return right.score - left.score;
+            }
+            if (right.entry.note.createdAt !== left.entry.note.createdAt) {
+                return right.entry.note.createdAt - left.entry.note.createdAt;
+            }
+            return left.entry.note.id - right.entry.note.id;
+        })
+        .slice(0, args.limit);
+
+    return ranked.map((entry, rank) => ({
+        source: "note" as const,
+        content: previewText(entry.entry.text),
+        score: linearDecayScore(rank, ranked.length),
+        noteId: entry.entry.note.id,
+        status: entry.entry.note.status,
+        createdAt: entry.entry.note.createdAt,
+        anchorOrdinal: entry.entry.note.anchorOrdinal,
+    }));
+}
+
 function searchCompartmentChunks(args: {
     db: Database;
     sessionId: string;
@@ -981,6 +1165,8 @@ function getSourceBoost(result: UnifiedSearchResult): number {
             return GIT_COMMIT_SOURCE_BOOST;
         case "primer":
             return PRIMER_SOURCE_BOOST;
+        case "note":
+            return 1;
     }
 }
 
@@ -1011,6 +1197,10 @@ function compareUnifiedResults(left: UnifiedSearchResult, right: UnifiedSearchRe
 
     if (left.source === "primer" && right.source === "primer") {
         return right.support - left.support || left.primerId - right.primerId;
+    }
+
+    if (left.source === "note" && right.source === "note") {
+        return right.createdAt - left.createdAt || left.noteId - right.noteId;
     }
 
     return 0;
@@ -1120,7 +1310,7 @@ function resolveSources(sources: SearchSource[] | undefined): Set<SearchSource> 
         // Default: search all recall sources. Facts are deliberately NOT a
         // source — they're always rendered in <session-history> so searching
         // them returns content the agent already sees.
-        return new Set<SearchSource>(["memory", "message", "git_commit", "primer"]);
+        return new Set<SearchSource>(["memory", "message", "git_commit", "primer", "note"]);
     }
     const set = new Set<SearchSource>();
     for (const source of sources) {
@@ -1128,7 +1318,8 @@ function resolveSources(sources: SearchSource[] | undefined): Set<SearchSource> 
             source === "memory" ||
             source === "message" ||
             source === "git_commit" ||
-            source === "primer"
+            source === "primer" ||
+            source === "note"
         ) {
             set.add(source);
         }
@@ -1162,6 +1353,7 @@ export async function unifiedSearch(
     const runMessages = activeSources.has("message");
     const runGitCommits = activeSources.has("git_commit") && gitCommitsEnabled;
     const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
+    const runNotes = activeSources.has("note");
     const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
 
     // Embed the query ONCE at the top — both memory and git-commit searches
@@ -1244,7 +1436,7 @@ export async function unifiedSearch(
         limit: tierLimit,
     });
 
-    const [memoryResults, gitCommitResults, primerResults] = await Promise.all([
+    const [memoryResults, gitCommitResults, primerResults, noteResults] = await Promise.all([
         runMemory
             ? searchMemories({
                   db,
@@ -1285,9 +1477,27 @@ export async function unifiedSearch(
                   }),
               )
             : Promise.resolve([] as PrimerSearchResult[]),
+        runNotes
+            ? Promise.resolve(
+                  searchNotes({
+                      db,
+                      sessionId,
+                      projectPath,
+                      query: trimmedQuery,
+                      limit: tierLimit,
+                      probes: messageProbes,
+                  }),
+              )
+            : Promise.resolve([] as NoteSearchResult[]),
     ]);
 
-    const results = [...memoryResults, ...primerResults, ...messageLikeResults, ...gitCommitResults]
+    const results = [
+        ...memoryResults,
+        ...primerResults,
+        ...messageLikeResults,
+        ...gitCommitResults,
+        ...noteResults,
+    ]
         .sort(compareUnifiedResults)
         .slice(0, limit);
 

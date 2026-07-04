@@ -25,6 +25,7 @@ import {
 } from "./project-embedding-registry";
 import { unifiedSearch } from "./search";
 import { initializeDatabase } from "./storage-db";
+import { addNote, dismissNote, updateNote } from "./storage-notes";
 import { createPrimer } from "./storage-primers";
 
 const readMessages = (sessionId: string) => rawMessagesBySession.get(sessionId) ?? [];
@@ -321,6 +322,188 @@ describe("unifiedSearch", () => {
         expect(results.filter((r) => r.source === "message")).toHaveLength(0);
         // Memory results are unaffected by the message-ordinal cutoff.
         expect(results.some((r) => r.source === "memory")).toBe(true);
+    });
+
+    it("returns note hits with id, status, anchor, and ready_reason text", async () => {
+        const readyNote = addNote(db, "smart", {
+            content: "Retry the queue benchmark after the release.",
+            projectPath: "git:test",
+            sessionId: "ses-note",
+            surfaceCondition: "When the release ships",
+            anchorOrdinal: 41,
+        });
+        updateNote(
+            db,
+            readyNote.id,
+            {
+                status: "ready",
+                readyReason: "Release shipped with the new queue drain.",
+            },
+            {
+                sessionId: "ses-note",
+                projectPath: "git:test",
+            },
+        );
+
+        const results = await unifiedSearch(db, "ses-note", "git:test", "queue drain shipped", {
+            limit: 5,
+            memoryEnabled: false,
+            embeddingEnabled: false,
+            sources: ["note"],
+        });
+
+        expect(results).toHaveLength(1);
+        expect(results[0]).toMatchObject({
+            source: "note",
+            noteId: readyNote.id,
+            status: "ready",
+            anchorOrdinal: 41,
+        });
+        if (results[0]?.source === "note") {
+            expect(results[0].content).toContain("Reason: Release shipped");
+        }
+    });
+
+    it("finds dismissed and pending notes across all statuses", async () => {
+        const dismissed = addNote(db, "session", {
+            sessionId: "ses-note-status",
+            content: "Decided to keep the fallback cache disabled because telemetry was noisy.",
+            anchorOrdinal: 12,
+        });
+        expect(
+            dismissNote(db, dismissed.id, {
+                sessionId: "ses-note-status",
+                projectPath: "git:test",
+            }),
+        ).toBe(true);
+
+        const pending = addNote(db, "smart", {
+            content: "Revisit telemetry after the deploy window closes.",
+            projectPath: "git:test",
+            sessionId: "ses-note-status",
+            surfaceCondition: "When the deploy window closes",
+            anchorOrdinal: 13,
+        });
+
+        const dismissedResults = await unifiedSearch(
+            db,
+            "ses-note-status",
+            "git:test",
+            "telemetry noisy fallback",
+            {
+                limit: 5,
+                memoryEnabled: false,
+                embeddingEnabled: false,
+                sources: ["note"],
+            },
+        );
+        const pendingResults = await unifiedSearch(
+            db,
+            "ses-note-status",
+            "git:test",
+            "deploy window closes",
+            {
+                limit: 5,
+                memoryEnabled: false,
+                embeddingEnabled: false,
+                sources: ["note"],
+            },
+        );
+
+        expect(dismissedResults[0]).toMatchObject({
+            source: "note",
+            noteId: dismissed.id,
+            status: "dismissed",
+        });
+        expect(pendingResults[0]).toMatchObject({
+            source: "note",
+            noteId: pending.id,
+            status: "pending",
+        });
+    });
+
+    it("scopes note search to the current session and project notes", async () => {
+        const ownSession = addNote(db, "session", {
+            sessionId: "ses-scope",
+            content: "scope marker own session",
+        });
+        addNote(db, "session", {
+            sessionId: "ses-other",
+            content: "scope marker other session",
+        });
+        const sameProjectSmart = addNote(db, "smart", {
+            content: "scope marker same project smart",
+            projectPath: "git:own",
+            sessionId: "ses-foreign",
+            surfaceCondition: "When project scope matters",
+        });
+        addNote(db, "smart", {
+            content: "scope marker foreign project smart",
+            projectPath: "git:other",
+            sessionId: "ses-scope",
+            surfaceCondition: "When project scope matters",
+        });
+
+        const results = await unifiedSearch(db, "ses-scope", "git:own", "scope marker", {
+            limit: 10,
+            memoryEnabled: false,
+            embeddingEnabled: false,
+            sources: ["note"],
+        });
+
+        const noteIds = results
+            .filter(
+                (result): result is Extract<(typeof results)[number], { source: "note" }> =>
+                    result.source === "note",
+            )
+            .map((result) => result.noteId)
+            .sort((left, right) => left - right);
+        expect(noteIds).toEqual([ownSession.id, sameProjectSmart.id].sort((a, b) => a - b));
+    });
+
+    it("restricts note results to the note source and includes them in broad searches", async () => {
+        const memory = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "broad recall marker from memory",
+        });
+        const note = addNote(db, "session", {
+            sessionId: "ses-broad-note",
+            content: "broad recall marker from note",
+        });
+
+        const noteOnly = await unifiedSearch(
+            db,
+            "ses-broad-note",
+            "/repo/project",
+            "broad recall marker",
+            {
+                limit: 10,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                sources: ["note"],
+            },
+        );
+        expect(noteOnly.every((result) => result.source === "note")).toBe(true);
+        expect(noteOnly[0]).toMatchObject({ source: "note", noteId: note.id });
+
+        const broad = await unifiedSearch(
+            db,
+            "ses-broad-note",
+            "/repo/project",
+            "broad recall marker",
+            {
+                limit: 10,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+            },
+        );
+        const broadSources = broad.map((result) => result.source);
+        expect(broadSources).toContain("memory");
+        expect(broadSources).toContain("note");
+        expect(
+            broad.some((result) => result.source === "memory" && result.memoryId === memory.id),
+        ).toBe(true);
     });
 
     it("restricts results to the sources filter", async () => {

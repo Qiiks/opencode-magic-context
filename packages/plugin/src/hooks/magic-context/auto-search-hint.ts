@@ -79,6 +79,10 @@ function renderFragment(result: UnifiedSearchResult, charCap: number): string {
             const compressed = cavemanCompress(result.content, "ultra");
             return truncate(compressed, charCap);
         }
+        case "note": {
+            const compressed = cavemanCompress(result.content, "ultra");
+            return truncate(compressed, charCap);
+        }
     }
 }
 

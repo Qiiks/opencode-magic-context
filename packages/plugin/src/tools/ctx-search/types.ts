@@ -3,7 +3,7 @@ import type { Database } from "../../shared/sqlite";
 /** Sources the agent can narrow ctx_search to. Facts are intentionally NOT a
  *  source — they're always rendered in <session-history> in message[0], so
  *  searching them returns content already visible in context. */
-export type CtxSearchSource = "memory" | "message" | "git_commit" | "primer";
+export type CtxSearchSource = "memory" | "message" | "git_commit" | "primer" | "note";
 
 export interface CtxSearchArgs {
     query: string;

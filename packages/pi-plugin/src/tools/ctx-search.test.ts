@@ -47,4 +47,51 @@ describe("createCtxSearchTool", () => {
 			closeQuietly(db);
 		}
 	});
+
+	it("accepts note sources and renders note anchors", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+			async (_db, _sessionId, _project, _query, options) => {
+				expect(options?.sources).toEqual(["note"]);
+				return [
+					{
+						source: "note",
+						content:
+							"Decision: keep the compatibility shim for one more release.",
+						score: 0.91,
+						noteId: 5,
+						status: "ready",
+						createdAt: Date.now() - 24 * 60 * 60 * 1000,
+						anchorOrdinal: 21,
+					},
+				] as UnifiedSearchResult[];
+			},
+		);
+		try {
+			const tool = createCtxSearchTool({
+				db,
+				memoryEnabled: false,
+				embeddingEnabled: false,
+				gitCommitsEnabled: false,
+			});
+
+			const result = await tool.execute(
+				"call-2",
+				{ query: "compatibility shim", sources: ["note"] },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-search") as never,
+			);
+
+			const text = result.content[0]?.text ?? "";
+			expect(text).toContain("id=#5 status=ready");
+			expect(text).toContain("@msg 21");
+			expect(text).toContain(
+				"Use ctx_expand(start=N-10, end=N) around any note @msg anchor above",
+			);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
 });
