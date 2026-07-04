@@ -2077,6 +2077,29 @@ mod tests {
         )
     }
 
+    /// Cross-repo drift pin for the shared CK wire fixture. Three parties ride
+    /// this exact byte shape (llm-runner produces it, this module parses it,
+    /// ai-proxy produces it), and each repo vendors its own copy — so a
+    /// one-sided regeneration would leave every repo locally green while the
+    /// wire silently drifts. Each repo pins the fixture's sha256; a regen
+    /// fails the pin everywhere until each consumer deliberately re-vendors
+    /// and updates its constant. llm-runner owns the canonical fixture and
+    /// announces the new sha when it legitimately changes.
+    #[test]
+    fn ck_wire_golden_bytes_match_cross_repo_pin() {
+        use sha2::{Digest, Sha256};
+        const GOLDEN_SHA256: &str =
+            "67513b59744cd94d109d08ac7ddcbfd19347fe9eceafb40e46af73f8db1aff20";
+        let bytes = include_bytes!("../testdata/ck_wire_golden.json");
+        let actual = format!("{:x}", Sha256::digest(bytes));
+        assert_eq!(
+            actual, GOLDEN_SHA256,
+            "ck_wire_golden.json changed. If this is a deliberate re-vendor of the \
+             canonical fixture, update GOLDEN_SHA256 to match; otherwise restore the \
+             vendored bytes."
+        );
+    }
+
     #[test]
     fn ck_wire_golden_projects_to_flat_blocks() {
         let ck: Vec<CkWireMessage> =
