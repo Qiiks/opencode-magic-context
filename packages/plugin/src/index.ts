@@ -9,8 +9,10 @@ import { loadPluginConfig } from "./config";
 import { isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
+import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import { resolveProjectIdentity } from "./features/magic-context/memory/project-identity";
+import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
 import {
@@ -44,6 +46,7 @@ import { setKeepSubagents } from "./shared/keep-subagents";
 import { log } from "./shared/logger";
 import { refreshModelLimitsFromApi } from "./shared/models-dev-cache";
 import { MagicContextRpcServer } from "./shared/rpc-server";
+import { closeQuietly } from "./shared/sqlite-helpers";
 
 const server: Plugin = async (ctx) => {
     // Move config from the legacy per-harness locations to the shared CortexKit
@@ -171,6 +174,35 @@ const server: Plugin = async (ctx) => {
             log(`[v22-backfill] failed to start background runner: ${err}`);
         }
     }
+
+    setTimeout(() => {
+        try {
+            const db = openDatabase();
+            if (!db || !isDatabasePersisted(db)) return;
+            const ocDb = openOpenCodeDb();
+            if (!ocDb) return;
+            try {
+                const sessions = ocDb
+                    .prepare(
+                        "SELECT id, COALESCE(directory, '') AS directory FROM session ORDER BY id ASC",
+                    )
+                    .all() as Array<{ id: string; directory: string }>;
+                void runSessionProjectBackfill(
+                    db,
+                    sessions.map((session) => ({
+                        sessionId: session.id,
+                        directory: session.directory,
+                    })),
+                ).catch((err) => {
+                    log(`[session-projects] background runner failed: ${err}`);
+                });
+            } finally {
+                closeQuietly(ocDb);
+            }
+        } catch (err) {
+            log(`[session-projects] failed to start background runner: ${err}`);
+        }
+    }, 0);
 
     // Resolve storage dir up front. Used by the RPC server below AND by
     // the auto-update checker (for cross-process dedup of npm hits when
