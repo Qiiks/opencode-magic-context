@@ -638,7 +638,7 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
                 endpoint: "http://localhost:1234/v1",
             },
         });
-        const projectConfig = JSON.stringify({ ctx_reduce_enabled: true });
+        const projectConfig = JSON.stringify({ smart_drops: true });
 
         const result = loadWithUserAndProjectConfig(userConfig, projectConfig);
 
@@ -679,20 +679,19 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
         // sets a value, project doesn't mention it — user must win.
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({ execute_threshold_percentage: 30, enabled: true }),
-            JSON.stringify({ ctx_reduce_enabled: false }),
+            JSON.stringify({ smart_drops: false }),
         );
 
         // execute_threshold_percentage min is 20, so 30 is valid
         expect(result.execute_threshold_percentage).toBe(30);
-        expect(result.ctx_reduce_enabled).toBe(false);
     });
 
     it("nested object fields deep-merge across user and project", () => {
-        // User sets ctx_reduce_enabled: false; project sets historian model.
+        // User sets a scalar field; project sets historian fallback.
         // Both must coexist in the merged result.
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({
-                ctx_reduce_enabled: false,
+                language: "tr",
                 historian: { model: "anthropic/claude-opus-4-7" },
             }),
             JSON.stringify({
@@ -700,19 +699,29 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
             }),
         );
 
-        expect(result.ctx_reduce_enabled).toBe(false);
+        expect(result.language).toBe("tr");
         expect(result.historian?.model).toBe("anthropic/claude-opus-4-7");
         expect(result.historian?.fallback_models).toEqual(["anthropic/claude-sonnet-4-6"]);
     });
 
     it("project boolean override beats user default", () => {
-        // User: ctx_reduce_enabled defaults to true (omitted). Project sets false.
+        // User omits smart_drops (default false). Project turns it on.
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({ enabled: true }),
-            JSON.stringify({ ctx_reduce_enabled: false }),
+            JSON.stringify({ smart_drops: true }),
         );
 
-        expect(result.ctx_reduce_enabled).toBe(false);
+        expect(result.smart_drops).toBe(true);
+    });
+
+    it("ignores the removed ctx_reduce_enabled key without failing parse", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({ ctx_reduce_enabled: false, execute_threshold_percentage: 30 }),
+            JSON.stringify({}),
+        );
+
+        expect(result.execute_threshold_percentage).toBe(30);
+        expect("ctx_reduce_enabled" in result).toBe(false);
     });
 
     it("disabled_hooks union-merges across user and project", () => {

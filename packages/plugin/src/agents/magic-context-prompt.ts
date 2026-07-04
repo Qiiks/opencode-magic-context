@@ -24,10 +24,10 @@ Because of this:
 - **Finishing a task does not end the session.** Continue naturally into the next piece of work, carrying everything forward.
 - **There are no compaction pauses.** Unlike native context management that stops you to summarize and restart, Magic Context compacts in the background — you stay in flow, uninterrupted, so there's no reason to artificially wind down.`;
 
-/** Closer for ctx_reduce_enabled=true — the agent has an active housekeeping role. */
+/** Closer for sessions where ctx_reduce is callable — the agent has an active housekeeping role. */
 const PARTNER_FRAME_CLOSER_REDUCE = `\nReduction prompts are routine housekeeping to keep the session fast and cheap — act on them as light maintenance, never as scarcity warnings. Keep individual operations efficient, but never let context size change *what* work you take on or *how thoroughly* you do it.`;
 
-/** Closer for ctx_reduce_enabled=false — context is managed fully automatically. */
+/** Closer for sessions where ctx_reduce is unavailable — context is managed fully automatically. */
 const PARTNER_FRAME_CLOSER_NO_REDUCE = `\nContext is managed for you entirely automatically — there's nothing to prune and no warnings to act on. Stay reasonably concise per operation, and never let context size change *what* work you take on or *how thoroughly* you do it.`;
 
 /**
@@ -87,11 +87,12 @@ Keep your user's instructions and intent — never drop a user message for its d
 NEVER drop assistant text messages unless they are exceptionally large. Your conversation messages are lightweight; only large tool outputs are worth dropping.
 Before your turn finishes, consider using \`ctx_reduce\` to drop large tool outputs you no longer need.`;
 
-/** Intro when ctx_reduce is disabled — no drop guidance, no ctx_reduce references,
- *  and no tag system description. When `ctx_reduce_enabled: false`, transform.ts
- *  skips §N§ prefix injection entirely, so the agent never sees tags — describing
- *  a tagging system they can't observe just wastes tokens and (empirically) primes
- *  some models to emit malformed `§N">§` tokens at the start of their own text. */
+/** Intro when ctx_reduce is unavailable — no drop guidance, no ctx_reduce
+ *  references, and no tag system description. When the session's tool allow-list
+ *  denies ctx_reduce, transform.ts skips §N§ prefix injection entirely, so the
+ *  agent never sees tags — describing a tagging system they can't observe just
+ *  wastes tokens and (empirically) primes some models to emit malformed `§N">§`
+ *  tokens at the start of their own text. */
 const BASE_INTRO_NO_REDUCE = (memoryEnabled: boolean): string => `${CTX_NOTE_GUIDANCE}
 ${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
 Use \`ctx_expand\` to recover the raw conversation behind a \`<compartment>\` summary in \`<session-history>\` — pass its \`start\`/\`end\` attributes when the summary is not enough (exact wording, values, error text).
@@ -144,7 +145,7 @@ const CAVEMAN_COMPRESSION_WARNING = `\n**BEWARE**: History compression is on; ol
 export function buildMagicContextSection(
     _agent: string | null,
     protectedTags: number,
-    ctxReduceEnabled = true,
+    ctxReduceCallable = true,
     dreamerEnabled = false,
     temporalAwarenessEnabled = false,
     cavemanTextCompressionEnabled = false,
@@ -165,18 +166,15 @@ export function buildMagicContextSection(
         ? `\nWhen \`surface_condition\` is provided with \`write\`, the note becomes a project-scoped smart note.\nThe dreamer evaluates smart note conditions during nightly runs and surfaces them when conditions are met.\nExample: \`ctx_note(action="write", content="Implement X because Y", surface_condition="When PR #42 is merged in this repo")\``
         : "";
     const temporalGuidance = temporalAwarenessEnabled ? TEMPORAL_AWARENESS_GUIDANCE : "";
-    // Caveman compression only runs when ctx_reduce_enabled === false (verified
-    // in transform.ts gate). The flag is also gated upstream in hook.ts so it
-    // never reaches the prompt builder when ctx_reduce is on. Belt-and-braces:
-    // we still only emit the warning when ctxReduceEnabled === false even if
-    // somehow the flag flipped on with ctx_reduce enabled.
-    const cavemanWarning =
-        cavemanTextCompressionEnabled && !ctxReduceEnabled ? CAVEMAN_COMPRESSION_WARNING : "";
+    // Caveman compression is independent of ctx_reduce availability. Emit the
+    // warning in both primary guidance variants whenever the primary-session
+    // caveman pass is enabled so the agent does not mimic compressed history.
+    const cavemanWarning = cavemanTextCompressionEnabled ? CAVEMAN_COMPRESSION_WARNING : "";
     const languageDirective = buildPrimaryLanguageDirective(language);
     const languageGuidance = languageDirective ? `\n\n${languageDirective}` : "";
 
-    if (!ctxReduceEnabled) {
+    if (!ctxReduceCallable) {
         return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_NO_REDUCE}\n\n${BASE_INTRO_NO_REDUCE(memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
     }
-    return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_REDUCE}\n\n${BASE_INTRO(protectedTags, memoryEnabled)}${smartNoteGuidance}${temporalGuidance}\n${GENERIC_SECTION}\n\nPrefer many small targeted operations over one large blanket operation, and keep the working set tidy as routine maintenance.${languageGuidance}`;
+    return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_REDUCE}\n\n${BASE_INTRO(protectedTags, memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}\n${GENERIC_SECTION}\n\nPrefer many small targeted operations over one large blanket operation, and keep the working set tidy as routine maintenance.${languageGuidance}`;
 }

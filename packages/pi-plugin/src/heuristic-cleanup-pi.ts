@@ -92,8 +92,7 @@ export interface PiHeuristicCleanupConfig {
 	};
 	/**
 	 * Age-tier caveman text compression settings. Caller is responsible
-	 * for only forwarding this when `ctx_reduce_enabled === false` (the
-	 * feature replaces manual ctx_reduce text dropping).
+	 * for forwarding this only for primary sessions where caveman is enabled.
 	 */
 	caveman?: CavemanCleanupConfig;
 }

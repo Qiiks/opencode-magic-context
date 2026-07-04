@@ -85,14 +85,6 @@ const FIELD_DEFS: FieldDef[] = [
     section: "General",
   },
   {
-    key: "ctx_reduce_enabled",
-    label: "Agent Controlled Reduction",
-    type: "boolean",
-    description:
-      "Enable agent-controlled reductions via the ctx_reduce tool. When enabled, the agent is prompted and nudged to choose what messages and tool calls to drop. When disabled, the system still manages context automatically via historian comparting and the tiered emergency drop under pressure.",
-    section: "General",
-  },
-  {
     key: "toast_duration_ms",
     label: "Toast Duration (ms)",
     type: "number",
@@ -1500,11 +1492,6 @@ function ConfigForm(props: {
             const setCaveman = (patch: Record<string, unknown>) =>
               handleFieldChange("caveman_text_compression", { ...caveman(), ...patch });
 
-            const ctxReduceEnabled = () => {
-              const v = getNestedValue(formData(), "ctx_reduce_enabled");
-              return v == null ? true : Boolean(v);
-            };
-
             return (
               <div class="config-card full-width">
                 <div class="config-card-header">
@@ -1705,25 +1692,13 @@ function ConfigForm(props: {
                       <span class="config-field-key">caveman_text_compression.enabled</span>
                     </div>
                     <span class="config-field-desc">
-                      Age-tiered compression for long user/assistant text parts.{" "}
-                      <strong>
-                        Only active when Agent Controlled Reduction (<code>ctx_reduce_enabled</code>
-                        ) is OFF.
-                      </strong>{" "}
-                      Outside the protected tail, oldest 20% of eligible tags get ultra compression,
-                      next 20% full, next 20% lite, newest 40% untouched. Always compresses from the
-                      original source, so depth shifts are equivalent to compressing the original
-                      text directly. Off by default.
+                      Age-tiered compression for long user/assistant text parts. Active for primary
+                      sessions when enabled; subagents are excluded because their context is curated
+                      by the parent. Outside the protected tail, oldest 20% of eligible tags get
+                      ultra compression, next 20% full, next 20% lite, newest 40% untouched. Always
+                      compresses from the original source, so depth shifts are equivalent to
+                      compressing the original text directly. Off by default.
                     </span>
-                    <Show when={ctxReduceEnabled() && cavemanEnabled()}>
-                      <div
-                        class="config-field-desc"
-                        style={{ color: "var(--color-warning, #c8881f)", "margin-bottom": "4px" }}
-                      >
-                        ⚠️ Caveman compression has no effect while Agent Controlled Reduction is
-                        enabled. Disable <code>ctx_reduce_enabled</code> in General to use this.
-                      </div>
-                    </Show>
                     <label class="toggle-switch">
                       <input
                         type="checkbox"

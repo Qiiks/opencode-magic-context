@@ -18,11 +18,6 @@
       "description": "Output language for Magic Context's generated content and guidance, as a 2-letter ISO 639-1 code (e.g. \"tr\", \"es\", \"de\", \"ja\", \"pt\"). When set, the historian, dreamer, sidekick, and the agent-guidance block instruct the model to write its PROSE in this language while keeping all structural tokens (XML tags, the five memory category names, code identifiers, file paths) in English. USER-LEVEL ONLY (ignored in project config for security). Unset = today's behavior (model mirrors the conversation; English scaffolding). Changing it triggers one cache re-materialization; existing compartments/memories keep their original language until naturally rewritten.",
       "type": "string"
     },
-    "ctx_reduce_enabled": {
-      "default": true,
-      "description": "When false, ctx_reduce tool is hidden, all nudges disabled, and prompt guidance about ctx_reduce stripped. Heuristic cleanup, compartments, memory, and other features still work. (default: true)",
-      "type": "boolean"
-    },
     "historian": {
       "description": "Historian agent configuration (model, fallback_models, variant, temperature, maxTokens, permission, two_pass, etc.)",
       "type": "object",
@@ -1224,12 +1219,12 @@
         "enabled": false,
         "min_chars": 500
       },
-      "description": "Age-tier caveman compression for long user/assistant text parts. Only active when ctx_reduce_enabled is false. Oldest 20% of eligible tags (outside protected tail) go to ultra, next 20% to full, next 20% to lite, newest 40% untouched. Graduated from experimental.caveman_text_compression; opt-in, default off (lossy).",
+      "description": "Age-tier caveman compression for long user/assistant text parts. Active for primary sessions when enabled; never for subagents. Oldest 20% of eligible tags (outside protected tail) go to ultra, next 20% to full, next 20% to lite, newest 40% untouched. Graduated from experimental.caveman_text_compression; opt-in, default off (lossy).",
       "type": "object",
       "properties": {
         "enabled": {
           "default": false,
-          "description": "Apply deterministic caveman-style text compression to old conversation text. Only active when ctx_reduce_enabled=false. Compresses user/assistant text in oldest-first tiers: ultra (oldest 20%), full, lite, untouched (newest 40%).",
+          "description": "Apply deterministic caveman-style text compression to old conversation text. Active for primary sessions when enabled; never for subagents. Compresses user/assistant text in oldest-first tiers: ultra (oldest 20%), full, lite, untouched (newest 40%).",
           "type": "boolean"
         },
         "min_chars": {

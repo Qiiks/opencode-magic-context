@@ -260,20 +260,16 @@ export interface TransformDeps {
     db: ContextDatabase;
     /**
      * Channel 1 (ctx_reduce tool-output nudge) per-session metric baseline,
-     * refreshed at the end of each primary-session transform pass and read in
-     * tool.execute.after. Subagents never get a snapshot, which is how Channel 1
-     * stays primary-only.
+     * refreshed at the end of each transform pass where ctx_reduce is callable
+     * and read in tool.execute.after.
      */
     channel1StateBySession?: Map<string, import("./ctx-reduce-nudge").Channel1State>;
     protectedTags: number;
     /**
-     * Primary-session ctx_reduce setting. When false, tag prefix injection is
-     * skipped for ALL sessions (primary + subagent). When true, primary sessions
-     * get prefixes but subagent sessions still skip (subagents are always
-     * treated as ctx_reduce_enabled=false). See tag-messages.ts for the gate.
-     * Defaults to true when omitted (preserves legacy behavior for tests).
+     * ctx_reduce visibility is resolved per session from the session's tool
+     * allow-list. Tag DB rows are still maintained when the tool is unavailable,
+     * but §N§ prefixes and nudges are suppressed. See tag-messages.ts for the gate.
      */
-    ctxReduceEnabled?: boolean;
     /** Smart-drops (experimental, default off): also reclaim tool output that a
      *  later call supersedes, on top of the age-based auto-drop. Off → messages
      *  sent to the model are byte-identical to the age-based-only behavior. */
@@ -372,9 +368,9 @@ export interface TransformDeps {
     /**
      * Experimental age-tier caveman text compression — rewrites long
      * user/assistant text parts with progressively aggressive caveman
-     * rules based on their position in the eligible tag window. Only
-     * honored when `ctx_reduce_enabled: false` (transform zeroes this
-     * out when ctx_reduce is on so the postprocess path stays unaware).
+     * rules based on their position in the eligible tag window. Only runs for
+     * primary sessions; subagents are excluded because their context is curated
+     * by the parent and they have no ctx_expand recovery path.
      */
     cavemanTextCompression?: {
         enabled: boolean;
@@ -446,10 +442,8 @@ export function createTransform(deps: TransformDeps) {
         const fullFeatureMode = !reducedMode;
         // §N§ prefix + ctx_reduce + Channel 1 are gated on this single signal,
         // NOT on subagent status. `ctx_reduce` is registered process-globally
-        // (tool-registry.ts), so subagents already have the tool — they just
-        // need the §N§ prefix + Channel 1 baseline + guidance to use it. A
-        // primary with ctx_reduce disabled correctly gets none of these (no
-        // tool to act on tags). `undefined === true` for this gate (default on).
+        // (tool-registry.ts), so subagents may have the tool — they just need
+        // the §N§ prefix + Channel 1 baseline + guidance to use it.
         //
         // ALSO gated on the session's actual tool availability: a parent agent
         // can spawn this session with an explicit allow-list tools map that
@@ -457,9 +451,7 @@ export function createTransform(deps: TransformDeps) {
         // the model can't call are pure overhead plus cargo-cult risk. The
         // verdict is frozen per session (first user message's tools map) so it
         // can never flap mid-session and bust the cache.
-        const ctxReduceEnabledEffective =
-            deps.ctxReduceEnabled !== false &&
-            resolveCtxReduceAvailabilityFromMessages(sessionId, messages);
+        const ctxReduceCallable = resolveCtxReduceAvailabilityFromMessages(sessionId, messages);
 
         // Resolve the *session's* working directory, not the OpenCode launch
         // directory. When the user runs `opencode -s <id>` from outside the
@@ -1332,12 +1324,12 @@ export function createTransform(deps: TransformDeps) {
             // the identical live-wire floor.
             deps.tagger.initFromDb(sessionId, db, taggerFloor);
             logTransformTiming(sessionId, "tag.initFromDb", tInitFromDb);
-            // Skip §N§ prefix injection only when ctx_reduce is disabled (agents
-            // have no tool to act on tags). Subagents DO get prefixes now — they
-            // share the process-global ctx_reduce tool and self-manage tool
-            // bloat. DB tag records are maintained either way so heuristics and
-            // drops continue to work — only the agent-visible prefix is gated.
-            const skipPrefixInjection = !ctxReduceEnabledEffective;
+            // Skip §N§ prefix injection only when ctx_reduce is unavailable in
+            // this session's tool allow-list. Subagents with the tool DO get
+            // prefixes now — they self-manage tool bloat. DB tag records are
+            // maintained either way so heuristics and drops continue to work;
+            // only the agent-visible prefix is gated.
+            const skipPrefixInjection = !ctxReduceCallable;
             const result = tagMessages(sessionId, messages, deps.tagger, db, {
                 skipPrefixInjection,
             });
@@ -1494,15 +1486,15 @@ export function createTransform(deps: TransformDeps) {
         // every pass, so without this replay step compressed text would
         // oscillate between compressed (post-execute) and original (defer),
         // busting the provider prompt cache. Cheap when no tags carry
-        // caveman_depth > 0 (early exit). Only forwarded when ctx_reduce
-        // is disabled AND not a subagent — matches the gate that lets
-        // applyCavemanCleanup deepen depth in the first place.
+        // caveman_depth > 0 (early exit). Only runs for primary sessions —
+        // matches the gate that lets applyCavemanCleanup deepen depth in the
+        // first place.
         //
         // We feed the targets-slice subset (already loaded above for
         // applyFlushedStatuses) — replay only acts on tags whose
         // tag_number is in `targets` anyway, so passing the wider list
         // would just give it more rows to filter and discard.
-        if (!deps.ctxReduceEnabled && !reducedMode && deps.cavemanTextCompression?.enabled) {
+        if (!reducedMode && deps.cavemanTextCompression?.enabled) {
             const tCavemanReplay = performance.now();
             const replayedCaveman = replayCavemanCompression(
                 sessionId,
@@ -1730,21 +1722,11 @@ export function createTransform(deps: TransformDeps) {
             projectPath: sessionProjectIdentity,
             sessionDirectory,
             autoSearch: deps.autoSearch,
-            // Only forward caveman config when ctx_reduce is disabled — the
-            // feature replaces manual ctx_reduce text-dropping for users
-            // who opted out of agent-driven reduction. Keeping it gated here
-            // means the postprocess/heuristic paths can stay config-agnostic.
-            // Only forward caveman config when ctx_reduce is explicitly
-            // disabled AND this is not a subagent. The feature replaces
-            // manual ctx_reduce text-dropping for users who opted out of
-            // agent-driven reduction; subagents should never receive their
-            // own caveman compression because they have no equivalent
-            // recovery path and their context is already curated by the
-            // primary agent that spawned them.
-            cavemanTextCompression:
-                deps.ctxReduceEnabled === false && !reducedMode
-                    ? deps.cavemanTextCompression
-                    : undefined,
+            // Only forward caveman config for primary sessions. Subagents should
+            // never receive their own caveman compression because they have no
+            // equivalent recovery path and their context is already curated by
+            // the primary agent that spawned them.
+            cavemanTextCompression: !reducedMode ? deps.cavemanTextCompression : undefined,
             smartDrops: deps.smartDrops === true,
             // Pass the single resolved provider through to postprocess so every
             // empty-sentinel gate and whole-message placeholder choice agrees for
@@ -2000,10 +1982,10 @@ export function createTransform(deps: TransformDeps) {
         // nudges the agent to call ctx_reduce, so it's meaningful exactly when
         // the agent has the §N§ prefix + the tool — i.e. any session with
         // ctx_reduce enabled, INCLUDING subagents (which self-manage tool
-        // bloat). It must NOT fire for a ctx_reduce_enabled:false primary (no
-        // tool to act on). Channel 2 (the synthetic-user ceiling) rides the same
-        // gate — it fires for any ctx_reduce-effective session, subagents included.
-        if (ctxReduceEnabledEffective && deps.channel1StateBySession) {
+        // bloat). It must NOT fire when the session's tool allow-list denies
+        // ctx_reduce. Channel 2 (the synthetic-user ceiling) rides the same gate
+        // — it fires for any ctx_reduce-effective session, subagents included.
+        if (ctxReduceCallable && deps.channel1StateBySession) {
             try {
                 // Always resolve through resolveExecuteThreshold — even when the
                 // percentage config is a bare number — so an execute_threshold_tokens

@@ -148,15 +148,11 @@ describe("loadPiConfig", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
 		withHome(home);
-		const userPath = writeUserConfig(
-			home,
-			'{ "ctx_reduce_enabled": false }',
-			"json",
-		);
+		const userPath = writeUserConfig(home, '{ "smart_drops": true }', "json");
 
 		const result = loadPiConfig({ cwd });
 
-		expect(result.config.ctx_reduce_enabled).toBe(false);
+		expect(result.config.smart_drops).toBe(true);
 		expect(result.loadedFromPaths).toEqual([userPath]);
 	});
 

@@ -620,11 +620,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
 		// the retrieval-only sidekick, a separate security concern.)
 		memoryToolEnabled: true,
-		// Match OpenCode's gating: when ctx_reduce_enabled is false,
-		// we don't surface the tool at all (along with disabling §N§
-		// prefix injection and stripping ctx_reduce mentions from the
-		// system prompt). When true, register ctx_reduce.
-		ctxReduceEnabled: config.ctx_reduce_enabled === true,
 		protectedTags: config.protected_tags ?? 20,
 		// Smart notes (surface_condition) only work when dreamer is
 		// running — otherwise the note sits `pending` forever with no
@@ -632,9 +627,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		dreamerEnabled: isDreamerRunnable(config),
 	});
 	info(
-		`registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand${
-			config.ctx_reduce_enabled === true ? ", ctx_reduce" : ""
-		}`,
+		"registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce",
 	);
 
 	// Register the per-LLM-call transform pipeline. Tags eligible message
@@ -666,17 +659,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		auto: PiAutoSearchHandlerOptions,
 	): PiContextHandlerOptions => ({
 		db: database,
-		ctxReduceEnabled: cfg.ctx_reduce_enabled,
 		smartDrops: cfg.smart_drops === true,
 		protectedTags: cfg.protected_tags ?? 20,
 		heuristics: {
-			caveman:
-				cfg.ctx_reduce_enabled === false && cfg.caveman_text_compression
-					? {
-							enabled: cfg.caveman_text_compression.enabled,
-							minChars: cfg.caveman_text_compression.min_chars,
-						}
-					: undefined,
+			caveman: cfg.caveman_text_compression
+				? {
+						enabled: cfg.caveman_text_compression.enabled,
+						minChars: cfg.caveman_text_compression.min_chars,
+					}
+				: undefined,
 			clearReasoningAge: cfg.clear_reasoning_age,
 		},
 		injection: {
@@ -1124,11 +1115,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				memoryEnabled: effectiveConfig.memory.enabled,
 				includeGuidance: true,
 				protectedTags: effectiveConfig.protected_tags,
-				ctxReduceEnabled: effectiveConfig.ctx_reduce_enabled,
+				ctxReduceCallable: true,
 				dreamerEnabled: effectiveDreamerRunnable,
 				temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
 				cavemanTextCompressionEnabled:
-					effectiveConfig.ctx_reduce_enabled === false &&
 					effectiveConfig.caveman_text_compression?.enabled === true,
 				language: effectiveConfig.language,
 				// Stable user memories rendered as <user-profile> — dreamer

@@ -876,7 +876,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -898,8 +897,7 @@ describe("registerPiContextHandler", () => {
 		// Council #4 (project-config bleed on /cd): a Pi process can switch
 		// projects mid-session; the context handler must resolve options from the
 		// CURRENT pass cwd, not the launch-cwd base options. We assert the
-		// resolver is consulted with ctx.cwd and that its returned options win
-		// (here: a switched project disables ctx_reduce, so no §N§ prefix).
+		// resolver is consulted with ctx.cwd and that its returned options win.
 		const db = createTestDb();
 		try {
 			const fake = createFakePi();
@@ -907,12 +905,9 @@ describe("registerPiContextHandler", () => {
 			const switchedDir = "/tmp/switched-project-abc";
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				// Base (launch) options: ctx_reduce ON.
-				ctxReduceEnabled: true,
 				resolveForProject: (dir: string) => {
 					seenDirs.push(dir);
-					// Switched checkout turns ctx_reduce OFF.
-					return { db, ctxReduceEnabled: false };
+					return { db, smartDrops: true };
 				},
 			});
 			const handler = fake.handlers.get("context") as (
@@ -943,7 +938,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -975,7 +969,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: false,
 				historian: {
 					runner: {} as SubagentRunner,
 					model: "test/historian",
@@ -1015,7 +1008,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				scheduler: { executeThresholdPercentage: 65 },
 			});
@@ -1068,7 +1060,6 @@ describe("registerPiContextHandler", () => {
 			recordPiLiveModel(sessionId, "anthropic/old-model");
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				scheduler: { executeThresholdPercentage: 65 },
 			});
@@ -1124,7 +1115,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -1160,7 +1150,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				// Disable protection so the immediate drop on tag #2 actually
 				// materializes; otherwise the schema default (20) defers the
 				// drop because tag #2 is in the protected window.
@@ -1217,7 +1206,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -1266,7 +1254,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -1337,7 +1324,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				autoSearch: {
 					enabled: true,
 					scoreThreshold: 0.6,
@@ -1377,7 +1363,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				autoSearch: {
 					enabled: true,
 					scoreThreshold: 0.6,
@@ -1430,7 +1415,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -1555,7 +1539,6 @@ describe("registerPiContextHandler", () => {
 			recordPiLiveModel("ses-context", "anthropic/claude-sonnet-4-5");
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				scheduler: {
 					executeThresholdPercentage: {
@@ -1612,7 +1595,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				scheduler: { executeThresholdPercentage: 80 },
 			});
@@ -1670,7 +1652,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				heuristics: {},
 				scheduler: { executeThresholdPercentage: 65 },
@@ -1749,7 +1730,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				heuristics: {},
 				scheduler: { executeThresholdPercentage: 65 },
@@ -1814,7 +1794,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				historian: {
 					runner,
@@ -2054,7 +2033,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -2092,7 +2070,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner: {} as SubagentRunner,
 					model: "test/historian",
@@ -2150,7 +2127,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner,
 					model: "test/model",
@@ -2214,7 +2190,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -2269,7 +2244,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner,
 					model: "test/model",
@@ -2332,7 +2306,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner,
 					model: "test/model",
@@ -2394,7 +2367,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner,
 					model: "test/model",
@@ -2487,7 +2459,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				heuristics: {},
 				injection: { injectionBudgetTokens: 10_000 },
@@ -2595,7 +2566,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db: args.db,
-				ctxReduceEnabled: true,
 				injection: { injectionBudgetTokens: 10_000 },
 			});
 			const handler = fake.handlers.get("context") as (

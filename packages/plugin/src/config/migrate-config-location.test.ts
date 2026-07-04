@@ -105,7 +105,7 @@ describe("migrateConfigFile (location migration)", () => {
         try {
             const legacy = join(dir, ".opencode", "magic-context.jsonc");
             mkdirSync(join(dir, ".opencode"), { recursive: true });
-            writeFileSync(legacy, '{ "ctx_reduce_enabled": true }');
+            writeFileSync(legacy, '{ "enabled": true }');
             const target = join(dir, ".cortexkit", "magic-context.jsonc");
 
             const r = migrateConfigFile({
@@ -117,7 +117,7 @@ describe("migrateConfigFile (location migration)", () => {
             expect(r.migrated).toBe(true);
             expect(r.conflict).toBe(false);
             // Content is at the target...
-            expect(readFileSync(target, "utf8")).toContain("ctx_reduce_enabled");
+            expect(readFileSync(target, "utf8")).toContain("enabled");
             // ...the legacy file is gone (idempotency comes from this)...
             expect(existsSync(legacy)).toBe(false);
             // ...and a human breadcrumb preserves the original below a header.
@@ -126,7 +126,7 @@ describe("migrateConfigFile (location migration)", () => {
             const markerText = readFileSync(marker, "utf8");
             expect(markerText).toContain("configuration moved");
             expect(markerText).toContain(target);
-            expect(markerText).toContain("ctx_reduce_enabled");
+            expect(markerText).toContain("enabled");
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

@@ -119,7 +119,6 @@ export function isMagicContextInternalAgent(systemPromptContent: string): boolea
 export function createSystemPromptHashHandler(deps: {
     db: ContextDatabase;
     protectedTags: number;
-    ctxReduceEnabled: boolean;
     dreamerEnabled: boolean;
     /** When false (`memory.enabled: false`), the `<project-memory>` block is
      *  never injected, so ctx_memory guidance is dropped from the prompt and the
@@ -177,8 +176,8 @@ export function createSystemPromptHashHandler(deps: {
     experimentalPinKeyFilesTokenBudget?: number;
     /** When true, add a temporal-awareness guidance paragraph + surface compartment dates */
     experimentalTemporalAwareness?: boolean;
-    /** When true (and ctx_reduce_enabled is false), inject a "BEWARE: history compression is on"
-     *  warning so the agent doesn't mimic its own caveman-compressed past output. */
+    /** When true, inject a "BEWARE: history compression is on" warning so the
+     *  agent doesn't mimic its own caveman-compressed past output. */
     experimentalCavemanTextCompression?: boolean;
 }): {
     handler: (input: { sessionID?: string }, output: { system: string[] }) => Promise<void>;
@@ -279,16 +278,10 @@ export function createSystemPromptHashHandler(deps: {
         }
 
         // ── Step 1: Inject magic-context guidance ──
-        // Subagent guidance depends on whether ctx_reduce is enabled:
-        //   • ctx_reduce ON  → minimal §N§ + ctx_reduce block (subagentReduceMode).
-        //     Subagents share the process-global ctx_reduce tool and get §N§
-        //     prefixes (transform.ts), so they self-manage tool bloat. They take
-        //     NONE of the primary's role (no partner frame, memory/search/note
-        //     guidance, reduction taxonomy) — just the drop mechanics.
-        //   • ctx_reduce OFF → NO block at all. The subagent has no §N§ prefix and
-        //     no ctx_reduce tool to act on, so there's nothing to guide; injecting
-        //     the no-reduce PRIMARY block here would leak the partner frame +
-        //     memory/search/note guidance into a bounded, parent-driven subagent.
+        // Subagents with callable ctx_reduce get only the minimal drop mechanics
+        // guidance. Subagents without the tool get no Magic Context guidance,
+        // because the primary-session no-reduce block would incorrectly describe
+        // memory/search/note behavior for a bounded, parent-driven child task.
         let sessionMetaEarly: import("../../features/magic-context/types").SessionMeta | undefined;
         try {
             sessionMetaEarly = getOrCreateSessionMeta(deps.db, sessionId);
@@ -301,14 +294,10 @@ export function createSystemPromptHashHandler(deps: {
         // guidance for an uncallable tool is overhead + cargo-cult risk.
         // Resolved once per session (frozen verdict — no hash flapping).
         const ctxReduceCallable = resolveCtxReduceAvailability(sessionId);
-        const subagentReduceMode =
-            isSubagentSession && deps.ctxReduceEnabled !== false && ctxReduceCallable;
-        const effectiveCtxReduceEnabled = isSubagentSession
-            ? false
-            : deps.ctxReduceEnabled !== false && ctxReduceCallable;
-        // A subagent with ctx_reduce disabled or uncallable gets no MC guidance.
-        const skipGuidanceForDisabledSubagent =
-            isSubagentSession && (deps.ctxReduceEnabled === false || !ctxReduceCallable);
+        const subagentReduceMode = isSubagentSession && ctxReduceCallable;
+        const effectiveCtxReduceEnabled = isSubagentSession ? false : ctxReduceCallable;
+        // A subagent without callable ctx_reduce gets no MC guidance.
+        const skipGuidanceForDisabledSubagent = isSubagentSession && !ctxReduceCallable;
         const fullPrompt = output.system.join("\n");
         if (
             fullPrompt.length > 0 &&

@@ -96,7 +96,6 @@ export interface MagicContextDeps {
     config: {
         protected_tags: number;
         language?: string;
-        ctx_reduce_enabled?: boolean;
         smart_drops?: boolean;
         toast_duration_ms?: number;
         clear_reasoning_age?: number;
@@ -304,7 +303,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         }
         return undefined;
     };
-    const ctxReduceEnabled = deps.config.ctx_reduce_enabled !== false;
     const dreamerRunnable = isDreamerRunnable(deps.config);
     const dreamerConfig = dreamerRunnable ? deps.config.dreamer : undefined;
     const historianRunnable = isHistorianRunnable(deps.config);
@@ -544,7 +542,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         db,
         channel1StateBySession,
         protectedTags: deps.config.protected_tags,
-        ctxReduceEnabled,
         smartDrops: deps.config.smart_drops === true,
         clearReasoningAge: deps.config.clear_reasoning_age ?? 50,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
@@ -606,12 +603,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
               }
             : undefined,
-        // Age-tier caveman text compression — only honored when
-        // ctx_reduce_enabled: false. Transform gates this itself too, but we
-        // avoid wiring the feature at all when ctx_reduce is on so the
-        // transform deps stay clean.
+        // Age-tier caveman text compression is an opt-in primary-session pass.
+        // Subagents are excluded in transform.ts because their context is curated
+        // by the parent and they have no ctx_expand recovery path.
         cavemanTextCompression:
-            ctxReduceEnabled === false && deps.config.caveman_text_compression?.enabled === true
+            deps.config.caveman_text_compression?.enabled === true
                 ? {
                       enabled: true,
                       minChars: deps.config.caveman_text_compression.min_chars ?? 500,
@@ -809,7 +805,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const systemPromptHash = createSystemPromptHashHandler({
         db,
         protectedTags: deps.config.protected_tags,
-        ctxReduceEnabled,
         dreamerEnabled: dreamerRunnable,
         // Gates ctx_memory guidance out of the prompt when memory is off (the
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
@@ -833,12 +828,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         internalChildSessions,
         experimentalUserMemories: userMemoryCollectionEnabled(deps.config.dreamer),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
-        // Caveman text compression only runs when ctx_reduce_enabled === false
-        // (gated in transform.ts and in hook.ts cavemanTextCompression wiring above).
-        // Mirror that gate here so the prompt warning never appears in modes where
-        // caveman won't actually compress anything.
-        experimentalCavemanTextCompression:
-            ctxReduceEnabled === false && deps.config.caveman_text_compression?.enabled === true,
+        // Mirror the primary-session caveman opt-in so the agent knows older
+        // prose may be rewritten even when ctx_reduce is available.
+        experimentalCavemanTextCompression: deps.config.caveman_text_compression?.enabled === true,
     });
     const systemPromptHashHandler = systemPromptHash.handler;
 
@@ -859,7 +851,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         commitSeenLastPass,
         client: deps.client,
         protectedTags: deps.config.protected_tags,
-        ctxReduceEnabled,
     });
 
     return {
@@ -875,7 +866,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions,
             pendingMaterializationSessions,
             lastHeuristicsTurnId,
-            ctxReduceEnabled,
             // E5 — only offer the upgrade reminder when historian can run (so
             // /ctx-session-upgrade is actually actionable). Self-gates per session.
             upgradeReminder: historianRunnable

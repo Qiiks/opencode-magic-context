@@ -45,6 +45,10 @@ import {
     COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT,
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./compartment-prompt";
+import {
+    clearCtxReduceAvailability,
+    resolveCtxReduceAvailabilityFromMessages,
+} from "./ctx-reduce-availability";
 import { createSystemPromptHashHandler, isMagicContextInternalAgent } from "./system-prompt-hash";
 
 const tempDirs: string[] = [];
@@ -78,13 +82,12 @@ function buildHandler(opts?: {
     dreamerEnabled?: boolean;
     experimentalUserMemories?: boolean;
     internalChildSessions?: Set<string>;
-    ctxReduceEnabled?: boolean;
+    experimentalCavemanTextCompression?: boolean;
     language?: string;
 }): ReturnType<typeof createSystemPromptHashHandler> {
     return createSystemPromptHashHandler({
         db: openDatabase(),
         protectedTags: 1,
-        ctxReduceEnabled: opts?.ctxReduceEnabled ?? true,
         language: opts?.language,
         dreamerEnabled: opts?.dreamerEnabled ?? false,
         historyRefreshSessions: opts?.historyRefreshSessions ?? new Set<string>(),
@@ -95,6 +98,7 @@ function buildHandler(opts?: {
         injectionSkipSignatures: opts?.injectionSkipSignatures,
         experimentalUserMemories: opts?.experimentalUserMemories,
         internalChildSessions: opts?.internalChildSessions,
+        experimentalCavemanTextCompression: opts?.experimentalCavemanTextCompression,
     });
 }
 
@@ -566,17 +570,22 @@ describe("system-prompt-hash subagent self-management (Unit B)", () => {
         expect(joined).not.toContain("ctx_search");
     });
 
-    it("injects NO block for a ctx_reduce-DISABLED subagent (no primary-role leak)", async () => {
-        useTempDataHome("sph-subagent-disabled-");
-        const sessionId = "ses-subagent-disabled";
+    it("injects NO block for a subagent without callable ctx_reduce (no primary-role leak)", async () => {
+        useTempDataHome("sph-subagent-denied-");
+        const sessionId = "ses-subagent-denied";
         const db = openDatabase();
         getOrCreateSessionMeta(db, sessionId);
         updateSessionMeta(db, sessionId, { isSubagent: true });
 
-        // ctx_reduce OFF: the subagent has no §N§ and no tool to act on, so it
-        // must get NO Magic Context block — not the no-reduce PRIMARY block
-        // (which would leak the partner frame + memory/search/note guidance).
-        const { handler } = buildHandler({ ctxReduceEnabled: false });
+        // Tool allow-list denies ctx_reduce: the subagent has no §N§ and no tool
+        // to act on, so it must get NO Magic Context block — not the no-reduce
+        // PRIMARY block (which would leak the partner frame + memory/search/note
+        // guidance).
+        clearCtxReduceAvailability(sessionId);
+        resolveCtxReduceAvailabilityFromMessages(sessionId, [
+            { info: { role: "user", tools: { "*": false, read: true } } },
+        ]);
+        const { handler } = buildHandler();
         const system = ["You are a general-purpose coding subagent."];
         await handler({ sessionID: sessionId }, { system });
 
@@ -601,6 +610,22 @@ describe("system-prompt-hash subagent self-management (Unit B)", () => {
         expect(joined).toContain("## Magic Context");
         expect(joined).toContain("long-term partner");
         expect(joined).toContain("ctx_memory");
+    });
+
+    it("warns primary sessions about caveman compression even when ctx_reduce is callable", async () => {
+        useTempDataHome("sph-primary-caveman-reduce-");
+        const sessionId = "ses-primary-caveman-reduce";
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+
+        const { handler } = buildHandler({ experimentalCavemanTextCompression: true });
+        const system = ["You are the primary coding assistant."];
+        await handler({ sessionID: sessionId }, { system });
+
+        const joined = system.join("\n");
+        expect(joined).toContain("ctx_reduce");
+        expect(joined).toContain("History compression is on");
+        expect(joined).toContain("DO NOT mimic this style");
     });
 
     it("ORDER INVARIANT: an internal MC child that is ALSO marked subagent still skips entirely", async () => {

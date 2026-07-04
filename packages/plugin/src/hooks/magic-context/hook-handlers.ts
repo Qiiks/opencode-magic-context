@@ -161,7 +161,6 @@ export function createChatMessageHook(args: {
     systemPromptRefreshSessions: SystemPromptRefreshSessions;
     pendingMaterializationSessions: PendingMaterializationSessions;
     lastHeuristicsTurnId: LastHeuristicsTurnId;
-    ctxReduceEnabled?: boolean;
     /** E5 — one-time session upgrade reminder. Optional: only wired when the
      *  historian can run (so an upgrade is actually possible). Self-gates. */
     upgradeReminder?: (sessionId: string) => Promise<void>;
@@ -240,7 +239,6 @@ export function createEventHook(args: {
     commitSeenLastPass?: Map<string, boolean>;
     client: PluginContext["client"];
     protectedTags: number;
-    ctxReduceEnabled?: boolean;
 }) {
     return async (input: { event: { type: string; properties?: unknown } }) => {
         await args.eventHandler(input);

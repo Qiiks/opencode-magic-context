@@ -936,26 +936,26 @@ Prefer many small targeted operations over one large blanket operation. Compress
 
 ## Session Modes
 
-Magic Context runs in three effective modes depending on `ctx_reduce_enabled` and whether the session is a subagent. The mode decides which of the heavier features (historian, nudges, prompt-adjunct injections) run for that session, while tag/drop/heuristic plumbing stays on everywhere so any subsequent manual or automated reduction still works.
+Magic Context runs in two effective modes: primary sessions and subagents. The mode decides which heavier features (historian, nudges, prompt-adjunct injections) run for that session, while tag/drop/heuristic plumbing stays on everywhere. The visible reduce surface is additionally gated by whether `ctx_reduce` is actually available in the session's tool allow-list.
 
-| Feature | Primary + `ctx_reduce_enabled: true` | Primary + `ctx_reduce_enabled: false` | Subagents (any `ctx_reduce_enabled`) |
-|---|---|---|---|
-| Tag DB records | ✓ | ✓ | ✓ |
-| `§N§` tag prefix injection in message text | ✓ | ✗ | ✗ |
-| `ctx_reduce` tool | ✓ | ✗ | ✗ |
-| Historian / compartments / compressor | ✓ | ✓ | ✗ |
-| Compartment injection (`<session-history>`) | ✓ | ✓ | ✗ |
-| `<project-docs>`, `<user-profile>`, `<key-files>` system-prompt blocks | ✓ | ✓ | ✗ |
-| Rolling / tool-heavy / sticky / deferred-note nudges | ✓ | ✗ | ✗ |
-| Heuristic tool drops at execute threshold | ✓ | ✓ | ✓ |
-| Heuristic reasoning clearing | ✓ | ✓ | ✓ |
-| 85 % force-materialization | ✓ | ✓ | ✗ |
-| 95 % block + emergency recovery | ✓ | ✓ | ✗ |
-| Experimental age-tier caveman text compression | ✗ | opt-in | ✗ |
+| Feature | Primary sessions | Subagents |
+|---|---|---|
+| Tag DB records | ✓ | ✓ |
+| `§N§` tag prefix injection in message text | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available |
+| `ctx_reduce` tool | tool allow-list controlled | tool allow-list controlled |
+| Historian / compartments / compressor | ✓ | ✗ |
+| Compartment injection (`<session-history>`) | ✓ | ✗ |
+| `<project-docs>`, `<user-profile>`, `<key-files>` system-prompt blocks | ✓ | ✗ |
+| Rolling / tool-heavy / sticky / deferred-note nudges | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available |
+| Heuristic tool drops at execute threshold | ✓ | ✓ |
+| Heuristic reasoning clearing | ✓ | ✓ |
+| 85 % force-materialization | ✓ | ✗ |
+| 95 % block + emergency recovery | ✓ | ✗ |
+| Experimental age-tier caveman text compression | opt-in | ✗ |
 
-**Subagent rationale:** subagents are driven by a parent agent, have bounded lifetimes, and often run in parallel (council, historian, sidekick, dreamer child sessions). They still benefit from automatic heuristic drops on their own context at execute passes, but turning on historian, nudges, or prompt-adjunct injections in each subagent would create redundant work and per-agent cache churn. Subagents that run into overflow fall back to the existing `overflow-detection.ts` path rather than Magic Context's own 85/95 thresholds.
+**Subagent rationale:** subagents are driven by a parent agent, have bounded lifetimes, and often run in parallel (council, historian, sidekick, dreamer child sessions). They still benefit from automatic heuristic drops on their own context at execute passes, but turning on historian, prompt-adjunct injections, or caveman text compression in each subagent would create redundant work and per-agent cache churn. Subagents that run into overflow fall back to the existing `overflow-detection.ts` path rather than Magic Context's own 85/95 thresholds.
 
-**`ctx_reduce_enabled: false` rationale:** removes agent-facing reduction machinery (the tool itself, nudges asking the agent to use it, and `§N§` prefix injection the agent can't act on) while keeping the deterministic parts (historian, heuristic drops, compartment injection, memory). Users who want a fully automatic pipeline can opt in and optionally enable caveman age-tier compression to recover most of the win that manual `ctx_reduce` gives for long user / assistant text parts.
+**Reduce availability rationale:** a session whose tool allow-list denies `ctx_reduce` cannot act on `§N§` markers or reduce nudges, so Magic Context hides that visible surface while keeping deterministic parts (historian, heuristic drops, compartment injection, memory).
 
 ## Error Handling
 

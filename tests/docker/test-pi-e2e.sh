@@ -119,7 +119,6 @@ mkdir -p "$HOME/.config/cortexkit"
 cat > "$HOME/.config/cortexkit/magic-context.jsonc" <<'JSON'
 {
   "enabled": true,
-  "ctx_reduce_enabled": true,
   "dreamer": { "enabled": false },
   "sidekick": { "enabled": false },
   "embedding": { "provider": "off" },

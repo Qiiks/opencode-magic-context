@@ -67,6 +67,7 @@ type TestMessage = {
         sessionID?: string;
         providerID?: string;
         modelID?: string;
+        tools?: Record<string, unknown>;
     };
     parts: TestPart[];
 };
@@ -1471,10 +1472,10 @@ describe("createTransform", () => {
         expect(getLastNudgeLevel(db, sessionId)).toBe("");
     });
 
-    it("Unit B: ctx_reduce_enabled:false primary gets NO Channel 1 baseline (latent-gap fix)", async () => {
-        // A primary with ctx_reduce disabled has no §N§ prefix and no tool to
-        // act on a nudge — it must NOT get a Channel 1 baseline (which would
-        // nudge it to call a tool it lacks). Pre-Unit-B this was gated on
+    it("Unit B: primary without callable ctx_reduce gets NO Channel 1 baseline (latent-gap fix)", async () => {
+        // A primary whose tool allow-list denies ctx_reduce has no §N§ prefix and
+        // no tool to act on a nudge — it must NOT get a Channel 1 baseline (which
+        // would nudge it to call a tool it lacks). Pre-Unit-B this was gated on
         // fullFeatureMode (true for this primary) and leaked.
         useTempDataHome("context-transform-noreduce-ch1-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
@@ -1498,7 +1499,6 @@ describe("createTransform", () => {
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTags: 0,
-            ctxReduceEnabled: false,
             channel1StateBySession,
         });
         await transform(
@@ -1506,14 +1506,97 @@ describe("createTransform", () => {
             {
                 messages: [
                     {
-                        info: { id: "m-user", role: "user", sessionID: "ses-noreduce-ch1" },
+                        info: {
+                            id: "m-user",
+                            role: "user",
+                            sessionID: "ses-noreduce-ch1",
+                            tools: { "*": false, read: true },
+                        },
                         parts: [{ type: "text", text: "hi" }],
                     },
                 ],
             },
         );
-        // No baseline → Channel 1 correctly inert for a no-reduce primary.
+        // No baseline → Channel 1 correctly inert when ctx_reduce is unavailable.
         expect(channel1StateBySession.has("ses-noreduce-ch1")).toBe(false);
+    });
+
+    it("runs caveman compression for a primary with ctx_reduce available while skipping dropped tags", async () => {
+        useTempDataHome("context-transform-caveman-with-reduce-");
+        const sessionId = "ses-caveman-with-reduce";
+        let decision: "defer" | "execute" = "defer";
+        const scheduler: Scheduler = { shouldExecute: mock(() => decision) };
+        const db = openDatabase();
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler,
+            contextUsageMap: new Map<string, { usage: ContextUsage; updatedAt: number }>([
+                [
+                    sessionId,
+                    { usage: { percentage: 70, inputTokens: 100_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            historyRefreshSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set<string>(),
+            lastHeuristicsTurnId: new Map<string, string>(),
+            clearReasoningAge: 50,
+            protectedTags: 0,
+            cavemanTextCompression: { enabled: true, minChars: 50 },
+        });
+        const droppedOriginal =
+            "I just wanted to clearly explain that the first message should be dropped before caveman can rewrite it. ".repeat(
+                4,
+            );
+        const compressibleOriginal =
+            "I just wanted to basically clearly explain that the implementation is actually quite complex because the historian and compartment machinery work together. ".repeat(
+                4,
+            );
+        const messages: TestMessage[] = [
+            {
+                info: {
+                    id: "m-drop",
+                    role: "user",
+                    sessionID: sessionId,
+                    tools: { "*": false, ctx_reduce: true },
+                },
+                parts: [{ type: "text", text: droppedOriginal }],
+            },
+            {
+                info: { id: "m-keep-1", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: compressibleOriginal }],
+            },
+            {
+                info: { id: "m-keep-2", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: compressibleOriginal }],
+            },
+            {
+                info: { id: "m-keep-3", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: compressibleOriginal }],
+            },
+            {
+                info: { id: "m-keep-4", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: compressibleOriginal }],
+            },
+        ];
+
+        // First pass tags only. The first user message explicitly allows ctx_reduce,
+        // freezing the availability gate in the reduce-enabled state.
+        await transform({}, { messages });
+        const firstTag = getTagsBySession(db, sessionId).find(
+            (tag) => tag.messageId === "m-drop:p0",
+        );
+        expect(firstTag?.tagNumber).toBe(1);
+        queuePendingOp(db, sessionId, 1, "drop");
+
+        decision = "execute";
+        await transform({}, { messages });
+
+        expect(text(messages[0], 0)).toBe("[dropped §1§]");
+        expect(text(messages[1], 0)).not.toBe(compressibleOriginal);
+        expect(text(messages[1], 0)).not.toContain("[dropped");
+        expect(getTagById(db, sessionId, 1)?.cavemanDepth).toBe(0);
+        expect(getTagsBySession(db, sessionId).some((tag) => tag.cavemanDepth > 0)).toBe(true);
     });
 
     it("preserves once-per-turn guard for primary sessions (does NOT re-run heuristics within one turn)", async () => {

@@ -23,7 +23,7 @@ Tool: Dropped tags: 4, 5, 6. Changes take effect on next message.
 ```
 
 :::note
-`ctx_reduce` is registered only when `ctx_reduce_enabled` is true (default on). See [Configuration](/reference/configuration/).
+`ctx_reduce` is part of the normal primary-session tool surface. If an agent's tool allow-list denies it, Magic Context also hides `§N§` prefixes and reduce nudges for that session.
 :::
 
 ## ctx_expand

@@ -343,10 +343,9 @@ export interface TagMessagesOptions {
      * When true, skip injecting §N§ prefix into message text/tool output parts.
      * DB-level tag records are still created normally — this flag only affects
      * whether the agent-visible part content gets the tag prefix. Used when
-     * `ctx_reduce_enabled: false` so agents don't see tag markers they can't
-     * act on. Subagents also set this flag (they are always treated as
-     * ctx_reduce_enabled=false). Cache-safe: skipping is consistent across
-     * passes, so message shape stays stable.
+     * the session's tool allow-list denies ctx_reduce so agents don't see tag
+     * markers they can't act on. Cache-safe: the availability verdict is frozen
+     * per session, so message shape stays stable.
      */
     skipPrefixInjection?: boolean;
     /** @internal diagnostic hook used by cache-stability/perf tests. */

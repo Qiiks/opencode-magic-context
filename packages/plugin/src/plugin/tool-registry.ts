@@ -64,19 +64,16 @@ export function createToolRegistry(args: {
     // `opencode -s <id>` from outside the project).
     const resolveProjectPath = (directory: string) => resolveProjectIdentity(directory);
 
-    const ctxReduceEnabled = pluginConfig.ctx_reduce_enabled !== false;
     // When memory is off the <project-memory> block is never injected, so an
     // agent's memory writes would never resurface. Omit ctx_memory entirely
     // (the matching guidance is gated in buildMagicContextSection). ctx_search
     // stays: it still recalls conversation + git commits, just not memories.
     const memoryEnabled = pluginConfig.memory?.enabled !== false;
     const allTools: Record<string, ToolDefinition> = {
-        ...(ctxReduceEnabled
-            ? createCtxReduceTools({
-                  db,
-                  protectedTags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
-              })
-            : {}),
+        ...createCtxReduceTools({
+            db,
+            protectedTags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
+        }),
         ...createCtxExpandTools({ db }),
         ...createCtxNoteTools({
             db,

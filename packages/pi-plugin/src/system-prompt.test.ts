@@ -102,7 +102,7 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 		}
 	});
 
-	it("emits no-reduce guidance variant when ctxReduceEnabled is false", () => {
+	it("emits no-reduce guidance variant when ctx_reduce is not callable", () => {
 		const db = createTestDb();
 		try {
 			const block = buildMagicContextBlock({
@@ -111,7 +111,7 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 				sessionId: "ses-noreduce",
 				memoryEnabled: false,
 				includeGuidance: true,
-				ctxReduceEnabled: false,
+				ctxReduceCallable: false,
 			});
 
 			expect(block).toContain(MAGIC_CONTEXT_GUIDANCE_MARKER);
