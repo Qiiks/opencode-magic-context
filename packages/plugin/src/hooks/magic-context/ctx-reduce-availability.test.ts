@@ -63,4 +63,20 @@ describe("ctx_reduce availability (spawn tools map)", () => {
         ]);
         expect(verdict).toBe(true);
     });
+
+    it("does not freeze a fail-open verdict from an array with no user message", () => {
+        clearCtxReduceAvailability("ses-no-user-yet");
+        // A pass with no user message at all fails open provisionally...
+        const provisional = resolveCtxReduceAvailabilityFromMessages("ses-no-user-yet", [
+            { info: { role: "assistant" } },
+        ]);
+        expect(provisional).toBe(true);
+        // ...but must NOT lock the session: the real first user message (a
+        // deny-list spawn) still decides the frozen verdict.
+        const final = resolveCtxReduceAvailabilityFromMessages("ses-no-user-yet", [
+            { info: { role: "assistant" } },
+            userMsg({ "*": false, read: true }),
+        ]);
+        expect(final).toBe(false);
+    });
 });

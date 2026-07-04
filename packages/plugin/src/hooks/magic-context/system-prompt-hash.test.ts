@@ -751,3 +751,84 @@ describe("system-prompt-hash honors per-agent opt-out (issue #53)", () => {
         expect(meta.systemPromptHash).toBe("main-agent-hash");
     });
 });
+
+describe("provisional ctx_reduce availability (pre-first-user race)", () => {
+    function createOpenCodeDbWithFirstUser(
+        dataHome: string,
+        sessionId: string,
+        tools: Record<string, unknown>,
+    ): void {
+        const { Database } = require("../../shared/sqlite");
+        const { mkdirSync } = require("node:fs");
+        mkdirSync(join(dataHome, "opencode"), { recursive: true });
+        const oc = new Database(join(dataHome, "opencode", "opencode.db"));
+        oc.exec(
+            "CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        oc.prepare(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, 1, 1, ?)",
+        ).run("msg-first-user", sessionId, JSON.stringify({ role: "user", tools }));
+        oc.close();
+    }
+
+    it("does not persist a hash while the availability verdict is provisional", async () => {
+        // A system pass can run BEFORE the session's first user message is
+        // persisted to opencode.db. The availability verdict is then a
+        // provisional fail-open true; persisting a hash computed from the
+        // reduce-enabled guidance variant would flip (hash change → flush →
+        // HARD fold) as soon as the real first user message denies the tool.
+        const dir = mkdtempSync(join(tmpdir(), "sph-provisional-"));
+        tempDirs.push(dir);
+        process.env.XDG_DATA_HOME = dir;
+        const { mkdirSync } = require("node:fs");
+        const { Database } = require("../../shared/sqlite");
+        mkdirSync(join(dir, "opencode"), { recursive: true });
+        // opencode.db exists but has NO first-user row for this session yet.
+        const oc = new Database(join(dir, "opencode", "opencode.db"));
+        oc.exec(
+            "CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        oc.close();
+
+        const sessionId = "ses-provisional";
+        clearCtxReduceAvailability(sessionId);
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+
+        const { handler } = buildHandler();
+        const system = ["Base agent prompt"];
+        await handler({ sessionID: sessionId }, { system });
+
+        // Guidance still renders (a prompt must go out)...
+        expect(system.join("\n")).toContain("## Magic Context");
+        // ...but no hash baseline is written from the provisional variant.
+        const meta = getOrCreateSessionMeta(db, sessionId);
+        expect(meta.systemPromptHash === "" || meta.systemPromptHash === "0").toBe(true);
+    });
+
+    it("persists the hash from the frozen deny-verdict variant once the first user row exists", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "sph-frozen-deny-"));
+        tempDirs.push(dir);
+        process.env.XDG_DATA_HOME = dir;
+
+        const sessionId = "ses-frozen-deny";
+        clearCtxReduceAvailability(sessionId);
+        createOpenCodeDbWithFirstUser(dir, sessionId, { "*": false, read: true });
+
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+
+        const { handler } = buildHandler();
+        const system = ["Base agent prompt"];
+        await handler({ sessionID: sessionId }, { system });
+
+        // Deny-list session: the no-reduce guidance variant renders...
+        const joined = system.join("\n");
+        expect(joined).toContain("## Magic Context");
+        expect(joined).not.toContain("ctx_reduce");
+        // ...and the hash IS persisted (frozen verdict owns the baseline).
+        const meta = getOrCreateSessionMeta(db, sessionId);
+        expect(meta.systemPromptHash).not.toBe("");
+        expect(meta.systemPromptHash).not.toBe("0");
+    });
+});

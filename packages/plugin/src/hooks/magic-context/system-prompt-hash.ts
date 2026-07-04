@@ -292,8 +292,15 @@ export function createSystemPromptHashHandler(deps: {
         // A session whose spawn tools map filters ctx_reduce out (parent
         // allow-lists) must be treated like ctx_reduce-disabled: reduce
         // guidance for an uncallable tool is overhead + cargo-cult risk.
-        // Resolved once per session (frozen verdict — no hash flapping).
-        const ctxReduceCallable = resolveCtxReduceAvailability(sessionId);
+        // The verdict freezes on the session's first user message; before that
+        // exists it is a PROVISIONAL fail-open default. Guidance still renders
+        // from the provisional value (a prompt must go out), but the hash write
+        // below is gated on `frozen` so a provisional reduce-enabled prompt is
+        // never persisted as the session's baseline — if the first user message
+        // then denies the tool, the variant settles BEFORE any hash existed,
+        // instead of flipping a persisted hash and busting the prompt cache.
+        const availability = resolveCtxReduceAvailability(sessionId);
+        const ctxReduceCallable = availability.callable;
         const subagentReduceMode = isSubagentSession && ctxReduceCallable;
         const effectiveCtxReduceEnabled = isSubagentSession ? false : ctxReduceCallable;
         // A subagent without callable ctx_reduce gets no MC guidance.
@@ -366,6 +373,14 @@ export function createSystemPromptHashHandler(deps: {
         // ── Step 3: Detect system prompt changes ──
         const systemContent = output.system.join("\n");
         if (systemContent.length === 0) return;
+
+        // Provisional availability (no first user message persisted yet): the
+        // guidance above may be the wrong variant for this session. Do not
+        // initialize or compare the persisted hash from it — the first pass with
+        // a frozen verdict owns the baseline. Skipping here means the variant
+        // settles before any hash is written, so a deny-list session's prompt
+        // never records a reduce-enabled hash it would immediately flip.
+        if (!availability.frozen) return;
 
         // Use hex digest — numeric strings get coerced by SQLite INTEGER column affinity,
         // causing precision loss on read-back and infinite hash-change flushes.

@@ -47,16 +47,28 @@ export function resolveCtxReduceAvailabilityFromMessages(
 
     for (const message of messages) {
         if (message.info?.role !== "user") continue;
-        const verdict = verdictFromToolsMap(message.info.tools);
-        if (verdict !== null) {
-            availabilityBySession.set(sessionId, verdict);
-            return verdict;
-        }
-        // First user message carries no signal → available, frozen.
-        break;
+        // First user message decides: explicit signal, or no-signal → available.
+        // Either way the verdict is final — freeze it.
+        const verdict = verdictFromToolsMap(message.info.tools) ?? true;
+        availabilityBySession.set(sessionId, verdict);
+        return verdict;
     }
-    availabilityBySession.set(sessionId, true);
+    // No user message in the array at all (not a real prompt — e.g. a stray
+    // pass on an empty session). Fail open but do NOT freeze: caching true here
+    // would lock a deny-list session into the reduce surface before its first
+    // user message ever arrives to say otherwise.
     return true;
+}
+
+/** Availability verdict plus whether it is final for the session's lifetime. */
+export interface CtxReduceAvailabilityVerdict {
+    callable: boolean;
+    /** True when resolved from the session's first user message (cached).
+     *  False when the verdict is a provisional fail-open default — consumers
+     *  that PERSIST state derived from the verdict (e.g. the system-prompt
+     *  hash) must skip persistence until a frozen verdict exists, or a later
+     *  final verdict flips the persisted bytes and busts the prompt cache. */
+    frozen: boolean;
 }
 
 /**
@@ -64,10 +76,13 @@ export function resolveCtxReduceAvailabilityFromMessages(
  * transform has seen any messages). Falls back to "available" when the DB is
  * absent (Pi-only installs) or the read fails.
  */
-export function resolveCtxReduceAvailability(sessionId: string): boolean {
+export function resolveCtxReduceAvailability(sessionId: string): CtxReduceAvailabilityVerdict {
     const cached = availabilityBySession.get(sessionId);
-    if (cached !== undefined) return cached;
-    if (!openCodeDbExists()) return true; // no caching — transform may learn more
+    if (cached !== undefined) return { callable: cached, frozen: true };
+    // No opencode.db at all: this handler only runs inside OpenCode, where the
+    // DB always exists — this branch is test/degraded-install territory, not
+    // the pre-first-user race. Treat as final so hash persistence proceeds.
+    if (!openCodeDbExists()) return { callable: true, frozen: true };
     try {
         const row = withReadOnlySessionDb(
             (db) =>
@@ -79,14 +94,14 @@ export function resolveCtxReduceAvailability(sessionId: string): boolean {
                     )
                     .get(sessionId) as { tools: string | null } | undefined,
         );
-        if (!row) return true; // session not persisted yet — don't cache
+        if (!row) return { callable: true, frozen: false }; // session not persisted yet
         const verdict = row.tools === null ? null : verdictFromToolsMap(JSON.parse(row.tools));
         const resolved = verdict ?? true;
         availabilityBySession.set(sessionId, resolved);
-        return resolved;
+        return { callable: resolved, frozen: true };
     } catch (error) {
         sessionLog(sessionId, "ctx_reduce availability read failed (fail-open):", error);
-        return true;
+        return { callable: true, frozen: false };
     }
 }
 
