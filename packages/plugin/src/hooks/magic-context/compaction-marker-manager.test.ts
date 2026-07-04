@@ -21,7 +21,7 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
@@ -32,6 +32,7 @@ import {
     type PersistedCompactionMarkerState,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -406,5 +407,48 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(persisted?.boundaryMessageId).toBe("msg_003_prior_user");
         expect(persisted?.boundaryOrdinal).toBe(4);
         expect(persisted?.targetEndMessageId).toBe("msg_004_target");
+    });
+
+    it("no-ops (success) on the pi harness without touching opencode.db", () => {
+        // Pi reaches this function through the recompilation runners both
+        // harnesses share. On a Pi-only install there is no opencode.db (often
+        // not even its parent directory), and the pre-fix behavior was an
+        // `unable to open database file` throw that turned a fully successful
+        // recompilation into a "Failed" report. The gate must return success
+        // without any opencode.db access.
+        const dataHome = useTempDataHome("pi-harness-no-oc-db-");
+        rmSync(join(dataHome, "opencode"), { recursive: true, force: true });
+
+        const db = openDatabase();
+        insertCompartment(db, "ses-pi", 4, "msg_004_target");
+        db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-pi");
+
+        setHarness("pi");
+        try {
+            expect(updateCompactionMarkerAfterPublication(db, "ses-pi", 4, dataHome)).toBe(true);
+        } finally {
+            _resetHarnessForTesting();
+        }
+        // No opencode.db file may be created as a side effect (an empty file
+        // here would make every later query fail with `no such table`).
+        expect(existsSync(join(dataHome, "opencode", "opencode.db"))).toBe(false);
+    });
+
+    it("fails loud without creating a junk opencode.db when the file is missing on opencode", () => {
+        // Defense-in-depth: even if an OpenCode-harness call somehow runs with
+        // opencode.db missing, the open must throw a diagnosable error instead
+        // of creating an empty database and failing later with `no such table`.
+        const dataHome = useTempDataHome("oc-harness-missing-db-");
+        rmSync(join(dataHome, "opencode"), { recursive: true, force: true });
+        mkdirSync(join(dataHome, "opencode"), { recursive: true });
+
+        const db = openDatabase();
+        insertCompartment(db, "ses-2", 4, "msg_004_target");
+        db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-2");
+
+        expect(() => updateCompactionMarkerAfterPublication(db, "ses-2", 4, dataHome)).toThrow(
+            /OpenCode database not found/,
+        );
+        expect(existsSync(join(dataHome, "opencode", "opencode.db"))).toBe(false);
     });
 });

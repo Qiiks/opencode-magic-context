@@ -28,6 +28,7 @@ import {
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getDataDir } from "../../shared/data-path";
+import { getHarness } from "../../shared/harness";
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { Database as SqliteDb } from "../../shared/sqlite";
@@ -333,6 +334,16 @@ export function updateCompactionMarkerAfterPublication(
     lastCompartmentEnd: number,
     directory?: string,
 ): boolean {
+    // OpenCode-only: this writes marker rows into opencode.db. Pi reaches this
+    // function through the recompilation runners both harnesses share, but Pi
+    // writes its native marker via a separate path (see pi-recomp-marker.ts),
+    // and on a Pi-only install the opencode.db parent directory may not exist
+    // at all — SQLite then throws `unable to open database file`, which turned
+    // a fully successful recompilation into a scary "Failed" report. There is
+    // nothing to update on Pi, so report success.
+    if (getHarness() !== "opencode") {
+        return true;
+    }
     const targetEndMessageId = getCompartmentEndMessageIdForOrdinal(
         db,
         sessionId,

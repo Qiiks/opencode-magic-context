@@ -729,7 +729,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	registerPiContextHandler(pi, bootContextOptions);
 	info(
 		historianConfig
-			? `registered historian trigger (model=${historianConfig.model}, executeThreshold=${historianConfig.executeThresholdPercentage ?? 65}%)`
+			? `registered historian trigger (model=${historianConfig.model}, executeThreshold=${formatExecuteThresholdForLog(historianConfig.executeThresholdPercentage)})`
 			: "registered historian trigger: DISABLED (set historian.model in magic-context.jsonc)",
 	);
 	info(
@@ -1746,4 +1746,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			// best-effort — Pi proceeds with the switch regardless
 		}
 	});
+}
+
+/**
+ * Format `execute_threshold_percentage` for the boot log. The config accepts
+ * either a bare number or a per-model map (`{ default: 65, "provider/model": 50 }`);
+ * naive interpolation printed the map form as `[object Object]%`.
+ */
+function formatExecuteThresholdForLog(
+	value: number | { default: number; [modelKey: string]: number } | undefined,
+): string {
+	if (value === undefined) return "65%";
+	if (typeof value === "number") return `${value}%`;
+	const overrides = Object.entries(value)
+		.filter(([key]) => key !== "default")
+		.map(([key, pct]) => `${key}=${pct}%`);
+	const base = `${value.default}%`;
+	return overrides.length > 0 ? `${base} (${overrides.join(", ")})` : base;
 }

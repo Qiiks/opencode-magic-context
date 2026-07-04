@@ -27,6 +27,7 @@
  *       whose parentID matches that user message's id
  */
 
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { getDataDir } from "../../shared/data-path";
 import { log } from "../../shared/logger";
@@ -156,6 +157,16 @@ function getWritableOpenCodeDb(): Database {
         } catch {
             // ignore
         }
+    }
+    // Fail with a diagnosable message instead of SQLite's bare `unable to open
+    // database file`, and NEVER create the file: the default open mode creates
+    // missing files, so on a machine without OpenCode (e.g. Pi-only installs)
+    // a stray `~/.local/share/opencode/` directory would get a junk empty
+    // opencode.db here and every later query would throw `no such table`.
+    // Callers on such installs must not reach this at all (harness-gated);
+    // this guard keeps the failure loud and side-effect-free if one does.
+    if (!existsSync(dbPath)) {
+        throw new Error(`OpenCode database not found at ${dbPath} (is OpenCode installed?)`);
     }
     const db = new Database(dbPath);
     // busy_timeout BEFORE journal_mode=WAL: setting WAL can need the file lock, so
