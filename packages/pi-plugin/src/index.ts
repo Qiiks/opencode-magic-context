@@ -38,6 +38,7 @@ import {
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
+import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
 	getOrCreateSessionMeta,
@@ -79,6 +80,7 @@ import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { log } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
+
 import {
 	type PiSidekickConfig,
 	registerCtxAugCommand,
@@ -121,6 +123,7 @@ import {
 	registerPiDreamerProject,
 	unregisterPiDreamerProject,
 } from "./dreamer";
+import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { awaitInFlightRecomps } from "./pi-recomp-runner";
@@ -496,6 +499,27 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	runDeferredV22Backfill(db).catch((err) => {
 		warn(`[v22-backfill] background runner failed: ${err}`);
 	});
+
+	setTimeout(() => {
+		void (async () => {
+			try {
+				const api = await loadDefaultPiSessionApi();
+				const sessions = (await api.listSessions()) as Array<{
+					id?: unknown;
+					cwd?: unknown;
+				}>;
+				await runSessionProjectBackfill(
+					database,
+					sessions.map((session) => ({
+						sessionId: typeof session?.id === "string" ? session.id : "",
+						directory: typeof session?.cwd === "string" ? session.cwd : "",
+					})),
+				);
+			} catch (err) {
+				warn(`[session-projects] background runner failed: ${err}`);
+			}
+		})();
+	}, 0);
 
 	// Capture boot project for initial config load and logging only. Runtime
 	// identity/path resolution uses ctx.cwd per hook/command so session cwd
