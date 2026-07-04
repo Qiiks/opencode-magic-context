@@ -42,7 +42,6 @@ describe("MagicContextConfigSchema", () => {
             const input = {
                 enabled: true,
                 auto_update: false,
-                ctx_reduce_enabled: true,
                 toast_duration_ms: 5000,
                 cache_ttl: "10m",
                 protected_tags: 3,

@@ -2,15 +2,14 @@
  * Pi-side tool registration.
  *
  * Registers `ctx_search`, `ctx_memory`, `ctx_note`, `ctx_expand`, and
- * conditionally `ctx_reduce` against the live Pi extension API. The
- * shared guidance block in `system-prompt.ts` advertises these to the
- * LLM only when each is registered, so a registration gap surfaces as
- * "tool not found" errors when the agent tries to follow the guidance.
+ * `ctx_reduce` against the live Pi extension API. The shared guidance block
+ * in `system-prompt.ts` advertises these to the LLM only when each is
+ * available, so a registration gap surfaces as "tool not found" errors when
+ * the agent tries to follow the guidance.
  *
- * `ctx_reduce` is gated on `ctxReduceEnabled`: when
- * `magic_context.ctx_reduce_enabled === false`, neither the tool nor
- * the §N§ tag prefix injection nor the related prompt guidance are
- * shipped. This matches OpenCode's gating in `tool-registry.ts`.
+ * `ctx_reduce` is part of the primary session-scoped surface. It is omitted
+ * only for `--no-session` child processes where session-scoped tools would
+ * resolve to the hidden ephemeral child session.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -36,11 +35,6 @@ export interface RegisterToolsOptions {
 	 *  `--magic-context-dreamer-actions`. The main extension entry
 	 *  (./index.ts) leaves this false to match OpenCode's primary-agent surface. */
 	allowDreamerActions?: boolean;
-	/** When true, register `ctx_reduce`. The flag should match
-	 *  `magic_context.ctx_reduce_enabled`. When false, the agent is in
-	 *  no-reduce mode (caveman compression / heuristic cleanup do all
-	 *  the work) and `ctx_reduce` shouldn't appear in the tool surface. */
-	ctxReduceEnabled?: boolean;
 	/** Number of recent tags that ctx_reduce should treat as protected
 	 *  (deferred drops instead of immediate). Should match `magic_context.protected_tags`. */
 	protectedTags?: number;
@@ -109,13 +103,10 @@ export function registerMagicContextTools(
 	// for downstream synthesis. See `tools/todowrite.ts` header for rationale.
 	pi.registerTool(createTodowriteTool());
 
-	// Conditionally register ctx_reduce. When ctxReduceEnabled is false:
-	//   - tool not registered (agent gets "tool not found" if it tries
-	//     to call ctx_reduce — but it shouldn't because the prompt
-	//     guidance also drops all references)
-	//   - §N§ tag prefix injection is also disabled upstream in
-	//     transcript-pi.ts, matching OpenCode's transform.ts gate
-	if (opts.ctxReduceEnabled === true) {
+	// ctx_reduce is session-scoped just like ctx_note/ctx_expand: it resolves the
+	// CURRENT session id at call time. Omit it for `--no-session` children where
+	// that id points at a hidden ephemeral child session.
+	if (!opts.sessionScopedToolsDisabled) {
 		pi.registerTool(
 			createCtxReduceTool({
 				db: opts.db,

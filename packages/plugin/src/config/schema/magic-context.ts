@@ -314,10 +314,6 @@ export interface MagicContextConfig {
     auto_update?: boolean;
     /** Output language for generated Magic Context prose. USER config only. */
     language?: string;
-    /** When false, ctx_reduce tool is not registered, all nudges are disabled,
-     *  and prompt guidance about ctx_reduce is stripped. Heuristic cleanup,
-     *  compartments, memory, and other features continue to work. Default: true. */
-    ctx_reduce_enabled: boolean;
     historian?: HistorianConfig;
     dreamer?: DreamerConfig;
     cache_ttl: string | { default: string; [modelKey: string]: string };
@@ -384,10 +380,11 @@ export interface MagicContextConfig {
      * Age-tier caveman compression for long user/assistant text parts.
      * Graduated from `experimental.caveman_text_compression`; opt-in, default off.
      *
-     * Only active when `ctx_reduce_enabled: false`. Buckets eligible
-     * (outside-protected-tail) messages into four age tiers by tag
-     * position — oldest 20% → ultra, next 20% → full, next 20% → lite,
-     * newest 40% → untouched — and rewrites the text part in place.
+     * Active only for primary sessions when enabled; never for subagents.
+     * Buckets eligible (outside-protected-tail) messages into four age
+     * tiers by tag position — oldest 20% → ultra, next 20% → full,
+     * next 20% → lite, newest 40% → untouched — and rewrites the text
+     * part in place.
      * Always compresses from the original source (source_contents), so
      * tier shifts produce the same result as if the target depth were
      * applied directly to the original text.
@@ -463,12 +460,6 @@ export const MagicContextConfigSchema = z
                     "behavior (model mirrors the conversation; English scaffolding). Changing it " +
                     "triggers one cache re-materialization; existing compartments/memories keep their " +
                     "original language until naturally rewritten.",
-            ),
-        ctx_reduce_enabled: z
-            .boolean()
-            .default(true)
-            .describe(
-                "When false, ctx_reduce tool is hidden, all nudges disabled, and prompt guidance about ctx_reduce stripped. Heuristic cleanup, compartments, memory, and other features still work. (default: true)",
             ),
         historian: HistorianConfigSchema.describe(
             "Historian agent configuration (model, fallback_models, variant, temperature, maxTokens, permission, two_pass, etc.)",
@@ -631,7 +622,7 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(false)
                     .describe(
-                        "Apply deterministic caveman-style text compression to old conversation text. Only active when ctx_reduce_enabled=false. Compresses user/assistant text in oldest-first tiers: ultra (oldest 20%), full, lite, untouched (newest 40%).",
+                        "Apply deterministic caveman-style text compression to old conversation text. Active for primary sessions when enabled; never for subagents. Compresses user/assistant text in oldest-first tiers: ultra (oldest 20%), full, lite, untouched (newest 40%).",
                     ),
                 min_chars: z
                     .number()
@@ -644,7 +635,7 @@ export const MagicContextConfigSchema = z
             })
             .default({ enabled: false, min_chars: 500 })
             .describe(
-                "Age-tier caveman compression for long user/assistant text parts. Only active when ctx_reduce_enabled is false. Oldest 20% of eligible tags (outside protected tail) go to ultra, next 20% to full, next 20% to lite, newest 40% untouched. Graduated from experimental.caveman_text_compression; opt-in, default off (lossy).",
+                "Age-tier caveman compression for long user/assistant text parts. Active for primary sessions when enabled; never for subagents. Oldest 20% of eligible tags (outside protected tail) go to ultra, next 20% to full, next 20% to lite, newest 40% untouched. Graduated from experimental.caveman_text_compression; opt-in, default off (lossy).",
             ),
         memory: z
             .object({

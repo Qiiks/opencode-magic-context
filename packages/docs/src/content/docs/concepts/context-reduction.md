@@ -73,17 +73,17 @@ So if your session's bulk is **tool calls** (common for heavy file-reading or bu
 
 This division is intentional: the historian works safely in the background on settled history, while tool-output reduction stays under the agent's control (or the 85% net) so an in-progress task never loses the outputs it's still using.
 
-## Automatic-only mode
+## Hiding the reduce surface
 
-Set `ctx_reduce_enabled: false` in your config to remove the agent-facing reduction machinery entirely:
+To remove the agent-facing reduction machinery for a particular agent, deny or omit `ctx_reduce` in that agent's tool allow-list. Magic Context freezes that availability verdict per session and then omits:
 
-- No `ctx_reduce` tool
-- No `§N§` tag prefixes in message text
-- No nudges
+- `§N§` tag prefixes in message text
+- Channel 1 and Channel 2 reduce nudges
+- Prompt guidance that tells the agent to call `ctx_reduce`
 
 The deterministic parts keep running: the historian still compresses older conversation into compartments, heuristic cleanup still fires (dedup, system-injection stripping, reasoning clearing), the 85% emergency drop still sheds tool outputs, compartments still inject, and memory still works.
 
-Note that in this mode there is no agent-driven `ctx_reduce`, so **tool outputs are only reclaimed by the 85% emergency drop** (Magic Context does not drop tool output by age). Sessions whose bulk is tool output will run closer to the 85% line than sessions where the agent actively reduces. You can optionally enable caveman text compression to recover some of the benefit that manual `ctx_reduce` provides for long user and assistant text. See the [configuration reference](/reference/configuration/) for the setting.
+Without agent-driven `ctx_reduce`, **tool outputs are only reclaimed by the 85% emergency drop** (Magic Context does not drop tool output by age). Sessions whose bulk is tool output will run closer to the 85% line than sessions where the agent actively reduces. You can optionally enable caveman text compression for long user and assistant prose; it is independent of `ctx_reduce` availability. See the [configuration reference](/reference/configuration/) for the setting.
 
 See [session modes](/concepts/session-modes/) for the full feature comparison across modes.
 

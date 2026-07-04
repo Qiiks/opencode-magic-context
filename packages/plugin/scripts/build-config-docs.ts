@@ -105,7 +105,7 @@ function collectLeaves(schema: JsonSchema, prefix: string, rows: LeafRow[]): voi
 
 const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string }> = [
     {
-        keys: ["enabled", "language", "ctx_reduce_enabled", "auto_update", "keep_subagents"],
+        keys: ["enabled", "language", "auto_update", "keep_subagents"],
         title: "Top-level switches",
         intro: "Global on/off switches for the plugin and its agent-facing surface.",
     },

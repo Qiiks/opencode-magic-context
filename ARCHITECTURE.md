@@ -144,19 +144,19 @@ Background maintenance (V2: per-task cron scheduling). A process-wide 15-min tim
 
 ## Session modes
 
-Three effective modes; the heavier features (historian, nudges, adjunct injection) are gated, while tag/drop plumbing stays on everywhere.
+Two effective modes; the heavier features (historian, nudges, adjunct injection) are gated, while tag/drop plumbing stays on everywhere. The primary reduce surface is additionally gated by the session's actual `ctx_reduce` tool availability, so agents that deny the tool also lose `§N§` prefixes and reduce nudges.
 
-| Feature | Primary + `ctx_reduce_enabled: true` | Primary + `ctx_reduce_enabled: false` | Subagents |
-|---|---|---|---|
-| Tag DB records | ✓ | ✓ | ✓ |
-| `§N§` prefix injection + `ctx_reduce` tool | ✓ | ✗ | ✓ (if `ctx_reduce` available) |
-| Historian / compartments / decay / m[0]m[1] | ✓ | ✓ | ✗ |
-| Channel 1 nudge | ✓ | ✗ | ✓ |
-| Channel 2 nudge | ✓ | ✗ | ✓ |
-| Synthetic-todowrite / auto-search | ✓ | ✓ | ✗ |
-| Heuristic tool drops at execute | ✓ once/turn | ✓ once/turn | ✓ every execute pass |
-| 85% force-materialize / 95% block | ✓ | ✓ | ✗ (overflow path only) |
-| Caveman text compression | ✗ | opt-in | ✗ |
+| Feature | Primary sessions | Subagents |
+|---|---|---|
+| Tag DB records | ✓ | ✓ |
+| `§N§` prefix injection + `ctx_reduce` tool | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available |
+| Historian / compartments / decay / m[0]m[1] | ✓ | ✗ |
+| Channel 1 nudge | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available |
+| Channel 2 nudge | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available |
+| Synthetic-todowrite / auto-search | ✓ | ✗ |
+| Heuristic tool drops at execute | ✓ once/turn | ✓ every execute pass |
+| 85% force-materialize / 95% block | ✓ | ✗ (overflow path only) |
+| Caveman text compression | opt-in | ✗ |
 
 Subagents run heuristic drops on every execute pass (no once-per-turn guard) because a long subagent run is effectively one parent turn and would otherwise starve; they have no provider-cache reuse to protect.
 

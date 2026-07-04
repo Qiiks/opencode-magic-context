@@ -152,7 +152,6 @@ export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
     $schema:
       "https://raw.githubusercontent.com/cortexkit/opencode-magic-context/master/assets/magic-context.schema.json",
     enabled: true,
-    ctx_reduce_enabled: true,
     protected_tags: 1,
     execute_threshold_percentage: 40,
     history_budget_percentage: 0.15,

@@ -48,9 +48,8 @@ export function applyHeuristicCleanup(
             ceilingTokens: number;
         };
         /**
-         * Age-tier caveman text compression settings. Only honored when the
-         * session is running with ctx_reduce_enabled=false — caller is
-         * responsible for zeroing this out when ctx_reduce is on.
+         * Age-tier caveman text compression settings. Caller is responsible
+         * for forwarding this only for primary sessions where caveman is enabled.
          */
         caveman?: CavemanCleanupConfig;
     },
@@ -251,7 +250,8 @@ export function applyHeuristicCleanup(
     // Age-tier caveman text compression. Runs LAST so tool drops and
     // injection stripping above can shrink the message set before we pick
     // text tags to compress. Caller guarantees config.caveman is provided
-    // only when ctx_reduce_enabled=false; we still defensively check enabled.
+    // only for primary sessions where caveman is enabled; we still defensively
+    // check enabled.
     let compressedTextTags = 0;
     let mutatedTextTags = 0;
     if (config.caveman?.enabled) {

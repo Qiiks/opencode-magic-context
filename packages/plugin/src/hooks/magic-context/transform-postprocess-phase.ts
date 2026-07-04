@@ -173,9 +173,9 @@ interface RunPostTransformPhaseArgs {
         ensureProjectRegistered?: (directory: string, db: ContextDatabase) => Promise<void>;
     };
     /**
-     * Age-tier caveman compression (experimental). Only honored when
-     * ctx_reduce_enabled is false. Caller is responsible for zeroing this
-     * out when ctx_reduce is on. Passed through to `applyHeuristicCleanup`.
+     * Age-tier caveman compression (experimental). Caller forwards this only
+     * for primary sessions because subagent context is curated by the parent.
+     * Passed through to `applyHeuristicCleanup`.
      */
     cavemanTextCompression?: {
         enabled: boolean;
@@ -484,10 +484,10 @@ export async function runPostTransformPhase(
         }
         if (shouldRunHeuristics) {
             const t5 = performance.now();
-            // Caveman config is only passed through when ctx_reduce_enabled is
-            // false AND the experimental flag is true. Caller (transform) wires
-            // both conditions so this postprocess path doesn't need to re-check
-            // them. Kept undefined otherwise so the heuristic pass skips entirely.
+            // Caveman config is only passed through for primary sessions when
+            // the experimental flag is true. Caller (transform) wires both
+            // conditions so this postprocess path doesn't need to re-check them.
+            // Kept undefined otherwise so the heuristic pass skips entirely.
             const cavemanConfig = args.cavemanTextCompression?.enabled
                 ? {
                       enabled: true,

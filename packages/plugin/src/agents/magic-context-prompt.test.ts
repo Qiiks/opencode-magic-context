@@ -33,7 +33,7 @@ describe("buildMagicContextSection — generic guidance", () => {
         expect(out).not.toContain("council member response outputs");
     });
 
-    it("opens with the long-term-partner frame in BOTH ctx_reduce modes", () => {
+    it("opens with the long-term-partner frame in BOTH ctx_reduce availability variants", () => {
         const reduce = buildMagicContextSection(null, 20, true, false, false, false);
         const noReduce = buildMagicContextSection(null, 20, false, false, false, false);
 
@@ -171,11 +171,11 @@ describe("buildMagicContextSection: memory gating", () => {
 });
 
 describe("buildMagicContextSection — caveman compression warning", () => {
-    it("emits the warning when caveman is enabled AND ctx_reduce is disabled", () => {
+    it("emits the warning when caveman is enabled and ctx_reduce is unavailable", () => {
         const out = buildMagicContextSection(
             null, // agent
             20, // protectedTags (ignored in no-reduce path)
-            false, // ctxReduceEnabled
+            false, // ctx_reduce is unavailable in this session.
             false, // dreamerEnabled
             false, // temporalAwarenessEnabled
             true, // cavemanTextCompressionEnabled
@@ -185,11 +185,11 @@ describe("buildMagicContextSection — caveman compression warning", () => {
         expect(out).toContain("DO NOT mimic this style");
     });
 
-    it("omits the warning when caveman is disabled (ctx_reduce off)", () => {
+    it("omits the warning when caveman is disabled", () => {
         const out = buildMagicContextSection(
             null,
             20,
-            false, // ctxReduceEnabled
+            false, // ctx_reduce is unavailable in this session.
             false, // dreamerEnabled
             false, // temporalAwarenessEnabled
             false, // cavemanTextCompressionEnabled = false
@@ -198,20 +198,19 @@ describe("buildMagicContextSection — caveman compression warning", () => {
         expect(out).not.toContain(CAVEMAN_PHRASE_TAIL);
     });
 
-    it("omits the warning when ctx_reduce is enabled, even if caveman flag is true", () => {
-        // Belt-and-braces: caveman never runs when ctx_reduce is enabled, so
-        // the warning would be misleading. Verify the guard still holds even
-        // if upstream wiring slips.
+    it("emits the warning when ctx_reduce is callable and caveman is enabled", () => {
+        // Caveman compression is independent from ctx_reduce availability, so
+        // reduce-enabled primary guidance must still warn about rewritten prose.
         const out = buildMagicContextSection(
             null,
             20,
-            true, // ctxReduceEnabled
+            true, // ctx_reduce is callable in this session.
             false, // dreamerEnabled
             false, // temporalAwarenessEnabled
             true, // cavemanTextCompressionEnabled
         );
-        expect(out).not.toContain(CAVEMAN_MARKER);
-        expect(out).not.toContain(CAVEMAN_PHRASE_TAIL);
+        expect(out).toContain(CAVEMAN_MARKER);
+        expect(out).toContain(CAVEMAN_PHRASE_TAIL);
     });
 
     it("omits the warning by default (parameter optional)", () => {

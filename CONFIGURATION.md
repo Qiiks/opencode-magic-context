@@ -99,7 +99,6 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `enabled` | `boolean` | `true` | Master toggle. |
 | `auto_update` | `boolean` | `true` | User-config-only plugin self-update toggle; project configs cannot disable it. |
 | `language` | `string` | unset | User-config-only output language for Magic Context generated prose and primary guidance, as a 2-letter ISO 639-1 code, for example `"tr"`, `"es"`, or `"pt"`. Structural tokens stay in English. |
-| `ctx_reduce_enabled` | `boolean` | `true` | When `false`, hides `ctx_reduce` tool, disables all nudges/reminders, and strips reduction guidance from prompts. Heuristic cleanup, compartments, memory, and search still work. Useful for testing whether automatic cleanup alone is sufficient. |
 | `cache_ttl` | `string` or `object` | `"5m"` | Time after a response before applying pending ops. String or per-model map. |
 | `protected_tags` | `number` (1–100) | `20` | Last N active tags immune from immediate dropping. |
 | `toast_duration_ms` | `number` (0–60000) | `5000` | TUI toast lifetime for Magic Context notifications in milliseconds. Increase this if toasts disappear too quickly, or set to `0` to disable Magic Context toasts entirely. |
@@ -550,7 +549,7 @@ Run ctx_search to retrieve full context if relevant.
 | `caveman_text_compression.enabled` | `boolean` | `false` |
 | `caveman_text_compression.min_chars` | `number` | `500` |
 
-**Only active when `ctx_reduce_enabled: false`.** This is the opt-in successor to agent-driven text dropping for users who run without the `ctx_reduce` tool. When the flag is on, each execute-threshold heuristic pass caveman-compresses long user and assistant text parts in place based on their position in the eligible tag window.
+**Primary-session opt-in.** When enabled, each execute-threshold heuristic pass caveman-compresses long user and assistant text parts in primary sessions based on their position in the eligible tag window. Subagents are never caveman-compressed because their context is curated by the parent and they have no `ctx_expand` recovery path.
 
 **Age-tier partitioning.** Eligible tags (active, message-type, outside protected tail, text part ≥ `min_chars`) are sorted oldest-first and bucketed:
 
@@ -567,9 +566,9 @@ Tier boundaries are hardcoded to keep behavior predictable and prevent cache-bus
 
 **Cache safety.** Runs only on execute-threshold heuristic passes (same gate as automatic tool drops), so the single cache-busting pass materializes both tool drops and caveman compression together. Defer passes don't run caveman, and tier assignments are persisted in `tags.caveman_depth` so the next pass re-compresses only the tags that have shifted tiers.
 
-**What it replaces.** With `ctx_reduce` on, agents can manually drop user/assistant text parts when they judge the content is no longer needed. With `ctx_reduce: false`, agents can't do that — this heuristic fills the gap by automatically aging long text toward ever-denser caveman compression. Tool drops and reasoning clearing still handle their own content regardless.
+**Relationship to `ctx_reduce`.** Caveman compression is independent of the agent-driven `ctx_reduce` tool. `ctx_reduce` is still best for tool outputs the agent knows are spent; caveman targets old prose only, and dropped tags always win over caveman rewriting. To hide the reduce surface for a particular agent, remove or deny `ctx_reduce` in that agent's tool allow-list; Magic Context then omits `§N§` prefixes, nudges, and reduce guidance for that session.
 
-**When to enable.** Enable alongside `ctx_reduce_enabled: false` if you find historian/heuristics insufficient for your workload — typically sessions with very long pasted content or verbose agent explanations that the automatic pipeline doesn't reach. Leaves `ctx_reduce_enabled: true` sessions untouched.
+**When to enable.** Enable if you find historian/heuristics insufficient for your workload — typically sessions with very long pasted content or verbose agent explanations that the automatic pipeline doesn't reach.
 
 ### `smart_drops`
 

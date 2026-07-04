@@ -69,10 +69,9 @@ export interface TagTranscriptOptions {
     /**
      * When true, skip injecting `§N§` prefix into visible text. Tags
      * still get assigned in the DB so historian/drops can reference
-     * them; the agent just doesn't see the markers. Used when
-     * `ctx_reduce_enabled: false` (agent has no `ctx_reduce` tool to
-     * act on the markers). Cache-safe because skip behavior is
-     * consistent across passes.
+     * them; the agent just doesn't see the markers. Used when the session's
+     * tool surface has no `ctx_reduce` tool to act on the markers. Cache-safe
+     * because the availability verdict is frozen per session.
      */
     skipPrefixInjection?: boolean;
     /**

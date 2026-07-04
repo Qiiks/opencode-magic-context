@@ -50,7 +50,7 @@ The historian keeps the live window small by compressing old history into [tiere
 
 ## How the modes differ
 
-Magic Context runs in [three effective modes](/concepts/session-modes/) depending on whether agent-driven reduction is on and whether the session is a subagent. The default mode (full surface) gives the agent the `ctx_reduce` tool and nudges it to use it. The automatic-only mode removes the agent-facing machinery and lets the pipeline handle everything. Subagents get a lightweight pass.
+Magic Context runs in [two effective modes](/concepts/session-modes/): primary sessions and subagents. Primary sessions get the full historian, memory, and prompt surface; the visible reduce surface appears only when `ctx_reduce` is available in the agent's tool allow-list. Subagents get a lightweight pass.
 
 ## Where to go next
 

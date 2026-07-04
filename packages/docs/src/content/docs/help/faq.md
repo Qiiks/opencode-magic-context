@@ -26,13 +26,12 @@ Yes. Most features have explicit toggles. See the [configuration reference](/ref
 | Feature | Config key | Default |
 |---|---|---|
 | Memory (cross-session) | `memory.enabled` | `true` |
-| Agent-driven reduction (`ctx_reduce`) | `ctx_reduce_enabled` | `true` |
 | Auto-search hints | `memory.auto_search.enabled` | `true` |
 | Temporal markers | `temporal_awareness` | `true` |
 | Dreamer (overnight consolidation) | `dreamer.enabled` | `false` |
 | Embeddings | `embedding.provider` | `"local"` |
 
-Setting `ctx_reduce_enabled: false` hides the `ctx_reduce` tool and removes all nudges. The historian and heuristic cleanup still run.
+To hide agent-driven reduction for a specific agent, deny or omit `ctx_reduce` in that agent's tool allow-list. The historian and heuristic cleanup still run.
 
 ## Where is my data stored?
 

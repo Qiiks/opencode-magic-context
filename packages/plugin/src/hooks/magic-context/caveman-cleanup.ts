@@ -83,7 +83,7 @@ export function computeTargetDepth(positionIndex: number, totalEligible: number)
  *
  * Preconditions: caller has already acquired the DB transaction context for
  * this heuristic pass (or this function opens its own). Caller is expected
- * to gate on `ctx_reduce_enabled === false` and `config.enabled === true`.
+ * to gate on primary sessions and `config.enabled === true`.
  */
 export function applyCavemanCleanup(
     sessionId: string,

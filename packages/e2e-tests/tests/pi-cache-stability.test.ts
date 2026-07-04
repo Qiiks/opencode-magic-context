@@ -198,7 +198,6 @@ describe("pi cache stability", () => {
         await withPiHarness(
             {
                 magicContextConfig: {
-                    ctx_reduce_enabled: false,
                     execute_threshold_percentage: 90,
                     caveman_text_compression: { enabled: true, min_chars: 40 },
                     memory: {

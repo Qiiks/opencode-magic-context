@@ -88,11 +88,11 @@ You can also view and edit memories from the [desktop dashboard](https://github.
 
 ## The ctx_reduce nudge
 
-When context is getting full and `ctx_reduce_enabled` is on (default), the agent receives a nudge prompting it to call `ctx_reduce` and mark stale tool outputs or long messages for removal. This happens before context pressure gets critical.
+When context is getting full and `ctx_reduce` is available to the agent, it receives a nudge prompting it to call `ctx_reduce` and mark stale tool outputs or long messages for removal. This happens before context pressure gets critical.
 
 The agent calls `ctx_reduce` with specific tag identifiers. Drops are queued — not applied immediately — so they happen at a moment that doesn't invalidate the provider's prompt cache. The session keeps flowing without interruption.
 
-If you prefer the agent to stay out of context management entirely, set `ctx_reduce_enabled: false` in your config. Compartmenting and heuristic cleanup continue automatically.
+If you prefer a specific agent to stay out of context management, deny or omit `ctx_reduce` in that agent's tool allow-list. Compartmenting and heuristic cleanup continue automatically.
 
 ## Setting expectations
 

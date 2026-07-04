@@ -18,7 +18,6 @@ import type { PluginContext } from "../types";
 export function buildMagicContextHookConfig(pluginConfig: MagicContextPluginConfig) {
     return {
         protected_tags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
-        ctx_reduce_enabled: pluginConfig.ctx_reduce_enabled,
         cache_ttl: pluginConfig.cache_ttl,
         clear_reasoning_age: pluginConfig.clear_reasoning_age,
         toast_duration_ms: pluginConfig.toast_duration_ms,
