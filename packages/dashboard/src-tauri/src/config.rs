@@ -106,7 +106,7 @@ pub fn read_config(path: &PathBuf, source: &str) -> ConfigFile {
     }
 }
 
-pub fn write_config(path: &PathBuf, content: &str) -> Result<(), String> {
+pub fn write_config(path: &Path, content: &str) -> Result<(), String> {
     write_config_atomic(path, content, None)
 }
 

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::pi_sessions;
-use crate::project_identity::{basename, normalize_stored_project_path, resolve_project_identity};
+use crate::project_identity::{basename, normalize_stored_project_path};
 
 pub fn resolve_db_path() -> Option<PathBuf> {
     // The magic-context plugin uses XDG_DATA_HOME or ~/.local/share on ALL platforms
@@ -210,6 +210,58 @@ impl std::str::FromStr for Harness {
             other => Err(format!("unknown harness: {other}")),
         }
     }
+}
+
+type SessionIdentityMap = HashMap<(Harness, String), String>;
+
+fn load_session_identity_map() -> SessionIdentityMap {
+    let Some(db_path) = resolve_db_path() else {
+        return HashMap::new();
+    };
+    let Ok(conn) = open_readonly(&db_path) else {
+        return HashMap::new();
+    };
+    load_session_identity_map_from_conn(&conn)
+}
+
+fn load_session_identity_map_from_conn(conn: &Connection) -> SessionIdentityMap {
+    let mut map = HashMap::new();
+    if !table_exists(conn, "session_projects") {
+        return map;
+    }
+    let Ok(mut stmt) =
+        conn.prepare("SELECT session_id, harness, project_path FROM session_projects")
+    else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) else {
+        return map;
+    };
+    for row in rows.flatten() {
+        let (session_id, harness_raw, identity) = row;
+        let Ok(harness) = harness_raw.parse::<Harness>() else {
+            continue;
+        };
+        map.insert((harness, session_id), identity);
+    }
+    map
+}
+
+fn lookup_session_identity(
+    identities: &SessionIdentityMap,
+    harness: Harness,
+    session_id: &str,
+) -> String {
+    identities
+        .get(&(harness, session_id.to_string()))
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -1799,13 +1851,9 @@ pub fn get_projects(conn: &Connection) -> Result<Vec<ProjectInfo>, rusqlite::Err
     let mut identities: Vec<String> = identity_set.into_iter().collect();
     identities.sort();
 
-    // Resolve friendly names/paths via the same enumeration the project picker
-    // uses. enumerate_projects_filtered recomputes identity with
-    // resolve_project_identity(&worktree) — the SAME git root-commit space the
-    // plugin stamps into git:<sha> — so these identities match. The older
-    // resolve_from_opencode_db matched git:<sha> against OpenCode's project.id,
-    // which is a DIFFERENT hash, so it never resolved a name and every Dreamer
-    // row fell back to git:<short>… (the regression this fixes).
+    // Use the same enumeration as the project list shown to the user. It keys on
+    // recorded project identities instead of comparing against OpenCode's own
+    // project identifier.
     let identity_to_row: HashMap<String, ProjectRow> = enumerate_projects_filtered(None)
         .into_iter()
         .map(|row| (row.identity.clone(), row))
@@ -1848,19 +1896,10 @@ pub fn enumerate_memory_projects(conn: &Connection) -> Result<Vec<ProjectRow>, r
         .query_map([], |row| row.get(0))?
         .collect::<Result<HashSet<_>, _>>()?;
 
-    // Each memory `project_path` is canonically one of:
-    //   - a resolved project identity (`git:<hash>` or `dir:<md5-12>`) for
-    //     memories written by the post-#87 plugin where storage stamps the
-    //     identity directly, or
-    //   - a raw filesystem path for legacy memories written before identity
-    //     normalization landed on the plugin side.
-    //
-    // Normalize every value to its identity. For identity-shaped strings the
-    // value is itself the identity. For real paths we resolve through git +
-    // MD5-12 fallback. This is the SAME normalization the v0.21.5 plugin-side
-    // fix to issue #87 performs on the query side — keeping the dashboard
-    // aligned with it so the project picker matches the memory pool by
-    // identity, not by raw path.
+    // Memory rows usually store a resolved project identity (`git:<hash>` or
+    // `dir:<md5-12>`). Some old rows may still store a raw filesystem path.
+    // Normalize both shapes so the picker is keyed by identity rather than by
+    // whatever path string happened to be written originally.
     let memory_identities: HashSet<String> = memory_project_values
         .iter()
         .map(|value| normalize_stored_project_path(value))
@@ -1908,33 +1947,65 @@ pub fn enumerate_memory_projects(conn: &Connection) -> Result<Vec<ProjectRow>, r
         .collect())
 }
 
-/// Map project identity → a representative real directory, computed from
-/// opencode.db's `session.directory` column — the SAME signal the plugin keys
-/// identity off. This resolves `dir:<hash>` identities (non-git directories
-/// opened directly, e.g. `/Users/x/Work`) to their real path: OpenCode buckets
-/// such sessions under the `global` project (worktree `/`), so the
-/// project.worktree-based `enumerate_projects_filtered` can't surface them and
-/// the dashboard would otherwise show only the opaque `dir:<hash>`. When several
-/// directories map to one identity (git subdir sessions), the shortest path wins
-/// (closest to the repo root).
+/// Return `(identity, directory)` pairs for sessions whose identity was recorded
+/// in the session identity map. Missing rows are normal for sessions from before
+/// identity tracking was added; those sessions cannot safely contribute a
+/// project identity here.
+fn mapped_session_directories(identities: &SessionIdentityMap) -> Vec<(String, String)> {
+    let mut dirs = Vec::new();
+
+    if let Some(oc) = resolve_opencode_db_path() {
+        if let Ok(conn) = open_readonly(&oc) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT id, COALESCE(directory, '')
+                 FROM session
+                 WHERE directory IS NOT NULL AND directory != ''",
+            ) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                }) {
+                    for row in rows.flatten() {
+                        let (session_id, dir) = row;
+                        let identity =
+                            lookup_session_identity(identities, Harness::Opencode, &session_id);
+                        if !identity.is_empty() {
+                            dirs.push((identity, dir));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for meta in pi_sessions::scan_pi_session_dir() {
+        if meta.cwd.is_empty() {
+            continue;
+        }
+        let identity = lookup_session_identity(identities, Harness::Pi, &meta.session_id);
+        if !identity.is_empty() {
+            dirs.push((identity, meta.cwd));
+        }
+    }
+
+    dirs
+}
+
+fn session_identity_by_directory(identities: &SessionIdentityMap) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for (identity, dir) in mapped_session_directories(identities) {
+        map.entry(dir).or_insert(identity);
+    }
+    map
+}
+
+/// Map project identity to a representative real directory using only the session
+/// identities recorded in the session identity map. Sessions without a recorded
+/// identity are omitted because there is no authoritative project identity to
+/// group them under.
 fn session_directories_by_identity() -> HashMap<String, String> {
+    let identities = load_session_identity_map();
     let mut map: HashMap<String, String> = HashMap::new();
-    let Some(oc) = resolve_opencode_db_path() else {
-        return map;
-    };
-    let Ok(conn) = open_readonly(&oc) else {
-        return map;
-    };
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT directory FROM session WHERE directory IS NOT NULL AND directory != ''",
-    ) else {
-        return map;
-    };
-    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-        return map;
-    };
-    for dir in rows.flatten() {
-        let identity = resolve_project_identity(&dir);
+    for (identity, dir) in mapped_session_directories(&identities) {
         map.entry(identity)
             .and_modify(|existing| {
                 if dir_is_better_representative(&dir, existing) {
@@ -1981,6 +2052,8 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
     }
 
     let mut groups: HashMap<String, ProjectAccum> = HashMap::new();
+    let session_identities = load_session_identity_map();
+    let identity_by_dir = session_identity_by_directory(&session_identities);
 
     if let Some(opencode_db_path) = resolve_opencode_db_path() {
         if let Ok(conn) = open_readonly(&opencode_db_path) {
@@ -2002,7 +2075,9 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
                                 continue;
                             }
                         }
-                        let identity = resolve_project_identity(&worktree);
+                        let Some(identity) = identity_by_dir.get(&worktree).cloned() else {
+                            continue;
+                        };
                         let entry = groups.entry(identity).or_default();
                         if !name.is_empty() {
                             entry.opencode_name = Some(name);
@@ -2024,13 +2099,18 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
                 continue;
             }
         }
-        let identity = resolve_project_identity(&meta.cwd);
+        let identity = lookup_session_identity(&session_identities, Harness::Pi, &meta.session_id);
+        if identity.is_empty() {
+            continue;
+        }
         let entry = pi_counts.entry(identity).or_insert((meta.cwd, 0));
         entry.1 = entry.1.saturating_add(1);
     }
     if let Some(allowed_paths) = project_paths_filter {
         for project_path in allowed_paths {
-            let identity = resolve_project_identity(project_path);
+            let Some(identity) = identity_by_dir.get(project_path).cloned() else {
+                continue;
+            };
             groups.entry(identity).or_insert_with(|| ProjectAccum {
                 opencode_path: Some(project_path.clone()),
                 ..ProjectAccum::default()
@@ -2092,6 +2172,9 @@ pub fn get_project_cards(conn: &Connection) -> Vec<ProjectCard> {
 
     let mut groups: HashMap<String, Accum> = HashMap::new();
     for row in list_all_sessions(SessionFilter::default()) {
+        if row.project_identity.is_empty() {
+            continue;
+        }
         let entry = groups.entry(row.project_identity.clone()).or_default();
         entry.harnesses.insert(row.harness);
         // First time we see a usable display name / path for this identity, keep
@@ -2170,7 +2253,7 @@ pub fn get_project_cards(conn: &Connection) -> Vec<ProjectCard> {
             std::path::Path::new(&card.primary_path).exists()
         })
         .collect();
-    cards.sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
+    cards.sort_by_key(|card| std::cmp::Reverse(card.last_activity_ms));
     cards
 }
 
@@ -2213,23 +2296,14 @@ const HAS_EMBEDDING_SELECT: &str =
 /// or a legacy raw filesystem path) into the set of `memories.project_path`
 /// values that should be matched against.
 ///
-/// **Why this exists**: the dashboard frontend sends the resolved project
-/// identity as the filter (matches how History does it), but the `memories`
-/// table stores raw filesystem paths in `project_path` — `git:<hash>` would
-/// never equal `/Users/.../my-repo`. We map the identity to every concrete
-/// path that resolves to it.
+/// When a project identity is stored directly, which is the common case, it
+/// matches exactly. Older rows that still contain raw filesystem paths are
+/// normalized with the deterministic directory fallback; this keeps historical
+/// non-git rows queryable without probing the filesystem or spawning external
+/// tools.
 ///
-/// **Why this matters for clones/worktrees**: the same git repo cloned to two
-/// directories (or checked out as multiple worktrees) shares one root-commit
-/// identity but contributes memories under different `project_path` values.
-/// Sending just `primary_path` from the frontend would silently miss memories
-/// written from other clones. This helper returns ALL contributing paths so
-/// the union is queried.
-///
-/// **Backward compatibility**: if the filter value is a legacy raw path
-/// (older dashboard build, or external caller), no rows resolve to it as an
-/// identity and we fall back to filtering by that single value — same
-/// behavior as the pre-fix code.
+/// If nothing normalizes to the filter, treat the filter as an old raw path and
+/// query that literal value so external callers keep the pre-identity behavior.
 pub(crate) fn resolve_paths_for_memory_filter(
     conn: &Connection,
     project_filter: &str,
@@ -2266,13 +2340,9 @@ pub(crate) fn bump_project_memory_epoch_for_identity_pub(
     bump_project_memory_epoch_for_identity(tx, identity)
 }
 
-/// Resolve a project-identity filter (`git:<sha>` / `dir:<hash>`) to the set of
-/// raw `project_path` values stored in `table` that normalize to the same
-/// identity. The plugin writes rows under the resolved identity, but legacy
-/// rows, symlinked, or non-canonical paths may be stored differently — so a
-/// literal `WHERE project_path = ?` misses them. This mirrors the memories
-/// path-resolution so key-files and smart-notes group the same way the Memories
-/// tab does. Falls back to the raw filter when nothing matches (legacy behavior).
+/// Resolve a project-identity filter (`git:<sha>` / `dir:<hash>`) to the stored
+/// `project_path` values in `table` that normalize to the same identity. Falls
+/// back to the raw filter when nothing matches, preserving legacy raw-path callers.
 fn resolve_paths_for_table_filter(
     conn: &Connection,
     table: &str,
@@ -2339,6 +2409,7 @@ fn enrich_memories_workspace_source(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn get_memories(
     conn: &Connection,
     project_filter: Option<&str>,
@@ -3612,9 +3683,8 @@ pub fn get_sessions(conn: &Connection) -> Result<Vec<SessionSummary>, rusqlite::
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Resolve session titles and the real Magic Context project identity from
-    // OpenCode's DB. info.1 is already the resolved git:/dir: identity (not the
-    // internal project_id), so it is used as-is — no `git:` prefix fabrication.
+    // Resolve session titles from OpenCode and project identity from the
+    // recorded session_projects mapping.
     let session_info = resolve_session_info(&sessions);
     for session in &mut sessions {
         if let Some(info) = session_info.get(&session.session_id) {
@@ -3646,8 +3716,8 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
     // worktree: OpenCode buckets git sessions that had no remote/commit at
     // creation under the `global` project (worktree "/", empty name), so
     // `p.worktree` is "/" and basename("/") renders as "/". `s.directory` always
-    // holds the real cwd. We resolve identity from it too — which also matches
-    // what the plugin keys memories under (plugin identity = session.directory).
+    // holds the real cwd for display. Project identity itself comes from the
+    // recorded session-to-project mapping, not from the joined project table.
     // Exclude archived sessions: OpenCode archives a session (sets time_archived)
     // to hide it from its own list, so the dashboard mirrors that and shows only
     // live sessions. This also keeps archived rows out of the project-card session
@@ -3668,6 +3738,7 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
     // tags every session on first prompt) default to `false`, matching the
     // "primary session" assumption.
     let subagent_map = load_subagent_map_for_harness(Harness::Opencode);
+    let session_identities = load_session_identity_map();
 
     let rows = stmt.query_map([], |row| {
         let session_id: String = row.get(0)?;
@@ -3683,7 +3754,7 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
         } else {
             &directory
         };
-        let identity = resolve_project_identity(effective_dir);
+        let identity = lookup_session_identity(&session_identities, Harness::Opencode, &session_id);
         let is_subagent = subagent_map.get(&session_id).copied().unwrap_or(false);
         // Friendly label: the named project wins; otherwise the directory's
         // basename. Never show a bare "/" (the global-project worktree) when the
@@ -3717,10 +3788,12 @@ pub fn list_pi_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
         return Vec::new();
     }
     let subagent_map = load_subagent_map_for_harness(Harness::Pi);
+    let session_identities = load_session_identity_map();
     pi_sessions::scan_pi_session_dir()
         .into_iter()
         .map(|meta| {
-            let project_identity = resolve_project_identity(&meta.cwd);
+            let project_identity =
+                lookup_session_identity(&session_identities, Harness::Pi, &meta.session_id);
             let is_subagent = subagent_map.get(&meta.session_id).copied().unwrap_or(false);
             SessionRow {
                 harness: Harness::Pi,
@@ -3964,11 +4037,15 @@ pub fn get_opencode_session_detail(
         .transpose()?
         .flatten();
 
+    let session_identities = load_session_identity_map();
+    let project_identity =
+        lookup_session_identity(&session_identities, Harness::Opencode, &session_id);
+
     Ok(Some(SessionDetail {
         harness: Harness::Opencode,
         session_id,
         title,
-        project_identity: resolve_project_identity(&effective_dir),
+        project_identity,
         project_display: if project_name.is_empty() {
             basename(&effective_dir)
         } else {
@@ -4120,7 +4197,8 @@ pub fn get_pi_session_detail(conn: Option<&Connection>, session_id: &str) -> Opt
     let token_breakdown = conn
         .and_then(|c| get_context_token_breakdown(c, session_id).ok())
         .flatten();
-    let project_identity = resolve_project_identity(&detail.meta.cwd);
+    let session_identities = load_session_identity_map();
+    let project_identity = lookup_session_identity(&session_identities, Harness::Pi, session_id);
     Some(SessionDetail {
         harness: Harness::Pi,
         session_id: detail.meta.session_id.clone(),
@@ -4175,14 +4253,9 @@ fn preview_from_json(value: &serde_json::Value) -> String {
         .collect()
 }
 
-/// Look up session titles and project IDs from OpenCode's database.
-/// Returns HashMap<session_id, (title, project_id)>.
-/// Resolve `(title, project_identity)` per OpenCode session id. The identity is
-/// Magic Context's own `git:<root-sha>` / `dir:<hash>` space, computed from the
-/// project's worktree path via `resolve_project_identity` — NOT OpenCode's
-/// internal `project_id` hash (a different space). Joining the worktree and
-/// resolving it is what `list_opencode_sessions` does; this mirrors it so
-/// `get_sessions` emits identities that actually match the project-scoped views.
+/// Look up OpenCode session titles and any project identities recorded for the
+/// sessions. Missing rows return an empty identity so callers can degrade without
+/// re-deriving it.
 fn resolve_session_info(
     sessions: &[SessionSummary],
 ) -> std::collections::HashMap<String, (String, String)> {
@@ -4200,31 +4273,19 @@ fn resolve_session_info(
         Err(_) => return result,
     };
 
-    let mut stmt = match conn.prepare(
-        "SELECT s.id, COALESCE(s.title, ''), COALESCE(p.worktree, '')
-         FROM session s
-         LEFT JOIN project p ON p.id = s.project_id",
-    ) {
+    let mut stmt = match conn.prepare("SELECT s.id, COALESCE(s.title, '') FROM session s") {
         Ok(s) => s,
         Err(_) => return result,
     };
+    let session_identities = load_session_identity_map();
 
     if let Ok(rows) = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     }) {
         for row in rows.flatten() {
-            let (session_id, title, worktree) = row;
-            // Empty worktree (no project row) → no resolvable identity; leave it
-            // blank so the caller skips setting project_identity.
-            let identity = if worktree.is_empty() {
-                String::new()
-            } else {
-                resolve_project_identity(&worktree)
-            };
+            let (session_id, title) = row;
+            let identity =
+                lookup_session_identity(&session_identities, Harness::Opencode, &session_id);
             result.insert(session_id, (title, identity));
         }
     }
@@ -5020,6 +5081,7 @@ fn exact_dream_run_memory_changes(
 ///   - written  = memories created in the window
 ///   - merged   = memories superseded (merged into a canonical) in the window
 ///   - archived = memories archived (non-merged) in the window that pre-existed
+///
 /// Exact for `written`; archived/merged can differ by edge cases from the stored
 /// count (e.g. a memory archived then un-archived). A future schema that records
 /// the actual changed ids at run time would make this exact (see note).
@@ -5475,6 +5537,297 @@ mod representative_dir_tests {
 }
 
 #[cfg(test)]
+mod session_identity_map_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn context_db_path(data_home: &Path) -> PathBuf {
+        data_home
+            .join("cortexkit")
+            .join("magic-context")
+            .join("context.db")
+    }
+
+    fn opencode_db_path(data_home: &Path) -> PathBuf {
+        data_home.join("opencode").join("opencode.db")
+    }
+
+    fn with_temp_data_home<T>(run: impl FnOnce(&Path) -> T) -> T {
+        let _guard = env_lock();
+        let data_home = tempfile::tempdir().expect("data home");
+        let pi_root = tempfile::tempdir().expect("pi root");
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", data_home.path());
+        crate::pi_sessions::clear_caches_for_tests();
+        crate::pi_sessions::set_test_root_for_tests(pi_root.path().to_path_buf());
+
+        let result = run(data_home.path());
+
+        if let Some(old) = old_xdg {
+            std::env::set_var("XDG_DATA_HOME", old);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        crate::pi_sessions::clear_caches_for_tests();
+        result
+    }
+
+    fn create_context_db(data_home: &Path, with_session_projects: bool) -> Connection {
+        let path = context_db_path(data_home);
+        std::fs::create_dir_all(path.parent().expect("context parent")).expect("context dirs");
+        let conn = Connection::open(&path).expect("open context db");
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                project_path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active'
+            );",
+        )
+        .expect("create memories");
+        if with_session_projects {
+            conn.execute_batch(
+                "CREATE TABLE session_projects (
+                    session_id TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    project_path TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, harness)
+                );",
+            )
+            .expect("create session_projects");
+        }
+        conn
+    }
+
+    fn create_opencode_db(data_home: &Path) -> Connection {
+        let path = opencode_db_path(data_home);
+        std::fs::create_dir_all(path.parent().expect("opencode parent")).expect("opencode dirs");
+        let conn = Connection::open(&path).expect("open opencode db");
+        conn.execute_batch(
+            "CREATE TABLE project (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                worktree TEXT NOT NULL
+            );
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                project_id TEXT,
+                directory TEXT,
+                time_updated INTEGER NOT NULL,
+                time_archived INTEGER
+            );",
+        )
+        .expect("create opencode schema");
+        conn
+    }
+
+    fn insert_session_project(conn: &Connection, session_id: &str, harness: &str, identity: &str) {
+        conn.execute(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at)
+             VALUES (?1, ?2, ?3, 1000)",
+            (session_id, harness, identity),
+        )
+        .expect("insert session project");
+    }
+
+    #[test]
+    fn load_session_identity_map_reads_known_harnesses_and_skips_unknown() {
+        with_temp_data_home(|data_home| {
+            let conn = create_context_db(data_home, true);
+            insert_session_project(&conn, "oc-1", "opencode", "git:oc-root");
+            insert_session_project(&conn, "pi-1", "pi", "dir:pi-root");
+            insert_session_project(&conn, "weird-1", "future", "git:future-root");
+            drop(conn);
+
+            let map = load_session_identity_map();
+            assert_eq!(
+                map.get(&(Harness::Opencode, "oc-1".to_string())),
+                Some(&"git:oc-root".to_string())
+            );
+            assert_eq!(
+                map.get(&(Harness::Pi, "pi-1".to_string())),
+                Some(&"dir:pi-root".to_string())
+            );
+            assert_eq!(map.len(), 2, "unknown harness rows must be skipped");
+        });
+    }
+
+    #[test]
+    fn load_session_identity_map_missing_table_returns_empty() {
+        with_temp_data_home(|data_home| {
+            let conn = create_context_db(data_home, false);
+            drop(conn);
+
+            assert!(load_session_identity_map().is_empty());
+        });
+    }
+
+    #[test]
+    fn list_opencode_sessions_uses_recorded_identities_and_leaves_unmapped_empty() {
+        with_temp_data_home(|data_home| {
+            let context = create_context_db(data_home, true);
+            insert_session_project(&context, "mapped", "opencode", "git:mapped-root");
+            drop(context);
+
+            let oc = create_opencode_db(data_home);
+            oc.execute(
+                "INSERT INTO project (id, name, worktree) VALUES ('p1', 'Project One', '/slow/share')",
+                [],
+            )
+            .expect("insert project");
+            oc.execute(
+                "INSERT INTO session (id, title, project_id, directory, time_updated, time_archived)
+                 VALUES ('mapped', 'Mapped session', 'p1', '/slow/share', 200, NULL)",
+                [],
+            )
+            .expect("insert mapped session");
+            oc.execute(
+                "INSERT INTO session (id, title, project_id, directory, time_updated, time_archived)
+                 VALUES ('unmapped', 'Old session', 'p1', '/other/share', 100, NULL)",
+                [],
+            )
+            .expect("insert unmapped session");
+            drop(oc);
+
+            let rows = list_opencode_sessions(&SessionFilter::default());
+            let mapped = rows
+                .iter()
+                .find(|row| row.session_id == "mapped")
+                .expect("mapped row");
+            assert_eq!(mapped.project_identity, "git:mapped-root");
+            let unmapped = rows
+                .iter()
+                .find(|row| row.session_id == "unmapped")
+                .expect("unmapped row");
+            assert_eq!(unmapped.project_identity, "");
+        });
+    }
+
+    #[test]
+    fn get_project_cards_groups_mapped_sessions_and_uses_main_checkout_representative() {
+        with_temp_data_home(|data_home| {
+            let temp = tempfile::tempdir().expect("projects");
+            let main = temp.path().join("main-checkout");
+            let worktree = temp.path().join("worktrees").join("bg_123");
+            let unmapped = temp.path().join("unmapped");
+            std::fs::create_dir_all(main.join(".git")).expect("main git dir");
+            std::fs::create_dir_all(&worktree).expect("worktree dir");
+            std::fs::write(
+                worktree.join(".git"),
+                "gitdir: ../main/.git/worktrees/bg_123\n",
+            )
+            .expect("worktree git file");
+            std::fs::create_dir_all(&unmapped).expect("unmapped dir");
+
+            let context = create_context_db(data_home, true);
+            insert_session_project(&context, "main-session", "opencode", "git:shared-root");
+            insert_session_project(&context, "worktree-session", "opencode", "git:shared-root");
+            context
+                .execute(
+                    "INSERT INTO memories (project_path, status) VALUES ('git:shared-root', 'active')",
+                    [],
+                )
+                .expect("insert memory");
+
+            let oc = create_opencode_db(data_home);
+            oc.execute(
+                "INSERT INTO project (id, name, worktree) VALUES ('main', 'Main Project', ?1)",
+                [main.to_string_lossy().as_ref()],
+            )
+            .expect("insert main project");
+            oc.execute(
+                "INSERT INTO project (id, name, worktree) VALUES ('worktree', 'Worktree Project', ?1)",
+                [worktree.to_string_lossy().as_ref()],
+            )
+            .expect("insert worktree project");
+            oc.execute(
+                "INSERT INTO project (id, name, worktree) VALUES ('unmapped', 'Unmapped Project', ?1)",
+                [unmapped.to_string_lossy().as_ref()],
+            )
+            .expect("insert unmapped project");
+            oc.execute(
+                "INSERT INTO session (id, title, project_id, directory, time_updated, time_archived)
+                 VALUES ('main-session', 'Main', 'main', ?1, 100, NULL)",
+                [main.to_string_lossy().as_ref()],
+            )
+            .expect("insert main session");
+            oc.execute(
+                "INSERT INTO session (id, title, project_id, directory, time_updated, time_archived)
+                 VALUES ('worktree-session', 'Worktree', 'worktree', ?1, 200, NULL)",
+                [worktree.to_string_lossy().as_ref()],
+            )
+            .expect("insert worktree session");
+            oc.execute(
+                "INSERT INTO session (id, title, project_id, directory, time_updated, time_archived)
+                 VALUES ('unmapped-session', 'Unmapped', 'unmapped', ?1, 300, NULL)",
+                [unmapped.to_string_lossy().as_ref()],
+            )
+            .expect("insert unmapped session");
+            drop(oc);
+
+            let cards = get_project_cards(&context);
+            assert_eq!(
+                cards.len(),
+                1,
+                "unmapped sessions should not form project cards"
+            );
+            let card = &cards[0];
+            assert_eq!(card.identity, "git:shared-root");
+            assert_eq!(card.session_count, 2);
+            assert_eq!(card.primary_path, main.to_string_lossy().to_string());
+            assert_eq!(card.display_name, "main-checkout");
+            assert_eq!(card.memory_count, 1);
+        });
+    }
+
+    #[test]
+    fn source_tree_does_not_spawn_git_for_identity_resolution() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let needle = ["Command::new(", "\"git\"", ")"].concat();
+        let mut offenders = Vec::new();
+
+        fn visit(dir: &Path, needle: &str, offenders: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read source dir") {
+                let entry = entry.expect("dir entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    if path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name == "target")
+                    {
+                        continue;
+                    }
+                    visit(&path, needle, offenders);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read rust source");
+                    if text.contains(needle) {
+                        offenders.push(path);
+                    }
+                }
+            }
+        }
+
+        visit(root, &needle, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "dashboard source must not spawn git: {offenders:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod list_sessions_paged_tests {
     use super::*;
 
@@ -5833,6 +6186,7 @@ mod load_messages_tests {
 mod cache_turn_tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn raw(
         harness: Harness,
         message_id: &str,
@@ -6570,13 +6924,10 @@ mod memory_project_filter_tests {
     //! `get_memories` / `get_memory_stats` filtered with `project_path = ?`
     //! against raw filesystem paths stored in the `memories` table.
     //!
-    //! These tests cover the helper that maps identities back to the set of
-    //! concrete paths (handling clones + worktrees that share an identity
-    //! but contribute memories under different absolute paths), and the
-    //! end-to-end identity-filter behavior of `get_memories` and
-    //! `get_memory_stats`.
+    //! These tests cover the helper that maps identity-shaped stored paths and
+    //! legacy raw paths to the values that should be queried, plus the end-to-end
+    //! identity-filter behavior of `get_memories` and `get_memory_stats`.
     use super::*;
-    use crate::project_identity::clear_cache_for_tests;
     use rusqlite::Connection;
 
     /// Build a minimal in-memory Magic Context-shaped DB with just enough of
@@ -6649,26 +7000,15 @@ mod memory_project_filter_tests {
         conn.last_insert_rowid()
     }
 
-    /// A non-git temp dir resolves to a `dir:<md5-12>` identity that's
-    /// derived purely from the canonicalized path string — no shell-out, no
-    /// git lookup. We use a stable dir so test order doesn't bite us when
-    /// shared filesystem state changes.
+    /// Raw legacy paths degrade to a deterministic `dir:<md5-12>` identity.
     fn stable_dir_identity(path: &str) -> String {
-        // Force the identity cache into a known state so this test doesn't
-        // see leftovers from a sibling test that resolved the same path.
-        clear_cache_for_tests();
-        resolve_project_identity(path)
+        normalize_stored_project_path(path)
     }
 
     #[test]
     fn resolve_paths_returns_all_paths_sharing_identity() {
-        // The CRITICAL invariant for issue #87: two clones of the same repo
-        // (or two paths that resolve to the same identity for any reason)
-        // both contribute memories under their own raw `project_path`, and
-        // a single identity filter must surface BOTH paths' memories.
-        //
-        // We use the SAME path twice to guarantee they share an identity
-        // without needing a real git repo in the test sandbox.
+        // A legacy raw path and its deterministic fallback identity must refer
+        // to the same stored memory rows.
         let conn = make_memory_db();
 
         // Two distinct memories under the same project_path (the realistic
@@ -6931,27 +7271,19 @@ mod memory_project_filter_tests {
     }
 
     /// Regression: `enumerate_memory_projects` returned rows whose
-    /// `display_name` was the raw identity (e.g. `git:abc…`, `dir:abc…`)
-    /// because it passed memory `project_path` values as a paths filter into
-    /// `enumerate_projects_filtered`. When the plugin started stamping
-    /// identities directly into memories.project_path (post-issue-#87 plugin
-    /// fix), those values never matched any `worktree`/`cwd` path, so the
-    /// OpenCode/Pi DB enrichment step was skipped and the fallback path
-    /// seeded ProjectRow with `primary_path = "git:HASH"`, then
-    /// `display_name = basename("git:HASH") = "git:HASH"`.
+    /// `display_name` was the raw identity (for example `git:abc…`) because
+    /// memory `project_path` values were passed into a function that expected
+    /// filesystem paths. When no project matched that stored path, the row that
+    /// `enumerate_memory_projects` fell back to used the raw identity string as
+    /// both `primary_path` and `display_name`.
     ///
-    /// Fix: filter the full enumerated project list by identity instead of
-    /// filtering by path string. These tests pin both arms:
-    ///   - identity-shaped memory values map to themselves
-    ///   - raw filesystem paths get resolved through `resolve_project_identity`
-    /// In both cases the returned ProjectRow display_name MUST NOT start
-    /// with `git:` or `dir:`. With no OpenCode/Pi DB in the test sandbox the
-    /// list is empty rather than poisoned with identity-named rows; that's
-    /// the correct safe failure mode.
+    /// Fix: filter the full enumerated project list by identity instead of by
+    /// path string. Identity-shaped memory values map to themselves, and raw
+    /// filesystem paths map to deterministic directory fallbacks.
     #[test]
     fn enumerate_memory_projects_with_identity_memories_does_not_leak_identity_as_name() {
-        // Simulate the post-#87 plugin storing the resolved identity directly
-        // as project_path.
+        // Simulate memories whose stored project path is already the resolved
+        // project identity.
         let conn = make_memory_db();
         insert_memory(&conn, "git:abc1234567890abcdef", "CONSTRAINTS", "active");
         insert_memory(

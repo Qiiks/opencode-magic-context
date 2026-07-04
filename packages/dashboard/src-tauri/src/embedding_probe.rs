@@ -498,7 +498,7 @@ fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
             v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254)
                 || v6
                     .to_ipv4_mapped()
-                    .map_or(false, |m| m.octets() == [169, 254, 169, 254])
+                    .is_some_and(|m| m.octets() == [169, 254, 169, 254])
         }
     }
 }
