@@ -1371,6 +1371,15 @@ impl ModuleHandler for McHandler {
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+        self.dispatch_value(ctx.channel(), request).await
+    }
+}
+
+impl McHandler {
+    /// Route a parsed request body to its handler. Split from `handle()` so the
+    /// routing arms are unit-testable (`RequestCtx` cannot be constructed
+    /// outside the transport).
+    async fn dispatch_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         let method = request
             .get("method")
             .and_then(Value::as_str)
@@ -1397,13 +1406,63 @@ impl ModuleHandler for McHandler {
                 },
             },
             // The CK-in/CK-out cache-stability spine.
-            Some("transform") => self.handle_transform_value(ctx.channel(), request).await,
+            Some("transform") => self.handle_transform_value(channel, request).await,
             Some("ctx_reduce" | "append_agent_drops" | "agent_drops.append") => {
-                self.handle_agent_drops_value(ctx.channel(), request)
+                self.handle_agent_drops_value(channel, request)
             }
-            // Default: echo (proves the wire round-trips).
-            _ => respond(json!({ "ok": true, "echo": request })),
+            // Explicit wire-debugging echo. Opt-in only: echoing every
+            // unrecognized body would silently swallow misrouted requests
+            // (a caller can "succeed" against an echo while testing nothing),
+            // so unknown shapes fail loud below instead.
+            Some("echo") => respond(json!({ "ok": true, "echo": request })),
+            _ => unrecognized_request_error(&request),
         }
+    }
+}
+
+/// Classify a request that matched no known `method`/`kind`. Two distinct
+/// errors so a misroute is diagnosable from the error code alone:
+/// - `{name, arguments}` without `method`/`kind` is the shape of an MCP
+///   tools/call envelope. This module does not accept MCP-routed tool calls
+///   yet (they need a mapping from the MCP shim's ephemeral session to the
+///   durable wire session id before commands like ctx_reduce can target the
+///   right queue), but the shape is recognized so a misconfigured MCP router
+///   fails with an exact cause instead of a generic shape error.
+/// - Anything else names the discriminator fields we looked for and the
+///   top-level keys we actually got.
+fn unrecognized_request_error(request: &Value) -> HandlerOutcome {
+    let has_mcp_shape = request.get("name").is_some() && request.get("arguments").is_some();
+    if has_mcp_shape {
+        return HandlerOutcome::Error {
+            code: "facade_envelope_not_supported".to_string(),
+            message: "MCP tools/call envelope ({name, arguments}) is not routable to this \
+                      module yet; MC commands use flat bodies with a top-level `kind` field"
+                .to_string(),
+        };
+    }
+    let got_keys = match request.as_object() {
+        Some(map) => {
+            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.join(", ")
+        }
+        None => format!("non-object JSON ({})", json_type_name(request)),
+    };
+    HandlerOutcome::Error {
+        code: "unrecognized_request_shape".to_string(),
+        message: format!(
+            "no `method` or `kind` field matched a known request; got top-level keys: [{got_keys}]"
+        ),
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -2038,6 +2097,66 @@ mod tests {
         assert_eq!(child["action"], "PASSTHROUGH");
         assert_eq!(child["ck_messages"].as_array().unwrap().len(), 1);
         assert_eq!(child["ck_messages"][0]["role"], "user");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_routes_each_envelope_class_to_a_distinct_arm() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        // A flat body with kind="transform" routes to the transform handler.
+        let transform = handler
+            .dispatch_value(7, request(vec![ck("m1", 1, "hello")]))
+            .await;
+        let transform_body: Value = match transform {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("transform should respond, got {other:?}"),
+        };
+        assert_eq!(transform_body["status"], "ok");
+
+        // Explicit echo: opt-in debugging arm still works when asked for by name.
+        let echo = handler
+            .dispatch_value(7, json!({ "kind": "echo", "probe": 42 }))
+            .await;
+        let echo_body: Value = match echo {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("echo should respond, got {other:?}"),
+        };
+        assert_eq!(echo_body["ok"], json!(true));
+        assert_eq!(echo_body["echo"]["probe"], json!(42));
+
+        // MCP tools/call envelope ({name, arguments}, no method/kind): a
+        // DISTINCT error so a facade misroute is diagnosable from the code.
+        let facade = handler
+            .dispatch_value(
+                7,
+                json!({ "name": "ctx_reduce", "arguments": { "drop": "1-3" } }),
+            )
+            .await;
+        assert_eq!(error_code(facade), "facade_envelope_not_supported");
+
+        // Anything else: fail loud, never a silent echo. The message names the
+        // keys that were present so a misrouted request is diagnosable.
+        let garbage = handler
+            .dispatch_value(7, json!({ "foo": 1, "bar": 2 }))
+            .await;
+        match garbage {
+            HandlerOutcome::Error { code, message } => {
+                assert_eq!(code, "unrecognized_request_shape");
+                assert!(message.contains("foo"), "message names got keys: {message}");
+            }
+            other => panic!("expected error outcome, got {other:?}"),
+        }
+
+        // Non-object bodies get the same loud failure with the JSON type named.
+        let non_object = handler.dispatch_value(7, json!("just a string")).await;
+        match non_object {
+            HandlerOutcome::Error { code, message } => {
+                assert_eq!(code, "unrecognized_request_shape");
+                assert!(message.contains("string"), "message names type: {message}");
+            }
+            other => panic!("expected error outcome, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
