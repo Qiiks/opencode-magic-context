@@ -131,6 +131,20 @@ stamps on send.
 
 ---
 
+## 6a. Project-identity dubious-ownership warnings
+
+**OpenCode:** when git refuses a repository as dubious ownership, the shared
+project-identity resolver logs the fallback and the OpenCode transform/hook path
+sends a one-shot session notification with the `safe.directory` command.
+
+**Pi:** `packages/pi-plugin/src/index.ts` surfaces config warnings through the
+standard `warn()` log channel and has no startup/session warning channel
+equivalent to OpenCode's ignored-message fallback. Pi therefore relies on the
+shared resolver's log-only dubious-ownership warning while still using the same
+`dir:` fallback identity and retry cooldown.
+
+---
+
 ## 7. Storage & process model
 
 - Pi sessions are JSONL (`~/.pi/agent/sessions/*.jsonl`); OpenCode uses its own

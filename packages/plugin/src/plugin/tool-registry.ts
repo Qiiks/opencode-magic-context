@@ -2,7 +2,7 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
 import { isDreamerRunnable } from "../config/agent-disable";
 import { DEFAULT_PROTECTED_TAGS } from "../features/magic-context/defaults";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import { resolveProjectIdentityOrFallback } from "../features/magic-context/memory/project-identity";
 import {
     getDatabasePersistenceError,
     isDatabasePersisted,
@@ -62,7 +62,7 @@ export function createToolRegistry(args: {
     // OpenCode's top-level `ctx.directory` reflects the launch dir, not the
     // session's actual working directory (e.g. when launched via
     // `opencode -s <id>` from outside the project).
-    const resolveProjectPath = (directory: string) => resolveProjectIdentity(directory);
+    const resolveProjectPath = (directory: string) => resolveProjectIdentityOrFallback(directory);
 
     // When memory is off the <project-memory> block is never injected, so an
     // agent's memory writes would never resurface. Omit ctx_memory entirely

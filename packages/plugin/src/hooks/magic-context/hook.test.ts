@@ -4,11 +4,16 @@
 process.env.OPENCODE_CLIENT = "desktop";
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import type { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeTaskScheduleState } from "../../features/magic-context/dreamer/storage-task-schedule";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    __resetProjectIdentityForTests,
+    __setProjectIdentityTestHooks,
+    resolveProjectIdentity,
+} from "../../features/magic-context/memory/project-identity";
 import { __resetMessageIndexAsyncForTests } from "../../features/magic-context/message-index-async";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
@@ -41,6 +46,7 @@ function makeTempDir(prefix: string): string {
 }
 
 afterEach(() => {
+    __resetProjectIdentityForTests();
     __resetMessageIndexAsyncForTests();
     closeReadOnlySessionDb();
     closeDatabase();
@@ -194,6 +200,23 @@ function countIndexedHookMessage(sessionId: string, messageId: string): number {
 }
 
 describe("magic-context hook", () => {
+    it("constructs with directory fallback when load-time identity resolution throws", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-identity-fallback-data-");
+        const projectDir = makeTempDir("hook-identity-fallback-project-");
+        mkdirSync(join(projectDir, ".git"));
+        __setProjectIdentityTestHooks({
+            execFileSync: mock(() => {
+                const error = new Error("permission denied") as Error & { code?: string };
+                error.code = "EACCES";
+                throw error;
+            }) as unknown as typeof execFileSync,
+        });
+        const deps = createMockDeps();
+        deps.directory = projectDir;
+
+        expect(createMagicContextHook(deps)).not.toBeNull();
+    });
+
     it("indexes terminal message.updated events asynchronously", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-message-index-");
         createOpenCodeDbForHook("ses-index", [

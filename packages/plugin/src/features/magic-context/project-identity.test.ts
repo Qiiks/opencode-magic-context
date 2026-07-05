@@ -1,20 +1,25 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path, { join } from "node:path";
 import {
+    __clearProjectIdentityTransientCooldownForTests,
+    __resetProjectIdentityForTests,
+    __setProjectIdentityTestHooks,
     normalizeStoredProjectPath,
     ProjectIdentityError,
     resolveProjectIdentity,
     resolveProjectIdentityStrict,
     storedPathBelongsToIdentity,
+    takeDubiousOwnershipProjectIdentityWarning,
 } from "./project-identity";
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
+    __resetProjectIdentityForTests();
     for (const dir of tempDirs) {
         try {
             chmodSync(dir, 0o755);
@@ -86,6 +91,25 @@ function expectProjectIdentityError(fn: () => void): ProjectIdentityError {
     return caught;
 }
 
+function makeGitFailure(fields: {
+    stderr?: string;
+    code?: string;
+    signal?: string;
+    killed?: boolean;
+}) {
+    const error = new Error("git failed") as Error & {
+        stderr?: Buffer;
+        code?: string;
+        signal?: string;
+        killed?: boolean;
+    };
+    if (fields.stderr !== undefined) error.stderr = Buffer.from(fields.stderr, "utf8");
+    if (fields.code !== undefined) error.code = fields.code;
+    if (fields.signal !== undefined) error.signal = fields.signal;
+    if (fields.killed !== undefined) error.killed = fields.killed;
+    return error;
+}
+
 describe("project identity", () => {
     it("resolveProjectIdentityStrict returns the git root commit identity", () => {
         const repo = makeGitRepo();
@@ -132,6 +156,108 @@ describe("project identity", () => {
         const directory = makeTempDir("project-identity-wrapper-");
 
         expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+    });
+
+    it("uses the no-git fast path without spawning git", () => {
+        const directory = makeTempDir("project-identity-no-git-fast-");
+        const execMock = mock(() => {
+            throw new Error("git should not be spawned for a directory with no .git ancestor");
+        });
+        __setProjectIdentityTestHooks({ execFileSync: execMock as unknown as typeof execFileSync });
+
+        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(execMock).not.toHaveBeenCalled();
+    });
+
+    it("detects git metadata in ancestors for subdirectory sessions", () => {
+        const repo = makeGitRepo();
+        const subdir = join(repo, "nested", "session");
+        mkdirSync(subdir, { recursive: true });
+
+        expect(resolveProjectIdentity(subdir)).toBe(`git:${rootCommit(repo)}`);
+    });
+
+    it("classifies dubious ownership and falls back until the cooldown expires", () => {
+        const directory = makeTempDir("project-identity-dubious-");
+        mkdirSync(join(directory, ".git"));
+        let now = 1_000;
+        let recovered = false;
+        const execMock = mock(() => {
+            if (recovered) return "abcdef1234567890\n";
+            throw makeGitFailure({
+                stderr:
+                    "fatal: detected dubious ownership in repository at '/repo'\n" +
+                    "To add an exception for this directory, call:\n",
+            });
+        });
+        __setProjectIdentityTestHooks({
+            execFileSync: execMock as unknown as typeof execFileSync,
+            nowMs: () => now,
+        });
+
+        const strictError = expectProjectIdentityError(() =>
+            resolveProjectIdentityStrict(directory),
+        );
+        expect(strictError.errorClass).toBe("dubious_ownership");
+
+        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(takeDubiousOwnershipProjectIdentityWarning(directory)).toContain(
+            "git config --global --add safe.directory",
+        );
+        expect(takeDubiousOwnershipProjectIdentityWarning(directory)).toBeNull();
+
+        recovered = true;
+        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(execMock).toHaveBeenCalledTimes(2);
+
+        now += 5 * 60 * 1000 + 1;
+        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
+        expect(execMock).toHaveBeenCalledTimes(3);
+    });
+
+    it("cools down git timeouts so immediate retries do not respawn git", () => {
+        const directory = makeTempDir("project-identity-timeout-");
+        mkdirSync(join(directory, ".git"));
+        const execMock = mock(() => {
+            throw makeGitFailure({ code: "ETIMEDOUT" });
+        });
+        __setProjectIdentityTestHooks({ execFileSync: execMock as unknown as typeof execFileSync });
+
+        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        expect(execMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("re-probes after a transient cooldown is cleared", () => {
+        const directory = makeTempDir("project-identity-clear-cooldown-");
+        mkdirSync(join(directory, ".git"));
+        let recovered = false;
+        const execMock = mock(() => {
+            if (recovered) return "abcdef1234567890\n";
+            throw makeGitFailure({ code: "ETIMEDOUT" });
+        });
+        __setProjectIdentityTestHooks({ execFileSync: execMock as unknown as typeof execFileSync });
+
+        expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
+        recovered = true;
+        __clearProjectIdentityTransientCooldownForTests(directory);
+
+        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
+        expect(execMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("still propagates permission_denied git failures", () => {
+        const directory = makeTempDir("project-identity-permission-");
+        mkdirSync(join(directory, ".git"));
+        __setProjectIdentityTestHooks({
+            execFileSync: mock(() => {
+                throw makeGitFailure({ code: "EACCES" });
+            }) as unknown as typeof execFileSync,
+        });
+
+        const error = expectProjectIdentityError(() => resolveProjectIdentity(directory));
+
+        expect(error.errorClass).toBe("permission_denied");
     });
 
     it("normalizeStoredProjectPath returns stored identities unchanged", () => {

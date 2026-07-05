@@ -88,7 +88,10 @@ function classifyBackfillError(error: unknown): {
     errorMessage: string;
 } {
     if (error instanceof ProjectIdentityError) {
-        return { errorClass: error.errorClass, errorMessage: error.message };
+        return {
+            errorClass: error.errorClass === "dubious_ownership" ? "unknown" : error.errorClass,
+            errorMessage: error.message,
+        };
     }
     if (error instanceof Error) {
         return { errorClass: "unknown", errorMessage: error.message };

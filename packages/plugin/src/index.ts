@@ -11,7 +11,7 @@ import { migrateMagicContextConfigLocations } from "./config/migrate-config-loca
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
-import { resolveProjectIdentity } from "./features/magic-context/memory/project-identity";
+import { resolveProjectIdentityOrFallback } from "./features/magic-context/memory/project-identity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
@@ -228,7 +228,7 @@ const server: Plugin = async (ctx) => {
         const dreamerRunnable = isDreamerRunnable(pluginConfig);
         const timerRegistration = {
             directory: ctx.directory,
-            projectIdentity: resolveProjectIdentity(ctx.directory),
+            projectIdentity: resolveProjectIdentityOrFallback(ctx.directory),
             client: ctx.client,
             dreamerConfig: dreamerRunnable ? pluginConfig.dreamer : undefined,
             language: pluginConfig.language,

@@ -35,7 +35,7 @@ import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityOrFallback } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
@@ -149,7 +149,7 @@ function resolveCurrentProject(ctx: { cwd: string }): {
 	projectIdentity: string;
 } {
 	const projectDir = ctx.cwd;
-	const projectIdentity = resolveProjectIdentity(projectDir);
+	const projectIdentity = resolveProjectIdentityOrFallback(projectDir);
 	return { projectDir, projectIdentity };
 }
 
@@ -525,7 +525,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// identity/path resolution uses ctx.cwd per hook/command so session cwd
 	// switches follow the active project without reloading config.
 	const projectDir = process.cwd();
-	const projectIdentity = resolveProjectIdentity(projectDir);
+	const projectIdentity = resolveProjectIdentityOrFallback(projectDir);
 	const seenDreamerProjectIdentities = new Set<string>([projectIdentity]);
 
 	try {

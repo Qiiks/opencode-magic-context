@@ -80,4 +80,21 @@ describe("storage-v22-backfill-failures", () => {
         expect(clearV22BackfillFailures(database)).toBe(1);
         expect(listV22BackfillFailures(database)).toEqual([]);
     });
+
+    test("records dubious ownership as unknown without violating the check constraint", () => {
+        const database = makeDb();
+
+        const row = recordV22BackfillFailure(database, {
+            tableName: "memories",
+            rowId: 7,
+            rawProjectPath: "/dubious",
+            errorClass: "dubious_ownership",
+            errorMessage: "git detected dubious ownership",
+            failedAt: 30,
+        });
+
+        expect(row.errorClass).toBe("unknown");
+        expect(row.errorMessage).toBe("git detected dubious ownership");
+        expect(getV22BackfillFailure(database, "memories", 7)?.errorClass).toBe("unknown");
+    });
 });

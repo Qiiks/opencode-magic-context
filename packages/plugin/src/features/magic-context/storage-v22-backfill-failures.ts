@@ -7,6 +7,8 @@ export type V22BackfillErrorClass =
     | "permission_denied"
     | "unknown";
 
+type RecordableV22BackfillErrorClass = V22BackfillErrorClass | "dubious_ownership";
+
 const ERROR_CLASSES = new Set<string>([
     "not_git_repo",
     "git_missing",
@@ -35,10 +37,18 @@ interface V22BackfillFailureDbRow {
     failed_at: number;
 }
 
-function assertErrorClass(errorClass: string): asserts errorClass is V22BackfillErrorClass {
+function normalizeErrorClass(errorClass: RecordableV22BackfillErrorClass): V22BackfillErrorClass {
+    // The database CHECK constraint intentionally keeps the historic small set
+    // for this log table. New identity-resolution details that do not need
+    // queryable recovery state are recorded as `unknown`; the message carries
+    // the actionable detail without requiring a schema migration.
+    if (errorClass === "dubious_ownership") {
+        return "unknown";
+    }
     if (!ERROR_CLASSES.has(errorClass)) {
         throw new Error(`Invalid v22 backfill error class: ${errorClass}`);
     }
+    return errorClass;
 }
 
 function toV22BackfillFailure(row: V22BackfillFailureDbRow): V22BackfillFailureRow {
@@ -59,12 +69,12 @@ export function recordV22BackfillFailure(
         tableName: string;
         rowId: number;
         rawProjectPath: string;
-        errorClass: V22BackfillErrorClass;
+        errorClass: RecordableV22BackfillErrorClass;
         errorMessage?: string | null;
         failedAt?: number;
     },
 ): V22BackfillFailureRow {
-    assertErrorClass(input.errorClass);
+    const errorClass = normalizeErrorClass(input.errorClass);
     db.prepare(
         `INSERT INTO v22_backfill_failures
             (table_name, row_id, raw_project_path, error_class, error_message, failed_at)
@@ -78,7 +88,7 @@ export function recordV22BackfillFailure(
         input.tableName,
         input.rowId,
         input.rawProjectPath,
-        input.errorClass,
+        errorClass,
         input.errorMessage ?? null,
         input.failedAt ?? Date.now(),
     );

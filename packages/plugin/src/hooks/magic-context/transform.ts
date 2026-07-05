@@ -1,5 +1,8 @@
 import * as crypto from "node:crypto";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentity,
+    takeDubiousOwnershipProjectIdentityWarning,
+} from "../../features/magic-context/memory/project-identity";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
@@ -130,6 +133,23 @@ function getMessageTokensCache(
         messageTokensBySession.set(sessionId, cache);
     }
     return cache;
+}
+
+function maybeSendProjectIdentityWarning(
+    deps: TransformDeps,
+    sessionId: string,
+    directory: string,
+    notificationParams: import("./send-session-notification").NotificationParams,
+): void {
+    if (!deps.client) return;
+    const warning = takeDubiousOwnershipProjectIdentityWarning(directory);
+    if (!warning) return;
+    void sendIgnoredMessage(deps.client, sessionId, warning, notificationParams).catch((error) => {
+        sessionLog(
+            sessionId,
+            `project identity warning delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    });
 }
 
 export function clearMessageTokensCache(sessionId: string, messageId?: string): void {
@@ -1122,10 +1142,19 @@ export function createTransform(deps: TransformDeps) {
         // runCompartmentPhase (historian memory resolution). Computing it
         // twice per turn is wasteful — resolveProjectIdentity caches by
         // directory but still does a cache lookup on each call, and the
-        // first call per directory in a new process spawns `git rev-parse`.
+        // first call per directory in a new process spawns `git rev-list`.
+        const memoryProjectDirectory = compartmentDirectory || process.cwd();
         const projectIdentity = deps.memoryConfig?.enabled
-            ? resolveProjectIdentity(compartmentDirectory || process.cwd())
+            ? resolveProjectIdentity(memoryProjectDirectory)
             : undefined;
+        if (deps.memoryConfig?.enabled) {
+            maybeSendProjectIdentityWarning(
+                deps,
+                sessionId,
+                memoryProjectDirectory,
+                notificationParams,
+            );
+        }
         // Session-scoped project identity for note-nudge and auto-search, which
         // must target the SESSION's project — not the launch cwd. `deps.projectPath`
         // is resolved once at hook init from the launch directory; on
@@ -1139,6 +1168,9 @@ export function createTransform(deps: TransformDeps) {
         const sessionProjectIdentity =
             projectIdentity ??
             (sessionDirectory ? resolveProjectIdentity(sessionDirectory) : deps.projectPath);
+        if (sessionDirectory) {
+            maybeSendProjectIdentityWarning(deps, sessionId, sessionDirectory, notificationParams);
+        }
         // Persist only host-resolved session bindings. The launch-directory
         // fallback keeps transforms non-fatal, but storing it as ownership would
         // let a transient SDK failure permanently mis-scope chunk backfills.

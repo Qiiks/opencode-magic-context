@@ -21,7 +21,10 @@ import {
     runDueTasksForProject,
     runManualDream,
 } from "../../features/magic-context/dreamer/task-scheduler";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentityOrFallback,
+    takeDubiousOwnershipProjectIdentityWarning,
+} from "../../features/magic-context/memory/project-identity";
 import {
     embedSessionCompartmentChunks,
     getEmbeddingCoverageStatus,
@@ -77,7 +80,7 @@ import {
     getLiveNotificationParams,
 } from "./hook-handlers";
 import type { LiveSessionState } from "./live-session-state";
-import { sendIgnoredMessage } from "./send-session-notification";
+import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import { maybeSendUpgradeReminder } from "./upgrade-reminder";
 
@@ -196,7 +199,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         return null;
     }
 
-    const projectPath = resolveProjectIdentity(deps.directory);
+    const projectPath = resolveProjectIdentityOrFallback(deps.directory);
 
     // Startup consistency check: reconcile any compaction markers whose state
     // references rows that no longer exist in OpenCode's DB. This can happen
@@ -303,6 +306,25 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         }
         return undefined;
     };
+
+    const maybeSendProjectIdentitySessionWarning = (sessionId: string, directory: string): void => {
+        const warning = takeDubiousOwnershipProjectIdentityWarning(directory);
+        if (!warning) return;
+        const notificationParams: NotificationParams = getLiveNotificationParams(
+            sessionId,
+            liveModelBySession,
+            variantBySession,
+            agentBySession,
+            deps.config.toast_duration_ms,
+        );
+        void sendIgnoredMessage(deps.client, sessionId, warning, notificationParams).catch(
+            (error) => {
+                log(
+                    `[magic-context] failed to send project identity warning for ${directory}: ${getErrorMessage(error)}`,
+                );
+            },
+        );
+    };
     const dreamerRunnable = isDreamerRunnable(deps.config);
     const dreamerConfig = dreamerRunnable ? deps.config.dreamer : undefined;
     const historianRunnable = isHistorianRunnable(deps.config);
@@ -378,7 +400,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return "Embedding is already running for this session.";
         }
         await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-        const sessionProjectIdentity = resolveProjectIdentity(directory);
+        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        maybeSendProjectIdentitySessionWarning(sessionId, directory);
         embedPauseBySession.delete(sessionId);
         const prior = embedRunStateBySession.get(sessionId);
         if (prior) prior.abort();
@@ -469,14 +492,16 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         const ctrl = embedRunStateBySession.get(sessionId);
         if (ctrl) ctrl.abort();
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentity(directory);
+        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const cov = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
         return `Paused at ${cov.session.embedded}/${cov.session.total} compartments embedded.`;
     };
 
     const getEmbedStatusText = (sessionId: string): string => {
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentity(directory);
+        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
         const progress = recompProgressBySession.get(sessionId);
         const drainUi = getEmbedDrainUiStatus(sessionId, progress);
@@ -503,7 +528,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 // transform return first, keeping the hot path clean.
                 await new Promise((resolve) => setTimeout(resolve, 0));
                 await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-                const sessionProjectIdentity = resolveProjectIdentity(directory);
+                const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+                maybeSendProjectIdentitySessionWarning(sessionId, directory);
                 const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
                 if (!coverage.enabled) return;
                 const remaining = coverage.session.total - coverage.session.embedded;
