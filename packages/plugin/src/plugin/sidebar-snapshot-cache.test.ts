@@ -18,7 +18,6 @@ function makeSnapshot(overrides: Partial<SidebarSnapshot> = {}): SidebarSnapshot
         contextLimit: 0,
         systemPromptTokens: 0,
         compartmentCount: 0,
-        factCount: 0,
         memoryCount: 0,
         memoryBlockCount: 0,
         pendingOpsCount: 0,
@@ -49,7 +48,6 @@ describe("applyStickySnapshotCache", () => {
             compartmentTokens: 50_000,
             conversationTokens: 25_000,
             compartmentCount: 5,
-            factCount: 3,
             memoryCount: 10,
         });
         const result = applyStickySnapshotCache("ses_test", fresh);
@@ -77,7 +75,6 @@ describe("applyStickySnapshotCache", () => {
                 toolCallTokens: 99_000,
                 toolDefinitionTokens: 32_000,
                 compartmentCount: 392,
-                factCount: 4,
                 memoryCount: 486,
             }),
         );
@@ -86,7 +83,6 @@ describe("applyStickySnapshotCache", () => {
         const flickered = makeSnapshot({
             inputTokens: 0, // mid-turn flicker
             compartmentCount: 393, // a new compartment landed
-            factCount: 5,
             memoryCount: 487,
             historianRunning: true,
             pendingOpsCount: 12,
@@ -106,7 +102,6 @@ describe("applyStickySnapshotCache", () => {
 
         // Counts and live state come from the fresh build.
         expect(result.compartmentCount).toBe(393);
-        expect(result.factCount).toBe(5);
         expect(result.memoryCount).toBe(487);
         expect(result.historianRunning).toBe(true);
         expect(result.pendingOpsCount).toBe(12);

@@ -69,6 +69,14 @@ describe("isNativeRuntimeMissingError", () => {
         expect(isNativeRuntimeMissingError(err)).toBe(true);
     });
 
+    test("MODULE_NOT_FOUND for the onnxruntime binding IS missing-runtime", () => {
+        const err = Object.assign(
+            new Error("Cannot find module '../bin/napi-v6/win32/x64/onnxruntime_binding.node'"),
+            { code: "ERR_MODULE_NOT_FOUND" },
+        );
+        expect(isNativeRuntimeMissingError(err)).toBe(true);
+    });
+
     test("ERR_DLOPEN_FAILED for an UNRELATED native module is not our runtime", () => {
         const err = Object.assign(new Error("some-other-native.node failed to load"), {
             code: "ERR_DLOPEN_FAILED",

@@ -101,6 +101,29 @@ function writeHealthyFiles(agentDir: string, cwd: string): void {
     );
 }
 
+function createInstalledPiPlugin(agentDir: string, withNativeBinding: boolean): void {
+    const pluginDir = join(agentDir, "npm", "node_modules", "@cortexkit", "pi-magic-context");
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(
+        join(pluginDir, "package.json"),
+        JSON.stringify({ name: "@cortexkit/pi-magic-context", version: "0.0.0" }),
+    );
+
+    const onnxDir = join(pluginDir, "node_modules", "onnxruntime-node");
+    mkdirSync(onnxDir, { recursive: true });
+    writeFileSync(
+        join(onnxDir, "package.json"),
+        JSON.stringify({ name: "onnxruntime-node", main: "index.js" }),
+    );
+    writeFileSync(join(onnxDir, "index.js"), "module.exports = {};\n");
+
+    if (withNativeBinding) {
+        const binDir = join(onnxDir, "bin", "napi-v6", process.platform, process.arch);
+        mkdirSync(binDir, { recursive: true });
+        writeFileSync(join(binDir, "onnxruntime_binding.node"), "mock native binding");
+    }
+}
+
 function createMockDb(): Database {
     const db = new Database(":memory:");
     db.exec(`
@@ -194,6 +217,40 @@ describe("Pi doctor", () => {
         expect(output).toContain("PASS SQLite integrity_check: ok");
         expect(output).toContain("Summary: PASS");
         expect(output).toContain("FAIL 0");
+    });
+
+    it("warns when the local onnxruntime native binding is absent", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        createInstalledPiPlugin(agentDir, false);
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor(baseOptions(root, cwd, prompts));
+
+        expect(code).toBe(0);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain(
+            "WARN Embedding provider: local — onnxruntime-node native binding missing",
+        );
+        expect(output).toContain("postinstall likely failed");
+        expect(output).toContain("WARN 1");
+    });
+
+    it("passes the local embedding check when the onnxruntime native binding is present", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        createInstalledPiPlugin(agentDir, true);
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor(baseOptions(root, cwd, prompts));
+
+        expect(code).toBe(0);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain("PASS Embedding provider: local (native runtime present)");
     });
 
     it("repairs missing package entry and missing user config in --force mode", async () => {

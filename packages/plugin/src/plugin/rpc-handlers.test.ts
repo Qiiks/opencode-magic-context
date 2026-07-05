@@ -103,6 +103,25 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
         }
     });
 
+    test("omits retired factCount from the RPC sidebar payload", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-sidebar-no-fact-count";
+            const directory = process.cwd();
+            db.prepare(
+                `INSERT INTO session_meta (
+                    session_id, last_input_tokens, last_context_percentage,
+                    system_prompt_tokens, memory_block_cache, memory_block_count
+                ) VALUES (?, 50000, 25, 5000, '', 0)`,
+            ).run(sessionId);
+
+            const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
+            expect(Object.hasOwn(snapshot as object, "factCount")).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("memory bucket measures the <project-memory> slice ACTUALLY in m[0] (v2 wire), not memory_block_cache", () => {
         const db = createTestDb();
         try {

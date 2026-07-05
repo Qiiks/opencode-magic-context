@@ -154,7 +154,6 @@ export function buildSidebarSnapshot(
         contextLimit: 0,
         systemPromptTokens: 0,
         compartmentCount: 0,
-        factCount: 0,
         memoryCount: 0,
         memoryBlockCount: 0,
         pendingOpsCount: 0,
@@ -221,12 +220,6 @@ export function buildSidebarSnapshot(
             )
             .get(sessionId);
         const compartmentCount = compartmentRow?.count ?? 0;
-
-        // v2: facts are retired as a render source (promoted to memories), so the
-        // sidebar reports 0 facts rather than counting the vestigial session_facts
-        // table — a non-zero count would mislead operators into thinking facts
-        // still render in <session-history>.
-        const factCount = 0;
 
         let memoryCount = 0;
         if (projectIdentity) {
@@ -424,7 +417,6 @@ export function buildSidebarSnapshot(
             contextLimit,
             systemPromptTokens: calibrated.systemTokens,
             compartmentCount,
-            factCount,
             memoryCount,
             memoryBlockCount,
             pendingOpsCount,

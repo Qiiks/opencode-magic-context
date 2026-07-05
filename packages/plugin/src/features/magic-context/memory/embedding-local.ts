@@ -288,14 +288,17 @@ export function isNativeRuntimeMissingError(error: unknown): boolean {
     // onnxruntime-node IS installed but its native binary fails to LOAD — e.g.
     // Windows missing the VC++ runtime throws ERR_DLOPEN_FAILED on the
     // `onnxruntime_binding.node` file (whose path contains "onnxruntime", not
-    // necessarily the literal "onnxruntime-node"). This is environmental and
-    // permanent, same as the missing-package case: latch and degrade once
-    // instead of re-spamming the load error on every embedding (issue #128).
+    // necessarily the literal "onnxruntime-node"). A failed postinstall can also
+    // surface as MODULE_NOT_FOUND for `onnxruntime_binding.node`. Both are
+    // environmental and permanent, same as the missing-package case: latch and
+    // degrade once instead of re-spamming the load error on every embedding.
     if (code === "ERR_DLOPEN_FAILED" && lower.includes("onnxruntime")) {
         return true;
     }
 
-    if (!lower.includes("onnxruntime-node")) return false;
+    const mentionsNativeRuntime =
+        lower.includes("onnxruntime-node") || lower.includes("onnxruntime_binding");
+    if (!mentionsNativeRuntime) return false;
     return (
         code === "ERR_MODULE_NOT_FOUND" ||
         name === "ResolveMessage" ||
@@ -554,11 +557,11 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                     // are disabled for this process until the install is repaired.
                     nativeRuntimeMissing = true;
                     log(
-                        "[magic-context] local embedding runtime is not installed " +
-                            "(onnxruntime-node missing from this install). Local embeddings " +
-                            "are disabled. Fix: reinstall the plugin (run `npx " +
-                            "@cortexkit/magic-context@latest doctor --force`), or configure an " +
-                            "`openai-compatible`/`ollama` embedding endpoint instead. " +
+                        "[magic-context] local embeddings are disabled because the " +
+                            "onnxruntime-node native binding is missing or failed to load. " +
+                            "Run `npx @cortexkit/magic-context@latest doctor` for repair " +
+                            "guidance (use `doctor --force` to reinstall cached plugin packages), " +
+                            "or configure an `openai-compatible` embedding HTTP endpoint. " +
                             "Existing memories are unaffected.",
                     );
                 } else {

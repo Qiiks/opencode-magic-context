@@ -181,7 +181,6 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 label: "Facts",
                 tokens: d.factTokens,
                 color: COLORS.facts,
-                detail: `(${d.factCount})`,
             })
         if (d.memoryTokens > 0)
             segs.push({
