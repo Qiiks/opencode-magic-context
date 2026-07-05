@@ -1877,6 +1877,15 @@ const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 50,
+        description: "add durable ctx-wrapup session marker",
+        up(db: Database): void {
+            if (tableExists(db, "session_meta")) {
+                ensureColumn(db, "session_meta", "wrapup_in_progress_state", "TEXT");
+            }
+        },
+    },
 ];
 
 /**

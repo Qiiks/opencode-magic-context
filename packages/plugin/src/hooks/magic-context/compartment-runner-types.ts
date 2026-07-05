@@ -1,7 +1,10 @@
 import type { PluginContext } from "../../plugin/types";
 import type { Database } from "../../shared/sqlite";
 import type { ParsedEvent } from "./compartment-parser";
-import type { ProtectedTailBoundarySnapshot } from "./protected-tail-boundary";
+import type {
+    BoundarySnapshotValidationResult,
+    ProtectedTailBoundarySnapshot,
+} from "./protected-tail-boundary";
 import type { NotificationParams } from "./send-session-notification";
 
 /**
@@ -26,7 +29,7 @@ export interface RecompProgress {
      *  a 0-compartment session in a project whose other sessions had them).
      *  Optional + defaults to "recomp" so runner-emitted per-pass entries (which
      *  don't know the flow) inherit the kind set by setRecompStarting. */
-    kind?: "recomp" | "upgrade" | "embed";
+    kind?: "recomp" | "upgrade" | "embed" | "wrapup";
     /** "skipped" is a TRANSIENT non-failure outcome: the incremental historian
      *  briefly held the compartment-state lease (or another process is mutating
      *  it), so the run no-op'd. It renders neutrally with retry guidance and
@@ -64,6 +67,13 @@ export interface CompartmentRunnerDeps {
     historianTimeoutMs?: number;
     /** Immutable protected-tail boundary resolved by the trigger/force path. Tests may omit it and use the default-snapshot factory. */
     boundarySnapshot?: ProtectedTailBoundarySnapshot;
+    /** Optional stale-snapshot refresh hook. Manual wrapup uses this so stale
+     *  snapshots re-resolve with the keep-watermark override instead of falling
+     *  back to normal pressure math. */
+    refreshBoundarySnapshot?: (
+        snapshot: ProtectedTailBoundarySnapshot,
+        validation: BoundarySnapshotValidationResult,
+    ) => ProtectedTailBoundarySnapshot | null;
     /** Current resolved main-model context limit used to reject stale boundary snapshots after model switches. */
     currentContextLimit?: number;
     /** Resolved fallback chain for historian-family calls (historian + compressor). */
@@ -128,6 +138,10 @@ export interface CompartmentRunnerDeps {
      * (which would defer queued drop ops — the production livelock).
      */
     onHistorianRunStarted?: () => void;
+    /** Manual wrapup bypasses the pressure-window quota but keeps the no-progress breaker. */
+    forceDrainQuota?: boolean;
+    /** Persist a weak-lookahead final compartment for coverage, but skip durable promotion. */
+    forceKeepLastCompartment?: boolean;
 }
 
 export interface CandidateCompartment {

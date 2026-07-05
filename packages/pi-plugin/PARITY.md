@@ -717,3 +717,16 @@ tool-arc fencing, and historian eligibility are parity-tested for those fields.
 and is deferred. Tests should assert text + tool-I/O parity and separately track
 Pi's expected undercount for thinking/images rather than treating it as a silent
 regression.
+
+---
+
+## 7. `/ctx-wrapup` progress surfaces as Pi status messages
+
+**OpenCode:** `/ctx-wrapup` uses the shared recomp progress channel, so the TUI
+sidebar can render a live **Wrapup** row with chunk counters.
+
+**Pi:** there is no persistent sidebar row. The command emits one status/toast
+message for the upfront estimate and one per historian chunk, then a final
+summary. The drain loop, durable `wrapup_in_progress` marker, sequential historian
+runs, and deferred compaction semantics are shared in intent; only the progress
+surface differs.

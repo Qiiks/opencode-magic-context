@@ -30,6 +30,7 @@ import {
     clearHistorianFailureState,
     getOverflowState,
     incrementHistorianFailure,
+    isWrapupInProgress,
     recordHistorianDrainFailure,
     recordProtectedTailPublicationFloor,
     reserveProtectedTailDrainTokens,
@@ -250,20 +251,22 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // live messages, so the head can never include a message that now belongs
         // to the current protected tail.
         if (!validation.ok && validation.reason === "stale_snapshot") {
-            const refreshed = resolveOpenCodeProtectedTailBoundary({
-                db,
-                sessionId,
-                mode: "incremental-runner",
-                contextLimit: deps.currentContextLimit ?? boundarySnapshot.contextLimit,
-                executeThresholdPercentage: boundarySnapshot.executeThresholdPercentage,
-                usage: {
-                    percentage: boundarySnapshot.usagePercentage,
-                    inputTokens: boundarySnapshot.usageInputTokens,
-                },
-                usageSource: boundarySnapshot.usageSource,
-                emergencyTailScale: boundarySnapshot.emergencyTailScale,
-            });
-            if (hasRunnableCompartmentWindow(refreshed)) {
+            const refreshed = deps.refreshBoundarySnapshot
+                ? deps.refreshBoundarySnapshot(boundarySnapshot, validation)
+                : resolveOpenCodeProtectedTailBoundary({
+                      db,
+                      sessionId,
+                      mode: "incremental-runner",
+                      contextLimit: deps.currentContextLimit ?? boundarySnapshot.contextLimit,
+                      executeThresholdPercentage: boundarySnapshot.executeThresholdPercentage,
+                      usage: {
+                          percentage: boundarySnapshot.usagePercentage,
+                          inputTokens: boundarySnapshot.usageInputTokens,
+                      },
+                      usageSource: boundarySnapshot.usageSource,
+                      emergencyTailScale: boundarySnapshot.emergencyTailScale,
+                  });
+            if (refreshed && hasRunnableCompartmentWindow(refreshed)) {
                 sessionLog(
                     sessionId,
                     `historian: refreshed stale protected-tail snapshot at run time (was: ${validation.detail ?? "stale"}) — eligible head ${refreshed.offset}-${refreshed.eligibleEndOrdinal - 1}`,
@@ -297,7 +300,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 `historian no-op: protectedTailStart=${protectedTailStart} eligibleEnd=${eligibleEndOrdinal} <= offset=${offset} — nothing to compact`,
             );
             if (boundarySnapshot.usagePercentage < 80 && !boundarySnapshot.emergencyTailScale) {
-                clearEmergencyRecovery(db, sessionId);
+                if (!isWrapupInProgress(db, sessionId)) clearEmergencyRecovery(db, sessionId);
             } else {
                 const count = recordHighPressureNoEligibleHead(db, boundarySnapshot);
                 sessionLog(
@@ -322,16 +325,18 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 (boundarySnapshot.contextLimit * boundarySnapshot.executeThresholdPercentage) / 100,
             ),
         );
-        const reserve = reserveProtectedTailDrainTokens({
-            db,
-            sessionId,
-            runId: crypto.randomUUID(),
-            trueRawTokens: boundarySnapshot.trueRawEligibleTokens,
-            usagePercentage: boundarySnapshot.usagePercentage,
-            usable,
-            perRunCap,
-            executeThresholdPercentage: boundarySnapshot.executeThresholdPercentage,
-        });
+        const reserve = deps.forceDrainQuota
+            ? { ok: true as const, reservation: null }
+            : reserveProtectedTailDrainTokens({
+                  db,
+                  sessionId,
+                  runId: crypto.randomUUID(),
+                  trueRawTokens: boundarySnapshot.trueRawEligibleTokens,
+                  usagePercentage: boundarySnapshot.usagePercentage,
+                  usable,
+                  perRunCap,
+                  executeThresholdPercentage: boundarySnapshot.executeThresholdPercentage,
+              });
         if (!reserve.ok) {
             sessionLog(
                 sessionId,
@@ -352,7 +357,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 `historian no-op: chunk empty after filtering (messageCount=${chunk.messageCount}, textLen=${chunk.text?.length ?? 0}) range=${offset}-${eligibleEndOrdinal - 1}`,
             );
             if (boundarySnapshot.usagePercentage < 80 && !boundarySnapshot.emergencyTailScale) {
-                clearEmergencyRecovery(db, sessionId);
+                if (!isWrapupInProgress(db, sessionId)) clearEmergencyRecovery(db, sessionId);
             } else {
                 recordHighPressureNoEligibleHead(db, boundarySnapshot);
             }
@@ -495,7 +500,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         const BOUNDARY_HEALING_SLACK = 2;
         const inEmergency = getOverflowState(db, sessionId).needsEmergencyRecovery;
         let persistedCompartments = emittedCompartments;
-        if (!inEmergency && emittedCompartments.length >= 2) {
+        if (!inEmergency && !deps.forceKeepLastCompartment && emittedCompartments.length >= 2) {
             const lastEmitted = emittedCompartments[emittedCompartments.length - 1];
             const lookaheadMargin = chunk.endIndex - lastEmitted.endMessage;
             if (lookaheadMargin <= BOUNDARY_HEALING_SLACK) {
@@ -564,6 +569,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // facts could double up.) Events ARE anchored, so we filter them by
         // persisted range below instead of skipping wholesale.
         const discardedLast = persistedCompartments.length < emittedCompartments.length;
+        const weakLookaheadFinalCompartment = deps.forceKeepLastCompartment === true;
+        const skipUnanchoredPromotion = discardedLast || weakLookaheadFinalCompartment;
 
         // Issue #44: gate promotion behind both `memory.enabled` and
         // `memory.auto_promote`. Without this, historian unconditionally
@@ -586,9 +593,14 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // compartment (atCompartment is a 1-based index into the EMITTED list;
         // anything > persistedCompartments.length pointed at the dropped tail).
         // They re-emit next run anchored to the persisted range.
-        const publishableEvents = (validatedPass.events ?? []).filter(
-            (e) => e.atCompartment == null || e.atCompartment <= persistedCompartments.length,
-        );
+        const publishableEvents = (validatedPass.events ?? []).filter((e) => {
+            if (typeof e.atCompartment !== "number") return !weakLookaheadFinalCompartment;
+            if (e.atCompartment > persistedCompartments.length) return false;
+            if (weakLookaheadFinalCompartment && e.atCompartment >= emittedCompartments.length) {
+                return false;
+            }
+            return true;
+        });
         let promotedFactRefs: Array<{ memoryId: number; content: string }> = [];
         let persistedIds: number[] = [];
 
@@ -629,7 +641,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             // written/bumped. Promotion is in the SAME transaction as the boundary
             // floor below so a crash cannot advance past facts that never became
             // project memories.
-            if (promotionActive && !discardedLast) {
+            if (promotionActive && !skipUnanchoredPromotion) {
                 promotedFactRefs = promoteSessionFactsDurable(
                     db,
                     sessionId,
@@ -660,13 +672,11 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             // Healthy historian progress — clear the drain-failure backoff so the
             // emergency catch-up latch can bypass the budget freely again.
             clearHistorianDrainFailure(db, sessionId);
-            // Successful historian publication means the overflow recovery is
-            // complete for this session. Clear the flag so we don't keep
-            // force-bumping percentage on future turns. detectedContextLimit
-            // stays — it's the authoritative real limit and remains valuable
-            // for pressure math going forward.
+            // Normal historian publication resolves overflow recovery. A manual
+            // wrapup can publish several chunks before reaching its keep watermark,
+            // so it leaves the recovery flag armed until the orchestrator finishes.
             recordProtectedTailPublicationFloor(db, sessionId, lastCompartmentEnd + 1);
-            clearEmergencyRecovery(db, sessionId);
+            if (!isWrapupInProgress(db, sessionId)) clearEmergencyRecovery(db, sessionId);
             drainReservation = null;
             if (deferMarkerApplication && lastNewEndMessageId) {
                 setPendingCompactionMarkerState(db, sessionId, {
@@ -794,7 +804,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // (`discardedLast` computed above for the fact-promotion gate.)
         if (
             deps.experimentalUserMemories === true &&
-            !discardedLast &&
+            !skipUnanchoredPromotion &&
             validatedPass.userObservations &&
             validatedPass.userObservations.length > 0
         ) {
@@ -822,7 +832,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // never prompt injection. Keep the same !discardedLast gate as facts and
         // observations so a provisional tail does not double-emit evidence.
         if (
-            !discardedLast &&
+            !skipUnanchoredPromotion &&
             promotionProjectIdentity &&
             validatedPass.primerCandidates &&
             validatedPass.primerCandidates.length > 0

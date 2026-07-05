@@ -131,6 +131,23 @@ export interface ProtectedTailDrainReserveResult {
     skippedReason?: string;
 }
 
+export interface WrapupInProgressState {
+    holderId: string;
+    acquiredAt: number;
+    expiresAt: number;
+    messagesToKeep: number;
+    anchorRawMessageCount: number;
+    targetEligibleEndOrdinal: number;
+    lastCompartmentEnd: number;
+    chunkIndex: number;
+    expectedChunks: number;
+    updatedAt: number;
+}
+
+export type AcquireWrapupResult =
+    | { ok: true; state: WrapupInProgressState }
+    | { ok: false; state: WrapupInProgressState | null };
+
 const CAS_RETRY_LIMIT = 5;
 const AUTO_SEARCH_NO_HINT_REASONS = new Set<string>([
     "below-threshold",
@@ -376,6 +393,190 @@ export function resetProtectedTailNoEligibleHead(db: Database, sessionId: string
 }
 
 export const DRAIN_WINDOW_MS = 10 * 60 * 1000;
+
+export const WRAPUP_IN_PROGRESS_TTL_MS = 5 * 60 * 1000;
+
+function parseWrapupState(value: unknown): WrapupInProgressState | null {
+    if (typeof value !== "string" || value.trim().length === 0) return null;
+    try {
+        const parsed = JSON.parse(value) as Partial<WrapupInProgressState> | null;
+        if (!parsed || typeof parsed !== "object") return null;
+        if (typeof parsed.holderId !== "string" || parsed.holderId.length === 0) return null;
+        const numberFields: Array<keyof WrapupInProgressState> = [
+            "acquiredAt",
+            "expiresAt",
+            "messagesToKeep",
+            "anchorRawMessageCount",
+            "targetEligibleEndOrdinal",
+            "lastCompartmentEnd",
+            "chunkIndex",
+            "expectedChunks",
+            "updatedAt",
+        ];
+        for (const field of numberFields) {
+            if (typeof parsed[field] !== "number" || !Number.isFinite(parsed[field])) return null;
+        }
+        return parsed as WrapupInProgressState;
+    } catch {
+        return null;
+    }
+}
+
+function readRawWrapupState(db: Database, sessionId: string): WrapupInProgressState | null {
+    const row = db
+        .prepare<[string], { wrapup_in_progress_state: string | null }>(
+            "SELECT wrapup_in_progress_state FROM session_meta WHERE session_id = ?",
+        )
+        .get(sessionId);
+    return parseWrapupState(row?.wrapup_in_progress_state);
+}
+
+export function getWrapupInProgressState(
+    db: Database,
+    sessionId: string,
+    now = Date.now(),
+): WrapupInProgressState | null {
+    const state = readRawWrapupState(db, sessionId);
+    if (!state) return null;
+    if (state.expiresAt > now) return state;
+    try {
+        db.exec("BEGIN IMMEDIATE");
+    } catch {
+        // Callers sometimes check this from inside their own write transaction.
+        // Treat an expired marker as absent there and let a later standalone check
+        // reclaim the stale blob.
+        return null;
+    }
+    let finished = false;
+    try {
+        const current = readRawWrapupState(db, sessionId);
+        if (current && current.expiresAt <= now) {
+            db.prepare(
+                "UPDATE session_meta SET wrapup_in_progress_state = NULL WHERE session_id = ?",
+            ).run(sessionId);
+        }
+        db.exec("COMMIT");
+        finished = true;
+    } finally {
+        if (!finished) {
+            try {
+                db.exec("ROLLBACK");
+            } catch {
+                // Transaction may have already been closed by SQLite.
+            }
+        }
+    }
+    return null;
+}
+
+export function isWrapupInProgress(db: Database, sessionId: string, now = Date.now()): boolean {
+    return getWrapupInProgressState(db, sessionId, now) !== null;
+}
+
+export function acquireWrapupInProgress(
+    db: Database,
+    sessionId: string,
+    state: Omit<WrapupInProgressState, "acquiredAt" | "expiresAt" | "updatedAt">,
+    now = Date.now(),
+): AcquireWrapupResult {
+    const acquiredAt = now;
+    const next: WrapupInProgressState = {
+        ...state,
+        acquiredAt,
+        expiresAt: acquiredAt + WRAPUP_IN_PROGRESS_TTL_MS,
+        updatedAt: acquiredAt,
+    };
+    db.exec("BEGIN IMMEDIATE");
+    let finished = false;
+    try {
+        ensureSessionMetaRow(db, sessionId);
+        const current = readRawWrapupState(db, sessionId);
+        if (current && current.expiresAt > now && current.holderId !== state.holderId) {
+            db.exec("COMMIT");
+            finished = true;
+            return { ok: false, state: current };
+        }
+        db.prepare("UPDATE session_meta SET wrapup_in_progress_state = ? WHERE session_id = ?").run(
+            stableStringify(next),
+            sessionId,
+        );
+        db.exec("COMMIT");
+        finished = true;
+        return { ok: true, state: next };
+    } finally {
+        if (!finished) {
+            try {
+                db.exec("ROLLBACK");
+            } catch {
+                // Transaction may have already been closed by SQLite.
+            }
+        }
+    }
+}
+
+export function updateWrapupInProgress(
+    db: Database,
+    sessionId: string,
+    holderId: string,
+    updates: Partial<Omit<WrapupInProgressState, "holderId" | "acquiredAt">>,
+    now = Date.now(),
+): WrapupInProgressState | null {
+    db.exec("BEGIN IMMEDIATE");
+    let finished = false;
+    try {
+        const current = readRawWrapupState(db, sessionId);
+        if (!current || current.holderId !== holderId || current.expiresAt <= now) {
+            db.exec("ROLLBACK");
+            finished = true;
+            return null;
+        }
+        const next: WrapupInProgressState = {
+            ...current,
+            ...updates,
+            holderId,
+            expiresAt: now + WRAPUP_IN_PROGRESS_TTL_MS,
+            updatedAt: now,
+        };
+        db.prepare("UPDATE session_meta SET wrapup_in_progress_state = ? WHERE session_id = ?").run(
+            stableStringify(next),
+            sessionId,
+        );
+        db.exec("COMMIT");
+        finished = true;
+        return next;
+    } finally {
+        if (!finished) {
+            try {
+                db.exec("ROLLBACK");
+            } catch {
+                // Transaction may have already been closed by SQLite.
+            }
+        }
+    }
+}
+
+export function releaseWrapupInProgress(db: Database, sessionId: string, holderId: string): void {
+    db.exec("BEGIN IMMEDIATE");
+    let finished = false;
+    try {
+        const current = readRawWrapupState(db, sessionId);
+        if (current?.holderId === holderId) {
+            db.prepare(
+                "UPDATE session_meta SET wrapup_in_progress_state = NULL WHERE session_id = ?",
+            ).run(sessionId);
+        }
+        db.exec("COMMIT");
+        finished = true;
+    } finally {
+        if (!finished) {
+            try {
+                db.exec("ROLLBACK");
+            } catch {
+                // Transaction may have already been closed by SQLite.
+            }
+        }
+    }
+}
 
 export function protectedTailWindowBudget(
     usagePercentage: number,

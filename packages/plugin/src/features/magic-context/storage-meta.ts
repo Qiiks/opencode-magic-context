@@ -1,6 +1,8 @@
 export {
+    type AcquireWrapupResult,
     type AppendAutoSearchHintOutcome,
     type AutoSearchHintDecision,
+    acquireWrapupInProgress,
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
     appendAutoSearchHintDecision,
@@ -42,7 +44,9 @@ export {
     getSessionWorkMetrics,
     getStaleReduceStrippedIds,
     getStrippedPlaceholderIds,
+    getWrapupInProgressState,
     incrementHistorianFailure,
+    isWrapupInProgress,
     loadPersistedUsage,
     loadProtectedTailMeta,
     markProtectedTailPolicyV3Seeded,
@@ -65,6 +69,7 @@ export {
     recordOverflowDetected,
     recordProtectedTailNoEligibleHead,
     recordProtectedTailPublicationFloor,
+    releaseWrapupInProgress,
     removeAutoSearchHintDecisionByMessageId,
     removeNoteNudgeAnchorByMessageId,
     removeStrippedPlaceholderId,
@@ -84,6 +89,9 @@ export {
     setPersistedTodoSyntheticAnchor,
     setSessionWorkMetrics,
     setStrippedPlaceholderIds,
+    updateWrapupInProgress,
+    WRAPUP_IN_PROGRESS_TTL_MS,
+    type WrapupInProgressState,
 } from "./storage-meta-persisted";
 export {
     advanceToolReclaimWatermark,

@@ -29,6 +29,7 @@ export type BoundaryMode =
     | "transform-force"
     | "manual-full-recomp"
     | "manual-partial-recomp"
+    | "manual-wrapup"
     | "pi-trigger"
     | "pi-runner";
 
@@ -127,6 +128,20 @@ export interface BoundarySnapshotValidationResult {
     ok: boolean;
     reason?: "stale_snapshot" | "model_or_limit_changed";
     detail?: string;
+}
+
+export interface WrapupBoundaryPlan {
+    snapshot: ProtectedTailBoundarySnapshot;
+    /** Meaningful user messages after the last durable compartment, counted at command start. */
+    meaningfulMessagesAboveLastCompartment: number;
+    /** Raw-message count used to anchor the keep watermark for the whole wrapup loop. */
+    anchorRawMessageCount: number;
+    /** First raw ordinal that remains protected by the keep watermark. */
+    targetProtectedTailStart: number;
+    /** Exclusive eligible end before per-run capping. */
+    targetEligibleEndOrdinal: number;
+    /** True when this snapshot exposes the whole remaining eligible range to the runner. */
+    finalChunk: boolean;
 }
 
 const ALPHA = 0.3;
@@ -267,6 +282,51 @@ function semanticSnapBoundary(args: {
         return candidate;
     }
     return snapped;
+}
+
+function snapWrapupBoundaryToUser(args: {
+    messages: ReturnType<typeof readRawSessionMessages>;
+    index: TrueRawTokenIndex;
+    candidate: number;
+    offset: number;
+    triggerBudget: number;
+}): number {
+    const { messages, index, candidate, offset, triggerBudget } = args;
+    if (candidate <= offset) return candidate;
+    const snapTokenLimit = Math.min(Math.max(triggerBudget, 2_000), 48_000);
+    for (let ordinal = candidate; ordinal >= offset; ordinal -= 1) {
+        const message = messages.find((m) => m.ordinal === ordinal);
+        if (!message) continue;
+        if (message.role !== "user" || !hasMeaningfulUserText(message.parts)) continue;
+        const extraTokens = index.rangeTokens(ordinal, candidate);
+        if (extraTokens <= snapTokenLimit) return ordinal;
+        return candidate;
+    }
+    return candidate;
+}
+
+function fenceWrapupBoundaryForToolArcs(args: {
+    candidate: number;
+    arcs: ReturnType<typeof buildToolArcs>;
+    lastCompartmentEndOrdinal: number;
+}): number {
+    let boundary = args.candidate;
+    for (const arc of args.arcs) {
+        if (arc.resOrdinal === null) {
+            // An open invocation at or after the watermark is already in the kept
+            // tail. An older open invocation is treated as stale/interrupted, which
+            // matches the normal boundary resolver's staleness rule.
+            continue;
+        }
+        if (
+            arc.invOrdinal >= args.lastCompartmentEndOrdinal + 1 &&
+            arc.invOrdinal < boundary &&
+            boundary <= arc.resOrdinal
+        ) {
+            boundary = arc.invOrdinal;
+        }
+    }
+    return boundary;
 }
 
 function applyHeadCap(args: {
@@ -652,6 +712,141 @@ export function resolveOpenCodeProtectedTailBoundary(
     args: Parameters<typeof resolveBoundaryContext>[0],
 ): ProtectedTailBoundarySnapshot {
     return resolveProtectedTailBoundary(resolveBoundaryContext(args));
+}
+
+export function resolveWrapupProtectedTailBoundary(
+    args: Parameters<typeof resolveBoundaryContext>[0] & {
+        messagesToKeep: number;
+        anchorRawMessageCount?: number;
+    },
+): WrapupBoundaryPlan {
+    const ctx = resolveBoundaryContext({ ...args, mode: "manual-wrapup" });
+    const createdAt = ctx.createdAt ?? Date.now();
+    const messages = readRawSessionMessages(ctx.sessionId);
+    const absoluteMessageCount = getCachedAbsoluteMessageCount(ctx.sessionId) ?? undefined;
+    const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
+        providerShapeVersion: ctx.providerShapeVersion,
+        cacheNamespace: ctx.cacheNamespace,
+        absoluteMessageCount,
+        storedTotalForMessage: ctx.storedTokenTotals
+            ? (m) => {
+                  const value = ctx.storedTokenTotals?.get(m.id);
+                  return value === undefined ? null : value;
+              }
+            : undefined,
+    });
+    const rawMessageCount = index.rawMessageCount;
+    const offset = Math.max(1, ctx.lastCompartmentEndOrdinal + 1);
+    const anchorRawMessageCount = Math.max(
+        0,
+        Math.min(rawMessageCount, Math.floor(args.anchorRawMessageCount ?? rawMessageCount)),
+    );
+    const usagePercentage = clampPercentage(ctx.usage?.percentage ?? 0);
+    const usageInputTokens = Math.max(0, Math.round(ctx.usage?.inputTokens ?? 0));
+
+    const meaningfulOrdinals = messages
+        .filter(
+            (message) =>
+                message.ordinal >= offset &&
+                message.ordinal <= anchorRawMessageCount &&
+                message.role === "user" &&
+                hasMeaningfulUserText(message.parts),
+        )
+        .map((message) => message.ordinal)
+        .sort((a, b) => a - b);
+    const meaningfulMessagesAboveLastCompartment = meaningfulOrdinals.length;
+    const keep = Math.max(1, Math.floor(args.messagesToKeep));
+
+    let targetProtectedTailStart = offset;
+    let boundaryReason = "manual-wrapup-empty";
+    if (rawMessageCount === 0 || meaningfulMessagesAboveLastCompartment <= keep) {
+        targetProtectedTailStart = offset;
+        boundaryReason =
+            rawMessageCount === 0 ? "manual-wrapup-empty" : "manual-wrapup-within-keep";
+    } else {
+        const oldestKeptIndex = meaningfulMessagesAboveLastCompartment - keep;
+        targetProtectedTailStart = meaningfulOrdinals[oldestKeptIndex] ?? offset;
+        boundaryReason = "manual-wrapup-keep-watermark";
+        const arcs = buildToolArcs(messages);
+        const fenced = fenceWrapupBoundaryForToolArcs({
+            candidate: targetProtectedTailStart,
+            arcs,
+            lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal,
+        });
+        if (fenced !== targetProtectedTailStart) boundaryReason = "manual-wrapup-tool-arc";
+        targetProtectedTailStart = fenced;
+        const snapped = snapWrapupBoundaryToUser({
+            messages,
+            index,
+            candidate: targetProtectedTailStart,
+            offset,
+            triggerBudget: ctx.triggerBudget,
+        });
+        if (snapped !== targetProtectedTailStart) boundaryReason = "manual-wrapup-user-snap";
+        targetProtectedTailStart = snapped;
+    }
+
+    targetProtectedTailStart = clampOrdinal(targetProtectedTailStart, rawMessageCount);
+    const target = deriveProtectedTailTokenTarget({
+        contextLimit: ctx.contextLimit,
+        executeThresholdPercentage: ctx.executeThresholdPercentage,
+        usagePercentage,
+        triggerBudget: ctx.triggerBudget,
+    });
+    const perRunCap = selectPerRunCap({
+        usagePercentage,
+        N: target.N,
+        contextLimit: ctx.contextLimit,
+        executeThresholdPercentage: ctx.executeThresholdPercentage,
+    });
+    const head = applyHeadCap({
+        index,
+        protectedTailStart: targetProtectedTailStart,
+        offset,
+        arcs: buildToolArcs(messages),
+        lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal,
+        capTokens: perRunCap,
+        recentOpenArcCutoff: targetProtectedTailStart,
+    });
+    const eligibleEndOrdinal = Math.min(head.eligibleEndOrdinal, targetProtectedTailStart);
+    const rawRangeFingerprint = computeRawRangeFingerprint(messages, offset, eligibleEndOrdinal);
+    const snapshot: ProtectedTailBoundarySnapshot = {
+        sessionId: ctx.sessionId,
+        mode: "manual-wrapup",
+        offset,
+        offsetMessageId: boundaryMessageId(index, offset),
+        protectedTailStart: targetProtectedTailStart,
+        protectedTailStartMessageId: boundaryMessageId(index, targetProtectedTailStart),
+        eligibleEndOrdinal,
+        eligibleEndMessageId: boundaryMessageId(index, eligibleEndOrdinal - 1),
+        rawMessageCountAtTrigger: rawMessageCount,
+        rawLastMessageIdAtTrigger: boundaryMessageId(index, rawMessageCount),
+        N: keep,
+        usagePercentage,
+        usageInputTokens,
+        usageSource: ctx.usageSource,
+        contextLimit: ctx.contextLimit,
+        executeThresholdPercentage: ctx.executeThresholdPercentage,
+        triggerBudget: ctx.triggerBudget,
+        priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
+        migrationFloorActive: ctx.migrationFloorActive,
+        emergencyTailScale: ctx.emergencyTailScale,
+        providerShapeVersion: ctx.providerShapeVersion,
+        cacheNamespace: ctx.cacheNamespace,
+        createdAt,
+        rawRangeFingerprint,
+        trueRawEligibleTokens: index.rangeTokens(offset, targetProtectedTailStart),
+        oversizeAtomicUnit: head.oversizeAtomicUnit,
+        boundaryReason,
+    };
+    return {
+        snapshot,
+        meaningfulMessagesAboveLastCompartment,
+        anchorRawMessageCount,
+        targetProtectedTailStart,
+        targetEligibleEndOrdinal: targetProtectedTailStart,
+        finalChunk: eligibleEndOrdinal >= targetProtectedTailStart,
+    };
 }
 
 export function getRawHistoryEligibility(db: Database, sessionId: string): RawHistoryEligibility {

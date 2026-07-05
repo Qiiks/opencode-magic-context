@@ -2,7 +2,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withContentLanguageDirective } from "@magic-context/core/agents/language-directive";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
-import { clearEmergencyRecovery } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	clearEmergencyRecovery,
+	isWrapupInProgress,
+} from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT } from "@magic-context/core/hooks/magic-context/compartment-prompt";
 import { executeContextRecompWithResult } from "@magic-context/core/hooks/magic-context/compartment-runner";
 import {
@@ -100,6 +103,15 @@ export function registerCtxRecompCommand(
 					title: "/ctx-recomp",
 					text: warning.text,
 					level: warning.confirmable ? "warning" : "error",
+				});
+				return;
+			}
+
+			if (isWrapupInProgress(deps.db, sessionId)) {
+				sendCtxStatusMessage(pi, {
+					title: "/ctx-recomp",
+					text: "## Magic Recomp\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try `/ctx-recomp` again.",
+					level: "warning",
 				});
 				return;
 			}

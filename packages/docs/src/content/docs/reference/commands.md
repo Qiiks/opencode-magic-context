@@ -1,15 +1,16 @@
 ---
 title: Commands
-description: Slash commands to inspect Magic Context, flush queues, rebuild history, augment prompts, and run dreamer.
+description: Slash commands to inspect Magic Context, flush queues, rebuild or wrap up history, augment prompts, and run dreamer.
 ---
 
-You run these slash commands in your harness chat or command box. They execute in the plugin, not in the model. Names are registered as `ctx-status`, `ctx-flush`, `ctx-recomp`, `ctx-aug`, `ctx-dream`, `ctx-embed`, and `ctx-session-upgrade` (type them with a leading `/`).
+You run these slash commands in your harness chat or command box. They execute in the plugin, not in the model. Names are registered as `ctx-status`, `ctx-flush`, `ctx-recomp`, `ctx-wrapup`, `ctx-aug`, `ctx-dream`, `ctx-embed`, and `ctx-session-upgrade` (type them with a leading `/`).
 
 ## Is something stuck?
 
 1. **`/ctx-status`** — Pending queue, cache TTL, tags, historian state. Start here.
 2. **`/ctx-flush`** — Apply queued context operations now (usually pending drops).
 3. **`/ctx-recomp`** — Rebuild compartments from raw history with the historian model; slow on long sessions. Use `/ctx-recomp <start>-<end>` for a partial range when only part of the timeline is wrong.
+4. **`/ctx-wrapup [messages_to_keep]`** — Deliberately compact older live history while keeping the newest meaningful messages raw.
 
 Use **`/ctx-session-upgrade`** for legacy session format upgrades, not `/ctx-recomp --upgrade` (deprecated).
 
@@ -54,6 +55,14 @@ Uses historian-model tokens; full recomp on long sessions can take a long time.
 - **OpenCode TUI:** Confirmation **dialog** for `/ctx-recomp` (typed range args are not wired through the dialog yet).
 - **OpenCode Desktop:** **Double-tap** — warning first, same command within **60 seconds** confirms. Partial recomp previews the snapped range.
 - **Pi:** Same double-tap confirmation; recomp runs **in the background** with `/ctx-recomp` progress messages. Partial ranges work on the command line.
+
+## /ctx-wrapup
+
+**What it does.** Runs the historian forward over older live history now. By default it keeps the newest **20 meaningful user messages** raw and wraps everything older into compartments; pass a positive integer to keep a different number, e.g. `/ctx-wrapup 40`.
+
+**When to use it.** Before switching from a large-context model to a smaller one, or when a long session has grown and you want to compact it on purpose instead of waiting for pressure triggers. A model switch already creates the cache-busting pass that materializes queued wrapup compartments, so you do **not** need `/ctx-flush` before switching models.
+
+**What you'll see.** It reports how many messages and compartments were wrapped. The compacted history is queued and materializes on the next model message that busts context. If there is no natural bust pending and you want the queued compacted history applied on the very next message, run `/ctx-flush` first; `/ctx-flush` marks the next pass as busting, it does not reduce the current context synchronously. OpenCode TUI shows a **Wrapup** progress bar; Pi shows per-chunk status messages.
 
 ## /ctx-aug
 

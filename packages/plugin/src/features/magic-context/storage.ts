@@ -78,8 +78,10 @@ export {
     queueMemoryMutation,
 } from "./storage-memory-mutation-log";
 export {
+    type AcquireWrapupResult,
     type AppendAutoSearchHintOutcome,
     type AutoSearchHintDecision,
+    acquireWrapupInProgress,
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
     advanceToolReclaimWatermark,
@@ -126,7 +128,9 @@ export {
     getSessionWorkMetrics,
     getStaleReduceStrippedIds,
     getStrippedPlaceholderIds,
+    getWrapupInProgressState,
     incrementHistorianFailure,
+    isWrapupInProgress,
     loadPersistedUsage,
     loadProtectedTailMeta,
     markProtectedTailPolicyV3Seeded,
@@ -151,6 +155,7 @@ export {
     recordOverflowDetected,
     recordProtectedTailNoEligibleHead,
     recordProtectedTailPublicationFloor,
+    releaseWrapupInProgress,
     removeAutoSearchHintDecisionByMessageId,
     removeNoteNudgeAnchorByMessageId,
     removeStrippedPlaceholderId,
@@ -171,6 +176,9 @@ export {
     setSessionWorkMetrics,
     setStrippedPlaceholderIds,
     updateSessionMeta,
+    updateWrapupInProgress,
+    WRAPUP_IN_PROGRESS_TTL_MS,
+    type WrapupInProgressState,
 } from "./storage-meta";
 export { bumpSessionFactsVersion } from "./storage-meta-shared";
 export {

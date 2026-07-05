@@ -11,6 +11,10 @@ export function getMagicContextBuiltinCommands(): BuiltinCommandConfig {
             description:
                 "Rebuild compartments and facts from raw history (full or <start>-<end> range)",
         },
+        "ctx-wrapup": {
+            template: "ctx-wrapup",
+            description: "Compact older live history while keeping the newest messages raw",
+        },
         "ctx-session-upgrade": {
             template: "ctx-session-upgrade",
             description:

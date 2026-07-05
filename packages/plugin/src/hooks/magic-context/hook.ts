@@ -55,7 +55,11 @@ import {
     getEmbedDrainUiStatus,
 } from "./embed-session-state";
 import { createEventHandler } from "./event-handler";
-import { resolveContextLimit, resolveModelKey } from "./event-resolvers";
+import {
+    resolveContextLimit,
+    resolveExecuteThresholdDetail,
+    resolveModelKey,
+} from "./event-resolvers";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
@@ -68,6 +72,7 @@ import {
 } from "./recomp-orchestrator";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
+import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
 
 export type { CommandExecuteInput, CommandExecuteOutput } from "./command-handler";
 
@@ -381,6 +386,35 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 agentBySession,
                 deps.config.toast_duration_ms,
             ),
+    });
+    const buildManagedWrapupCtx = (sessionId: string): ManagedWrapupContext => ({
+        ...buildManagedRecompCtx(sessionId),
+        contextLimit: (() => {
+            const model = resolveLiveModel(sessionId);
+            return model
+                ? resolveContextLimit(model.providerID, model.modelID, { db, sessionID: sessionId })
+                : 128_000;
+        })(),
+        executeThresholdPercentage: (() => {
+            const model = resolveLiveModel(sessionId);
+            const contextLimit = model
+                ? resolveContextLimit(model.providerID, model.modelID, { db, sessionID: sessionId })
+                : 128_000;
+            return resolveExecuteThresholdDetail(
+                deps.config.execute_threshold_percentage ?? 65,
+                model ? `${model.providerID}/${model.modelID}` : undefined,
+                65,
+                {
+                    tokensConfig: deps.config.execute_threshold_tokens,
+                    contextLimit,
+                    sessionId,
+                },
+            ).percentage;
+        })(),
+        hasPendingNaturalBust: (sid) =>
+            historyRefreshSessions.has(sid) ||
+            systemPromptRefreshSessions.has(sid) ||
+            pendingMaterializationSessions.has(sid),
     });
     // /ctx-embed start: backfill THIS session's compartment chunk embeddings,
     // reusing the recomp progress surface (sidebar + status bar) with kind="embed".
@@ -763,6 +797,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // had fallback but no progress (sidebar stuck on stale "failed") while
         // the RPC dialog had progress but no fallback (failed on empty primary
         // model). One runner closes both gaps.
+        executeWrapup: historianRunnable
+            ? async (sessionId, options) =>
+                  runManagedWrapup(buildManagedWrapupCtx(sessionId), sessionId, options)
+            : undefined,
         executeRecomp: historianRunnable
             ? async (sessionId, options) =>
                   runManagedRecomp(buildManagedRecompCtx(sessionId), sessionId, options)

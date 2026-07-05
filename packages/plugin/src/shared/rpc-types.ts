@@ -77,7 +77,7 @@ export interface SidebarSnapshot {
      */
     recompProgress?: {
         /** "recomp" → "Recomp" labels; "upgrade" → "Upgrade" labels. */
-        kind?: "recomp" | "upgrade" | "embed";
+        kind?: "recomp" | "upgrade" | "embed" | "wrapup";
         phase: "recomp" | "migration" | "done" | "failed" | "skipped";
         processedMessages: number;
         totalMessages: number;

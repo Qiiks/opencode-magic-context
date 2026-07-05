@@ -158,7 +158,7 @@ describe("migration v49 — per-model embedding coexistence", () => {
                  ) VALUES (999999, 'ses-orphan', 'git:orphan', 'opencode', 0, 0, 1, 'h', 'm', 4, x'01020304', 1)`,
             ).run();
             db.exec("PRAGMA foreign_keys=ON");
-            db.prepare("DELETE FROM schema_migrations WHERE version = 49").run();
+            db.prepare("DELETE FROM schema_migrations WHERE version IN (49, 50)").run();
 
             expect(() => runMigrations(db)).not.toThrow();
             expect(countRows(db, "compartment_chunk_embeddings")).toBe(0);

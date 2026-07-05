@@ -94,6 +94,7 @@ import { registerCtxFlushCommand } from "./commands/ctx-flush";
 import { registerCtxRecompCommand } from "./commands/ctx-recomp";
 import { registerCtxSessionUpgradeCommand } from "./commands/ctx-session-upgrade";
 import { registerCtxStatusCommand } from "./commands/ctx-status";
+import { registerCtxWrapupCommand } from "./commands/ctx-wrapup";
 import { loadPiConfig } from "./config";
 import {
 	awaitInFlightHistorians,
@@ -812,6 +813,25 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		autoPromote: config.memory.auto_promote,
 	});
 	info("registered /ctx-recomp");
+
+	registerCtxWrapupCommand(pi, {
+		db,
+		runner: new PiSubagentRunner(),
+		historianModel: historianConfig?.model,
+		historianChunkTokens: deriveHistorianChunkTokens(
+			resolveHistorianContextLimit(historianConfig?.model),
+		),
+		historianFallbacks: historianConfig?.fallbackModels,
+		historianTimeoutMs: config.historian_timeout_ms,
+		historianThinkingLevel: historianConfig?.thinkingLevel,
+		language: config.language,
+		memoryEnabled: config.memory.enabled,
+		autoPromote: config.memory.auto_promote,
+		userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
+		executeThresholdPercentage: config.execute_threshold_percentage,
+		executeThresholdTokens: config.execute_threshold_tokens,
+	});
+	info("registered /ctx-wrapup");
 
 	// E6b/E6c: /ctx-session-upgrade — full recomp (legacy→v2 tiered) + once-per-
 	// project memory migration into the 5-category taxonomy. Own runner instance

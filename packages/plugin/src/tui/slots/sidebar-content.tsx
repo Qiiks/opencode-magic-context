@@ -376,13 +376,17 @@ const RecompProgressSection = (props: {
             ? "Upgrade"
             : props.progress.kind === "embed"
               ? "Embed"
-              : "Recomp"
+              : props.progress.kind === "wrapup"
+                ? "Wrapup"
+                : "Recomp"
     const activeText = () =>
         props.progress.kind === "upgrade"
             ? "upgrading ⟳"
             : props.progress.kind === "embed"
               ? "embedding ⟳"
-              : "comparting ⟳"
+              : props.progress.kind === "wrapup"
+                ? "wrapping ⟳"
+                : "comparting ⟳"
     const label = createMemo(() => {
         switch (props.progress.phase) {
             case "recomp":

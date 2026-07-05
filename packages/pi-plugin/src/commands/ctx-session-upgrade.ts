@@ -4,6 +4,7 @@ import { getCompartments } from "@magic-context/core/features/magic-context/comp
 import { isMemoryMigrationDone } from "@magic-context/core/features/magic-context/memory/memory-migration";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
+import { isWrapupInProgress } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT } from "@magic-context/core/hooks/magic-context/compartment-prompt";
 import { executeContextRecompWithResult } from "@magic-context/core/hooks/magic-context/compartment-runner";
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
@@ -75,6 +76,15 @@ export function registerCtxSessionUpgradeCommand(
 					title: "/ctx-session-upgrade",
 					text: "## Session Upgrade\n\nUnavailable because `historian.model` is not configured.",
 					level: "error",
+				});
+				return;
+			}
+
+			if (isWrapupInProgress(deps.db, sessionId)) {
+				sendCtxStatusMessage(pi, {
+					title: "/ctx-session-upgrade",
+					text: "## Session Upgrade\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try again.",
+					level: "warning",
 				});
 				return;
 			}

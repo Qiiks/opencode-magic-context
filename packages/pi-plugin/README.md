@@ -91,6 +91,7 @@ All commands trigger `triggerTurn: false` (never sent to the LLM):
 | `/ctx-status` | Live token breakdown + queued ops + cache state |
 | `/ctx-flush` | Force-process pending ops queue |
 | `/ctx-recomp` | Rebuild compartments from raw history (heavy operation) |
+| `/ctx-wrapup [messages_to_keep]` | Compact older live history while keeping the newest meaningful messages raw |
 | `/ctx-dream` | Trigger a dream run on demand |
 | `/ctx-aug` | Augment your next prompt with sidekick-retrieved memories |
 

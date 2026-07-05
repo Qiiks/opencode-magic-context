@@ -13,7 +13,7 @@
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { embedBatchForProject, getProjectEmbeddingSnapshot } from "../memory/embedding";
-import { readGitCommits, readGitCommitsResult } from "./git-log-reader";
+import { readGitCommitsResult } from "./git-log-reader";
 import {
     countEmbeddedCommits,
     loadUnembeddedCommits,

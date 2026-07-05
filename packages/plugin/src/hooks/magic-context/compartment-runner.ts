@@ -4,7 +4,7 @@ import {
     releaseCompartmentLease,
     renewCompartmentLease,
 } from "../../features/magic-context/compartment-lease";
-import { updateSessionMeta } from "../../features/magic-context/storage-meta";
+import { isWrapupInProgress, updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { sessionLog } from "../../shared/logger";
 import { runCompartmentAgent } from "./compartment-runner-incremental";
 import {
@@ -17,6 +17,7 @@ import type { CompartmentRunnerDeps } from "./compartment-runner-types";
 export interface ActiveCompartmentRun {
     promise: Promise<void>;
     published: boolean;
+    kind?: "incremental" | "recomp" | "wrapup" | "other";
     /**
      * Set to true once the 95%-emergency user-facing notification has been
      * dispatched for this run. Prevents the notification from re-firing on
@@ -56,10 +57,12 @@ export function markActiveCompartmentRunPublished(sessionId: string): void {
 export function registerActiveCompartmentRun(
     sessionId: string,
     promise: Promise<void>,
+    kind: ActiveCompartmentRun["kind"] = "other",
 ): ActiveCompartmentRun {
     const activeRun: ActiveCompartmentRun = {
         promise: Promise.resolve(),
         published: false,
+        kind,
     };
     const wrapped = promise.finally(() => {
         // Only clear if this is still the current entry (another run may have
@@ -149,7 +152,7 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
                 activeRuns.delete(deps.sessionId);
             }
         });
-    activeRuns.set(deps.sessionId, { promise, published: false });
+    activeRuns.set(deps.sessionId, { promise, published: false, kind: "incremental" });
     // If the runner no-op'd synchronously (stale/empty snapshot, nothing to
     // compact, drain-quota), it returned before signalling onHistorianRunStarted
     // and before any `await`, so `promise` is already settling. It cleared
@@ -189,6 +192,13 @@ export async function executeContextRecompWithResult(
     options: ExecuteContextRecompOptions = {},
 ): Promise<ExecuteContextRecompResult> {
     const { sessionId } = deps;
+    if (isWrapupInProgress(deps.db, sessionId)) {
+        return {
+            message:
+                "## Magic Recomp — Skipped\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try `/ctx-recomp` again.",
+            published: false,
+        };
+    }
     if (activeRuns.has(sessionId)) {
         return {
             // "— Skipped" suffix so isRecompFailure() (string-based callers) treats
@@ -221,7 +231,7 @@ export async function executeContextRecompWithResult(
         .catch((err) => {
             sessionLog(sessionId, "compartment agent: recomp unhandled rejection:", err);
         });
-    activeRuns.set(sessionId, { promise: wrappedPromise, published: false });
+    activeRuns.set(sessionId, { promise: wrappedPromise, published: false, kind: "recomp" });
     try {
         const message = await promise;
         // B1 (dogfood 2026-05-30): log EVERY recomp outcome here — this wraps all

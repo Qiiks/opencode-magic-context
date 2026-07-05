@@ -69,6 +69,7 @@ In OpenCode's TUI, the sidebar shows compartment count and coverage. The `/ctx-s
 Two commands let you rebuild compartment state:
 
 - **`/ctx-recomp`** — rebuilds compartments from raw history. Accepts an optional `start-end` range for partial rebuilds. Use this when stored state seems wrong.
+- **`/ctx-wrapup [messages_to_keep]`** — advances the historian over older live history now while keeping the newest meaningful messages raw. This is useful before switching to a smaller-context model.
 - **`/ctx-session-upgrade`** — upgrades a session to the latest history format: rebuilds compartments with the current tiered format and migrates project memories to the current category taxonomy.
 
 See the [commands reference](/reference/commands/) for full syntax.
