@@ -57,7 +57,6 @@ const EMPTY_SNAPSHOT: SidebarSnapshot = {
     contextLimit: 0,
     systemPromptTokens: 0,
     compartmentCount: 0,
-    factCount: 0,
     memoryCount: 0,
     memoryBlockCount: 0,
     pendingOpsCount: 0,

@@ -29,7 +29,11 @@ import {
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
 import { collectDiagnostics } from "../lib/diagnostics-pi";
-import { checkLocalEmbeddingRuntimeByResolution } from "../lib/embedding-runtime";
+import {
+    checkLocalEmbeddingRuntimeByResolution,
+    formatLocalEmbeddingRuntimeDoctorWarning,
+    isLocalEmbeddingRuntimeBroken,
+} from "../lib/embedding-runtime";
 import { bundleIssueReport } from "../lib/logs-pi";
 import {
     getMagicContextLogPath,
@@ -688,18 +692,8 @@ async function runHealthChecks(options: {
                 runtimeReported = true;
                 break;
             }
-            if (runtime.state === "package-missing" || runtime.state === "binary-missing") {
-                add(
-                    results,
-                    "warn",
-                    `Embedding provider: local — native runtime (onnxruntime-node) is ${
-                        runtime.state === "package-missing"
-                            ? "not installed"
-                            : "missing its platform binary"
-                    }. Local embeddings won't work. Fix: reinstall the plugin, or set ` +
-                        "`embedding.provider` to `openai-compatible` (LM Studio / Ollama) or `off`. " +
-                        "Existing memories are unaffected.",
-                );
+            if (isLocalEmbeddingRuntimeBroken(runtime)) {
+                add(results, "warn", formatLocalEmbeddingRuntimeDoctorWarning(runtime));
                 runtimeReported = true;
                 break;
             }

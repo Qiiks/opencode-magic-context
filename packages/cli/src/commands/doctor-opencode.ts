@@ -21,7 +21,11 @@ import { isDevPathPluginEntry, matchesPluginEntry } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
 import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
 import { collectDiagnostics } from "../lib/diagnostics-opencode";
-import { checkLocalEmbeddingRuntime } from "../lib/embedding-runtime";
+import {
+    checkLocalEmbeddingRuntime,
+    formatLocalEmbeddingRuntimeDoctorWarning,
+    isLocalEmbeddingRuntimeBroken,
+} from "../lib/embedding-runtime";
 import { bundleIssueReport } from "../lib/logs-opencode";
 import { migrateDreamerV2ForDoctor } from "../lib/migrate-dreamer-v2-doctor";
 import { migrateExperimentalPinKeyFilesForDoctor } from "../lib/migrate-experimental-doctor";
@@ -300,14 +304,8 @@ async function runIssueFlow(): Promise<number> {
 // still means local embeddings).
 function checkLocalEmbeddingRuntimeForDoctor(): { issues: number; localRuntimeBroken?: boolean } {
     const runtime = checkLocalEmbeddingRuntime(getOpenCodePluginCacheRoots());
-    if (runtime.state === "package-missing" || runtime.state === "binary-missing") {
-        log.warn(
-            "Embedding provider: local — but the native runtime (onnxruntime-node) " +
-                `is ${runtime.state === "package-missing" ? "not installed" : "missing its platform binary"}. ` +
-                "Local embeddings won't work. Fix: re-run with `doctor --force` to reinstall " +
-                "the plugin, or set `embedding.provider` to `openai-compatible` (LM Studio / " +
-                "Ollama) or `off`. Existing memories are unaffected.",
-        );
+    if (isLocalEmbeddingRuntimeBroken(runtime)) {
+        log.warn(formatLocalEmbeddingRuntimeDoctorWarning(runtime));
         return { issues: 1, localRuntimeBroken: true };
     }
     log.success("Embedding provider: local (Xenova/all-MiniLM-L6-v2 bundled)");

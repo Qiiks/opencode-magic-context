@@ -63,7 +63,6 @@ interface StatusDialogDetail {
 	inputTokens: number;
 	systemPromptTokens: number;
 	compartmentCount: number;
-	factCount: number;
 	memoryCount: number;
 	memoryBlockCount: number;
 	sessionNoteCount: number;
@@ -517,8 +516,6 @@ export function buildPiStatusDetail(
 		inputTokens,
 		systemPromptTokens,
 		compartmentCount: compartments.length,
-		// v2: facts are retired as a render source (promoted to memories).
-		factCount: 0,
 		memoryCount: safeRead(
 			() => getMemoryCount(deps.db, deps.projectIdentity),
 			0,

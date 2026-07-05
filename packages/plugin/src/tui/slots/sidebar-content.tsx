@@ -789,11 +789,6 @@ const SidebarContent = (props: {
                 label="Compartments"
                 value={String(s()?.compartmentCount ?? 0)}
             />
-            <StatRow
-                theme={props.theme}
-                label="Facts"
-                value={String(s()?.factCount ?? 0)}
-            />
 
             {/* Recomp / session-upgrade live progress */}
             <Show when={s()?.recompProgress}>

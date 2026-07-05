@@ -6,6 +6,7 @@ import {
     checkLocalEmbeddingRuntime,
     checkLocalEmbeddingRuntimeAt,
     checkLocalEmbeddingRuntimeByResolution,
+    formatLocalEmbeddingRuntimeDoctorWarning,
 } from "./embedding-runtime";
 
 function makeRoot(): string {
@@ -15,7 +16,11 @@ function makeRoot(): string {
 function installPackage(root: string, withBinary: boolean): void {
     const pkgDir = join(root, "node_modules", "onnxruntime-node");
     mkdirSync(pkgDir, { recursive: true });
-    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "onnxruntime-node" }));
+    writeFileSync(
+        join(pkgDir, "package.json"),
+        JSON.stringify({ name: "onnxruntime-node", main: "index.js" }),
+    );
+    writeFileSync(join(pkgDir, "index.js"), "module.exports = {};\n");
     if (withBinary) {
         const binDir = join(pkgDir, "bin", "napi-v6", "win32", "x64");
         mkdirSync(binDir, { recursive: true });
@@ -110,7 +115,11 @@ describe("checkLocalEmbeddingRuntime (multi-root)", () => {
 // succeeds from the plugin dir — mirrors the real on-disk dev-path / hoisted
 // layout (a nested node_modules the package manager populated), which a
 // hardcoded path check would get wrong across layouts.
-function installResolvablePlugin(withPackage: boolean, withBinary: boolean): string {
+function installResolvablePlugin(
+    withPackage: boolean,
+    withBinary: boolean,
+    indexSource = "module.exports = {};\n",
+): string {
     const pluginDir = mkdtempSync(join(tmpdir(), "mc-pi-plugin-"));
     writeFileSync(
         join(pluginDir, "package.json"),
@@ -123,7 +132,7 @@ function installResolvablePlugin(withPackage: boolean, withBinary: boolean): str
             join(pkgDir, "package.json"),
             JSON.stringify({ name: "onnxruntime-node", main: "index.js" }),
         );
-        writeFileSync(join(pkgDir, "index.js"), "module.exports = {};");
+        writeFileSync(join(pkgDir, "index.js"), indexSource);
         if (withBinary) {
             const binDir = join(pkgDir, "bin", "napi-v6", "win32", "x64");
             mkdirSync(binDir, { recursive: true });
@@ -138,6 +147,28 @@ describe("checkLocalEmbeddingRuntimeByResolution", () => {
         const dir = installResolvablePlugin(true, true);
         try {
             expect(checkLocalEmbeddingRuntimeByResolution(dir, "win32", "x64").state).toBe("ok");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("resolvable package + matching binary that fails to load → load-failed", () => {
+        const dir = installResolvablePlugin(
+            true,
+            true,
+            "const err = new Error('onnxruntime_binding.node failed to load');\n" +
+                "err.code = 'ERR_DLOPEN_FAILED';\n" +
+                "throw err;\n",
+        );
+        try {
+            const status = checkLocalEmbeddingRuntimeByResolution(dir, "win32", "x64");
+            expect(status.state).toBe("load-failed");
+            if (status.state === "load-failed") {
+                expect(status.reason).toContain("ERR_DLOPEN_FAILED");
+                expect(formatLocalEmbeddingRuntimeDoctorWarning(status)).toContain(
+                    "onnxruntime-node native binding missing",
+                );
+            }
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

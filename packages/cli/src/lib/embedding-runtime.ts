@@ -19,7 +19,56 @@ export type LocalEmbeddingRuntimeStatus =
     | { state: "ok"; binaryPath: string }
     | { state: "package-missing"; packageDir: string }
     | { state: "binary-missing"; packageDir: string; expectedBinary: string }
+    | { state: "load-failed"; packageDir: string; reason: string }
     | { state: "unknown"; reason: string };
+
+export type BrokenLocalEmbeddingRuntimeStatus = Extract<
+    LocalEmbeddingRuntimeStatus,
+    { state: "package-missing" | "binary-missing" | "load-failed" }
+>;
+
+function describeError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error ?? "unknown error");
+    const code = (error as { code?: unknown } | null)?.code;
+    return typeof code === "string" && code.length > 0 ? `${code}: ${message}` : message;
+}
+
+function probeOnnxRuntimeNodeLoad(packageDir: string): LocalEmbeddingRuntimeStatus | null {
+    try {
+        const req = createRequire(join(packageDir, "package.json"));
+        req(packageDir);
+        return null;
+    } catch (error) {
+        return { state: "load-failed", packageDir, reason: describeError(error) };
+    }
+}
+
+export function isLocalEmbeddingRuntimeBroken(
+    status: LocalEmbeddingRuntimeStatus,
+): status is BrokenLocalEmbeddingRuntimeStatus {
+    return (
+        status.state === "package-missing" ||
+        status.state === "binary-missing" ||
+        status.state === "load-failed"
+    );
+}
+
+export function formatLocalEmbeddingRuntimeDoctorWarning(
+    status: BrokenLocalEmbeddingRuntimeStatus,
+): string {
+    const cause =
+        status.state === "package-missing"
+            ? "package is not installed"
+            : status.state === "binary-missing"
+              ? "expected platform binding file is absent"
+              : `binding failed to load: ${status.reason}`;
+    return (
+        "Embedding provider: local — onnxruntime-node native binding missing — " +
+        `${cause}; its postinstall likely failed. Embeddings will not work. ` +
+        "Reinstall with network access to the npm registry and GitHub releases, " +
+        "or switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)."
+    );
+}
 
 /**
  * Maps `process.platform`/`process.arch` to onnxruntime-node's on-disk binary
@@ -50,16 +99,15 @@ export function checkLocalEmbeddingRuntimeAt(
     }
     const rel = expectedBinaryRelPath(platform, arch);
     if (rel === null) {
-        // Unknown platform/arch — the package is present; don't false-alarm on a
-        // binary path we can't predict. transformers will surface a real error if
-        // it genuinely can't load.
-        return { state: "ok", binaryPath: packageDir };
+        // Unknown platform/arch — the package is present, but a direct package
+        // load can still prove whether its own native-loader path works.
+        return probeOnnxRuntimeNodeLoad(packageDir) ?? { state: "ok", binaryPath: packageDir };
     }
     const binaryPath = join(packageDir, rel);
     if (!existsSync(binaryPath)) {
         return { state: "binary-missing", packageDir, expectedBinary: binaryPath };
     }
-    return { state: "ok", binaryPath };
+    return probeOnnxRuntimeNodeLoad(packageDir) ?? { state: "ok", binaryPath };
 }
 
 /**
@@ -170,12 +218,13 @@ export function checkLocalEmbeddingRuntimeByResolution(
 
     const rel = expectedBinaryRelPath(platform, arch);
     if (rel === null) {
-        // Unknown platform/arch — package resolves; don't guess a binary path.
-        return { state: "ok", binaryPath: onnxDir };
+        // Unknown platform/arch — package resolves, but a direct package load can
+        // still prove whether its own native-loader path works.
+        return probeOnnxRuntimeNodeLoad(onnxDir) ?? { state: "ok", binaryPath: onnxDir };
     }
     const binaryPath = join(onnxDir, rel);
     if (!existsSync(binaryPath)) {
         return { state: "binary-missing", packageDir: onnxDir, expectedBinary: binaryPath };
     }
-    return { state: "ok", binaryPath };
+    return probeOnnxRuntimeNodeLoad(onnxDir) ?? { state: "ok", binaryPath };
 }

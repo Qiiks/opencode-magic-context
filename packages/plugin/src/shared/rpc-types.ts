@@ -10,7 +10,6 @@ export interface SidebarSnapshot {
     contextLimit: number;
     systemPromptTokens: number;
     compartmentCount: number;
-    factCount: number;
     memoryCount: number;
     memoryBlockCount: number;
     pendingOpsCount: number;
