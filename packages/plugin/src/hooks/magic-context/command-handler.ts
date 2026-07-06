@@ -6,7 +6,7 @@ import {
 } from "../../features/magic-context/dreamer/task-registry";
 import type { ManualRunResult } from "../../features/magic-context/dreamer/task-scheduler";
 import { runSidekick } from "../../features/magic-context/sidekick/agent";
-import { getCompartments } from "../../features/magic-context/storage";
+import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
@@ -33,6 +33,19 @@ interface RecompConfirmation {
 }
 const recompConfirmationBySession = new Map<string, RecompConfirmation>();
 const RECOMP_CONFIRMATION_WINDOW_MS = 60_000;
+
+function isSubagentSession(db: Database, sessionId: string): boolean {
+    const meta = getOrCreateSessionMeta(db, sessionId);
+    if (meta.isSubagent) return true;
+    try {
+        const row = db
+            .prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { is_subagent?: unknown } | null;
+        return row?.is_subagent === 1 || row?.is_subagent === true;
+    } catch {
+        return false;
+    }
+}
 
 const RECOMP_USAGE = [
     "Usage:",
@@ -597,7 +610,10 @@ export function createMagicContextCommandHandler(deps: {
 
             if (isWrapup) {
                 const parsed = parseWrapupArgs(input.arguments);
-                if (!parsed.ok) {
+                if (isSubagentSession(deps.db, sessionId)) {
+                    result =
+                        "## Magic Wrapup — Skipped\n\n/ctx-wrapup is only available in primary sessions.";
+                } else if (!parsed.ok) {
                     result = `## Magic Wrapup — Invalid Arguments\n\n${parsed.message}`;
                 } else if (!deps.executeWrapup) {
                     result =

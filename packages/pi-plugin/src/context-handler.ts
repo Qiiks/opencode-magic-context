@@ -2242,6 +2242,7 @@ export function registerPiContextHandler(
 				temporalAwareness: options.injection?.temporalAwareness === true,
 				appendCompaction: resolvePiAppendCompaction(ctx),
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
+				isSubagent: sessionMeta.isSubagent,
 			});
 			const piDecisionSnapshotNewestAssistant =
 				branchEntries === null
@@ -2753,10 +2754,18 @@ function startPiCompartmentLeaseRenewal(
 	holderId: string,
 ): ReturnType<typeof setInterval> {
 	return setInterval(() => {
-		if (!renewCompartmentLease(db, sessionId, holderId)) {
+		try {
+			if (!renewCompartmentLease(db, sessionId, holderId)) {
+				sessionLog(
+					sessionId,
+					"compartment lease renewal failed; publish will be skipped if holder is stale",
+				);
+			}
+		} catch (err) {
+			// A missed renewal is safe because the compartment lease has a five-minute TTL.
 			sessionLog(
 				sessionId,
-				"compartment lease renewal failed; publish will be skipped if holder is stale",
+				`compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
 			);
 		}
 	}, COMPARTMENT_LEASE_RENEWAL_MS);
@@ -2855,6 +2864,13 @@ function spawnPiHistorianRun(args: {
 				sessionId,
 				"historian skipped: compartment lease held by another process",
 			);
+			return;
+		}
+		if (isWrapupInProgress(db, sessionId)) {
+			// Close the cross-process check/lease race: /ctx-wrapup may have published
+			// its marker after the first check but before this process won the lease.
+			sessionLog(sessionId, "historian skipped: /ctx-wrapup became active");
+			releaseCompartmentLease(db, sessionId, holderId);
 			return;
 		}
 		const renewal = startPiCompartmentLeaseRenewal(db, sessionId, holderId);
@@ -3304,6 +3320,7 @@ interface RunPipelineArgs {
 	heuristics?: {
 		caveman?: { enabled: boolean; minChars: number };
 	};
+	isSubagent?: boolean;
 	/** ceiling = contextLimit × executeThreshold% for the tiered emergency drop. */
 	emergencyCeilingTokens?: number;
 	/** Memory-injection config — when omitted, no <session-history> injection runs. */
@@ -3919,7 +3936,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// transform.ts:793. Idempotent — `cavemanCompress(originalText, level)`
 	// is deterministic, so replay produces the exact text the original
 	// execute pass produced, regardless of how many times it runs.
-	if (args.heuristics?.caveman?.enabled) {
+	if (args.heuristics?.caveman?.enabled && !args.isSubagent) {
 		try {
 			// P0 perf: caveman replay only acts on tags whose tag_number is in
 			// `targets`, so fetch just that slice instead of the whole session
@@ -4020,7 +4037,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 									ceilingTokens: args.emergencyCeilingTokens,
 								}
 							: undefined,
-					caveman: args.heuristics.caveman,
+					caveman: args.isSubagent ? undefined : args.heuristics.caveman,
 				},
 				activeTags,
 				stableIdResolver,

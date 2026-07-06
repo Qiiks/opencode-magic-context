@@ -165,8 +165,16 @@ async function runOneWrapupIteration(args: {
     );
     if (!leaseHolderId) return false;
     const renewal = setInterval(() => {
-        if (!renewCompartmentLease(ctx.db, sessionId, leaseHolderId)) {
-            sessionLog(sessionId, "wrapup: compartment lease renewal failed");
+        try {
+            if (!renewCompartmentLease(ctx.db, sessionId, leaseHolderId)) {
+                sessionLog(sessionId, "wrapup: compartment lease renewal failed");
+            }
+        } catch (err) {
+            // A missed renewal is safe because the compartment lease has a five-minute TTL.
+            sessionLog(
+                sessionId,
+                `wrapup: compartment lease renewal threw; continuing (${err instanceof Error ? err.message : String(err)})`,
+            );
         }
     }, COMPARTMENT_LEASE_RENEWAL_MS);
     const runCompartmentAgentForWrapup = ctx.runCompartmentAgentForWrapup ?? runCompartmentAgent;
@@ -283,10 +291,18 @@ export async function runManagedWrapup(
         return true;
     };
     const markerRenewal = setInterval(() => {
-        renewWrapupMarker({
-            lastCompartmentEnd: getLastCompartmentEndMessage(ctx.db, sessionId),
-            chunkIndex,
-        });
+        try {
+            renewWrapupMarker({
+                lastCompartmentEnd: getLastCompartmentEndMessage(ctx.db, sessionId),
+                chunkIndex,
+            });
+        } catch (err) {
+            // A missed renewal is safe because the wrapup marker has a five-minute TTL.
+            sessionLog(
+                sessionId,
+                `wrapup: marker renewal threw; continuing (${err instanceof Error ? err.message : String(err)})`,
+            );
+        }
     }, 60_000);
     (markerRenewal as { unref?: () => void }).unref?.();
 

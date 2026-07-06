@@ -7,6 +7,7 @@ import {
 	getLastCompartmentEndMessage,
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
+import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
 	getOverflowState,
@@ -188,6 +189,28 @@ describe("Pi /ctx-wrapup", () => {
 		expect(parseWrapupArgs(" 7 ")).toEqual({ ok: true, messagesToKeep: 7 });
 		expect(parseWrapupArgs("0").ok).toBe(false);
 		expect(parseWrapupArgs("two").ok).toBe(false);
+	});
+
+	it("refuses subagent sessions", async () => {
+		const db = createDb();
+		try {
+			const sessionId = "pi-subagent-wrapup";
+			updateSessionMeta(db, sessionId, { isSubagent: true });
+			const runPiHistorianForWrapup = mock(async () => {});
+
+			const result = await runPiWrapup(
+				pi().api,
+				deps(db, { runPiHistorianForWrapup }),
+				ctx(sessionId, 8),
+				sessionId,
+				2,
+			);
+
+			expect(result).toContain("only available in primary sessions");
+			expect(runPiHistorianForWrapup).not.toHaveBeenCalled();
+		} finally {
+			closeQuietly(db);
+		}
 	});
 
 	it("stops on no progress and releases the durable marker", async () => {

@@ -336,16 +336,46 @@ function lastKnownGitIdentity(canonical: string): string | undefined {
     return lastKnownGitIdentityCache.get(canonical) ?? identityCache.get(canonical);
 }
 
+function nearestLastKnownGitIdentity(
+    canonical: string,
+): { identity: string; source: string } | undefined {
+    const visited = new Set<string>();
+    const walk = (start: string): { identity: string; source: string } | undefined => {
+        let current = start;
+        while (!visited.has(current)) {
+            visited.add(current);
+            const cached = lastKnownGitIdentity(current);
+            if (cached !== undefined) return { identity: cached, source: current };
+            const parent = path.dirname(current);
+            if (parent === current) break;
+            current = parent;
+        }
+        return undefined;
+    };
+
+    const exactOrAncestor = walk(canonical);
+    if (exactOrAncestor) return exactOrAncestor;
+
+    try {
+        const realCanonical = realpathSync.native(canonical);
+        if (realCanonical !== canonical) return walk(realCanonical);
+    } catch {
+        // If realpath fails, the path-based ancestor walk above is the only safe cache lookup.
+    }
+    return undefined;
+}
+
 function reuseLastKnownGitIdentity(canonical: string): string | undefined {
-    const cached = lastKnownGitIdentity(canonical);
+    const cached = nearestLastKnownGitIdentity(canonical);
     if (cached === undefined) return undefined;
     if (!transientGitIdentityReuseLoggedDirectories.has(canonical)) {
         transientGitIdentityReuseLoggedDirectories.add(canonical);
+        const sourceNote = cached.source === canonical ? "" : ` from ancestor ${cached.source}`;
         log(
-            `[magic-context] git identity resolution is temporarily unavailable for ${canonical}; reusing the last successful project identity to avoid splitting project-scoped memory`,
+            `[magic-context] git identity resolution is temporarily unavailable for ${canonical}; reusing the last successful project identity${sourceNote} to avoid splitting project-scoped memory`,
         );
     }
-    return cached;
+    return cached.identity;
 }
 
 function formatDubiousOwnershipWarning(canonical: string): string {

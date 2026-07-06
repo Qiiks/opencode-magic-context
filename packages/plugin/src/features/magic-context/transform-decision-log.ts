@@ -23,7 +23,8 @@ export type CanonicalMaterializeReason =
     | "first_render"
     | "pressure_refold"
     | "upgrade_state"
-    | "cached_m1_missing";
+    | "cached_m1_missing"
+    | "project_change";
 
 export interface PendingTransformDecision {
     tsMs: number;
@@ -60,6 +61,7 @@ const canonicalReasons = new Set<string>([
     "pressure_refold",
     "upgrade_state",
     "cached_m1_missing",
+    "project_change",
 ]);
 
 const piReasonAliases: Record<string, CanonicalMaterializeReason> = {

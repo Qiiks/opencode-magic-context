@@ -17,6 +17,7 @@ import {
 	acquireWrapupInProgress,
 	type ContextDatabase,
 	clearEmergencyRecovery,
+	getOrCreateSessionMeta,
 	getWrapupInProgressState,
 	releaseWrapupInProgress,
 	updateWrapupInProgress,
@@ -105,6 +106,16 @@ export function registerCtxWrapupCommand(
 				return;
 			}
 
+			const sessionMeta = getOrCreateSessionMeta(deps.db, sessionId);
+			if (sessionMeta.isSubagent) {
+				sendCtxStatusMessage(pi, {
+					title: "/ctx-wrapup",
+					text: "## Magic Wrapup — Skipped\n\n/ctx-wrapup is only available in primary sessions.",
+					level: "warning",
+				});
+				return;
+			}
+
 			if (!deps.historianModel) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-wrapup",
@@ -150,6 +161,9 @@ export async function runPiWrapup(
 	sessionId: string,
 	messagesToKeep: number,
 ): Promise<string> {
+	if (getOrCreateSessionMeta(deps.db, sessionId).isSubagent) {
+		return "## Magic Wrapup — Skipped\n\n/ctx-wrapup is only available in primary sessions.";
+	}
 	if (isPiRecompInFlight(sessionId)) {
 		return "## Magic Wrapup — Skipped\n\nA recomp or upgrade is already running for this session. Wait for it to finish, then try `/ctx-wrapup` again.";
 	}
@@ -233,9 +247,16 @@ export async function runPiWrapup(
 			return true;
 		};
 		const renewal = setInterval(() => {
-			renewWrapupMarker({
-				lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
-			});
+			try {
+				renewWrapupMarker({
+					lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
+				});
+			} catch (err) {
+				// A missed renewal is safe because the wrapup marker has a five-minute TTL.
+				console.warn(
+					`[magic-context][pi] /ctx-wrapup marker renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
 		}, 60_000);
 		try {
 			sendCtxStatusMessage(pi, {
@@ -329,7 +350,14 @@ export async function runPiWrapup(
 					break;
 				}
 				const leaseRenewal = setInterval(() => {
-					renewCompartmentLease(deps.db, sessionId, leaseHolder);
+					try {
+						renewCompartmentLease(deps.db, sessionId, leaseHolder);
+					} catch (err) {
+						// A missed renewal is safe because the compartment lease has a five-minute TTL.
+						console.warn(
+							`[magic-context][pi] /ctx-wrapup compartment lease renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
 				}, COMPARTMENT_LEASE_RENEWAL_MS);
 				try {
 					const runHistorian = deps.runPiHistorianForWrapup ?? runPiHistorian;

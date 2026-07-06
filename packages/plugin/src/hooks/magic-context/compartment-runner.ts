@@ -91,10 +91,18 @@ function startLeaseRenewal(
     holderId: string,
 ): ReturnType<typeof setInterval> {
     return setInterval(() => {
-        if (!renewCompartmentLease(deps.db, deps.sessionId, holderId)) {
+        try {
+            if (!renewCompartmentLease(deps.db, deps.sessionId, holderId)) {
+                sessionLog(
+                    deps.sessionId,
+                    "compartment lease renewal failed; publish will be skipped if holder is stale",
+                );
+            }
+        } catch (err) {
+            // A missed renewal is safe because the compartment lease has a five-minute TTL.
             sessionLog(
                 deps.sessionId,
-                "compartment lease renewal failed; publish will be skipped if holder is stale",
+                `compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
             );
         }
     }, COMPARTMENT_LEASE_RENEWAL_MS);
@@ -131,6 +139,15 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
         updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
         return;
     }
+    if (isWrapupInProgress(deps.db, deps.sessionId)) {
+        // Close the cross-process check/lease race: /ctx-wrapup may have published
+        // its marker after the first check but before this process won the lease.
+        sessionLog(deps.sessionId, "compartment agent skipped: /ctx-wrapup became active");
+        releaseCompartmentLease(deps.db, deps.sessionId, holderId);
+        updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
+        return;
+    }
+
     const renewal = startLeaseRenewal(deps, holderId);
 
     // Track the real underlying promise — NOT a raced wrapper.
