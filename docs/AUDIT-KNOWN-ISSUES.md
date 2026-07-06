@@ -899,3 +899,17 @@ IPv4/IPv6 link-local + unspecified blocked; URL userinfo (`user:pass@`) rejected
 DNS pinned via `resolve_to_addrs`. The user-scope relaxation mirrors `doctor`
 (Node). Do not extend token expansion / endpoint contact to any non-user scope
 without a new threat model.
+
+## A54: ctx_search returns pending smart notes (accepted by design)
+
+A release audit flagged that `ctx_search` matches smart notes whose surface
+condition has not been met yet (`pending` status), reading this as a bypass of
+the hidden-until-ready contract. Accepted as designed: hidden-until-ready
+governs UNPROMPTED surfacing (the dreamer's evaluation loop deciding when to
+inject a note), while `ctx_search` is explicit recall invoked by the same agent
+that wrote the note ("did we park a follow-up about X?"). Hiding pending notes
+from search would make parked work unfindable precisely when the agent asks for
+it. Results carry `status=pending` so the caller can see the condition has not
+fired. The same reasoning covers restricted children that carry `ctx_search`
+(retrospective): notes are the same sensitivity class as project memories,
+which those children already search.
