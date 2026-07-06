@@ -13,7 +13,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { log } from "../../../shared/logger";
 
@@ -25,6 +25,7 @@ import { log } from "../../../shared/logger";
 const GIT_TIMEOUT_MS = 5_000;
 const TRANSIENT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const identityCache = new Map<string, string>();
+const lastKnownGitIdentityCache = new Map<string, string>();
 // Cached `dir:` fallbacks for directories that have NO `.git` entry in their
 // ancestor chain. We only cache the no-`.git` case: once a `.git` appears we
 // must re-resolve every call so the identity flips to the stable `git:<root>`
@@ -33,13 +34,15 @@ const identityCache = new Map<string, string>();
 // they hit `identityCache` or the transient cooldown.
 const directoryFallbackCache = new Map<string, string>();
 // Cool down git-backed directories whose git probe failed transiently. During
-// the window we serve the deterministic `dir:` fallback without spawning git;
-// after it expires, the next call re-probes so the identity self-heals to
-// `git:<root>` when the user fixes git or the slow disk recovers.
+// the window we reuse the last successful `git:` identity when this process has
+// one; true cold-start failures still use the deterministic `dir:` fallback.
+// After the cooldown expires, the next call re-probes so the cache refreshes
+// when the user fixes git or the slow disk recovers.
 const transientFailureCooldown = new Map<string, number>();
 const dubiousOwnershipFallbackDirectories = new Set<string>();
 const dubiousOwnershipLoggedDirectories = new Set<string>();
 const dubiousOwnershipWarnedDirectories = new Set<string>();
+const transientGitIdentityReuseLoggedDirectories = new Set<string>();
 let execFileSyncForIdentity: typeof execFileSync = execFileSync;
 let nowMs = (): number => Date.now();
 
@@ -298,8 +301,10 @@ export function resolveProjectIdentityStrict(directory: string): string {
 
     const identity = `git:${rootCommit}`;
     identityCache.set(canonical, identity);
+    lastKnownGitIdentityCache.set(canonical, identity);
     transientFailureCooldown.delete(canonical);
     dubiousOwnershipFallbackDirectories.delete(canonical);
+    transientGitIdentityReuseLoggedDirectories.delete(canonical);
     return identity;
 }
 
@@ -308,12 +313,12 @@ export function resolveProjectIdentityStrict(directory: string): string {
  *
  * Returns a stable string suitable for use as a database key:
  *   - `"git:<sha>"` for git repositories with at least one commit
- *   - `"dir:<md5-12>"` for accessible non-git directories, empty repos, or git-backed directories
- *     whose git probe is temporarily unavailable
+ *   - `"dir:<md5-12>"` for accessible non-git directories, empty repos, or cold-start git-backed
+ *     directories whose git probe is temporarily unavailable before any `git:` identity is known
  *
- * A `dir:` fallback can split project-scoped rows until git recovers, but that split is bounded and
- * self-heals through the backfill/reconciliation paths. Keeping Magic Context alive with a temporary
- * identity is better than propagating an identity error from plugin load or every transform pass.
+ * A cold-start `dir:` fallback can split project-scoped rows until git recovers, but that split is
+ * bounded and self-heals through the backfill/reconciliation paths. After a successful git resolve,
+ * transient failures reuse the last known `git:` identity so mid-session rows stay under one key.
  */
 function shouldUseDirectoryFallback(error: ProjectIdentityError): boolean {
     return error.errorClass !== "permission_denied";
@@ -325,6 +330,22 @@ function getActiveCooldown(canonical: string): number | undefined {
     if (nowMs() < until) return until;
     transientFailureCooldown.delete(canonical);
     return undefined;
+}
+
+function lastKnownGitIdentity(canonical: string): string | undefined {
+    return lastKnownGitIdentityCache.get(canonical) ?? identityCache.get(canonical);
+}
+
+function reuseLastKnownGitIdentity(canonical: string): string | undefined {
+    const cached = lastKnownGitIdentity(canonical);
+    if (cached === undefined) return undefined;
+    if (!transientGitIdentityReuseLoggedDirectories.has(canonical)) {
+        transientGitIdentityReuseLoggedDirectories.add(canonical);
+        log(
+            `[magic-context] git identity resolution is temporarily unavailable for ${canonical}; reusing the last successful project identity to avoid splitting project-scoped memory`,
+        );
+    }
+    return cached;
 }
 
 function formatDubiousOwnershipWarning(canonical: string): string {
@@ -361,6 +382,12 @@ export function resolveProjectIdentity(directory: string): string {
     }
 
     if (getActiveCooldown(canonical) !== undefined) {
+        if (hasGitDir(canonical)) {
+            const cachedGitIdentity = reuseLastKnownGitIdentity(canonical);
+            if (cachedGitIdentity !== undefined) {
+                return cachedGitIdentity;
+            }
+        }
         return directoryFallback(canonical);
     }
 
@@ -375,6 +402,10 @@ export function resolveProjectIdentity(directory: string): string {
                 transientFailureCooldown.delete(canonical);
             } else {
                 transientFailureCooldown.set(canonical, nowMs() + TRANSIENT_FAILURE_COOLDOWN_MS);
+                const cachedGitIdentity = reuseLastKnownGitIdentity(canonical);
+                if (cachedGitIdentity !== undefined) {
+                    return cachedGitIdentity;
+                }
             }
             if (error.errorClass === "dubious_ownership") {
                 recordDubiousOwnershipFallback(canonical);
@@ -403,7 +434,20 @@ export function resolveProjectIdentityOrFallback(directory: string): string {
  *  appeared since we cached a `dir:` fallback)? A plain file counts for worktrees
  *  and submodules. Any filesystem miss just means "keep walking". */
 function hasGitDir(canonical: string): boolean {
-    let current = canonical;
+    if (hasGitDirInAncestorChain(canonical)) {
+        return true;
+    }
+
+    try {
+        const realCanonical = realpathSync.native(canonical);
+        return realCanonical !== canonical && hasGitDirInAncestorChain(realCanonical);
+    } catch {
+        return false;
+    }
+}
+
+function hasGitDirInAncestorChain(startDirectory: string): boolean {
+    let current = startDirectory;
     while (true) {
         if (existsSync(path.join(current, ".git"))) {
             return true;
@@ -471,13 +515,23 @@ export function __clearProjectIdentityTransientCooldownForTests(directory?: stri
     transientFailureCooldown.delete(path.resolve(directory));
 }
 
+export function __clearProjectIdentityResolutionCacheForTests(directory?: string): void {
+    if (directory === undefined) {
+        identityCache.clear();
+        return;
+    }
+    identityCache.delete(path.resolve(directory));
+}
+
 export function __resetProjectIdentityForTests(): void {
     identityCache.clear();
+    lastKnownGitIdentityCache.clear();
     directoryFallbackCache.clear();
     transientFailureCooldown.clear();
     dubiousOwnershipFallbackDirectories.clear();
     dubiousOwnershipLoggedDirectories.clear();
     dubiousOwnershipWarnedDirectories.clear();
+    transientGitIdentityReuseLoggedDirectories.clear();
     execFileSyncForIdentity = execFileSync;
     nowMs = (): number => Date.now();
 }

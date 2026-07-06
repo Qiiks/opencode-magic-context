@@ -67,7 +67,11 @@ function formatAge(committedAtMs: number): string {
 const NOTE_EXPAND_HINT =
     "Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
 
-function formatResult(result: UnifiedSearchResult, index: number): string {
+function formatResult(
+    result: UnifiedSearchResult,
+    index: number,
+    currentSessionId: string,
+): string {
     if (result.source === "memory") {
         const source = result.sourceName ? ` source=${result.sourceName}` : "";
         return [
@@ -91,7 +95,10 @@ function formatResult(result: UnifiedSearchResult, index: number): string {
     }
 
     if (result.source === "note") {
-        const anchor = result.anchorOrdinal !== null ? ` @msg ${result.anchorOrdinal}` : "";
+        const anchor =
+            result.anchorOrdinal !== null && result.sourceSessionId === currentSessionId
+                ? ` @msg ${result.anchorOrdinal}`
+                : "";
         return [
             `[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatAge(result.createdAt)}${anchor}`,
             result.content,
@@ -113,18 +120,31 @@ function formatResult(result: UnifiedSearchResult, index: number): string {
     ].join("\n");
 }
 
-function formatSearchResults(query: string, results: UnifiedSearchResult[]): string {
+function formatSearchResults(
+    query: string,
+    results: UnifiedSearchResult[],
+    currentSessionId: string,
+): string {
     if (results.length === 0) {
         return `No results found for "${query}" across notes, memories, primers, git commits, or message history.`;
     }
 
-    const bodyParts = results.map((result, index) => formatResult(result, index + 1));
+    const bodyParts = results.map((result, index) =>
+        formatResult(result, index + 1, currentSessionId),
+    );
     if (results.some((result) => result.source === "message" || result.source === "compartment")) {
         bodyParts.push(
             "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.",
         );
     }
-    if (results.some((result) => result.source === "note" && result.anchorOrdinal !== null)) {
+    if (
+        results.some(
+            (result) =>
+                result.source === "note" &&
+                result.anchorOrdinal !== null &&
+                result.sourceSessionId === currentSessionId,
+        )
+    ) {
         bodyParts.push(NOTE_EXPAND_HINT);
     }
     const body = bodyParts.join("\n\n");
@@ -218,7 +238,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                 },
             );
 
-            return formatSearchResults(query, results);
+            return formatSearchResults(query, results, toolContext.sessionID);
         },
     });
 }

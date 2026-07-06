@@ -83,7 +83,11 @@ function formatAge(committedAtMs: number): string {
 	return years === 1 ? "1y ago" : `${years}y ago`;
 }
 
-function formatResult(result: UnifiedSearchResult, index: number): string {
+function formatResult(
+	result: UnifiedSearchResult,
+	index: number,
+	currentSessionId: string,
+): string {
 	if (result.source === "memory") {
 		// `source=` attributes a foreign workspace member's memory to its origin
 		// project (parity with OpenCode ctx-search/tools.ts); empty for own-project.
@@ -110,7 +114,10 @@ function formatResult(result: UnifiedSearchResult, index: number): string {
 
 	if (result.source === "note") {
 		const anchor =
-			result.anchorOrdinal !== null ? ` @msg ${result.anchorOrdinal}` : "";
+			result.anchorOrdinal !== null &&
+			result.sourceSessionId === currentSessionId
+				? ` @msg ${result.anchorOrdinal}`
+				: "";
 		return [
 			`[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatAge(result.createdAt)}${anchor}`,
 			result.content,
@@ -135,12 +142,13 @@ function formatResult(result: UnifiedSearchResult, index: number): string {
 function formatSearchResults(
 	query: string,
 	results: UnifiedSearchResult[],
+	currentSessionId: string,
 ): string {
 	if (results.length === 0) {
 		return `No results found for "${query}" across notes, memories, primers, git commits, or message history.`;
 	}
 	const bodyParts = results.map((result, index) =>
-		formatResult(result, index + 1),
+		formatResult(result, index + 1, currentSessionId),
 	);
 	if (
 		results.some(
@@ -154,7 +162,10 @@ function formatSearchResults(
 	}
 	if (
 		results.some(
-			(result) => result.source === "note" && result.anchorOrdinal !== null,
+			(result) =>
+				result.source === "note" &&
+				result.anchorOrdinal !== null &&
+				result.sourceSessionId === currentSessionId,
 		)
 	) {
 		bodyParts.push(NOTE_EXPAND_HINT);
@@ -259,7 +270,12 @@ export function createCtxSearchTool(
 			);
 
 			return {
-				content: [{ type: "text", text: formatSearchResults(query, results) }],
+				content: [
+					{
+						type: "text",
+						text: formatSearchResults(query, results, sessionId),
+					},
+				],
 				details: undefined,
 			};
 		},

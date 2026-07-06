@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, sep } from "node:path";
@@ -33,14 +34,146 @@ function describeError(error: unknown): string {
     return typeof code === "string" && code.length > 0 ? `${code}: ${message}` : message;
 }
 
-function probeOnnxRuntimeNodeLoad(packageDir: string): LocalEmbeddingRuntimeStatus | null {
-    try {
-        const req = createRequire(join(packageDir, "package.json"));
-        req(packageDir);
-        return null;
-    } catch (error) {
-        return { state: "load-failed", packageDir, reason: describeError(error) };
+const ONNX_LOAD_PROBE_TIMEOUT_MS = 10_000;
+const ONNX_LOAD_PROBE_OUTPUT_LIMIT = 800;
+const ONNX_LOAD_PROBE_PACKAGE_DIR_ENV = "MAGIC_CONTEXT_ONNX_RUNTIME_NODE_PACKAGE_DIR";
+const ONNX_RUNTIME_NODE_LOAD_PROBE_SCRIPT = [
+    'const { createRequire } = require("node:module");',
+    'const { join } = require("node:path");',
+    "function describe(error) {",
+    '  const message = error instanceof Error ? error.message : String(error ?? "unknown error");',
+    '  const code = error && typeof error === "object" && typeof error.code === "string" ? error.code : "";',
+    '  return code ? code + ": " + message : message;',
+    "}",
+    "try {",
+    `  const packageDir = process.env.${ONNX_LOAD_PROBE_PACKAGE_DIR_ENV};`,
+    `  if (!packageDir) throw new Error("${ONNX_LOAD_PROBE_PACKAGE_DIR_ENV} is not set");`,
+    '  const req = createRequire(join(packageDir, "package.json"));',
+    "  req(packageDir);",
+    "  process.stdout.write(JSON.stringify({ ok: true }));",
+    "} catch (error) {",
+    "  process.stdout.write(JSON.stringify({ ok: false, reason: describe(error) }));",
+    "}",
+].join("\n");
+
+interface OnnxRuntimeLoadProbeChildResult {
+    stdout?: string | Buffer | null;
+    stderr?: string | Buffer | null;
+    status?: number | null;
+    signal?: NodeJS.Signals | string | null;
+    error?: Error | null;
+}
+
+function runOnnxRuntimeNodeLoadProbeChild(packageDir: string): OnnxRuntimeLoadProbeChildResult {
+    return spawnSync("node", ["-e", ONNX_RUNTIME_NODE_LOAD_PROBE_SCRIPT], {
+        encoding: "utf8",
+        env: { ...process.env, [ONNX_LOAD_PROBE_PACKAGE_DIR_ENV]: packageDir },
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: ONNX_LOAD_PROBE_TIMEOUT_MS,
+    });
+}
+
+let runOnnxRuntimeNodeLoadProbeChildForRuntime = runOnnxRuntimeNodeLoadProbeChild;
+
+export function __setEmbeddingRuntimeTestHooks(hooks: {
+    runOnnxRuntimeNodeLoadProbeChild?: (packageDir: string) => OnnxRuntimeLoadProbeChildResult;
+}): void {
+    runOnnxRuntimeNodeLoadProbeChildForRuntime =
+        hooks.runOnnxRuntimeNodeLoadProbeChild ?? runOnnxRuntimeNodeLoadProbeChild;
+}
+
+function outputText(output: string | Buffer | null | undefined): string {
+    if (typeof output === "string") return output;
+    if (Buffer.isBuffer(output)) return output.toString("utf8");
+    return "";
+}
+
+function outputSnippet(output: string | Buffer | null | undefined): string {
+    const normalized = outputText(output).replace(/\s+/g, " ").trim();
+    if (normalized.length <= ONNX_LOAD_PROBE_OUTPUT_LIMIT) return normalized;
+    return `${normalized.slice(0, ONNX_LOAD_PROBE_OUTPUT_LIMIT)}…`;
+}
+
+function stderrSuffix(result: OnnxRuntimeLoadProbeChildResult): string {
+    const stderr = outputSnippet(result.stderr);
+    return stderr.length > 0 ? `; stderr: ${stderr}` : "";
+}
+
+function stdoutSuffix(result: OnnxRuntimeLoadProbeChildResult): string {
+    const stdout = outputSnippet(result.stdout);
+    return stdout.length > 0 ? `; stdout: ${stdout}` : "";
+}
+
+function parseOnnxProbeVerdict(output: string): { ok: boolean; reason?: string } | null {
+    const candidates = output
+        .trim()
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .reverse();
+    for (const candidate of candidates) {
+        try {
+            const parsed = JSON.parse(candidate) as { ok?: unknown; reason?: unknown };
+            if (typeof parsed.ok === "boolean") {
+                return {
+                    ok: parsed.ok,
+                    reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
+                };
+            }
+        } catch {
+            // Keep scanning; native loaders may print extra lines before the verdict.
+        }
     }
+    return null;
+}
+
+function probeOnnxRuntimeNodeLoad(packageDir: string): LocalEmbeddingRuntimeStatus | null {
+    const result = runOnnxRuntimeNodeLoadProbeChildForRuntime(packageDir);
+    const errorCode = (result.error as { code?: unknown } | null)?.code;
+    if (errorCode === "ETIMEDOUT") {
+        return {
+            state: "load-failed",
+            packageDir,
+            reason: `probe timed out after ${ONNX_LOAD_PROBE_TIMEOUT_MS}ms${stderrSuffix(result)}`,
+        };
+    }
+    if (result.error) {
+        return {
+            state: "load-failed",
+            packageDir,
+            reason: `probe process failed: ${describeError(result.error)}${stderrSuffix(result)}`,
+        };
+    }
+    if (result.signal) {
+        return {
+            state: "load-failed",
+            packageDir,
+            reason: `probe terminated by signal ${result.signal}${stderrSuffix(result)}`,
+        };
+    }
+    if (typeof result.status === "number" && result.status !== 0) {
+        return {
+            state: "load-failed",
+            packageDir,
+            reason: `probe exited with code ${result.status}${stderrSuffix(result)}`,
+        };
+    }
+
+    const verdict = parseOnnxProbeVerdict(outputText(result.stdout));
+    if (verdict?.ok === true) return null;
+    if (verdict?.ok === false) {
+        return {
+            state: "load-failed",
+            packageDir,
+            reason: verdict.reason ?? "onnxruntime-node failed to load",
+        };
+    }
+
+    return {
+        state: "load-failed",
+        packageDir,
+        reason: `probe returned no JSON verdict${stdoutSuffix(result)}${stderrSuffix(result)}`,
+    };
 }
 
 export function isLocalEmbeddingRuntimeBroken(

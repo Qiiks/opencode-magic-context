@@ -170,6 +170,7 @@ export interface NoteSearchResult {
     status: Note["status"];
     createdAt: number;
     anchorOrdinal: number | null;
+    sourceSessionId: string | null;
 }
 
 export type UnifiedSearchResult =
@@ -946,6 +947,7 @@ function searchNotes(args: {
             status: entry.note.status,
             createdAt: entry.note.createdAt,
             anchorOrdinal: entry.note.anchorOrdinal,
+            sourceSessionId: entry.note.sessionId,
         }));
     }
 
@@ -1010,6 +1012,7 @@ function searchNotes(args: {
         status: entry.entry.note.status,
         createdAt: entry.entry.note.createdAt,
         anchorOrdinal: entry.entry.note.anchorOrdinal,
+        sourceSessionId: entry.entry.note.sessionId,
     }));
 }
 
