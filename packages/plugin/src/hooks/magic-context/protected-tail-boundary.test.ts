@@ -616,7 +616,7 @@ it("treats an emergency-scaled complete small head as runnable even below the fo
 });
 
 describe("wrapup protected-tail boundary", () => {
-    it("counts meaningful user messages and keeps the newest N raw", () => {
+    it("counts raw messages of any role and keeps the newest N raw", () => {
         useBoundaryTempDataHome("wrapup-boundary-meaningful-");
         const sessionId = "ses-wrapup-meaningful";
         createBoundaryOpenCodeDb(sessionId, [
@@ -641,7 +641,10 @@ describe("wrapup protected-tail boundary", () => {
             messagesToKeep: 2,
         });
 
-        expect(plan.meaningfulMessagesAboveLastCompartment).toBe(4);
+        expect(plan.rawMessagesAboveLastCompartment).toBe(8);
+        // keep=2 raw messages over 8 ordinals -> candidate ordinal 7 (m7), then the
+        // user-boundary snap prefers the nearby user message m8... snapping only
+        // moves EARLIER, so the nearest user at or before 7 is m6 (ordinal 6).
         expect(plan.targetProtectedTailStart).toBe(6);
         expect(plan.snapshot.eligibleEndOrdinal).toBeGreaterThan(1);
         expect(plan.snapshot.eligibleEndOrdinal).toBeLessThanOrEqual(6);

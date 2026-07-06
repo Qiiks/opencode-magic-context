@@ -132,8 +132,8 @@ export interface BoundarySnapshotValidationResult {
 
 export interface WrapupBoundaryPlan {
     snapshot: ProtectedTailBoundarySnapshot;
-    /** Meaningful user messages after the last durable compartment, counted at command start. */
-    meaningfulMessagesAboveLastCompartment: number;
+    /** Raw messages (any role) after the last durable compartment, counted at command start. */
+    rawMessagesAboveLastCompartment: number;
     /** Raw-message count used to anchor the keep watermark for the whole wrapup loop. */
     anchorRawMessageCount: number;
     /** First raw ordinal that remains protected by the keep watermark. */
@@ -748,28 +748,23 @@ export function resolveWrapupProtectedTailBoundary(
     const usagePercentage = clampPercentage(ctx.usage?.percentage ?? 0);
     const usageInputTokens = Math.max(0, Math.round(ctx.usage?.inputTokens ?? 0));
 
-    const meaningfulOrdinals = messages
-        .filter(
-            (message) =>
-                message.ordinal >= offset &&
-                message.ordinal <= anchorRawMessageCount &&
-                message.role === "user" &&
-                hasMeaningfulUserText(message.parts),
-        )
-        .map((message) => message.ordinal)
-        .sort((a, b) => a - b);
-    const meaningfulMessagesAboveLastCompartment = meaningfulOrdinals.length;
+    // The keep watermark counts RAW messages (any role), not user turns: in
+    // agentic sessions one user turn can span 100+ tool messages, so a
+    // user-turn count would keep an unbounded token tail and defeat the
+    // pre-model-switch use case. Raw counting gives a bounded, predictable
+    // keep; the arc fence and user-boundary snap below still keep the actual
+    // cut safe.
+    const rawMessagesAboveLastCompartment = Math.max(0, anchorRawMessageCount - offset + 1);
     const keep = Math.max(1, Math.floor(args.messagesToKeep));
 
     let targetProtectedTailStart = offset;
     let boundaryReason = "manual-wrapup-empty";
-    if (rawMessageCount === 0 || meaningfulMessagesAboveLastCompartment <= keep) {
+    if (rawMessageCount === 0 || rawMessagesAboveLastCompartment <= keep) {
         targetProtectedTailStart = offset;
         boundaryReason =
             rawMessageCount === 0 ? "manual-wrapup-empty" : "manual-wrapup-within-keep";
     } else {
-        const oldestKeptIndex = meaningfulMessagesAboveLastCompartment - keep;
-        targetProtectedTailStart = meaningfulOrdinals[oldestKeptIndex] ?? offset;
+        targetProtectedTailStart = anchorRawMessageCount - keep + 1;
         boundaryReason = "manual-wrapup-keep-watermark";
         const arcs = buildToolArcs(messages);
         const fenced = fenceWrapupBoundaryForToolArcs({
@@ -856,7 +851,7 @@ export function resolveWrapupProtectedTailBoundary(
     };
     return {
         snapshot,
-        meaningfulMessagesAboveLastCompartment,
+        rawMessagesAboveLastCompartment,
         anchorRawMessageCount,
         targetProtectedTailStart,
         targetEligibleEndOrdinal: targetProtectedTailStart,

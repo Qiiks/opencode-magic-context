@@ -10,7 +10,7 @@ You run these slash commands in your harness chat or command box. They execute i
 1. **`/ctx-status`** — Pending queue, cache TTL, tags, historian state. Start here.
 2. **`/ctx-flush`** — Apply queued context operations now (usually pending drops).
 3. **`/ctx-recomp`** — Rebuild compartments from raw history with the historian model; slow on long sessions. Use `/ctx-recomp <start>-<end>` for a partial range when only part of the timeline is wrong.
-4. **`/ctx-wrapup [messages_to_keep]`** — Deliberately compact older live history while keeping the newest meaningful messages raw.
+4. **`/ctx-wrapup [messages_to_keep]`** — Deliberately compact older live history while keeping the newest N messages raw.
 
 Use **`/ctx-session-upgrade`** for legacy session format upgrades, not `/ctx-recomp --upgrade` (deprecated).
 
@@ -58,7 +58,7 @@ Uses historian-model tokens; full recomp on long sessions can take a long time.
 
 ## /ctx-wrapup
 
-**What it does.** Runs the historian forward over older live history now. By default it keeps the newest **20 meaningful user messages** raw and wraps everything older into compartments; pass a positive integer to keep a different number, e.g. `/ctx-wrapup 40`.
+**What it does.** Runs the historian forward over older live history now. By default it keeps the newest **20 messages** raw (counting every message: yours, the assistant's, and tool results) and wraps everything older into compartments; pass a positive integer to keep a different number, e.g. `/ctx-wrapup 40`. The cut never splits an in-flight tool exchange and prefers to land on one of your messages, so the actual kept count can be slightly higher.
 
 **When to use it.** Before switching from a large-context model to a smaller one, or when a long session has grown and you want to compact it on purpose instead of waiting for pressure triggers. A model switch already creates the cache-busting pass that materializes queued wrapup compartments, so you do **not** need `/ctx-flush` before switching models.
 

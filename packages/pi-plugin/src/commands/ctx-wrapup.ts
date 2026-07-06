@@ -182,8 +182,8 @@ export async function runPiWrapup(
 			cacheNamespace: `pi:${sessionId}`,
 			messagesToKeep,
 		});
-		if (initialPlan.meaningfulMessagesAboveLastCompartment <= messagesToKeep) {
-			return `## Magic Wrapup\n\nNothing to wrap up — only ${initialPlan.meaningfulMessagesAboveLastCompartment} messages above the last compartment.`;
+		if (initialPlan.rawMessagesAboveLastCompartment <= messagesToKeep) {
+			return `## Magic Wrapup\n\nNothing to wrap up — only ${initialPlan.rawMessagesAboveLastCompartment} messages above the last compartment.`;
 		}
 
 		holderId = crypto.randomUUID();

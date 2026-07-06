@@ -400,7 +400,7 @@ export function createMagicContextCommandHandler(deps: {
         sessionId: string,
         options?: { range?: PartialRecompRange },
     ) => Promise<string>;
-    /** Runs /ctx-wrapup over the live raw tail, keeping the newest meaningful messages raw. */
+    /** Runs /ctx-wrapup over the live raw tail, keeping the newest N raw messages. */
     executeWrapup?: (sessionId: string, options: { messagesToKeep: number }) => Promise<string>;
     /** Runs the once-per-project 5-cat memory migration for /ctx-session-upgrade.
      *  Optional: when unavailable, /ctx-session-upgrade still upgrades compartments

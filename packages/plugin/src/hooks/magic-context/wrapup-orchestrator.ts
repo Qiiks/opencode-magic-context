@@ -231,10 +231,10 @@ export async function runManagedWrapup(
 
     const initialPlan = buildPlan(ctx, sessionId, messagesToKeep);
     if (
-        initialPlan.meaningfulMessagesAboveLastCompartment <= messagesToKeep ||
+        initialPlan.rawMessagesAboveLastCompartment <= messagesToKeep ||
         !hasRunnableCompartmentWindow(initialPlan.snapshot)
     ) {
-        const message = `Nothing to wrap up — only ${initialPlan.meaningfulMessagesAboveLastCompartment} messages above the last compartment.`;
+        const message = `Nothing to wrap up — only ${initialPlan.rawMessagesAboveLastCompartment} messages above the last compartment.`;
         setRecompTerminal(ctx.liveSessionState, sessionId, "done", message);
         return message;
     }

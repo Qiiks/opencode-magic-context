@@ -233,7 +233,7 @@ Recall works **across sessions** (a new session inherits everything) and **acros
 | `/ctx-status` | Debug view: tags, pending drops, cache TTL, nudge state, historian progress, compartment coverage, history budget |
 | `/ctx-flush` | Force all queued operations immediately, bypassing cache TTL |
 | `/ctx-recomp` | Rebuild compartments from raw history (accepts a `start-end` range). Use when stored state seems wrong |
-| `/ctx-wrapup [messages_to_keep]` | Compact older live history while keeping the newest meaningful messages raw; queued compaction materializes on the next model message |
+| `/ctx-wrapup [messages_to_keep]` | Compact older live history while keeping the newest N messages raw; queued compaction materializes on the next model message |
 | `/ctx-session-upgrade` | Upgrade this session to the latest history format: rebuild compartments and migrate project memories |
 | `/ctx-aug` | Run sidekick augmentation on a prompt: retrieve relevant memories via a separate model |
 | `/ctx-dream` | Run dreamer maintenance on demand: maintain memory, docs, smart notes, and user-profile review |
