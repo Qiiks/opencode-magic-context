@@ -682,4 +682,50 @@ describe("wrapup protected-tail boundary", () => {
         expect(plan.snapshot.boundaryReason).toBe("manual-wrapup-user-snap");
         closeQuietly(db);
     });
+
+    it("re-fences after user snap when the snapped user is inside an earlier tool arc", () => {
+        useBoundaryTempDataHome("wrapup-boundary-refence-");
+        const sessionId = "ses-wrapup-refence";
+        createBoundaryOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", parts: [{ type: "text", text: "one" }] },
+            {
+                id: "m2",
+                role: "assistant",
+                parts: [{ type: "tool", id: "outer", state: { status: "pending" } }],
+            },
+            { id: "m3", role: "user", parts: [{ type: "text", text: "queued while outer runs" }] },
+            { id: "m4", role: "assistant", parts: [{ type: "text", text: "still working" }] },
+            {
+                id: "m5",
+                role: "assistant",
+                parts: [{ type: "tool", id: "inner", state: { status: "pending" } }],
+            },
+            {
+                id: "m6",
+                role: "tool",
+                parts: [{ type: "tool_result", id: "outer", content: "outer result" }],
+            },
+            { id: "m7", role: "user", parts: [{ type: "text", text: "queued while inner runs" }] },
+            {
+                id: "m8",
+                role: "tool",
+                parts: [{ type: "tool_result", id: "inner", content: "inner result" }],
+            },
+            { id: "m9", role: "user", parts: [{ type: "text", text: "newest kept" }] },
+        ]);
+        const db = createContextDb();
+        const plan = resolveWrapupProtectedTailBoundary({
+            db,
+            sessionId,
+            mode: "manual-wrapup",
+            contextLimit: 128_000,
+            executeThresholdPercentage: 65,
+            usage: null,
+            usageSource: "manual-none",
+            messagesToKeep: 2,
+        });
+
+        expect(plan.targetProtectedTailStart).toBeLessThanOrEqual(2);
+        closeQuietly(db);
+    });
 });

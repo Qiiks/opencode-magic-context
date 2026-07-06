@@ -140,8 +140,6 @@ export interface WrapupBoundaryPlan {
     targetProtectedTailStart: number;
     /** Exclusive eligible end before per-run capping. */
     targetEligibleEndOrdinal: number;
-    /** True when this snapshot exposes the whole remaining eligible range to the runner. */
-    finalChunk: boolean;
 }
 
 const ALPHA = 0.3;
@@ -311,20 +309,26 @@ function fenceWrapupBoundaryForToolArcs(args: {
     lastCompartmentEndOrdinal: number;
 }): number {
     let boundary = args.candidate;
-    for (const arc of args.arcs) {
-        if (arc.resOrdinal === null) {
-            // An open invocation at or after the watermark is already in the kept
-            // tail. An older open invocation is treated as stale/interrupted, which
-            // matches the normal boundary resolver's staleness rule.
-            continue;
+    const maxPasses = args.arcs.length + 1;
+    for (let pass = 0; pass < maxPasses; pass += 1) {
+        let next = boundary;
+        for (const arc of args.arcs) {
+            if (arc.resOrdinal === null) {
+                // An open invocation at or after the watermark is already in the kept
+                // tail. An older open invocation is treated as stale/interrupted, which
+                // matches the normal boundary resolver's staleness rule.
+                continue;
+            }
+            if (
+                arc.invOrdinal >= args.lastCompartmentEndOrdinal + 1 &&
+                arc.invOrdinal < next &&
+                next <= arc.resOrdinal
+            ) {
+                next = arc.invOrdinal;
+            }
         }
-        if (
-            arc.invOrdinal >= args.lastCompartmentEndOrdinal + 1 &&
-            arc.invOrdinal < boundary &&
-            boundary <= arc.resOrdinal
-        ) {
-            boundary = arc.invOrdinal;
-        }
+        if (next === boundary) return boundary;
+        boundary = next;
     }
     return boundary;
 }
@@ -784,6 +788,17 @@ export function resolveWrapupProtectedTailBoundary(
         });
         if (snapped !== targetProtectedTailStart) boundaryReason = "manual-wrapup-user-snap";
         targetProtectedTailStart = snapped;
+        const refenced = fenceWrapupBoundaryForToolArcs({
+            candidate: targetProtectedTailStart,
+            arcs,
+            lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal,
+        });
+        // User snapping can move from a later tool invocation to an earlier queued
+        // user turn that sits inside another closed tool arc. Re-fence after the
+        // snap; the fence helper iterates so overlapping arcs move to a stable
+        // invocation boundary instead of splitting an invocation/result pair.
+        if (refenced !== targetProtectedTailStart) boundaryReason = "manual-wrapup-tool-arc";
+        targetProtectedTailStart = refenced;
     }
 
     targetProtectedTailStart = clampOrdinal(targetProtectedTailStart, rawMessageCount);
@@ -845,7 +860,6 @@ export function resolveWrapupProtectedTailBoundary(
         anchorRawMessageCount,
         targetProtectedTailStart,
         targetEligibleEndOrdinal: targetProtectedTailStart,
-        finalChunk: eligibleEndOrdinal >= targetProtectedTailStart,
     };
 }
 

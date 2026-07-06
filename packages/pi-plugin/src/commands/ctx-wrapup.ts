@@ -28,6 +28,10 @@ import { resolveWrapupProtectedTailBoundary } from "@magic-context/core/hooks/ma
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { applyDeferredPiCompactionMarker } from "../compaction-marker-manager-pi";
+import {
+	signalPiDeferredHistoryRefresh,
+	signalPiDeferredMaterialization,
+} from "../context-handler";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
 import { runPiHistorian } from "../pi-historian-runner";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
@@ -201,8 +205,32 @@ export async function runPiWrapup(
 			);
 		}
 
+		let ownershipLost = false;
+		const ownershipLostReason =
+			"another process took over this session's wrapup";
+		const markOwnershipLost = (): void => {
+			if (ownershipLost) return;
+			ownershipLost = true;
+		};
+		const renewWrapupMarker = (
+			updates: Parameters<typeof updateWrapupInProgress>[3],
+		): boolean => {
+			const updated = updateWrapupInProgress(
+				deps.db,
+				sessionId,
+				holderId,
+				updates,
+			);
+			if (!updated) {
+				markOwnershipLost();
+				return false;
+			}
+			return true;
+		};
 		const renewal = setInterval(() => {
-			updateWrapupInProgress(deps.db, sessionId, holderId, {});
+			renewWrapupMarker({
+				lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
+			});
 		}, 60_000);
 		try {
 			sendCtxStatusMessage(pi, {
@@ -218,6 +246,23 @@ export async function runPiWrapup(
 			let failure: string | null = null;
 
 			for (;;) {
+				if (ownershipLost) {
+					failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
+					break;
+				}
+				if (
+					!renewWrapupMarker({
+						chunkIndex,
+						lastCompartmentEnd: getLastCompartmentEndMessage(
+							deps.db,
+							sessionId,
+						),
+					})
+				) {
+					failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
+					break;
+				}
+
 				const plan = resolveWrapupProtectedTailBoundary({
 					db: deps.db,
 					sessionId,
@@ -234,18 +279,26 @@ export async function runPiWrapup(
 				if (plan.snapshot.eligibleEndOrdinal <= plan.snapshot.offset) break;
 
 				chunkIndex += 1;
-				updateWrapupInProgress(deps.db, sessionId, holderId, {
-					chunkIndex,
-					lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
-					targetEligibleEndOrdinal: plan.targetEligibleEndOrdinal,
-					expectedChunks: Math.max(
+				if (
+					!renewWrapupMarker({
 						chunkIndex,
-						estimateChunks(
-							plan.snapshot.trueRawEligibleTokens,
-							deps.historianChunkTokens,
+						lastCompartmentEnd: getLastCompartmentEndMessage(
+							deps.db,
+							sessionId,
 						),
-					),
-				});
+						targetEligibleEndOrdinal: plan.targetEligibleEndOrdinal,
+						expectedChunks: Math.max(
+							chunkIndex,
+							estimateChunks(
+								plan.snapshot.trueRawEligibleTokens,
+								deps.historianChunkTokens,
+							),
+						),
+					})
+				) {
+					failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
+					break;
+				}
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-wrapup",
 					text: `## Magic Wrapup\n\nChunk ${chunkIndex}: wrapping messages ${plan.snapshot.offset}-${plan.snapshot.eligibleEndOrdinal - 1} (~${plan.snapshot.trueRawEligibleTokens.toLocaleString()} eligible tokens remain).`,
@@ -255,8 +308,14 @@ export async function runPiWrapup(
 				const leaseHolder = await acquireCompartmentLeaseEventually(
 					deps.db,
 					sessionId,
-					holderId,
+					renewWrapupMarker,
 				);
+				if (!leaseHolder) {
+					failure = ownershipLost
+						? `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`
+						: "Another Magic Context rebuild started while wrapup was waiting. Run /ctx-wrapup again to continue.";
+					break;
+				}
 				const leaseRenewal = setInterval(() => {
 					renewCompartmentLease(deps.db, sessionId, leaseHolder);
 				}, COMPARTMENT_LEASE_RENEWAL_MS);
@@ -303,9 +362,14 @@ export async function runPiWrapup(
 							}),
 						ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 						forceDrainQuota: true,
-						forceKeepLastCompartment: plan.finalChunk,
-						onPublished: () =>
-							updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd }),
+						// The runner applies this only to the actual final chunk; token-capped
+						// chunks are downgraded based on readSessionChunk().hasMore.
+						forceKeepLastCompartment: true,
+						onPublished: () => {
+							updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd });
+							signalPiDeferredHistoryRefresh(sessionId);
+							signalPiDeferredMaterialization(sessionId);
+						},
 					});
 				} finally {
 					clearInterval(leaseRenewal);
@@ -369,13 +433,15 @@ function resolvePiContextLimit(ctx: ExtensionCommandContext): number {
 async function acquireCompartmentLeaseEventually(
 	db: ContextDatabase,
 	sessionId: string,
-	wrapupHolderId: string,
-): Promise<string> {
+	renewWrapupMarker: (
+		updates: Parameters<typeof updateWrapupInProgress>[3],
+	) => boolean,
+): Promise<string | null> {
 	for (;;) {
 		const holderId = crypto.randomUUID();
 		const lease = acquireCompartmentLease(db, sessionId, holderId);
 		if (lease) return holderId;
-		updateWrapupInProgress(db, sessionId, wrapupHolderId, {});
+		if (!renewWrapupMarker({})) return null;
 		await new Promise((resolve) => setTimeout(resolve, LEASE_WAIT_MS));
 	}
 }

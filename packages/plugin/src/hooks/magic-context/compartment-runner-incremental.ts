@@ -349,6 +349,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         drainReservation = reserve.reservation;
 
         const chunk = readSessionChunk(sessionId, historianChunkTokens, offset, eligibleEndOrdinal);
+        const forceKeepLastCompartmentForChunk =
+            deps.forceKeepLastCompartment === true && !chunk.hasMore;
         telemetry.chunkStartOrdinal = chunk.startIndex;
         telemetry.chunkEndOrdinal = chunk.endIndex;
         if (!chunk.text || chunk.messageCount === 0) {
@@ -500,7 +502,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         const BOUNDARY_HEALING_SLACK = 2;
         const inEmergency = getOverflowState(db, sessionId).needsEmergencyRecovery;
         let persistedCompartments = emittedCompartments;
-        if (!inEmergency && !deps.forceKeepLastCompartment && emittedCompartments.length >= 2) {
+        if (!inEmergency && !forceKeepLastCompartmentForChunk && emittedCompartments.length >= 2) {
             const lastEmitted = emittedCompartments[emittedCompartments.length - 1];
             const lookaheadMargin = chunk.endIndex - lastEmitted.endMessage;
             if (lookaheadMargin <= BOUNDARY_HEALING_SLACK) {
@@ -560,17 +562,13 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // above); using it directly made promotion + embedding silently no-op.
         const promotionDirectory = sessionDirectory || deps.directory;
 
-        // discard-last: when the provisional last compartment was dropped, its
-        // facts/events are NOT durable yet — they will be re-derived
-        // next run with real following context. Facts are unanchored, so we
-        // cannot distinguish persisted-range facts from discarded-tail facts;
-        // the safe choice is to SKIP fact promotion entirely on a discard-last
-        // run. (Dedup would catch exact re-emissions next run, but reworded
-        // facts could double up.) Events ARE anchored, so we filter them by
-        // persisted range below instead of skipping wholesale.
-        const discardedLast = persistedCompartments.length < emittedCompartments.length;
-        const weakLookaheadFinalCompartment = deps.forceKeepLastCompartment === true;
-        const skipUnanchoredPromotion = discardedLast || weakLookaheadFinalCompartment;
+        // A wrapup caller may request final weak-lookahead preservation, but the
+        // runner is authoritative: a token-capped chunk (`chunk.hasMore`) still has
+        // more raw history after it, so it must use normal discard-last healing and
+        // promotion. Only the actual final chunk keeps its weak-lookahead tail and
+        // skips unanchored promotion.
+        const weakLookaheadFinalCompartment = forceKeepLastCompartmentForChunk;
+        const skipUnanchoredPromotion = weakLookaheadFinalCompartment;
 
         // Issue #44: gate promotion behind both `memory.enabled` and
         // `memory.auto_promote`. Without this, historian unconditionally
@@ -798,10 +796,9 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // Store user behavior observations as candidates ONLY when the user-memory
         // feature is enabled. Without this gate we'd persist behavioral candidates
         // for users who opted out of user memories entirely (privacy).
-        // discard-last: skip observation candidates for the discarded provisional
-        // compartment for the SAME reason facts are skipped above — observations
-        // are unanchored, so a reworded re-emission next run would double-store.
-        // (`discardedLast` computed above for the fact-promotion gate.)
+        // Actual final wrapup chunks skip unanchored observations because the kept
+        // tail has weak lookahead; token-capped chunks still promote observations
+        // so facts from a never-re-read persisted range are not lost.
         if (
             deps.experimentalUserMemories === true &&
             !skipUnanchoredPromotion &&
@@ -829,8 +826,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         }
 
         // Primers v1 are recall-only side-table writes (dashboard + ctx_search),
-        // never prompt injection. Keep the same !discardedLast gate as facts and
-        // observations so a provisional tail does not double-emit evidence.
+        // never prompt injection. Use the same actual-final weak-lookahead gate as
+        // facts and observations.
         if (
             !skipUnanchoredPromotion &&
             promotionProjectIdentity &&

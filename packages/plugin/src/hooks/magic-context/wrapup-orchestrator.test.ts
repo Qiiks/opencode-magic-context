@@ -51,6 +51,20 @@ async function withProvider<T>(sessionId: string, count: number, fn: () => Promi
     }
 }
 
+function stealWrapupMarker(db: Database, sessionId: string): void {
+    const state = getWrapupInProgressState(db, sessionId);
+    expect(state).not.toBeNull();
+    db.prepare("UPDATE session_meta SET wrapup_in_progress_state = ? WHERE session_id = ?").run(
+        JSON.stringify({
+            ...state,
+            holderId: "foreign-holder",
+            updatedAt: Date.now(),
+            expiresAt: Date.now() + 60_000,
+        }),
+        sessionId,
+    );
+}
+
 function appendRange(db: Database, sessionId: string, start: number, end: number): void {
     if (end < start) return;
     appendCompartments(db, sessionId, [
@@ -87,7 +101,7 @@ function baseCtx(db: Database, state = liveState()): ManagedWrapupContext {
 }
 
 describe("runManagedWrapup", () => {
-    it("drains multiple chunks, releases the marker, and forces keep only on the final chunk", async () => {
+    it("drains multiple chunks and lets the runner decide actual final-chunk keep", async () => {
         const db = createDb();
         try {
             const sessionId = "ses-wrapup-multi";
@@ -109,7 +123,7 @@ describe("runManagedWrapup", () => {
             expect(result).toContain(
                 "If you want it applied on the very next message, run /ctx-flush first.",
             );
-            expect(forceKeepFlags).toEqual([false, false, true]);
+            expect(forceKeepFlags).toEqual([true, true, true]);
             expect(getLastCompartmentEndMessage(db, sessionId)).toBe(9);
             expect(getWrapupInProgressState(db, sessionId)).toBeNull();
             expect(ctx.liveSessionState.deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
@@ -134,6 +148,32 @@ describe("runManagedWrapup", () => {
             expect(result).toBe("Nothing to wrap up — only 3 messages above the last compartment.");
             expect(runner).not.toHaveBeenCalled();
             expect(getWrapupInProgressState(db, sessionId)).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("aborts when wrapup marker ownership is lost and leaves the foreign marker", async () => {
+        const db = createDb();
+        try {
+            const sessionId = "ses-wrapup-ownership-lost";
+            let calls = 0;
+            const ctx = baseCtx(db);
+            ctx.runCompartmentAgentForWrapup = mock(async (deps) => {
+                calls += 1;
+                appendRange(db, sessionId, 1, 3);
+                deps.onCompartmentStatePublished?.(sessionId);
+                stealWrapupMarker(db, sessionId);
+            });
+
+            const result = await withProvider(sessionId, 10, () =>
+                runManagedWrapup(ctx, sessionId, { messagesToKeep: 2 }),
+            );
+
+            expect(result).toContain("## Magic Wrapup — Partial");
+            expect(result).toContain("another process took over this session's wrapup");
+            expect(calls).toBe(1);
+            expect(getWrapupInProgressState(db, sessionId)?.holderId).toBe("foreign-holder");
         } finally {
             closeQuietly(db);
         }

@@ -21,7 +21,7 @@ import {
     type ProtectedTailBoundarySnapshot,
     resolveWrapupProtectedTailBoundary,
 } from "./protected-tail-boundary";
-import { setRawMessageProvider } from "./read-session-chunk";
+import { readSessionChunk, setRawMessageProvider } from "./read-session-chunk";
 
 function createDb(): Database {
     const db = new Database(":memory:");
@@ -39,13 +39,30 @@ function rawMessages(count: number) {
     }));
 }
 
-function withProvider<T>(sessionId: string, count: number, fn: () => Promise<T>): Promise<T> {
-    const messages = rawMessages(count);
+function withProviderMessages<T>(
+    sessionId: string,
+    messages: ReturnType<typeof rawMessages>,
+    fn: () => Promise<T>,
+): Promise<T> {
     const unregister = setRawMessageProvider(sessionId, {
         readMessages: () => messages,
         getMessageCount: () => messages.length,
     });
     return fn().finally(unregister);
+}
+
+function withProvider<T>(sessionId: string, count: number, fn: () => Promise<T>): Promise<T> {
+    return withProviderMessages(sessionId, rawMessages(count), fn);
+}
+
+function alternatingMessages(count: number) {
+    const text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+    return Array.from({ length: count }, (_, index) => ({
+        ordinal: index + 1,
+        id: `m-${index + 1}`,
+        role: index % 2 === 0 ? "user" : "assistant",
+        parts: [{ type: "text", text: `message ${index + 1} ${text} ${text} ${text}` }],
+    }));
 }
 
 function historianXml(): string {
@@ -68,7 +85,24 @@ function historianXml(): string {
 </output>`;
 }
 
-function client(): PluginContext["client"] {
+function twoCompartmentHistorianXml(): string {
+    return `<output>
+<compartments>
+<compartment start="1" end="2" title="First wrapped" episode_type="debug" importance="50">
+<p1>First durable wrapup.</p1><p2>First.</p2><p3>First.</p3><p4>wrapup</p4>
+</compartment>
+<compartment start="3" end="4" title="Provisional wrapped" episode_type="debug" importance="50">
+<p1>Provisional wrapup.</p1><p2>Provisional.</p2><p3>Prov.</p3><p4>wrapup</p4>
+</compartment>
+</compartments>
+<facts><PROJECT_RULES>
+* Mid-loop wrapup facts must promote.
+</PROJECT_RULES></facts>
+<meta><messages_processed>1-4</messages_processed><unprocessed_from>5</unprocessed_from></meta>
+</output>`;
+}
+
+function client(output = historianXml()): PluginContext["client"] {
     return {
         session: {
             get: mock(async () => ({ data: { directory: "/tmp/wrapup-runner" } })),
@@ -78,7 +112,7 @@ function client(): PluginContext["client"] {
                 data: [
                     {
                         info: { role: "assistant", time: { created: 1 } },
-                        parts: [{ type: "text", text: historianXml() }],
+                        parts: [{ type: "text", text: output }],
                     },
                 ],
             })),
@@ -113,15 +147,17 @@ async function runWithLease(args: {
     forceKeepLastCompartment?: boolean;
     forceDrainQuota?: boolean;
     refreshBoundarySnapshot?: Parameters<typeof runCompartmentAgent>[0]["refreshBoundarySnapshot"];
+    historianChunkTokens?: number;
+    output?: string;
 }) {
     const holderId = `holder-${Math.random()}`;
     expect(acquireCompartmentLease(args.db, args.sessionId, holderId)).not.toBeNull();
     try {
         await runCompartmentAgent({
-            client: client(),
+            client: client(args.output),
             db: args.db,
             sessionId: args.sessionId,
-            historianChunkTokens: 10_000,
+            historianChunkTokens: args.historianChunkTokens ?? 10_000,
             historianTimeoutMs: 5_000,
             boundarySnapshot: args.snapshot,
             currentContextLimit: 20,
@@ -168,6 +204,48 @@ describe("runCompartmentAgent wrapup controls", () => {
             } finally {
                 closeQuietly(db);
             }
+        }
+    });
+
+    it("downgrades forced final keep on token-capped chunks so discard-last and promotion still run", async () => {
+        const db = createDb();
+        const sessionId = "ses-force-mid-loop-has-more";
+        const project = resolveProjectIdentity("/tmp/wrapup-runner");
+        try {
+            const messages = alternatingMessages(10);
+            await withProviderMessages(sessionId, messages, async () => {
+                const snapshot = {
+                    ...wrapupSnapshot(db, sessionId),
+                    protectedTailStart: 9,
+                    protectedTailStartMessageId: "m-9",
+                    eligibleEndOrdinal: 9,
+                    eligibleEndMessageId: "m-8",
+                    rawRangeFingerprint: "",
+                    trueRawEligibleTokens: 1_000,
+                };
+                const chunk = readSessionChunk(sessionId, 220, 1, snapshot.eligibleEndOrdinal);
+                expect(chunk.hasMore).toBe(true);
+                expect(chunk.endIndex).toBeGreaterThanOrEqual(4);
+                expect(chunk.endIndex).toBeLessThanOrEqual(6);
+
+                await runWithLease({
+                    db,
+                    sessionId,
+                    snapshot,
+                    forceKeepLastCompartment: true,
+                    forceDrainQuota: true,
+                    historianChunkTokens: 220,
+                    output: twoCompartmentHistorianXml(),
+                });
+            });
+
+            expect(getCompartments(db, sessionId)).toHaveLength(1);
+            expect(getCompartments(db, sessionId)[0]?.endMessage).toBe(2);
+            expect(getMemoriesByProject(db, project).map((memory) => memory.content)).toContain(
+                "Mid-loop wrapup facts must promote.",
+            );
+        } finally {
+            closeQuietly(db);
         }
     });
 

@@ -456,6 +456,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				offset,
 				eligibleEndOrdinal,
 			);
+			const forceKeepLastCompartmentForChunk =
+				forceKeepLastCompartment === true && !chunk.hasMore;
 			if (!chunk.text || chunk.messageCount === 0) {
 				sessionLog(
 					sessionId,
@@ -849,7 +851,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			let newCompartments = emittedCompartments;
 			if (
 				!inEmergency &&
-				!forceKeepLastCompartment &&
+				!forceKeepLastCompartmentForChunk &&
 				emittedCompartments.length >= 2
 			) {
 				const lastEmitted = emittedCompartments[emittedCompartments.length - 1];
@@ -902,14 +904,14 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				}
 			}
 
-			// discard-last: when the provisional last compartment was dropped, its
-			// facts AND observations are not durable yet — skip both this run
-			// (unanchored; re-derived next run). Computed before publication so
-			// durable promotion can share the publish transaction.
+			// A wrapup caller may request final weak-lookahead preservation, but the
+			// runner is authoritative: a token-capped chunk (`chunk.hasMore`) still has
+			// more raw history after it, so it must use normal discard-last healing and
+			// promotion. Only the actual final chunk keeps its weak-lookahead tail and
+			// skips unanchored promotion.
 			const discardedLast = newCompartments.length < emittedCompartments.length;
-			const weakLookaheadFinalCompartment = forceKeepLastCompartment === true;
-			const skipUnanchoredPromotion =
-				discardedLast || weakLookaheadFinalCompartment;
+			const weakLookaheadFinalCompartment = forceKeepLastCompartmentForChunk;
+			const skipUnanchoredPromotion = weakLookaheadFinalCompartment;
 
 			// Two distinct gates (parity with OpenCode): embeddingActive = memory
 			// feature on (drives registration + embedding, the ctx_search / dreamer
@@ -1086,8 +1088,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			}
 
 			// Primers v1 are recall-only side-table writes (dashboard + ctx_search),
-			// never prompt injection. They share the same !discardedLast gate as facts
-			// and observations so provisional tails do not double-emit evidence.
+			// never prompt injection. They use the same actual-final weak-lookahead
+			// gate as facts and observations.
 			if (
 				!skipUnanchoredPromotion &&
 				validatedPass.primerCandidates?.length &&

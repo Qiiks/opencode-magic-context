@@ -1,11 +1,15 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
     addStaleReduceStrippedIds,
     advanceToolReclaimWatermark,
     getActiveTagsBySession,
     getOrCreateSessionMeta,
+    getPendingCompactionMarkerState,
     getProcessedImageStrippedIds,
     getTagsBySession,
     insertTag,
@@ -25,10 +29,30 @@ import {
 } from "./transform-postprocess-phase";
 
 const SESSION_ID = "ses-postprocess-drift";
+const tempDirs: string[] = [];
+const originalXdgDataHome = process.env.XDG_DATA_HOME;
 let db: Database;
+
+function createOpenCodeDbWithoutMessages(prefix: string): void {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    tempDirs.push(dir);
+    process.env.XDG_DATA_HOME = dir;
+    mkdirSync(join(dir, "opencode"), { recursive: true });
+    const opencodeDb = new Database(join(dir, "opencode", "opencode.db"));
+    opencodeDb.exec(
+        "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+    );
+    opencodeDb.exec(
+        "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+    );
+    opencodeDb.close();
+}
 
 afterEach(() => {
     if (db) db.close();
+    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+    tempDirs.length = 0;
 });
 
 describe("m[0] mutation drift watcher", () => {
@@ -200,6 +224,69 @@ describe("deferred compaction marker CAS drain", () => {
         });
 
         expect(outcome).toBe("cas-lost-already-cleared");
+        expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(false);
+    });
+
+    it("preserves a pending marker newer than the consumed compartment boundary", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-newer-than-consumed";
+        const newer = { ordinal: 12, endMessageId: "msg-12", publishedAt: 2 };
+        setPendingCompactionMarkerState(db, sessionId, newer);
+        const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, [], {
+                deferredHistoryWasPendingAtPassStart: true,
+                historyRebuiltThisPass: true,
+                canConsumeDeferredLate: true,
+                deferredHistoryRefreshSessions,
+                pendingCompartmentInjection: {
+                    block: "",
+                    compartmentEndMessage: 10,
+                    compartmentEndMessageId: "msg-10",
+                    compartmentCount: 1,
+                    skippedVisibleMessages: 0,
+                    factCount: 0,
+                    memoryCount: 0,
+                    rebuiltFromDb: true,
+                },
+            }),
+        );
+
+        expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(newer);
+        expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
+    });
+
+    it("drains a pending marker covered by the consumed compartment boundary", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-covered-by-consumed";
+        createOpenCodeDbWithoutMessages("postprocess-covered-marker-");
+        const covered = { ordinal: 10, endMessageId: "msg-10", publishedAt: 1 };
+        setPendingCompactionMarkerState(db, sessionId, covered);
+        const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, [], {
+                deferredHistoryWasPendingAtPassStart: true,
+                historyRebuiltThisPass: true,
+                canConsumeDeferredLate: true,
+                deferredHistoryRefreshSessions,
+                pendingCompartmentInjection: {
+                    block: "",
+                    compartmentEndMessage: 10,
+                    compartmentEndMessageId: "msg-10",
+                    compartmentCount: 1,
+                    skippedVisibleMessages: 0,
+                    factCount: 0,
+                    memoryCount: 0,
+                    rebuiltFromDb: true,
+                },
+            }),
+        );
+
+        expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
         expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(false);
     });
 });

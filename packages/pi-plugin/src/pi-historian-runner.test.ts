@@ -85,6 +85,14 @@ function successXmlWithUserObservation(observation: string) {
 	return `${successXml()}\n<user_observations>\n* ${observation}\n</user_observations>`;
 }
 
+function twoCompartmentSuccessXml() {
+	return `<compartment start="1" end="2" title="Initial Pi slice">Summarized the first Pi turn.</compartment>
+<compartment start="3" end="4" title="Provisional Pi slice">Summarized the provisional Pi turn.</compartment>
+<PROJECT_RULES>
+* Pi mid-loop wrapup facts must promote.
+</PROJECT_RULES>`;
+}
+
 function makeBoundarySnapshot(
 	overrides: Partial<ProtectedTailBoundarySnapshot> = {},
 ): ProtectedTailBoundarySnapshot {
@@ -139,6 +147,8 @@ async function runHistorianWith(args: {
 	boundarySnapshot?: ProtectedTailBoundarySnapshot;
 	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
 	providerMessages?: ReturnType<typeof rawMessages>;
+	forceKeepLastCompartment?: boolean;
+	historianChunkTokens?: number;
 	beforeRun?: (db: ReturnType<typeof createTestDb>) => void;
 	ensureProjectRegistered?: Parameters<
 		typeof runPiHistorian
@@ -156,7 +166,7 @@ async function runHistorianWith(args: {
 		provider: { readMessages: () => args.providerMessages ?? rawMessages() },
 		runner,
 		historianModel: "test/model",
-		historianChunkTokens: 20_000,
+		historianChunkTokens: args.historianChunkTokens ?? 20_000,
 		twoPass: args.twoPass,
 		memoryEnabled: args.memoryEnabled,
 		autoPromote: args.autoPromote,
@@ -168,6 +178,7 @@ async function runHistorianWith(args: {
 		refreshBoundarySnapshot: args.refreshBoundarySnapshot,
 		compartmentLeaseHolderId: holderId,
 		ensureProjectRegistered: args.ensureProjectRegistered,
+		forceKeepLastCompartment: args.forceKeepLastCompartment,
 	});
 	return { db, runner };
 }
@@ -525,6 +536,55 @@ describe("runPiHistorian", () => {
 			);
 		} finally {
 			closeQuietly(db);
+		}
+	});
+
+	it("downgrades forced final keep on token-capped chunks and skips promotion only on the actual final chunk", async () => {
+		const projectPath = resolveProjectIdentity(process.cwd());
+		const longMessages = rawMessages(10).map((message) => ({
+			...message,
+			parts: [
+				{
+					type: "text",
+					text: `${message.parts[0]?.text ?? "message"} alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu alpha beta gamma delta`,
+				},
+			],
+		}));
+		const midLoop = await runHistorianWith({
+			outputs: [twoCompartmentSuccessXml()],
+			providerMessages: longMessages,
+			boundarySnapshot: makeBoundarySnapshot({
+				protectedTailStart: 7,
+				protectedTailStartMessageId: "m7",
+				eligibleEndOrdinal: 7,
+				eligibleEndMessageId: "m6",
+			}),
+			historianChunkTokens: 100,
+			forceKeepLastCompartment: true,
+		});
+		try {
+			expect(getCompartments(midLoop.db, "ses-historian")).toHaveLength(1);
+			expect(getCompartments(midLoop.db, "ses-historian")[0]?.endMessage).toBe(
+				2,
+			);
+			expect(
+				getMemoriesByProject(midLoop.db, projectPath).map(
+					(memory) => memory.content,
+				),
+			).toContain("Pi mid-loop wrapup facts must promote.");
+		} finally {
+			closeQuietly(midLoop.db);
+		}
+
+		const finalChunk = await runHistorianWith({
+			outputs: [successXml("Pi final wrapup facts stay deferred.")],
+			forceKeepLastCompartment: true,
+		});
+		try {
+			expect(getCompartments(finalChunk.db, "ses-historian")).toHaveLength(1);
+			expect(getMemoriesByProject(finalChunk.db, projectPath)).toEqual([]);
+		} finally {
+			closeQuietly(finalChunk.db);
 		}
 	});
 

@@ -45,6 +45,7 @@ export interface WrapupOptions {
 }
 
 const WAIT_FOR_LEASE_MS = 1_000;
+type WrapupProgressUpdate = Parameters<typeof updateWrapupInProgress>[3];
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -125,7 +126,7 @@ async function waitForExistingIncrementalRun(sessionId: string): Promise<"ok" | 
 async function acquireCompartmentLeaseForWrapup(
     ctx: ManagedWrapupContext,
     sessionId: string,
-    wrapupHolderId: string,
+    renewWrapupMarker: (updates: WrapupProgressUpdate) => boolean,
 ): Promise<string | null> {
     const holderId = crypto.randomUUID();
     for (;;) {
@@ -143,7 +144,7 @@ async function acquireCompartmentLeaseForWrapup(
         const lease = acquireCompartmentLease(ctx.db, sessionId, holderId);
         if (lease) return holderId;
         emitWrapupProgress(ctx, sessionId, { note: "Waiting for the compartment-state lease…" });
-        updateWrapupInProgress(ctx.db, sessionId, wrapupHolderId, {});
+        if (!renewWrapupMarker({})) return null;
         await sleep(WAIT_FOR_LEASE_MS);
     }
 }
@@ -154,11 +155,14 @@ async function runOneWrapupIteration(args: {
     plan: WrapupBoundaryPlan;
     messagesToKeep: number;
     anchorRawMessageCount: number;
-    wrapupHolderId: string;
-    finalChunk: boolean;
+    renewWrapupMarker: (updates: WrapupProgressUpdate) => boolean;
 }): Promise<boolean> {
-    const { ctx, sessionId, plan, messagesToKeep, anchorRawMessageCount, wrapupHolderId } = args;
-    const leaseHolderId = await acquireCompartmentLeaseForWrapup(ctx, sessionId, wrapupHolderId);
+    const { ctx, sessionId, plan, messagesToKeep, anchorRawMessageCount } = args;
+    const leaseHolderId = await acquireCompartmentLeaseForWrapup(
+        ctx,
+        sessionId,
+        args.renewWrapupMarker,
+    );
     if (!leaseHolderId) return false;
     const renewal = setInterval(() => {
         if (!renewCompartmentLease(ctx.db, sessionId, leaseHolderId)) {
@@ -186,7 +190,9 @@ async function runOneWrapupIteration(args: {
         preserveInjectionCacheUntilConsumed: true,
         compartmentLeaseHolderId: leaseHolderId,
         forceDrainQuota: true,
-        forceKeepLastCompartment: args.finalChunk,
+        // Wrapup wants coverage on the actual final chunk. The runner downgrades
+        // this hint whenever readSessionChunk reports more raw history remains.
+        forceKeepLastCompartment: true,
         refreshBoundarySnapshot: () =>
             buildPlan(ctx, sessionId, messagesToKeep, anchorRawMessageCount).snapshot,
         onCompartmentStatePublished: (sid) => {
@@ -255,22 +261,29 @@ export async function runManagedWrapup(
         return `## Magic Wrapup — Skipped\n\n${message}`;
     }
 
-    const activeAtStart = await waitForExistingIncrementalRun(sessionId);
-    if (activeAtStart === "busy") {
-        const message = "Another Magic Context rebuild is already running for this session.";
-        releaseWrapupInProgress(ctx.db, sessionId, wrapupHolderId);
-        setRecompTerminal(ctx.liveSessionState, sessionId, "skipped", message);
-        return `## Magic Wrapup — Skipped\n\n${message}`;
-    }
-
     const startLastEnd = getLastCompartmentEndMessage(ctx.db, sessionId);
     const startCompartmentCount = getCompartments(ctx.db, sessionId).length;
     let chunkIndex = 0;
     let lastEnd = startLastEnd;
     let stoppedForFailure = false;
     let stoppedReason = "";
+    let ownershipLost = false;
+    const ownershipLostReason = "another process took over this session's wrapup.";
+    const markOwnershipLost = (): void => {
+        if (ownershipLost) return;
+        ownershipLost = true;
+        sessionLog(sessionId, "wrapup: durable marker ownership lost; aborting loop");
+    };
+    const renewWrapupMarker = (updates: WrapupProgressUpdate): boolean => {
+        const updated = updateWrapupInProgress(ctx.db, sessionId, wrapupHolderId, updates);
+        if (!updated) {
+            markOwnershipLost();
+            return false;
+        }
+        return true;
+    };
     const markerRenewal = setInterval(() => {
-        updateWrapupInProgress(ctx.db, sessionId, wrapupHolderId, {
+        renewWrapupMarker({
             lastCompartmentEnd: getLastCompartmentEndMessage(ctx.db, sessionId),
             chunkIndex,
         });
@@ -278,79 +291,115 @@ export async function runManagedWrapup(
     (markerRenewal as { unref?: () => void }).unref?.();
 
     try {
-        emitWrapupProgress(ctx, sessionId, {
-            processedMessages: Math.max(0, lastEnd),
-            totalMessages: Math.max(0, initialPlan.targetEligibleEndOrdinal - 1),
-            passCount: 0,
-            compartmentsCreated: 0,
-            note: `Eligible ${plural(initialPlan.snapshot.trueRawEligibleTokens, "token")} across about ${plural(expectedChunks, "chunk")}.`,
-        });
+        const activeAtStart = await waitForExistingIncrementalRun(sessionId);
+        if (activeAtStart === "busy") {
+            const message = "Another Magic Context rebuild is already running for this session.";
+            setRecompTerminal(ctx.liveSessionState, sessionId, "skipped", message);
+            return `## Magic Wrapup — Skipped\n\n${message}`;
+        }
 
-        for (;;) {
-            const plan = buildPlan(
-                ctx,
-                sessionId,
-                messagesToKeep,
-                initialPlan.anchorRawMessageCount,
-            );
-            lastEnd = getLastCompartmentEndMessage(ctx.db, sessionId);
-            if (lastEnd + 1 >= plan.targetEligibleEndOrdinal) break;
-
-            chunkIndex += 1;
+        if (ownershipLost) {
+            stoppedForFailure = true;
+            stoppedReason = ownershipLostReason;
+        } else {
             emitWrapupProgress(ctx, sessionId, {
                 processedMessages: Math.max(0, lastEnd),
-                totalMessages: Math.max(0, plan.targetEligibleEndOrdinal - 1),
-                passCount: chunkIndex - 1,
-                compartmentsCreated: Math.max(
-                    0,
-                    getCompartments(ctx.db, sessionId).length - startCompartmentCount,
-                ),
-                note: `Chunk ${chunkIndex}/${expectedChunks}: messages ${plan.snapshot.offset}-${plan.snapshot.eligibleEndOrdinal - 1}…`,
-            });
-            updateWrapupInProgress(ctx.db, sessionId, wrapupHolderId, {
-                lastCompartmentEnd: lastEnd,
-                chunkIndex,
-                expectedChunks,
-                targetEligibleEndOrdinal: plan.targetEligibleEndOrdinal,
+                totalMessages: Math.max(0, initialPlan.targetEligibleEndOrdinal - 1),
+                passCount: 0,
+                compartmentsCreated: 0,
+                note: `Eligible ${plural(initialPlan.snapshot.trueRawEligibleTokens, "token")} across about ${plural(expectedChunks, "chunk")}.`,
             });
 
-            const beforeEnd = lastEnd;
-            const beforeFailures = getHistorianFailureState(ctx.db, sessionId).failureCount;
-            const ran = await runOneWrapupIteration({
-                ctx,
-                sessionId,
-                plan,
-                messagesToKeep,
-                anchorRawMessageCount: initialPlan.anchorRawMessageCount,
-                wrapupHolderId,
-                finalChunk: plan.finalChunk,
-            });
-            if (!ran) {
-                stoppedForFailure = true;
-                stoppedReason = "Another Magic Context rebuild started while wrapup was waiting.";
-                break;
+            for (;;) {
+                if (ownershipLost) {
+                    stoppedForFailure = true;
+                    stoppedReason = ownershipLostReason;
+                    break;
+                }
+                if (
+                    !renewWrapupMarker({
+                        lastCompartmentEnd: getLastCompartmentEndMessage(ctx.db, sessionId),
+                        chunkIndex,
+                        expectedChunks,
+                    })
+                ) {
+                    stoppedForFailure = true;
+                    stoppedReason = ownershipLostReason;
+                    break;
+                }
+
+                const plan = buildPlan(
+                    ctx,
+                    sessionId,
+                    messagesToKeep,
+                    initialPlan.anchorRawMessageCount,
+                );
+                lastEnd = getLastCompartmentEndMessage(ctx.db, sessionId);
+                if (lastEnd + 1 >= plan.targetEligibleEndOrdinal) break;
+
+                chunkIndex += 1;
+                emitWrapupProgress(ctx, sessionId, {
+                    processedMessages: Math.max(0, lastEnd),
+                    totalMessages: Math.max(0, plan.targetEligibleEndOrdinal - 1),
+                    passCount: chunkIndex - 1,
+                    compartmentsCreated: Math.max(
+                        0,
+                        getCompartments(ctx.db, sessionId).length - startCompartmentCount,
+                    ),
+                    note: `Chunk ${chunkIndex}/${expectedChunks}: messages ${plan.snapshot.offset}-${plan.snapshot.eligibleEndOrdinal - 1}…`,
+                });
+                if (
+                    !renewWrapupMarker({
+                        lastCompartmentEnd: lastEnd,
+                        chunkIndex,
+                        expectedChunks,
+                        targetEligibleEndOrdinal: plan.targetEligibleEndOrdinal,
+                    })
+                ) {
+                    stoppedForFailure = true;
+                    stoppedReason = ownershipLostReason;
+                    break;
+                }
+
+                const beforeEnd = lastEnd;
+                const beforeFailures = getHistorianFailureState(ctx.db, sessionId).failureCount;
+                const ran = await runOneWrapupIteration({
+                    ctx,
+                    sessionId,
+                    plan,
+                    messagesToKeep,
+                    anchorRawMessageCount: initialPlan.anchorRawMessageCount,
+                    renewWrapupMarker,
+                });
+                if (!ran) {
+                    stoppedForFailure = true;
+                    stoppedReason = ownershipLost
+                        ? ownershipLostReason
+                        : "Another Magic Context rebuild started while wrapup was waiting.";
+                    break;
+                }
+                const afterEnd = getLastCompartmentEndMessage(ctx.db, sessionId);
+                const afterFailures = getHistorianFailureState(ctx.db, sessionId).failureCount;
+                if (afterEnd <= beforeEnd) {
+                    stoppedForFailure = true;
+                    stoppedReason =
+                        afterFailures > beforeFailures
+                            ? "The historian failed on the current chunk."
+                            : "The historian made no forward progress on the current chunk.";
+                    break;
+                }
+                lastEnd = afterEnd;
+                emitWrapupProgress(ctx, sessionId, {
+                    processedMessages: Math.max(0, lastEnd),
+                    totalMessages: Math.max(0, plan.targetEligibleEndOrdinal - 1),
+                    passCount: chunkIndex,
+                    compartmentsCreated: Math.max(
+                        0,
+                        getCompartments(ctx.db, sessionId).length - startCompartmentCount,
+                    ),
+                    note: `Wrapped through message ${lastEnd}.`,
+                });
             }
-            const afterEnd = getLastCompartmentEndMessage(ctx.db, sessionId);
-            const afterFailures = getHistorianFailureState(ctx.db, sessionId).failureCount;
-            if (afterEnd <= beforeEnd) {
-                stoppedForFailure = true;
-                stoppedReason =
-                    afterFailures > beforeFailures
-                        ? "The historian failed on the current chunk."
-                        : "The historian made no forward progress on the current chunk.";
-                break;
-            }
-            lastEnd = afterEnd;
-            emitWrapupProgress(ctx, sessionId, {
-                processedMessages: Math.max(0, lastEnd),
-                totalMessages: Math.max(0, plan.targetEligibleEndOrdinal - 1),
-                passCount: chunkIndex,
-                compartmentsCreated: Math.max(
-                    0,
-                    getCompartments(ctx.db, sessionId).length - startCompartmentCount,
-                ),
-                note: `Wrapped through message ${lastEnd}.`,
-            });
         }
     } finally {
         clearInterval(markerRenewal);

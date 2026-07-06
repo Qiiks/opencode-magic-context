@@ -8,9 +8,17 @@ import {
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
-import { setPendingPiCompactionMarkerState } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	getPendingPiCompactionMarkerState,
+	getWrapupInProgressState,
+	setPendingPiCompactionMarkerState,
+} from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import {
+	consumeDeferredHistoryRefresh,
+	consumeDeferredMaterialization,
+} from "../context-handler";
 import {
 	parseWrapupArgs,
 	type RegisterCtxWrapupDeps,
@@ -93,7 +101,7 @@ function deps(
 		historianChunkTokens: 10,
 		memoryEnabled: false,
 		autoPromote: false,
-		runPiHistorianForWrapup: mock(async () => {
+		runPiHistorianForWrapup: mock(async (args) => {
 			const sessionId = args.sessionId;
 			const start = getLastCompartmentEndMessage(db, sessionId) + 1;
 			const end = Math.min(
@@ -101,6 +109,7 @@ function deps(
 				start + 2,
 			);
 			appendRange(db, sessionId, start, end);
+			args.onPublished?.();
 		}),
 		...overrides,
 	};
@@ -142,6 +151,76 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 
+	it("signals deferred history and materialization after a wrapup publish", async () => {
+		const db = createDb();
+		try {
+			const sessionId = "pi-wrapup-signals";
+			const result = await runPiWrapup(
+				pi().api,
+				deps(db, {
+					runPiHistorianForWrapup: mock(async (args) => {
+						appendRange(db, sessionId, 1, 3);
+						args.onPublished?.();
+					}),
+				}),
+				ctx(sessionId, 8),
+				sessionId,
+				2,
+			);
+
+			expect(result).toContain("## Magic Wrapup");
+			expect(consumeDeferredHistoryRefresh(sessionId)).toBe(true);
+			expect(consumeDeferredMaterialization(sessionId)).toBe(true);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("aborts when wrapup marker ownership is lost and leaves the foreign marker", async () => {
+		const db = createDb();
+		try {
+			const sessionId = "pi-ownership-lost";
+			let calls = 0;
+			const result = await runPiWrapup(
+				pi().api,
+				deps(db, {
+					runPiHistorianForWrapup: mock(async (args) => {
+						calls += 1;
+						appendRange(db, sessionId, 1, 3);
+						args.onPublished?.();
+						const state = getWrapupInProgressState(db, sessionId);
+						expect(state).not.toBeNull();
+						db.prepare(
+							"UPDATE session_meta SET wrapup_in_progress_state = ? WHERE session_id = ?",
+						).run(
+							JSON.stringify({
+								...state,
+								holderId: "foreign-holder",
+								updatedAt: Date.now(),
+								expiresAt: Date.now() + 60_000,
+							}),
+							sessionId,
+						);
+					}),
+				}),
+				ctx(sessionId, 10),
+				sessionId,
+				2,
+			);
+
+			expect(result).toContain("## Magic Wrapup — Partial");
+			expect(result).toContain(
+				"another process took over this session's wrapup",
+			);
+			expect(calls).toBe(1);
+			expect(getWrapupInProgressState(db, sessionId)?.holderId).toBe(
+				"foreign-holder",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("stops when the pending Pi marker cannot be drained after a chunk", async () => {
 		const db = createDb();
 		try {
@@ -149,7 +228,7 @@ describe("Pi /ctx-wrapup", () => {
 			const result = await runPiWrapup(
 				pi().api,
 				deps(db, {
-					runPiHistorianForWrapup: mock(async () => {
+					runPiHistorianForWrapup: mock(async (args) => {
 						appendRange(db, sessionId, 1, 3);
 						setPendingPiCompactionMarkerState(db, sessionId, {
 							firstKeptEntryId: "m-4",
@@ -159,6 +238,7 @@ describe("Pi /ctx-wrapup", () => {
 							summary: "pending marker",
 							publishedAt: Date.now(),
 						});
+						args.onPublished?.();
 					}),
 				}),
 				ctx(sessionId, 8),
@@ -172,6 +252,11 @@ describe("Pi /ctx-wrapup", () => {
 			);
 			expect(result).toContain("appendCompaction unavailable");
 			expect(getLastCompartmentEndMessage(db, sessionId)).toBe(3);
+			expect(getPendingPiCompactionMarkerState(db, sessionId)).toEqual(
+				expect.objectContaining({ ordinal: 3, endMessageId: "m-3" }),
+			);
+			expect(consumeDeferredHistoryRefresh(sessionId)).toBe(true);
+			expect(consumeDeferredMaterialization(sessionId)).toBe(true);
 		} finally {
 			closeQuietly(db);
 		}

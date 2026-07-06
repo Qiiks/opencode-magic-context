@@ -7,7 +7,10 @@ import {
     runMemoryMigration,
 } from "../../features/magic-context/memory/memory-migration";
 import { resolveProjectIdentity } from "../../features/magic-context/project-identity";
-import { clearEmergencyRecovery } from "../../features/magic-context/storage-meta-persisted";
+import {
+    clearEmergencyRecovery,
+    isWrapupInProgress,
+} from "../../features/magic-context/storage-meta-persisted";
 import type { PluginContext } from "../../plugin/types";
 import type { Database } from "../../shared/sqlite";
 import {
@@ -344,6 +347,12 @@ export async function runManagedUpgrade(
     ctx: ManagedRecompContext,
     sessionId: string,
 ): Promise<string> {
+    if (isWrapupInProgress(ctx.db, sessionId)) {
+        const message =
+            "/ctx-wrapup is already compacting this session. Wait for it to finish, then try `/ctx-session-upgrade` again.";
+        setRecompTerminal(ctx.liveSessionState, sessionId, "skipped", message);
+        return `## Session Upgrade — Skipped\n\n${message}`;
+    }
     // Immediate sidebar feedback before any async work (see setRecompStarting).
     setRecompStarting(ctx.liveSessionState, sessionId, "Starting upgrade…", "upgrade");
     try {

@@ -4,9 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
-import { markMemoryMigrationDone } from "../../features/magic-context/memory/memory-migration";
+import {
+    isMemoryMigrationDone,
+    markMemoryMigrationDone,
+} from "../../features/magic-context/memory/memory-migration";
 import { resolveProjectIdentity } from "../../features/magic-context/project-identity";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage-db";
+import { acquireWrapupInProgress } from "../../features/magic-context/storage-meta-persisted";
 import type { LiveSessionState } from "./live-session-state";
 import {
     contextualizeUpgradeReason,
@@ -66,6 +70,33 @@ function makeCtx(
         ...overrides,
     } as ManagedRecompContext;
 }
+
+describe("runManagedUpgrade — wrapup guard", () => {
+    it("skips before migration-only upgrade work while wrapup is active", async () => {
+        useTempDataHome("recomp-orch-wrapup-guard-");
+        const db = openDatabase();
+        const dir = "/tmp/recomp-orch-wrapup-guard";
+        const sessionId = "ses-wrapup-upgrade";
+        const project = resolveProjectIdentity(dir);
+        const acquired = acquireWrapupInProgress(db, sessionId, {
+            holderId: "wrapup-holder",
+            messagesToKeep: 2,
+            anchorRawMessageCount: 10,
+            targetEligibleEndOrdinal: 8,
+            lastCompartmentEnd: 0,
+            chunkIndex: 1,
+            expectedChunks: 2,
+        });
+        expect(acquired.ok).toBe(true);
+
+        const ctx = makeCtx(db, dir);
+        const message = await runManagedUpgrade(ctx, sessionId);
+
+        expect(message).toContain("## Session Upgrade — Skipped");
+        expect(message).toContain("/ctx-wrapup is already compacting");
+        expect(isMemoryMigrationDone(db, project)).toBe(false);
+    });
+});
 
 describe("runManagedUpgrade — already-upgraded guard", () => {
     it("is a no-op when there are no legacy compartments and migration is done", async () => {
