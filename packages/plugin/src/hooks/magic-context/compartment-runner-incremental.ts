@@ -562,13 +562,21 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // above); using it directly made promotion + embedding silently no-op.
         const promotionDirectory = sessionDirectory || deps.directory;
 
+        // Unanchored promotion (facts/observations/primers) is skipped in two
+        // distinct weak-boundary cases:
+        //  - discard-last: the provisional tail compartment was dropped, and facts
+        //    are unanchored so persisted-range facts cannot be separated from
+        //    discarded-tail facts; a reworded re-emission next run would double up.
+        //  - forced final keep: a wrapup's actual final chunk persists its
+        //    weak-lookahead tail for coverage, but nothing durable is extracted
+        //    from a boundary the discard-last heuristic would have distrusted.
         // A wrapup caller may request final weak-lookahead preservation, but the
         // runner is authoritative: a token-capped chunk (`chunk.hasMore`) still has
         // more raw history after it, so it must use normal discard-last healing and
-        // promotion. Only the actual final chunk keeps its weak-lookahead tail and
-        // skips unanchored promotion.
+        // promotion.
+        const discardedLast = persistedCompartments.length < emittedCompartments.length;
         const weakLookaheadFinalCompartment = forceKeepLastCompartmentForChunk;
-        const skipUnanchoredPromotion = weakLookaheadFinalCompartment;
+        const skipUnanchoredPromotion = discardedLast || weakLookaheadFinalCompartment;
 
         // Issue #44: gate promotion behind both `memory.enabled` and
         // `memory.auto_promote`. Without this, historian unconditionally

@@ -911,7 +911,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// skips unanchored promotion.
 			const discardedLast = newCompartments.length < emittedCompartments.length;
 			const weakLookaheadFinalCompartment = forceKeepLastCompartmentForChunk;
-			const skipUnanchoredPromotion = weakLookaheadFinalCompartment;
+			// discard-last runs must also skip unanchored promotion: facts cannot be
+			// attributed to the persisted range, and a reworded re-emission next run
+			// would double-store.
+			const skipUnanchoredPromotion = discardedLast || weakLookaheadFinalCompartment;
 
 			// Two distinct gates (parity with OpenCode): embeddingActive = memory
 			// feature on (drives registration + embedding, the ctx_search / dreamer

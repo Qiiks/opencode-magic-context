@@ -207,7 +207,7 @@ describe("runCompartmentAgent wrapup controls", () => {
         }
     });
 
-    it("downgrades forced final keep on token-capped chunks so discard-last and promotion still run", async () => {
+    it("downgrades forced final keep on token-capped chunks so discard-last healing still applies", async () => {
         const db = createDb();
         const sessionId = "ses-force-mid-loop-has-more";
         const project = resolveProjectIdentity("/tmp/wrapup-runner");
@@ -239,11 +239,15 @@ describe("runCompartmentAgent wrapup controls", () => {
                 });
             });
 
+            // The downgrade proof is the HEALING, not promotion: an un-downgraded
+            // forced keep would persist BOTH compartments; the token-capped chunk
+            // instead drops the provisional tail (discard-last), and the discarded
+            // range re-reads next iteration. Promotion is skipped on discard-last
+            // runs by long-standing design (unanchored facts would double-store on
+            // the re-read), so no memories may appear here.
             expect(getCompartments(db, sessionId)).toHaveLength(1);
             expect(getCompartments(db, sessionId)[0]?.endMessage).toBe(2);
-            expect(getMemoriesByProject(db, project).map((memory) => memory.content)).toContain(
-                "Mid-loop wrapup facts must promote.",
-            );
+            expect(getMemoriesByProject(db, project)).toHaveLength(0);
         } finally {
             closeQuietly(db);
         }

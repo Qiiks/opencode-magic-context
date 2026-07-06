@@ -539,7 +539,7 @@ describe("runPiHistorian", () => {
 		}
 	});
 
-	it("downgrades forced final keep on token-capped chunks and skips promotion only on the actual final chunk", async () => {
+	it("downgrades forced final keep on token-capped chunks so discard-last healing still applies", async () => {
 		const projectPath = resolveProjectIdentity(process.cwd());
 		const longMessages = rawMessages(10).map((message) => ({
 			...message,
@@ -563,15 +563,16 @@ describe("runPiHistorian", () => {
 			forceKeepLastCompartment: true,
 		});
 		try {
+			// The downgrade proof is the HEALING: an un-downgraded forced keep
+			// would persist both compartments. The token-capped chunk instead
+			// drops the provisional tail, and discard-last runs skip unanchored
+			// promotion by long-standing design (the discarded range re-reads
+			// next iteration; reworded facts would double-store).
 			expect(getCompartments(midLoop.db, "ses-historian")).toHaveLength(1);
 			expect(getCompartments(midLoop.db, "ses-historian")[0]?.endMessage).toBe(
 				2,
 			);
-			expect(
-				getMemoriesByProject(midLoop.db, projectPath).map(
-					(memory) => memory.content,
-				),
-			).toContain("Pi mid-loop wrapup facts must promote.");
+			expect(getMemoriesByProject(midLoop.db, projectPath)).toEqual([]);
 		} finally {
 			closeQuietly(midLoop.db);
 		}
