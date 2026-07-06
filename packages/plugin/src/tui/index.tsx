@@ -797,6 +797,15 @@ const tui: TuiPlugin = async (api, _options, meta) => {
         if (action === "show-embed-dialog") {
             return stillActive() && (await showEmbedDialog(api, requestedSessionId))
         }
+        if (action === "wrapup-progress-kick") {
+            // /ctx-wrapup blocks its command turn and fires no message events, so
+            // the sidebar poll would never notice the run. Kick the fast progress
+            // poll (same loop the recomp dialog kicks). The start toast arrives
+            // separately via the ignored-message notification path.
+            if (!stillActive()) return false
+            kickRecompProgressRefresh()
+            return true
+        }
         if (action === "show-flush-dialog") {
             const flushMsg = String(n.payload?.message ?? "Flushed.")
             return stillActive() && showResultDialog(api, "Flush", flushMsg)
