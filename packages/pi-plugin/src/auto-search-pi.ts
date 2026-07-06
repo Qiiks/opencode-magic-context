@@ -400,19 +400,20 @@ export async function runAutoSearchHintForPi(args: {
 			AUTO_SEARCH_TIMEOUT_MS,
 		);
 	} catch (error) {
+		// Retryable failure — do not persist a permanent no-hint decision, or the
+		// same user message would be suppressed even though a later pass may succeed.
 		log(
-			`[auto-search] unified search failed for session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+			`[auto-search] unified search failed for session ${sessionId} (will retry next pass): ${error instanceof Error ? error.message : String(error)}`,
 		);
-		writeNoHintAndReconcile("error");
 		return messages;
 	}
 
 	if (results === null) {
+		// Timeout is also retryable, matching OpenCode's auto-search runner.
 		sessionLog(
 			sessionId,
-			`auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn`,
+			`auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn (will retry)`,
 		);
-		writeNoHintAndReconcile("timeout");
 		return messages;
 	}
 

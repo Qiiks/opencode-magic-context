@@ -2198,7 +2198,7 @@ export function clearDeferredExecutePendingIfMatches(
 /**
  * List all sessions with a deferred marker still pending. Used at hook init
  * to re-seed `deferredHistoryRefreshSessions` and
- * `pendingMaterializationSessions` after a plugin restart — without this,
+ * `deferredMaterializationSessions` after a plugin restart — without this,
  * a publish that ran before a crash would lose its deferred-history signal
  * and the next transform pass would not consume the marker.
  *

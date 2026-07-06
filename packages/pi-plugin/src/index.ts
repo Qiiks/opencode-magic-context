@@ -108,6 +108,7 @@ import {
 	recordPiLiveModel,
 	registerPiContextHandler,
 	signalPiDeferredHistoryRefresh,
+	signalPiDeferredMaterialization,
 	signalPiHistoryRefresh,
 	signalPiPendingMaterialization,
 	signalPiSystemPromptRefresh,
@@ -533,7 +534,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
 		for (const sid of pendingPiMarkerSessions) {
 			signalPiDeferredHistoryRefresh(sid);
-			signalPiPendingMaterialization(sid);
+			signalPiDeferredMaterialization(sid);
 		}
 		if (pendingPiMarkerSessions.length > 0) {
 			log(

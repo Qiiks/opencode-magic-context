@@ -53,6 +53,7 @@ import {
 	registerPiContextHandler,
 	resolvePiHistorianTriggerInputs,
 	signalPiDeferredHistoryRefresh,
+	signalPiDeferredMaterialization,
 	signalPiHistoryRefresh,
 	signalPiPendingMaterialization,
 	trackSessionForProject,
@@ -2759,6 +2760,7 @@ describe("registerPiContextHandler", () => {
 			db: ReturnType<typeof createTestDb>;
 			sessionId: string;
 			appendCompaction?: (...args: unknown[]) => string | undefined;
+			contextPercent?: number;
 		}): Promise<void> {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
@@ -2787,6 +2789,13 @@ describe("registerPiContextHandler", () => {
 			if (args.appendCompaction) {
 				ctx.sessionManager.appendCompaction = args.appendCompaction;
 			}
+			if (args.contextPercent !== undefined) {
+				(ctx as { getContextUsage: () => unknown }).getContextUsage = () => ({
+					tokens: args.contextPercent === 0 ? 0 : 90_000,
+					percent: args.contextPercent,
+					contextWindow: 100_000,
+				});
+			}
 			await handler({ messages }, ctx as never);
 		}
 
@@ -2812,6 +2821,120 @@ describe("registerPiContextHandler", () => {
 				expect(appendCompaction).toHaveBeenCalledTimes(1);
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("preserves deferred marker signals on contention fallback, then drains after a covered render", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-contention-retry";
+			const appendCompaction = mock(() => "compact-1");
+			let contention = true;
+			const restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
+				(_state, _db, _messages) => ({
+					injected: true,
+					compartmentCount: 1,
+					factCount: 0,
+					memoryCount: 0,
+					skippedVisibleMessages: 0,
+					m0Materialized: !contention,
+					m0Reason: contention ? "contention" : "test_success",
+					m0Bytes: 2,
+					m1Bytes: 2,
+					contentionExhausted: contention,
+					renderedBoundary: contention
+						? { endMessageId: "entry-1", ordinal: 1 }
+						: { endMessageId: "entry-2", ordinal: 2 },
+					syntheticLeadingCount: 0,
+				}),
+			);
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 90,
+				});
+
+				expect(appendCompaction).not.toHaveBeenCalled();
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(true);
+				expect(consumeDeferredMaterialization(sessionId)).toBe(true);
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+
+				contention = false;
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 90,
+				});
+
+				expect(appendCompaction).toHaveBeenCalledTimes(1);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+				expect(consumeDeferredMaterialization(sessionId)).toBe(false);
+			} finally {
+				restoreInjection();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("defers rehydrated Pi marker signals until the next natural bust", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-rehydrated-deferred";
+			try {
+				seedCompartment(db, sessionId);
+				const appendCompaction = mock(() => "compact-1");
+
+				await runDrainPass({ db, sessionId, appendCompaction });
+
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 0,
+				});
+
+				expect(appendCompaction).not.toHaveBeenCalled();
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 90,
+				});
+
+				expect(appendCompaction).toHaveBeenCalledTimes(1);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 			} finally {
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);

@@ -20,11 +20,13 @@ import {
     closeDatabase,
     getOrCreateSessionMeta,
     openDatabase,
+    setPendingCompactionMarkerState,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import type { Tagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import { createMagicContextHook, type MagicContextDeps } from "./hook";
+import { createLiveSessionState } from "./live-session-state";
 import { closeReadOnlySessionDb } from "./read-session-db";
 
 type PromptMocks = {
@@ -215,6 +217,25 @@ describe("magic-context hook", () => {
         deps.directory = projectDir;
 
         expect(createMagicContextHook(deps)).not.toBeNull();
+    });
+
+    it("rehydrates pending marker sessions into both deferred signal sets", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-marker-rehydrate-");
+        const db = openDatabase();
+        const sessionId = "ses-marker-rehydrate";
+        setPendingCompactionMarkerState(db, sessionId, {
+            endMessageId: "msg-2",
+            ordinal: 2,
+            publishedAt: 1,
+        });
+        const liveSessionState = createLiveSessionState();
+        const deps = createMockDeps();
+        deps.liveSessionState = liveSessionState;
+
+        expect(createMagicContextHook(deps)).not.toBeNull();
+
+        expect(liveSessionState.deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
+        expect(liveSessionState.deferredMaterializationSessions.has(sessionId)).toBe(true);
     });
 
     it("indexes terminal message.updated events asynchronously", async () => {

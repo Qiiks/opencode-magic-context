@@ -366,6 +366,71 @@ describe("runAutoSearchHintForPi", () => {
 		}
 	});
 
+	it("does not persist no-hint decisions for retryable search errors", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+			async () => {
+				throw new Error("temporary search failure");
+			},
+		);
+		try {
+			const messages = [userMessage("explain the historian cache wiring", 1)];
+
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: baseOptions,
+			});
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: baseOptions,
+			});
+
+			expect(spy).toHaveBeenCalledTimes(2);
+			expect(getAutoSearchHintDecisions(db, "ses-auto")).toHaveLength(0);
+			expect(textOf(messages[0])).not.toContain("<ctx-search-hint>");
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("does not persist no-hint decisions for retryable search timeouts", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+			() => new Promise<UnifiedSearchResult[]>(() => undefined),
+		);
+		try {
+			const messages = [userMessage("explain the historian cache wiring", 1)];
+			const started = Date.now();
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: baseOptions,
+			});
+			const elapsed = Date.now() - started;
+
+			expect(elapsed).toBeLessThan(4_000);
+			expect(getAutoSearchHintDecisions(db, "ses-auto")).toHaveLength(0);
+			expect(textOf(messages[0])).not.toContain("<ctx-search-hint>");
+
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: baseOptions,
+			});
+			expect(spy).toHaveBeenCalledTimes(2);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	}, 10_000);
+
 	it("does not double-append an already present cached hint", async () => {
 		const db = createTestDb();
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(

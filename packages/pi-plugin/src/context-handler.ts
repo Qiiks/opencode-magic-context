@@ -84,6 +84,7 @@ import {
 	getAutoSearchHintDecisions,
 	getNoteNudgeAnchors,
 	getOverflowState,
+	type PendingPiCompactionMarker,
 	peekDeferredExecutePending,
 	pruneAutoSearchHintDecisions,
 	pruneNoteNudgeAnchors,
@@ -244,12 +245,20 @@ function applyForwardPressureFloor(
 		: { percentage: trailingPercentage, inputTokens: trailingInputTokens };
 }
 
+let injectM0M1PiForRun = injectM0M1Pi;
+
 export const __test = {
 	FORWARD_PRESSURE_LIMIT_FACTOR,
 	adoptPiFallbackTags,
 	applyForwardPressureFloor,
 	buildEntryFingerprintMap,
 	buildPiToolOwnerMap,
+	setInjectM0M1PiForTests(fn: typeof injectM0M1Pi): () => void {
+		injectM0M1PiForRun = fn;
+		return () => {
+			injectM0M1PiForRun = injectM0M1Pi;
+		};
+	},
 };
 
 /**
@@ -3427,6 +3436,16 @@ interface RunPipelineResult {
 	postCommitEntryIdByRef: ReadonlyMap<object, string>;
 }
 
+function pendingPiMarkerCoveredByRenderedBoundary(
+	pending: PendingPiCompactionMarker,
+	injection: PiInjectionResult | null,
+): boolean {
+	if (!injection || injection.contentionExhausted) return false;
+	const boundary = injection.renderedBoundary;
+	if (pending.endMessageId === boundary.endMessageId) return true;
+	return boundary.ordinal !== null && pending.ordinal <= boundary.ordinal;
+}
+
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let executedWorkThisPass = false;
 	let historyWasConsumedThisPass = false;
@@ -3440,6 +3459,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let emergency = false;
 	let autoReclaimDidMutateThisPass = false;
 	let suppressDeferredHistoryDrain = false;
+	let deferredMaterializationConsumedThisPass = false;
 	let casLost = false;
 	const deferredHistoryWasPendingAtPassStart =
 		deferredHistoryRefreshSessions.has(args.sessionId);
@@ -4055,7 +4075,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (deferredMaterialize && pendingOpsAppliedThisPass) {
 		const fullPassSucceeded = shouldRunHeuristics ? heuristicsExecuted : true;
 		if (fullPassSucceeded) {
-			consumeDeferredMaterialization(args.sessionId);
+			deferredMaterializationConsumedThisPass = consumeDeferredMaterialization(
+				args.sessionId,
+			);
 		}
 	}
 
@@ -4278,7 +4300,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// a HARD trigger. injectM0M1Pi now keeps cached m[0] and soft-refreshes m[1];
 			// HARD triggers (model/system/ttl/epoch/upgrade/mutation) still
 			// re-materialize inside mustMaterializePi when genuinely needed.
-			injectionResult = injectM0M1Pi(
+			injectionResult = injectM0M1PiForRun(
 				{
 					sessionId: args.sessionId,
 					projectIdentity: args.projectIdentity,
@@ -4372,6 +4394,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		(deferredHistoryWasPendingAtPassStart || hasPendingMaterializeSignal) &&
 		!suppressDeferredHistoryDrain &&
 		!casLost;
+	let preserveDeferredMaterializationForMarkerDrain = false;
 	if (deferredHistoryDrainEligible) {
 		try {
 			const pending = getPendingPiCompactionMarkerState(
@@ -4379,7 +4402,26 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.sessionId,
 			);
 			if (!pending) {
-				consumeDeferredHistoryRefresh(args.sessionId);
+				if (injectionResult?.contentionExhausted === true) {
+					suppressDeferredHistoryDrain = true;
+					preserveDeferredMaterializationForMarkerDrain = true;
+					sessionLog(
+						args.sessionId,
+						"Pi deferred-history drain skipped: m[0]/m[1] used a contention fallback; preserving deferred signals",
+					);
+				} else {
+					consumeDeferredHistoryRefresh(args.sessionId);
+				}
+			} else if (
+				!pendingPiMarkerCoveredByRenderedBoundary(pending, injectionResult)
+			) {
+				suppressDeferredHistoryDrain = true;
+				preserveDeferredMaterializationForMarkerDrain = true;
+				const boundary = injectionResult?.renderedBoundary;
+				sessionLog(
+					args.sessionId,
+					`Pi compaction-marker drain skipped: pending ordinal ${pending.ordinal} is newer than rendered boundary ${boundary?.ordinal ?? "<none>"} endMessageId=${boundary?.endMessageId ?? "<none>"}; preserving deferred signals`,
+				);
 			} else if (!args.appendCompaction || !args.readBranchEntries) {
 				suppressDeferredHistoryDrain = true;
 				sessionLog(
@@ -4423,6 +4465,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				`Pi compaction-marker drain failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
+	}
+	if (
+		preserveDeferredMaterializationForMarkerDrain &&
+		deferredMaterializationConsumedThisPass
+	) {
+		signalPiDeferredMaterialization(args.sessionId);
 	}
 
 	if (executedWorkThisPass) {

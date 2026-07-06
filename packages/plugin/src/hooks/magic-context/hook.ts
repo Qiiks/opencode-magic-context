@@ -239,19 +239,22 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         deps.liveSessionState?.historyRefreshSessions ?? new Set<string>();
     const deferredHistoryRefreshSessions =
         deps.liveSessionState?.deferredHistoryRefreshSessions ?? new Set<string>();
+    const systemPromptRefreshSessions =
+        deps.liveSessionState?.systemPromptRefreshSessions ?? new Set<string>();
+    const pendingMaterializationSessions =
+        deps.liveSessionState?.pendingMaterializationSessions ?? new Set<string>();
+    const deferredMaterializationSessions =
+        deps.liveSessionState?.deferredMaterializationSessions ?? new Set<string>();
 
-    // Plan v6 §7: hook-init rehydration of deferred-marker drain state. A
-    // publish that wrote `pending_compaction_marker_state` before the plugin
-    // process exited (crash, restart) must still get its drain pass; seed
-    // `deferredHistoryRefreshSessions` from the persisted pending blobs so the
-    // next consuming transform pass picks them up via
-    // `applyDeferredCompactionMarker`. Idempotent — running twice just re-adds
-    // the same session ids to the Set.
+    // If the process exits after saving pending_compaction_marker_state, reload
+    // both deferred signal sets from that saved state. The next transform pass can
+    // then apply the pending marker exactly like the live publish path would.
     try {
         const sessionsWithPending = getSessionsWithPendingMarker(db);
         if (sessionsWithPending.length > 0) {
             for (const sid of sessionsWithPending) {
                 deferredHistoryRefreshSessions.add(sid);
+                deferredMaterializationSessions.add(sid);
             }
             log(
                 `[magic-context] rehydrated ${sessionsWithPending.length} session(s) with pending compaction-marker drain at hook init`,
@@ -260,13 +263,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     } catch (error) {
         log("[magic-context] hook init: pending-marker rehydration failed:", error);
     }
-
-    const systemPromptRefreshSessions =
-        deps.liveSessionState?.systemPromptRefreshSessions ?? new Set<string>();
-    const pendingMaterializationSessions =
-        deps.liveSessionState?.pendingMaterializationSessions ?? new Set<string>();
-    const deferredMaterializationSessions =
-        deps.liveSessionState?.deferredMaterializationSessions ?? new Set<string>();
     const lastHeuristicsTurnId = new Map<string, string>();
     const commitSeenLastPass = new Map<string, boolean>();
     const variantBySession =

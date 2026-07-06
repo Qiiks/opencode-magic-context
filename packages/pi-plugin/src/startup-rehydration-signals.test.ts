@@ -12,6 +12,7 @@ describe("Pi startup rehydration signal contract", () => {
 			),
 		);
 		expect(block).toContain("signalPiDeferredHistoryRefresh(sid)");
-		expect(block).toContain("signalPiPendingMaterialization(sid)");
+		expect(block).toContain("signalPiDeferredMaterialization(sid)");
+		expect(block).not.toContain("signalPiPendingMaterialization(sid)");
 	});
 });
