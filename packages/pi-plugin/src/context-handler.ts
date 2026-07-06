@@ -3899,28 +3899,30 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// transform.ts:793. Idempotent — `cavemanCompress(originalText, level)`
 	// is deterministic, so replay produces the exact text the original
 	// execute pass produced, regardless of how many times it runs.
-	try {
-		// P0 perf: caveman replay only acts on tags whose tag_number is in
-		// `targets`, so fetch just that slice instead of the whole session
-		// (~50k rows on long sessions).
-		const tags = getTagsByNumbers(args.db, args.sessionId, targetTagNumbers);
-		const replayed = replayCavemanCompression(
-			args.sessionId,
-			args.db,
-			targets,
-			tags,
-		);
-		if (replayed > 0) {
+	if (args.heuristics?.caveman?.enabled) {
+		try {
+			// P0 perf: caveman replay only acts on tags whose tag_number is in
+			// `targets`, so fetch just that slice instead of the whole session
+			// (~50k rows on long sessions).
+			const tags = getTagsByNumbers(args.db, args.sessionId, targetTagNumbers);
+			const replayed = replayCavemanCompression(
+				args.sessionId,
+				args.db,
+				targets,
+				tags,
+			);
+			if (replayed > 0) {
+				sessionLog(
+					args.sessionId,
+					`caveman replay: ${replayed} tags re-compressed from source`,
+				);
+			}
+		} catch (err) {
 			sessionLog(
 				args.sessionId,
-				`caveman replay: ${replayed} tags re-compressed from source`,
+				`caveman replay failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
-	} catch (err) {
-		sessionLog(
-			args.sessionId,
-			`caveman replay failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
-		);
 	}
 
 	// 3d. Cleanup stages NOT applicable to Pi (intentionally omitted):

@@ -63,6 +63,7 @@ describe("createCtxSearchTool", () => {
 						status: "ready",
 						createdAt: Date.now() - 24 * 60 * 60 * 1000,
 						anchorOrdinal: 21,
+						sourceSessionId: "ses-search",
 					},
 				] as UnifiedSearchResult[];
 			},
@@ -87,6 +88,52 @@ describe("createCtxSearchTool", () => {
 			expect(text).toContain("id=#5 status=ready");
 			expect(text).toContain("@msg 21");
 			expect(text).toContain(
+				"Use ctx_expand(start=N-10, end=N) around any note @msg anchor above",
+			);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("omits note anchors and footer hints for foreign-session smart notes", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+			async () =>
+				[
+					{
+						source: "note",
+						content:
+							"Foreign session note should not expose an expandable anchor.",
+						score: 0.72,
+						noteId: 6,
+						status: "ready",
+						createdAt: Date.now(),
+						anchorOrdinal: 22,
+						sourceSessionId: "ses-other",
+					},
+				] as UnifiedSearchResult[],
+		);
+		try {
+			const tool = createCtxSearchTool({
+				db,
+				memoryEnabled: false,
+				embeddingEnabled: false,
+				gitCommitsEnabled: false,
+			});
+
+			const result = await tool.execute(
+				"call-3",
+				{ query: "foreign anchor", sources: ["note"] },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-search") as never,
+			);
+
+			const text = result.content[0]?.text ?? "";
+			expect(text).toContain("id=#6 status=ready");
+			expect(text).not.toContain("@msg 22");
+			expect(text).not.toContain(
 				"Use ctx_expand(start=N-10, end=N) around any note @msg anchor above",
 			);
 		} finally {

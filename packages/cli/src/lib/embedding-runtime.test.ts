@@ -1,13 +1,18 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+    __setEmbeddingRuntimeTestHooks,
     checkLocalEmbeddingRuntime,
     checkLocalEmbeddingRuntimeAt,
     checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
 } from "./embedding-runtime";
+
+afterEach(() => {
+    __setEmbeddingRuntimeTestHooks({});
+});
 
 function makeRoot(): string {
     return mkdtempSync(join(tmpdir(), "mc-embruntime-"));
@@ -71,6 +76,87 @@ describe("checkLocalEmbeddingRuntimeAt", () => {
                 "ppc64",
             );
             expect(status.state).toBe("ok");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("child probe parses JSON load failures without requiring onnxruntime in-process", () => {
+        const root = makeRoot();
+        try {
+            installPackage(root, true);
+            __setEmbeddingRuntimeTestHooks({
+                runOnnxRuntimeNodeLoadProbeChild: () => ({
+                    stdout: JSON.stringify({
+                        ok: false,
+                        reason: "ERR_DLOPEN_FAILED: native binding failed",
+                    }),
+                    stderr: "",
+                    status: 0,
+                    signal: null,
+                }),
+            });
+
+            const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64");
+
+            expect(status.state).toBe("load-failed");
+            if (status.state === "load-failed") {
+                expect(status.reason).toContain("ERR_DLOPEN_FAILED");
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("child probe treats nonzero exits and stderr as load failures", () => {
+        const root = makeRoot();
+        try {
+            installPackage(root, true);
+            __setEmbeddingRuntimeTestHooks({
+                runOnnxRuntimeNodeLoadProbeChild: () => ({
+                    stdout: "",
+                    stderr: "dyld: abort loading onnxruntime_binding.node",
+                    status: 134,
+                    signal: null,
+                }),
+            });
+
+            const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64");
+
+            expect(status.state).toBe("load-failed");
+            if (status.state === "load-failed") {
+                expect(status.reason).toContain("134");
+                expect(status.reason).toContain("dyld: abort");
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("child probe treats timeouts as load failures with captured stderr", () => {
+        const root = makeRoot();
+        try {
+            installPackage(root, true);
+            const timeout = Object.assign(new Error("spawnSync node ETIMEDOUT"), {
+                code: "ETIMEDOUT",
+            });
+            __setEmbeddingRuntimeTestHooks({
+                runOnnxRuntimeNodeLoadProbeChild: () => ({
+                    stdout: "",
+                    stderr: "probe hung while loading native addon",
+                    status: null,
+                    signal: "SIGTERM",
+                    error: timeout,
+                }),
+            });
+
+            const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64");
+
+            expect(status.state).toBe("load-failed");
+            if (status.state === "load-failed") {
+                expect(status.reason).toContain("timed out");
+                expect(status.reason).toContain("probe hung");
+            }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

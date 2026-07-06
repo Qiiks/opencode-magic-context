@@ -358,6 +358,7 @@ describe("unifiedSearch", () => {
             noteId: readyNote.id,
             status: "ready",
             anchorOrdinal: 41,
+            sourceSessionId: "ses-note",
         });
         if (results[0]?.source === "note") {
             expect(results[0].content).toContain("Reason: Release shipped");
@@ -451,14 +452,20 @@ describe("unifiedSearch", () => {
             sources: ["note"],
         });
 
-        const noteIds = results
-            .filter(
-                (result): result is Extract<(typeof results)[number], { source: "note" }> =>
-                    result.source === "note",
-            )
+        const noteResults = results.filter(
+            (result): result is Extract<(typeof results)[number], { source: "note" }> =>
+                result.source === "note",
+        );
+        const noteIds = noteResults
             .map((result) => result.noteId)
             .sort((left, right) => left - right);
         expect(noteIds).toEqual([ownSession.id, sameProjectSmart.id].sort((a, b) => a - b));
+        expect(noteResults.find((result) => result.noteId === ownSession.id)?.sourceSessionId).toBe(
+            "ses-scope",
+        );
+        expect(
+            noteResults.find((result) => result.noteId === sameProjectSmart.id)?.sourceSessionId,
+        ).toBe("ses-foreign");
     });
 
     it("restricts note results to the note source and includes them in broad searches", async () => {

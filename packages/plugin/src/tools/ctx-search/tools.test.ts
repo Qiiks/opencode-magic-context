@@ -163,6 +163,7 @@ describe("createCtxSearchTools", () => {
                         status: "dismissed",
                         createdAt: Date.now() - 2 * 24 * 60 * 60 * 1000,
                         anchorOrdinal: 44,
+                        sourceSessionId: "ses-search",
                     },
                 ] as UnifiedSearchResult[],
         );
@@ -184,6 +185,44 @@ describe("createCtxSearchTools", () => {
             expect(result).toContain("id=#7 status=dismissed");
             expect(result).toContain("@msg 44");
             expect(result).toContain(NOTE_EXPAND_HINT);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("omits note anchors and footer hints for foreign-session smart notes", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+            async () =>
+                [
+                    {
+                        source: "note",
+                        content: "Foreign session note should not expose an expandable anchor.",
+                        score: 0.73,
+                        noteId: 8,
+                        status: "ready",
+                        createdAt: Date.now(),
+                        anchorOrdinal: 45,
+                        sourceSessionId: "ses-other",
+                    },
+                ] as UnifiedSearchResult[],
+        );
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: false,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+
+            const result = await tools.ctx_search.execute(
+                { query: "foreign anchor", sources: ["note"] },
+                toolContext("ses-search"),
+            );
+
+            expect(result).toContain("[1] [note]");
+            expect(result).not.toContain("@msg 45");
+            expect(result).not.toContain(NOTE_EXPAND_HINT);
         } finally {
             spy.mockRestore();
         }

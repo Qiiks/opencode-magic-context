@@ -26,6 +26,7 @@ import {
 	setLastNudgeLevel,
 	setLastNudgeUndropped,
 	setPendingPiCompactionMarkerState,
+	updateCavemanDepth,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
 import { getEmergencyInputSample } from "@magic-context/core/features/magic-context/storage-meta-persisted";
@@ -1717,6 +1718,58 @@ describe("registerPiContextHandler", () => {
 				(tag) => tag.type === "tool" && tag.status === "dropped",
 			).length;
 			expect(freshGrowthDropped).toBeGreaterThan(sameSampleDropped);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("does not replay persisted caveman compression when caveman is disabled", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-caveman-replay-disabled";
+		const originalText =
+			"The assistant should preserve the detailed explanation about queue scheduling because caveman replay is disabled.";
+		try {
+			updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				heuristics: { caveman: { enabled: false, minChars: 1 } },
+				scheduler: { executeThresholdPercentage: 65 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const entryIds = ["entry-user", "entry-assistant"];
+			const buildMessages = () =>
+				[userMessage("start", 1), assistantMessage(originalText, 2)] as never[];
+			const contextFor = (messages: never[]) =>
+				({
+					...fakeContext(sessionId, process.cwd(), entryIds, messages),
+					getContextUsage: () => ({
+						tokens: 1_000,
+						percent: 1,
+						contextWindow: 100_000,
+					}),
+				}) as never;
+
+			let messages = buildMessages();
+			await handler({ messages }, contextFor(messages));
+			const assistantTag = getTagsBySession(db, sessionId)
+				.filter((tag) => tag.type === "message")
+				.sort((left, right) => right.tagNumber - left.tagNumber)[0];
+			if (!assistantTag) throw new Error("expected assistant message tag");
+			updateCavemanDepth(db, sessionId, assistantTag.tagNumber, 1);
+			db.prepare(
+				"INSERT OR REPLACE INTO source_contents (session_id, tag_id, content, created_at, harness) VALUES (?, ?, ?, ?, 'pi')",
+			).run(sessionId, assistantTag.tagNumber, originalText, Date.now());
+
+			messages = buildMessages();
+			const result = await handler({ messages }, contextFor(messages));
+
+			expect(textOf(result.messages[1] as never)).toContain(originalText);
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);

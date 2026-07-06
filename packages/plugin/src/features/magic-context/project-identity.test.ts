@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path, { join } from "node:path";
 import {
+    __clearProjectIdentityResolutionCacheForTests,
     __clearProjectIdentityTransientCooldownForTests,
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
@@ -175,6 +176,55 @@ describe("project identity", () => {
         mkdirSync(subdir, { recursive: true });
 
         expect(resolveProjectIdentity(subdir)).toBe(`git:${rootCommit(repo)}`);
+    });
+
+    it("detects git metadata through symlinked checkout paths", () => {
+        const repo = makeTempDir("project-identity-symlink-repo-");
+        writeFileSync(join(repo, ".git"), "gitdir: .git/worktrees/main\n", "utf8");
+        const subdir = join(repo, "nested", "session");
+        mkdirSync(subdir, { recursive: true });
+        const linkParent = makeTempDir("project-identity-symlink-parent-");
+        const link = join(linkParent, "checkout");
+        try {
+            symlinkSync(subdir, link, "dir");
+        } catch (error) {
+            if ((error as { code?: unknown }).code === "EPERM") return;
+            throw error;
+        }
+        const execMock = mock(() => "abcdef1234567890\n");
+        __setProjectIdentityTestHooks({ execFileSync: execMock as unknown as typeof execFileSync });
+
+        expect(resolveProjectIdentity(link)).toBe("git:abcdef1234567890");
+        expect(execMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("reuses the last successful git identity during transient failures and cooldown", () => {
+        const directory = makeTempDir("project-identity-last-known-");
+        mkdirSync(join(directory, ".git"));
+        let now = 1_000;
+        let mode: "first" | "timeout" | "second" = "first";
+        const execMock = mock(() => {
+            if (mode === "first") return "abcdef1234567890\n";
+            if (mode === "second") return "1234567890abcdef\n";
+            throw makeGitFailure({ code: "ETIMEDOUT" });
+        });
+        __setProjectIdentityTestHooks({
+            execFileSync: execMock as unknown as typeof execFileSync,
+            nowMs: () => now,
+        });
+
+        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
+        __clearProjectIdentityResolutionCacheForTests(directory);
+        mode = "timeout";
+
+        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
+        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
+        expect(execMock).toHaveBeenCalledTimes(2);
+
+        mode = "second";
+        now += 5 * 60 * 1000 + 1;
+        expect(resolveProjectIdentity(directory)).toBe("git:1234567890abcdef");
+        expect(execMock).toHaveBeenCalledTimes(3);
     });
 
     it("classifies dubious ownership and falls back until the cooldown expires", () => {
