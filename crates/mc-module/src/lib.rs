@@ -1667,11 +1667,17 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
             tools: vec![
                 Tool {
                     name: "transform".to_string(),
+                    description: Some(
+                        "Cache-stable context transform: folds compacted history into m0/m1 and applies frozen reductions".to_string(),
+                    ),
                     execution_mode: ExecutionMode::Pure,
                     schema: json!({ "type": "object" }),
                 },
                 Tool {
                     name: "ctx_reduce".to_string(),
+                    description: Some(
+                        "Queue tagged context items for deferred discard on the next cache-busting pass".to_string(),
+                    ),
                     execution_mode: ExecutionMode::Pure,
                     schema: json!({ "type": "object" }),
                 },
