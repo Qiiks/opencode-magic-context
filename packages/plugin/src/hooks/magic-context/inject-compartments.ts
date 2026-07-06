@@ -602,6 +602,7 @@ export interface M0SnapshotMarkers {
     // read), so readCurrentM0SnapshotMarkers takes them as inputs.
     systemHash: string;
     modelKey: string;
+    projectIdentity?: string | null;
 }
 
 /**
@@ -645,6 +646,7 @@ export interface M0M1State {
     cachedM0SystemHash: string | null;
     cachedM0ToolSetHash: string | null;
     cachedM0ModelKey: string | null;
+    cachedM0ProjectIdentity?: string | null;
     snapshotMarkers?: M0SnapshotMarkers | null;
 }
 
@@ -978,6 +980,7 @@ export function readCurrentM0SnapshotMarkers(args: {
         upgradeState: getUpgradeState(args.db, args.sessionId),
         systemHash: hard.systemHash,
         modelKey: hard.modelKey,
+        projectIdentity: args.projectPath ?? null,
     };
 }
 
@@ -1004,6 +1007,7 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         upgradeState: state.cachedM0UpgradeState,
         systemHash: state.cachedM0SystemHash ?? "",
         modelKey: state.cachedM0ModelKey ?? "",
+        projectIdentity: state.cachedM0ProjectIdentity ?? null,
     };
 }
 
@@ -1069,6 +1073,20 @@ export function mustMaterialize(args: {
     }
 
     // ── HARD: genuine m[0] CONTENT change (the rendered baseline bytes differ) ──
+    if (current.projectIdentity !== null) {
+        const cachedProjectIdentity = args.state.cachedM0ProjectIdentity ?? null;
+        if (cachedProjectIdentity === null) {
+            args.state.cachedM0ProjectIdentity = current.projectIdentity;
+            args.db
+                .prepare(
+                    "UPDATE session_meta SET cached_m0_project_identity = ? WHERE session_id = ?",
+                )
+                .run(current.projectIdentity, args.sessionId);
+        } else if (cachedProjectIdentity !== current.projectIdentity) {
+            return { value: true, reason: "project_change" };
+        }
+    }
+
     // Compare the workspace fingerprint whenever EITHER the cached baseline or
     // the current pass is workspaced — keying only on current `isWorkspaced`
     // would miss the workspace→single transition: a cached union m[0] whose
@@ -1474,6 +1492,7 @@ function applyMarkersToState(
     // re-fire the same HARD trigger on the very next pass (double-fold).
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ModelKey = markers.modelKey;
+    state.cachedM0ProjectIdentity = markers.projectIdentity;
     state.snapshotMarkers = markers;
 }
 
@@ -1673,6 +1692,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             // so carry the captured values and exclude them from the stale check.
             systemHash: snapshotMarkers.systemHash,
             modelKey: snapshotMarkers.modelKey,
+            projectIdentity: projectPath ?? null,
         };
         // NOTE: maxMemoryId is deliberately EXCLUDED from this stale-check.
         // Additive memory writes (write/promote) do not invalidate the rendered
@@ -1690,7 +1710,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             current.maxMutationId !== snapshotMarkers.maxMutationId ||
             current.maxMemoryMutationId !== snapshotMarkers.maxMemoryMutationId ||
             current.sessionFactsVersion !== snapshotMarkers.sessionFactsVersion ||
-            current.upgradeState !== snapshotMarkers.upgradeState;
+            current.upgradeState !== snapshotMarkers.upgradeState ||
+            (current.projectIdentity ?? null) !== (snapshotMarkers.projectIdentity ?? null);
         if (stale) {
             options.db.exec("ROLLBACK");
             throw new MaterializeContentionError({ reason: "snapshot changed before Phase 3" });
@@ -1726,6 +1747,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             upgradeState: snapshotMarkers.upgradeState,
             systemHash: snapshotMarkers.systemHash,
             modelKey: snapshotMarkers.modelKey,
+            projectIdentity: snapshotMarkers.projectIdentity,
         });
 
         // v2 path persists the rendered-memory identity itself. `memory_block_ids`
@@ -1987,6 +2009,7 @@ interface CachedM0M1Row {
     cached_m0_upgrade_state: string | null;
     cached_m0_system_hash: string | null;
     cached_m0_model_key: string | null;
+    cached_m0_project_identity: string | null;
     memory_block_ids: string | null;
 }
 
@@ -2032,6 +2055,7 @@ function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | nul
                     cached_m0_upgrade_state,
                     cached_m0_system_hash,
                     cached_m0_model_key,
+                    cached_m0_project_identity,
                     memory_block_ids
                FROM session_meta
               WHERE session_id = ?`,
@@ -2062,6 +2086,7 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         upgradeState: row.cached_m0_upgrade_state,
         systemHash: row.cached_m0_system_hash ?? "",
         modelKey: row.cached_m0_model_key ?? "",
+        projectIdentity: row.cached_m0_project_identity ?? null,
     };
 }
 
@@ -2083,7 +2108,8 @@ function cachedRowMatchesState(row: CachedM0M1Row, state: M0M1State): boolean {
         row.cached_m0_session_facts_version === state.cachedM0SessionFactsVersion &&
         (row.cached_m0_upgrade_state ?? null) === (state.cachedM0UpgradeState ?? null) &&
         (row.cached_m0_system_hash ?? "") === (state.cachedM0SystemHash ?? "") &&
-        (row.cached_m0_model_key ?? "") === (state.cachedM0ModelKey ?? "")
+        (row.cached_m0_model_key ?? "") === (state.cachedM0ModelKey ?? "") &&
+        (row.cached_m0_project_identity ?? null) === (state.cachedM0ProjectIdentity ?? null)
     );
 }
 
@@ -2107,6 +2133,7 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
     state.cachedM0UpgradeState = markers.upgradeState;
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ModelKey = markers.modelKey;
+    state.cachedM0ProjectIdentity = markers.projectIdentity;
     state.snapshotMarkers = markers;
 }
 

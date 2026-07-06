@@ -137,6 +137,7 @@ function insertSessionMeta(
         counter?: number;
         lastNudgeTokens?: number;
         lastResponseTime?: number;
+        isSubagent?: boolean;
     } = {},
 ): void {
     db.prepare(
@@ -149,7 +150,7 @@ function insertSessionMeta(
         opts.lastNudgeTokens ?? 0,
         "",
         "",
-        0,
+        opts.isSubagent ? 1 : 0,
         0,
         0,
         0,
@@ -274,6 +275,35 @@ describe("createMagicContextCommandHandler", () => {
         );
 
         expect(sendNotification).not.toHaveBeenCalled();
+    });
+
+    it("refuses ctx-wrapup in subagent sessions", async () => {
+        insertSessionMeta(db, "ses-sub");
+        db.prepare("UPDATE session_meta SET is_subagent = 1 WHERE session_id = ?").run("ses-sub");
+        const sendNotification = mock(async () => {});
+        const executeWrapup = mock(async () => "should not run");
+        const handler = createMagicContextCommandHandler({
+            db,
+            protectedTags: 3,
+            sendNotification,
+            executeWrapup,
+        });
+
+        await expectSentinel(
+            handler["command.execute.before"](
+                { command: "ctx-wrapup", sessionID: "ses-sub", arguments: "20" },
+                makeOutput(""),
+                {},
+            ),
+            "CTX-WRAPUP",
+        );
+
+        expect(executeWrapup).not.toHaveBeenCalled();
+        expect(sendNotification).toHaveBeenCalledWith(
+            "ses-sub",
+            expect.stringContaining("only available in primary sessions"),
+            {},
+        );
     });
 
     describe("ctx-flush", () => {
