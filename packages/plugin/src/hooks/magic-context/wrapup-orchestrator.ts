@@ -37,6 +37,7 @@ export interface ManagedWrapupContext extends ManagedRecompContext {
     contextLimit: number;
     executeThresholdPercentage: number;
     hasPendingNaturalBust?: (sessionId: string) => boolean;
+    runCompartmentAgentForWrapup?: typeof runCompartmentAgent;
 }
 
 export interface WrapupOptions {
@@ -164,7 +165,8 @@ async function runOneWrapupIteration(args: {
             sessionLog(sessionId, "wrapup: compartment lease renewal failed");
         }
     }, COMPARTMENT_LEASE_RENEWAL_MS);
-    const runnerPromise = runCompartmentAgent({
+    const runCompartmentAgentForWrapup = ctx.runCompartmentAgentForWrapup ?? runCompartmentAgent;
+    const runnerPromise = runCompartmentAgentForWrapup({
         client: ctx.client,
         db: ctx.db,
         sessionId,

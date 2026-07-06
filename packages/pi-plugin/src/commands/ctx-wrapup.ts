@@ -35,7 +35,7 @@ import { readPiSessionMessages } from "../read-session-pi";
 import { updateStatusLine } from "../status-line";
 import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
 
-interface RegisterCtxWrapupDeps {
+export interface RegisterCtxWrapupDeps {
 	db: ContextDatabase;
 	runner: SubagentRunner;
 	historianModel: string | undefined;
@@ -54,6 +54,8 @@ interface RegisterCtxWrapupDeps {
 		default?: number;
 		[modelKey: string]: number | undefined;
 	};
+	runPiHistorianForWrapup?: typeof runPiHistorian;
+	drainPendingPiMarkerForWrapup?: typeof drainPendingPiMarker;
 }
 
 const DEFAULT_MESSAGES_TO_KEEP = 20;
@@ -135,7 +137,7 @@ export function registerCtxWrapupCommand(
 	});
 }
 
-async function runPiWrapup(
+export async function runPiWrapup(
 	pi: ExtensionAPI,
 	deps: RegisterCtxWrapupDeps,
 	ctx: ExtensionCommandContext,
@@ -259,7 +261,8 @@ async function runPiWrapup(
 					renewCompartmentLease(deps.db, sessionId, leaseHolder);
 				}, COMPARTMENT_LEASE_RENEWAL_MS);
 				try {
-					await runPiHistorian({
+					const runHistorian = deps.runPiHistorianForWrapup ?? runPiHistorian;
+					await runHistorian({
 						db: deps.db,
 						sessionId,
 						directory: ctx.cwd,
@@ -315,7 +318,9 @@ async function runPiWrapup(
 					break;
 				}
 				lastEnd = afterEnd;
-				const drained = drainPendingPiMarker(deps.db, sessionId, ctx);
+				const drainMarker =
+					deps.drainPendingPiMarkerForWrapup ?? drainPendingPiMarker;
+				const drained = drainMarker(deps.db, sessionId, ctx);
 				if (!drained.ok) {
 					failure = `Wrapped up through message ${lastEnd}, but Pi's pending compaction marker could not be applied yet (${drained.reason}). Run /ctx-wrapup again after the next context pass.`;
 					break;

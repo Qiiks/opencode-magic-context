@@ -5,6 +5,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
+import { clearSession } from "./storage-meta-session";
 
 function columnNames(db: Database, table: string): string[] {
     return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
@@ -50,6 +51,25 @@ describe("migration v50 — ctx-wrapup durable marker", () => {
                 )
                 .get() as { wrapup_in_progress_state: string | null };
             expect(row.wrapup_in_progress_state).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("clearSession removes the session-scoped wrapup marker with session_meta", () => {
+        const db = new Database(":memory:");
+        try {
+            initializeDatabase(db);
+            runMigrations(db);
+            db.prepare(
+                "INSERT INTO session_meta (session_id, wrapup_in_progress_state) VALUES (?, ?)",
+            ).run("ses-clear", JSON.stringify({ holderId: "h", expiresAt: 999 }));
+
+            clearSession(db, "ses-clear");
+
+            expect(
+                db.prepare("SELECT 1 FROM session_meta WHERE session_id = ?").get("ses-clear"),
+            ).toBeNull();
         } finally {
             closeQuietly(db);
         }
