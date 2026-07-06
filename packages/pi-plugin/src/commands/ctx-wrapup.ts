@@ -17,17 +17,17 @@ import {
 	acquireWrapupInProgress,
 	type ContextDatabase,
 	clearEmergencyRecovery,
-	clearPendingPiCompactionMarkerStateIf,
-	getPendingPiCompactionMarkerState,
 	getWrapupInProgressState,
 	releaseWrapupInProgress,
 	updateWrapupInProgress,
 } from "@magic-context/core/features/magic-context/storage";
 import { resolveExecuteThreshold } from "@magic-context/core/hooks/magic-context/event-resolvers";
-import { resolveWrapupProtectedTailBoundary } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
+import {
+	hasRunnableCompartmentWindow,
+	resolveWrapupProtectedTailBoundary,
+} from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
-import { applyDeferredPiCompactionMarker } from "../compaction-marker-manager-pi";
 import {
 	signalPiDeferredHistoryRefresh,
 	signalPiDeferredMaterialization,
@@ -59,7 +59,6 @@ export interface RegisterCtxWrapupDeps {
 		[modelKey: string]: number | undefined;
 	};
 	runPiHistorianForWrapup?: typeof runPiHistorian;
-	drainPendingPiMarkerForWrapup?: typeof drainPendingPiMarker;
 }
 
 const DEFAULT_MESSAGES_TO_KEEP = 20;
@@ -135,7 +134,10 @@ export function registerCtxWrapupCommand(
 			sendCtxStatusMessage(pi, {
 				title: "/ctx-wrapup",
 				text: result,
-				level: result.includes("Failed") ? "error" : "success",
+				level:
+					result.includes("Failed") || result.includes("Partial")
+						? "error"
+						: "success",
 			});
 		},
 	});
@@ -184,6 +186,9 @@ export async function runPiWrapup(
 		});
 		if (initialPlan.rawMessagesAboveLastCompartment <= messagesToKeep) {
 			return `## Magic Wrapup\n\nNothing to wrap up — only ${initialPlan.rawMessagesAboveLastCompartment} messages above the last compartment.`;
+		}
+		if (!hasRunnableCompartmentWindow(initialPlan.snapshot)) {
+			return `## Magic Wrapup — Partial\n\nNo runnable wrapup boundary is available yet; wrapped up 0 messages into 0 compartments. Run /ctx-wrapup again to continue.`;
 		}
 
 		holderId = crypto.randomUUID();
@@ -243,6 +248,7 @@ export async function runPiWrapup(
 			const startCompartmentCount = getCompartments(deps.db, sessionId).length;
 			let chunkIndex = 0;
 			let lastEnd = startEnd;
+			let targetEligibleEndOrdinal = initialPlan.targetEligibleEndOrdinal;
 			let failure: string | null = null;
 
 			for (;;) {
@@ -276,7 +282,13 @@ export async function runPiWrapup(
 					messagesToKeep,
 					anchorRawMessageCount: initialPlan.anchorRawMessageCount,
 				});
-				if (plan.snapshot.eligibleEndOrdinal <= plan.snapshot.offset) break;
+				targetEligibleEndOrdinal = plan.targetEligibleEndOrdinal;
+				lastEnd = getLastCompartmentEndMessage(deps.db, sessionId);
+				if (lastEnd + 1 >= targetEligibleEndOrdinal) break;
+				if (!hasRunnableCompartmentWindow(plan.snapshot)) {
+					failure = `No runnable wrapup boundary is available yet; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
+					break;
+				}
 
 				chunkIndex += 1;
 				if (
@@ -382,16 +394,12 @@ export async function runPiWrapup(
 					break;
 				}
 				lastEnd = afterEnd;
-				const drainMarker =
-					deps.drainPendingPiMarkerForWrapup ?? drainPendingPiMarker;
-				const drained = drainMarker(deps.db, sessionId, ctx);
-				if (!drained.ok) {
-					failure = `Wrapped up through message ${lastEnd}, but Pi's pending compaction marker could not be applied yet (${drained.reason}). Run /ctx-wrapup again after the next context pass.`;
-					break;
-				}
 			}
 
 			const finalEnd = getLastCompartmentEndMessage(deps.db, sessionId);
+			if (!failure && finalEnd + 1 < targetEligibleEndOrdinal) {
+				failure = `Wrapped up through message ${finalEnd}, but no runnable wrapup boundary remained before target message ${targetEligibleEndOrdinal}. Run /ctx-wrapup again to continue.`;
+			}
 			const finalCompartmentCount = getCompartments(deps.db, sessionId).length;
 			const messagesWrapped = Math.max(0, finalEnd - startEnd);
 			const compartmentsCreated = Math.max(
@@ -468,56 +476,4 @@ function readBranchEntries(ctx: ExtensionCommandContext): unknown[] {
 		| null
 		| undefined;
 	return Array.isArray(branch?.entries) ? branch.entries : [];
-}
-
-function appendCompaction(
-	ctx: ExtensionCommandContext,
-):
-	| ((
-			summary: string,
-			firstKeptEntryId: string,
-			tokensBefore: number,
-			details?: unknown,
-			fromHook?: boolean,
-	  ) => string | undefined)
-	| null {
-	const candidate = (
-		ctx.sessionManager as {
-			appendCompaction?: (
-				summary: string,
-				firstKeptEntryId: string,
-				tokensBefore: number,
-				details?: unknown,
-				fromHook?: boolean,
-			) => string | undefined;
-		}
-	).appendCompaction;
-	return typeof candidate === "function"
-		? candidate.bind(ctx.sessionManager)
-		: null;
-}
-
-function drainPendingPiMarker(
-	db: ContextDatabase,
-	sessionId: string,
-	ctx: ExtensionCommandContext,
-): { ok: true } | { ok: false; reason: string } {
-	const pending = getPendingPiCompactionMarkerState(db, sessionId);
-	if (!pending) return { ok: true };
-	const append = appendCompaction(ctx);
-	if (!append) return { ok: false, reason: "appendCompaction unavailable" };
-	const outcome = applyDeferredPiCompactionMarker(
-		{
-			db,
-			readBranchEntries: () => readBranchEntries(ctx),
-			appendCompaction: append,
-		},
-		sessionId,
-		pending,
-	);
-	if (outcome.kind === "retryable-failure") {
-		return { ok: false, reason: outcome.error.message };
-	}
-	clearPendingPiCompactionMarkerStateIf(db, sessionId, pending);
-	return { ok: true };
 }

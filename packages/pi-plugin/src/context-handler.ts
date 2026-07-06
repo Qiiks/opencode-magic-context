@@ -69,6 +69,7 @@ import {
 	getPendingPiCompactionMarkerState,
 	getTagsByNumbers,
 	hasPiFallbackToolOwnerTags,
+	isWrapupInProgress,
 	setSessionWorkMetrics,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
@@ -2982,6 +2983,17 @@ function maybeFireHistorian(args: {
 
 	if (inFlightHistorian.has(sessionId)) {
 		sessionLog(sessionId, "historian trigger eval: in-flight, skipping");
+		return;
+	}
+
+	if (isWrapupInProgress(db, sessionId)) {
+		// /ctx-wrapup owns compartment-state publication while this marker is live.
+		// The marker has a five-minute TTL renewed by wrapup, so a crashed wrapup
+		// self-expires instead of suppressing trigger-fired historian runs forever.
+		sessionLog(
+			sessionId,
+			"historian trigger eval: /ctx-wrapup active, skipping",
+		);
 		return;
 	}
 

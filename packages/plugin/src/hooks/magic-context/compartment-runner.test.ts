@@ -17,6 +17,7 @@ import {
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
 import {
+    acquireWrapupInProgress,
     closeDatabase,
     getOrCreateSessionMeta,
     getPendingOps,
@@ -966,6 +967,106 @@ describe("runCompartmentAgent", () => {
         } finally {
             releaseCompartmentLease(db, "ses-lease-denied", holderId);
         }
+    });
+
+    it("skips trigger-fired compartment starts while /ctx-wrapup is active", () => {
+        useTempDataHome("compartment-runner-wrapup-active-");
+        const db = openDatabase();
+        const sessionId = "ses-wrapup-active-skip";
+        acquireWrapupInProgress(db, sessionId, {
+            holderId: "wrapup-holder",
+            messagesToKeep: 20,
+            anchorRawMessageCount: 100,
+            targetEligibleEndOrdinal: 80,
+            lastCompartmentEnd: 0,
+            chunkIndex: 0,
+            expectedChunks: 1,
+        });
+        updateSessionMeta(db, sessionId, { compartmentInProgress: true });
+
+        startCompartmentAgent({
+            client: {} as PluginContext["client"],
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        const leaseRow = db
+            .prepare(
+                "SELECT holder_id AS holderId FROM compartment_state_lease WHERE session_id = ?",
+            )
+            .get(sessionId) as { holderId: string } | null;
+        expect(leaseRow).toBeNull();
+        expect(getActiveCompartmentRun(sessionId)).toBeUndefined();
+        expect(getOrCreateSessionMeta(db, sessionId).compartmentInProgress).toBe(false);
+    });
+
+    it("allows trigger-fired compartment starts after an expired /ctx-wrapup marker", async () => {
+        useTempDataHome("compartment-runner-wrapup-expired-");
+        const sessionId = "ses-wrapup-expired-start";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "eligible one" },
+            { id: "m-2", role: "assistant", text: "eligible two" },
+            { id: "m-3", role: "user", text: "protected 1" },
+            { id: "m-4", role: "user", text: "protected 2" },
+            { id: "m-5", role: "user", text: "protected 3" },
+            { id: "m-6", role: "user", text: "protected 4" },
+            { id: "m-7", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        acquireWrapupInProgress(
+            db,
+            sessionId,
+            {
+                holderId: "expired-wrapup-holder",
+                messagesToKeep: 20,
+                anchorRawMessageCount: 100,
+                targetEligibleEndOrdinal: 80,
+                lastCompartmentEnd: 0,
+                chunkIndex: 0,
+                expectedChunks: 1,
+            },
+            Date.now() - 10 * 60_000,
+        );
+        updateSessionMeta(db, sessionId, { compartmentInProgress: true });
+        const createSession = mock(async () => ({ data: { id: "ses-agent-expired" } }));
+        const prompt = mock(async () => ({}));
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/wrapup-expired" } })),
+                create: createSession,
+                prompt,
+                messages: mock(async () => ({
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: '<compartment start="1" end="2" title="Expired marker">Expired marker run.</compartment>',
+                                },
+                            ],
+                        },
+                    ],
+                })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        startCompartmentAgent({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+        const active = getActiveCompartmentRun(sessionId);
+        expect(active).toBeDefined();
+        await active?.promise;
+
+        expect(createSession).toHaveBeenCalledTimes(1);
+        expect(prompt).toHaveBeenCalled();
     });
 
     it("clears compartment-in-progress after successful compartment generation", async () => {

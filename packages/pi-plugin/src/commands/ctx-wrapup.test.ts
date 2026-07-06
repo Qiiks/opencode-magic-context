@@ -9,8 +9,10 @@ import {
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
+	getOverflowState,
 	getPendingPiCompactionMarkerState,
 	getWrapupInProgressState,
+	recordOverflowDetected,
 	setPendingPiCompactionMarkerState,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { Database } from "@magic-context/core/shared/sqlite";
@@ -44,8 +46,8 @@ function branch(count: number) {
 	}));
 }
 
-function ctx(sessionId: string, count = 8) {
-	const entries = branch(count);
+function ctx(sessionId: string, source: number | unknown[] = 8) {
+	const entries = typeof source === "number" ? branch(source) : source;
 	return {
 		cwd: "/tmp/pi-wrapup",
 		model: { provider: "anthropic", id: "claude" },
@@ -56,6 +58,71 @@ function ctx(sessionId: string, count = 8) {
 		getContextUsage: () => ({ contextWindow: 20, tokens: 1, percent: 1 }),
 		ui: { setStatus() {} },
 	} as never;
+}
+
+function fencedToolArcBranch(): unknown[] {
+	return [
+		{
+			id: "m-1",
+			type: "message",
+			timestamp: 1,
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-1",
+						name: "bash",
+						arguments: { cmd: "echo start" },
+					},
+				],
+			},
+		},
+		{
+			id: "m-2",
+			type: "message",
+			timestamp: 2,
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "assistant while tool is pending" }],
+			},
+		},
+		{
+			id: "m-3",
+			type: "message",
+			timestamp: 3,
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "more assistant while pending" }],
+			},
+		},
+		{
+			id: "m-4",
+			type: "message",
+			timestamp: 4,
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "bash",
+				content: [{ type: "text", text: "tool output" }],
+			},
+		},
+		{
+			id: "m-5",
+			type: "message",
+			timestamp: 5,
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "assistant after tool result" }],
+			},
+		},
+		{
+			id: "m-6",
+			type: "message",
+			timestamp: 6,
+			message: { role: "user", content: "protected live tail" },
+		},
+	];
 }
 
 function pi() {
@@ -221,7 +288,7 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 
-	it("stops when the pending Pi marker cannot be drained after a chunk", async () => {
+	it("leaves the pending Pi marker queued until the next consuming context pass", async () => {
 		const db = createDb();
 		try {
 			const sessionId = "pi-marker-pending";
@@ -229,13 +296,18 @@ describe("Pi /ctx-wrapup", () => {
 				pi().api,
 				deps(db, {
 					runPiHistorianForWrapup: mock(async (args) => {
-						appendRange(db, sessionId, 1, 3);
+						const start = getLastCompartmentEndMessage(db, sessionId) + 1;
+						const end = Math.min(
+							args.boundarySnapshot.eligibleEndOrdinal - 1,
+							start + 2,
+						);
+						appendRange(db, sessionId, start, end);
 						setPendingPiCompactionMarkerState(db, sessionId, {
-							firstKeptEntryId: "m-4",
-							endMessageId: "m-3",
-							ordinal: 3,
-							tokensBefore: 123,
-							summary: "pending marker",
+							firstKeptEntryId: `m-${end + 1}`,
+							endMessageId: `m-${end}`,
+							ordinal: end,
+							tokensBefore: 123 + end,
+							summary: `pending marker ${end}`,
 							publishedAt: Date.now(),
 						});
 						args.onPublished?.();
@@ -246,17 +318,37 @@ describe("Pi /ctx-wrapup", () => {
 				2,
 			);
 
-			expect(result).toContain("## Magic Wrapup — Partial");
-			expect(result).toContain(
-				"pending compaction marker could not be applied yet",
-			);
-			expect(result).toContain("appendCompaction unavailable");
-			expect(getLastCompartmentEndMessage(db, sessionId)).toBe(3);
+			expect(result).toContain("## Magic Wrapup");
+			expect(result).not.toContain("## Magic Wrapup — Partial");
+			expect(getLastCompartmentEndMessage(db, sessionId)).toBe(6);
 			expect(getPendingPiCompactionMarkerState(db, sessionId)).toEqual(
-				expect.objectContaining({ ordinal: 3, endMessageId: "m-3" }),
+				expect.objectContaining({ ordinal: 6, endMessageId: "m-6" }),
 			);
 			expect(consumeDeferredHistoryRefresh(sessionId)).toBe(true);
 			expect(consumeDeferredMaterialization(sessionId)).toBe(true);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("reports partial when a fenced boundary has no runnable wrapup window", async () => {
+		const db = createDb();
+		try {
+			const sessionId = "pi-wrapup-fenced-zero-progress";
+			recordOverflowDetected(db, sessionId, 20, "anthropic/claude");
+			const result = await runPiWrapup(
+				pi().api,
+				deps(db),
+				ctx(sessionId, fencedToolArcBranch()),
+				sessionId,
+				3,
+			);
+
+			expect(result).toContain("## Magic Wrapup — Partial");
+			expect(result).toContain("No runnable wrapup boundary");
+			expect(result).toContain("Run /ctx-wrapup again");
+			expect(getLastCompartmentEndMessage(db, sessionId)).toBe(-1);
+			expect(getOverflowState(db, sessionId).needsEmergencyRecovery).toBe(true);
 		} finally {
 			closeQuietly(db);
 		}

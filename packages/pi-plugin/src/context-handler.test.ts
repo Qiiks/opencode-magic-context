@@ -8,6 +8,7 @@ import {
 } from "@magic-context/core/features/magic-context/message-index-async";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
+	acquireWrapupInProgress,
 	addNote,
 	appendNoteNudgeAnchor,
 	getHistorianFailureState,
@@ -1837,6 +1838,149 @@ describe("registerPiContextHandler", () => {
 				getContextUsage: () => ({
 					tokens: 85_000,
 					percent: 10,
+					contextWindow: 100_000,
+				}),
+			} as never);
+			await awaitInFlightHistorians();
+
+			expect(runner.run).toHaveBeenCalledTimes(1);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("skips trigger-fired historian while /ctx-wrapup is active", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-wrapup-active-skip";
+		try {
+			acquireWrapupInProgress(db, sessionId, {
+				holderId: "wrapup-holder",
+				messagesToKeep: 20,
+				anchorRawMessageCount: 100,
+				targetEligibleEndOrdinal: 80,
+				lastCompartmentEnd: 0,
+				chunkIndex: 0,
+				expectedChunks: 1,
+			});
+			const runner = {
+				harness: "pi",
+				run: mock(async () => ({
+					ok: true as const,
+					assistantText:
+						'<compartment start="1" end="2" title="Skipped">Should not run.</compartment>',
+					durationMs: 1,
+				})),
+			} as unknown as SubagentRunner;
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				historian: {
+					runner,
+					model: "test/historian",
+					historianChunkTokens: 20_000,
+					executeThresholdPercentage: 80,
+					protectedTags: 0,
+				},
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const messages = Array.from({ length: 12 }, (_, index) =>
+				index % 2 === 0
+					? userMessage(`user ${index}`, index + 1)
+					: assistantMessage(`assistant ${index}`, index + 1),
+			) as never[];
+
+			await handler({ messages }, {
+				...fakeContext(
+					sessionId,
+					process.cwd(),
+					messages.map((_, index) => `entry-${index + 1}`),
+					messages,
+				),
+				getContextUsage: () => ({
+					tokens: 85_000,
+					percent: 85,
+					contextWindow: 100_000,
+				}),
+			} as never);
+			await awaitInFlightHistorians();
+
+			const leaseRow = db
+				.prepare(
+					"SELECT holder_id AS holderId FROM compartment_state_lease WHERE session_id = ?",
+				)
+				.get(sessionId) as { holderId: string } | null;
+			expect(leaseRow).toBeNull();
+			expect(runner.run).not.toHaveBeenCalled();
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("fires trigger historian after an expired /ctx-wrapup marker", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-wrapup-expired-fire";
+		try {
+			acquireWrapupInProgress(
+				db,
+				sessionId,
+				{
+					holderId: "expired-wrapup-holder",
+					messagesToKeep: 20,
+					anchorRawMessageCount: 100,
+					targetEligibleEndOrdinal: 80,
+					lastCompartmentEnd: 0,
+					chunkIndex: 0,
+					expectedChunks: 1,
+				},
+				Date.now() - 10 * 60_000,
+			);
+			const runner = {
+				harness: "pi",
+				run: mock(async () => ({
+					ok: true as const,
+					assistantText:
+						'<compartment start="1" end="2" title="Expired">Expired wrapup marker no longer blocks.</compartment>',
+					durationMs: 1,
+				})),
+			} as unknown as SubagentRunner;
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				historian: {
+					runner,
+					model: "test/historian",
+					historianChunkTokens: 20_000,
+					executeThresholdPercentage: 80,
+					protectedTags: 0,
+				},
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const messages = Array.from({ length: 12 }, (_, index) =>
+				index % 2 === 0
+					? userMessage(`user ${index}`, index + 1)
+					: assistantMessage(`assistant ${index}`, index + 1),
+			) as never[];
+
+			await handler({ messages }, {
+				...fakeContext(
+					sessionId,
+					process.cwd(),
+					messages.map((_, index) => `entry-${index + 1}`),
+					messages,
+				),
+				getContextUsage: () => ({
+					tokens: 85_000,
+					percent: 85,
 					contextWindow: 100_000,
 				}),
 			} as never);

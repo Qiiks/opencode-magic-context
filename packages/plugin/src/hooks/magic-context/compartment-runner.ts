@@ -109,6 +109,15 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
         return;
     }
 
+    if (isWrapupInProgress(deps.db, deps.sessionId)) {
+        // /ctx-wrapup owns compartment-state publication while this marker is live.
+        // The marker has a five-minute TTL renewed by wrapup, so a crashed wrapup
+        // self-expires instead of suppressing trigger-fired historian runs forever.
+        sessionLog(deps.sessionId, "compartment agent skipped: /ctx-wrapup is active");
+        updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
+        return;
+    }
+
     const holderId = crypto.randomUUID();
     const lease = acquireCompartmentLease(deps.db, deps.sessionId, holderId);
     if (!lease) {
