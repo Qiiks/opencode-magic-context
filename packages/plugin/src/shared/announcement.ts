@@ -24,16 +24,17 @@ import { getMagicContextStorageDir } from "./data-path";
  * Bump only when there are user-visible changes worth a startup dialog.
  * Does NOT need to match the published package version.
  */
-export const ANNOUNCEMENT_VERSION = "0.30.4";
+export const ANNOUNCEMENT_VERSION = "0.31.0";
 
 /**
  * Short, user-facing bullet strings. Keep each line ~80 chars or shorter so the
  * TUI dialog renders cleanly without horizontal scroll on a typical terminal.
  */
 export const ANNOUNCEMENT_FEATURES: ReadonlyArray<string> = [
-    "Pi: fixed historian and dreamer failing when your model comes from a provider extension (Antigravity, Anthropic OAuth, etc.). Subagents now load your extensions.",
-    "Pi: fixed the retrospective and refresh-primers dreamer tasks reading sessions through the wrong API.",
-    "OpenCode: the plugin no longer re-adds its TUI sidebar entry on startup, so removing it from tui.jsonc now sticks.",
+    "New /ctx-wrapup command: compact older history on demand, keeping the newest N messages raw. Run it before switching to a smaller-context model.",
+    "ctx_search now also searches your session notes and smart notes.",
+    "Project identity now survives transient git failures (slow disks, dubious ownership) without splitting your project memory.",
+    "Removed the ctx_reduce_enabled setting; agent-controlled reduction is always on. Caveman text compression is now independent (caveman_text_compression.enabled).",
 ];
 
 /**
