@@ -29,7 +29,11 @@ import {
 	updateCavemanDepth,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
-import { getEmergencyInputSample } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	getEmergencyInputSample,
+	getOverflowState,
+	recordOverflowDetected,
+} from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
@@ -48,7 +52,9 @@ import {
 	collectMessageEntryIdsStrict,
 	consumeDeferredHistoryRefresh,
 	consumeDeferredMaterialization,
+	consumePendingMaterialization,
 	__test as contextHandlerInternals,
+	hasPendingMaterialization,
 	recordPiLiveModel,
 	registerPiContextHandler,
 	resolvePiHistorianTriggerInputs,
@@ -1646,6 +1652,269 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("vetoes pending-op drain and heuristics while a historian is in flight except during force materialization", async () => {
+		async function runScenario(args: {
+			sessionId: string;
+			inFlightHistorian: boolean;
+			inputTokens: number;
+		}) {
+			const db = createTestDb();
+			let restoreInFlight: (() => void) | undefined;
+			try {
+				updateSessionMeta(db, args.sessionId, { piStableIdScheme: 1 });
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					heuristics: {},
+					scheduler: { executeThresholdPercentage: 65 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				const entryIds = [
+					"entry-user-1",
+					"entry-drop",
+					"entry-user-2",
+					"entry-tools",
+					"entry-result-a",
+					"entry-result-b",
+					"entry-latest",
+				];
+				const buildMessages = () =>
+					[
+						userMessage("first request", 1),
+						assistantMessage("drop target", 2),
+						userMessage("read twice", 3),
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "toolCall",
+									id: "read-a",
+									name: "mcp_read",
+									arguments: { filePath: "src/a.ts" },
+								},
+								{
+									type: "toolCall",
+									id: "read-b",
+									name: "mcp_read",
+									arguments: { filePath: "src/a.ts" },
+								},
+							],
+							timestamp: 4,
+						},
+						{
+							...toolResultMessage("read-a", "read result", 5),
+							toolName: "mcp_read",
+						},
+						{
+							...toolResultMessage("read-b", "read result", 6),
+							toolName: "mcp_read",
+						},
+						userMessage("latest request", 7),
+					] as never[];
+				const contextFor = (messages: never[], tokens = 1_000) =>
+					({
+						...fakeContext(args.sessionId, process.cwd(), entryIds, messages),
+						getContextUsage: () => ({
+							tokens,
+							percent: tokens / 1000,
+							contextWindow: 100_000,
+						}),
+					}) as never;
+
+				let messages = buildMessages();
+				await handler({ messages }, contextFor(messages, 0));
+
+				const dropTag = getTagsBySession(db, args.sessionId).find(
+					(tag) =>
+						tag.type === "message" &&
+						(tag.messageId === "entry-drop" ||
+							tag.messageId.startsWith("entry-drop:")),
+				);
+				if (!dropTag) throw new Error("expected queued-drop target tag");
+				queuePendingOp(db, args.sessionId, dropTag.tagNumber, "drop", 1);
+				updateSessionMeta(db, args.sessionId, {
+					lastResponseTime: Date.now(),
+					cacheTtl: "59m",
+					lastContextPercentage: args.inputTokens / 1000,
+					lastInputTokens: args.inputTokens,
+				});
+				if (args.inFlightHistorian) {
+					restoreInFlight =
+						contextHandlerInternals.setInFlightHistorianForTests(
+							args.sessionId,
+							new Promise(() => undefined),
+						);
+				}
+
+				messages = buildMessages();
+				await handler({ messages }, contextFor(messages));
+
+				const tags = getTagsBySession(db, args.sessionId);
+				return {
+					dropStatus: tags.find((tag) => tag.tagNumber === dropTag.tagNumber)
+						?.status,
+					readAStatus: tags.find((tag) => tag.messageId === "read-a")?.status,
+					pendingOps: getPendingOps(db, args.sessionId).length,
+				};
+			} finally {
+				restoreInFlight?.();
+				clearContextHandlerSession(args.sessionId);
+				closeQuietly(db);
+			}
+		}
+
+		expect(
+			await runScenario({
+				sessionId: "ses-historian-veto-execute",
+				inFlightHistorian: true,
+				inputTokens: 70_000,
+			}),
+		).toEqual({
+			dropStatus: "active",
+			readAStatus: "active",
+			pendingOps: 1,
+		});
+		expect(
+			await runScenario({
+				sessionId: "ses-historian-veto-force",
+				inFlightHistorian: true,
+				inputTokens: 85_000,
+			}),
+		).toMatchObject({
+			dropStatus: "dropped",
+			readAStatus: "dropped",
+			pendingOps: 0,
+		});
+		expect(
+			await runScenario({
+				sessionId: "ses-historian-veto-none",
+				inFlightHistorian: false,
+				inputTokens: 70_000,
+			}),
+		).toMatchObject({
+			dropStatus: "dropped",
+			readAStatus: "dropped",
+			pendingOps: 0,
+		});
+	});
+
+	it("gates new stale ctx_reduce strips by provider but replays already-stripped tags", async () => {
+		const buildMessages = () =>
+			[
+				userMessage("older request", 1),
+				{
+					role: "assistant",
+					content: [
+						{ type: "text", text: "I will reduce now." },
+						{
+							type: "toolCall",
+							id: "reduce-1",
+							name: "ctx_reduce",
+							arguments: {},
+						},
+					],
+					timestamp: 2,
+				},
+				{
+					...toolResultMessage("reduce-1", "reduced old tags", 3),
+					toolName: "ctx_reduce",
+				},
+				userMessage("next request", 4),
+				assistantMessage("newer answer", 5),
+				userMessage("latest request", 6),
+			] as never[];
+		const entryIds = [
+			"entry-1",
+			"entry-reduce-owner",
+			"entry-reduce-result",
+			"entry-4",
+			"entry-5",
+			"entry-6",
+		];
+
+		async function runProviderScenario(
+			provider: string,
+			replayProvider = provider,
+		) {
+			const db = createTestDb();
+			try {
+				const sessionId = `ses-stale-reduce-${provider}`;
+				updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 2,
+					heuristics: {},
+					scheduler: { executeThresholdPercentage: 65 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				const contextFor = (
+					messages: never[],
+					tokens: number,
+					providerForPass = provider,
+				) =>
+					({
+						...fakeContext(sessionId, process.cwd(), entryIds, messages),
+						model: {
+							provider: providerForPass,
+							id: "test-model",
+							contextWindow: 100_000,
+						},
+						getContextUsage: () => ({
+							tokens,
+							percent: tokens / 1000,
+							contextWindow: 100_000,
+						}),
+					}) as never;
+
+				let messages = buildMessages();
+				await handler({ messages }, contextFor(messages, 0));
+				updateSessionMeta(db, sessionId, {
+					lastResponseTime: Date.now(),
+					cacheTtl: "59m",
+					lastContextPercentage: 70,
+					lastInputTokens: 70_000,
+				});
+
+				messages = buildMessages();
+				await handler({ messages }, contextFor(messages, 70_000));
+				const reduceStatus = getTagsBySession(db, sessionId).find(
+					(tag) => tag.type === "tool" && tag.messageId === "reduce-1",
+				)?.status;
+
+				messages = buildMessages();
+				const replay = await handler(
+					{ messages },
+					contextFor(messages, 1_000, replayProvider),
+				);
+
+				return {
+					reduceStatus,
+					replayedToolResult: textOf(replay.messages[2] as never),
+				};
+			} finally {
+				clearContextHandlerSession(`ses-stale-reduce-${provider}`);
+				closeQuietly(db);
+			}
+		}
+
+		await expect(runProviderScenario("openai")).resolves.toEqual({
+			reduceStatus: "active",
+			replayedToolResult: "§3§ reduced old tags",
+		});
+		await expect(runProviderScenario("anthropic", "openai")).resolves.toEqual({
+			reduceStatus: "dropped",
+			replayedToolResult: "[dropped §3§]",
+		});
+	});
+
 	it("latches same-sample emergency drops but re-runs on fresh forward growth", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-forward-emergency-latch";
@@ -1830,6 +2099,46 @@ describe("registerPiContextHandler", () => {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 		}
+	});
+
+	it("disarms emergency recovery only after real pressure falls below the force threshold", async () => {
+		async function runRecoveryPass(sessionId: string, tokens: number) {
+			const db = createTestDb();
+			try {
+				updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+				recordOverflowDetected(db, sessionId, undefined);
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					scheduler: { executeThresholdPercentage: 65 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+
+				await handler({ messages: [] as never[] }, {
+					...fakeContext(sessionId, process.cwd(), [], []),
+					getContextUsage: () => ({
+						tokens,
+						percent: tokens / 1000,
+						contextWindow: 100_000,
+					}),
+				} as never);
+
+				return getOverflowState(db, sessionId).needsEmergencyRecovery;
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		}
+
+		await expect(
+			runRecoveryPass("ses-recovery-real-pressure-high", 85_000),
+		).resolves.toBe(true);
+		await expect(
+			runRecoveryPass("ses-recovery-real-pressure-low", 10_000),
+		).resolves.toBe(false);
 	});
 
 	it("uses live forward pressure when deciding whether to fire the historian", async () => {
@@ -2900,6 +3209,9 @@ describe("registerPiContextHandler", () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-marker-rehydrated-deferred";
 			try {
+				const { signalPiDeferredCompactionMarkerDrain } = await import(
+					"./index"
+				);
 				seedCompartment(db, sessionId);
 				const appendCompaction = mock(() => "compact-1");
 
@@ -2913,8 +3225,8 @@ describe("registerPiContextHandler", () => {
 					summary: "summary",
 					publishedAt: 1,
 				});
-				signalPiDeferredHistoryRefresh(sessionId);
-				signalPiDeferredMaterialization(sessionId);
+				signalPiDeferredCompactionMarkerDrain(sessionId);
+				expect(hasPendingMaterialization(sessionId)).toBe(false);
 
 				await runDrainPass({
 					db,
@@ -2935,6 +3247,7 @@ describe("registerPiContextHandler", () => {
 
 				expect(appendCompaction).toHaveBeenCalledTimes(1);
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
+				expect(consumePendingMaterialization(sessionId)).toBe(false);
 			} finally {
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);

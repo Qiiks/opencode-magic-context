@@ -10,10 +10,10 @@
  *     as parts of type `"toolCall"` with `{ id, name, arguments }`.
  *     OpenCode's `extractToolInfo` checks `"tool" | "tool_use" |
  *     "tool-invocation"` shapes that don't exist in Pi.
- *   - Stale `ctx_reduce` removal also walks Pi shape directly. OpenCode
- *     mutates message parts to sentinels; Pi persists `tags.status='dropped'`
- *     and lets `applyFlushedStatuses` replay the existing drop path on
- *     every pass, which is the cache-stable mechanism Pi already uses.
+ *   - Stale `ctx_reduce` removal also walks Pi shape directly. New discovery is
+ *     gated to providers that can safely drop empty sentinels; Pi persists
+ *     `tags.status='dropped'` and lets `applyFlushedStatuses` replay existing
+ *     drops on every provider, which is the cache-stable mechanism Pi already uses.
  *
  *   - Everything else (drop aged tools, strip system injections from
  *     message tags, age-tier caveman compression) is tag-driven and
@@ -80,6 +80,11 @@ const DEDUP_SAFE_TOOLS = new Set([
 
 export interface PiHeuristicCleanupConfig {
 	protectedTags: number;
+	/**
+	 * Whether this pass may discover NEW stale ctx_reduce strips. Existing dropped
+	 * tags still replay through applyFlushedStatuses on every provider.
+	 */
+	staleReduceStripEnabled: boolean;
 	/**
 	 * Tiered target-headroom emergency drop (Phase 2). Provided only on the
 	 * ≥85% force-materialize (cache-busting) pass; undefined on routine execute
@@ -357,13 +362,18 @@ export function applyPiHeuristicCleanup(
 	}
 
 	// ── Pass 1b: stale ctx_reduce calls (Pi persisted-drop replay) ──────
-	const staleReduce = collectStaleReduceCallIds(
-		piMessages,
-		buildMessageIdToMaxTagFromTargets(targets),
-		toolAgeCutoff,
-		resolveStableId,
-	);
-	if (staleReduce.composite.size > 0 || staleReduce.bareCallIds.size > 0) {
+	const staleReduce = config.staleReduceStripEnabled
+		? collectStaleReduceCallIds(
+				piMessages,
+				buildMessageIdToMaxTagFromTargets(targets),
+				toolAgeCutoff,
+				resolveStableId,
+			)
+		: { composite: new Set<string>(), bareCallIds: new Set<string>() };
+	if (
+		config.staleReduceStripEnabled &&
+		(staleReduce.composite.size > 0 || staleReduce.bareCallIds.size > 0)
+	) {
 		db.transaction(() => {
 			for (const tag of tags) {
 				if (tag.status !== "active") continue;

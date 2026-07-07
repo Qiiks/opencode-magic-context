@@ -11,8 +11,14 @@ describe("Pi startup rehydration signal contract", () => {
 				"Magic Context (pi) failed to rehydrate deferred Pi compaction markers",
 			),
 		);
-		expect(block).toContain("signalPiDeferredHistoryRefresh(sid)");
-		expect(block).toContain("signalPiDeferredMaterialization(sid)");
+		const helper = source.slice(
+			source.indexOf("function signalPiDeferredCompactionMarkerDrain"),
+			source.indexOf("export function persistPiMessageEndModelMeta"),
+		);
+		expect(block).toContain("signalPiDeferredCompactionMarkerDrain(sid)");
+		expect(helper).toContain("signalPiDeferredHistoryRefresh(sessionId)");
+		expect(helper).toContain("signalPiDeferredMaterialization(sessionId)");
 		expect(block).not.toContain("signalPiPendingMaterialization(sid)");
+		expect(helper).not.toContain("signalPiPendingMaterialization(sessionId)");
 	});
 });
