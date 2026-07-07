@@ -12,6 +12,7 @@ import { migrateLegacyAgentEnabledInMemory } from "@magic-context/core/config/ag
 import { migrateDreamerV2 } from "@magic-context/core/config/migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "@magic-context/core/config/migrate-experimental";
 import {
+	constrainProjectThresholdOverrides,
 	dropInheritedEmbeddingKeyOnRedirect,
 	stripUnsafeProjectConfigFields,
 } from "@magic-context/core/config/project-security";
@@ -63,12 +64,11 @@ interface LoadedConfigFile {
 	loadOutcome: LoadOutcome;
 }
 
-// Hard cutover: config is read ONLY from the shared CortexKit location. The
-// legacy Pi paths (~/.pi/agent/, <root>/.pi/) are touched only by the location
-// migrator (migrateMagicContextConfigLocations), which runs at Pi init before
-// the loader and moves them to the CortexKit path. They are never a read
-// fallback. The CortexKit target normalizes to .jsonc; we still detect a
-// pre-existing .json at the target for resilience.
+// Shared CortexKit paths are the primary config location. When that base is
+// absent because migration refused/not-yet-ran, Pi may still READ its own legacy
+// paths as a non-destructive fallback (see resolvePiLegacyFallback) rather than
+// silently using schema defaults. The CortexKit target normalizes to .jsonc; we
+// still detect a pre-existing .json at the target for resilience.
 function getProjectConfigPaths(cwd: string): string[] {
 	const basePath = cortexKitProjectConfigBasePath(cwd);
 	return [`${basePath}.jsonc`, `${basePath}.json`];
@@ -343,6 +343,10 @@ export function loadPiConfig(
 	// The trusted user config (sorted first) — passed to the embedding-redirect
 	// guard so a project repeating the user's own endpoint is not a redirect.
 	const userRaw = mergeFiles.find((f) => f.scope === "user")?.config;
+	// Threshold trust boundary is relative to the USER/default effective config:
+	// a cloned repo may delay compaction, but it may not lower thresholds in a
+	// way that forces extra historian work on the user's account.
+	const trustedBaseConfig = parsePiConfig(userRaw ?? {}).config;
 
 	for (const loaded of mergeFiles) {
 		const prefix =
@@ -362,6 +366,13 @@ export function loadPiConfig(
 				rawConfig,
 				userRaw,
 			)) {
+				warnings.push(`${prefix} ${warning}`);
+			}
+			for (const warning of constrainProjectThresholdOverrides({
+				mergedRaw: rawConfig,
+				projectRaw,
+				trustedBaseConfig,
+			})) {
 				warnings.push(`${prefix} ${warning}`);
 			}
 		} else {
@@ -503,6 +514,10 @@ export function loadPiConfigDetailed(
 		return a.scope === "user" ? -1 : 1;
 	});
 	const userRaw = mergeFiles.find((f) => f.scope === "user")?.config;
+	// Threshold trust boundary is relative to the USER/default effective config:
+	// a cloned repo may delay compaction, but it may not lower thresholds in a
+	// way that forces extra historian work on the user's account.
+	const trustedBaseConfig = parsePiConfig(userRaw ?? {}).config;
 
 	for (const loaded of mergeFiles) {
 		const prefix =
@@ -520,6 +535,13 @@ export function loadPiConfigDetailed(
 				rawConfig,
 				userRaw,
 			)) {
+				warnings.push(`${prefix} ${warning}`);
+			}
+			for (const warning of constrainProjectThresholdOverrides({
+				mergedRaw: rawConfig,
+				projectRaw,
+				trustedBaseConfig,
+			})) {
 				warnings.push(`${prefix} ${warning}`);
 			}
 		} else {

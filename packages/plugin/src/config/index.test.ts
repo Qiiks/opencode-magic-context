@@ -621,6 +621,78 @@ describe("loadPluginConfig — user-only settings", () => {
         expect(result.enabled).toBe(false);
         expect(result.configWarnings?.join("\n")).toContain("Ignoring auto_update");
     });
+
+    it("keeps historian model selection user-owned when project config tries to override it", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({
+                historian: {
+                    model: "anthropic/user-historian",
+                    fallback_models: ["anthropic/user-fallback"],
+                },
+            }),
+            JSON.stringify({
+                historian: {
+                    model: "anthropic/project-historian",
+                    fallback_models: ["anthropic/project-fallback"],
+                    temperature: 0.2,
+                },
+            }),
+        );
+
+        expect(result.historian?.model).toBe("anthropic/user-historian");
+        expect(result.historian?.fallback_models).toEqual(["anthropic/user-fallback"]);
+        expect(result.historian?.temperature).toBe(0.2);
+        expect(result.configWarnings?.join("\n")).toContain(
+            "Ignoring historian.model/fallback_models",
+        );
+    });
+});
+
+describe("loadPluginConfig — project compaction trust boundary", () => {
+    it("ignores a lower project execute_threshold_percentage with a warning", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({ execute_threshold_percentage: 60 }),
+            JSON.stringify({ execute_threshold_percentage: 50 }),
+        );
+
+        expect(result.execute_threshold_percentage).toBe(60);
+        expect(result.configWarnings?.join("\n")).toContain(
+            "Ignoring execute_threshold_percentage",
+        );
+    });
+
+    it("applies a higher project execute_threshold_percentage", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({ execute_threshold_percentage: 60 }),
+            JSON.stringify({ execute_threshold_percentage: 70 }),
+        );
+
+        expect(result.execute_threshold_percentage).toBe(70);
+        expect(result.configWarnings?.join("\n") ?? "").not.toContain(
+            "execute_threshold_percentage",
+        );
+    });
+
+    it("ignores a lower project execute_threshold_tokens.default with a warning", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({ execute_threshold_tokens: { default: 12_000 } }),
+            JSON.stringify({ execute_threshold_tokens: { default: 9_000 } }),
+        );
+
+        expect(result.execute_threshold_tokens).toEqual({ default: 12_000 });
+        expect(result.configWarnings?.join("\n")).toContain(
+            "Ignoring execute_threshold_tokens.default",
+        );
+    });
+
+    it("applies a higher project execute_threshold_tokens.default", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({ execute_threshold_tokens: { default: 12_000 } }),
+            JSON.stringify({ execute_threshold_tokens: { default: 18_000 } }),
+        );
+
+        expect(result.execute_threshold_tokens).toEqual({ default: 18_000 });
+    });
 });
 
 describe("loadPluginConfig — raw merge preserves user fields not set in project", () => {
@@ -686,22 +758,26 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
         expect(result.execute_threshold_percentage).toBe(30);
     });
 
-    it("nested object fields deep-merge across user and project", () => {
-        // User sets a scalar field; project sets historian fallback.
-        // Both must coexist in the merged result.
+    it("still applies project dreamer model and task overrides", () => {
         const result = loadWithUserAndProjectConfig(
+            JSON.stringify({ language: "tr" }),
             JSON.stringify({
-                language: "tr",
-                historian: { model: "anthropic/claude-opus-4-7" },
-            }),
-            JSON.stringify({
-                historian: { fallback_models: ["anthropic/claude-sonnet-4-6"] },
+                dreamer: {
+                    model: "anthropic/project-dreamer",
+                    tasks: {
+                        verify: {
+                            schedule: "0 3 * * *",
+                            model: "anthropic/project-verify",
+                        },
+                    },
+                },
             }),
         );
 
         expect(result.language).toBe("tr");
-        expect(result.historian?.model).toBe("anthropic/claude-opus-4-7");
-        expect(result.historian?.fallback_models).toEqual(["anthropic/claude-sonnet-4-6"]);
+        expect(result.dreamer?.model).toBe("anthropic/project-dreamer");
+        expect(result.dreamer?.tasks.verify.schedule).toBe("0 3 * * *");
+        expect(result.dreamer?.tasks.verify.model).toBe("anthropic/project-verify");
     });
 
     it("project boolean override beats user default", () => {

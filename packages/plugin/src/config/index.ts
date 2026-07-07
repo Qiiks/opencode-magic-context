@@ -12,6 +12,7 @@ import {
 import { migrateDreamerV2 } from "./migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "./migrate-experimental";
 import {
+    constrainProjectThresholdOverrides,
     dropInheritedEmbeddingKeyOnRedirect,
     stripUnsafeProjectConfigFields,
 } from "./project-security";
@@ -488,6 +489,10 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
 
     const allWarnings: string[] = [];
     let mergedRaw: Record<string, unknown> = {};
+    // Threshold trust boundary is relative to the USER/default effective config:
+    // a cloned repo may delay compaction, but it may not lower thresholds in a
+    // way that forces extra historian work on the user's account.
+    const trustedBaseConfig = parsePluginConfig(userLoaded?.config ?? {});
 
     if (userLegacyFallback.source) {
         allWarnings.push(
@@ -526,6 +531,13 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
             mergedRaw,
             userLoaded?.config,
         )) {
+            allWarnings.push(`[project config] ${warning}`);
+        }
+        for (const warning of constrainProjectThresholdOverrides({
+            mergedRaw,
+            projectRaw,
+            trustedBaseConfig,
+        })) {
             allWarnings.push(`[project config] ${warning}`);
         }
     }
