@@ -299,30 +299,73 @@ function getMessageSearchStatementWithCutoff(db: Database): PreparedStatement {
 }
 
 const ftsRowCountStatements = new WeakMap<Database, PreparedStatement>();
+const ftsRowCountStatementsWithCutoff = new WeakMap<Database, PreparedStatement>();
 const ftsMatchCountStatements = new WeakMap<Database, PreparedStatement>();
+const ftsMatchCountStatementsWithCutoff = new WeakMap<Database, PreparedStatement>();
 
 /** Total indexed FTS rows for one session (probe-weight denominator). */
-function getSessionFtsRowCount(db: Database, sessionId: string): number {
-    let stmt = ftsRowCountStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ?");
-        ftsRowCountStatements.set(db, stmt);
-    }
-    const row = stmt.get(sessionId) as { n?: number } | undefined;
+function getSessionFtsRowCount(db: Database, sessionId: string, cutoff: number | null): number {
+    const stmt =
+        cutoff === null
+            ? (() => {
+                  let cached = ftsRowCountStatements.get(db);
+                  if (!cached) {
+                      cached = db.prepare(
+                          "SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ?",
+                      );
+                      ftsRowCountStatements.set(db, cached);
+                  }
+                  return cached;
+              })()
+            : (() => {
+                  let cached = ftsRowCountStatementsWithCutoff.get(db);
+                  if (!cached) {
+                      cached = db.prepare(
+                          "SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) <= ?",
+                      );
+                      ftsRowCountStatementsWithCutoff.set(db, cached);
+                  }
+                  return cached;
+              })();
+    const row = (cutoff === null ? stmt.get(sessionId) : stmt.get(sessionId, cutoff)) as
+        | { n?: number }
+        | undefined;
     return typeof row?.n === "number" ? row.n : 0;
 }
 
 /** Document frequency of one (sanitized) FTS query within a session. */
-function countSessionFtsMatches(db: Database, sessionId: string, ftsQuery: string): number {
-    let stmt = ftsMatchCountStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            "SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?",
-        );
-        ftsMatchCountStatements.set(db, stmt);
-    }
+function countSessionFtsMatches(
+    db: Database,
+    sessionId: string,
+    ftsQuery: string,
+    cutoff: number | null,
+): number {
+    const stmt =
+        cutoff === null
+            ? (() => {
+                  let cached = ftsMatchCountStatements.get(db);
+                  if (!cached) {
+                      cached = db.prepare(
+                          "SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?",
+                      );
+                      ftsMatchCountStatements.set(db, cached);
+                  }
+                  return cached;
+              })()
+            : (() => {
+                  let cached = ftsMatchCountStatementsWithCutoff.get(db);
+                  if (!cached) {
+                      cached = db.prepare(
+                          "SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? AND CAST(message_ordinal AS INTEGER) <= ?",
+                      );
+                      ftsMatchCountStatementsWithCutoff.set(db, cached);
+                  }
+                  return cached;
+              })();
     try {
-        const row = stmt.get(sessionId, ftsQuery) as { n?: number } | undefined;
+        const row = (
+            cutoff === null ? stmt.get(sessionId, ftsQuery) : stmt.get(sessionId, ftsQuery, cutoff)
+        ) as { n?: number } | undefined;
         return typeof row?.n === "number" ? row.n : 0;
     } catch {
         // Malformed FTS syntax that survived sanitization — treat as rare.
@@ -768,7 +811,7 @@ function searchMessages(args: {
     // contain a literal symbol but not the query's other (AND-joined) tokens.
     // Each probe list is weighted by its discrimination (document frequency):
     // a probe matching 2% of the corpus contributes a third of a rare probe.
-    const corpusSize = getSessionFtsRowCount(args.db, args.sessionId);
+    const corpusSize = getSessionFtsRowCount(args.db, args.sessionId, cutoff);
     const queryLists: Array<{ rows: NormalizedMessageRow[]; weight: number }> = [];
     if (baseQuery.length > 0) {
         queryLists.push({
@@ -781,7 +824,7 @@ function searchMessages(args: {
     for (const probe of probes) {
         const probeQuery = sanitizeFtsQuery(probe);
         if (probeQuery.length === 0) continue;
-        const df = countSessionFtsMatches(args.db, args.sessionId, probeQuery);
+        const df = countSessionFtsMatches(args.db, args.sessionId, probeQuery, cutoff);
         const weight = probeDiscriminationWeight(df, corpusSize);
         probeWeights.set(probe, weight);
         queryLists.push({

@@ -31,6 +31,7 @@ import {
     embedSessionCompartmentChunks,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
+    embedUnembeddedMemoriesForProject,
     getProjectEmbeddingSnapshot,
     markProjectLoadUntrusted,
     registerProjectEmbedding,
@@ -418,6 +419,80 @@ describe("project embedding registry", () => {
         release?.();
 
         expect(await inFlight).toBeNull();
+    });
+
+    it("stores unembedded memory vectors when the memory content stays unchanged", async () => {
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:memory-backfill";
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "Backfill this exact memory.",
+        });
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/memory-backfill",
+        );
+
+        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
+
+        expect(embedded).toBe(1);
+        expect(
+            loadAllEmbeddings(db, projectIdentity, currentModelId(projectIdentity)).has(memory.id),
+        ).toBe(true);
+    });
+
+    it("skips stale sweep results when a memory changes before the batch save", async () => {
+        let release: (() => void) | undefined;
+        let batchStarted: (() => void) | undefined;
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new (class extends FakeEmbeddingProvider {
+                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                        batchStarted?.();
+                        await new Promise<void>((resolve) => {
+                            release = resolve;
+                        });
+                        return super.embedBatch(texts);
+                    }
+                })(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:memory-stale";
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "Old memory body",
+        });
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/memory-stale",
+        );
+
+        const started = new Promise<void>((resolve) => {
+            batchStarted = resolve;
+        });
+        const inFlight = embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
+        await started;
+        db.prepare(
+            "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+        ).run("New memory body", "new-memory-hash", Date.now(), memory.id);
+        release?.();
+
+        expect(await inFlight).toBe(0);
+        expect(loadAllEmbeddings(db, projectIdentity, currentModelId(projectIdentity)).size).toBe(
+            0,
+        );
     });
 
     it("keeps memory, commit, and chunk embeddings coexisting per model", () => {

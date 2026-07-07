@@ -39,7 +39,7 @@ import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-pro
 import {
     clearEmbeddingsForProject,
     getMemoryEmbedCoverage,
-    saveEmbedding,
+    saveEmbeddingIfHashMatches,
 } from "./memory/storage-memory-embeddings";
 import {
     recordSessionProjectIdentity,
@@ -134,6 +134,7 @@ interface ProjectEmbeddingRegistration {
 interface UnembeddedMemoryRow {
     id: number;
     content: string;
+    normalized_hash: string;
 }
 
 type EmbeddingIdentityScope = "memory" | "commit" | "chunk";
@@ -827,14 +828,18 @@ async function embedTextsWindowBounded(
 function isUnembeddedMemoryRow(row: unknown): row is UnembeddedMemoryRow {
     if (row === null || typeof row !== "object") return false;
     const candidate = row as Record<string, unknown>;
-    return typeof candidate.id === "number" && typeof candidate.content === "string";
+    return (
+        typeof candidate.id === "number" &&
+        typeof candidate.content === "string" &&
+        typeof candidate.normalized_hash === "string"
+    );
 }
 
 function getLoadUnembeddedMemoriesStatement(db: Database): PreparedStatement {
     let stmt = loadUnembeddedMemoriesStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT m.id AS id, m.content AS content FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL LIMIT ?",
+            "SELECT m.id AS id, m.content AS content, m.normalized_hash AS normalized_hash FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL LIMIT ?",
         );
         loadUnembeddedMemoriesStatements.set(db, stmt);
     }
@@ -867,8 +872,17 @@ export async function embedUnembeddedMemoriesForProject(
             for (const [index, memory] of memories.entries()) {
                 const embedding = result.vectors[index];
                 if (!embedding) continue;
-                saveEmbedding(db, memory.id, embedding, result.modelId);
-                embeddedCount += 1;
+                if (
+                    saveEmbeddingIfHashMatches(
+                        db,
+                        memory.id,
+                        embedding,
+                        result.modelId,
+                        memory.normalized_hash,
+                    )
+                ) {
+                    embeddedCount += 1;
+                }
             }
         })();
         return embeddedCount;

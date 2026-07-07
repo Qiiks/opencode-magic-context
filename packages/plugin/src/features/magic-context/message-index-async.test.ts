@@ -49,6 +49,16 @@ function countMessageRows(db: Database, sessionId: string, messageId: string): n
     return typeof row?.count === "number" ? row.count : 0;
 }
 
+function searchMessageIds(db: Database, sessionId: string, ftsQuery: string): string[] {
+    return (
+        db
+            .prepare(
+                "SELECT message_id FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? ORDER BY bm25(message_history_fts), CAST(message_ordinal AS INTEGER) ASC",
+            )
+            .all(sessionId, ftsQuery) as Array<{ message_id: string }>
+    ).map((row) => row.message_id);
+}
+
 describe("message-index-async", () => {
     let db: Database;
 
@@ -90,6 +100,50 @@ describe("message-index-async", () => {
         await wait(140);
 
         expect(countMessageRows(db, "ses-overlap", "m-1")).toBe(1);
+    });
+
+    it("reconciles a failed incremental hole even after a later incremental success advanced the watermark", async () => {
+        const originalPrepare = db.prepare.bind(db);
+        let failMessageId: string | null = "m-2";
+        (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+            const stmt = originalPrepare(sql);
+            if (sql.startsWith("INSERT INTO message_history_fts")) {
+                const run = stmt.run.bind(stmt);
+                (stmt as unknown as { run: typeof stmt.run }).run = ((...args: unknown[]) => {
+                    if (failMessageId !== null && args[2] === failMessageId) {
+                        throw new Error("synthetic incremental failure");
+                    }
+                    return run(...(args as Parameters<typeof stmt.run>));
+                }) as typeof stmt.run;
+            }
+            return stmt;
+        }) as typeof db.prepare;
+
+        const fullHistory = [
+            message("m-1", 1, "alpha indexed first"),
+            message("m-2", 2, "beta hole should come back"),
+            message("m-3", 3, "gamma later incremental succeeds"),
+        ];
+        scheduleReconciliation(db, "ses-hole", () => [fullHistory[0]!]);
+        await wait(20);
+        expect(isSessionReconciled("ses-hole")).toBe(true);
+
+        scheduleIncrementalIndex(db, "ses-hole", "m-2", () => fullHistory[1] ?? null);
+        await wait(140);
+        expect(countMessageRows(db, "ses-hole", "m-2")).toBe(0);
+        expect(isSessionReconciled("ses-hole")).toBe(false);
+
+        failMessageId = null;
+        scheduleIncrementalIndex(db, "ses-hole", "m-3", () => fullHistory[2] ?? null);
+        await wait(140);
+        expect(countMessageRows(db, "ses-hole", "m-3")).toBe(1);
+
+        scheduleReconciliation(db, "ses-hole", () => fullHistory);
+        await wait(20);
+
+        expect(searchMessageIds(db, "ses-hole", "beta")).toEqual(["m-2"]);
+        expect(countMessageRows(db, "ses-hole", "m-3")).toBe(1);
+        expect(isSessionReconciled("ses-hole")).toBe(true);
     });
 
     it("clears and rebuilds after a removed message", async () => {

@@ -24,6 +24,7 @@ function createTestDb(): Database {
     CREATE TABLE message_history_index (
       session_id TEXT PRIMARY KEY,
       last_indexed_ordinal INTEGER NOT NULL DEFAULT 0,
+      dirty_floor_ordinal INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL DEFAULT 0,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );

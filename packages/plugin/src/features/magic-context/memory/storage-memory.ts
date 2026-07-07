@@ -117,6 +117,11 @@ export interface MemoryCountsByStatus {
     mergedIds: number[];
 }
 
+export interface InsertMemoryResult {
+    memory: Memory;
+    inserted: boolean;
+}
+
 interface MemoryCountByStatusRow {
     id: number;
     status: MemoryStatus;
@@ -219,6 +224,14 @@ function isMemorySourceType(value: unknown): value is MemorySourceType {
 
 function isVerificationStatus(value: unknown): value is VerificationStatus {
     return typeof value === "string" && value in VERIFICATION_STATUS_LOOKUP;
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+    return (
+        error instanceof Error &&
+        "code" in error &&
+        (error as { code?: unknown }).code === "SQLITE_CONSTRAINT_UNIQUE"
+    );
 }
 
 function isNullableString(value: unknown): value is string | null {
@@ -500,16 +513,19 @@ function getMemoryCountsByStatusStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
-export function insertMemory(db: Database, input: MemoryInput): Memory {
-    const now = Date.now();
-    const normalizedHash = computeNormalizedHash(input.content);
+function buildInsertMemoryValues(
+    input: MemoryInput,
+    normalizedHash: string,
+    now: number,
+    includeImportance: boolean,
+): Array<string | number | null> {
     const insertValues: Array<string | number | null> = [
         input.projectPath,
         input.category,
         input.content,
         normalizedHash,
     ];
-    if (hasMemoryImportanceColumn(db)) {
+    if (includeImportance) {
         insertValues.push(input.importance ?? 50);
     }
     insertValues.push(
@@ -530,16 +546,59 @@ export function insertMemory(db: Database, input: MemoryInput): Memory {
         null,
         input.metadataJson ?? null,
     );
-    const result = getInsertMemoryStatement(db).run(...insertValues);
+    return insertValues;
+}
 
-    const insertedResult = result as { lastInsertRowid?: number | bigint };
-    const inserted = getMemoryById(db, Number(insertedResult.lastInsertRowid));
+function loadInsertedMemory(db: Database, rowid: number | bigint | undefined): Memory {
+    const inserted = getMemoryById(db, Number(rowid));
     if (!inserted) {
         throw new Error("Failed to load inserted memory row");
     }
+    return inserted;
+}
+
+export function insertMemory(db: Database, input: MemoryInput): Memory {
+    const now = Date.now();
+    const normalizedHash = computeNormalizedHash(input.content);
+    const insertValues = buildInsertMemoryValues(
+        input,
+        normalizedHash,
+        now,
+        hasMemoryImportanceColumn(db),
+    );
+    const result = getInsertMemoryStatement(db).run(...insertValues);
+
+    const insertedResult = result as { lastInsertRowid?: number | bigint };
+    const inserted = loadInsertedMemory(db, insertedResult.lastInsertRowid);
 
     invalidateProject(input.projectPath);
     return inserted;
+}
+
+/**
+ * Shared-DB callers can race between their exact-hash pre-check and INSERT. When
+ * the unique constraint wins, treat it as the same exact-dedup path the tool uses:
+ * bump seen_count/last_seen_at on the existing row and return it instead of
+ * surfacing a transient write failure.
+ */
+export function insertMemoryIdempotent(db: Database, input: MemoryInput): InsertMemoryResult {
+    try {
+        return { memory: insertMemory(db, input), inserted: true };
+    } catch (error) {
+        if (!isUniqueConstraintError(error)) {
+            throw error;
+        }
+        const normalizedHash = computeNormalizedHash(input.content);
+        const existing = getMemoryByHash(db, input.projectPath, input.category, normalizedHash);
+        if (!existing) {
+            throw error;
+        }
+        updateMemorySeenCount(db, existing.id);
+        return {
+            memory: getMemoryById(db, existing.id) ?? existing,
+            inserted: false,
+        };
+    }
 }
 
 export function getMemoryByHash(

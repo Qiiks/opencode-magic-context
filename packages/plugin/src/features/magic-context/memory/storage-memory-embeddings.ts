@@ -16,6 +16,7 @@ interface StoredModelIdRow {
 }
 
 const saveEmbeddingStatements = new WeakMap<Database, PreparedStatement>();
+const saveEmbeddingIfHashMatchesStatements = new WeakMap<Database, PreparedStatement>();
 const loadAllEmbeddingsStatements = new WeakMap<Database, PreparedStatement>();
 const deleteEmbeddingStatements = new WeakMap<Database, PreparedStatement>();
 const getStoredModelIdStatements = new WeakMap<Database, PreparedStatement>();
@@ -53,6 +54,17 @@ function getSaveEmbeddingStatement(db: Database): PreparedStatement {
             "INSERT INTO memory_embeddings (memory_id, embedding, model_id) VALUES (?, ?, ?) ON CONFLICT(memory_id, model_id) DO UPDATE SET embedding = excluded.embedding",
         );
         saveEmbeddingStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getSaveEmbeddingIfHashMatchesStatement(db: Database): PreparedStatement {
+    let stmt = saveEmbeddingIfHashMatchesStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            "INSERT INTO memory_embeddings (memory_id, embedding, model_id) SELECT ?, ?, ? FROM memories WHERE id = ? AND normalized_hash = ? ON CONFLICT(memory_id, model_id) DO UPDATE SET embedding = excluded.embedding",
+        );
+        saveEmbeddingIfHashMatchesStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -129,6 +141,28 @@ export function saveEmbedding(
 ): void {
     const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
     getSaveEmbeddingStatement(db).run(memoryId, blob, modelId);
+}
+
+/** Save an embedding only if the memory row still has the same normalized hash
+ *  we embedded. If the content changed while the provider call was in flight,
+ *  the stale vector is discarded instead of resurrecting an out-of-date row. */
+export function saveEmbeddingIfHashMatches(
+    db: Database,
+    memoryId: number,
+    embedding: Float32Array,
+    modelId: string,
+    normalizedHash: string,
+): boolean {
+    const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+    return (
+        getSaveEmbeddingIfHashMatchesStatement(db).run(
+            memoryId,
+            blob,
+            modelId,
+            memoryId,
+            normalizedHash,
+        ).changes > 0
+    );
 }
 
 export function loadAllEmbeddings(

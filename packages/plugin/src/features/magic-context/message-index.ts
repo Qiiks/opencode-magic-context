@@ -11,12 +11,16 @@ import { clearCompressionDepth } from "./compression-depth-storage";
 
 interface MessageHistoryIndexRow {
     last_indexed_ordinal?: number;
+    dirty_floor_ordinal?: number;
 }
 
 const lastIndexedStatements = new WeakMap<Database, PreparedStatement>();
 const insertMessageStatements = new WeakMap<Database, PreparedStatement>();
 const upsertIndexStatements = new WeakMap<Database, PreparedStatement>();
+const upsertCleanIndexStatements = new WeakMap<Database, PreparedStatement>();
+const upsertDirtyFloorStatements = new WeakMap<Database, PreparedStatement>();
 const deleteFtsStatements = new WeakMap<Database, PreparedStatement>();
+const deleteFtsFromOrdinalStatements = new WeakMap<Database, PreparedStatement>();
 const deleteIndexStatements = new WeakMap<Database, PreparedStatement>();
 const countIndexedMessageStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -28,7 +32,7 @@ function getLastIndexedStatement(db: Database): PreparedStatement {
     let stmt = lastIndexedStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT last_indexed_ordinal FROM message_history_index WHERE session_id = ?",
+            "SELECT last_indexed_ordinal, dirty_floor_ordinal FROM message_history_index WHERE session_id = ?",
         );
         lastIndexedStatements.set(db, stmt);
     }
@@ -57,11 +61,44 @@ function getUpsertIndexStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
+function getUpsertCleanIndexStatement(db: Database): PreparedStatement {
+    let stmt = upsertCleanIndexStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            "INSERT INTO message_history_index (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness) VALUES (?, ?, 0, ?, ?) ON CONFLICT(session_id) DO UPDATE SET last_indexed_ordinal = excluded.last_indexed_ordinal, dirty_floor_ordinal = 0, updated_at = excluded.updated_at",
+        );
+        upsertCleanIndexStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getUpsertDirtyFloorStatement(db: Database): PreparedStatement {
+    let stmt = upsertDirtyFloorStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            "INSERT INTO message_history_index (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET last_indexed_ordinal = MAX(message_history_index.last_indexed_ordinal, excluded.last_indexed_ordinal), dirty_floor_ordinal = CASE WHEN message_history_index.dirty_floor_ordinal <= 0 THEN excluded.dirty_floor_ordinal WHEN excluded.dirty_floor_ordinal <= 0 THEN message_history_index.dirty_floor_ordinal ELSE MIN(message_history_index.dirty_floor_ordinal, excluded.dirty_floor_ordinal) END, updated_at = excluded.updated_at",
+        );
+        upsertDirtyFloorStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
 function getDeleteFtsStatement(db: Database): PreparedStatement {
     let stmt = deleteFtsStatements.get(db);
     if (!stmt) {
         stmt = db.prepare("DELETE FROM message_history_fts WHERE session_id = ?");
         deleteFtsStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getDeleteFtsFromOrdinalStatement(db: Database): PreparedStatement {
+    let stmt = deleteFtsFromOrdinalStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            "DELETE FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) >= ?",
+        );
+        deleteFtsFromOrdinalStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -93,6 +130,29 @@ interface CountRow {
 export function getLastIndexedOrdinal(db: Database, sessionId: string): number {
     const row = getLastIndexedStatement(db).get(sessionId) as MessageHistoryIndexRow | null;
     return typeof row?.last_indexed_ordinal === "number" ? row.last_indexed_ordinal : 0;
+}
+
+function getDirtyIndexFloor(db: Database, sessionId: string): number | null {
+    const row = getLastIndexedStatement(db).get(sessionId) as MessageHistoryIndexRow | null;
+    return typeof row?.dirty_floor_ordinal === "number" && row.dirty_floor_ordinal > 0
+        ? row.dirty_floor_ordinal
+        : null;
+}
+
+/**
+ * Remember the earliest ordinal that a failed incremental write left missing. A
+ * later incremental success may advance the watermark past that hole, so the
+ * reconciler must rewind from this floor instead of trusting the watermark.
+ */
+export function markMessageIndexDirty(db: Database, sessionId: string, floorOrdinal: number): void {
+    const dirtyFloor = Math.max(1, Math.floor(floorOrdinal));
+    getUpsertDirtyFloorStatement(db).run(
+        sessionId,
+        getLastIndexedOrdinal(db, sessionId),
+        dirtyFloor,
+        Date.now(),
+        getHarness(),
+    );
 }
 
 function isMessageAlreadyIndexed(db: Database, sessionId: string, messageId: string): boolean {
@@ -243,10 +303,15 @@ export function indexMessagesAfterOrdinal(
     try {
         // Re-read under the lock: another process may have advanced the
         // watermark between the caller's out-of-transaction read and now.
-        const effectiveWatermark = Math.max(
-            lastIndexedOrdinal,
-            getLastIndexedOrdinal(db, sessionId),
-        );
+        let effectiveWatermark = Math.max(lastIndexedOrdinal, getLastIndexedOrdinal(db, sessionId));
+        const dirtyFloor = getDirtyIndexFloor(db, sessionId);
+        if (dirtyFloor !== null) {
+            const rewindOrdinal = Math.max(1, Math.min(dirtyFloor, finalWatermark + 1));
+            if (rewindOrdinal <= finalWatermark) {
+                getDeleteFtsFromOrdinalStatement(db).run(sessionId, rewindOrdinal);
+            }
+            effectiveWatermark = Math.min(effectiveWatermark, rewindOrdinal - 1);
+        }
         const insertMessage = getInsertMessageStatement(db);
         for (const message of messages) {
             if (message.ordinal <= effectiveWatermark) {
@@ -264,7 +329,7 @@ export function indexMessagesAfterOrdinal(
         }
         // Never regress a higher watermark a concurrent writer may have set.
         const newWatermark = Math.max(effectiveWatermark, finalWatermark);
-        getUpsertIndexStatement(db).run(sessionId, newWatermark, now, getHarness());
+        getUpsertCleanIndexStatement(db).run(sessionId, newWatermark, now, getHarness());
         db.exec("COMMIT");
         committed = true;
     } finally {
@@ -297,7 +362,7 @@ export function ensureMessagesIndexed(
         lastIndexedOrdinal = 0;
     }
 
-    if (lastIndexedOrdinal >= messages.length) {
+    if (lastIndexedOrdinal >= messages.length && getDirtyIndexFloor(db, sessionId) === null) {
         return;
     }
 
