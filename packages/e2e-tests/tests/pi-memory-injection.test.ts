@@ -19,8 +19,20 @@ afterAll(async () => {
     await h.dispose();
 });
 
+function countCompartments(sessionId: string): number {
+    try {
+        const row = h
+            .contextDb()
+            .prepare("SELECT COUNT(*) AS n FROM compartments WHERE session_id = ?")
+            .get(sessionId) as { n: number } | null;
+        return row?.n ?? 0;
+    } catch {
+        return 0;
+    }
+}
+
 function seedMemory(content: string): void {
-    const db = openTestDb(h.contextDbPath());
+    const db = openTestDb(h.contextDbPath(), { readwrite: true });
     try {
         const now = Date.now();
         db.prepare(
@@ -62,9 +74,15 @@ describe("pi memory injection", () => {
             text: "after seed",
             usage: { input_tokens: 120, output_tokens: 10, cache_creation_input_tokens: 120 },
         });
-        await h.sendPrompt("read my project memory", { timeoutMs: 60_000 });
+        const assertion = await h.sendPrompt("read my project memory", { timeoutMs: 60_000 });
+        expect(assertion.sessionId).toBeTruthy();
+
+        // The assertion session has no historian output; memory injection alone
+        // must build the session-history wrapper and project-memory payload.
+        expect(countCompartments(assertion.sessionId!)).toBe(0);
 
         const body = JSON.stringify(h.mock.lastRequest()!.body);
+        expect(body).toContain("<session-history>");
         expect(body).toContain("<project-memory>");
         expect(body).toContain(directive);
     }, 60_000);
