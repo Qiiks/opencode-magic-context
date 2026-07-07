@@ -62,6 +62,28 @@ describe("createCtxSearchTools", () => {
         expect(result).toContain("No results found");
     });
 
+    it("preserves an explicit empty sources list as no sources", async () => {
+        insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "This should not appear when sources is empty.",
+        });
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => "/repo/project",
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+
+        const result = await tools.ctx_search.execute(
+            { query: "appear", sources: [] },
+            toolContext(),
+        );
+
+        expect(result).toContain("No results found");
+    });
+
     it("formats message results with inline ranges and one trailing expand hint", async () => {
         replaceAllCompartments(db, "ses-message", [
             {

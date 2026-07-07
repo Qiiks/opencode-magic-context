@@ -805,6 +805,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,
       last_indexed_ordinal INTEGER NOT NULL DEFAULT 0,
+      dirty_floor_ordinal INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
@@ -1418,6 +1419,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // ships in a later commit once Pi can write to the same DB concurrently
     // and we can validate the safety property end-to-end.
     ensureColumn(db, "tags", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
+    ensureColumn(db, "message_history_index", "dirty_floor_ordinal", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "pending_ops", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "source_contents", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "compartments", "harness", "TEXT NOT NULL DEFAULT 'opencode'");

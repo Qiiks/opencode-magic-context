@@ -6,6 +6,7 @@ import {
     getLastIndexedOrdinal,
     indexMessagesAfterOrdinal,
     indexSingleMessage,
+    markMessageIndexDirty,
 } from "./message-index";
 
 /**
@@ -47,8 +48,9 @@ function isDatabaseLockedError(error: unknown): boolean {
  *    the same `(sessionId,messageId)` inside 100ms are dropped.
  * 2. Per-session lazy reconciliation: the first transform/hook touch schedules
  *    one catch-up pass. It reads raw messages, resumes from
- *    `message_history_index.last_indexed_ordinal`, inserts missing newer rows,
- *    and advances the watermark to `messages.length`.
+ *    `message_history_index.last_indexed_ordinal`, rewinds from any recorded
+ *    dirty floor left by a failed incremental write, inserts missing rows, and
+ *    advances the watermark to `messages.length`.
  * 3. Revert/delete handling: `message.removed` clears all FTS rows + the
  *    watermark and then re-runs reconciliation. Searches during that rebuild
  *    window correctly see no message hits.
@@ -160,10 +162,13 @@ export function scheduleReconciliation(
     reconciliationScheduledSessions.add(sessionId);
 
     defer(() => {
-        void reconcileSessionIndex(db, sessionId, readMessages).catch((error) => {
-            reconciliationScheduledSessions.delete(sessionId);
-            logIndexingError(sessionId, "reconciliation", error);
-        });
+        void reconcileSessionIndex(db, sessionId, readMessages)
+            .catch((error) => {
+                logIndexingError(sessionId, "reconciliation", error);
+            })
+            .finally(() => {
+                reconciliationScheduledSessions.delete(sessionId);
+            });
     });
 }
 
@@ -181,14 +186,22 @@ export function scheduleIncrementalIndex(
     const timer = setTimeout(() => {
         incrementalTimers.delete(key);
         pendingIncrementalKeys.add(key);
+        let attemptedOrdinal: number | null = null;
         void runWithSessionLock(sessionId, () => {
             const message = readSingleMessage(sessionId, messageId);
             if (!message) {
                 return;
             }
+            attemptedOrdinal = message.ordinal;
             indexSingleMessage(db, sessionId, message);
         })
             .catch((error) => {
+                markMessageIndexDirty(
+                    db,
+                    sessionId,
+                    attemptedOrdinal ?? getLastIndexedOrdinal(db, sessionId) + 1,
+                );
+                reconciledSessions.delete(sessionId);
                 logIndexingError(sessionId, `incremental index for ${messageId}`, error);
             })
             .finally(() => {

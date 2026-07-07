@@ -783,6 +783,55 @@ describe("unifiedSearch", () => {
         expect(probedMessages[0]?.messageId).toBe("m1");
     });
 
+    it("counts probe corpus statistics only inside the message cutoff", async () => {
+        rawMessagesBySession.set("ses-cutoff-probes", [
+            {
+                ordinal: 1,
+                id: "common-1",
+                role: "assistant",
+                parts: [{ type: "text", text: "CommonTerm is the eligible early hit." }],
+            },
+            {
+                ordinal: 2,
+                id: "rare-2",
+                role: "assistant",
+                parts: [{ type: "text", text: "RareSymbolXyz is the eligible late hit." }],
+            },
+            ...Array.from({ length: 12 }, (_, i) => ({
+                ordinal: i + 3,
+                id: `tail-${i}`,
+                role: "assistant" as const,
+                parts: [
+                    {
+                        type: "text" as const,
+                        text: `CommonTerm appears again in excluded live-tail row ${i}.`,
+                    },
+                ],
+            })),
+        ]);
+        ensureMessagesIndexed(db, "ses-cutoff-probes", readMessages);
+
+        const results = await unifiedSearch(
+            db,
+            "ses-cutoff-probes",
+            "/repo/probe-cutoff",
+            "RareSymbolXyz CommonTerm",
+            {
+                memoryEnabled: false,
+                embeddingEnabled: false,
+                readMessages,
+                embedQuery,
+                isEmbeddingRuntimeEnabled,
+                sources: ["message"],
+                explicitSearch: true,
+                maxMessageOrdinal: 2,
+            },
+        );
+
+        const messages = results.filter((r) => r.source === "message");
+        expect(messages.map((r) => r.messageId)).toEqual(["common-1", "rare-2"]);
+    });
+
     it("multi-probe scores decay linearly instead of flattening into a ~1.0 band", async () => {
         // Regression: the flat +0.5 verbatim bonus sat 30× above the RRF scale,
         // so after divide-by-max normalization every probe-matching message

@@ -7,11 +7,11 @@ import {
     getMemoriesByProject,
     getMemoryByHash,
     getMemoryById,
-    insertMemory,
+    insertMemoryIdempotent,
     type Memory,
     type MemoryCategory,
     mergeMemoryStats,
-    saveEmbedding,
+    saveEmbeddingIfHashMatches,
     supersededMemory,
     updateMemorySeenCount,
     V2_MEMORY_CATEGORIES,
@@ -158,6 +158,7 @@ function queueMemoryEmbedding(args: {
         return;
     }
 
+    const normalizedHash = computeNormalizedHash(args.content);
     void (async () => {
         const result = await embedTextForProject(args.projectPath, args.content);
         if (!result) {
@@ -168,7 +169,21 @@ function queueMemoryEmbedding(args: {
             return;
         }
 
-        saveEmbedding(args.deps.db, args.memoryId, result.vector, result.modelId);
+        const saved = saveEmbeddingIfHashMatches(
+            args.deps.db,
+            args.memoryId,
+            result.vector,
+            result.modelId,
+            normalizedHash,
+        );
+        if (!saved) {
+            sessionLog(
+                args.sessionId,
+                `memory embedding skipped for memory ${args.memoryId}: content changed before the embedding finished.`,
+            );
+            return;
+        }
+
         sessionLog(args.sessionId, `proactively embedded memory ${args.memoryId}.`);
     })().catch((error: unknown) => {
         sessionLog(args.sessionId, `memory embedding failed for memory ${args.memoryId}:`, error);
@@ -390,7 +405,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     return `Memory already exists [ID: ${existingMemory.id}] in ${category} (seen count incremented).`;
                 }
 
-                const memory = insertMemory(deps.db, {
+                const insertResult = insertMemoryIdempotent(deps.db, {
                     projectPath: projectPath,
                     category,
                     content,
@@ -398,16 +413,19 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     sourceType:
                         toolContext.agent === DREAMER_AGENT ? "dreamer" : getSourceType(deps),
                 });
+                if (!insertResult.inserted) {
+                    return `Memory already exists [ID: ${insertResult.memory.id}] in ${category} (seen count incremented).`;
+                }
 
                 queueMemoryEmbedding({
                     deps,
                     sessionId: toolContext.sessionID,
                     projectPath,
-                    memoryId: memory.id,
+                    memoryId: insertResult.memory.id,
                     content,
                 });
 
-                return `Saved memory [ID: ${memory.id}] in ${category}.`;
+                return `Saved memory [ID: ${insertResult.memory.id}] in ${category}.`;
             }
 
             if (args.action === "list") {
@@ -557,12 +575,6 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 }
 
                 const normalizedHash = computeNormalizedHash(content);
-                const duplicate = getMemoryByHash(deps.db, projectPath, category, normalizedHash);
-                const canonicalExisting =
-                    duplicate && ids.includes(duplicate.id) ? duplicate : null;
-                if (duplicate && !canonicalExisting) {
-                    return `Error: Memory content already exists as ID ${duplicate.id}; update or archive existing duplicates instead.`;
-                }
 
                 const mergedFrom = JSON.stringify(
                     Array.from(
@@ -598,19 +610,36 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     ? "permanent"
                     : "active";
 
-                const canonicalMemory = deps.db.transaction(() => {
+                let mergeConflict: string | null = null;
+                const canonicalMemory = runImmediateTransaction(deps.db, () => {
+                    const lockedDuplicate = getMemoryByHash(
+                        deps.db,
+                        projectPath,
+                        category,
+                        normalizedHash,
+                    );
+                    const canonicalExisting =
+                        lockedDuplicate && ids.includes(lockedDuplicate.id)
+                            ? lockedDuplicate
+                            : null;
+                    if (lockedDuplicate && !canonicalExisting) {
+                        mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
+                        return null;
+                    }
+
                     const nextCanonical =
-                        canonicalExisting ??
-                        insertMemory(deps.db, {
-                            projectPath: projectPath,
-                            category,
-                            content,
-                            sourceSessionId: toolContext.sessionID,
-                            sourceType:
-                                toolContext.agent === DREAMER_AGENT
-                                    ? "dreamer"
-                                    : getSourceType(deps),
-                        });
+                        canonicalExisting?.id != null
+                            ? canonicalExisting
+                            : insertMemoryIdempotent(deps.db, {
+                                  projectPath: projectPath,
+                                  category,
+                                  content,
+                                  sourceSessionId: toolContext.sessionID,
+                                  sourceType:
+                                      toolContext.agent === DREAMER_AGENT
+                                          ? "dreamer"
+                                          : getSourceType(deps),
+                              }).memory;
                     const canonicalContentChanged =
                         nextCanonical.content !== content ||
                         nextCanonical.normalizedHash !== normalizedHash;
@@ -657,7 +686,10 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     }
 
                     return nextCanonical;
-                })();
+                });
+                if (mergeConflict || !canonicalMemory) {
+                    return mergeConflict ?? "Error: Failed to merge memories.";
+                }
 
                 queueMemoryEmbedding({
                     deps,

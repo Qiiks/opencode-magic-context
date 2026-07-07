@@ -8,7 +8,7 @@ export type CtxSearchSource = "memory" | "message" | "git_commit" | "primer" | "
 export interface CtxSearchArgs {
     query: string;
     limit?: number;
-    /** Restrict search to specific sources. Omit to search all. */
+    /** Restrict search to specific sources. Omit to search all; [] searches none. */
     sources?: CtxSearchSource[];
 }
 

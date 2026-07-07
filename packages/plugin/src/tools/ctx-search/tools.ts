@@ -32,10 +32,11 @@ function normalizeLimit(limit?: number): number {
 /** Validate and normalize the `sources` arg. Drops unknown strings (the enum
  *  constraint catches them at the schema layer, but we still want a safe
  *  runtime check for plugins/tests that call this directly). Returns
- *  `undefined` when no `sources` were provided so unifiedSearch falls back to
- *  its default (all sources). */
+ *  `undefined` only when the caller OMITTED `sources`; an explicit [] must stay
+ *  [] so unifiedSearch honors the documented "no sources" meaning instead of
+ *  widening back to "all sources". */
 function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
-    if (!sources || sources.length === 0) return undefined;
+    if (sources === undefined) return undefined;
     const result: CtxSearchSource[] = [];
     const seen = new Set<CtxSearchSource>();
     for (const source of sources) {
@@ -47,7 +48,7 @@ function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
             }
         }
     }
-    return result.length > 0 ? result : undefined;
+    return result;
 }
 
 function formatAge(committedAtMs: number): string {
@@ -168,7 +169,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                 .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
                 .optional()
                 .describe(
-                    'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
+                    'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources; pass [] to search no sources.',
                 ),
         },
         async execute(args: CtxSearchArgs, toolContext) {
