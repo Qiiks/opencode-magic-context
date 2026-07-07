@@ -14,6 +14,8 @@ export interface RpcPortFileRecord {
      * auth required" only when the server itself didn't set one).
      */
     token?: string;
+    /** Per-server filename nonce; prevents same-process instances from sharing one file. */
+    instance_id?: string;
 }
 
 /**
@@ -31,8 +33,14 @@ export function rpcPortDir(storageDir: string, directory: string): string {
 }
 
 /** Per-process RPC port file path. */
-export function rpcPortFilePath(storageDir: string, directory: string, pid = process.pid): string {
-    return join(rpcPortDir(storageDir, directory), `port-${pid}.json`);
+export function rpcPortFilePath(
+    storageDir: string,
+    directory: string,
+    pid = process.pid,
+    instanceId?: string,
+): string {
+    const suffix = instanceId ? `-${instanceId}` : "";
+    return join(rpcPortDir(storageDir, directory), `port-${pid}${suffix}.json`);
 }
 
 /** Legacy single-port file used by v0.18.0 and earlier. */
@@ -66,6 +74,8 @@ export function parseRpcPortFile(content: string, fallbackPid = 0): RpcPortFileR
                 pid,
                 started_at: Number.isFinite(startedAt) ? startedAt : 0,
                 token: typeof parsed.token === "string" ? parsed.token : undefined,
+                instance_id:
+                    typeof parsed.instance_id === "string" ? parsed.instance_id : undefined,
             };
         } catch {
             return null;

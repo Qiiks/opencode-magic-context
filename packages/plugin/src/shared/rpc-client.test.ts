@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { MagicContextRpcClient } from "./rpc-client";
+import { drainNotifications, isTuiConnected, pushNotification } from "./rpc-notifications";
 import { MagicContextRpcServer } from "./rpc-server";
-import { parseRpcPortFile, rpcPortFilePath } from "./rpc-utils";
+import { parseRpcPortFile, type RpcPortFileRecord, rpcPortDir, rpcPortFilePath } from "./rpc-utils";
 
 interface TestServer {
     port: number;
@@ -54,6 +55,78 @@ function writePortFileForPid(
     const portFile = rpcPortFilePath(storageDir, directory, pid);
     mkdirSync(dirname(portFile), { recursive: true });
     writeFileSync(portFile, JSON.stringify({ port, pid, started_at: startedAt }), "utf-8");
+}
+
+function readNewestPortRecord(storageDir: string, directory: string): RpcPortFileRecord | null {
+    const records: RpcPortFileRecord[] = [];
+    for (const entry of readdirSync(rpcPortDir(storageDir, directory))) {
+        if (!entry.startsWith("port-") || !entry.endsWith(".json")) continue;
+        const record = parseRpcPortFile(
+            readFileSync(join(rpcPortDir(storageDir, directory), entry), "utf-8"),
+        );
+        if (record) records.push(record);
+    }
+    records.sort((a, b) => b.started_at - a.started_at);
+    return records[0] ?? null;
+}
+
+async function waitFor(condition: () => boolean, label: string, timeoutMs = 2_000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        if (condition()) return;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`Timed out waiting for ${label}`);
+}
+
+async function openSocket(port: number, token: string): Promise<WebSocket> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
+    await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("socket open timed out")), 2_000);
+        ws.addEventListener(
+            "open",
+            () => {
+                clearTimeout(timeout);
+                resolve();
+            },
+            { once: true },
+        );
+        ws.addEventListener(
+            "error",
+            () => {
+                clearTimeout(timeout);
+                reject(new Error("socket open failed"));
+            },
+            { once: true },
+        );
+    });
+    return ws;
+}
+
+function waitForJsonMessage<T extends { type?: string }>(
+    ws: WebSocket,
+    predicate: (message: T) => boolean,
+    timeoutMs = 2_000,
+): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            ws.removeEventListener("message", onMessage);
+            reject(new Error("socket message timed out"));
+        }, timeoutMs);
+        const onMessage = (event: MessageEvent) => {
+            let message: T;
+            try {
+                message = JSON.parse(String(event.data)) as T;
+            } catch {
+                return;
+            }
+            if (!predicate(message)) return;
+            clearTimeout(timeout);
+            ws.removeEventListener("message", onMessage);
+            resolve(message);
+        };
+        ws.addEventListener("message", onMessage);
+    });
 }
 
 async function startRpcServer(handler: (method: string) => Response | object): Promise<TestServer> {
@@ -145,9 +218,7 @@ describe("MagicContextRpcClient", () => {
         const port = await server.start();
         try {
             // Sanity: the port file carries a non-empty token.
-            const record = parseRpcPortFile(
-                readFileSync(rpcPortFilePath(storageDir, directory), "utf-8"),
-            );
+            const record = readNewestPortRecord(storageDir, directory);
             expect(typeof record?.token).toBe("string");
             expect((record?.token ?? "").length).toBeGreaterThan(0);
 
@@ -164,6 +235,94 @@ describe("MagicContextRpcClient", () => {
             expect(health.status).toBe(200);
         } finally {
             server.stop();
+        }
+    });
+
+    test("websocket upgrade rejects missing bearer token before a socket is created", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-ws-auth";
+        const server = new MagicContextRpcServer(storageDir, directory);
+        const port = await server.start();
+        try {
+            const res = await fetch(`http://127.0.0.1:${port}/ws`);
+            expect(res.status).toBe(401);
+            expect(isTuiConnected()).toBe(false);
+        } finally {
+            server.stop();
+        }
+    });
+
+    test("re-hello replaces the previous websocket notification sink", async () => {
+        drainNotifications(Number.MAX_SAFE_INTEGER);
+        const storageDir = makeTempDir();
+        const directory = "/repo-ws-rehello";
+        const server = new MagicContextRpcServer(storageDir, directory);
+        const port = await server.start();
+        const record = readNewestPortRecord(storageDir, directory);
+        expect(typeof record?.token).toBe("string");
+
+        const ws = await openSocket(port, record?.token ?? "");
+        const notifications: unknown[] = [];
+        ws.addEventListener("message", (event) => {
+            const message = JSON.parse(String(event.data)) as {
+                type?: string;
+                notification?: unknown;
+            };
+            if (message.type === "notification") notifications.push(message.notification);
+        });
+
+        try {
+            ws.send(JSON.stringify({ type: "hello", token: record?.token, sessionId: "ses_A" }));
+            await waitForJsonMessage(ws, (message) => message.type === "hello-ack");
+            expect(isTuiConnected("ses_A")).toBe(true);
+
+            ws.send(JSON.stringify({ type: "hello", token: record?.token, sessionId: "ses_B" }));
+            await waitForJsonMessage(ws, (message) => message.type === "hello-ack");
+            expect(isTuiConnected("ses_A")).toBe(false);
+            expect(isTuiConnected("ses_B")).toBe(true);
+
+            ws.send(JSON.stringify({ type: "hello", token: record?.token, sessionId: "ses_B" }));
+            await waitForJsonMessage(ws, (message) => message.type === "hello-ack");
+            pushNotification("live", { ok: true }, "ses_B");
+            await waitFor(() => notifications.length >= 1, "one live notification");
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            expect(notifications).toHaveLength(1);
+
+            ws.close();
+            await waitFor(() => !isTuiConnected(), "socket sink cleanup");
+        } finally {
+            try {
+                ws.close();
+            } catch {
+                // best-effort
+            }
+            server.stop();
+        }
+    });
+
+    test("same-process servers keep distinct port files during overlap", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-port-collision";
+        const first = new MagicContextRpcServer(storageDir, directory);
+        const second = new MagicContextRpcServer(storageDir, directory);
+        await first.start();
+        const secondPort = await second.start();
+
+        try {
+            const files = readdirSync(rpcPortDir(storageDir, directory)).filter(
+                (entry) => entry.startsWith("port-") && entry.endsWith(".json"),
+            );
+            expect(files.length).toBeGreaterThanOrEqual(2);
+
+            first.stop();
+            const remaining = readNewestPortRecord(storageDir, directory);
+            expect(remaining?.port).toBe(secondPort);
+
+            const client = new MagicContextRpcClient(storageDir, directory);
+            expect((await client.resolveEndpoint())?.port).toBe(secondPort);
+        } finally {
+            first.stop();
+            second.stop();
         }
     });
 

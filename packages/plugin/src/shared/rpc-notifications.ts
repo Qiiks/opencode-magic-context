@@ -107,38 +107,90 @@ export function pushNotification(
     }
 }
 
-/** Return pending notifications after acking the client's last received id.
+export interface DrainNotificationsOptions {
+    /**
+     * Cursor for global notifications when a session-scoped client sends separate
+     * session and global watermarks.
+     */
+    globalLastReceivedId?: number;
+    /** Ack/drain only the named session, not global notifications. */
+    sessionOnly?: boolean;
+    /** Ack/drain only session-less global notifications. */
+    globalOnly?: boolean;
+}
+
+function cursor(value: number | undefined): number {
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** Return pending notifications after pruning only the scopes the client acked.
  *
- *  Session scoping: when `sessionId` is provided, only notifications tagged for
- *  that session (or session-less/global ones) are returned and pruned — a
- *  notification tagged for a DIFFERENT session is never handed to this client
- *  and is never pruned by this client's ack. This matters because the in-memory
- *  queue is per-process but a TUI can end up bound to a process that also serves
- *  OTHER sessions: e.g. opening OpenCode Desktop on the same project starts a
- *  newer RPC server that the TUI's port discovery (newest-pid-wins) then selects,
- *  so a Desktop-session upgrade-dialog action would otherwise surface in an
- *  unrelated TUI session. Each client also tracks its own `lastReceivedId`, so a
- *  global watermark prune would let session A's ack drop session B's still-unseen
- *  notification — scoping the prune to the acking session prevents that too.
+ *  Session-scoped and global notifications have independent cursors. A TUI can
+ *  switch from session A to session B after handling a high id in A; that high
+ *  watermark must never prune B's lower, still-unseen ids. Global notifications
+ *  are also tracked separately so a global dialog does not become a session
+ *  watermark. Legacy callers that omit options keep the original single-cursor
+ *  behavior.
  *
  *  Delivery is at-least-once (non-destructive return + prune-on-ack): a returned
- *  notification stays queued until a later call acks it via a higher
- *  `lastReceivedId`, so a dropped WS socket re-delivers the backlog on reconnect
- *  (the client sends its `lastReceivedId` in the hello). */
-export function drainNotifications(lastReceivedId = 0, sessionId?: string): RpcNotification[] {
+ *  notification stays queued until a later call acks it via the matching scope's
+ *  cursor, so a dropped WS socket re-delivers unhandled backlog on reconnect. */
+export function drainNotifications(
+    lastReceivedId = 0,
+    sessionId?: string,
+    options: DrainNotificationsOptions = {},
+): RpcNotification[] {
+    const sessionCursor = cursor(lastReceivedId);
+
+    if (options.globalOnly) {
+        queue = queue.filter(
+            (notification) =>
+                notification.sessionId !== undefined || notification.id > sessionCursor,
+        );
+        return queue.filter(
+            (notification) =>
+                notification.sessionId === undefined && notification.id > sessionCursor,
+        );
+    }
+
+    if (options.sessionOnly) {
+        if (sessionId === undefined) return [];
+        queue = queue.filter(
+            (notification) =>
+                notification.sessionId !== sessionId || notification.id > sessionCursor,
+        );
+        return queue.filter(
+            (notification) =>
+                notification.sessionId === sessionId && notification.id > sessionCursor,
+        );
+    }
+
+    if (sessionId !== undefined && options.globalLastReceivedId !== undefined) {
+        const globalCursor = cursor(options.globalLastReceivedId);
+        queue = queue.filter((notification) => {
+            if (notification.sessionId === undefined) return notification.id > globalCursor;
+            if (notification.sessionId === sessionId) return notification.id > sessionCursor;
+            return true;
+        });
+        return queue.filter((notification) => {
+            if (notification.sessionId === undefined) return notification.id > globalCursor;
+            return notification.sessionId === sessionId && notification.id > sessionCursor;
+        });
+    }
+
     const matchesClient = (notification: RpcNotification): boolean =>
         sessionId === undefined ||
         notification.sessionId === undefined ||
         notification.sessionId === sessionId;
-    if (lastReceivedId > 0) {
-        // Prune only notifications THIS client both owns (session-matched) and has
-        // acked (id <= lastReceivedId). Other sessions' notifications survive.
+    if (sessionCursor > 0) {
+        // Legacy single-cursor mode prunes the scopes this client can see. New WS
+        // clients pass dual cursors above so cross-session watermarks stay isolated.
         queue = queue.filter(
-            (notification) => !(notification.id <= lastReceivedId && matchesClient(notification)),
+            (notification) => !(notification.id <= sessionCursor && matchesClient(notification)),
         );
     }
     return queue.filter(
-        (notification) => notification.id > lastReceivedId && matchesClient(notification),
+        (notification) => notification.id > sessionCursor && matchesClient(notification),
     );
 }
 

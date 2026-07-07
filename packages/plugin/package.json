@@ -30,8 +30,9 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
+    "build": "bun run build:tui && bun build src/index.ts --outdir dist --target node --format esm --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
     "build:tui": "bun scripts/build-tui.ts",
+    "check:tui-compiled": "bun run build:tui && git diff --exit-code -- src/tui-compiled && test -z \"$(git status --porcelain -- src/tui-compiled)\"",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun test",
     "lint": "biome check .",
