@@ -631,6 +631,16 @@ impl McHandler {
         };
         let state = loaded.meta.historian.state.as_str().to_string();
         let last_failure = loaded.meta.historian.last_failure.clone();
+        if loaded.meta.pending_rewrite.is_some() {
+            return PreparedHistorianAction::Complete(HistorianDiagnostics {
+                fired: false,
+                reason: None,
+                no_fire: Some("pending_rewrite".to_string()),
+                state,
+                progress: None,
+                last_failure,
+            });
+        }
         if let Some(completion) = self.live_historian_completion_wait(&parsed.session_id) {
             return PreparedHistorianAction::Busy {
                 diagnostics: HistorianDiagnostics {
@@ -1715,7 +1725,7 @@ mod tests {
         CkIngressMessage, CkKind, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
     };
     use historian_producer::{ProducerOutput, RunHandle, RunState};
-    use mc_store::{HistorianChunkRange, HistorianDurableState, ModuleUsage};
+    use mc_store::{HistorianChunkRange, HistorianDurableState, ModuleUsage, StoredCompartment};
     use tokio::sync::Notify;
 
     #[test]
@@ -1985,6 +1995,20 @@ mod tests {
         ck_with_role(mid, ordinal, "user", text)
     }
 
+    fn stored_comp(seq: i64, start: i64, end: i64, end_mid: &str, p1: &str) -> StoredCompartment {
+        StoredCompartment {
+            sequence: seq,
+            start_message: start,
+            end_message: end,
+            end_message_id: format!("{end_mid}#0"),
+            title: format!("C{seq}"),
+            content: p1.to_string(),
+            p1: Some(p1.to_string()),
+            importance: 50,
+            ..Default::default()
+        }
+    }
+
     fn big_messages_from(start_ordinal: u64) -> Vec<CkIngressMessage> {
         (0..80)
             .map(|idx| {
@@ -2051,7 +2075,15 @@ mod tests {
     }
 
     async fn call_transform_request(handler: &McHandler, request: Value) -> Value {
-        match handler.handle_transform_for_test(7, request).await {
+        call_transform_request_on_channel(handler, 7, request).await
+    }
+
+    async fn call_transform_request_on_channel(
+        handler: &McHandler,
+        channel: u16,
+        request: Value,
+    ) -> Value {
+        match handler.handle_transform_for_test(channel, request).await {
             HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         }
@@ -2104,6 +2136,106 @@ mod tests {
         assert_eq!(child["action"], "PASSTHROUGH");
         assert_eq!(child["ck_messages"].as_array().unwrap().len(), 1);
         assert_eq!(child["ck_messages"][0]["role"], "user");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn emergency_absent_shape_pending_suppresses_historian_fire() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        store
+            .replace_compartments("ses", &[stored_comp(1, 1, 1, "m1", "S0")])
+            .unwrap();
+
+        let boot = call_transform_request(
+            &handler,
+            request_with_usage(vec![ck("m1", 1, "raw"), ck("m2", 2, "tail")], 1, 100),
+        )
+        .await;
+        assert_eq!(boot["action"], "HARD");
+        assert_eq!(boot["boundary_id"], "m1#0");
+
+        let raw = call_transform_request(
+            &handler,
+            request_with_usage(vec![ck("foreign", 90, "other conversation")], 95, 100),
+        )
+        .await;
+        assert_eq!(raw["action"], "PASSTHROUGH");
+        assert_eq!(raw["historian"]["no_fire"], "pending_rewrite");
+        assert_eq!(producer.connects.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        assert!(store.load("ses").unwrap().meta.pending_rewrite.is_some());
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn composite_session_keys_scope_lineage_and_do_not_match_child_prefix_suffixes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
+        let key_a = "conversation:root|agent:alpha";
+        let key_b = "conversation:root|agent:beta";
+        let suffix_key = "conversation:root|scope:mc-historian:child";
+        handler.bind_route(8, binding(project.to_str().unwrap(), key_a));
+        handler.bind_route(9, binding(project.to_str().unwrap(), key_b));
+        handler.bind_route(10, binding(project.to_str().unwrap(), suffix_key));
+
+        store
+            .replace_compartments(key_a, &[stored_comp(1, 1, 1, "a1", "A")])
+            .unwrap();
+        store
+            .replace_compartments(key_b, &[stored_comp(1, 1, 1, "b1", "B")])
+            .unwrap();
+
+        let a = call_transform_request_on_channel(
+            &handler,
+            8,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "owned-llmrunner",
+                "session_id": key_a,
+                "render_config": "cfg0",
+                "usage": ModuleUsage { current_total_input_tokens: 1, context_limit_tokens: 100 },
+                "messages": [ck("a1", 1, "raw a"), ck("a2", 2, "tail a")],
+            }),
+        )
+        .await;
+        let b = call_transform_request_on_channel(
+            &handler,
+            9,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "owned-llmrunner",
+                "session_id": key_b,
+                "render_config": "cfg0",
+                "usage": ModuleUsage { current_total_input_tokens: 1, context_limit_tokens: 100 },
+                "messages": [ck("b1", 1, "raw b"), ck("b2", 2, "tail b")],
+            }),
+        )
+        .await;
+        assert_eq!(a["boundary_id"], "a1#0");
+        assert_eq!(b["boundary_id"], "b1#0");
+        assert_eq!(store.load(key_a).unwrap().core.boundary_id, "a1#0");
+        assert_eq!(store.load(key_b).unwrap().core.boundary_id, "b1#0");
+
+        let suffix = call_transform_request_on_channel(
+            &handler,
+            10,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "owned-llmrunner",
+                "session_id": suffix_key,
+                "render_config": "cfg0",
+                "usage": ModuleUsage { current_total_input_tokens: 1, context_limit_tokens: 100 },
+                "messages": [ck("s1", 1, "not a child producer session")],
+            }),
+        )
+        .await;
+        assert_eq!(suffix["action"], "HARD");
+        assert!(store.load(suffix_key).unwrap().row_version.is_some());
+        assert!(!suffix_key.starts_with(historian::MC_CHILD_SESSION_PREFIX));
     }
 
     #[tokio::test(flavor = "current_thread")]

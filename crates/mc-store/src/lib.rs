@@ -807,6 +807,20 @@ pub struct DeferredExecuteState {
     pub reason: String,
 }
 
+/// Durable alarm state for a boundary-absent request that shares no prefix with the
+/// session's held lineage. The transform arms this once and then serves matching
+/// absent-shape traffic raw without more writes; only boundary-present recovery or a
+/// later re-arm advances the diagnostic counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRewriteState {
+    pub armed_at_ms: i64,
+    pub absent_shape_fingerprint: String,
+    #[serde(default)]
+    pub absent_request_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_present_at_ms: Option<i64>,
+}
+
 /// The durable identity fingerprint for one block of a message. The transform records
 /// the ordered vector per `mid` and rejects later drift instead of silently applying
 /// frozen reductions to a different block list.
@@ -891,6 +905,22 @@ pub struct ModuleMeta {
     /// bump so state dumps explain which suffix was dropped without retaining history.
     #[serde(default)]
     pub last_recut: Option<String>,
+    /// A boundary-absent, share-nothing request on a key that already has lineage. This
+    /// is an alarmed raw-pass-through state, not a predicate for a future truncate.
+    #[serde(default)]
+    pub pending_rewrite: Option<PendingRewriteState>,
+    /// Interleave edges between pending raw traffic and boundary-present traffic. The
+    /// counter is diagnostic and drives the durable ambiguous alarm.
+    #[serde(default)]
+    pub pending_rewrite_trip_count: u32,
+    /// True after repeated arm/clear interleaving proves two conversations are sharing
+    /// one session key. Serving continues, but absent-shape traffic remains raw.
+    #[serde(default)]
+    pub pending_rewrite_ambiguous: bool,
+    /// Durable loud detail for the pending/ambiguous rewrite alarm. It is separate from
+    /// historian failures because no historian run owns this state.
+    #[serde(default)]
+    pub pending_rewrite_last_failure: Option<String>,
     /// Frozen CK-native synthetic todo pair plus the real tail message id it follows.
     /// Replays keep this exact position; only changed todo content moves it to a new
     /// tail end.

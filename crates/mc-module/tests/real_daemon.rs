@@ -4,8 +4,8 @@
 //!
 //! Covered here (the cases drivable through the real production path): the first-pass
 //! Hard fold, growing-tail and nonce-only defers (cached prefix byte-stable), an
-//! epoch (render-config) Hard, a revert that removes the boundary (defer + reconcile,
-//! then Hard rematerialize), and a process restart replaying byte-identical. The m1
+//! epoch (render-config) Hard, a share-nothing boundary absence that degrades to raw
+//! pending-rewrite pass-through, and a process restart replaying byte-identical. The m1
 //! delta SOFT and the deferred-drop drain need a content/reducer producer not yet
 //! built, so they are exercised in the library tests with stubbed inputs instead.
 
@@ -191,21 +191,29 @@ async fn mc_transform_spine_through_real_daemon() {
     assert_eq!(e["action"], "HARD", "epoch change must fold Hard");
     assert!(m0(&e).contains("SUMMARY-1-10"));
 
-    // revert removes the boundary "m10" (array no longer contains it) → defer+reconcile.
+    // A share-nothing boundary absence is not a safe re-cut target. It returns the raw
+    // array, arms the pending-rewrite alarm, and leaves the held lineage intact.
     let rev = call(
         &consumer,
         json!({ "session_id": "spine", "render_config": "cfg1", "messages": [ck("z", 90, "other")] }),
     )
     .await;
-    assert_eq!(rev["action"], "SOFT+", "revert pass must not bust");
     assert_eq!(
-        rev["reconcile_pending"], true,
-        "boundary loss flags reconcile"
+        rev["action"], "PASSTHROUGH",
+        "share-nothing revert degrades raw"
     );
-    assert!(m0(&rev).contains("SUMMARY-1-10"), "revert keeps frozen m0");
+    assert_eq!(
+        rev["reconcile_pending"], false,
+        "pending raw traffic must not set reconcile"
+    );
+    assert_eq!(
+        tail_ids(&rev),
+        vec!["z"],
+        "raw pass-through returns the live array"
+    );
 
-    // the boundary returns (m10 back in the array) → a reconcile-CLEARING defer: it writes
-    // once to clear the flag but the prefix stays byte-identical (still SOFT+, not a bust).
+    // The boundary returns (m10 back in the array) → pending clears in a normal defer: it
+    // writes once to clear the alarm but the prefix stays byte-identical (still SOFT+).
     let reconciled = call(
         &consumer,
         json!({ "session_id": "spine", "render_config": "cfg1", "messages": [ck("m10", 10, "raw covered")] }),

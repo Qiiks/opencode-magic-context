@@ -30,11 +30,14 @@ use crate::selection::{
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
-    DeferredExecuteState, McStore, McStoreError, ModuleMeta, ModuleUsage, StoredCompartment,
+    DeferredExecuteState, McStore, McStoreError, ModuleMeta, ModuleUsage, PendingRewriteState,
+    StoredCompartment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt::Write as _;
 
 use crate::ck_wire::{
     duplicate_ids, project_messages, reduced_block, split_block_id, CkIngressMessage, CkWireBlock,
@@ -54,6 +57,10 @@ const SYNTH_REGION_KIND: &str = "synthesized-region";
 /// Frozen-unit key prefix for a tail reduction (a reduced tool output / superseded edit).
 /// `red:<target_id>` — the target is the real tail item whose bytes are replaced.
 const RED_KEY_PREFIX: &str = "red:";
+/// Repeated pending/raw ↔ present interleaving should be impossible with correctly
+/// separated upstream session keys. Five edges corresponds to three arm/clear cycles
+/// when the initial arm is not counted as evidence of multiplexing by itself.
+const PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD: u32 = 5;
 
 /// The m1 delta content + its byte-affecting digest. `revision` is a digest over ALL
 /// byte-affecting m1 render inputs such that `render` is a pure function of what the
@@ -534,8 +541,6 @@ fn apply_once(
     }
 
     let loaded = store.load(&req.session_id)?;
-    enforce_block_identity(&loaded.meta, &projection, &loaded.core)?;
-    let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
 
     // --- boundary presence: computed over live source vs durable boundary_id ---
     let boundary_present = !loaded.core.boundary_id.is_empty()
@@ -545,6 +550,90 @@ fn apply_once(
     } else {
         "-".to_string()
     };
+
+    let mut has_compartments_cache: Option<bool> = None;
+    let mut pending_rewrite_absent_shape = false;
+    if !boundary_present {
+        let needs_lineage_check = loaded.meta.pending_rewrite.is_some()
+            || !loaded.core.boundary_id.is_empty()
+            || loaded.meta.coverage_ordinal.is_some()
+            || {
+                let has_compartments = store.has_compartments(&req.session_id)?;
+                has_compartments_cache = Some(has_compartments);
+                has_compartments
+            };
+        if needs_lineage_check {
+            let compartments = store.load_compartments(&req.session_id)?;
+            let has_compartments = !compartments.is_empty();
+            has_compartments_cache = Some(has_compartments);
+            pending_rewrite_absent_shape = loaded.row_version.is_some()
+                && has_durable_lineage(&loaded.core, &loaded.meta, has_compartments)
+                && surviving_revert_prefix_seq(&compartments, &live) < 0;
+        }
+    }
+
+    // A share-nothing boundary absence on a session with held lineage is not a valid
+    // re-cut target. New conversations must arrive on a fresh upstream key; on an old
+    // key this is either a missed lineage switch or foreign traffic. The destructive
+    // truncate-all arm is eliminated, not gated: only a committed truncate may bump the
+    // revert epoch, and this arm never owns a truncate. It records one durable alarm and
+    // then serves raw bytes without touching identity, usage, scheduler, or core state.
+    if pending_rewrite_absent_shape {
+        let fingerprint = absent_shape_fingerprint(&live);
+        if loaded.meta.pending_rewrite.is_some() {
+            eprintln!(
+                "mc-module: pending_rewrite raw pass-through for {} fingerprint {}",
+                req.session_id, fingerprint
+            );
+            return Ok(pending_passthrough_result(
+                projection,
+                req,
+                loaded.row_version.unwrap_or(0),
+                false,
+            ));
+        }
+
+        let core = loaded.core.clone();
+        let mut meta = loaded.meta.clone();
+        let mut trip_count = meta.pending_rewrite_trip_count;
+        if trip_count > 0 {
+            trip_count = trip_count.saturating_add(1);
+        }
+        let ambiguous = meta.pending_rewrite_ambiguous
+            || trip_count >= PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD;
+        meta.pending_rewrite = Some(PendingRewriteState {
+            armed_at_ms: ctx.now_ms,
+            absent_shape_fingerprint: fingerprint.clone(),
+            absent_request_count: 1,
+            last_present_at_ms: (meta.last_committed_pass_at_ms > 0)
+                .then_some(meta.last_committed_pass_at_ms),
+        });
+        meta.pending_rewrite_trip_count = trip_count;
+        meta.pending_rewrite_ambiguous = ambiguous;
+        meta.pending_rewrite_last_failure = Some(pending_rewrite_detail(
+            &req.session_id,
+            &fingerprint,
+            ambiguous,
+        ));
+        meta.last_committed_pass_at_ms = ctx.now_ms;
+        let row_version = store.commit(&req.session_id, loaded.row_version, &core, &meta)?;
+        eprintln!(
+            "mc-module: armed pending_rewrite for {} fingerprint {} ambiguous={}",
+            req.session_id, fingerprint, ambiguous
+        );
+        return Ok(pending_passthrough_result(
+            projection,
+            req,
+            row_version,
+            true,
+        ));
+    }
+
+    let clear_pending_rewrite_on_present =
+        loaded.meta.pending_rewrite.is_some() && boundary_present;
+
+    enforce_block_identity(&loaded.meta, &projection, &loaded.core)?;
+    let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
 
     // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
     // The effective render_config folds the live m0-content-epoch (workspace_fingerprint)
@@ -610,8 +699,14 @@ fn apply_once(
     // correctly ride m1 as a SOFT delta once the boundary is present. The store query runs
     // only in this rare never-minted window (short-circuited by is_empty), never in steady
     // state where the boundary is present.
-    let first_fold_due =
-        loaded.core.boundary_id.is_empty() && store.has_compartments(&req.session_id)?;
+    let first_fold_due = if loaded.core.boundary_id.is_empty() {
+        match has_compartments_cache {
+            Some(value) => value,
+            None => store.has_compartments(&req.session_id)?,
+        }
+    } else {
+        false
+    };
     let render_config_changed =
         loaded.meta.initialized && effective_render_config != loaded.meta.last_render_config;
     let reconcile_hard_due = loaded.core.reconcile_pending && !boundary_present;
@@ -703,6 +798,24 @@ fn apply_once(
     let mut core = loaded.core.clone();
     let mut meta = loaded.meta.clone();
     let mut commit_expected = loaded.row_version;
+    if clear_pending_rewrite_on_present {
+        meta.pending_rewrite = None;
+        meta.pending_rewrite_trip_count = meta.pending_rewrite_trip_count.saturating_add(1);
+        if meta.pending_rewrite_trip_count >= PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD {
+            meta.pending_rewrite_ambiguous = true;
+            meta.pending_rewrite_last_failure = Some(pending_rewrite_detail(
+                &req.session_id,
+                "boundary_present_recovery",
+                true,
+            ));
+            eprintln!(
+                "mc-module: pending_rewrite ambiguous after boundary-present recovery for {}",
+                req.session_id
+            );
+        } else if !meta.pending_rewrite_ambiguous {
+            meta.pending_rewrite_last_failure = None;
+        }
+    }
     apply_ingress_meta(&mut meta, req, &projection);
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
 
@@ -1459,6 +1572,68 @@ fn surviving_revert_prefix_seq(compartments: &[StoredCompartment], live: &[&Flat
         .unwrap_or(-1)
 }
 
+fn has_durable_lineage(core: &CoreState, meta: &ModuleMeta, has_compartments: bool) -> bool {
+    has_compartments || !core.boundary_id.is_empty() || meta.coverage_ordinal.is_some()
+}
+
+fn absent_shape_fingerprint(live: &[&FlatBlock]) -> String {
+    let mut hasher = Sha256::new();
+    for block in live {
+        hasher.update(block.id.as_bytes());
+        hasher.update([0]);
+        hasher.update(block.ordinal.to_le_bytes());
+        hasher.update([0]);
+        hasher.update(block.role.as_bytes());
+        hasher.update([0]);
+        hasher.update(block.kind_tag.as_bytes());
+        hasher.update([0]);
+        hasher.update(block.bytes.as_bytes());
+        hasher.update([0xff]);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn pending_rewrite_detail(session_id: &str, fingerprint: &str, ambiguous: bool) -> String {
+    let state = if ambiguous {
+        "ambiguous_pending_rewrite"
+    } else {
+        "pending_rewrite"
+    };
+    format!(
+        "{state}: boundary-absent share-nothing array on session {session_id}; \
+         absent_shape_fingerprint={fingerprint}; expected causes are an upstream \
+         lineage-switch detection miss or foreign traffic on this session key; serving raw \
+         pass-through and preserving the held lineage"
+    )
+}
+
+fn pending_passthrough_result(
+    projection: FlatProjection,
+    req: &TransformRequest,
+    row_version: u64,
+    committed: bool,
+) -> TransformWithProjection {
+    let mut response = TransformResponse::passthrough(
+        req.messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect(),
+        req.full_array_fingerprint.clone(),
+    );
+    response.row_version = row_version;
+    response.committed = committed;
+    TransformWithProjection {
+        projection,
+        scheduler_pass: scheduler::PassDecision::Defer,
+        response,
+    }
+}
+
 fn anchor_folded_by_coverage(
     req: &TransformRequest,
     old_coverage: Option<u64>,
@@ -1806,6 +1981,48 @@ mod tests {
                 ck_wire::HarnessMeta::default(),
             ),
         }
+    }
+
+    fn item_with_block_provider_extras(
+        id: &str,
+        ordinal: u64,
+        bytes: &str,
+        nonce: &str,
+    ) -> CkIngressMessage {
+        let mut provider = std::collections::BTreeMap::new();
+        provider.insert("cache_control".to_string(), json!({ "nonce": nonce }));
+        let mut extras = ck_wire::ProviderExtras::new();
+        extras.insert("synthetic".to_string(), provider);
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![ck_wire::CkWireBlock::with_provider_extras(
+                    ck_wire::CkKind::Text {
+                        text: bytes.to_string(),
+                    },
+                    extras,
+                )],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(id.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn post_submit_strip_block_provider_extras(
+        mut messages: Vec<CkIngressMessage>,
+    ) -> Vec<CkIngressMessage> {
+        for message in &mut messages {
+            for block in &mut message.ck.content {
+                block.provider_extras.clear();
+            }
+        }
+        messages
     }
 
     fn flat_id(mid: &str) -> String {
@@ -3275,7 +3492,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_recut_nothing_survives_bootstraps_without_first_fold_loop() {
+    fn reconcile_recut_nothing_survives_arms_pending_raw_without_truncate() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 2, "t2", "S0")])
@@ -3284,27 +3501,240 @@ mod tests {
         let boot = run(&s, &req("ses", "cfg0", live_full), &spine());
         assert_eq!(boot.action, "HARD");
         assert_eq!(boot.boundary_id, "t2#0");
+        let before_absent = s.load("ses").unwrap();
+        let before_compartments = s.load_compartments("ses").unwrap();
 
-        let live_reverted = vec![item("t9", 9, "post-revert")];
-        let revert = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
-        assert_eq!(revert.action, "SOFT+");
-        assert!(revert.reconcile_pending);
+        let live_absent = vec![item("t9", 9, "post-revert")];
+        let armed = run(&s, &req("ses", "cfg0", live_absent.clone()), &spine());
+        assert_eq!(armed.action, "PASSTHROUGH");
+        assert!(armed.committed, "arming writes the one durable alarm row");
+        assert!(!armed.reconcile_pending);
+        assert_eq!(tail_ids(&armed), vec!["t9"]);
+        let after_arm = s.load("ses").unwrap();
+        assert_eq!(after_arm.core.boundary_id, before_absent.core.boundary_id);
+        assert!(!after_arm.core.reconcile_pending);
+        assert_eq!(after_arm.meta.revert_epoch, before_absent.meta.revert_epoch);
+        assert_eq!(s.load_compartments("ses").unwrap(), before_compartments);
+        assert!(after_arm.meta.pending_rewrite.is_some());
+        assert!(after_arm
+            .meta
+            .pending_rewrite_last_failure
+            .as_deref()
+            .unwrap()
+            .contains("upstream lineage-switch detection miss"));
 
-        let remat = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
-        assert_eq!(remat.action, "HARD");
-        assert_eq!(remat.boundary_id, "");
-        assert_eq!(remat.coverage_ordinal, None);
-        assert!(!remat.reconcile_pending);
-        assert_eq!(tail_ids(&remat), vec!["t9"]);
-        assert!(s.load_compartments("ses").unwrap().is_empty());
-        assert_eq!(s.load("ses").unwrap().meta.revert_epoch, 1);
+        let row_after_arm = after_arm.row_version.unwrap();
+        let repeat = run(&s, &req("ses", "cfg0", live_absent), &spine());
+        assert_eq!(repeat.action, "PASSTHROUGH");
+        assert!(!repeat.committed, "arm-once pending repeats are write-free");
+        assert_eq!(repeat.row_version, row_after_arm);
+        assert_eq!(tail_ids(&repeat), tail_ids(&armed));
+        assert_eq!(s.load("ses").unwrap().row_version.unwrap(), row_after_arm);
+        assert_eq!(s.load_compartments("ses").unwrap(), before_compartments);
+    }
 
-        let defer = run(&s, &req("ses", "cfg0", live_reverted), &spine());
-        assert_eq!(defer.action, "SOFT+");
-        assert!(
-            !defer.committed,
-            "an empty re-cut must not leave a first-fold trigger"
+    #[test]
+    fn fresh_key_share_nothing_bootstraps_without_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let boot = run(
+            &s,
+            &req("fresh", "cfg0", vec![item("foreign", 9, "new session")]),
+            &spine(),
         );
+        assert_eq!(boot.action, "HARD");
+        let loaded = s.load("fresh").unwrap();
+        assert!(loaded.meta.pending_rewrite.is_none());
+        assert!(loaded.row_version.is_some());
+    }
+
+    #[test]
+    fn provider_extras_strip_canary_does_not_arm_pending_on_legitimate_extension() {
+        // Coupling canary: MC's shape fingerprint uses flattened block bytes, while the
+        // upstream lineage-switch detector keys only on role/kind. Per-turn-churning
+        // provider fields must therefore be absent from both bases before MC sees the
+        // array; changing either basis requires changing the other together.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "S0")])
+            .unwrap();
+        let initial = post_submit_strip_block_provider_extras(vec![
+            item_with_block_provider_extras("a", 1, "raw", "first"),
+            item_with_block_provider_extras("b", 2, "tail", "first"),
+        ]);
+        let boot = run(&s, &req("ses", "cfg0", initial), &spine());
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(boot.boundary_id, "a#0");
+
+        let extension = post_submit_strip_block_provider_extras(vec![
+            item_with_block_provider_extras("a", 1, "raw", "changed"),
+            item_with_block_provider_extras("b", 2, "tail", "changed"),
+            item_with_block_provider_extras("c", 3, "extension", "changed"),
+        ]);
+        let pass = run(&s, &req("ses", "cfg0", extension), &spine());
+        assert_eq!(pass.action, "SOFT+");
+        assert_eq!(pass.boundary_id, "a#0");
+        assert!(s.load("ses").unwrap().meta.pending_rewrite.is_none());
+    }
+
+    #[test]
+    fn pending_rewrite_recovers_on_boundary_present_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 2, "t2", "S0")])
+            .unwrap();
+        let live_present = vec![item("t2", 2, "turn two"), item("t3", 3, "tail")];
+        let boot = run(&s, &req("ses", "cfg0", live_present.clone()), &spine());
+        assert_eq!(boot.boundary_id, "t2#0");
+
+        let absent = vec![item("foreign", 50, "other conversation")];
+        let armed = run(&s, &req("ses", "cfg0", absent), &spine());
+        assert_eq!(armed.action, "PASSTHROUGH");
+        assert!(s.load("ses").unwrap().meta.pending_rewrite.is_some());
+
+        let recovered_live = vec![
+            item("t2", 2, "turn two"),
+            item("t3", 3, "tail"),
+            item("t4", 4, "extension"),
+        ];
+        let recovered = run(&s, &req("ses", "cfg0", recovered_live), &spine());
+        assert_eq!(recovered.action, "SOFT+");
+        assert_eq!(recovered.boundary_id, "t2#0");
+        assert_eq!(tail_ids(&recovered), vec!["t3", "t4"]);
+        let loaded = s.load("ses").unwrap();
+        assert!(loaded.meta.pending_rewrite.is_none());
+        assert!(!loaded.meta.pending_rewrite_ambiguous);
+        assert_eq!(loaded.meta.revert_epoch, 0);
+        assert_eq!(s.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_rewrite_interleave_sets_ambiguous_without_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 2, "t2", "S0")])
+            .unwrap();
+        let present = vec![item("t2", 2, "turn two"), item("t3", 3, "tail")];
+        let boot = run(&s, &req("ses", "cfg0", present.clone()), &spine());
+        assert_eq!(boot.boundary_id, "t2#0");
+
+        for cycle in 0..3 {
+            let absent = vec![item(&format!("foreign{cycle}"), 50 + cycle, "other")];
+            let raw = run(&s, &req("ses", "cfg0", absent), &spine());
+            assert_eq!(raw.action, "PASSTHROUGH");
+            let normal = run(&s, &req("ses", "cfg0", present.clone()), &spine());
+            assert_eq!(normal.action, "SOFT+");
+        }
+
+        let loaded = s.load("ses").unwrap();
+        assert!(loaded.meta.pending_rewrite.is_none());
+        assert!(loaded.meta.pending_rewrite_ambiguous);
+        assert!(loaded
+            .meta
+            .pending_rewrite_last_failure
+            .as_deref()
+            .unwrap()
+            .contains("ambiguous_pending_rewrite"));
+        assert_eq!(loaded.meta.revert_epoch, 0);
+        assert_eq!(s.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_rewrite_passes_isolate_ingress_meta_usage_and_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 2, "t2", "S0")])
+            .unwrap();
+        let boot = run(
+            &s,
+            &with_usage(
+                req(
+                    "ses",
+                    "cfg0",
+                    vec![item("t2", 2, "turn two"), item("t3", 3, "tail")],
+                ),
+                10,
+                100,
+            ),
+            &spine(),
+        );
+        assert_eq!(boot.boundary_id, "t2#0");
+        let before = s.load("ses").unwrap();
+
+        let foreign_same_mid = vec![item("t3", 90, "foreign bytes with reused tail mid")];
+        let armed = run(
+            &s,
+            &with_usage(req("ses", "cfg0", foreign_same_mid.clone()), 95, 100),
+            &spine(),
+        );
+        assert_eq!(armed.action, "PASSTHROUGH");
+        let after_arm = s.load("ses").unwrap();
+        assert_eq!(
+            after_arm.meta.block_identity_by_mid, before.meta.block_identity_by_mid,
+            "foreign block identities are never adopted while arming pending"
+        );
+        assert_eq!(after_arm.meta.last_usage, before.meta.last_usage);
+        assert_eq!(
+            after_arm.core.reconcile_pending,
+            before.core.reconcile_pending
+        );
+
+        let row_after_arm = after_arm.row_version.unwrap();
+        let meta_after_arm = after_arm.meta.clone();
+        let repeat = run(
+            &s,
+            &with_usage(req("ses", "cfg0", foreign_same_mid), 100, 100),
+            &spine(),
+        );
+        assert_eq!(repeat.action, "PASSTHROUGH");
+        let after_repeat = s.load("ses").unwrap();
+        assert_eq!(after_repeat.row_version.unwrap(), row_after_arm);
+        assert_eq!(after_repeat.meta, meta_after_arm);
+        assert_eq!(
+            after_repeat.core.reconcile_pending,
+            before.core.reconcile_pending
+        );
+    }
+
+    #[test]
+    fn pending_rewrite_persists_across_store_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = store(dir.path());
+            s.replace_compartments("ses", &[comp(1, 1, 2, "t2", "S0")])
+                .unwrap();
+            let boot = run(
+                &s,
+                &req(
+                    "ses",
+                    "cfg0",
+                    vec![item("t2", 2, "turn two"), item("t3", 3, "tail")],
+                ),
+                &spine(),
+            );
+            assert_eq!(boot.boundary_id, "t2#0");
+            let raw = run(
+                &s,
+                &req("ses", "cfg0", vec![item("foreign", 90, "other")]),
+                &spine(),
+            );
+            assert_eq!(raw.action, "PASSTHROUGH");
+            assert!(s.load("ses").unwrap().meta.pending_rewrite.is_some());
+        }
+
+        let s = store(dir.path());
+        let before = s.load("ses").unwrap();
+        assert!(before.meta.pending_rewrite.is_some());
+        let row = before.row_version.unwrap();
+        let raw = run(
+            &s,
+            &req("ses", "cfg0", vec![item("foreign", 90, "other")]),
+            &spine(),
+        );
+        assert_eq!(raw.action, "PASSTHROUGH");
+        assert!(!raw.committed);
+        assert_eq!(s.load("ses").unwrap().row_version.unwrap(), row);
+        assert_eq!(s.load_compartments("ses").unwrap().len(), 1);
     }
 
     #[test]
@@ -3724,17 +4154,16 @@ mod tests {
         );
         assert_eq!(m0_bytes(&defer), m0_bytes(&soft));
 
-        // revert BELOW the new boundary (m20 gone) → boundary absent → reconcile
+        // A share-nothing boundary absence is not a safe re-cut target. It degrades to
+        // raw pass-through and arms the pending-rewrite alarm without touching lineage.
         let revert = run(
             &s,
             &req("ses", "cfg0", vec![item("z", 30, "other")]),
             &spine(),
         );
-        assert_eq!(revert.action, "SOFT+");
-        assert!(
-            revert.reconcile_pending,
-            "revert below b1 → reconcile pending"
-        );
+        assert_eq!(revert.action, "PASSTHROUGH");
+        assert!(!revert.reconcile_pending);
+        assert!(s.load("ses").unwrap().meta.pending_rewrite.is_some());
     }
 
     #[test]
@@ -3887,7 +4316,7 @@ mod tests {
     }
 
     #[test]
-    fn revert_defers_then_reconcile_rematerializes() {
+    fn share_nothing_revert_arms_pending_instead_of_reconcile_rematerializing() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 10, "m10", "S1")])
@@ -3900,30 +4329,20 @@ mod tests {
         assert_eq!(before.action, "HARD");
         assert_eq!(before.boundary_id, "m10#0");
 
-        // revert removed the boundary message m10 — array no longer contains it
-        let revert = run(
+        let raw = run(
             &s,
             &req("ses", "cfg0", vec![item("z", 50, "other")]),
             &spine(),
         );
-        assert_eq!(revert.action, "SOFT+", "revert must not bust");
-        assert!(revert.reconcile_pending);
-        assert_eq!(m0_bytes(&revert), m0_bytes(&before), "frozen m0 replays");
-        assert!(revert.committed, "reconcile flag flip persists");
-
-        // the compartment is also gone after the revert (the historian would re-cut), so
-        // the next pass with the boundary still absent → Hard rematerialize. With no
-        // compartments now, m0 is the empty-history placeholder over the live tail.
-        s.replace_compartments("ses", &[]).unwrap();
-        let remat = run(
-            &s,
-            &req("ses", "cfg0", vec![item("a2", 60, "reverted")]),
-            &spine(),
-        );
-        assert_eq!(remat.action, "HARD");
-        assert_eq!(remat.boundary_id, "", "no compartment → empty anchor");
-        assert!(!remat.reconcile_pending);
-        assert_eq!(tail_ids(&remat), vec!["a2"], "live item is the tail");
+        assert_eq!(raw.action, "PASSTHROUGH");
+        assert!(!raw.reconcile_pending);
+        assert_eq!(tail_ids(&raw), vec!["z"]);
+        let loaded = s.load("ses").unwrap();
+        assert_eq!(loaded.core.boundary_id, "m10#0");
+        assert!(!loaded.core.reconcile_pending);
+        assert!(loaded.meta.pending_rewrite.is_some());
+        assert_eq!(loaded.meta.revert_epoch, 0);
+        assert_eq!(s.load_compartments("ses").unwrap().len(), 1);
     }
 
     #[test]
@@ -4875,55 +5294,48 @@ mod tests {
     }
 
     #[test]
-    fn reverted_orphan_reduction_gcd_on_reconcile_hard() {
+    fn reverted_orphan_reduction_gcd_on_surviving_prefix_reconcile_hard() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        bootstrap_covering_a(&s);
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "S1"), comp(2, 2, 2, "b", "S2")])
+            .unwrap();
+        let live = vec![
+            item("a", 1, "raw a"),
+            item("b", 2, "raw b"),
+            item("t3", 3, "OUT"),
+        ];
+        let boot = run(&s, &req("ses", "cfg0", live.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(boot.boundary_id, "b#0");
 
-        // freeze a drop on t2
-        let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
-        run(
-            &s,
-            &req(
-                "ses",
-                "cfg0",
-                vec![item("a", 1, "raw"), item("t2", 2, "OUT")],
-            ),
-            &d,
-        );
+        // Freeze a drop on t3. The later revert keeps compartment a, so this exercises
+        // the surviving-prefix re-cut path rather than the share-nothing raw alarm.
+        let d = with_reductions(vec![reduce("t3", "drop", "[dropped 1]")]);
+        let soft = run(&s, &req("ses", "cfg0", live), &d);
+        assert_eq!(soft.action, "SOFT");
+        assert_eq!(tail_bytes(&soft, "t3"), "[dropped 1]");
 
-        // a revert removes BOTH the boundary "a" AND the reduced item t2 from the array
-        let revert = run(
-            &s,
-            &req("ses", "cfg0", vec![item("z", 9, "other")]),
-            &spine(),
-        );
+        let reverted = vec![item("a", 1, "raw a"), item("z", 9, "other")];
+        let revert = run(&s, &req("ses", "cfg0", reverted.clone()), &spine());
         assert_eq!(revert.action, "SOFT+");
         assert!(revert.reconcile_pending);
 
-        // reconcile-HARD rematerializes; the compartment is gone too (the historian re-cut),
-        // When compartments are cleared, the history summary is recomputed with no
-        // compartments left, so m0 becomes the empty baseline and the reduction for
-        // t2#0 is removed because it no longer targets a live tail block.
-        s.replace_compartments("ses", &[]).unwrap();
-        let remat = run(
-            &s,
-            &req("ses", "cfg0", vec![item("a2", 10, "reverted")]),
-            &spine(),
-        );
+        let remat = run(&s, &req("ses", "cfg0", reverted), &spine());
         assert_eq!(remat.action, "HARD");
+        assert_eq!(remat.boundary_id, "a#0");
         assert!(
             !m0_bytes(&remat).contains("[dropped 1]"),
             "no orphaned reduction in m0"
         );
         let reloaded = s.load("ses").unwrap();
+        assert_eq!(s.load_compartments("ses").unwrap().len(), 1);
         assert!(
             !reloaded
                 .core
                 .frozen_units
                 .iter()
-                .any(|u| u.key == "red:t2#0"),
-            "orphan red:t2#0 GC'd"
+                .any(|u| u.key == "red:t3#0"),
+            "orphan red:t3#0 GC'd"
         );
     }
 
