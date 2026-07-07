@@ -6,6 +6,32 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 10_000;
 
+interface VerificationPathsExecOptions {
+    cwd: string;
+    timeout: number;
+    maxBuffer: number;
+    encoding: BufferEncoding;
+}
+
+type VerificationPathsExecResult = {
+    stdout: string | Buffer;
+    stderr: string | Buffer;
+};
+
+type VerificationPathsExecFile = (
+    file: string,
+    args: readonly string[],
+    options: VerificationPathsExecOptions,
+) => Promise<VerificationPathsExecResult>;
+
+const defaultExecFileForVerificationPaths: VerificationPathsExecFile = async (
+    file,
+    args,
+    options,
+) => (await execFileAsync(file, [...args], options)) as VerificationPathsExecResult;
+
+let execFileForVerificationPaths = defaultExecFileForVerificationPaths;
+
 export interface NormalizedVerificationFiles {
     files: string[];
     warnings: string[];
@@ -14,7 +40,7 @@ export interface NormalizedVerificationFiles {
 
 async function runGit(cwd: string, args: readonly string[]): Promise<string | null> {
     try {
-        const result = await execFileAsync("git", [...args], {
+        const result = await execFileForVerificationPaths("git", args, {
             cwd,
             timeout: GIT_TIMEOUT_MS,
             maxBuffer: 16 * 1024 * 1024,
@@ -253,4 +279,17 @@ export async function normalizeVerificationFiles(args: {
         warnings,
         gitRoot,
     };
+}
+
+export function __setVerificationPathsTestHooks(hooks: {
+    execFile?: VerificationPathsExecFile;
+}): void {
+    // Keep the real filesystem shape on disk, but let tests script git output.
+    // Under heavy machine load, launching git can stall while the operating
+    // system assesses the binary, so the seam keeps gate tests deterministic.
+    execFileForVerificationPaths = hooks.execFile ?? defaultExecFileForVerificationPaths;
+}
+
+export function __resetVerificationPathsForTests(): void {
+    execFileForVerificationPaths = defaultExecFileForVerificationPaths;
 }

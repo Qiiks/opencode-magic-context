@@ -1,13 +1,18 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import type { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { _resetHarnessForTesting } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import {
+    __resetProjectIdentityForTests,
+    __setProjectIdentityTestHooks,
+} from "./memory/project-identity";
 import { runMigrations } from "./migrations";
 import {
     _getSessionProjectBackfillState,
@@ -17,9 +22,11 @@ import { initializeDatabase } from "./storage-db";
 
 const tempDirs: string[] = [];
 const openDatabases: Database[] = [];
+const DEFAULT_RESOLVER_ROOT_COMMIT = "abcdef1234567890abcdef1234567890abcdef12";
 
 afterEach(() => {
     _resetHarnessForTesting();
+    __resetProjectIdentityForTests();
     for (const db of openDatabases) {
         closeQuietly(db);
     }
@@ -54,35 +61,17 @@ function getStoredProjectPath(db: Database, sessionId: string): string | null {
     return row?.project_path ?? null;
 }
 
-function runGit(directory: string, args: string[]): string {
-    return execFileSync("git", args, {
-        cwd: directory,
-        encoding: "utf8",
-        env: { ...process.env, LC_ALL: "C", LANG: "C" },
-        stdio: ["ignore", "pipe", "pipe"],
-    });
+function makeGitMetadataDirectory(prefix: string): string {
+    const dir = makeTempDir(prefix);
+    mkdirSync(join(dir, ".git"));
+    return dir;
 }
 
-function makeGitRepo(): { directory: string; rootCommit: string } {
-    const directory = makeTempDir("session-project-backfill-git-");
-    runGit(directory, ["init"]);
-    writeFileSync(join(directory, "README.md"), "# test\n", "utf8");
-    runGit(directory, ["add", "README.md"]);
-    runGit(directory, [
-        "-c",
-        "user.email=test@example.com",
-        "-c",
-        "user.name=Test User",
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "-m",
-        "initial commit",
-    ]);
-    const rootCommit = runGit(directory, ["rev-list", "--max-parents=0", "HEAD"])
-        .split("\n")[0]!
-        .trim();
-    return { directory, rootCommit };
+function returningRootCommit(rootCommit: string): typeof execFileSync {
+    // Keep the real `.git` walk on disk, but route git output through the test
+    // seam. Under heavy machine load, launching git can stall while the
+    // operating system assesses the binary, which makes direct calls flaky.
+    return (() => `${rootCommit}\n`) as typeof execFileSync;
 }
 
 describe("runSessionProjectBackfill", () => {
@@ -290,16 +279,17 @@ describe("runSessionProjectBackfill", () => {
         expect(_getSessionProjectBackfillState(db)?.status).toBe("completed");
     });
 
-    it("uses the default resolver seam for a real git repository", async () => {
+    it("uses the default resolver seam for a git-shaped directory", async () => {
         const db = createDb();
-        const repo = makeGitRepo();
+        const directory = makeGitMetadataDirectory("session-project-backfill-git-");
+        __setProjectIdentityTestHooks({
+            execFileSync: returningRootCommit(DEFAULT_RESOLVER_ROOT_COMMIT),
+        });
 
-        const result = await runSessionProjectBackfill(db, [
-            { sessionId: "ses-git", directory: repo.directory },
-        ]);
+        const result = await runSessionProjectBackfill(db, [{ sessionId: "ses-git", directory }]);
 
         expect(result.status).toBe("completed");
         expect(result.backfilledSessions).toBe(1);
-        expect(getStoredProjectPath(db, "ses-git")).toBe(`git:${repo.rootCommit}`);
+        expect(getStoredProjectPath(db, "ses-git")).toBe(`git:${DEFAULT_RESOLVER_ROOT_COMMIT}`);
     });
 });
