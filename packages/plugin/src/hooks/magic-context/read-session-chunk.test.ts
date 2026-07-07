@@ -421,5 +421,63 @@ describe("readSessionChunk", () => {
             expect(chunk.messageCount).toBe(1);
             expect(chunk.hasMore).toBe(false);
         });
+
+        it("reports hasMore false when the remaining eligible tail is only filtered noise", () => {
+            //#given
+            useTempDataHome("read-session-noise-tail-");
+            createOpenCodeDbWithMessages("ses-noise-tail", [
+                { id: "m-1", role: "user", part: { type: "text", text: "eligible work" } },
+                { id: "m-2", role: "assistant", part: { type: "text", text: "done" } },
+                {
+                    id: "m-3",
+                    role: "user",
+                    part: { type: "text", text: "## Magic Status", ignored: true },
+                },
+                {
+                    id: "m-4",
+                    role: "user",
+                    part: {
+                        type: "text",
+                        text: "<system-reminder>background finished</system-reminder>",
+                    },
+                },
+            ]);
+
+            //#when
+            const chunk = readSessionChunk("ses-noise-tail", 100_000, 1);
+
+            //#then: filtered tail noise was scanned, so no semantic work remains.
+            expect(chunk.endIndex).toBe(2);
+            expect(chunk.text).toContain("eligible work");
+            expect(chunk.text).not.toContain("Magic Status");
+            expect(chunk.hasMore).toBe(false);
+        });
+
+        it("keeps hasMore true when budget-blocked content precedes trailing noise", () => {
+            //#given
+            useTempDataHome("read-session-blocked-before-noise-");
+            createOpenCodeDbWithMessages("ses-blocked-before-noise", [
+                { id: "m-1", role: "user", part: { type: "text", text: "first content" } },
+                {
+                    id: "m-2",
+                    role: "assistant",
+                    part: { type: "text", text: "second content beyond budget" },
+                },
+                {
+                    id: "m-3",
+                    role: "user",
+                    part: { type: "text", text: "## Magic Status", ignored: true },
+                },
+            ]);
+
+            //#when
+            const chunk = readSessionChunk("ses-blocked-before-noise", 1, 1);
+
+            //#then
+            expect(chunk.endIndex).toBe(1);
+            expect(chunk.text).toContain("first content");
+            expect(chunk.text).not.toContain("second content");
+            expect(chunk.hasMore).toBe(true);
+        });
     });
 });

@@ -2,6 +2,10 @@
 
 import { describe, expect, it, mock } from "bun:test";
 import {
+    acquireCompartmentLease,
+    releaseCompartmentLease,
+} from "../../features/magic-context/compartment-lease";
+import {
     appendCompartments,
     getCompartments,
     getLastCompartmentEndMessage,
@@ -194,6 +198,30 @@ describe("runManagedWrapup", () => {
             expect(result).toContain("made no forward progress");
             expect(result).toContain("Run /ctx-wrapup again to continue");
             expect(getWrapupInProgressState(db, sessionId)).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("bounds waiting for a foreign compartment lease and releases the wrapup marker", async () => {
+        const db = createDb();
+        try {
+            const sessionId = "ses-wrapup-lease-timeout";
+            const foreignHolder = "foreign-lease-holder";
+            expect(acquireCompartmentLease(db, sessionId, foreignHolder)).not.toBeNull();
+            const ctx = baseCtx(db);
+            ctx.wrapupLeaseWaitTimeoutMs = 0;
+            ctx.runCompartmentAgentForWrapup = mock(async () => {});
+
+            const result = await withProvider(sessionId, 8, () =>
+                runManagedWrapup(ctx, sessionId, { messagesToKeep: 2 }),
+            );
+
+            expect(result).toContain("## Magic Wrapup — Partial");
+            expect(result).toContain("Timed out waiting");
+            expect(ctx.runCompartmentAgentForWrapup).not.toHaveBeenCalled();
+            expect(getWrapupInProgressState(db, sessionId)).toBeNull();
+            releaseCompartmentLease(db, sessionId, foreignHolder);
         } finally {
             closeQuietly(db);
         }

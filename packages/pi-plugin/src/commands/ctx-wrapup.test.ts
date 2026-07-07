@@ -2,6 +2,10 @@
 
 import { describe, expect, it, mock } from "bun:test";
 import {
+	acquireCompartmentLease,
+	releaseCompartmentLease,
+} from "@magic-context/core/features/magic-context/compartment-lease";
+import {
 	appendCompartments,
 	getCompartments,
 	getLastCompartmentEndMessage,
@@ -236,6 +240,37 @@ describe("Pi /ctx-wrapup", () => {
 				)
 				.get(sessionId) as { wrapup_in_progress_state: string | null } | null;
 			expect(row?.wrapup_in_progress_state ?? null).toBeNull();
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("bounds waiting for a foreign compartment lease and clears the wrapup marker", async () => {
+		const db = createDb();
+		try {
+			const sessionId = "pi-wrapup-lease-timeout";
+			const foreignHolder = "foreign-lease-holder";
+			expect(
+				acquireCompartmentLease(db, sessionId, foreignHolder),
+			).not.toBeNull();
+			const runPiHistorianForWrapup = mock(async () => {});
+
+			const result = await runPiWrapup(
+				pi().api,
+				deps(db, {
+					runPiHistorianForWrapup,
+					wrapupLeaseWaitTimeoutMs: 0,
+				}),
+				ctx(sessionId, 8),
+				sessionId,
+				2,
+			);
+
+			expect(result).toContain("## Magic Wrapup — Partial");
+			expect(result).toContain("Timed out waiting");
+			expect(runPiHistorianForWrapup).not.toHaveBeenCalled();
+			expect(getWrapupInProgressState(db, sessionId)).toBeNull();
+			releaseCompartmentLease(db, sessionId, foreignHolder);
 		} finally {
 			closeQuietly(db);
 		}
