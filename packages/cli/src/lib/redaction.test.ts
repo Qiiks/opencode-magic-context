@@ -1,7 +1,12 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { hasShareabilitySensitiveText, isSecretKey, sanitizeConfigValue } from "./redaction";
+import {
+    hasShareabilitySensitiveText,
+    isSecretKey,
+    sanitizeConfigValue,
+    sanitizeDiagnosticEndpoint,
+} from "./redaction";
 
 describe("isSecretKey — true positives", () => {
     // Real secret-bearing key names from common providers and config shapes.
@@ -149,5 +154,19 @@ describe("hasShareabilitySensitiveText", () => {
 
     it("allows non-sensitive project facts", () => {
         expect(hasShareabilitySensitiveText("Use Bun for test scripts in this repo.")).toBe(false);
+    });
+});
+
+describe("sanitizeDiagnosticEndpoint", () => {
+    it("strips query strings and userinfo from valid URLs", () => {
+        const sanitized = sanitizeDiagnosticEndpoint(
+            "https://user:pass@example.com/v1/embeddings?api_key=secret#frag",
+        );
+        expect(sanitized).toBe("https://example.com/v1/embeddings");
+    });
+
+    it("strips query strings and userinfo from invalid-scheme display values", () => {
+        const sanitized = sanitizeDiagnosticEndpoint("ftp://user:pass@example.com/v1?token=secret");
+        expect(sanitized).toBe("ftp://example.com/v1");
     });
 });

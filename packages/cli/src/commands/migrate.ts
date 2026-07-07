@@ -1,10 +1,12 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { writeFileAtomic } from "../lib/atomic-write";
+import { getPiSessionsRoot } from "../lib/paths";
 
 export interface MigrateOpenCodeSessionToPiOptions {
     /**
@@ -64,9 +66,7 @@ export interface MigrateCliOptions {
 type DatabaseLike = Pick<DatabaseType, "prepare" | "close" | "exec">;
 
 type FileSystemLike = {
-    existsSync(path: string): boolean;
-    mkdirSync(path: string, options?: { recursive?: boolean }): unknown;
-    writeFileSync(path: string, data: string): unknown;
+    writeFileAtomic(path: string, data: string): unknown;
     unlinkSync(path: string): unknown;
 };
 
@@ -177,11 +177,11 @@ function defaultCortexkitDbPath(): string {
 }
 
 function defaultPiSessionsRoot(): string {
-    return join(homedir(), ".pi", "agent", "sessions");
+    return getPiSessionsRoot();
 }
 
 function defaultFs(): FileSystemLike {
-    return { existsSync, mkdirSync, writeFileSync, unlinkSync };
+    return { writeFileAtomic, unlinkSync };
 }
 
 function stmt<T>(db: DatabaseLike, sql: string): StatementLike<T> {
@@ -975,12 +975,12 @@ export function migrateOpenCodeSessionToPi(
         const jsonl = `${buildResult.entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 
         if (!opts.dryRun) {
-            if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-            // Write the Pi JSONL file FIRST, then commit the shared-DB rows in a
-            // single transaction. Ordering + transaction together guarantee we
-            // never leave orphaned compartment/fact rows pointing at a session
-            // file that was never written.
-            fs.writeFileSync(outputPath, jsonl);
+            // Write the Pi JSONL file FIRST via atomic temp-sibling + rename,
+            // then commit the shared-DB rows in a single transaction. Ordering +
+            // transaction together guarantee we never leave orphaned
+            // compartment/fact rows pointing at a session file that was never
+            // written.
+            fs.writeFileAtomic(outputPath, jsonl);
             try {
                 commitMagicContextState?.();
             } catch (commitError) {

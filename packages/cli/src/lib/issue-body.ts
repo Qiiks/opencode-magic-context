@@ -29,6 +29,10 @@
  */
 export const MAX_GITHUB_BODY_BYTES = 60_000;
 
+const LOG_TRUNCATION_MARKER = "[truncated for GitHub 64KB limit — older log lines dropped]\n";
+const FINAL_TRUNCATION_MARKER = "\n\n[truncated further to fit GitHub body limit]\n";
+const FALLBACK_TRUNCATION_MARKER = "\n\n[truncated for GitHub 64KB limit]\n";
+
 /**
  * Pattern tokens that mark a log line as ERROR-shaped. Magic Context's
  * runtime uses a small, predictable vocabulary in `sessionLog(...)` calls
@@ -111,6 +115,8 @@ export function capBodyToGithubLimit(
 ): string {
     if (Buffer.byteLength(body, "utf8") <= maxBytes) return body;
 
+    let capped = body;
+
     // Find the main log fence (we use a stable heading that the bundlers
     // always emit below). We don't search for the closing ``` directly
     // because there are several fenced blocks; instead we anchor on the
@@ -119,38 +125,27 @@ export function capBodyToGithubLimit(
     const heading = "## Log (last";
     const headingIdx = body.indexOf(heading);
     if (headingIdx === -1) {
-        // No main log section to shrink — fall back to a raw byte truncation
-        // with a marker. This shouldn't happen with the bundlers we control,
-        // but keeps the function defensive for callers passing arbitrary
-        // markdown.
-        const marker = "\n\n[truncated for GitHub 64KB limit]\n";
-        const markerBytes = Buffer.byteLength(marker, "utf8");
-        // Slice the body to a code-point boundary so we never split a multi-
-        // byte UTF-8 character. Naive `Buffer.subarray(...).toString("utf8")`
-        // would replace any half-codepoint at the cut with U+FFFD (3 bytes),
-        // pushing the output OVER the requested budget.
-        return truncateToByteBudget(body, maxBytes - markerBytes) + marker;
+        const markerBytes = Buffer.byteLength(FALLBACK_TRUNCATION_MARKER, "utf8");
+        capped = truncateToByteBudget(body, maxBytes - markerBytes) + FALLBACK_TRUNCATION_MARKER;
+        return enforceFinalBodyLimit(capped, maxBytes);
     }
+
     const fenceOpenIdx = body.indexOf("\n```", headingIdx);
-    if (fenceOpenIdx === -1) return body; // malformed; pass through unchanged
+    if (fenceOpenIdx === -1) return enforceFinalBodyLimit(body, maxBytes);
     const logStart = fenceOpenIdx + "\n```\n".length;
     const fenceCloseIdx = body.indexOf("\n```", logStart);
-    if (fenceCloseIdx === -1) return body;
+    if (fenceCloseIdx === -1) return enforceFinalBodyLimit(body, maxBytes);
 
     const head = body.slice(0, logStart);
     const log = body.slice(logStart, fenceCloseIdx);
     const tail = body.slice(fenceCloseIdx);
 
     const overheadBytes = Buffer.byteLength(head, "utf8") + Buffer.byteLength(tail, "utf8");
-    // Reserve room for the truncation marker that we'll prepend to the log
-    // body so the agent / human reading the issue knows lines were dropped.
-    const truncationMarker = "[truncated for GitHub 64KB limit — older log lines dropped]\n";
-    const markerBytes = Buffer.byteLength(truncationMarker, "utf8");
+    const markerBytes = Buffer.byteLength(LOG_TRUNCATION_MARKER, "utf8");
     const logBudget = maxBytes - overheadBytes - markerBytes;
     if (logBudget <= 0) {
-        // Even with no log content we'd be over budget. Drop the log block
-        // entirely (keep the heading + a stub marker) so the rest survives.
-        return `${head}${truncationMarker}${tail}`;
+        capped = `${head}${LOG_TRUNCATION_MARKER}${tail}`;
+        return enforceFinalBodyLimit(capped, maxBytes);
     }
 
     // Drop oldest lines (from the top) until what's left fits the budget.
@@ -172,7 +167,17 @@ export function capBodyToGithubLimit(
         kept = truncateToByteBudget(kept, logBudget);
     }
 
-    return `${head}${truncationMarker}${kept}${tail}`;
+    capped = `${head}${LOG_TRUNCATION_MARKER}${kept}${tail}`;
+    return enforceFinalBodyLimit(capped, maxBytes);
+}
+
+function enforceFinalBodyLimit(body: string, maxBytes: number): string {
+    if (Buffer.byteLength(body, "utf8") <= maxBytes) return body;
+    const markerBytes = Buffer.byteLength(FINAL_TRUNCATION_MARKER, "utf8");
+    if (markerBytes >= maxBytes) {
+        return truncateToByteBudget(FINAL_TRUNCATION_MARKER, maxBytes);
+    }
+    return truncateToByteBudget(body, maxBytes - markerBytes) + FINAL_TRUNCATION_MARKER;
 }
 
 /**

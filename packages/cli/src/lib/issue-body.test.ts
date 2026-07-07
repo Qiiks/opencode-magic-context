@@ -193,6 +193,27 @@ describe("capBodyToGithubLimit", () => {
         expect(Buffer.byteLength(capped, "utf8")).toBeLessThanOrEqual(MAX_GITHUB_BODY_BYTES);
     });
 
+    it("hard-truncates the tail when non-log sections alone exceed the budget", () => {
+        const hugeDescription = "x".repeat(80_000);
+        const body = [
+            "## Description",
+            hugeDescription,
+            "",
+            "## Recent errors (last 20, sanitized)",
+            "```",
+            "transform failed: critical error",
+            "```",
+            "",
+            "## Log (last 1 lines, sanitized)",
+            "```",
+            "tiny log",
+            "```",
+        ].join("\n");
+
+        const capped = capBodyToGithubLimit(body, 10_000);
+        expect(Buffer.byteLength(capped, "utf8")).toBeLessThanOrEqual(10_000);
+        expect(capped).toContain("[truncated further to fit GitHub body limit]");
+    });
     it("falls back to raw byte truncation when log heading is missing", () => {
         // Synthetic input with no `## Log (last` heading — exercises the
         // defensive fallback path. We pad with non-ASCII to ensure UTF-8

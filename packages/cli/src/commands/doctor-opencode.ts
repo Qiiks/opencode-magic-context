@@ -5,7 +5,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
-
 import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
@@ -17,6 +16,7 @@ import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path"
 import { Database } from "@magic-context/core/shared/sqlite";
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
+
 import { isDevPathPluginEntry, matchesPluginEntry } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
 import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
@@ -37,6 +37,11 @@ import {
 } from "../lib/opencode-plugin-cache";
 import { detectConfigPaths, getMagicContextLogPath } from "../lib/paths";
 import { confirm, intro, log, outro, selectOne, spinner, text } from "../lib/prompts";
+import {
+    sanitizeDiagnosticEndpoint,
+    sanitizeDiagnosticText,
+    sanitizePathString,
+} from "../lib/redaction";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { clearPluginCache } from "./doctor-opencode-cache";
 
@@ -138,6 +143,40 @@ function getSelfVersion(): string {
         }
     }
     return "0.0.0";
+}
+
+export function isPinnedOpenCodePluginSpecifier(specifier: string): boolean {
+    if (specifier === PLUGIN_NAME || specifier === PLUGIN_ENTRY_WITH_VERSION) return false;
+    return specifier.startsWith(`${PLUGIN_NAME}@`);
+}
+
+export function getUserNpmrcPath(): string {
+    const custom = process.env.NPM_CONFIG_USERCONFIG?.trim();
+    if (custom) return custom;
+    const home = process.env.HOME?.trim();
+    return join(home || homedir(), ".npmrc");
+}
+
+export function collectNpmReleaseAgeWarnings(): string[] {
+    const ageWarnings: string[] = [];
+    const npmrcPath = getUserNpmrcPath();
+    if (!existsSync(npmrcPath)) return ageWarnings;
+    try {
+        const npmrc = readFileSync(npmrcPath, "utf-8");
+        for (const line of npmrc.split("\n")) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+            const [key] = trimmed.split("=").map((s) => s.trim());
+            if (key === "min-release-age" || key === "before") {
+                ageWarnings.push(
+                    `${sanitizePathString(npmrcPath)} has '${sanitizeDiagnosticText(trimmed)}'`,
+                );
+            }
+        }
+    } catch {
+        // Can't read .npmrc — skip.
+    }
+    return ageWarnings;
 }
 
 /** Compare semver-like strings. Returns -1 if a<b, 0 if equal, 1 if a>b. */
@@ -417,7 +456,9 @@ async function checkEmbeddingConfig(
 
     // Run the live probe.
     const probeSpinner = spinner();
-    probeSpinner.start(`Testing embedding endpoint ${endpoint} (model: ${model})`);
+    probeSpinner.start(
+        `Testing embedding endpoint ${sanitizeDiagnosticEndpoint(endpoint)} (model: ${sanitizeDiagnosticText(model)})`,
+    );
 
     let outcome: EmbeddingProbeOutcome;
     try {
@@ -431,7 +472,9 @@ async function checkEmbeddingConfig(
         });
     } catch (error) {
         probeSpinner.stop("Embedding probe failed unexpectedly");
-        log.error(`Probe threw: ${error instanceof Error ? error.message : String(error)}`);
+        log.error(
+            `Probe threw: ${sanitizeDiagnosticText(error instanceof Error ? error.message : String(error))}`,
+        );
         return { issues: localIssues + 1 };
     }
 
@@ -447,11 +490,11 @@ async function checkEmbeddingConfig(
             log.error(
                 `Embedding endpoint rejected credentials (${outcome.status}) — check api_key / env var`,
             );
-            if (outcome.preview) log.info(`  ${outcome.preview}`);
+            if (outcome.preview) log.info(`  ${sanitizeDiagnosticText(outcome.preview)}`);
             return { issues: localIssues + 1 };
         case "endpoint_unsupported":
             log.error(`Embedding endpoint does not support embeddings (${outcome.status})`);
-            if (outcome.preview) log.info(`  ${outcome.preview}`);
+            if (outcome.preview) log.info(`  ${sanitizeDiagnosticText(outcome.preview)}`);
             log.info(
                 "  Common causes: endpoint points at a chat-completion route (should be the provider base, e.g. '.../v1'), or the provider doesn't offer an embeddings API",
             );
@@ -461,7 +504,7 @@ async function checkEmbeddingConfig(
             return { issues: localIssues + 1 };
         case "http_error":
             log.error(`Embedding endpoint returned ${outcome.status}`);
-            if (outcome.preview) log.info(`  ${outcome.preview}`);
+            if (outcome.preview) log.info(`  ${sanitizeDiagnosticText(outcome.preview)}`);
             return { issues: localIssues + 1 };
         case "timeout":
             log.warn(
@@ -469,11 +512,13 @@ async function checkEmbeddingConfig(
             );
             return { issues: localIssues + 1 };
         case "network_error":
-            log.error(`Could not reach embedding endpoint: ${outcome.message}`);
+            log.error(
+                `Could not reach embedding endpoint: ${sanitizeDiagnosticText(outcome.message)}`,
+            );
             return { issues: localIssues + 1 };
         case "invalid_scheme":
             log.error(
-                `Embedding endpoint must start with http:// or https://: ${outcome.endpoint}`,
+                `Embedding endpoint must start with http:// or https://: ${sanitizeDiagnosticEndpoint(outcome.endpoint)}`,
             );
             return { issues: localIssues + 1 };
     }
@@ -873,10 +918,7 @@ export async function runDoctor(
                 if (isDevPathPluginEntry(oldEntry)) {
                     pass(`Plugin registered in ${configName} (dev path: ${oldEntryStr})`);
                 } else {
-                    const isPinned =
-                        oldEntryStr !== PLUGIN_NAME &&
-                        oldEntryStr !== PLUGIN_ENTRY_WITH_VERSION &&
-                        /^@cortexkit\/opencode-magic-context@\d/.test(oldEntryStr);
+                    const isPinned = isPinnedOpenCodePluginSpecifier(oldEntryStr);
 
                     if (isPinned && !options.force) {
                         // Warn but don't change — user intentionally pinned
@@ -967,10 +1009,7 @@ export async function runDoctor(
                 if (isDevPathPluginEntry(tuiEntry)) {
                     pass(`TUI sidebar plugin configured (dev path: ${tuiEntryStr})`);
                 } else {
-                    const tuiPinned =
-                        tuiEntryStr !== PLUGIN_NAME &&
-                        tuiEntryStr !== PLUGIN_ENTRY_WITH_VERSION &&
-                        /^@cortexkit\/opencode-magic-context@\d/.test(tuiEntryStr);
+                    const tuiPinned = isPinnedOpenCodePluginSpecifier(tuiEntryStr);
                     if (tuiPinned && !options.force) {
                         warn(
                             `TUI plugin pinned to ${tuiEntryStr} — use 'doctor --force' to upgrade`,
@@ -1117,7 +1156,14 @@ export async function runDoctor(
         );
     } else if (cacheResult.action === "error") {
         warn(`Could not clear plugin cache: ${cacheResult.error}`);
-        log.info(`  Manually delete: ${cacheResult.path}`);
+        if (cacheResult.clearedPaths && cacheResult.clearedPaths.length > 0) {
+            log.info(`  Cleared roots: ${cacheResult.clearedPaths.join(", ")}`);
+        }
+        if (cacheResult.failedPaths && cacheResult.failedPaths.length > 0) {
+            log.info(`  Failed roots: ${cacheResult.failedPaths.join(", ")}`);
+        } else {
+            log.info(`  Manually delete: ${cacheResult.path}`);
+        }
         issues++;
     } else {
         pass("Plugin cache clean (no cached version found)");
@@ -1129,23 +1175,7 @@ export async function runDoctor(
     // npx and the auto-update checker uses npm install, neither of which read
     // bunfig.
     {
-        const ageWarnings: string[] = [];
-        const npmrcPath = join(homedir(), ".npmrc");
-        if (existsSync(npmrcPath)) {
-            try {
-                const npmrc = readFileSync(npmrcPath, "utf-8");
-                for (const line of npmrc.split("\n")) {
-                    const trimmed = line.trim();
-                    if (trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
-                    const [key] = trimmed.split("=").map((s) => s.trim());
-                    if (key === "min-release-age" || key === "before") {
-                        ageWarnings.push(`~/.npmrc has '${trimmed}'`);
-                    }
-                }
-            } catch {
-                // Can't read .npmrc — skip
-            }
-        }
+        const ageWarnings = collectNpmReleaseAgeWarnings();
 
         if (ageWarnings.length > 0) {
             log.warn(

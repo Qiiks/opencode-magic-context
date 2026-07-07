@@ -8,6 +8,8 @@ export interface PluginCacheResult {
     action: "cleared" | "up_to_date" | "not_found" | "check_unavailable" | "error";
     path: string;
     paths?: string[];
+    clearedPaths?: string[];
+    failedPaths?: string[];
     cached?: string;
     latest?: string;
     error?: string;
@@ -94,6 +96,8 @@ export async function clearPluginCache(
             action: "error",
             path: firstFailure?.path ?? clearTargets[0]?.path ?? existingRoots[0] ?? "",
             paths: failed.map((entry) => entry.path),
+            clearedPaths: cleared.map((entry) => entry.path),
+            failedPaths: failed.map((entry) => entry.path),
             error: firstFailure?.error,
         };
     }

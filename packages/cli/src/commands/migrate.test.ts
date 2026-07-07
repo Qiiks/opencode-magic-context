@@ -12,6 +12,7 @@ import {
 
 const tempDirs: string[] = [];
 const databases: Array<{ close(): void }> = [];
+const originalPiDir = process.env.PI_CODING_AGENT_DIR;
 
 function tempDir(): string {
     const dir = mkdtempSync(join(tmpdir(), "mc-migrate-test-"));
@@ -182,6 +183,8 @@ function makeCortexkitDb() {
 }
 
 afterEach(() => {
+    if (originalPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalPiDir;
     for (const db of databases.splice(0)) db.close();
     for (const dir of tempDirs.splice(0)) {
         try {
@@ -288,12 +291,11 @@ describe("migrateOpenCodeSessionToPi", () => {
             dryRun: true,
             now: new Date("2026-04-30T11:46:47.422Z"),
             fs: {
-                existsSync: () => false,
-                mkdirSync: () => {
-                    throw new Error("mkdir should not be called");
-                },
-                writeFileSync: (path) => {
+                writeFileAtomic: (path) => {
                     writes.push(path);
+                },
+                unlinkSync: () => {
+                    throw new Error("unlink should not be called");
                 },
             },
         });
@@ -301,6 +303,47 @@ describe("migrateOpenCodeSessionToPi", () => {
         expect(result.dryRun).toBe(true);
         expect(result.byteCount).toBeGreaterThan(0);
         expect(writes).toEqual([]);
+    });
+
+    it("defaults to PI_CODING_AGENT_DIR/sessions and writes the JSONL atomically before DB commit", () => {
+        const db = makeDb();
+        const { sessionId, cwd } = insertSyntheticSession(db);
+        const root = tempDir();
+        const agentDir = join(root, "isolated", "agent");
+        process.env.PI_CODING_AGENT_DIR = agentDir;
+        const order: string[] = [];
+        const cortexkitDb = makeCortexkitDb();
+        const wrappedCortexkitDb = {
+            prepare: cortexkitDb.prepare.bind(cortexkitDb),
+            close: cortexkitDb.close.bind(cortexkitDb),
+            exec: (sql: string) => {
+                if (sql === "BEGIN IMMEDIATE") order.push("db-commit");
+                return cortexkitDb.exec(sql);
+            },
+        };
+
+        const result = migrateOpenCodeSessionToPi({
+            db,
+            cortexkitDb: wrappedCortexkitDb,
+            sessionId,
+            now: new Date("2026-04-30T11:46:47.422Z"),
+            fs: {
+                writeFileAtomic: (path, data) => {
+                    order.push("write");
+                    expect(path.startsWith(join(agentDir, "sessions"))).toBe(true);
+                    expect(path).toContain(projectPathToPiDirSlug(cwd));
+                    expect(data.endsWith("\n")).toBe(true);
+                },
+                unlinkSync: () => {
+                    order.push("unlink");
+                },
+            },
+        });
+
+        expect(result.outputPath.startsWith(join(agentDir, "sessions"))).toBe(true);
+        expect(order[0]).toBe("write");
+        expect(order[1]).toBe("db-commit");
+        expect(order).not.toContain("unlink");
     });
 });
 
@@ -600,11 +643,12 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
             dryRun: true,
             now: new Date("2026-04-30T11:46:47.422Z"),
             fs: {
-                existsSync: () => false,
-                mkdirSync: () => {
-                    throw new Error("mkdir should not be called");
+                writeFileAtomic: () => {
+                    throw new Error("writeFileAtomic should not be called");
                 },
-                writeFileSync: () => {},
+                unlinkSync: () => {
+                    throw new Error("unlink should not be called");
+                },
             },
         });
         expect(result.dryRun).toBe(true);

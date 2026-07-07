@@ -124,6 +124,23 @@ function createInstalledPiPlugin(agentDir: string, withNativeBinding: boolean): 
     }
 }
 
+function writePiCachePackage(cacheRoot: string, version: string): string {
+    const pluginDir = join(
+        cacheRoot,
+        "extensions",
+        "npm",
+        "node_modules",
+        "@cortexkit",
+        "pi-magic-context",
+    );
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(
+        join(pluginDir, "package.json"),
+        JSON.stringify({ name: "@cortexkit/pi-magic-context", version }),
+    );
+    return pluginDir;
+}
+
 function createMockDb(): Database {
     const db = new Database(":memory:");
     db.exec(`
@@ -499,5 +516,150 @@ describe("Pi doctor", () => {
         expect(report).not.toContain(root);
         expect(report).not.toContain("abc123");
         expect(report).not.toContain("sk-12345678901234567890");
+    });
+
+    it("clears stale caches under PI_CODING_AGENT_DIR's parent without touching HOME/.pi/cache", async () => {
+        const root = makeTempRoot();
+        const home = join(root, "home");
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = join(root, "isolated", "agent");
+        process.env.HOME = home;
+        process.env.PI_CODING_AGENT_DIR = agentDir;
+        process.env.XDG_DATA_HOME = join(root, "data");
+        process.env.XDG_CACHE_HOME = join(root, "cache");
+        process.env.XDG_CONFIG_HOME = join(root, "config");
+        mkdirSync(agentDir, { recursive: true });
+        mkdirSync(join(process.env.XDG_CONFIG_HOME, "cortexkit"), { recursive: true });
+        mkdirSync(join(cwd, ".cortexkit"), { recursive: true });
+        writeHealthyFiles(agentDir, cwd);
+        const isolatedCachePlugin = writePiCachePackage(join(root, "isolated", "cache"), "9.9.9");
+        const homeCachePlugin = writePiCachePackage(join(home, ".pi", "cache"), "9.9.9");
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor({
+            ...baseOptions(root, cwd, prompts),
+            force: true,
+        });
+
+        expect(code).toBe(0);
+        expect(existsSync(isolatedCachePlugin)).toBe(false);
+        expect(existsSync(homeCachePlugin)).toBe(true);
+        expect(prompts.messages.join("\n")).toContain(
+            `Cleared stale Pi extension cache: ${isolatedCachePlugin}`,
+        );
+    });
+
+    it("reports an unknown CLI version as info instead of pass-current", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+
+        const code = await runDoctor({
+            ...options,
+            deps: {
+                ...options.deps,
+                selfVersion: () => "unknown",
+            },
+        });
+
+        expect(code).toBe(0);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain(
+            "INFO Magic Context for Pi CLI version unknown; npm latest is v0.1.0",
+        );
+        expect(output).not.toContain("PASS Magic Context for Pi CLI vunknown is current");
+    });
+
+    it("sanitizes invalid-scheme embedding endpoints before printing them", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        writeFileSync(
+            join(root, ".config", "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: "ftp://user:pass@example.com/v1?api_key=secret",
+                    model: "text-embedding-3-small",
+                },
+            }),
+        );
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        const errors: string[] = [];
+        const originalError = console.error;
+        console.error = (message?: unknown) => {
+            errors.push(String(message));
+        };
+        try {
+            const code = await runDoctor({
+                ...options,
+                deps: {
+                    ...options.deps,
+                    probeEmbeddingEndpoint: async () => ({
+                        kind: "invalid_scheme",
+                        endpoint: "ftp://user:pass@example.com/v1?api_key=secret",
+                    }),
+                },
+            });
+
+            expect(code).toBe(1);
+        } finally {
+            console.error = originalError;
+        }
+
+        const output = errors.join("\n");
+        expect(output).toContain("ftp://example.com/v1");
+        expect(output).not.toContain("user:pass");
+        expect(output).not.toContain("api_key=secret");
+    });
+
+    it("sanitizes thrown embedding probe errors before printing them", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        writeFileSync(
+            join(root, ".config", "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: "https://example.com/v1",
+                    model: "text-embedding-3-small",
+                },
+            }),
+        );
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        const errors: string[] = [];
+        const originalError = console.error;
+        console.error = (message?: unknown) => {
+            errors.push(String(message));
+        };
+        try {
+            const code = await runDoctor({
+                ...options,
+                deps: {
+                    ...options.deps,
+                    probeEmbeddingEndpoint: async () => {
+                        throw new Error("token=abc123 from /Users/alice/private");
+                    },
+                },
+            });
+
+            expect(code).toBe(1);
+        } finally {
+            console.error = originalError;
+        }
+
+        const output = errors.join("\n");
+        expect(output).toContain("Embedding probe threw: token=<REDACTED:token>");
+        expect(output).toContain("/Users/<USER>/private");
+        expect(output).not.toContain("alice");
+        expect(output).not.toContain("token=abc123");
     });
 });
