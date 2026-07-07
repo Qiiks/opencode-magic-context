@@ -19,9 +19,13 @@ import {
 import { getUserMemoryCandidates } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import type { ProtectedTailBoundarySnapshot } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
+import type {
+	SubagentRunner,
+	SubagentRunResult,
+} from "@magic-context/core/shared/subagent-runner";
 import {
 	buildPiCompactionSummary,
+	clearPiHistorianAlertState,
 	runPiHistorian,
 } from "./pi-historian-runner";
 import { createTestDb } from "./test-utils.test";
@@ -128,19 +132,46 @@ function makeBoundarySnapshot(
 }
 
 function runnerReturning(outputs: string[]): SubagentRunner {
+	return runnerWithSteps(outputs);
+}
+
+function okRun(text: string): SubagentRunResult {
+	return { ok: true, assistantText: text, durationMs: 1 };
+}
+
+function runnerWithSteps(
+	steps: Array<string | SubagentRunResult | Error>,
+): SubagentRunner {
 	const run = mock(async () => {
-		const text = outputs.shift() ?? "";
-		return { ok: true as const, assistantText: text, durationMs: 1 };
+		const step = steps.shift() ?? "";
+		if (step instanceof Error) throw step;
+		if (typeof step === "string") return okRun(step);
+		return step;
 	});
 	return { harness: "pi", run } as unknown as SubagentRunner;
 }
 
+function attemptedModels(runner: SubagentRunner): Array<string | undefined> {
+	return (
+		runner.run as unknown as {
+			mock: { calls: Array<[Parameters<SubagentRunner["run"]>[0]]> };
+		}
+	).mock.calls.map(([options]) => options.model);
+}
+
 async function runHistorianWith(args: {
-	outputs: string[];
+	outputs?: string[];
+	runner?: SubagentRunner;
+	historianModel?: string;
+	fallbackModels?: readonly string[];
+	fallbackModelId?: string;
 	memoryEnabled?: boolean;
 	autoPromote?: boolean;
 	userMemoriesEnabled?: boolean;
 	twoPass?: boolean;
+	signal?: AbortSignal;
+	retryBackoffMs?: (retryIndex: number) => number;
+	notifyIssue?: Parameters<typeof runPiHistorian>[0]["notifyIssue"];
 	onPublished?: () => void;
 	appendCompaction?: Parameters<typeof runPiHistorian>[0]["appendCompaction"];
 	readBranchEntries?: () => unknown[];
@@ -155,7 +186,7 @@ async function runHistorianWith(args: {
 	>[0]["ensureProjectRegistered"];
 }) {
 	const db = createTestDb();
-	const runner = runnerReturning([...args.outputs]);
+	const runner = args.runner ?? runnerReturning([...(args.outputs ?? [])]);
 	const holderId = "test-holder";
 	expect(acquireCompartmentLease(db, "ses-historian", holderId)).not.toBeNull();
 	args.beforeRun?.(db);
@@ -165,8 +196,12 @@ async function runHistorianWith(args: {
 		directory: process.cwd(),
 		provider: { readMessages: () => args.providerMessages ?? rawMessages() },
 		runner,
-		historianModel: "test/model",
+		historianModel: args.historianModel ?? "test/model",
+		fallbackModels: args.fallbackModels,
+		fallbackModelId: args.fallbackModelId,
 		historianChunkTokens: args.historianChunkTokens ?? 20_000,
+		signal: args.signal,
+		retryBackoffMs: args.retryBackoffMs,
 		twoPass: args.twoPass,
 		memoryEnabled: args.memoryEnabled,
 		autoPromote: args.autoPromote,
@@ -174,6 +209,7 @@ async function runHistorianWith(args: {
 		onPublished: args.onPublished,
 		appendCompaction: args.appendCompaction,
 		readBranchEntries: args.readBranchEntries,
+		notifyIssue: args.notifyIssue,
 		boundarySnapshot: args.boundarySnapshot,
 		refreshBoundarySnapshot: args.refreshBoundarySnapshot,
 		compartmentLeaseHolderId: holderId,
@@ -440,6 +476,134 @@ describe("runPiHistorian", () => {
 			);
 		} finally {
 			closeQuietly(db);
+		}
+	});
+
+	it("tries configured fallbacks before the live session model last resort", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: ["", "", successXml("Session model recovered Pi history.")],
+			fallbackModels: ["fallback/model"],
+			fallbackModelId: "session/model",
+		});
+		try {
+			expect(attemptedModels(runner)).toEqual([
+				"test/model",
+				"fallback/model",
+				"session/model",
+			]);
+			expect(getCompartments(db, "ses-historian")).toEqual([
+				expect.objectContaining({ title: "Initial Pi slice" }),
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not duplicate the session model when it is already the historian model", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [""],
+			fallbackModelId: "test/model",
+		});
+		try {
+			expect(attemptedModels(runner)).toEqual(["test/model"]);
+			expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
+				1,
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not duplicate the session model when it is already a configured fallback", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: ["", ""],
+			fallbackModels: ["session/model"],
+			fallbackModelId: "session/model",
+		});
+		try {
+			expect(attemptedModels(runner)).toEqual(["test/model", "session/model"]);
+			expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
+				1,
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("retries transient historian prompt failures on the same model before succeeding", async () => {
+		const runner = runnerWithSteps([
+			new Error("429 rate limit from provider"),
+			successXml("Transient retry recovered Pi history."),
+		]);
+		const { db } = await runHistorianWith({
+			runner,
+			retryBackoffMs: () => 0,
+		});
+		try {
+			expect(attemptedModels(runner)).toEqual(["test/model", "test/model"]);
+			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("advances to fallback immediately for non-transient historian prompt failures", async () => {
+		const runner = runnerWithSteps([
+			new Error("401 unauthorized"),
+			successXml("Fallback model recovered Pi history."),
+		]);
+		const { db } = await runHistorianWith({
+			runner,
+			fallbackModels: ["fallback/model"],
+			retryBackoffMs: () => 0,
+		});
+		try {
+			expect(attemptedModels(runner)).toEqual(["test/model", "fallback/model"]);
+			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not retry or advance fallbacks after an abort signal", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const runner = runnerWithSteps([successXml()]);
+		const { db } = await runHistorianWith({
+			runner,
+			fallbackModels: ["fallback/model"],
+			signal: controller.signal,
+			retryBackoffMs: () => 0,
+		});
+		try {
+			expect(runner.run).not.toHaveBeenCalled();
+			expect(getCompartments(db, "ses-historian")).toEqual([]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("notifies failed historian runs once with the transient failure framing", async () => {
+		clearPiHistorianAlertState("ses-historian");
+		const notices: string[] = [];
+		const notifyIssue = mock((text: string) => {
+			notices.push(text);
+		});
+		const first = await runHistorianWith({ outputs: [""], notifyIssue });
+		try {
+			expect(notifyIssue).toHaveBeenCalledTimes(1);
+			expect(notices[0]).toContain("Hit a transient issue comparting history");
+			expect(notices[0]).toContain("only be alerted again");
+		} finally {
+			closeQuietly(first.db);
+		}
+
+		const second = await runHistorianWith({ outputs: [""], notifyIssue });
+		try {
+			expect(notifyIssue).toHaveBeenCalledTimes(1);
+		} finally {
+			closeQuietly(second.db);
+			clearPiHistorianAlertState("ses-historian");
 		}
 	});
 

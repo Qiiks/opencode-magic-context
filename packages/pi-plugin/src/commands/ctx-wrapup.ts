@@ -369,6 +369,7 @@ export async function runPiWrapup(
 						runner: deps.runner,
 						historianModel: deps.historianModel as string,
 						fallbackModels: deps.historianFallbacks,
+						fallbackModelId: modelKey,
 						historianChunkTokens: deps.historianChunkTokens,
 						boundarySnapshot: plan.snapshot,
 						refreshBoundarySnapshot: () =>

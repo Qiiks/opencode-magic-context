@@ -154,6 +154,7 @@ import {
 	runAutoSearchHintForPi,
 } from "./auto-search-pi";
 import { clearPiEmbedSessionState } from "./commands/ctx-embed";
+import { sendCtxStatusMessage } from "./commands/pi-command-utils";
 import {
 	type ApplyDeferredPiCompactionMarkerDeps,
 	applyDeferredPiCompactionMarker,
@@ -2295,6 +2296,7 @@ export function registerPiContextHandler(
 			// fire-and-forget so we never block the LLM call on it.
 			if (options.historian) {
 				maybeFireHistorian({
+					pi,
 					ctx,
 					sessionId,
 					db: options.db,
@@ -2851,6 +2853,7 @@ function sendPiIgnoredNotification(
 }
 
 function spawnPiHistorianRun(args: {
+	pi: ExtensionAPI;
 	ctx: ExtensionContext;
 	sessionId: string;
 	db: ContextDatabase;
@@ -2860,8 +2863,10 @@ function spawnPiHistorianRun(args: {
 	boundarySnapshot: ProtectedTailBoundarySnapshot;
 	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
 	currentContextLimit: number;
+	fallbackModelId?: string;
 }): void {
 	const {
+		pi,
 		ctx,
 		sessionId,
 		db,
@@ -2871,6 +2876,7 @@ function spawnPiHistorianRun(args: {
 		boundarySnapshot,
 		refreshBoundarySnapshot,
 		currentContextLimit,
+		fallbackModelId,
 	} = args;
 	const holderId = crypto.randomUUID();
 	const runPromise = (async () => {
@@ -2901,6 +2907,7 @@ function spawnPiHistorianRun(args: {
 				runner: historian.runner,
 				historianModel: historian.model,
 				fallbackModels: historian.fallbackModels,
+				fallbackModelId,
 				historianChunkTokens: historian.historianChunkTokens,
 				boundarySnapshot,
 				refreshBoundarySnapshot,
@@ -2913,6 +2920,20 @@ function spawnPiHistorianRun(args: {
 				userMemoriesEnabled: historian.userMemoriesEnabled,
 				language: historian.language,
 				compartmentLeaseHolderId: holderId,
+				notifyIssue: (text) => {
+					if (!isContextHandlerSessionActive(sessionId)) {
+						sessionLog(
+							sessionId,
+							"historian failure notice skipped after session context cleared",
+						);
+						return;
+					}
+					sendCtxStatusMessage(pi, {
+						title: "Magic Context",
+						text,
+						level: "warning",
+					});
+				},
 				onPublished: () => {
 					const sessionStillActive = isContextHandlerSessionActive(sessionId);
 					try {
@@ -3010,6 +3031,7 @@ function resolvePiReadBranchEntries(
  * agent turn continues regardless of historian outcome.
  */
 function maybeFireHistorian(args: {
+	pi: ExtensionAPI;
 	ctx: ExtensionContext;
 	sessionId: string;
 	db: ContextDatabase;
@@ -3215,6 +3237,7 @@ function maybeFireHistorian(args: {
 					`## Historian recovery\n\nHistorian previously failed ${failureState.failureCount} time(s), so Magic Context is retrying history comparting immediately after restart.`,
 				);
 				spawnPiHistorianRun({
+					pi: args.pi,
 					ctx,
 					sessionId,
 					db,
@@ -3224,6 +3247,7 @@ function maybeFireHistorian(args: {
 					boundarySnapshot,
 					refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
 					currentContextLimit: boundaryContextLimit,
+					fallbackModelId: modelKey,
 				});
 				return;
 			}
@@ -3300,6 +3324,7 @@ function maybeFireHistorian(args: {
 		// at session_shutdown — without that, `pi --print` mode would
 		// kill the historian subprocess mid-run when the parent exits.
 		spawnPiHistorianRun({
+			pi: args.pi,
 			ctx,
 			sessionId,
 			db,
@@ -3312,6 +3337,7 @@ function maybeFireHistorian(args: {
 			}),
 			refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
 			currentContextLimit: boundaryContextLimit,
+			fallbackModelId: modelKey,
 		});
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);

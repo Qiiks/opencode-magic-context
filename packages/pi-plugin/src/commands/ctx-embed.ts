@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	embedSessionCompartmentChunks,
 	getEmbeddingCoverageStatus,
+	type SessionChunkBackfillProgress,
 } from "@magic-context/core/features/magic-context/project-embedding-registry";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -13,6 +14,11 @@ import { formatEmbedStatusText } from "@magic-context/core/hooks/magic-context/f
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
 import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
 
+const EMBED_PROGRESS_COMPARTMENT_STEP = 8;
+const EMBED_PROGRESS_MIN_INTERVAL_MS = 10_000;
+
+type EmbedDrainStatus = { text: string; level: "success" | "info" };
+
 export function clearPiEmbedSessionState(sessionId: string): void {
 	embedPauseBySession.delete(sessionId);
 	const ctrl = embedRunStateBySession.get(sessionId);
@@ -23,11 +29,16 @@ export function clearPiEmbedSessionState(sessionId: string): void {
 	autoEmbedAttemptedBySession.delete(sessionId);
 }
 
-async function runEmbedDrain(
+export async function runEmbedDrain(
 	db: ContextDatabase,
 	projectIdentity: string,
 	sessionId: string,
-): Promise<{ text: string; level: "success" | "info" }> {
+	options: {
+		onStatus?: (status: EmbedDrainStatus) => void;
+		now?: () => number;
+		batchSize?: number;
+	} = {},
+): Promise<EmbedDrainStatus> {
 	// Idempotent start: a drain already running for this session means a second
 	// start would abort it then race the just-released lease to "busy" — killing
 	// the active run for nothing. Just report it's running.
@@ -43,6 +54,37 @@ async function runEmbedDrain(
 	if (prior) prior.abort();
 	const controller = new AbortController();
 	embedRunStateBySession.set(sessionId, controller);
+	const now = options.now ?? Date.now;
+	let startEmitted = false;
+	let lastProgressEmbedded = 0;
+	let lastProgressAt = 0;
+	const emitProgress = (progress: SessionChunkBackfillProgress): void => {
+		if (progress.total <= 0) return;
+		if (!startEmitted) {
+			startEmitted = true;
+			lastProgressAt = now();
+			options.onStatus?.({
+				text: `## /ctx-embed\n\nEmbedding ${progress.total} compartment${progress.total === 1 ? "" : "s"} of history…`,
+				level: "info",
+			});
+			return;
+		}
+		if (progress.embedded <= 0 || progress.embedded >= progress.total) return;
+		const currentTime = now();
+		const enoughCompartments =
+			progress.embedded - lastProgressEmbedded >=
+			EMBED_PROGRESS_COMPARTMENT_STEP;
+		const enoughTime =
+			currentTime - lastProgressAt >= EMBED_PROGRESS_MIN_INTERVAL_MS &&
+			progress.embedded > lastProgressEmbedded;
+		if (!enoughCompartments && !enoughTime) return;
+		lastProgressEmbedded = progress.embedded;
+		lastProgressAt = currentTime;
+		options.onStatus?.({
+			text: `## /ctx-embed\n\nEmbedded ${progress.embedded}/${progress.total} compartments so far…`,
+			level: "info",
+		});
+	};
 	let outcome: Awaited<ReturnType<typeof embedSessionCompartmentChunks>>;
 	try {
 		outcome = await embedSessionCompartmentChunks(
@@ -51,6 +93,10 @@ async function runEmbedDrain(
 			sessionId,
 			{
 				signal: controller.signal,
+				onProgress: emitProgress,
+				...(options.batchSize !== undefined
+					? { batchSize: options.batchSize }
+					: {}),
 			},
 		);
 	} finally {
@@ -160,6 +206,13 @@ export function registerCtxEmbedCommand(
 					deps.db,
 					project.projectIdentity,
 					sessionId,
+					{
+						onStatus: (status) =>
+							sendCtxStatusMessage(pi, {
+								title: "/ctx-embed",
+								...status,
+							}),
+					},
 				);
 				sendCtxStatusMessage(pi, { title: "/ctx-embed", text, level });
 				return;

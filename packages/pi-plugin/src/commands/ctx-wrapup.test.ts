@@ -266,6 +266,31 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 
+	it("passes the active session model as the wrapup historian last-resort fallback", async () => {
+		const db = createDb();
+		try {
+			const sessionId = "pi-wrapup-session-model";
+			const runPiHistorianForWrapup = mock(async (args) => {
+				appendRange(db, sessionId, 1, 3);
+				args.onPublished?.();
+			});
+
+			await runPiWrapup(
+				pi().api,
+				deps(db, { runPiHistorianForWrapup }),
+				ctx(sessionId, 8),
+				sessionId,
+				2,
+			);
+
+			expect(runPiHistorianForWrapup).toHaveBeenCalledWith(
+				expect.objectContaining({ fallbackModelId: "anthropic/claude" }),
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("aborts when wrapup marker ownership is lost and leaves the foreign marker", async () => {
 		const db = createDb();
 		try {
