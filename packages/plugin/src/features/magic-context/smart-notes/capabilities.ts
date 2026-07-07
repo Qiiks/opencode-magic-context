@@ -24,6 +24,8 @@ export interface SmartNoteCapabilityApi {
     httpGet(url: string): Promise<{ status: number; body: string }>;
 }
 
+export type SmartNoteCapabilityFactory = (signal: AbortSignal) => SmartNoteCapabilityApi;
+
 export interface SmartNoteCapabilitiesOptions {
     projectRoot: string;
     signal: AbortSignal;

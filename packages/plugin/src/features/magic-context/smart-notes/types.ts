@@ -59,12 +59,18 @@ export interface SmartNoteCheckResult {
     met: boolean;
 }
 
+export interface SmartNoteNetworkErrorOptions {
+    terminal?: boolean;
+}
+
 export class SmartNoteNetworkError extends Error {
     readonly isSmartNoteNetworkError = true;
+    readonly terminal: boolean;
 
-    constructor(message: string) {
+    constructor(message: string, options: SmartNoteNetworkErrorOptions = {}) {
         super(message);
         this.name = "SmartNoteNetworkError";
+        this.terminal = options.terminal ?? false;
     }
 }
 
@@ -85,6 +91,10 @@ export function isSmartNoteNetworkError(error: unknown): boolean {
                 error.message.includes("SmartNoteNetworkError") ||
                 error.message.includes("SMART_NOTE_NETWORK")))
     );
+}
+
+export function isTerminalSmartNoteNetworkError(error: unknown): error is SmartNoteNetworkError {
+    return error instanceof SmartNoteNetworkError && error.terminal;
 }
 
 export function parseSmartNoteManifest(json: string | null): SmartNoteCheckManifest {

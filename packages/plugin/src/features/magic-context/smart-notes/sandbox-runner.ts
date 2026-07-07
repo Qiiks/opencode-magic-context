@@ -14,7 +14,7 @@ import {
     type QuickJSHandle,
 } from "quickjs-emscripten";
 
-import type { SmartNoteCapabilityApi } from "./capabilities";
+import type { SmartNoteCapabilityApi, SmartNoteCapabilityFactory } from "./capabilities";
 import { isSmartNoteNetworkError, type SmartNoteCheckResult } from "./types";
 
 /**
@@ -58,7 +58,8 @@ function withSandboxLock<T>(fn: () => Promise<T>): Promise<T> {
 
 export interface RunCompiledSmartNoteCheckOptions {
     compiledCheck: string;
-    capabilities: SmartNoteCapabilityApi;
+    capabilities?: SmartNoteCapabilityApi;
+    capabilityFactory?: SmartNoteCapabilityFactory;
     signal?: AbortSignal;
     timeoutMs?: number;
     heapLimitBytes?: number;
@@ -84,13 +85,36 @@ const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_HEAP_LIMIT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_STACK_LIMIT_BYTES = 512 * 1024;
 
+// Host calls can outlive the VM interrupt path, so any capability that touches
+// the outside world must listen to this run's controller. Otherwise one tarpit
+// request can keep the shared QuickJS module suspended past the sandbox budget
+// and block the next caller on the process-wide lock.
+function resolveCapabilitiesForRun(
+    options: RunCompiledSmartNoteCheckOptions,
+    signal: AbortSignal,
+): SmartNoteCapabilityApi {
+    if (options.capabilityFactory) {
+        return options.capabilityFactory(signal);
+    }
+    if (options.capabilities) {
+        return options.capabilities;
+    }
+    throw new Error("smart-note check requires capabilities");
+}
+
+function throwIfRunAborted(signal: AbortSignal): void {
+    if (signal.aborted) {
+        throw signal.reason ?? new Error("smart-note check aborted");
+    }
+}
+
 export async function runCompiledSmartNoteCheck(
     options: RunCompiledSmartNoteCheckOptions,
 ): Promise<RunCompiledSmartNoteCheckResult> {
     // Serialize the actual sandbox work (see withSandboxLock): only one
     // asyncify-suspended eval may exist at a time on the shared module. The
-    // per-check timeout starts INSIDE the lock so a check queued behind another
-    // doesn't burn its own budget waiting for the lock.
+    // per-check timeout and host-capability controller start INSIDE the lock so
+    // a check queued behind another doesn't burn its own budget waiting.
     return withSandboxLock(() => runCompiledSmartNoteCheckLocked(options));
 }
 
@@ -100,14 +124,21 @@ async function runCompiledSmartNoteCheckLocked(
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const controller = new AbortController();
     const externalAbort = () => controller.abort(options.signal?.reason);
-    options.signal?.addEventListener("abort", externalAbort, { once: true });
+    if (options.signal?.aborted) {
+        externalAbort();
+    } else {
+        options.signal?.addEventListener("abort", externalAbort, { once: true });
+    }
     const timer = setTimeout(
         () => controller.abort(new Error("smart-note check timed out")),
         timeoutMs,
     );
     try {
+        throwIfRunAborted(controller.signal);
+        const capabilities = resolveCapabilitiesForRun(options, controller.signal);
         const deadline = Date.now() + timeoutMs;
         const quickjs = await getAsyncModule();
+        throwIfRunAborted(controller.signal);
         const context = quickjs.newContext();
         try {
             context.runtime.setMemoryLimit(options.heapLimitBytes ?? DEFAULT_HEAP_LIMIT_BYTES);
@@ -115,7 +146,7 @@ async function runCompiledSmartNoteCheckLocked(
             context.runtime.setInterruptHandler(
                 () => controller.signal.aborted || Date.now() > deadline,
             );
-            installCapabilityObject(context, options.capabilities);
+            installCapabilityObject(context, capabilities);
             disableAmbientDynamicCode(context);
             const result = await evalCheck(context, options.compiledCheck);
             const checkResult = result as { met?: unknown } | null;

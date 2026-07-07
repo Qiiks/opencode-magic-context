@@ -8,7 +8,7 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { recordChildInvocation } from "../subagent-token-capture";
-import type { SmartNoteCapabilityApi } from "./capabilities";
+import type { SmartNoteCapabilityFactory } from "./capabilities";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./compiler-prompt";
 import { runCompiledSmartNoteCheck } from "./sandbox-runner";
 import type {
@@ -24,7 +24,8 @@ interface CompileSmartNoteArgs {
     sessionDirectory: string | undefined;
     projectIdentity: string;
     note: { id: number; content: string; surfaceCondition: string | null };
-    capabilities: SmartNoteCapabilityApi;
+    capabilityFactory: SmartNoteCapabilityFactory;
+    signal: AbortSignal;
     deadline: number;
     model?: string;
     fallbackModels?: readonly string[];
@@ -149,7 +150,8 @@ Remember: output only the JSON object described by the system prompt.`;
         }
         const dryRun = await runCompiledSmartNoteCheck({
             compiledCheck,
-            capabilities: args.capabilities,
+            capabilityFactory: args.capabilityFactory,
+            signal: args.signal,
             timeoutMs: 2_000,
         });
         if (!dryRun.ok) {
