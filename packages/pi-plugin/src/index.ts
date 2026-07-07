@@ -21,7 +21,7 @@
  */
 
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isDreamerRunnable } from "@magic-context/core/config/agent-disable";
 import { migrateMagicContextConfigLocations } from "@magic-context/core/config/migrate-config-location";
@@ -297,10 +297,14 @@ function warn(message: string, data?: unknown): void {
 }
 
 // Migrate config from the legacy per-harness locations to the shared CortexKit
-// location BEFORE any loadPiConfig (hard cutover: the loader reads only
-// CortexKit). Memoized per directory so the per-cwd switch sites don't re-run
-// the (idempotent, lock-guarded) migration on every pass. Fails open.
+// location BEFORE any loadPiConfig. The loader prefers the shared CortexKit
+// paths and only falls back to Pi-owned legacy files when that base is absent.
+// Memoized per directory so the per-cwd switch sites don't re-run the
+// (idempotent, lock-guarded) migration on every pass. Fails open.
 const migratedConfigDirs = new Set<string>();
+// Memoized per directory so repeated /cd lookups do not spam the same config
+// summary/warning lines on every hot-path config resolution.
+const loggedPiConfigDirs = new Set<string>();
 function ensureConfigLocationsMigrated(dir: string): void {
 	if (migratedConfigDirs.has(dir)) return;
 	migratedConfigDirs.add(dir);
@@ -309,6 +313,34 @@ function ensureConfigLocationsMigrated(dir: string): void {
 		info: (m) => info(m),
 	});
 }
+
+function logPiConfigLoad(args: {
+	dir: string;
+	loadedFromPaths: string[];
+	warnings: string[];
+	dedupe?: boolean;
+}): void {
+	const key = resolve(args.dir);
+	if (args.dedupe && loggedPiConfigDirs.has(key)) return;
+	if (args.dedupe) {
+		loggedPiConfigDirs.add(key);
+	}
+	if (args.loadedFromPaths.length > 0) {
+		info(`config loaded from: ${args.loadedFromPaths.join(", ")}`);
+	} else {
+		info("config: no magic-context.jsonc found, using schema defaults");
+	}
+	for (const warning of args.warnings) {
+		warn(`config: ${warning}`);
+	}
+}
+
+export const __test = {
+	logPiConfigLoad,
+	resetLoggedPiConfigDirs(): void {
+		loggedPiConfigDirs.clear();
+	},
+};
 
 function formatTokens(value: number): string {
 	return value.toLocaleString();
@@ -449,9 +481,10 @@ setHarness("pi");
 // ---------------------------------------------------------------------------
 // Config-driven resolvers
 //
-// Step 5b replaced the env-var stop-gaps with `loadPiConfig()` which reads
-// $cwd/.pi/magic-context.jsonc (project) + ~/.pi/agent/magic-context.jsonc
-// (user) and merges them through the shared Zod schema. The resolvers below
+// Step 5b replaced the env-var stop-gaps with `loadPiConfig()`, which reads
+// the shared CortexKit config paths (project `.cortexkit/`, user `~/.config/`)
+// and falls back to Pi-owned legacy files only until migration completes. The
+// resolvers below
 // adapt the schema-shaped config into the Pi-specific options the various
 // registration helpers expect.
 //
@@ -655,10 +688,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	);
 
 	// Step 5b: load the user's full magic-context.jsonc config. The loader
-	// reads $cwd/.pi/magic-context.jsonc and ~/.pi/agent/magic-context.jsonc
-	// (Pi convention), validates them through the shared Zod schema, falls
-	// back to defaults for invalid fields per-key, and returns merged
-	// config + warnings.
+	// reads the shared CortexKit project/user paths, validates them through the
+	// shared Zod schema, falls back to Pi-owned legacy files only while migration
+	// is incomplete, and uses defaults for invalid fields per-key. It returns
+	// the merged config plus warnings.
 	//
 	// We surface warnings via the standard `warn()` channel so users see
 	// them in the magic-context log. Loading never throws — bad config
@@ -667,14 +700,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const { config, warnings, loadedFromPaths } = loadPiConfig({
 		cwd: projectDir,
 	});
-	if (loadedFromPaths.length > 0) {
-		info(`config loaded from: ${loadedFromPaths.join(", ")}`);
-	} else {
-		info("config: no magic-context.jsonc found, using schema defaults");
-	}
-	for (const w of warnings) {
-		warn(`config: ${w}`);
-	}
+	logPiConfigLoad({
+		dir: projectDir,
+		loadedFromPaths,
+		warnings,
+		dedupe: true,
+	});
 
 	// Pi opens the shared DB before config is available (above), so apply the
 	// configured SQLite tuning to the already-open connection now. cache_size /
@@ -809,7 +840,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		const cached = projectDepsByDir.get(dir);
 		if (cached) return cached;
 		ensureConfigLocationsMigrated(dir);
-		const switchedConfig = loadPiConfig({ cwd: dir }).config;
+		const switchedLoad = loadPiConfig({ cwd: dir });
+		logPiConfigLoad({
+			dir,
+			loadedFromPaths: switchedLoad.loadedFromPaths,
+			warnings: switchedLoad.warnings,
+			dedupe: true,
+		});
+		const switchedConfig = switchedLoad.config;
 		const switchedIdentity =
 			identityOverride ?? resolveProjectIdentityOrFallback(dir);
 		const built = buildProjectDeps(dir, switchedIdentity, switchedConfig);
@@ -1338,7 +1376,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 			// Use effectiveConfig (re-resolved from the CURRENT checkout's cwd on
 			// a project switch) for every system-prompt decision below — a
-			// switched-into project may carry its own .pi/magic-context.jsonc
+			// switched-into project may carry its own .cortexkit/magic-context.jsonc
 			// (memory/docs/key-files/injection toggles). Reusing boot `config`
 			// would render the launch project's adjuncts in the new checkout.
 			if (effectiveConfig.system_prompt_injection?.enabled === false) {

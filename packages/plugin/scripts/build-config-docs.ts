@@ -233,7 +233,7 @@ Add the schema line for editor validation and autocomplete:
 \`\`\`
 
 :::note
-Project-level configs cannot use \`{env:VAR}\` / \`{file:path}\` expansion and cannot set \`sqlite.*\` or override hidden-agent prompts/permissions — these are security boundaries against untrusted repositories. User-level config has no such restriction.
+Project-level configs cannot use \`{env:VAR}\` / \`{file:path}\` expansion. A cloned repository also cannot set \`sqlite.*\`, hidden-agent prompts/permissions, \`historian.model\`, or \`historian.fallback_models\`. Project \`execute_threshold_percentage\` / \`execute_threshold_tokens\` may only RAISE thresholds relative to the user's effective settings (a repo may delay compaction, not make it happen earlier). Dreamer model/schedule/task tuning and \`memory.enabled\` remain allowed project overrides.
 :::
 
 ${sections.join("\n\n")}

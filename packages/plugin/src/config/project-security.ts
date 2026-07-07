@@ -1,3 +1,5 @@
+import { DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE } from "./schema/magic-context";
+
 /**
  * Security hardening for PROJECT-level (repo-supplied, untrusted) config.
  *
@@ -13,6 +15,7 @@
 
 /** Hidden agents that run with elevated/autonomous capability. */
 const HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"] as const;
+const HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"] as const;
 
 /**
  * Fields on a hidden-agent block that constitute a privilege-escalation /
@@ -31,16 +34,153 @@ const HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"] as const;
  *                   closes — a cloned repo could rewrite sidekick's instructions
  *                   via `/ctx-aug`.
  *
- * Benign fields (model/temperature/disable/schedule/tasks/…) are deliberately
- * NOT stripped: a repo may legitimately tune its own dreamer cadence or model,
- * and none of those are an escalation vector (the model is still invoked
- * through the user's own provider auth).
+ * Dreamer model/cadence fields are deliberately NOT stripped: a repo may tune
+ * its own dreamer overlays and schedules through the user's provider auth.
+ * Historian model selection stays USER-tier only, and compaction thresholds are
+ * project raise-only, so a cloned repo cannot force earlier compaction or extra
+ * historian spend on the user's dime.
  */
 const AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"] as const;
 const EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider"] as const;
+const PERCENTAGE_THRESHOLD_REASON =
+    "security: a repository may only raise compaction thresholds above the user's effective value; it cannot force earlier historian work or cloned-repo cost escalation.";
+const TOKEN_THRESHOLD_REASON =
+    "security: a repository may only raise execute_threshold_tokens above the user's trusted token threshold; it cannot force earlier historian work or cloned-repo cost escalation.";
+const TOKEN_THRESHOLD_INTRODUCTION_REASON =
+    "security: a repository cannot introduce a new execute_threshold_tokens override when the user has no trusted token threshold for that key; that could force earlier historian work or cloned-repo cost escalation.";
+
+interface PercentageThresholdConfig {
+    defaultValue: number;
+    overrides: Map<string, number>;
+}
+
+interface TokenThresholdConfig {
+    defaultValue: number | undefined;
+    overrides: Map<string, number>;
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isValidPercentageThreshold(value: unknown): value is number {
+    return typeof value === "number" && Number.isFinite(value) && value >= 20 && value <= 80;
+}
+
+function isValidTokenThreshold(value: unknown): value is number {
+    return (
+        typeof value === "number" && Number.isFinite(value) && value >= 5_000 && value <= 2_000_000
+    );
+}
+
+function normalizeTrustedPercentageThresholds(value: unknown): PercentageThresholdConfig {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return { defaultValue: value, overrides: new Map() };
+    }
+
+    if (
+        isPlainObject(value) &&
+        typeof value.default === "number" &&
+        Number.isFinite(value.default)
+    ) {
+        const overrides = new Map<string, number>();
+        for (const [key, child] of Object.entries(value)) {
+            if (key === "default") continue;
+            if (typeof child === "number" && Number.isFinite(child)) {
+                overrides.set(key, child);
+            }
+        }
+        return { defaultValue: value.default, overrides };
+    }
+
+    return { defaultValue: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, overrides: new Map() };
+}
+
+function normalizeTrustedTokenThresholds(value: unknown): TokenThresholdConfig {
+    if (!isPlainObject(value)) {
+        return { defaultValue: undefined, overrides: new Map() };
+    }
+
+    const overrides = new Map<string, number>();
+    for (const [key, child] of Object.entries(value)) {
+        if (key === "default") continue;
+        if (typeof child === "number" && Number.isFinite(child)) {
+            overrides.set(key, child);
+        }
+    }
+
+    return {
+        defaultValue:
+            typeof value.default === "number" && Number.isFinite(value.default)
+                ? value.default
+                : undefined,
+        overrides,
+    };
+}
+
+function clonePercentageThresholds(value: PercentageThresholdConfig): PercentageThresholdConfig {
+    return {
+        defaultValue: value.defaultValue,
+        overrides: new Map(value.overrides),
+    };
+}
+
+function cloneTokenThresholds(value: TokenThresholdConfig): TokenThresholdConfig {
+    return {
+        defaultValue: value.defaultValue,
+        overrides: new Map(value.overrides),
+    };
+}
+
+function percentageThresholdsEqual(
+    left: PercentageThresholdConfig,
+    right: PercentageThresholdConfig,
+): boolean {
+    if (left.defaultValue !== right.defaultValue) return false;
+    if (left.overrides.size !== right.overrides.size) return false;
+    for (const [key, value] of left.overrides) {
+        if (right.overrides.get(key) !== value) return false;
+    }
+    return true;
+}
+
+function setMergedPercentageThreshold(
+    mergedRaw: Record<string, unknown>,
+    value: PercentageThresholdConfig,
+): void {
+    if (value.overrides.size === 0) {
+        mergedRaw.execute_threshold_percentage = value.defaultValue;
+        return;
+    }
+
+    const serialized: Record<string, number> = { default: value.defaultValue };
+    for (const [key, threshold] of value.overrides) {
+        serialized[key] = threshold;
+    }
+    mergedRaw.execute_threshold_percentage = serialized;
+}
+
+function setMergedTokenThreshold(
+    mergedRaw: Record<string, unknown>,
+    value: TokenThresholdConfig,
+): void {
+    if (value.defaultValue === undefined && value.overrides.size === 0) {
+        delete mergedRaw.execute_threshold_tokens;
+        return;
+    }
+
+    const serialized: Record<string, number> = {};
+    if (value.defaultValue !== undefined) {
+        serialized.default = value.defaultValue;
+    }
+    for (const [key, threshold] of value.overrides) {
+        serialized[key] = threshold;
+    }
+    mergedRaw.execute_threshold_tokens = serialized;
+}
+
+function makeProjectThresholdWarning(field: string, reason: string): string {
+    return `Ignoring ${field} from project config (${reason})`;
 }
 
 /**
@@ -59,6 +199,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  *  - `embedding.endpoint` / `embedding.provider` — a repo must not choose
  *    where private memory/search/commit text is embedded. User-level config is
  *    the trust boundary for embedding destinations.
+ *  - `historian.model` / `historian.fallback_models` — historian model spend is
+ *    user-level only; a cloned repo cannot force extra compaction cost.
  *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
  *    re-permission the historian/dreamer/sidekick.
  */
@@ -104,6 +246,23 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         }
     }
 
+    const historian = projectRaw.historian;
+    if (isPlainObject(historian)) {
+        const removed: string[] = [];
+        for (const field of HISTORIAN_USER_ONLY_FIELDS) {
+            if (field in historian) {
+                delete historian[field];
+                removed.push(field);
+            }
+        }
+        if (removed.length > 0) {
+            warnings.push(
+                `Ignoring historian.${removed.join("/")} from project config ` +
+                    "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).",
+            );
+        }
+    }
+
     for (const agentKey of HIDDEN_AGENT_KEYS) {
         const block = projectRaw[agentKey];
         if (!isPlainObject(block)) continue;
@@ -119,6 +278,164 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
                 `Ignoring ${agentKey}.${removed.join("/")} from project config ` +
                     "(security: a repository cannot reprogram or re-permission hidden agents).",
             );
+        }
+    }
+
+    return warnings;
+}
+
+/**
+ * Clamp project-tier compaction thresholds after merge so a cloned repository
+ * may only DELAY compaction relative to the trusted user/default settings. A
+ * repo may never lower thresholds in a way that forces earlier historian work
+ * or cloned-repo cost escalation on the user's account.
+ */
+export function constrainProjectThresholdOverrides(args: {
+    mergedRaw: Record<string, unknown>;
+    projectRaw: Record<string, unknown>;
+    trustedBaseConfig: {
+        execute_threshold_percentage?: unknown;
+        execute_threshold_tokens?: unknown;
+    };
+}): string[] {
+    const warnings: string[] = [];
+    const basePercentage = normalizeTrustedPercentageThresholds(
+        args.trustedBaseConfig.execute_threshold_percentage,
+    );
+    const baseTokens = normalizeTrustedTokenThresholds(
+        args.trustedBaseConfig.execute_threshold_tokens,
+    );
+
+    if ("execute_threshold_percentage" in args.projectRaw) {
+        const projectValue = args.projectRaw.execute_threshold_percentage;
+
+        if (isValidPercentageThreshold(projectValue)) {
+            const constrained = clonePercentageThresholds(basePercentage);
+            constrained.defaultValue = Math.max(basePercentage.defaultValue, projectValue);
+            for (const [modelKey, threshold] of basePercentage.overrides) {
+                const raisedThreshold = Math.max(threshold, projectValue);
+                if (raisedThreshold === constrained.defaultValue) {
+                    constrained.overrides.delete(modelKey);
+                } else {
+                    constrained.overrides.set(modelKey, raisedThreshold);
+                }
+            }
+            setMergedPercentageThreshold(args.mergedRaw, constrained);
+            if (percentageThresholdsEqual(constrained, basePercentage)) {
+                warnings.push(
+                    makeProjectThresholdWarning(
+                        "execute_threshold_percentage",
+                        PERCENTAGE_THRESHOLD_REASON,
+                    ),
+                );
+            }
+        } else if (isPlainObject(projectValue)) {
+            const constrained = clonePercentageThresholds(basePercentage);
+            let touchedValidEntry = false;
+
+            if (isValidPercentageThreshold(projectValue.default)) {
+                touchedValidEntry = true;
+                if (projectValue.default > basePercentage.defaultValue) {
+                    constrained.defaultValue = projectValue.default;
+                } else {
+                    warnings.push(
+                        makeProjectThresholdWarning(
+                            "execute_threshold_percentage.default",
+                            PERCENTAGE_THRESHOLD_REASON,
+                        ),
+                    );
+                }
+            }
+
+            for (const [modelKey, rawValue] of Object.entries(projectValue)) {
+                if (modelKey === "default") continue;
+                if (!isValidPercentageThreshold(rawValue)) continue;
+                touchedValidEntry = true;
+                const baseValue =
+                    basePercentage.overrides.get(modelKey) ?? basePercentage.defaultValue;
+                if (rawValue > baseValue) {
+                    if (rawValue === constrained.defaultValue) {
+                        constrained.overrides.delete(modelKey);
+                    } else {
+                        constrained.overrides.set(modelKey, rawValue);
+                    }
+                } else {
+                    warnings.push(
+                        makeProjectThresholdWarning(
+                            `execute_threshold_percentage.${modelKey}`,
+                            PERCENTAGE_THRESHOLD_REASON,
+                        ),
+                    );
+                }
+            }
+
+            if (touchedValidEntry) {
+                setMergedPercentageThreshold(args.mergedRaw, constrained);
+            }
+        }
+    }
+
+    if (
+        "execute_threshold_tokens" in args.projectRaw &&
+        isPlainObject(args.projectRaw.execute_threshold_tokens)
+    ) {
+        const projectValue = args.projectRaw.execute_threshold_tokens;
+        const constrained = cloneTokenThresholds(baseTokens);
+        let touchedValidEntry = false;
+
+        if (isValidTokenThreshold(projectValue.default)) {
+            touchedValidEntry = true;
+            if (baseTokens.defaultValue === undefined) {
+                warnings.push(
+                    makeProjectThresholdWarning(
+                        "execute_threshold_tokens.default",
+                        TOKEN_THRESHOLD_INTRODUCTION_REASON,
+                    ),
+                );
+            } else if (projectValue.default > baseTokens.defaultValue) {
+                constrained.defaultValue = projectValue.default;
+            } else {
+                warnings.push(
+                    makeProjectThresholdWarning(
+                        "execute_threshold_tokens.default",
+                        TOKEN_THRESHOLD_REASON,
+                    ),
+                );
+            }
+        }
+
+        for (const [modelKey, rawValue] of Object.entries(projectValue)) {
+            if (modelKey === "default") continue;
+            if (!isValidTokenThreshold(rawValue)) continue;
+            touchedValidEntry = true;
+            const baseValue = baseTokens.overrides.get(modelKey) ?? baseTokens.defaultValue;
+            if (baseValue === undefined) {
+                warnings.push(
+                    makeProjectThresholdWarning(
+                        `execute_threshold_tokens.${modelKey}`,
+                        TOKEN_THRESHOLD_INTRODUCTION_REASON,
+                    ),
+                );
+                continue;
+            }
+            if (rawValue > baseValue) {
+                if (rawValue === constrained.defaultValue) {
+                    constrained.overrides.delete(modelKey);
+                } else {
+                    constrained.overrides.set(modelKey, rawValue);
+                }
+            } else {
+                warnings.push(
+                    makeProjectThresholdWarning(
+                        `execute_threshold_tokens.${modelKey}`,
+                        TOKEN_THRESHOLD_REASON,
+                    ),
+                );
+            }
+        }
+
+        if (touchedValidEntry) {
+            setMergedTokenThreshold(args.mergedRaw, constrained);
         }
     }
 

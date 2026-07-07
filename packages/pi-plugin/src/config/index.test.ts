@@ -295,6 +295,42 @@ describe("loadPiConfig", () => {
 		);
 	});
 
+	it("keeps historian model selection user-owned when project config tries to override it", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(
+			home,
+			JSON.stringify({
+				historian: {
+					model: "anthropic/user-historian",
+					fallback_models: ["anthropic/user-fallback"],
+				},
+			}),
+		);
+		writeProjectConfig(
+			cwd,
+			JSON.stringify({
+				historian: {
+					model: "anthropic/project-historian",
+					fallback_models: ["anthropic/project-fallback"],
+					temperature: 0.2,
+				},
+			}),
+		);
+
+		const result = loadPiConfig({ cwd });
+
+		expect(result.config.historian?.model).toBe("anthropic/user-historian");
+		expect(result.config.historian?.fallback_models).toEqual([
+			"anthropic/user-fallback",
+		]);
+		expect(result.config.historian?.temperature).toBe(0.2);
+		expect(result.warnings.join("\n")).toContain(
+			"Ignoring historian.model/fallback_models",
+		);
+	});
+
 	it("migrates legacy agent enabled keys before schema parsing", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");

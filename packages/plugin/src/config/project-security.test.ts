@@ -1,35 +1,36 @@
 import { describe, expect, it } from "bun:test";
 
 import {
+    constrainProjectThresholdOverrides,
     dropInheritedEmbeddingKeyOnRedirect,
     stripUnsafeProjectConfigFields,
 } from "./project-security";
 
 describe("stripUnsafeProjectConfigFields", () => {
     it("strips auto_update from project config", () => {
-        const raw: Record<string, unknown> = { auto_update: false, historian: { model: "x" } };
+        const raw: Record<string, unknown> = { auto_update: false, dreamer: { model: "x" } };
         const warnings = stripUnsafeProjectConfigFields(raw);
         expect("auto_update" in raw).toBe(false);
-        expect(raw.historian).toEqual({ model: "x" });
+        expect(raw.dreamer).toEqual({ model: "x" });
         expect(warnings.some((w) => w.includes("auto_update"))).toBe(true);
     });
 
     it("strips language from project config", () => {
-        const raw: Record<string, unknown> = { language: "tr", historian: { model: "x" } };
+        const raw: Record<string, unknown> = { language: "tr", dreamer: { model: "x" } };
         const warnings = stripUnsafeProjectConfigFields(raw);
         expect("language" in raw).toBe(false);
-        expect(raw.historian).toEqual({ model: "x" });
+        expect(raw.dreamer).toEqual({ model: "x" });
         expect(warnings.some((w) => w.includes("language"))).toBe(true);
     });
 
     it("strips sqlite.* from project config (resource-exhaustion vector)", () => {
         const raw: Record<string, unknown> = {
             sqlite: { cache_size_mb: 999_999, mmap_size_mb: 999_999 },
-            historian: { model: "x" },
+            dreamer: { model: "x" },
         };
         const warnings = stripUnsafeProjectConfigFields(raw);
         expect("sqlite" in raw).toBe(false);
-        expect(raw.historian).toEqual({ model: "x" });
+        expect(raw.dreamer).toEqual({ model: "x" });
         expect(warnings.some((w) => w.includes("sqlite"))).toBe(true);
     });
 
@@ -51,6 +52,20 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(embedding.model).toBe("text-embedding-3-small");
         expect(embedding.query_input_type).toBe("query");
         expect(warnings.some((w) => w.includes("embedding.endpoint/provider"))).toBe(true);
+    });
+
+    it("strips historian model selection from project config but keeps safe tuning fields", () => {
+        const raw: Record<string, unknown> = {
+            historian: {
+                model: "repo-model",
+                fallback_models: ["repo-fallback"],
+                temperature: 0.2,
+            },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+        expect(raw.historian).toEqual({ temperature: 0.2 });
+        expect(warnings.some((w) => w.includes("historian.model/fallback_models"))).toBe(true);
     });
 
     it("strips hidden-agent prompt/permission/tools but keeps benign fields", () => {
@@ -114,6 +129,50 @@ describe("stripUnsafeProjectConfigFields", () => {
     it("ignores non-object agent blocks", () => {
         const raw: Record<string, unknown> = { dreamer: true, historian: "x" };
         expect(stripUnsafeProjectConfigFields(raw)).toHaveLength(0);
+    });
+});
+
+describe("constrainProjectThresholdOverrides", () => {
+    it("drops lower project token thresholds and warns", () => {
+        const mergedRaw: Record<string, unknown> = {
+            execute_threshold_tokens: { default: 9_000 },
+        };
+        const warnings = constrainProjectThresholdOverrides({
+            mergedRaw,
+            projectRaw: { execute_threshold_tokens: { default: 9_000 } },
+            trustedBaseConfig: { execute_threshold_tokens: { default: 12_000 } },
+        });
+
+        expect(mergedRaw.execute_threshold_tokens).toEqual({ default: 12_000 });
+        expect(warnings).toEqual([expect.stringContaining("execute_threshold_tokens.default")]);
+    });
+
+    it("allows higher project token thresholds", () => {
+        const mergedRaw: Record<string, unknown> = {
+            execute_threshold_tokens: { default: 18_000 },
+        };
+        const warnings = constrainProjectThresholdOverrides({
+            mergedRaw,
+            projectRaw: { execute_threshold_tokens: { default: 18_000 } },
+            trustedBaseConfig: { execute_threshold_tokens: { default: 12_000 } },
+        });
+
+        expect(mergedRaw.execute_threshold_tokens).toEqual({ default: 18_000 });
+        expect(warnings).toHaveLength(0);
+    });
+
+    it("does not let project config introduce token thresholds without a trusted baseline", () => {
+        const mergedRaw: Record<string, unknown> = {
+            execute_threshold_tokens: { default: 18_000 },
+        };
+        const warnings = constrainProjectThresholdOverrides({
+            mergedRaw,
+            projectRaw: { execute_threshold_tokens: { default: 18_000 } },
+            trustedBaseConfig: {},
+        });
+
+        expect(mergedRaw.execute_threshold_tokens).toBeUndefined();
+        expect(warnings).toEqual([expect.stringContaining("execute_threshold_tokens.default")]);
     });
 });
 
