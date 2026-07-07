@@ -303,7 +303,12 @@ fn flatten_block(
 
 fn ensure_supported(mid: &str, block_index: usize, block: &CkWireBlock) -> Result<(), CkWireError> {
     match &block.kind {
-        CkKind::Media(_) | CkKind::Opaque(_) => Err(CkWireError::UnsupportedBlock {
+        // Opaque is a first-class carrier (provider-native blocks the module must
+        // never interpret): it projects like any block — verbatim bytes, arc data
+        // internal to the block — and selection classifies it as never-reducible.
+        // Media stays rejected until a canonical vector exists for it.
+        CkKind::Opaque(_) => Ok(()),
+        CkKind::Media(_) => Err(CkWireError::UnsupportedBlock {
             mid: mid.to_string(),
             block_index,
             kind: block.kind.tag().to_string(),

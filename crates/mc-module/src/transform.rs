@@ -2089,7 +2089,7 @@ mod tests {
     fn ck_wire_golden_bytes_match_cross_repo_pin() {
         use sha2::{Digest, Sha256};
         const GOLDEN_SHA256: &str =
-            "67513b59744cd94d109d08ac7ddcbfd19347fe9eceafb40e46af73f8db1aff20";
+            "e6143e10762f3f1b33a2a2bc32860e8fcd51dece00d7af67e7c2245c309db192";
         let bytes = include_bytes!("../testdata/ck_wire_golden.json");
         let actual = format!("{:x}", Sha256::digest(bytes));
         assert_eq!(
@@ -2106,6 +2106,16 @@ mod tests {
             serde_json::from_str(include_str!("../testdata/ck_wire_golden.json")).unwrap();
         let projection = project_messages(&ingress_from_ck(ck)).unwrap();
         let actual = serde_json::to_value(&projection.blocks).unwrap();
+        if std::env::var_os("MC_REGEN_PROJECTION_GOLDEN").is_some() {
+            std::fs::write(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/testdata/ingress-projection-golden.json"
+                ),
+                serde_json::to_string_pretty(&actual).unwrap(),
+            )
+            .unwrap();
+        }
         let expected: Value =
             serde_json::from_str(include_str!("../testdata/ingress-projection-golden.json"))
                 .unwrap();
@@ -2132,7 +2142,11 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_opaque_and_media_fail_loud_at_ingress() {
+    fn opaque_projects_verbatim_and_media_fails_loud_at_ingress() {
+        // Opaque is a first-class carrier: it must project (verbatim bytes,
+        // "opaque" kind_tag), never reject — a rejected Opaque would fail every
+        // conversation containing a provider-native block (e.g. Responses
+        // reasoning items) at ingress.
         let opaque = CkIngressMessage {
             mid: "opaque".to_string(),
             ordinal: 1,
@@ -2140,7 +2154,7 @@ mod tests {
                 "user",
                 vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(
                     ck_wire::OpaqueBlock {
-                        source: json!({ "source": "wire", "family": "test" }),
+                        source: json!({ "source": "wire", "wire": "test" }),
                         kind: "native".to_string(),
                         raw: json!({ "x": 1 }),
                         arc: None,
@@ -2151,10 +2165,15 @@ mod tests {
                 ck_wire::HarnessMeta::default(),
             ),
         };
-        assert!(matches!(
-            project_messages(&[opaque]),
-            Err(CkWireError::UnsupportedBlock { .. })
-        ));
+        let projection = project_messages(&[opaque]).unwrap();
+        assert_eq!(projection.blocks.len(), 1);
+        let block = &projection.blocks[0];
+        assert_eq!(block.kind_tag, "opaque");
+        // Verbatim source bytes: the serialized block must round-trip the
+        // source-tagged struct shape ({"source":"wire","wire":...}) untouched.
+        assert!(block
+            .bytes
+            .contains("\"source\":{\"source\":\"wire\",\"wire\":\"test\"}"));
 
         let media = CkIngressMessage {
             mid: "media".to_string(),
