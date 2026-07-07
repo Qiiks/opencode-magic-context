@@ -1209,6 +1209,26 @@
       "description": "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
       "type": "boolean"
     },
+    "todowrite": {
+      "default": {
+        "enabled": true,
+        "overlay": true
+      },
+      "description": "Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there.",
+          "type": "boolean"
+        },
+        "overlay": {
+          "default": true,
+          "description": "Pi only: show the persistent todo overlay above the editor while tasks are active.",
+          "type": "boolean"
+        }
+      }
+    },
     "smart_drops": {
       "default": false,
       "description": "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 5), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",

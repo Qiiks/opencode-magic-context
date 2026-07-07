@@ -30,6 +30,10 @@ describe("MagicContextConfigSchema", () => {
                     auto_promote: true,
                     retrieval_count_promotion_threshold: 3,
                 },
+                todowrite: {
+                    enabled: true,
+                    overlay: true,
+                },
             });
             expect(result.historian).toBeUndefined();
             expect(result.dreamer).toBeUndefined();
@@ -63,6 +67,10 @@ describe("MagicContextConfigSchema", () => {
                 },
                 temporal_awareness: false,
                 keep_subagents: false,
+                todowrite: {
+                    enabled: false,
+                    overlay: false,
+                },
                 smart_drops: false,
                 caveman_text_compression: {
                     enabled: false,

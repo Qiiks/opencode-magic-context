@@ -19,6 +19,7 @@ import { createCtxMemoryTool } from "./ctx-memory";
 import { createCtxNoteTool } from "./ctx-note";
 import { createCtxReduceTool } from "./ctx-reduce";
 import { createCtxSearchTool } from "./ctx-search";
+import { registerTodosCommand } from "./todo-view-pi";
 import { createTodowriteTool } from "./todowrite";
 
 export interface RegisterToolsOptions {
@@ -55,6 +56,10 @@ export interface RegisterToolsOptions {
 	 *  child session, so ctx_note would write notes orphaned under the hidden
 	 *  child id and ctx_expand would expand the child's empty transcript. */
 	sessionScopedToolsDisabled?: boolean;
+	/** When false, omit Magic Context's Pi todowrite tool entirely. */
+	todowriteEnabled?: boolean;
+	/** Main Pi entry registers /todos; lean subagent entries keep commands off. */
+	todowriteCommandEnabled?: boolean;
 }
 
 export function registerMagicContextTools(
@@ -100,13 +105,18 @@ export function registerMagicContextTools(
 		pi.registerTool(createCtxExpandTool({ db: opts.db }));
 	}
 
-	// `todowrite` parity with OpenCode. Pi-coding-agent has no built-in
-	// task list tool, so without this the synthetic-todowrite injector
-	// would never have anything to surface. The tool just captures the
-	// `todos` arg and echoes a pretty-printed JSON ack; `message_end`
-	// in index.ts snapshots `params.todos` into `session_meta.last_todo_state`
-	// for downstream synthesis. See `tools/todowrite.ts` header for rationale.
-	pi.registerTool(createTodowriteTool());
+	if (opts.todowriteEnabled !== false) {
+		// `todowrite` parity with OpenCode. Pi-coding-agent has no built-in
+		// task list tool, so without this the synthetic-todowrite injector
+		// would never have anything to surface. The tool just captures the
+		// `todos` arg and echoes a pretty-printed JSON ack; `message_end`
+		// in index.ts snapshots `params.todos` into `session_meta.last_todo_state`
+		// for downstream synthesis. See `tools/todowrite.ts` header for rationale.
+		pi.registerTool(createTodowriteTool());
+		if (opts.todowriteCommandEnabled !== false) {
+			registerTodosCommand(pi);
+		}
+	}
 
 	// ctx_reduce is session-scoped just like ctx_note/ctx_expand: it resolves the
 	// CURRENT session id at call time. Omit it for `--no-session` children where

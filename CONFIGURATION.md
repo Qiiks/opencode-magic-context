@@ -110,6 +110,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `commit_cluster_trigger` | `object` | See below | Controls the commit-cluster historian trigger. |
 | `system_prompt_injection` | `object` | See below | Controls whether and where Magic Context augments the system prompt; lets you opt specific agents out. |
 | `keep_subagents` | `boolean` | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success, so their full transcript stays in the host session store for inspection. Kept sessions accumulate until cleared manually — leave `false` for normal use. |
+| `todowrite` | `object` | See below | **Pi only.** Controls Magic Context's built-in `todowrite` tool and persistent task overlay. OpenCode has its own built-in `todowrite`, so this setting has no effect there. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
 
 ### `language`
@@ -161,6 +162,26 @@ Controls whether and where Magic Context augments the system prompt (its guidanc
 
 - **`enabled`** — when `false`, NO injection happens for ANY agent. Global escape hatch; Magic Context's transform and compaction still run, but nothing is added to the system prompt.
 - **`skip_signatures`** — substring opt-out list. If an agent's system prompt contains any of these strings, Magic Context skips ALL injection for that call. Use it to exempt a specific custom agent by putting the signature (e.g. the default `<!-- magic-context: skip -->`) in that agent's prompt.
+
+### `todowrite` (Pi only)
+
+Pi does not ship a built-in `todowrite` tool, so Magic Context registers an OpenCode-parity task-list tool by default. Disable it if another Pi extension already provides todo UX:
+
+```jsonc
+{
+  "todowrite": {
+    "enabled": true,  // default: true
+    "overlay": true   // default: true
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `boolean` | `true` | Register Magic Context's Pi `todowrite` tool and `/todos` command. Set `false` when using another todo extension. |
+| `overlay` | `boolean` | `true` | Show the persistent todo overlay above the editor while tasks are active. |
+
+Pi registers tools, slash commands, and widgets once at extension boot. If you `/cd` into a project with a different `todowrite.enabled` value, run `/reload` or restart Pi for the tool surface to change.
 
 ### `sqlite`
 

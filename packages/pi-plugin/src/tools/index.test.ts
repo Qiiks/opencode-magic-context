@@ -8,9 +8,13 @@ describe("registerMagicContextTools", () => {
 		const db = createTestDb();
 		try {
 			const registered: string[] = [];
+			const commands: string[] = [];
 			const pi = {
 				registerTool: (tool: { name: string }) => {
 					registered.push(tool.name);
+				},
+				registerCommand: (name: string) => {
+					commands.push(name);
 				},
 			} as never;
 
@@ -18,12 +22,15 @@ describe("registerMagicContextTools", () => {
 				db,
 				memoryToolEnabled: false,
 				sessionScopedToolsDisabled: true,
+				todowriteCommandEnabled: false,
 			});
 
 			expect(registered).toContain("ctx_search");
 			expect(registered).not.toContain("ctx_memory");
 			expect(registered).not.toContain("ctx_note");
 			expect(registered).not.toContain("ctx_expand");
+			expect(registered).toContain("todowrite");
+			expect(commands).not.toContain("todos");
 		} finally {
 			closeQuietly(db);
 		}
@@ -43,6 +50,7 @@ describe("registerMagicContextTools", () => {
 				}) => {
 					registered.set(tool.name, tool);
 				},
+				registerCommand: () => undefined,
 			} as never;
 
 			registerMagicContextTools(pi, {
@@ -71,6 +79,64 @@ describe("registerMagicContextTools", () => {
 			expect(
 				(result as { isError?: boolean } | undefined)?.isError,
 			).toBeUndefined();
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("registers todowrite and /todos by default", () => {
+		const db = createTestDb();
+		try {
+			const registered: string[] = [];
+			const commands: string[] = [];
+			const pi = {
+				registerTool: (tool: { name: string }) => registered.push(tool.name),
+				registerCommand: (name: string) => commands.push(name),
+			} as never;
+
+			registerMagicContextTools(pi, { db });
+
+			expect(registered).toContain("todowrite");
+			expect(commands).toContain("todos");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("omits todowrite and /todos when todowrite is disabled", () => {
+		const db = createTestDb();
+		try {
+			const registered: string[] = [];
+			const commands: string[] = [];
+			const pi = {
+				registerTool: (tool: { name: string }) => registered.push(tool.name),
+				registerCommand: (name: string) => commands.push(name),
+			} as never;
+
+			registerMagicContextTools(pi, { db, todowriteEnabled: false });
+
+			expect(registered).toContain("ctx_search");
+			expect(registered).not.toContain("todowrite");
+			expect(commands).not.toContain("todos");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("can keep /todos off for lean subagent entries", () => {
+		const db = createTestDb();
+		try {
+			const registered: string[] = [];
+			const commands: string[] = [];
+			const pi = {
+				registerTool: (tool: { name: string }) => registered.push(tool.name),
+				registerCommand: (name: string) => commands.push(name),
+			} as never;
+
+			registerMagicContextTools(pi, { db, todowriteCommandEnabled: false });
+
+			expect(registered).toContain("todowrite");
+			expect(commands).not.toContain("todos");
 		} finally {
 			closeQuietly(db);
 		}

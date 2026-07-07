@@ -143,6 +143,11 @@ import {
 } from "./system-prompt";
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools } from "./tools";
+import {
+	registerTodoOverlay,
+	registerTodoStateLifecycle,
+	setTodoSnapshot,
+} from "./tools/todo-view-pi";
 
 const PREFIX = "[magic-context][pi]";
 
@@ -737,12 +742,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const bootProjectDeps = buildProjectDeps(projectDir, projectIdentity, config);
 	projectDepsByDir.set(projectDir, bootProjectDeps);
+	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled !== false;
+	const todowriteOverlayEnabled =
+		todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
 
 	// Register the agent-facing tools. Reuses the same business logic
 	// the OpenCode plugin uses (insertMemory, unifiedSearch, addNote, …)
 	// via the shared cortexkit DB. Cross-harness memory sharing is automatic
 	// because both plugins resolve the same project identity for the same
 	// directory.
+	// Pi registers tools, commands, and widgets once at extension boot. Therefore
+	// `todowrite.enabled` follows the boot project's config: after `/cd` into a
+	// project with a different value, users need `/reload` or a Pi restart for the
+	// tool/command/overlay surface to change, matching Pi's registration lifecycle.
 	registerMagicContextTools(pi, {
 		db,
 		ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
@@ -771,9 +783,28 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		dreamerEnabled: isDreamerRunnable(config),
 		resolveDreamerEnabled: (ctx) =>
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
+		todowriteEnabled,
 	});
 	info(
-		"registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce",
+		todowriteEnabled
+			? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos"
+			: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
+	);
+
+	const readLastTodoState = (sessionId: string) =>
+		getOrCreateSessionMeta(db, sessionId).lastTodoState;
+	if (todowriteEnabled) {
+		registerTodoStateLifecycle(pi, { readLastTodoState });
+	}
+	const todoOverlay = todowriteOverlayEnabled
+		? registerTodoOverlay(pi, {
+				readLastTodoState,
+			})
+		: undefined;
+	info(
+		todowriteOverlayEnabled
+			? "registered todowrite overlay"
+			: "registered todowrite overlay: DISABLED (todowrite.enabled=false or todowrite.overlay=false)",
 	);
 
 	// Register the per-LLM-call transform pipeline. Tags eligible message
@@ -1439,6 +1470,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				const sessionMeta = Array.isArray(todos)
 					? getOrCreateSessionMeta(db, sessionId)
 					: null;
+				if (todowriteEnabled && Array.isArray(todos)) {
+					setTodoSnapshot(sessionId, todos);
+					todoOverlay?.update(sessionId);
+				}
 
 				// Synthetic-todowrite snapshot capture (Pi parity with
 				// OpenCode hook-handlers.ts:386-401). Persist normalized
@@ -1714,6 +1749,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 							if (!Array.isArray(todos)) continue;
 							const normalized = normalizeTodoStateJson(todos);
 							if (normalized === null) continue;
+							if (todowriteEnabled) {
+								setTodoSnapshot(sessionId, todos);
+								todoOverlay?.update(sessionId);
+							}
 							updateSessionMeta(db, sessionId, {
 								lastTodoState: normalized,
 							});
