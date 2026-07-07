@@ -313,17 +313,29 @@ pub fn build_historian_chunk(
             break;
         }
         let role = message.ck.role.as_str();
-        if message.ordinal < start || role == "system" {
+        if message.ordinal < start {
             continue;
         }
+        // System-role content never enters the chunk text (it is pinned prompt
+        // material, not conversation), but its ORDINAL must still ride the
+        // chunk's line meta: the coverage validator requires the claimed raw
+        // range to be contiguous, and a compartment covering the span genuinely
+        // folds the system message out of the tail (build_output re-emits
+        // covered system at the head). Feeding it through as a zero-block
+        // message reuses the pending-noise absorption that already handles
+        // empty messages, instead of silently gapping the coverage.
         let flat_message = FlatMessage {
             mid: message.mid.as_str(),
             ordinal: message.ordinal,
             role,
-            blocks: blocks_by_mid
-                .get(message.mid.as_str())
-                .cloned()
-                .unwrap_or_default(),
+            blocks: if role == "system" {
+                Vec::new()
+            } else {
+                blocks_by_mid
+                    .get(message.mid.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+            },
         };
         if !builder.push_message(&flat_message) {
             break;
@@ -989,19 +1001,29 @@ mod tests {
     }
 
     #[test]
-    fn chunk_uses_flat_block_ids_and_skips_system_messages() {
+    fn chunk_uses_flat_block_ids_and_covers_system_ordinals_without_their_text() {
         let messages = vec![
             msg("u1", 1, "user", vec![text("hello")]),
             msg("sys", 2, "system", vec![text("identity")]),
             msg("a3", 3, "assistant", vec![text("done")]),
         ];
         let built = project_and_build(&messages, 1, 1_000, 4);
-        assert_eq!(built.text, "[1] U: hello\n[3] A: done");
+        // System CONTENT stays out of the chunk text (pinned prompt material,
+        // not conversation)...
+        assert!(!built.text.contains("identity"));
+        assert!(built.text.contains("U: hello"));
+        assert!(built.text.contains("A: done"));
         assert_eq!(built.chunk.start_index, 1);
-        assert!(!built.chunk.lines.iter().any(|line| line.ordinal == 2));
-        assert!(built.chunk.lines.iter().any(|line| line.ordinal == 3));
+        // ...but its ordinal rides the line meta: the claimed coverage range
+        // must be contiguous or validate_chunk_coverage rejects the firing.
+        let ordinals: Vec<u64> = built.chunk.lines.iter().map(|line| line.ordinal).collect();
+        assert_eq!(ordinals, vec![1, 2, 3]);
         assert_eq!(built.chunk.lines[0].message_id, "u1#0");
         assert_eq!(built.end_message_id, "a3#0");
+        assert!(
+            crate::historian_validate::validate_chunk_coverage(&built.chunk).is_none(),
+            "a mid-span system message must not open a coverage gap"
+        );
     }
 
     #[test]

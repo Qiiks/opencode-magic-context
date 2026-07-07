@@ -753,6 +753,12 @@
           ]
         },
         {
+          "ordinal": 2,
+          "id": "sys2",
+          "role": "user",
+          "parts": []
+        },
+        {
           "ordinal": 3,
           "id": "a3",
           "role": "assistant",
@@ -816,14 +822,18 @@
         "endIndex": 3,
         "startMessageId": "u1",
         "endMessageId": "a3",
-        "messageCount": 2,
-        "tokenEstimate": 12,
+        "messageCount": 3,
+        "tokenEstimate": 14,
         "hasMore": false,
-        "text": "[1] U: hello\n[3] A: done",
+        "text": "[1] U: hello\n[2-3] A: done",
         "lines": [
           {
             "ordinal": 1,
             "messageId": "u1"
+          },
+          {
+            "ordinal": 2,
+            "messageId": "sys2"
           },
           {
             "ordinal": 3,

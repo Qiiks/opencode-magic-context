@@ -162,8 +162,15 @@ const cases: Array<{
         offset: 1,
         eligibleEnd: 4,
         exercises: ["system_skip"],
+        // The TS leg never sees a wire system message (system prompts are not
+        // session rows), so the oracle-equivalent of CK's system-at-ordinal-2 is
+        // a zero-part message occupying the same ordinal: no summarizable
+        // content, but the ordinal still rides the coverage line meta. The CK
+        // builder feeds system messages through as zero-block for exactly this
+        // reason — a mid-span system ordinal must not open a coverage gap.
         ts: [
             { ordinal: 1, id: "u1", role: "user", parts: [text("hello")] },
+            { ordinal: 2, id: "sys2", role: "user", parts: [] },
             { ordinal: 3, id: "a3", role: "assistant", parts: [text("done")] },
         ],
         ck: [
@@ -298,8 +305,10 @@ function assertNonVacuous(label: string, expected: SessionChunk, exercises: stri
                 if (!expected.text.startsWith("[2] A: TC: read(src/lib.rs)")) throw new Error(`${label}: standalone result did not open a TC-only A block`);
                 break;
             case "system_skip":
-                if (expected.text.includes("identity") || expected.lines.some((line) => line.ordinal === 2)) throw new Error(`${label}: system role was not skipped`);
-                if (!expected.lines.some((line) => line.ordinal === 3)) throw new Error(`${label}: post-system ordinal was not processed`);
+                if (expected.text.includes("identity")) throw new Error(`${label}: system content leaked into the chunk text`);
+                if (expected.lines.map((line) => line.ordinal).join(",") !== "1,2,3") {
+                    throw new Error(`${label}: system ordinal must ride coverage line meta without a gap`);
+                }
                 break;
             case "commit_cap":
                 if (!expected.text.includes("commits: 1111111, 2222222, 3333333, 4444444, 5555555")) throw new Error(`${label}: commit cap did not keep the first five hashes`);
