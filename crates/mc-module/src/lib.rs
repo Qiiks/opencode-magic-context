@@ -36,6 +36,7 @@ pub mod memory_tool;
 pub mod project_docs;
 pub mod scheduler;
 pub mod selection;
+pub mod session_resolver;
 pub mod transform;
 
 use std::collections::{HashMap, HashSet};
@@ -48,8 +49,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
-use mc_store::{HistorianPhase, McStore};
-use serde_json::{json, Value};
+use mc_store::{HistorianPhase, InsertMemoryInput, McStore};
+use serde_json::{json, Map, Value};
 use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest};
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
@@ -62,10 +63,15 @@ use historian_chunk::{
 };
 use historian_producer::{HistorianProducer, HistorianProducerConfig, HistorianProducerError};
 use selection::SelKind;
+#[cfg(test)]
+use session_resolver::ResolvedSession;
+use session_resolver::{
+    MissingSessionResolver, RealSessionResolver, SessionResolveError, SessionResolver,
+};
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        Bindings, Concurrency, ConsumerRole, ExecutionMode, IdentityBinding, IdentityScope,
+        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
@@ -73,15 +79,16 @@ use subc_protocol::{
 use transform::ReductionDecision;
 use transform::{transform_with_projection, HistorianDiagnostics, TransformRequest};
 
-/// The per-route session binding: the project + session a route channel is bound to, plus
-/// the render budget frozen at bind. Established once at `on_bind` (the daemon relays the
-/// resolved {project_root, session} for the route), read by the transform path to resolve
-/// which project's store to read, and removed at `on_route_gone`. The project is NEVER
-/// taken from a per-pass request field — a crafted request could spoof it to read another
-/// project's memories — so it lives here, keyed by the route channel the daemon controls.
+/// The per-route binding: the project, harness, session-slot value, and render budget
+/// frozen at bind. Transform routes carry the durable session in `session`; MCP facade
+/// routes carry an instance token there and must resolve it before touching the store.
+/// The project is NEVER taken from a per-pass request field — a crafted request could
+/// spoof it to read another project's memories — so it lives here, keyed by the route
+/// channel the daemon controls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
     pub project_root: PathBuf,
+    pub harness: String,
     pub session: String,
     pub model_key: Option<String>,
     pub config: McModuleConfig,
@@ -122,12 +129,20 @@ const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
 /// After a historian abandon, suppress refires for this long so a persistently
 /// failing model does not burn a full summarization pass on every transform.
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
+const SESSION_UNRESOLVED_MESSAGE: &str =
+    "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
+
+struct FacadeScope {
+    memory_project_path: String,
+    conversation_key: String,
+}
 
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (channel → {project, session}).
 pub struct McHandler {
     store: OnceLock<Arc<McStore>>,
     producer_factory: Arc<dyn HistorianProducerFactory>,
+    session_resolver: Arc<dyn SessionResolver>,
     config: Mutex<ConfigCache>,
     #[cfg(test)]
     fixed_config: Option<McModuleConfig>,
@@ -282,9 +297,14 @@ impl McHandler {
             }),
             None => Arc::new(MissingProducerFactory),
         };
+        let session_resolver: Arc<dyn SessionResolver> = match connection_file {
+            Some(path) => Arc::new(RealSessionResolver::new(path)),
+            None => Arc::new(MissingSessionResolver),
+        };
         McHandler {
             store: OnceLock::new(),
             producer_factory,
+            session_resolver,
             config: Mutex::new(ConfigCache::default()),
             #[cfg(test)]
             fixed_config: None,
@@ -319,9 +339,23 @@ impl McHandler {
         factory: Arc<dyn HistorianProducerFactory>,
         config: McModuleConfig,
     ) -> Self {
+        Self::with_producer_factory_config_resolver(
+            factory,
+            config,
+            Arc::new(MissingSessionResolver),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_producer_factory_config_resolver(
+        factory: Arc<dyn HistorianProducerFactory>,
+        config: McModuleConfig,
+        session_resolver: Arc<dyn SessionResolver>,
+    ) -> Self {
         McHandler {
             store: OnceLock::new(),
             producer_factory: factory,
+            session_resolver,
             config: Mutex::new(ConfigCache::default()),
             fixed_config: Some(config),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -368,6 +402,18 @@ impl McHandler {
             return Err(BindingError::SessionMismatch);
         }
         Ok(binding.clone())
+    }
+
+    /// Return the channel binding without comparing a request session. MCP facade routes
+    /// bind the `session` slot to an instance token, not to the durable conversation key;
+    /// facade handlers must resolve that token through ai-proxy before touching the store.
+    fn facade_binding(&self, channel: u16) -> Result<SessionBinding, BindingError> {
+        self.bindings
+            .lock()
+            .expect("bindings mutex")
+            .get(&channel)
+            .cloned()
+            .ok_or(BindingError::Unbound)
     }
 
     fn effective_config(&self, project_root: &Path) -> McModuleConfig {
@@ -1301,6 +1347,223 @@ impl McHandler {
     async fn handle_transform_for_test(&self, channel: u16, request: Value) -> HandlerOutcome {
         self.handle_transform_value(channel, request).await
     }
+
+    async fn handle_facade_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let Some(name) = request.get("name").and_then(Value::as_str) else {
+            return unrecognized_request_error(&request);
+        };
+        match name {
+            "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
+            "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
+            _ => unrecognized_request_error(&request),
+        }
+    }
+
+    async fn resolve_facade_scope(&self, channel: u16) -> Result<FacadeScope, HandlerOutcome> {
+        let binding = self
+            .facade_binding(channel)
+            .map_err(|_| session_unresolved_error())?;
+        let instance_token = binding.session.trim();
+        if instance_token.is_empty() {
+            return Err(session_unresolved_error());
+        }
+        match self
+            .session_resolver
+            .resolve_session(&binding.project_root, &binding.harness, instance_token)
+            .await
+        {
+            Ok(Some(resolved)) => Ok(FacadeScope {
+                memory_project_path: binding.project_root.to_string_lossy().to_string(),
+                conversation_key: resolved.session_id,
+            }),
+            Ok(None) => Err(session_unresolved_error()),
+            Err(SessionResolveError::Timeout) => Err(HandlerOutcome::Error {
+                code: "session_resolve_timeout".to_string(),
+                message: "session.resolve timed out after 2s".to_string(),
+            }),
+            Err(error) => Err(HandlerOutcome::Error {
+                code: "session_resolve_failed".to_string(),
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request) else {
+            return invalid_params_error("ctx_memory arguments must be an object");
+        };
+        let Some(action) = string_arg(args, "action") else {
+            return invalid_params_error("ctx_memory requires an action");
+        };
+        let facade_scope = match self.resolve_facade_scope(channel).await {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        let memory_project = facade_scope.memory_project_path.as_str();
+        let conversation_key = facade_scope.conversation_key.as_str();
+        match action {
+            "write" => {
+                let Some(category) = non_empty_string_arg(args, "category") else {
+                    return tool_error_result(
+                        "Error: 'category' is required when action is 'write'.",
+                    );
+                };
+                let Some(content) = non_empty_string_arg(args, "content") else {
+                    return tool_error_result(
+                        "Error: 'content' is required when action is 'write'.",
+                    );
+                };
+                match store.insert_memory(InsertMemoryInput {
+                    project_path: memory_project,
+                    category,
+                    content,
+                    source_session_id: Some(conversation_key),
+                    source_type: Some("agent"),
+                    importance: Some(50),
+                    expires_at: None,
+                    metadata_json: None,
+                    now_ms: now_ms(),
+                }) {
+                    Ok(id) => {
+                        mcp_text_result(format!("Saved memory [ID: {id}] in {category}."), false)
+                    }
+                    Err(error) => HandlerOutcome::Error {
+                        code: "memory_store_failed".to_string(),
+                        message: error.to_string(),
+                    },
+                }
+            }
+            "update" => {
+                let Some(id) = single_memory_id(args, "update") else {
+                    return tool_error_result(
+                        "Error: provide exactly one memory id when action is 'update'.",
+                    );
+                };
+                let Some(content) = non_empty_string_arg(args, "content") else {
+                    return tool_error_result(
+                        "Error: 'content' is required when action is 'update'.",
+                    );
+                };
+                match memory_tool::update_memory(store, memory_project, id, content, now_ms()) {
+                    Ok(memory) => mcp_text_result(
+                        format!("Updated memory [ID: {}] in {}.", memory.id, memory.category),
+                        false,
+                    ),
+                    Err(error) => tool_error_result(format!("Error: {error}")),
+                }
+            }
+            "archive" => {
+                let ids = memory_ids(args, "archive");
+                if ids.is_empty() {
+                    return tool_error_result(
+                        "Error: provide at least one memory id when action is 'archive'.",
+                    );
+                }
+                let reason = string_arg(args, "reason");
+                let mut archived = Vec::new();
+                for id in ids {
+                    match memory_tool::archive_memory(store, memory_project, id, reason, now_ms()) {
+                        Ok(true) => archived.push(id),
+                        Ok(false) => {}
+                        Err(error) => return tool_error_result(format!("Error: {error}")),
+                    }
+                }
+                if archived.is_empty() {
+                    mcp_text_result("No active memories needed archiving.".to_string(), false)
+                } else {
+                    mcp_text_result(
+                        format!("Archived memory IDs [{}].", join_i64s(&archived)),
+                        false,
+                    )
+                }
+            }
+            "merge" => {
+                let Some((target_id, source_ids)) = merge_ids(args) else {
+                    return tool_error_result(
+                        "Error: provide target_id plus source_ids, or ids with the target first, when action is 'merge'.",
+                    );
+                };
+                let Some(content) = non_empty_string_arg(args, "content") else {
+                    return tool_error_result(
+                        "Error: 'content' is required when action is 'merge'.",
+                    );
+                };
+                match memory_tool::merge_memories(
+                    store,
+                    memory_project,
+                    target_id,
+                    &source_ids,
+                    content,
+                    now_ms(),
+                ) {
+                    Ok(memory) => mcp_text_result(
+                        format!(
+                            "Merged memories into [ID: {}] in {}; superseded [{}].",
+                            memory.id,
+                            memory.category,
+                            join_i64s(&source_ids)
+                        ),
+                        false,
+                    ),
+                    Err(error) => tool_error_result(format!("Error: {error}")),
+                }
+            }
+            _ => tool_error_result("Error: Unknown ctx_memory action.".to_string()),
+        }
+    }
+
+    async fn handle_ctx_search_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request) else {
+            return invalid_params_error("ctx_search arguments must be an object");
+        };
+        let Some(query) = non_empty_string_arg(args, "query") else {
+            return tool_error_result("Error: 'query' is required for ctx_search.");
+        };
+        let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
+        let facade_scope = match self.resolve_facade_scope(channel).await {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        let memory_project = facade_scope.memory_project_path.as_str();
+        let conversation_key = facade_scope.conversation_key.as_str();
+        match memory_tool::search_memories_and_compartments_for_session(
+            store,
+            memory_project,
+            conversation_key,
+            query,
+            limit,
+        ) {
+            Ok(results) => {
+                let rendered = results
+                    .into_iter()
+                    .map(|result| {
+                        json!({
+                            "source": match result.source_kind {
+                                memory_tool::MemorySearchSourceKind::Memory => "memory",
+                                memory_tool::MemorySearchSourceKind::CompartmentTitle => "compartment_title",
+                                memory_tool::MemorySearchSourceKind::CompartmentBody => "compartment_body",
+                            },
+                            "id": result.id,
+                            "snippet": result.snippet,
+                            "category": result.category,
+                            "sequence": result.sequence,
+                            "title": result.title,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                mcp_text_result(Value::Array(rendered).to_string(), false)
+            }
+            Err(error) => tool_error_result(format!("Error: {error}")),
+        }
+    }
 }
 
 impl Default for McHandler {
@@ -1344,6 +1607,7 @@ impl ModuleHandler for McHandler {
             req.route_channel,
             SessionBinding {
                 project_root: req.identity.project_root.clone(),
+                harness: req.identity.harness.clone(),
                 session: req.identity.session.clone(),
                 model_key: None,
                 config,
@@ -1395,50 +1659,55 @@ impl McHandler {
             .get("method")
             .and_then(Value::as_str)
             .or_else(|| request.get("kind").and_then(Value::as_str));
-        match method {
-            // Proves the store opened end-to-end: load a sentinel session through the
-            // real opened handle and report its presence/state.
-            Some("health") => match self.store.get() {
-                Some(store) => match store.load("__health__") {
-                    Ok(state) => respond(json!({
-                        "ok": true,
-                        "store_open": true,
-                        "initialized": state.meta.initialized,
-                        "row_version": state.row_version,
-                    })),
-                    Err(e) => HandlerOutcome::Error {
-                        code: "store_load_failed".to_string(),
-                        message: e.to_string(),
+        if let Some(method) = method {
+            return match method {
+                // Proves the store opened end-to-end: load a sentinel session through the
+                // real opened handle and report its presence/state.
+                "health" => match self.store.get() {
+                    Some(store) => match store.load("__health__") {
+                        Ok(state) => respond(json!({
+                            "ok": true,
+                            "store_open": true,
+                            "initialized": state.meta.initialized,
+                            "row_version": state.row_version,
+                        })),
+                        Err(e) => HandlerOutcome::Error {
+                            code: "store_load_failed".to_string(),
+                            message: e.to_string(),
+                        },
+                    },
+                    None => HandlerOutcome::Error {
+                        code: "store_unavailable".to_string(),
+                        message: "store not opened (no HELLO_ACK storage seam yet)".to_string(),
                     },
                 },
-                None => HandlerOutcome::Error {
-                    code: "store_unavailable".to_string(),
-                    message: "store not opened (no HELLO_ACK storage seam yet)".to_string(),
-                },
-            },
-            // The CK-in/CK-out cache-stability spine.
-            Some("transform") => self.handle_transform_value(channel, request).await,
-            Some("ctx_reduce" | "append_agent_drops" | "agent_drops.append") => {
-                self.handle_agent_drops_value(channel, request)
-            }
-            // Explicit wire-debugging echo. Opt-in only: echoing every
-            // unrecognized body would silently swallow misrouted requests
-            // (a caller can "succeed" against an echo while testing nothing),
-            // so unknown shapes fail loud below instead.
-            Some("echo") => respond(json!({ "ok": true, "echo": request })),
-            _ => unrecognized_request_error(&request),
+                // Handle transform requests: decode the incoming context array, update
+                // cache state, and return the rewritten array for the caller.
+                "transform" => self.handle_transform_value(channel, request).await,
+                "ctx_reduce" | "append_agent_drops" | "agent_drops.append" => {
+                    self.handle_agent_drops_value(channel, request)
+                }
+                // Explicit wire-debugging echo. Opt-in only: echoing every
+                // unrecognized body would silently swallow misrouted requests
+                // (a caller can "succeed" against an echo while testing nothing),
+                // so unknown shapes fail loud below instead.
+                "echo" => respond(json!({ "ok": true, "echo": request })),
+                _ => unrecognized_request_error(&request),
+            };
         }
+        if request.get("name").is_some() && request.get("arguments").is_some() {
+            return self.handle_facade_value(channel, request).await;
+        }
+        unrecognized_request_error(&request)
     }
 }
 
 /// Classify a request that matched no known `method`/`kind`. Two distinct
 /// errors so a misroute is diagnosable from the error code alone:
 /// - `{name, arguments}` without `method`/`kind` is the shape of an MCP
-///   tools/call envelope. This module does not accept MCP-routed tool calls
-///   yet (they need a mapping from the MCP shim's ephemeral session to the
-///   durable wire session id before commands like ctx_reduce can target the
-///   right queue), but the shape is recognized so a misconfigured MCP router
-///   fails with an exact cause instead of a generic shape error.
+///   tools/call envelope. Only ctx_memory and ctx_search are accepted on that
+///   surface; unsupported names keep a distinct error so a policy or routing
+///   mistake is diagnosable from the code alone.
 /// - Anything else names the discriminator fields we looked for and the
 ///   top-level keys we actually got.
 fn unrecognized_request_error(request: &Value) -> HandlerOutcome {
@@ -1446,8 +1715,9 @@ fn unrecognized_request_error(request: &Value) -> HandlerOutcome {
     if has_mcp_shape {
         return HandlerOutcome::Error {
             code: "facade_envelope_not_supported".to_string(),
-            message: "MCP tools/call envelope ({name, arguments}) is not routable to this \
-                      module yet; MC commands use flat bodies with a top-level `kind` field"
+            message: "MCP tools/call envelope ({name, arguments}) names a tool this module \
+                      does not route on the facade; other module commands use flat bodies \
+                      with a top-level `kind` field"
                 .to_string(),
         };
     }
@@ -1511,6 +1781,124 @@ fn respond(value: Value) -> HandlerOutcome {
             message: e.to_string(),
         },
     }
+}
+
+fn mcp_text_result(text: String, is_error: bool) -> HandlerOutcome {
+    respond(json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error,
+    }))
+}
+
+fn tool_error_result(message: impl Into<String>) -> HandlerOutcome {
+    mcp_text_result(message.into(), true)
+}
+
+fn session_unresolved_error() -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "session_unresolved".to_string(),
+        message: SESSION_UNRESOLVED_MESSAGE.to_string(),
+    }
+}
+
+fn invalid_params_error(message: impl Into<String>) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "invalid_params".to_string(),
+        message: message.into(),
+    }
+}
+
+fn store_unavailable_error() -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "store_unavailable".to_string(),
+        message: "store not opened (no HELLO_ACK storage seam yet)".to_string(),
+    }
+}
+
+fn facade_arguments(request: &Value) -> Option<&Map<String, Value>> {
+    request.get("arguments")?.as_object()
+}
+
+fn string_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(Value::as_str)
+}
+
+fn non_empty_string_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    string_arg(args, key)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn i64_arg(args: &Map<String, Value>, key: &str) -> Option<i64> {
+    args.get(key).and_then(Value::as_i64)
+}
+
+fn usize_arg(args: &Map<String, Value>, key: &str) -> Option<usize> {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
+    if let Some(id) = i64_arg(args, "id") {
+        return Some(id);
+    }
+    let ids = memory_ids(args, action);
+    (ids.len() == 1).then_some(ids[0])
+}
+
+fn memory_ids(args: &Map<String, Value>, _action: &str) -> Vec<i64> {
+    let mut ids = Vec::new();
+    if let Some(id) = i64_arg(args, "id") {
+        ids.push(id);
+    }
+    if let Some(values) = args.get("ids").and_then(Value::as_array) {
+        for value in values {
+            if let Some(id) = value.as_i64() {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn merge_ids(args: &Map<String, Value>) -> Option<(i64, Vec<i64>)> {
+    if let Some(target_id) = i64_arg(args, "target_id") {
+        let source_ids = args
+            .get("source_ids")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(Value::as_i64)
+            .collect::<Vec<_>>();
+        if source_ids.is_empty() {
+            return None;
+        }
+        return Some((target_id, dedup_i64s(source_ids)));
+    }
+    let ids = memory_ids(args, "merge");
+    if ids.len() < 2 {
+        return None;
+    }
+    Some((ids[0], ids[1..].to_vec()))
+}
+
+fn dedup_i64s(ids: Vec<i64>) -> Vec<i64> {
+    let mut deduped = Vec::new();
+    for id in ids {
+        if !deduped.contains(&id) {
+            deduped.push(id);
+        }
+    }
+    deduped
+}
+
+fn join_i64s(ids: &[i64]) -> String {
+    ids.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn drop_ids_from_command(request: &Value) -> Vec<String> {
@@ -1666,6 +2054,82 @@ pub fn dev_descriptor_at(data_home: &str) -> StorageDescriptor {
     }
 }
 
+fn ctx_memory_description() -> String {
+    "Save and maintain durable project memories for facts that should stay useful in later turns. Use write for a new standalone fact, update when an existing memory changed, archive when a memory is wrong or obsolete, and merge when several memories describe the same fact. Keep each memory concise and understandable without this chat's surrounding context.".to_string()
+}
+
+fn ctx_search_description() -> String {
+    "Keyword-search saved project memories and summarized conversation history. This is literal word or phrase search, not semantic search; use it to find remembered facts or prior discussion snippets before answering.".to_string()
+}
+
+fn ctx_memory_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["write", "update", "archive", "merge"],
+                "description": "Operation to perform."
+            },
+            "category": {
+                "type": "string",
+                "description": "Memory category for a new memory, such as ARCHITECTURE, CONSTRAINTS, DECISIONS, PREFERENCES, or WORKFLOW. Required for write."
+            },
+            "content": {
+                "type": "string",
+                "description": "Standalone memory text. Required for write, update, and merge."
+            },
+            "id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Single memory id for update or archive."
+            },
+            "ids": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 1 },
+                "description": "Memory ids. For update provide exactly one. For archive provide one or more. For merge, the first id is kept and updated, and the remaining ids are superseded."
+            },
+            "target_id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Merge form: memory id to keep and update."
+            },
+            "source_ids": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 1 },
+                "description": "Merge form: memory ids to supersede into target_id."
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional short reason for archive."
+            }
+        },
+        "required": ["action"]
+    })
+}
+
+fn ctx_search_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Literal keyword or phrase to find in memories and summarized history."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 25,
+                "default": 8,
+                "description": "Maximum number of matches to return."
+            }
+        },
+        "required": ["query"]
+    })
+}
+
 /// The module manifest registered at HELLO. Slice-1 declares the transform provider
 /// role + a project-scoped sqlite storage binding; the surface widens with the spine.
 pub fn manifest(module_id: &str) -> ModuleManifest {
@@ -1692,13 +2156,27 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
                     execution_mode: ExecutionMode::Pure,
                     schema: json!({ "type": "object" }),
                 },
+                Tool {
+                    name: "ctx_memory".to_string(),
+                    description: Some(ctx_memory_description()),
+                    execution_mode: ExecutionMode::Mutating,
+                    schema: ctx_memory_schema(),
+                },
+                Tool {
+                    name: "ctx_search".to_string(),
+                    description: Some(ctx_search_description()),
+                    execution_mode: ExecutionMode::Pure,
+                    schema: ctx_search_schema(),
+                },
             ],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
             concurrency: Concurrency::ModuleManaged,
             emits_push: false,
             sub_supervises: false,
         }],
-        consumes: Vec::new(),
+        consumes: vec![ConsumerRole::ServiceClient {
+            of: vec!["ai-proxy".to_string()],
+        }],
         scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
@@ -1718,7 +2196,7 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::ck_wire::{
@@ -1762,15 +2240,109 @@ mod tests {
         let m = manifest("magic-context");
         assert_eq!(m.module_id, "magic-context");
         assert_eq!(m.protocol_ver, PROTOCOL_VERSION);
+        assert_eq!(
+            m.consumes,
+            vec![ConsumerRole::ServiceClient {
+                of: vec!["ai-proxy".to_string()]
+            }]
+        );
+        let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+            panic!("magic-context must expose a tool provider role");
+        };
+        let by_name = tools
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool))
+            .collect::<HashMap<_, _>>();
+        for name in ["ctx_memory", "ctx_search"] {
+            let tool = by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert_eq!(
+                tool.name, name,
+                "mcp.jsonc overrides use the bare tool name"
+            );
+            assert_eq!(tool.schema["type"], "object");
+            assert!(tool.schema["properties"].is_object());
+            assert!(tool.description.as_deref().is_some_and(|text| {
+                !text.contains("CortexKit") && !text.contains("transform") && !text.contains('§')
+            }));
+        }
+        assert_eq!(
+            by_name["ctx_memory"].execution_mode,
+            ExecutionMode::Mutating
+        );
+        assert_eq!(by_name["ctx_search"].execution_mode, ExecutionMode::Pure);
     }
 
     fn binding(root: &str, session: &str) -> SessionBinding {
         SessionBinding {
             project_root: PathBuf::from(root),
+            harness: "mc-module-test".to_string(),
             session: session.to_string(),
             model_key: None,
             config: default_test_config(),
             history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+        }
+    }
+
+    #[derive(Clone)]
+    enum FakeResolve {
+        Hit(String),
+        None,
+        Timeout,
+    }
+
+    #[derive(Default)]
+    struct FakeSessionResolver {
+        responses: Mutex<HashMap<String, FakeResolve>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeSessionResolver {
+        fn with(pairs: &[(&str, FakeResolve)]) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(
+                    pairs
+                        .iter()
+                        .map(|(token, response)| ((*token).to_string(), response.clone()))
+                        .collect(),
+                ),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("resolver calls mutex").clone()
+        }
+    }
+
+    #[async_trait]
+    impl SessionResolver for FakeSessionResolver {
+        async fn resolve_session(
+            &self,
+            _project_root: &Path,
+            _harness: &str,
+            instance_token: &str,
+        ) -> Result<Option<ResolvedSession>, SessionResolveError> {
+            self.calls
+                .lock()
+                .expect("resolver calls mutex")
+                .push(instance_token.to_string());
+            match self
+                .responses
+                .lock()
+                .expect("resolver responses mutex")
+                .get(instance_token)
+                .cloned()
+                .unwrap_or(FakeResolve::None)
+            {
+                FakeResolve::Hit(session_id) => Ok(Some(ResolvedSession {
+                    session_id,
+                    last_traffic_ms: 123,
+                })),
+                FakeResolve::None => Ok(None),
+                FakeResolve::Timeout => Err(SessionResolveError::Timeout),
+            }
         }
     }
 
@@ -1948,14 +2520,23 @@ mod tests {
         state: Arc<ProducerState>,
         config: McModuleConfig,
     ) -> (McHandler, Arc<McStore>, tempfile::TempDir, PathBuf) {
+        handler_with_store_and_resolver(state, config, Arc::new(MissingSessionResolver))
+    }
+
+    fn handler_with_store_and_resolver(
+        state: Arc<ProducerState>,
+        config: McModuleConfig,
+        resolver: Arc<dyn SessionResolver>,
+    ) -> (McHandler, Arc<McStore>, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
         let store =
             Arc::new(McStore::open(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
-        let handler = McHandler::with_producer_factory_and_config(
+        let handler = McHandler::with_producer_factory_config_resolver(
             Arc::new(TestProducerFactory { state }),
             config,
+            resolver,
         );
         handler.store.set(Arc::clone(&store)).ok().unwrap();
         let project = dir.path().join("project");
@@ -2098,6 +2679,83 @@ mod tests {
             HandlerOutcome::Error { code, .. } => code,
             other => panic!("expected error outcome, got {other:?}"),
         }
+    }
+
+    async fn call_facade(handler: &McHandler, name: &str, arguments: Value) -> HandlerOutcome {
+        call_facade_on_channel(handler, 7, name, arguments).await
+    }
+
+    async fn call_facade_on_channel(
+        handler: &McHandler,
+        channel: u16,
+        name: &str,
+        arguments: Value,
+    ) -> HandlerOutcome {
+        handler
+            .dispatch_value(channel, json!({ "name": name, "arguments": arguments }))
+            .await
+    }
+
+    fn tool_body(outcome: HandlerOutcome) -> Value {
+        match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("expected tool response, got {other:?}"),
+        }
+    }
+
+    fn tool_is_error(outcome: HandlerOutcome) -> bool {
+        tool_body(outcome)["isError"].as_bool().unwrap_or(false)
+    }
+
+    fn tool_json_array(outcome: HandlerOutcome) -> Vec<Value> {
+        let body = tool_body(outcome);
+        let text = body["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool response missing text: {body}"));
+        serde_json::from_str(text).unwrap_or_else(|error| panic!("tool text was not JSON: {error}"))
+    }
+
+    fn insert_memory(
+        store: &McStore,
+        project: &str,
+        category: &str,
+        content: &str,
+        now: i64,
+    ) -> i64 {
+        store
+            .insert_memory(InsertMemoryInput {
+                project_path: project,
+                category,
+                content,
+                source_session_id: Some(project),
+                source_type: Some("test"),
+                importance: Some(50),
+                expires_at: None,
+                metadata_json: None,
+                now_ms: now,
+            })
+            .unwrap()
+    }
+
+    fn seed_workspace(store: &McStore, own: &str, foreign: &str) {
+        store
+            .seed_workspace_member("ws", own, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
+            .unwrap();
+    }
+
+    fn synthetic_text(response: &Value, index: usize) -> String {
+        response["ck_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["meta"]["synthetic"] == json!(true))
+            .nth(index)
+            .and_then(|message| message["content"][0]["kind"]["text"].as_str())
+            .unwrap_or_default()
+            .to_string()
     }
 
     async fn call_transform(handler: &McHandler, messages: Vec<CkIngressMessage>) -> Value {
@@ -2296,6 +2954,381 @@ mod tests {
             }
             other => panic!("expected error outcome, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_session_resolve_errors_are_typed() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[
+            ("missing-map", FakeResolve::None),
+            ("slow-map", FakeResolve::Timeout),
+        ]);
+        let (handler, _store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver.clone());
+
+        handler.bind_route(7, binding("/repo", ""));
+        let no_token = call_facade(
+            &handler,
+            "ctx_search",
+            json!({ "query": "anything", "limit": 1 }),
+        )
+        .await;
+        match no_token {
+            HandlerOutcome::Error { code, message } => {
+                assert_eq!(code, "session_unresolved");
+                assert_eq!(message, SESSION_UNRESOLVED_MESSAGE);
+            }
+            other => panic!("expected unresolved error, got {other:?}"),
+        }
+        assert_eq!(resolver.calls(), Vec::<String>::new());
+
+        handler.bind_route(7, binding("/repo", "missing-map"));
+        let none = call_facade(
+            &handler,
+            "ctx_search",
+            json!({ "query": "anything", "limit": 1 }),
+        )
+        .await;
+        assert_eq!(error_code(none), "session_unresolved");
+
+        handler.bind_route(7, binding("/repo", "slow-map"));
+        let timeout = call_facade(
+            &handler,
+            "ctx_search",
+            json!({ "query": "anything", "limit": 1 }),
+        )
+        .await;
+        assert_eq!(error_code(timeout), "session_resolve_timeout");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_multi_instance_shares_memory_pool_and_splits_compartment_scope() {
+        let producer = Arc::new(ProducerState::default());
+        let project_root = "/same/repo";
+        let key_a = "pm_a5ee3bf8/session-A/epoch-1";
+        let key_b = "pm_a5ee3bf8/session-B/epoch-1";
+        let resolver = FakeSessionResolver::with(&[
+            ("token-a", FakeResolve::Hit(key_a.to_string())),
+            ("token-b", FakeResolve::Hit(key_b.to_string())),
+        ]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding(project_root, "token-a"));
+        handler.bind_route(8, binding(project_root, "token-b"));
+        store
+            .replace_compartments(
+                key_a,
+                &[stored_comp(1, 1, 10, "a10", "alpha-compartment-only")],
+            )
+            .unwrap();
+        store
+            .replace_compartments(
+                key_b,
+                &[stored_comp(1, 1, 10, "b10", "beta-compartment-only")],
+            )
+            .unwrap();
+
+        let a = call_facade_on_channel(
+            &handler,
+            7,
+            "ctx_memory",
+            json!({ "action": "write", "category": "CONSTRAINTS", "content": "shared project fact" }),
+        )
+        .await;
+        assert!(!tool_is_error(a));
+        let b_search = tool_json_array(
+            call_facade_on_channel(
+                &handler,
+                8,
+                "ctx_search",
+                json!({ "query": "shared project fact", "limit": 5 }),
+            )
+            .await,
+        );
+        assert!(b_search.iter().any(|row| row["source"] == "memory"));
+
+        let b = call_facade_on_channel(
+            &handler,
+            8,
+            "ctx_memory",
+            json!({ "action": "write", "category": "CONSTRAINTS", "content": "second shared fact" }),
+        )
+        .await;
+        assert!(!tool_is_error(b));
+
+        let project_rows = store.load_active_memories(project_root, now_ms()).unwrap();
+        assert_eq!(project_rows.len(), 2);
+        assert!(project_rows
+            .iter()
+            .any(|memory| memory.content == "shared project fact"));
+        assert!(project_rows
+            .iter()
+            .any(|memory| memory.content == "second shared fact"));
+        let first = store.get_memory_full(project_rows[0].id).unwrap().unwrap();
+        assert_eq!(first.source_session_id.as_deref(), Some(key_a));
+        assert!(store
+            .load_active_memories(key_a, now_ms())
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .load_active_memories(key_b, now_ms())
+            .unwrap()
+            .is_empty());
+
+        let a_comp = tool_json_array(
+            call_facade_on_channel(
+                &handler,
+                7,
+                "ctx_search",
+                json!({ "query": "alpha-compartment-only", "limit": 5 }),
+            )
+            .await,
+        );
+        assert!(a_comp.iter().any(|row| row["source"] == "compartment_body"));
+        let a_cannot_see_b = tool_json_array(
+            call_facade_on_channel(
+                &handler,
+                7,
+                "ctx_search",
+                json!({ "query": "beta-compartment-only", "limit": 5 }),
+            )
+            .await,
+        );
+        assert!(a_cannot_see_b.is_empty());
+        let b_comp = tool_json_array(
+            call_facade_on_channel(
+                &handler,
+                8,
+                "ctx_search",
+                json!({ "query": "beta-compartment-only", "limit": 5 }),
+            )
+            .await,
+        );
+        assert!(b_comp.iter().any(|row| row["source"] == "compartment_body"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_flat_envelope_precedence_keeps_kind_arm_and_rejects_ctx_reduce_name() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[(
+            "token",
+            FakeResolve::Hit("composite-session".to_string()),
+        )]);
+        let (handler, _store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/repo", "token"));
+
+        let echo = handler
+            .dispatch_value(
+                7,
+                json!({ "kind": "echo", "name": "ctx_memory", "arguments": { "action": "write" } }),
+            )
+            .await;
+        let echo_body = tool_body(echo);
+        assert_eq!(echo_body["ok"], json!(true));
+        assert_eq!(echo_body["echo"]["kind"], "echo");
+
+        let reduce = call_facade(&handler, "ctx_reduce", json!({ "drop": "1-3" })).await;
+        assert_eq!(error_code(reduce), "facade_envelope_not_supported");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_security_guards_run_through_public_handler_path() {
+        let producer = Arc::new(ProducerState::default());
+        let own = "/repo";
+        let foreign = "opaque-foreign-key";
+        let resolver = FakeSessionResolver::with(&[(
+            "token",
+            FakeResolve::Hit("opaque-own-conversation".to_string()),
+        )]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding(own, "token"));
+        seed_workspace(&store, own, foreign);
+
+        let foreign_private_update =
+            insert_memory(&store, foreign, "PREFERENCES", "private update", 1);
+        let foreign_private_archive =
+            insert_memory(&store, foreign, "PREFERENCES", "private archive", 1);
+        let foreign_private_merge =
+            insert_memory(&store, foreign, "PREFERENCES", "private merge", 1);
+        let own_private = insert_memory(&store, own, "PREFERENCES", "own private", 1);
+
+        assert!(tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "action": "update", "id": foreign_private_update, "content": "edited" }),
+            )
+            .await
+        ));
+        assert!(tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "action": "archive", "ids": [foreign_private_archive] }),
+            )
+            .await
+        ));
+        assert!(tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "action": "merge", "ids": [foreign_private_merge, own_private], "content": "merged" }),
+            )
+            .await
+        ));
+
+        let shared_update = insert_memory(&store, foreign, "CONSTRAINTS", "shared update", 1);
+        let shared_archive = insert_memory(&store, foreign, "CONSTRAINTS", "shared archive", 1);
+        let shared_target = insert_memory(&store, foreign, "CONSTRAINTS", "shared target", 1);
+        let shared_source = insert_memory(&store, foreign, "CONSTRAINTS", "shared source", 1);
+
+        assert!(!tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "action": "update", "id": shared_update, "content": "shared edited" }),
+            )
+            .await
+        ));
+        assert!(!tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "action": "archive", "ids": [shared_archive] }),
+            )
+            .await
+        ));
+        assert!(!tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "action": "merge", "ids": [shared_target, shared_source], "content": "shared merged" }),
+            )
+            .await
+        ));
+        assert_eq!(
+            store
+                .get_memory_full(shared_source)
+                .unwrap()
+                .unwrap()
+                .superseded_by_memory_id,
+            Some(shared_target)
+        );
+
+        let cross_target = insert_memory(&store, own, "CONSTRAINTS", "constraint", 1);
+        let cross_source = insert_memory(&store, own, "PREFERENCES", "preference", 1);
+        assert!(tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "action": "merge", "ids": [cross_target, cross_source], "content": "bad merge" }),
+            )
+            .await
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_cache_mutations_drive_soft_memory_deltas_through_public_path() {
+        let producer = Arc::new(ProducerState::default());
+        let project_root = "/repo/cache-project";
+        let scope = "pm_a5ee3bf8/parent-session/epoch-1";
+        let additive_project_root = "/repo/additive-project";
+        let additive_scope = "pm_a5ee3bf8/additive-session/epoch-1";
+        let resolver = FakeSessionResolver::with(&[
+            ("token", FakeResolve::Hit(scope.to_string())),
+            (
+                "token-additive",
+                FakeResolve::Hit(additive_scope.to_string()),
+            ),
+        ]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding(project_root, "token"));
+        handler.bind_route(8, binding(project_root, scope));
+        store
+            .replace_compartments(scope, &[stored_comp(1, 1, 10, "m10", "SUMMARY")])
+            .unwrap();
+        let memory_id = insert_memory(&store, project_root, "CONSTRAINTS", "original rule", 1);
+
+        let mut boot_req = request(vec![ck("m10", 10, "raw covered")]);
+        boot_req["session_id"] = json!(scope);
+        let boot = call_transform_request_on_channel(&handler, 8, boot_req.clone()).await;
+        assert_eq!(boot["action"], "HARD");
+        assert!(synthetic_text(&boot, 0).contains("original rule"));
+
+        let before = store
+            .max_memory_mutation_id(&[project_root.to_string()])
+            .unwrap();
+        assert!(!tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "action": "update", "id": memory_id, "content": "updated rule" }),
+            )
+            .await
+        ));
+        let after = store
+            .max_memory_mutation_id(&[project_root.to_string()])
+            .unwrap();
+        assert!(
+            after > before,
+            "facade update must advance the mutation log"
+        );
+
+        let update_delta = call_transform_request_on_channel(&handler, 8, boot_req.clone()).await;
+        assert_eq!(update_delta["action"], "SOFT");
+        assert!(synthetic_text(&update_delta, 1).contains("<memory-updates>"));
+        assert!(synthetic_text(&update_delta, 1).contains("updated rule"));
+
+        handler.bind_route(9, binding(additive_project_root, additive_scope));
+        store
+            .replace_compartments(
+                additive_scope,
+                &[stored_comp(1, 1, 10, "m10", "ADDITIVE-SUMMARY")],
+            )
+            .unwrap();
+        let mut add_req = request(vec![ck("m10", 10, "raw covered")]);
+        add_req["session_id"] = json!(additive_scope);
+        let add_boot = call_transform_request_on_channel(&handler, 9, add_req.clone()).await;
+        assert_eq!(add_boot["action"], "HARD");
+        let add_before = store
+            .max_memory_mutation_id(&[additive_project_root.to_string()])
+            .unwrap();
+        handler.bind_route(7, binding(additive_project_root, "token-additive"));
+        let resolver_scope_memory = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({ "action": "write", "category": "CONSTRAINTS", "content": "new additive memory" }),
+        )
+        .await;
+        assert!(!tool_is_error(resolver_scope_memory));
+        assert_eq!(
+            store
+                .max_memory_mutation_id(&[additive_project_root.to_string()])
+                .unwrap(),
+            add_before,
+            "additive writes must not append mutation-log rows"
+        );
+        assert!(store
+            .load_active_memories(additive_project_root, now_ms())
+            .unwrap()
+            .iter()
+            .any(|memory| {
+                memory.content == "new additive memory"
+                    && store
+                        .get_memory_full(memory.id)
+                        .unwrap()
+                        .unwrap()
+                        .source_session_id
+                        .as_deref()
+                        == Some(additive_scope)
+            }));
+        let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
+        assert_eq!(add_delta["action"], "SOFT");
+        assert!(synthetic_text(&add_delta, 1).contains("<new-memories>"));
+        assert!(synthetic_text(&add_delta, 1).contains("new additive memory"));
     }
 
     #[tokio::test(flavor = "current_thread")]
