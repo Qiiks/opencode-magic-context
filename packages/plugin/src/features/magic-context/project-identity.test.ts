@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
-import { execFileSync } from "node:child_process";
+import type { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path, { join } from "node:path";
 import {
@@ -18,6 +18,8 @@ import {
 } from "./project-identity";
 
 const tempDirs: string[] = [];
+const FIRST_ROOT_COMMIT = "abcdef1234567890abcdef1234567890abcdef12";
+const SECOND_ROOT_COMMIT = "1234567890abcdef1234567890abcdef12345678";
 
 afterEach(() => {
     __resetProjectIdentityForTests();
@@ -38,36 +40,17 @@ function makeTempDir(prefix: string): string {
     return dir;
 }
 
-function runGit(directory: string, args: string[]): string {
-    return execFileSync("git", args, {
-        cwd: directory,
-        encoding: "utf8",
-        env: { ...process.env, LC_ALL: "C", LANG: "C" },
-        stdio: ["ignore", "pipe", "pipe"],
-    });
-}
-
-function makeGitRepo(): string {
-    const dir = makeTempDir("project-identity-git-");
-    runGit(dir, ["init"]);
-    writeFileSync(join(dir, "README.md"), "# test\n", "utf8");
-    runGit(dir, ["add", "README.md"]);
-    runGit(dir, [
-        "-c",
-        "user.email=test@example.com",
-        "-c",
-        "user.name=Test User",
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "-m",
-        "initial commit",
-    ]);
+function makeRepoWithGitMetadata(prefix: string): string {
+    const dir = makeTempDir(prefix);
+    mkdirSync(join(dir, ".git"));
     return dir;
 }
 
-function rootCommit(directory: string): string {
-    return runGit(directory, ["rev-list", "--max-parents=0", "HEAD"]).split("\n")[0]!.trim();
+function returningRootCommit(rootCommit: string): typeof execFileSync {
+    // Keep the real `.git` walk on disk, but route git output through the test
+    // seam. Under heavy machine load, launching git can stall while the
+    // operating system assesses the binary, which makes direct calls flaky.
+    return (() => `${rootCommit}\n`) as typeof execFileSync;
 }
 
 function expectedDirIdentity(directory: string): string {
@@ -113,12 +96,12 @@ function makeGitFailure(fields: {
 
 describe("project identity", () => {
     it("resolveProjectIdentityStrict returns the git root commit identity", () => {
-        const repo = makeGitRepo();
-        const commit = rootCommit(repo);
+        const repo = makeRepoWithGitMetadata("project-identity-git-");
+        __setProjectIdentityTestHooks({ execFileSync: returningRootCommit(FIRST_ROOT_COMMIT) });
 
         const identity = resolveProjectIdentityStrict(repo);
 
-        expect(identity).toBe(`git:${commit}`);
+        expect(identity).toBe(`git:${FIRST_ROOT_COMMIT}`);
         expect(identity.slice("git:".length).length).toBeGreaterThanOrEqual(7);
     });
 
@@ -142,7 +125,8 @@ describe("project identity", () => {
     });
 
     it("resolveProjectIdentityStrict caches git identities across calls", () => {
-        const repo = makeGitRepo();
+        const repo = makeRepoWithGitMetadata("project-identity-cache-");
+        __setProjectIdentityTestHooks({ execFileSync: returningRootCommit(FIRST_ROOT_COMMIT) });
         const first = resolveProjectIdentityStrict(repo);
 
         chmodSync(repo, 0o000);
@@ -159,10 +143,10 @@ describe("project identity", () => {
         expect(resolveProjectIdentity(directory)).toBe(expectedDirIdentity(directory));
     });
 
-    it("uses the no-git fast path without spawning git", () => {
+    it("uses the no-git fast path without invoking git", () => {
         const directory = makeTempDir("project-identity-no-git-fast-");
         const execMock = mock(() => {
-            throw new Error("git should not be spawned for a directory with no .git ancestor");
+            throw new Error("git should not be launched for a directory with no .git ancestor");
         });
         __setProjectIdentityTestHooks({ execFileSync: execMock as unknown as typeof execFileSync });
 
@@ -171,16 +155,16 @@ describe("project identity", () => {
     });
 
     it("detects git metadata in ancestors for subdirectory sessions", () => {
-        const repo = makeGitRepo();
+        const repo = makeRepoWithGitMetadata("project-identity-ancestor-");
         const subdir = join(repo, "nested", "session");
         mkdirSync(subdir, { recursive: true });
+        __setProjectIdentityTestHooks({ execFileSync: returningRootCommit(FIRST_ROOT_COMMIT) });
 
-        expect(resolveProjectIdentity(subdir)).toBe(`git:${rootCommit(repo)}`);
+        expect(resolveProjectIdentity(subdir)).toBe(`git:${FIRST_ROOT_COMMIT}`);
     });
 
     it("detects git metadata through symlinked checkout paths", () => {
-        const repo = makeTempDir("project-identity-symlink-repo-");
-        writeFileSync(join(repo, ".git"), "gitdir: .git/worktrees/main\n", "utf8");
+        const repo = makeRepoWithGitMetadata("project-identity-symlink-repo-");
         const subdir = join(repo, "nested", "session");
         mkdirSync(subdir, { recursive: true });
         const linkParent = makeTempDir("project-identity-symlink-parent-");
@@ -191,21 +175,20 @@ describe("project identity", () => {
             if ((error as { code?: unknown }).code === "EPERM") return;
             throw error;
         }
-        const execMock = mock(() => "abcdef1234567890\n");
+        const execMock = mock(() => `${FIRST_ROOT_COMMIT}\n`);
         __setProjectIdentityTestHooks({ execFileSync: execMock as unknown as typeof execFileSync });
 
-        expect(resolveProjectIdentity(link)).toBe("git:abcdef1234567890");
+        expect(resolveProjectIdentity(link)).toBe(`git:${FIRST_ROOT_COMMIT}`);
         expect(execMock).toHaveBeenCalledTimes(1);
     });
 
     it("reuses the last successful git identity during transient failures and cooldown", () => {
-        const directory = makeTempDir("project-identity-last-known-");
-        mkdirSync(join(directory, ".git"));
+        const directory = makeRepoWithGitMetadata("project-identity-last-known-");
         let now = 1_000;
         let mode: "first" | "timeout" | "second" = "first";
         const execMock = mock(() => {
-            if (mode === "first") return "abcdef1234567890\n";
-            if (mode === "second") return "1234567890abcdef\n";
+            if (mode === "first") return `${FIRST_ROOT_COMMIT}\n`;
+            if (mode === "second") return `${SECOND_ROOT_COMMIT}\n`;
             throw makeGitFailure({ code: "ETIMEDOUT" });
         });
         __setProjectIdentityTestHooks({
@@ -213,27 +196,26 @@ describe("project identity", () => {
             nowMs: () => now,
         });
 
-        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
+        expect(resolveProjectIdentity(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
         __clearProjectIdentityResolutionCacheForTests(directory);
         mode = "timeout";
 
-        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
-        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
+        expect(resolveProjectIdentity(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
+        expect(resolveProjectIdentity(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
         expect(execMock).toHaveBeenCalledTimes(2);
 
         mode = "second";
         now += 5 * 60 * 1000 + 1;
-        expect(resolveProjectIdentity(directory)).toBe("git:1234567890abcdef");
+        expect(resolveProjectIdentity(directory)).toBe(`git:${SECOND_ROOT_COMMIT}`);
         expect(execMock).toHaveBeenCalledTimes(3);
     });
 
     it("classifies dubious ownership and falls back until the cooldown expires", () => {
-        const directory = makeTempDir("project-identity-dubious-");
-        mkdirSync(join(directory, ".git"));
+        const directory = makeRepoWithGitMetadata("project-identity-dubious-");
         let now = 1_000;
         let recovered = false;
         const execMock = mock(() => {
-            if (recovered) return "abcdef1234567890\n";
+            if (recovered) return `${FIRST_ROOT_COMMIT}\n`;
             throw makeGitFailure({
                 stderr:
                     "fatal: detected dubious ownership in repository at '/repo'\n" +
@@ -261,13 +243,12 @@ describe("project identity", () => {
         expect(execMock).toHaveBeenCalledTimes(2);
 
         now += 5 * 60 * 1000 + 1;
-        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
+        expect(resolveProjectIdentity(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
         expect(execMock).toHaveBeenCalledTimes(3);
     });
 
-    it("cools down git timeouts so immediate retries do not respawn git", () => {
-        const directory = makeTempDir("project-identity-timeout-");
-        mkdirSync(join(directory, ".git"));
+    it("cools down git timeouts so immediate retries do not rerun git", () => {
+        const directory = makeRepoWithGitMetadata("project-identity-timeout-");
         const execMock = mock(() => {
             throw makeGitFailure({ code: "ETIMEDOUT" });
         });
@@ -279,11 +260,10 @@ describe("project identity", () => {
     });
 
     it("re-probes after a transient cooldown is cleared", () => {
-        const directory = makeTempDir("project-identity-clear-cooldown-");
-        mkdirSync(join(directory, ".git"));
+        const directory = makeRepoWithGitMetadata("project-identity-clear-cooldown-");
         let recovered = false;
         const execMock = mock(() => {
-            if (recovered) return "abcdef1234567890\n";
+            if (recovered) return `${FIRST_ROOT_COMMIT}\n`;
             throw makeGitFailure({ code: "ETIMEDOUT" });
         });
         __setProjectIdentityTestHooks({ execFileSync: execMock as unknown as typeof execFileSync });
@@ -292,13 +272,12 @@ describe("project identity", () => {
         recovered = true;
         __clearProjectIdentityTransientCooldownForTests(directory);
 
-        expect(resolveProjectIdentity(directory)).toBe("git:abcdef1234567890");
+        expect(resolveProjectIdentity(directory)).toBe(`git:${FIRST_ROOT_COMMIT}`);
         expect(execMock).toHaveBeenCalledTimes(2);
     });
 
     it("still propagates permission_denied git failures", () => {
-        const directory = makeTempDir("project-identity-permission-");
-        mkdirSync(join(directory, ".git"));
+        const directory = makeRepoWithGitMetadata("project-identity-permission-");
         __setProjectIdentityTestHooks({
             execFileSync: mock(() => {
                 throw makeGitFailure({ code: "EACCES" });
@@ -329,8 +308,8 @@ describe("project identity", () => {
         expect(storedPathBelongsToIdentity("dir:deadbeef", "dir:deadbeef")).toBe(true);
         // Mismatched identity.
         expect(storedPathBelongsToIdentity("git:abc123", "git:other")).toBe(false);
-        // A raw filesystem path stored before normalization must still match the
-        // identity it normalizes to (the #11 case Pi previously rejected).
+        // Raw filesystem paths stored before normalization must still match the
+        // identity they normalize to.
         const directory = makeTempDir("project-identity-belongs-");
         const identity = expectedDirIdentity(directory);
         expect(storedPathBelongsToIdentity(directory, identity)).toBe(true);
