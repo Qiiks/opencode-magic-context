@@ -1754,7 +1754,7 @@ mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
-    use mc_store::StoredCompartment;
+    use mc_store::{InsertMemoryInput, StoredCompartment};
     use serde_json::{json, Value};
 
     fn store(dir: &std::path::Path) -> McStore {
@@ -1852,6 +1852,25 @@ mod tests {
             p1: Some(p1.to_string()),
             importance: 50,
             ..Default::default()
+        }
+    }
+
+    fn memory_input<'a>(
+        project_path: &'a str,
+        category: &'a str,
+        content: &'a str,
+        now_ms: i64,
+    ) -> InsertMemoryInput<'a> {
+        InsertMemoryInput {
+            project_path,
+            category,
+            content,
+            source_session_id: None,
+            source_type: Some("tool"),
+            importance: Some(70),
+            expires_at: None,
+            metadata_json: None,
+            now_ms,
         }
     }
 
@@ -3428,6 +3447,77 @@ mod tests {
             prev_m0 = Some(m0_bytes(&r).to_string());
             prev_m1 = Some(m1_bytes(&r).to_string());
         }
+    }
+
+    #[test]
+    fn public_memory_update_rides_soft_not_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let memory_id = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
+            .unwrap();
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let before = run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        assert_eq!(before.action, "HARD");
+
+        s.update_memory_content(memory_id, "corrected", 1).unwrap();
+        let soft = run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        assert_eq!(soft.action, "SOFT", "public update port should not HARD");
+        assert_eq!(m0_bytes(&soft), m0_bytes(&before));
+        assert!(
+            m1_bytes(&soft).contains("<memory-updates>"),
+            "{}",
+            m1_bytes(&soft)
+        );
+        assert!(m1_bytes(&soft).contains("corrected"), "{}", m1_bytes(&soft));
+    }
+
+    #[test]
+    fn public_memory_insert_rides_soft_not_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let before = run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        assert_eq!(before.action, "HARD");
+
+        s.insert_memory(memory_input(
+            "git:proj",
+            "ARCHITECTURE",
+            "a durable rule",
+            1,
+        ))
+        .unwrap();
+        let soft = run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        assert_eq!(soft.action, "SOFT", "public insert port should not HARD");
+        assert_eq!(m0_bytes(&soft), m0_bytes(&before));
+        assert!(
+            m1_bytes(&soft).contains("<new-memories>"),
+            "{}",
+            m1_bytes(&soft)
+        );
+        assert!(
+            m1_bytes(&soft).contains("a durable rule"),
+            "{}",
+            m1_bytes(&soft)
+        );
     }
 
     #[test]
