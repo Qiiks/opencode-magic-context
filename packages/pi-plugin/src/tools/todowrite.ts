@@ -28,6 +28,11 @@
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+	TITLE_DONE_STATUSES,
+	TODO_PRIORITIES,
+	TODO_STATUSES,
+} from "@magic-context/core/hooks/magic-context/todo-view";
 import { type Static, Type } from "typebox";
 import {
 	renderTodowriteCall,
@@ -35,19 +40,11 @@ import {
 	TODO_TOOL_NAME,
 } from "./todo-view-pi";
 
-const STATUS_VALUES = [
-	"pending",
-	"in_progress",
-	"completed",
-	"cancelled",
-] as const;
-const PRIORITY_VALUES = ["high", "medium", "low"] as const;
-
 const TodoItem = Type.Object({
 	content: Type.String({ description: "Brief description of the task" }),
-	status: Type.Union(STATUS_VALUES.map((v) => Type.Literal(v))),
+	status: Type.Union(TODO_STATUSES.map((v) => Type.Literal(v))),
 	priority: Type.Optional(
-		Type.Union(PRIORITY_VALUES.map((v) => Type.Literal(v))),
+		Type.Union(TODO_PRIORITIES.map((v) => Type.Literal(v))),
 	),
 	id: Type.Optional(
 		Type.String({ description: "Optional stable id for the todo" }),
@@ -93,8 +90,9 @@ export function createTodowriteTool(): ToolDefinition<typeof TodowriteParams> {
 			// and `message_end` handlers capture `params.todos` into
 			// `session_meta.last_todo_state` directly, so this output is
 			// purely for the agent's own visibility on the next turn.
-			const completed = todos.filter((t) => t.status === "completed").length;
-			const active = todos.length - completed;
+			const active = todos.filter(
+				(todo) => !TITLE_DONE_STATUSES.has(todo.status),
+			).length;
 			return {
 				content: [
 					{

@@ -118,6 +118,47 @@ describe("createToolExecuteAfterHook todo snapshots", () => {
         }
     });
 
+    test("foreign todowrite statuses leave state unchanged", async () => {
+        const db = createTestDb();
+        try {
+            const hook = createTestHook(db);
+            updateSessionMeta(db, "ses-foreign", { lastTodoState: "[]" });
+
+            await hook({
+                tool: "todowrite",
+                sessionID: "ses-foreign",
+                args: { todos: [{ content: "Third-party", status: "done" }] },
+            });
+
+            expect(getOrCreateSessionMeta(db, "ses-foreign").lastTodoState).toBe("[]");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("missing or non-array todowrite todos leave state unchanged", async () => {
+        const db = createTestDb();
+        try {
+            const hook = createTestHook(db);
+            updateSessionMeta(db, "ses-malformed", { lastTodoState: "[]" });
+
+            await hook({
+                tool: "todowrite",
+                sessionID: "ses-malformed",
+                args: {},
+            });
+            await hook({
+                tool: "todowrite",
+                sessionID: "ses-malformed",
+                args: { todos: { content: "Not an array", status: "pending" } },
+            });
+
+            expect(getOrCreateSessionMeta(db, "ses-malformed").lastTodoState).toBe("[]");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("malformed todowrite args leave state unchanged", async () => {
         const db = createTestDb();
         try {

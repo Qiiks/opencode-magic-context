@@ -42,6 +42,16 @@ describe("normalizeTodoStateJson", () => {
         ]);
     });
 
+    it("rejects foreign status values", () => {
+        expect(normalizeTodoStateJson([{ content: "Interop", status: "done" }])).toBeNull();
+    });
+
+    it("rejects unknown priority values", () => {
+        expect(
+            normalizeTodoStateJson([{ content: "Urgent", status: "pending", priority: "urgent" }]),
+        ).toBeNull();
+    });
+
     it("rejects whole array if any item is malformed", () => {
         const todos = [
             { content: "Valid", status: "pending", priority: "high" },
