@@ -155,6 +155,11 @@ function resolveCurrentProject(ctx: { cwd: string }): {
 	return { projectDir, projectIdentity };
 }
 
+export function signalPiDeferredCompactionMarkerDrain(sessionId: string): void {
+	signalPiDeferredHistoryRefresh(sessionId);
+	signalPiDeferredMaterialization(sessionId);
+}
+
 export function persistPiMessageEndModelMeta(args: {
 	db: ContextDatabase;
 	sessionId: string;
@@ -533,8 +538,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	try {
 		const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
 		for (const sid of pendingPiMarkerSessions) {
-			signalPiDeferredHistoryRefresh(sid);
-			signalPiDeferredMaterialization(sid);
+			signalPiDeferredCompactionMarkerDrain(sid);
 		}
 		if (pendingPiMarkerSessions.length > 0) {
 			log(
@@ -1040,14 +1044,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				// the durable pending marker in session_meta survives. On switch-BACK
 				// the marker would then sit undrained (the drain is signal-driven, and
 				// startup-only rehydration never re-fires). Re-signal here when this
-				// session has a durable pending marker so the next pass drains it.
+				// session has a durable pending marker so the next eligible materializing
+				// pass drains it, using the same deferred signal shape as startup.
 				//
 				// Gate on the same APIs the drain itself requires
 				// (sessionManager.appendCompaction + getBranch): when they're
-				// unavailable the drain skips-and-PRESERVES the signal, so
-				// re-signaling every turn would force materialization repeatedly
-				// with no way to make progress (a per-turn cache bust). Only re-arm
-				// when the marker can actually be applied.
+				// unavailable the drain skips-and-PRESERVES the signal, so re-signaling
+				// every turn would keep an undrainable signal armed. Only re-arm when the
+				// marker can actually be applied.
 				try {
 					const smForDrain = sm as {
 						appendCompaction?: unknown;
@@ -1057,8 +1061,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 						typeof smForDrain.appendCompaction === "function" &&
 						typeof smForDrain.getBranch === "function";
 					if (canDrain && getPendingPiCompactionMarkerState(db, sessionId)) {
-						signalPiDeferredHistoryRefresh(sessionId);
-						signalPiPendingMaterialization(sessionId);
+						signalPiDeferredCompactionMarkerDrain(sessionId);
 					}
 				} catch {
 					// Best-effort: a read failure must not block agent start.

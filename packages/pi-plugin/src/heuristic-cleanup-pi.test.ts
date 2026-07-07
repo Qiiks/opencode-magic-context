@@ -72,6 +72,7 @@ describe("applyPiHeuristicCleanup", () => {
 
 			const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
 				protectedTags: 0,
+				staleReduceStripEnabled: true,
 			});
 			transcript.commit();
 
@@ -118,6 +119,7 @@ describe("applyPiHeuristicCleanup", () => {
 
 			const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
 				protectedTags: 0,
+				staleReduceStripEnabled: true,
 			});
 			transcript.commit();
 
@@ -169,6 +171,7 @@ describe("applyPiHeuristicCleanup", () => {
 
 			const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
 				protectedTags: 0,
+				staleReduceStripEnabled: true,
 			});
 
 			expect(result.deduplicatedTools).toBe(0);
@@ -218,6 +221,7 @@ describe("applyPiHeuristicCleanup", () => {
 			// protectedTags); protectedTags:2 reproduces the old age-2 cutoff.
 			const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
 				protectedTags: 2,
+				staleReduceStripEnabled: true,
 			});
 			transcript.commit();
 
@@ -333,6 +337,7 @@ describe("applyPiHeuristicCleanup", () => {
 			// protected tail (the fresh one near the end stays protected).
 			const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
 				protectedTags: 3,
+				staleReduceStripEnabled: true,
 			});
 			transcript.commit();
 
@@ -387,6 +392,7 @@ describe("applyPiHeuristicCleanup emergency floor accounting", () => {
 				[],
 				{
 					protectedTags: 0,
+					staleReduceStripEnabled: true,
 					emergency: { currentTotalInputTokens: 7000, ceilingTokens: 6000 },
 				},
 				activeAfterPending,
