@@ -19,7 +19,7 @@ use cortexkit_store_types::StorageDescriptor;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
@@ -1034,6 +1034,79 @@ pub struct StoredMemory {
     pub updated_at: i64,
 }
 
+/// A complete `mc_memories` row for tool-side guards and lossless mutations. The render
+/// path intentionally reads a smaller projection; mutation ports use this shape so they
+/// can preserve status, ownership, merge metadata, and cache-invalidation columns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredMemoryFull {
+    pub id: i64,
+    pub project_path: String,
+    pub category: String,
+    pub content: String,
+    pub normalized_hash: String,
+    pub importance: Option<i32>,
+    pub scope: String,
+    pub shareable: i32,
+    pub source_session_id: Option<String>,
+    pub source_type: Option<String>,
+    pub seen_count: i64,
+    pub retrieval_count: i64,
+    pub first_seen_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_seen_at: i64,
+    pub last_retrieved_at: Option<i64>,
+    pub status: String,
+    pub expires_at: Option<i64>,
+    pub verification_status: String,
+    pub verified_at: Option<i64>,
+    pub classified_at: Option<i64>,
+    pub superseded_by_memory_id: Option<i64>,
+    pub merged_from: Option<String>,
+    pub metadata_json: Option<String>,
+}
+
+/// Inputs for an additive ctx_memory write. Duplicate detection follows the plugin's
+/// normalized-content hash (`lowercase → collapse whitespace → MD5`): a matching
+/// `(project_path, category, normalized_hash)` returns the existing row id instead of
+/// inserting a new row.
+#[derive(Debug, Clone, Copy)]
+pub struct InsertMemoryInput<'a> {
+    pub project_path: &'a str,
+    pub category: &'a str,
+    pub content: &'a str,
+    pub source_session_id: Option<&'a str>,
+    pub source_type: Option<&'a str>,
+    pub importance: Option<i32>,
+    pub expires_at: Option<i64>,
+    pub metadata_json: Option<&'a str>,
+    pub now_ms: i64,
+}
+
+/// Minimal memory search row. The module ranks/snippets the results; the store owns the
+/// SQL LIKE and workspace-visibility read so search shares the render path's boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredMemorySearchRow {
+    pub id: i64,
+    pub project_path: String,
+    pub category: String,
+    pub content: String,
+    pub updated_at: i64,
+}
+
+/// Minimal compartment search row. `sequence` is the durable row id inside a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredCompartmentSearchRow {
+    pub sequence: i64,
+    pub title: String,
+    pub content: String,
+    pub p1: Option<String>,
+    pub p2: Option<String>,
+    pub p3: Option<String>,
+    pub p4: Option<String>,
+    pub created_at: i64,
+}
+
 /// A loaded per-session row: the core state, the meta blob, and the CAS token.
 #[derive(Debug, Clone)]
 pub struct LoadedState {
@@ -1603,6 +1676,267 @@ impl McStore {
         Ok(promoted)
     }
 
+    /// Load a complete memory row by id. This is the guard-layer read: unlike the render
+    /// projection it includes ownership, lifecycle, merge lineage, and metadata columns.
+    pub fn get_memory_full(&self, id: i64) -> Result<Option<StoredMemoryFull>, McStoreError> {
+        let row = self.inner.with_conn(|conn| {
+            conn.query_row(
+                MEMORY_FULL_SELECT_BY_ID,
+                params![id],
+                stored_memory_full_from_row,
+            )
+            .optional()
+        })?;
+        Ok(row)
+    }
+
+    /// Insert a memory row unless an existing row already matches the project, category,
+    /// and normalized content hash. Duplicate hits update only bookkeeping fields such as
+    /// `seen_count` and timestamps, and skip the mutation log because the rendered content
+    /// did not change.
+    pub fn insert_memory(&self, input: InsertMemoryInput<'_>) -> Result<i64, McStoreError> {
+        let memory_id = self.inner.with_conn_fenced(|tx| {
+            let normalized_hash = compute_normalized_memory_hash(input.content);
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM mc_memories
+                     WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3",
+                    params![input.project_path, input.category, normalized_hash],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET seen_count = COALESCE(seen_count, 0) + 1,
+                            last_seen_at = ?1,
+                            updated_at = ?1
+                      WHERE id = ?2",
+                    params![input.now_ms, id],
+                )?;
+                return Ok(id);
+            }
+
+            tx.execute(
+                "INSERT INTO mc_memories
+                   (project_path, category, content, normalized_hash, importance,
+                    source_session_id, source_type, seen_count, retrieval_count,
+                    first_seen_at, created_at, updated_at, last_seen_at, status,
+                    expires_at, verification_status, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, ?8, ?8, ?8, ?8,
+                         'active', ?9, 'unverified', ?10)",
+                params![
+                    input.project_path,
+                    input.category,
+                    input.content,
+                    normalized_hash,
+                    input.importance.map(i64::from),
+                    input.source_session_id,
+                    input.source_type.unwrap_or("historian"),
+                    input.now_ms,
+                    input.expires_at,
+                    input.metadata_json,
+                ],
+            )?;
+            Ok(tx.last_insert_rowid())
+        })?;
+        Ok(memory_id)
+    }
+
+    /// Replace a memory's content and append the cache-visible mutation-log row in the
+    /// SAME fenced transaction. Change detection for non-additive edits reads the
+    /// append-only mutation-log watermark, so splitting the row update from the log append
+    /// could leave readers serving stale cached memory content.
+    pub fn update_memory_content(
+        &self,
+        id: i64,
+        content: &str,
+        now_ms: i64,
+    ) -> Result<Option<StoredMemoryFull>, McStoreError> {
+        let row = self.inner.with_conn_fenced(|tx| {
+            let Some(memory) = load_memory_full_tx(tx, id)? else {
+                return Ok(None);
+            };
+            let normalized_hash = compute_normalized_memory_hash(content);
+            tx.execute(
+                "UPDATE mc_memories
+                    SET content = ?1,
+                        normalized_hash = ?2,
+                        updated_at = ?3,
+                        shareable = 0,
+                        classified_at = NULL
+                  WHERE id = ?4",
+                params![content, normalized_hash, now_ms, id],
+            )?;
+            append_memory_mutation_tx(
+                tx,
+                MemoryMutationAppend {
+                    project_path: &memory.project_path,
+                    mutation_type: "update",
+                    target_memory_id: id,
+                    superseded_by_id: None,
+                    category: Some(&memory.category),
+                    new_content: Some(content),
+                    queued_at: now_ms,
+                },
+            )?;
+            load_memory_full_tx(tx, id)
+        })?;
+        Ok(row)
+    }
+
+    /// Archive a memory and append the terminal mutation-log row in the SAME fenced
+    /// transaction. See [`Self::update_memory_content`] for why the log row is inseparable
+    /// from non-additive row mutations.
+    pub fn archive_memory(
+        &self,
+        id: i64,
+        reason: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Option<StoredMemoryFull>, McStoreError> {
+        let row = self.inner.with_conn_fenced(|tx| {
+            let Some(memory) = load_memory_full_tx(tx, id)? else {
+                return Ok(None);
+            };
+            let trimmed_reason = reason.map(str::trim).filter(|s| !s.is_empty());
+            if let Some(reason) = trimmed_reason {
+                let metadata_json = merge_archive_reason(memory.metadata_json.as_deref(), reason);
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET status = 'archived', metadata_json = ?1, updated_at = ?2
+                      WHERE id = ?3",
+                    params![metadata_json, now_ms, id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE mc_memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
+                    params![now_ms, id],
+                )?;
+            }
+            append_memory_mutation_tx(
+                tx,
+                MemoryMutationAppend {
+                    project_path: &memory.project_path,
+                    mutation_type: "archive",
+                    target_memory_id: id,
+                    superseded_by_id: None,
+                    category: None,
+                    new_content: None,
+                    queued_at: now_ms,
+                },
+            )?;
+            load_memory_full_tx(tx, id)
+        })?;
+        Ok(row)
+    }
+
+    /// Merge source memories into an existing target. The target update, merge lineage,
+    /// each source supersede marker, and one mutation-log row per affected memory are
+    /// written in a single fenced transaction so cache invalidation and lineage stay in
+    /// sync.
+    pub fn merge_memories(
+        &self,
+        target_id: i64,
+        source_ids: &[i64],
+        merged_content: &str,
+        now_ms: i64,
+    ) -> Result<Option<StoredMemoryFull>, McStoreError> {
+        let row = self.inner.with_conn_fenced(|tx| {
+            let Some(target) = load_memory_full_tx(tx, target_id)? else {
+                return Ok(None);
+            };
+            let mut unique_sources: Vec<i64> = source_ids.to_vec();
+            unique_sources.sort_unstable();
+            unique_sources.dedup();
+
+            let mut source_rows = Vec::new();
+            for source_id in unique_sources {
+                if source_id == target_id {
+                    continue;
+                }
+                let Some(source) = load_memory_full_tx(tx, source_id)? else {
+                    return Ok(None);
+                };
+                source_rows.push(source);
+            }
+
+            let mut affected = Vec::with_capacity(source_rows.len() + 1);
+            affected.push(target.clone());
+            affected.extend(source_rows.iter().cloned());
+            let merged_from = merged_from_json(&affected);
+            let seen_count: i64 = affected.iter().map(|m| m.seen_count.max(0)).sum();
+            let retrieval_count: i64 = affected.iter().map(|m| m.retrieval_count.max(0)).sum();
+            let merged_status = if affected.iter().any(|m| m.status == "permanent") {
+                "permanent"
+            } else {
+                "active"
+            };
+            let normalized_hash = compute_normalized_memory_hash(merged_content);
+
+            tx.execute(
+                "UPDATE mc_memories
+                    SET content = ?1,
+                        normalized_hash = ?2,
+                        seen_count = ?3,
+                        retrieval_count = ?4,
+                        merged_from = ?5,
+                        status = ?6,
+                        updated_at = ?7,
+                        shareable = 0,
+                        classified_at = NULL
+                  WHERE id = ?8",
+                params![
+                    merged_content,
+                    normalized_hash,
+                    seen_count,
+                    retrieval_count,
+                    merged_from,
+                    merged_status,
+                    now_ms,
+                    target_id,
+                ],
+            )?;
+            append_memory_mutation_tx(
+                tx,
+                MemoryMutationAppend {
+                    project_path: &target.project_path,
+                    mutation_type: "update",
+                    target_memory_id: target_id,
+                    superseded_by_id: None,
+                    category: Some(&target.category),
+                    new_content: Some(merged_content),
+                    queued_at: now_ms,
+                },
+            )?;
+
+            for source in &source_rows {
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET status = 'archived',
+                            superseded_by_memory_id = ?1,
+                            updated_at = ?2
+                      WHERE id = ?3",
+                    params![target_id, now_ms, source.id],
+                )?;
+                append_memory_mutation_tx(
+                    tx,
+                    MemoryMutationAppend {
+                        project_path: &source.project_path,
+                        mutation_type: "superseded",
+                        target_memory_id: source.id,
+                        superseded_by_id: Some(target_id),
+                        category: None,
+                        new_content: None,
+                        queued_at: now_ms,
+                    },
+                )?;
+            }
+
+            load_memory_full_tx(tx, target_id)
+        })?;
+        Ok(row)
+    }
+
     /// Publish a validated historian chunk in one CAS-gated transaction. The publish
     /// predicate proves the producer still matches the exact firing that created the
     /// chunk; stale reattaches or a second racing publisher fail before any rows are
@@ -1926,41 +2260,10 @@ impl McStore {
         membership: &WorkspaceMembership,
         now_ms: i64,
     ) -> Result<Vec<StoredMemory>, McStoreError> {
-        let WorkspaceMembership {
-            union_identities,
-            own_identity,
-            share_categories,
-            ..
-        } = membership;
-        if union_identities.is_empty() {
+        if membership.union_identities.is_empty() {
             return Ok(Vec::new());
         }
-        // own predicate (full visibility) OR foreign predicate (shared categories only).
-        let foreign: Vec<&String> = union_identities
-            .iter()
-            .filter(|p| *p != own_identity)
-            .collect();
-
-        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
-        let mut sharing = String::from("project_path IN (?)");
-        binds.push(rusqlite::types::Value::from(own_identity.clone()));
-        if !foreign.is_empty() && !share_categories.is_empty() {
-            let fph = std::iter::repeat_n("?", foreign.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let cph = std::iter::repeat_n("?", share_categories.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            sharing.push_str(&format!(
-                " OR (project_path IN ({fph}) AND category IN ({cph}))"
-            ));
-            for p in &foreign {
-                binds.push(rusqlite::types::Value::from((*p).clone()));
-            }
-            for c in share_categories {
-                binds.push(rusqlite::types::Value::from(c.clone()));
-            }
-        }
+        let (sharing, binds) = workspace_union_memory_visibility_filter(membership);
 
         let rows = self.inner.with_conn(|conn| {
             let sql = format!(
@@ -1986,6 +2289,96 @@ impl McStore {
                         expires_at: r.get(5)?,
                         superseded_by_memory_id: r.get(6)?,
                         updated_at: r.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
+    /// Search active/permanent memory content visible to `project_path` with a literal,
+    /// case-insensitive SQL LIKE. Workspace visibility is built by the same helper used by
+    /// [`Self::load_workspace_union_memories`], keeping search and render on one boundary.
+    pub fn search_visible_memory_contents(
+        &self,
+        project_path: &str,
+        query: &str,
+    ) -> Result<Vec<StoredMemorySearchRow>, McStoreError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let membership = self.resolve_workspace_membership(project_path)?;
+        let (sharing, binds) = match &membership {
+            Some(m) => workspace_union_memory_visibility_filter(m),
+            None => project_memory_visibility_filter(project_path),
+        };
+        let pattern = sql_like_pattern(query);
+
+        let rows = self.inner.with_conn(|conn| {
+            let sql = format!(
+                "SELECT id, project_path, category, content, updated_at
+                   FROM mc_memories
+                  WHERE ({sharing})
+                    AND status IN ('active', 'permanent')
+                    AND LOWER(content) LIKE ? ESCAPE '\\'
+                  ORDER BY updated_at DESC, id ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut all_binds = binds.clone();
+            all_binds.push(rusqlite::types::Value::from(pattern));
+            let mapped = stmt
+                .query_map(rusqlite::params_from_iter(all_binds.iter()), |r| {
+                    Ok(StoredMemorySearchRow {
+                        id: r.get(0)?,
+                        project_path: r.get(1)?,
+                        category: r.get(2)?,
+                        content: r.get(3)?,
+                        updated_at: r.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
+    /// Search a session's compartment title and tier text with a literal, case-insensitive
+    /// SQL LIKE. The caller supplies the already-resolved session id; no routing is done in
+    /// this store layer.
+    pub fn search_compartments_like(
+        &self,
+        session_id: &str,
+        query: &str,
+    ) -> Result<Vec<StoredCompartmentSearchRow>, McStoreError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = sql_like_pattern(query);
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sequence, title, content, p1, p2, p3, p4, created_at
+                   FROM mc_compartments
+                  WHERE session_id = ?1
+                    AND (LOWER(title) LIKE ?2 ESCAPE '\\'
+                      OR LOWER(content) LIKE ?2 ESCAPE '\\'
+                      OR LOWER(COALESCE(p1, '')) LIKE ?2 ESCAPE '\\'
+                      OR LOWER(COALESCE(p2, '')) LIKE ?2 ESCAPE '\\'
+                      OR LOWER(COALESCE(p3, '')) LIKE ?2 ESCAPE '\\'
+                      OR LOWER(COALESCE(p4, '')) LIKE ?2 ESCAPE '\\')
+                  ORDER BY sequence DESC",
+            )?;
+            let mapped = stmt
+                .query_map(params![session_id, pattern], |r| {
+                    Ok(StoredCompartmentSearchRow {
+                        sequence: r.get(0)?,
+                        title: r.get(1)?,
+                        content: r.get(2)?,
+                        p1: r.get(3)?,
+                        p2: r.get(4)?,
+                        p3: r.get(5)?,
+                        p4: r.get(6)?,
+                        created_at: r.get(7)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2304,6 +2697,194 @@ fn promote_facts_tx(
     Ok(promoted)
 }
 
+const MEMORY_FULL_SELECT_BY_ID: &str =
+    "SELECT id, project_path, category, content, normalized_hash, importance, scope,
+            shareable, source_session_id, source_type, seen_count, retrieval_count,
+            first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
+            status, expires_at, verification_status, verified_at, classified_at,
+            superseded_by_memory_id, merged_from, metadata_json
+       FROM mc_memories WHERE id = ?1";
+
+fn stored_memory_full_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemoryFull> {
+    Ok(StoredMemoryFull {
+        id: r.get(0)?,
+        project_path: r.get(1)?,
+        category: r.get(2)?,
+        content: r.get(3)?,
+        normalized_hash: r.get(4)?,
+        importance: r.get::<_, Option<i64>>(5)?.map(|v| v as i32),
+        scope: r.get(6)?,
+        shareable: r.get::<_, i64>(7)? as i32,
+        source_session_id: r.get(8)?,
+        source_type: r.get(9)?,
+        seen_count: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
+        retrieval_count: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
+        first_seen_at: r.get(12)?,
+        created_at: r.get(13)?,
+        updated_at: r.get(14)?,
+        last_seen_at: r.get(15)?,
+        last_retrieved_at: r.get(16)?,
+        status: r
+            .get::<_, Option<String>>(17)?
+            .unwrap_or_else(|| "active".to_string()),
+        expires_at: r.get(18)?,
+        verification_status: r
+            .get::<_, Option<String>>(19)?
+            .unwrap_or_else(|| "unverified".to_string()),
+        verified_at: r.get(20)?,
+        classified_at: r.get(21)?,
+        superseded_by_memory_id: r.get(22)?,
+        merged_from: r.get(23)?,
+        metadata_json: r.get(24)?,
+    })
+}
+
+fn load_memory_full_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+) -> rusqlite::Result<Option<StoredMemoryFull>> {
+    tx.query_row(
+        MEMORY_FULL_SELECT_BY_ID,
+        params![id],
+        stored_memory_full_from_row,
+    )
+    .optional()
+}
+
+struct MemoryMutationAppend<'a> {
+    project_path: &'a str,
+    mutation_type: &'a str,
+    target_memory_id: i64,
+    superseded_by_id: Option<i64>,
+    category: Option<&'a str>,
+    new_content: Option<&'a str>,
+    queued_at: i64,
+}
+
+fn append_memory_mutation_tx(
+    tx: &rusqlite::Transaction<'_>,
+    mutation: MemoryMutationAppend<'_>,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO mc_memory_mutation_log
+            (project_path, mutation_type, target_memory_id, superseded_by_id,
+             category, new_content, queued_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            mutation.project_path,
+            mutation.mutation_type,
+            mutation.target_memory_id,
+            mutation.superseded_by_id,
+            mutation.category,
+            mutation.new_content,
+            mutation.queued_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn merge_archive_reason(existing: Option<&str>, reason: &str) -> String {
+    let mut object = existing
+        .and_then(|json| serde_json::from_str::<Value>(json).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    object.insert(
+        "archive_reason".to_string(),
+        Value::String(reason.to_string()),
+    );
+    Value::Object(object).to_string()
+}
+
+fn merged_from_json(rows: &[StoredMemoryFull]) -> String {
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        ids.insert(row.id);
+        if let Some(raw) = &row.merged_from {
+            if let Ok(Value::Array(values)) = serde_json::from_str::<Value>(raw) {
+                for value in values {
+                    if let Some(id) = value.as_i64() {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    let ids: Vec<i64> = ids.into_iter().collect();
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn project_memory_visibility_filter(project_path: &str) -> (String, Vec<rusqlite::types::Value>) {
+    (
+        "project_path = ?".to_string(),
+        vec![rusqlite::types::Value::from(project_path.to_string())],
+    )
+}
+
+fn workspace_union_memory_visibility_filter(
+    membership: &WorkspaceMembership,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let WorkspaceMembership {
+        union_identities,
+        own_identity,
+        share_categories,
+        ..
+    } = membership;
+
+    let foreign: Vec<&String> = union_identities
+        .iter()
+        .filter(|p| *p != own_identity)
+        .collect();
+
+    let mut binds: Vec<rusqlite::types::Value> =
+        vec![rusqlite::types::Value::from(own_identity.clone())];
+    let mut sharing = String::from("project_path = ?");
+    if !foreign.is_empty() && !share_categories.is_empty() {
+        let fph = std::iter::repeat_n("?", foreign.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cph = std::iter::repeat_n("?", share_categories.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        sharing.push_str(&format!(
+            " OR (project_path IN ({fph}) AND category IN ({cph}))"
+        ));
+        for p in &foreign {
+            binds.push(rusqlite::types::Value::from((*p).clone()));
+        }
+        for c in share_categories {
+            binds.push(rusqlite::types::Value::from(c.clone()));
+        }
+    }
+
+    (sharing, binds)
+}
+
+fn sql_like_pattern(query: &str) -> String {
+    let mut escaped = String::new();
+    for ch in query.trim().to_lowercase().chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    format!("%{escaped}%")
+}
+
+/// Compute the ctx_memory normalized hash used for duplicate detection. This mirrors the
+/// plugin path: lowercase, collapse whitespace runs to one space, trim, then MD5 hex.
+pub fn compute_normalized_memory_hash(content: &str) -> String {
+    let normalized = content
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let digest = md5::compute(normalized.as_bytes());
+    format!("{digest:032x}")
+}
+
 fn stable_content_hash(content: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in content.as_bytes() {
@@ -2365,6 +2946,25 @@ mod tests {
             backend: StorageBackend::Sqlite {
                 path: dir.join("store.db").to_string_lossy().to_string(),
             },
+        }
+    }
+
+    fn insert_input<'a>(
+        project_path: &'a str,
+        category: &'a str,
+        content: &'a str,
+        now_ms: i64,
+    ) -> InsertMemoryInput<'a> {
+        InsertMemoryInput {
+            project_path,
+            category,
+            content,
+            source_session_id: None,
+            source_type: Some("tool"),
+            importance: Some(50),
+            expires_at: None,
+            metadata_json: None,
+            now_ms,
         }
     }
 
@@ -2745,6 +3345,134 @@ mod tests {
         // empty inputs → 0 (no panic, no all-rows scan)
         assert_eq!(store.max_memory_id(&[]).unwrap(), 0);
         assert_eq!(store.max_memory_mutation_id(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn insert_memory_dedups_without_mutation_log_and_advances_memory_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let paths = [project.to_string()];
+
+        let id = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "Use Rust", 10))
+            .unwrap();
+        assert_eq!(store.max_memory_id(&paths).unwrap(), id);
+        assert_eq!(store.max_memory_mutation_id(&paths).unwrap(), 0);
+
+        let duplicate = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "  use   rust  ", 20))
+            .unwrap();
+        assert_eq!(
+            duplicate, id,
+            "normalized duplicate returns the existing id"
+        );
+        assert_eq!(store.max_memory_id(&paths).unwrap(), id);
+        assert_eq!(store.max_memory_mutation_id(&paths).unwrap(), 0);
+        assert_eq!(store.load_active_memories(project, 20).unwrap().len(), 1);
+        assert_eq!(store.get_memory_full(id).unwrap().unwrap().seen_count, 2);
+    }
+
+    #[test]
+    fn update_memory_content_advances_mutation_log_with_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let id = store
+            .insert_memory(insert_input(project, "ARCHITECTURE", "old", 1))
+            .unwrap();
+        let before = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+
+        let updated = store.update_memory_content(id, "new", 2).unwrap().unwrap();
+        assert_eq!(updated.content, "new");
+        let after = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+        assert!(after > before);
+        let mutations = store
+            .memory_mutations_for_render(&[project.to_string()], before, &[id])
+            .unwrap();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].target_memory_id, id);
+        assert_eq!(mutations[0].mutation_type, "update");
+        assert_eq!(mutations[0].new_content.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn archive_memory_advances_mutation_log_with_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let id = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "keep", 1))
+            .unwrap();
+        let before = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+
+        let archived = store
+            .archive_memory(id, Some("obsolete"), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(archived.status, "archived");
+        assert!(archived
+            .metadata_json
+            .as_deref()
+            .unwrap_or("")
+            .contains("archive_reason"));
+        let mutations = store
+            .memory_mutations_for_render(&[project.to_string()], before, &[id])
+            .unwrap();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].target_memory_id, id);
+        assert_eq!(mutations[0].mutation_type, "archive");
+    }
+
+    #[test]
+    fn merge_memories_logs_target_and_each_source_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let target = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "old target", 1))
+            .unwrap();
+        let source = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "old source", 1))
+            .unwrap();
+        let before = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+
+        let merged = store
+            .merge_memories(target, &[source], "merged content", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.content, "merged content");
+        assert_eq!(merged.merged_from, Some(format!("[{target},{source}]")));
+        let source_row = store.get_memory_full(source).unwrap().unwrap();
+        assert_eq!(source_row.status, "archived");
+        assert_eq!(source_row.superseded_by_memory_id, Some(target));
+
+        let after = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+        assert_eq!(after - before, 2, "target update + source supersede");
+        let mutations = store
+            .memory_mutations_for_render(&[project.to_string()], before, &[target, source])
+            .unwrap();
+        assert_eq!(mutations.len(), 2);
+        assert!(mutations.iter().any(|m| {
+            m.target_memory_id == target
+                && m.mutation_type == "update"
+                && m.new_content.as_deref() == Some("merged content")
+        }));
+        assert!(mutations.iter().any(|m| {
+            m.target_memory_id == source
+                && m.mutation_type == "superseded"
+                && m.superseded_by_id == Some(target)
+        }));
     }
 
     #[test]

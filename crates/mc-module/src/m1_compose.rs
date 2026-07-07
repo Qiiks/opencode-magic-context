@@ -234,7 +234,7 @@ fn load_new_memories(
 mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-    use mc_store::StoredCompartment;
+    use mc_store::{InsertMemoryInput, StoredCompartment};
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         StorageDescriptor {
@@ -276,6 +276,25 @@ mod tests {
             memory_mutation_cursor: cursor,
             rendered_memory_ids: manifest,
             ..Default::default()
+        }
+    }
+
+    fn insert_input<'a>(
+        project: &'a str,
+        category: &'a str,
+        content: &'a str,
+        now: i64,
+    ) -> InsertMemoryInput<'a> {
+        InsertMemoryInput {
+            project_path: project,
+            category,
+            content,
+            source_session_id: None,
+            source_type: Some("tool"),
+            importance: Some(70),
+            expires_at: None,
+            metadata_json: None,
+            now_ms: now,
         }
     }
 
@@ -348,6 +367,95 @@ mod tests {
             m1.new_coverage, None,
             "memory-only delta keeps the boundary put"
         );
+    }
+
+    #[test]
+    fn public_memory_ports_drive_m1_revision_and_delta_blocks() {
+        let project = "git:proj";
+
+        for case in ["update", "archive", "merge"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open(&descriptor(dir.path())).unwrap();
+            store
+                .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
+                .unwrap();
+            let target = store
+                .insert_memory(insert_input(project, "CONSTRAINTS", "original", 1))
+                .unwrap();
+            let merge_source = (case == "merge").then(|| {
+                store
+                    .insert_memory(insert_input(project, "CONSTRAINTS", "duplicate", 1))
+                    .unwrap()
+            });
+            let mut manifest = vec![target];
+            if let Some(source) = merge_source {
+                manifest.push(source);
+            }
+            let max_mem = store.max_memory_id(&[project.to_string()]).unwrap();
+            let cursor = store
+                .max_memory_mutation_id(&[project.to_string()])
+                .unwrap();
+            let before_signal = m1_revision_signal(&store, project, "ses").unwrap();
+
+            match case {
+                "update" => {
+                    store.update_memory_content(target, "corrected", 2).unwrap();
+                }
+                "archive" => {
+                    store.archive_memory(target, Some("obsolete"), 2).unwrap();
+                }
+                "merge" => {
+                    store
+                        .merge_memories(target, &[merge_source.unwrap()], "merged", 2)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let after_signal = m1_revision_signal(&store, project, "ses").unwrap();
+            assert_ne!(
+                before_signal, after_signal,
+                "{case} must move the m1 signal"
+            );
+            let meta = meta_after_hard(1, Some(10), max_mem, cursor, manifest);
+            let m1 = compose_m1_from_store(&store, project, "ses", &meta, 0).unwrap();
+            assert!(m1.body.contains("<memory-updates>"), "{case}: {}", m1.body);
+            assert_eq!(
+                m1.new_coverage, None,
+                "memory-only mutations do not extend coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn public_insert_renders_new_memories_without_mutation_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        store
+            .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
+            .unwrap();
+        let before_signal = m1_revision_signal(&store, project, "ses").unwrap();
+        let cursor = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+
+        store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "brand new", 1))
+            .unwrap();
+        let after_signal = m1_revision_signal(&store, project, "ses").unwrap();
+        assert_ne!(before_signal, after_signal, "insert moves max_memory_id");
+        assert_eq!(
+            store
+                .max_memory_mutation_id(&[project.to_string()])
+                .unwrap(),
+            cursor,
+            "additive inserts do not write the mutation log"
+        );
+        let meta = meta_after_hard(1, Some(10), 0, cursor, vec![]);
+        let m1 = compose_m1_from_store(&store, project, "ses", &meta, 0).unwrap();
+        assert!(m1.body.contains("<new-memories>"), "{}", m1.body);
+        assert!(m1.body.contains("brand new"), "{}", m1.body);
     }
 
     #[test]
