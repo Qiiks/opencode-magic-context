@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+    addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
     advanceToolReclaimWatermark,
     getActiveTagsBySession,
@@ -589,7 +590,7 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
         expect(statuses.get(3)).toBe("active"); // newest todowrite kept
     });
 
-    it("ON but DEFER pass: nothing is dropped (reclaim block requires execute)", async () => {
+    it("ON but plain DEFER pass: nothing is dropped (reclaim block requires a known bust)", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-smart-defer";
@@ -720,6 +721,72 @@ describe("known m[0] hard-fold folds the execute pass in", () => {
         // into this pass (no second bust later).
         expect(getTagsBySession(db, sessionId).find((t) => t.tagNumber === 1)?.status).toBe(
             "dropped",
+        );
+    });
+
+    it("drains two-pass reclaim and advances its watermark on a DEFER scheduler pass when m[0] HARD-folds", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-hardfold-reclaim-drain";
+        materializeBaseline(sessionId);
+
+        const trigger = makeToolMessage("tool-1");
+        const reclaimable = makeToolMessage("tool-2");
+        const newer = makeToolMessage("tool-3");
+        insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "edit");
+        insertTag(db, sessionId, "tool-2", "tool", 4000, 2, 0, "bash");
+        insertTag(db, sessionId, "tool-3", "tool", 4000, 3, 0, "read");
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        advanceToolReclaimWatermark(db, sessionId, 2);
+        const messages = [trigger, reclaimable, newer];
+        const targets = new Map<number, TagTarget>([
+            [1, makeDropTarget(trigger)],
+            [2, makeDropTarget(reclaimable)],
+            [3, makeDropTarget(newer)],
+        ]);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                contextUsage: { percentage: 40, inputTokens: 4000 },
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+                currentTurnId: "turn-hardfold-reclaim",
+                m0M1: {
+                    projectPath: FOLD_PROJECT,
+                    projectDirectory: FOLD_PROJECT,
+                    historyBudgetTokens: 98_000,
+                    hardSignals: {
+                        ...BASE_HARD,
+                        modelKey: "anthropic/sonnet",
+                    },
+                },
+            }),
+        );
+
+        const statuses = new Map(
+            getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]),
+        );
+        expect(statuses.get(1)).toBe("dropped");
+        expect(statuses.get(2)).toBe("dropped");
+        expect(statuses.get(3)).toBe("active");
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(3);
+
+        const deferReplayBytes = JSON.stringify(messages);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                contextUsage: { percentage: 40, inputTokens: 4000 },
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+                currentTurnId: "turn-hardfold-reclaim-replay",
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        expect(JSON.stringify(messages)).toBe(deferReplayBytes);
+        expect(getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 3)?.status).toBe(
+            "active",
         );
     });
 
@@ -958,6 +1025,42 @@ describe("postprocess empty-sentinel provider gate", () => {
 
         expect(userMessage.parts).toEqual([{ type: "text", text: "" }]);
         expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual(["m-image"]);
+    });
+
+    it("replays frozen processed image strips on defer passes even when the watermark is zero", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-anthropic-processed-image-zero-watermark";
+        addProcessedImageStrippedIds(db, sessionId, ["m-image-frozen"]);
+        const userMessage = {
+            info: { id: "m-image-frozen", role: "user" },
+            parts: [
+                {
+                    type: "file",
+                    mime: "image/png",
+                    url: `data:image/png;base64,${"a".repeat(220)}`,
+                },
+            ],
+        } as unknown as MessageLike;
+        const messages: MessageLike[] = [
+            userMessage,
+            {
+                info: { id: "m-assistant", role: "assistant" },
+                parts: [{ type: "text", text: "seen" }],
+            },
+        ] as unknown as MessageLike[];
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                watermark: 0,
+                messageTagNumbers: new Map([[userMessage, 1]]),
+                resolvedProviderID: "anthropic",
+            }),
+        );
+
+        expect(userMessage.parts).toEqual([{ type: "text", text: "" }]);
+        expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual(["m-image-frozen"]);
     });
 
     it("does not replay stale ctx_reduce frozen ids as empty sentinels for github-copilot", async () => {

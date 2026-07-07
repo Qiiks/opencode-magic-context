@@ -173,10 +173,10 @@ describe("maybeDeliverChannel2", () => {
 
         expect(promptAsync).toHaveBeenCalledTimes(1);
         expect(delivered).toBe(false);
-        expect(getChannel2NudgeState(db, "ses-confirm-lost")).toBe("delivered");
+        expect(getChannel2NudgeState(db, "ses-confirm-lost")).toBe("");
     });
 
-    it("preserves a sibling's delivered claim and logs the duplicate window distinctly", async () => {
+    it("preserves a sibling's delivered claim when token confirmation is no longer ours", async () => {
         useTempDataHome("ch2-duplicate-window-");
         const db = openDatabase()!;
         const sessionId = "ses-duplicate-window";
@@ -206,9 +206,44 @@ describe("maybeDeliverChannel2", () => {
                 (call) =>
                     call[0] === sessionId &&
                     typeof call[1] === "string" &&
-                    call[1].includes("duplicate window"),
+                    call[1].includes("confirmation was not ours"),
             ),
         ).toBe(true);
+    });
+
+    it("does not stale-confirm when a healed mid-send claim is re-delivered elsewhere", async () => {
+        useTempDataHome("ch2-healed-mid-send-");
+        const db = openDatabase()!;
+        const sessionId = "ses-healed-mid-send";
+        setChannel2NudgeState(db, sessionId, "pending");
+
+        const secondPromptAsync = mock(async () => ({}));
+        const firstPromptAsync = mock(async () => {
+            // Simulate boot healing a stale claim while the original promptAsync is
+            // still in flight, then a sibling process delivering the rewound intent.
+            db.prepare(
+                "UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE session_id = ?",
+            ).run(sessionId);
+            const secondDelivered = await maybeDeliverChannel2(sessionId, {
+                db,
+                client: fakeClient(secondPromptAsync),
+                reclaimableTokens: 30_000,
+                usableTokens: 60_000,
+            });
+            expect(secondDelivered).toBe(true);
+        });
+
+        const delivered = await maybeDeliverChannel2(sessionId, {
+            db,
+            client: fakeClient(firstPromptAsync),
+            reclaimableTokens: 30_000,
+            usableTokens: 60_000,
+        });
+
+        expect(firstPromptAsync).toHaveBeenCalledTimes(1);
+        expect(secondPromptAsync).toHaveBeenCalledTimes(1);
+        expect(delivered).toBe(false);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("delivered");
     });
 
     it("leaves a stale claim healable when claimed→pending CAS throws on send failure", async () => {
@@ -222,7 +257,7 @@ describe("maybeDeliverChannel2", () => {
             const statement = originalPrepare(sql);
             if (
                 sql ===
-                "UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ? WHERE session_id = ? AND channel2_nudge_state = ?"
+                "UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = ? WHERE session_id = ? AND channel2_nudge_state = 'claimed' AND channel2_nudge_claim_token = ?"
             ) {
                 return {
                     ...statement,
@@ -230,12 +265,14 @@ describe("maybeDeliverChannel2", () => {
                         if (
                             args[0] === "pending" &&
                             args[1] === 0 &&
-                            args[2] === sessionId &&
-                            args[3] === "claimed"
+                            args[2] === "" &&
+                            args[3] === sessionId
                         ) {
                             throw new Error("SQLITE_BUSY: database is locked");
                         }
-                        return statement.run(...(args as [unknown, unknown, unknown, unknown]));
+                        return statement.run(
+                            ...(args as [unknown, unknown, unknown, unknown, unknown]),
+                        );
                     },
                 } as typeof statement;
             }

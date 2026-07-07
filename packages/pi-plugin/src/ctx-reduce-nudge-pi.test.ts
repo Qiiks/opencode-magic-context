@@ -315,7 +315,7 @@ describe("maybeDeliverChannel2Pi", () => {
 			const statement = originalPrepare(sql);
 			if (
 				sql ===
-				"UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ? WHERE session_id = ? AND channel2_nudge_state = ?"
+				"UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ? AND channel2_nudge_state = ?"
 			) {
 				return {
 					...statement,

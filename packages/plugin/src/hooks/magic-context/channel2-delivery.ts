@@ -10,15 +10,18 @@
 // boundary, warning the agent WHILE the reclaimable pile is growing instead
 // of after the turn already ballooned.
 //
-// Lease state machine (cross-process CAS): pending -> claimed -> delivered.
-//   - claim `pending -> claimed` before send (so two processes can't both send)
-//   - on confirmed success: `claimed -> delivered` (cap consumed, terminal)
+// Lease state machine (cross-process CAS): pending -> claimed(token) -> delivered.
+//   - claim `pending -> claimed` with a per-claim token before send (so two
+//     processes can't both send from the same pending row)
+//   - on confirmed success: token-CAS `claimed -> delivered` (cap consumed,
+//     terminal)
 //   - on send failure: revert `claimed -> pending` (don't burn the one ceiling
 //     nudge on a transient transport error)
 //   - after a successful send: never revert to pending, even if confirmation
 //     fails; the user message may already exist and re-arming duplicates it. If
-//     another claimant already sealed `delivered`, preserve that authoritative
-//     row and log the duplicate window instead of blindly overwriting it.
+//     a stale lease was healed and another process re-delivered, the token-CAS
+//     misses and we leave that authoritative row alone instead of blindly
+//     overwriting it.
 //
 // Delivery transport is the in-process client OpenCode hands the plugin
 // (`input.client`). On OpenCode >= 1.17.7 that client routes through the live
@@ -30,10 +33,13 @@
 // separate client aimed at the live HTTP listener + a reachability probe to
 // avoid it; that's fixed upstream now, so the separate client + probe are gone.
 
+import { randomUUID } from "node:crypto";
 import {
+    casChannel2NudgeClaim,
     casChannel2NudgeState,
+    claimChannel2NudgeState,
+    getChannel2NudgeClaim,
     getChannel2NudgeState,
-    setChannel2NudgeState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { sessionLog } from "../../shared/logger";
 import { resolvePromptContext } from "../../shared/prompt-context";
@@ -61,29 +67,6 @@ export interface Channel2DeliveryDeps {
      */
     usableTokens?: number;
     oldestReclaimableToolTags?: readonly ToolReclaimHint[];
-}
-
-function sealDeliveredAfterUnconfirmedSend(
-    db: Database,
-    sessionId: string,
-): "already-delivered" | "sealed" | "stuck-claimed" {
-    try {
-        if (getChannel2NudgeState(db, sessionId) === "delivered") {
-            return "already-delivered";
-        }
-    } catch {
-        // Best-effort probe only — if this read fails, fall through and try to
-        // seal the cap rather than risking a re-deliverable pending state.
-    }
-
-    try {
-        setChannel2NudgeState(db, sessionId, "delivered");
-        return "sealed";
-    } catch {
-        // Leave the stale claimed lease intact so the TTL heal can recover it on a
-        // later openDatabase() call if this process can't write right now.
-        return "stuck-claimed";
-    }
 }
 
 /**
@@ -144,8 +127,10 @@ export async function maybeDeliverChannel2(
     const client = deps.client;
     if (!client) return false;
 
-    // Claim the intent before sending so a sibling process can't double-deliver.
-    if (!casChannel2NudgeState(deps.db, sessionId, "pending", "claimed")) {
+    // Claim the intent before sending so a sibling process can't send from the
+    // same pending row; the token makes confirm/revert refuse healed stale leases.
+    const claimToken = randomUUID();
+    if (!claimChannel2NudgeState(deps.db, sessionId, claimToken)) {
         return false;
     }
 
@@ -185,13 +170,33 @@ export async function maybeDeliverChannel2(
         if (typeof session?.promptAsync !== "function") {
             throw new Error("client has no session.promptAsync");
         }
+        const claim = getChannel2NudgeClaim(deps.db, sessionId);
+        if (claim.state !== "claimed" || claim.claimToken !== claimToken) {
+            sessionLog(
+                sessionId,
+                `channel2 ceiling nudge delivery skipped: claim no longer owned before send (state=${claim.state || "empty"})`,
+            );
+            return false;
+        }
         await session.promptAsync({ path: { id: sessionId }, body });
     } catch (error) {
         // Revert only when the send itself failed. Once promptAsync returns, the
         // synthetic user message may already exist; re-arming can duplicate it.
         try {
-            casChannel2NudgeState(deps.db, sessionId, "claimed", "pending");
-            sessionLog(sessionId, "channel2 ceiling nudge delivery failed (will retry):", error);
+            const restored = casChannel2NudgeClaim(deps.db, sessionId, "pending", claimToken);
+            if (restored) {
+                sessionLog(
+                    sessionId,
+                    "channel2 ceiling nudge delivery failed (will retry):",
+                    error,
+                );
+            } else {
+                sessionLog(
+                    sessionId,
+                    "channel2 ceiling nudge delivery failed after its claim was no longer owned; lease state left unchanged:",
+                    error,
+                );
+            }
         } catch (revertError) {
             sessionLog(
                 sessionId,
@@ -205,48 +210,25 @@ export async function maybeDeliverChannel2(
     try {
         // Confirmed: consume the one-shot cap (terminal). The CAS result is
         // authoritative; a stolen/expired claim must not be treated as delivered.
-        const confirmed = casChannel2NudgeState(deps.db, sessionId, "claimed", "delivered");
+        const confirmed = casChannel2NudgeClaim(deps.db, sessionId, "delivered", claimToken);
         if (confirmed) {
             sessionLog(sessionId, "channel2 ceiling nudge delivered");
             return true;
         }
-
-        const outcome = sealDeliveredAfterUnconfirmedSend(deps.db, sessionId);
-        if (outcome === "already-delivered") {
-            sessionLog(
-                sessionId,
-                "channel2 ceiling nudge duplicate window: our send returned after a sibling reclaimed the stale lease and already delivered",
-            );
-        } else if (outcome === "sealed") {
-            sessionLog(
-                sessionId,
-                "channel2 ceiling nudge sent but claim confirmation was lost; sealed delivered without an authoritative confirm",
-            );
-        } else {
-            sessionLog(
-                sessionId,
-                "channel2 ceiling nudge sent but claim confirmation was lost; lease stayed claimed and will heal later",
-            );
-        }
+        const claim = getChannel2NudgeClaim(deps.db, sessionId);
+        sessionLog(
+            sessionId,
+            `channel2 ceiling nudge sent but claim confirmation was not ours (state=${claim.state || "empty"}); leaving existing lease state unchanged`,
+        );
         return false;
     } catch (error) {
         // Post-send DB failure: do NOT revert to pending, because the send already
         // happened and retrying risks a duplicate ceiling nudge.
-        const outcome = sealDeliveredAfterUnconfirmedSend(deps.db, sessionId);
-        if (outcome === "already-delivered") {
-            sessionLog(
-                sessionId,
-                "channel2 ceiling nudge duplicate window: our send returned after a sibling reclaimed the stale lease and already delivered",
-            );
-        } else if (outcome === "sealed") {
-            sessionLog(sessionId, "channel2 ceiling nudge sent but confirm failed:", error);
-        } else {
-            sessionLog(
-                sessionId,
-                "channel2 ceiling nudge sent but confirm failed; lease stayed claimed and will heal later:",
-                error,
-            );
-        }
+        sessionLog(
+            sessionId,
+            "channel2 ceiling nudge sent but token-confirm failed; lease state left unchanged:",
+            error,
+        );
         return false;
     }
 }

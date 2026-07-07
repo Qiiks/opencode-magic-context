@@ -964,6 +964,9 @@ export function resetLastNudgeCycleIfTailShrank(
 //   'claimed'  — a delivery attempt is in flight (CAS-claimed before send);
 //                `channel2_nudge_claimed_at` stores the lease timestamp so boot
 //                recovery only rewinds stale claims, never a live sibling send.
+//                OpenCode also writes `channel2_nudge_claim_token` so a slow
+//                sender cannot confirm a lease after another process heals and
+//                re-delivers it.
 //   'delivered'— confirmed sent; the one ceiling nudge is consumed (terminal)
 // On send failure the caller reverts 'claimed' -> 'pending' so a transient error
 // does not permanently burn the single ceiling nudge. After send succeeds, a
@@ -975,7 +978,9 @@ interface PersistedChannel2StateRow {
 }
 
 interface PersistedChannel2ClaimRow {
+    channel2_nudge_state?: string;
     channel2_nudge_claimed_at: number;
+    channel2_nudge_claim_token?: string | null;
 }
 
 function isChannel2StateRow(row: unknown): row is PersistedChannel2StateRow {
@@ -1006,6 +1011,37 @@ export function getChannel2NudgeClaimedAt(db: Database, sessionId: string): numb
         : 0;
 }
 
+export interface Channel2NudgeClaim {
+    state: Channel2NudgeState;
+    claimedAt: number;
+    claimToken: string;
+}
+
+export function getChannel2NudgeClaim(db: Database, sessionId: string): Channel2NudgeClaim {
+    const result = db
+        .prepare(
+            "SELECT channel2_nudge_state, channel2_nudge_claimed_at, channel2_nudge_claim_token FROM session_meta WHERE session_id = ?",
+        )
+        .get(sessionId) as PersistedChannel2ClaimRow | null;
+    const rawState =
+        typeof result?.channel2_nudge_state === "string" ? result.channel2_nudge_state : "";
+    const state: Channel2NudgeState =
+        rawState === "pending" || rawState === "claimed" || rawState === "delivered"
+            ? rawState
+            : "";
+    return {
+        state,
+        claimedAt:
+            typeof result?.channel2_nudge_claimed_at === "number"
+                ? result.channel2_nudge_claimed_at
+                : 0,
+        claimToken:
+            typeof result?.channel2_nudge_claim_token === "string"
+                ? result.channel2_nudge_claim_token
+                : "",
+    };
+}
+
 export function setChannel2NudgeState(
     db: Database,
     sessionId: string,
@@ -1015,7 +1051,7 @@ export function setChannel2NudgeState(
         ensureSessionMetaRow(db, sessionId);
         const claimedAt = state === "claimed" ? Date.now() : 0;
         db.prepare(
-            "UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ? WHERE session_id = ?",
+            "UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ?",
         ).run(state, claimedAt, sessionId);
     })();
 }
@@ -1037,9 +1073,48 @@ export function casChannel2NudgeState(
         const claimedAt = to === "claimed" ? Date.now() : 0;
         const result = db
             .prepare(
-                "UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ? WHERE session_id = ? AND channel2_nudge_state = ?",
+                "UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ? AND channel2_nudge_state = ?",
             )
             .run(to, claimedAt, sessionId, from);
+        changed = (result.changes ?? 0) > 0;
+    })();
+    return changed;
+}
+
+export function claimChannel2NudgeState(
+    db: Database,
+    sessionId: string,
+    claimToken: string,
+): boolean {
+    let changed = false;
+    db.transaction(() => {
+        ensureSessionMetaRow(db, sessionId);
+        const result = db
+            .prepare(
+                "UPDATE session_meta SET channel2_nudge_state = 'claimed', channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = ? WHERE session_id = ? AND channel2_nudge_state = 'pending'",
+            )
+            .run(Date.now(), claimToken, sessionId);
+        changed = (result.changes ?? 0) > 0;
+    })();
+    return changed;
+}
+
+export function casChannel2NudgeClaim(
+    db: Database,
+    sessionId: string,
+    to: Channel2NudgeState,
+    claimToken: string,
+): boolean {
+    let changed = false;
+    db.transaction(() => {
+        ensureSessionMetaRow(db, sessionId);
+        const claimedAt = to === "claimed" ? Date.now() : 0;
+        const nextClaimToken = to === "claimed" ? claimToken : "";
+        const result = db
+            .prepare(
+                "UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = ? WHERE session_id = ? AND channel2_nudge_state = 'claimed' AND channel2_nudge_claim_token = ?",
+            )
+            .run(to, claimedAt, nextClaimToken, sessionId, claimToken);
         changed = (result.changes ?? 0) > 0;
     })();
     return changed;
