@@ -440,7 +440,8 @@ function collectHistorianDumps(
 async function collectRecentSessions(): Promise<RecentSessionSummary[]> {
     // env-first: honor XDG/HOME overrides (and sandboxed doctor test runs)
     // instead of Bun's homedir(), which ignores a runtime HOME override.
-    const dataHome = process.env.XDG_DATA_HOME || join(process.env.HOME || homedir(), ".local", "share");
+    const dataHome =
+        process.env.XDG_DATA_HOME || join(process.env.HOME || homedir(), ".local", "share");
     const opencodeDbPath = join(dataHome, "opencode", "opencode.db");
     if (!existsSync(opencodeDbPath)) return [];
 
