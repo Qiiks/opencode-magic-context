@@ -13,6 +13,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { indexMessagesAfterOrdinal } from "@magic-context/core/features/magic-context/message-index";
 import {
 	addNote,
 	getNotes,
@@ -20,10 +21,12 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { createTestDb, fakeContext } from "../test-utils.test";
 import { createCtxNoteTool } from "./ctx-note";
+import { createCtxSearchTool } from "./ctx-search";
 
 async function callNote(args: {
 	db: ReturnType<typeof createTestDb>;
 	dreamerEnabled?: boolean;
+	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 	sessionId?: string;
 	cwd?: string;
 	params: Record<string, unknown>;
@@ -31,6 +34,7 @@ async function callNote(args: {
 	const tool = createCtxNoteTool({
 		db: args.db,
 		dreamerEnabled: args.dreamerEnabled,
+		resolveDreamerEnabled: args.resolveDreamerEnabled,
 	});
 	const result = await tool.execute(
 		"call-1",
@@ -104,6 +108,74 @@ describe("Pi ctx_note smart notes", () => {
 			"When PR #42 is merged in this repo",
 		);
 		expect(notes[0].content).toBe("Revisit caching after PR #42 merges");
+	});
+
+	it("resolves smart-note enablement from the invocation cwd", async () => {
+		const db = createTestDb();
+		const { isError, text } = await callNote({
+			db,
+			dreamerEnabled: false,
+			resolveDreamerEnabled: (ctx) => ctx.cwd === "/tmp/project-b",
+			cwd: "/tmp/project-b",
+			params: {
+				action: "write",
+				content: "Follow up when the release tag exists",
+				surface_condition: "When release tag v1.2.3 exists",
+			},
+		});
+
+		expect(isError).toBe(false);
+		expect(text.toLowerCase()).toContain("smart");
+	});
+
+	it("stores sessionId on smart notes so note search renders same-session @msg anchors", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-smart-anchor";
+		indexMessagesAfterOrdinal(
+			db,
+			sessionId,
+			[
+				{
+					id: "m1",
+					ordinal: 1,
+					role: "user",
+					parts: [
+						{ type: "text", text: "Please remember the release follow-up." },
+					],
+				},
+			],
+			0,
+		);
+
+		const { isError } = await callNote({
+			db,
+			dreamerEnabled: true,
+			sessionId,
+			params: {
+				action: "write",
+				content: "Release follow-up parked for tag v1.2.3",
+				surface_condition: "When tag v1.2.3 exists",
+			},
+		});
+		expect(isError).toBe(false);
+
+		const projectIdentity = resolveProjectIdentity(process.cwd());
+		const notes = getNotes(db, { projectPath: projectIdentity, type: "smart" });
+		expect(notes).toHaveLength(1);
+		expect(notes[0].sessionId).toBe(sessionId);
+		expect(notes[0].anchorOrdinal).toBe(1);
+
+		const search = createCtxSearchTool({ db });
+		const result = await search.execute(
+			"search-1",
+			{ query: "release follow-up", sources: ["note"] },
+			new AbortController().signal,
+			undefined,
+			fakeContext(sessionId, process.cwd()) as never,
+		);
+		const text = (result.content[0] as { text: string }).text;
+		expect(text).toContain("@msg 1");
+		expect(text).toContain("Use ctx_expand(start=N-10, end=N)");
 	});
 
 	it("creates a session note (no surface_condition) regardless of dreamer flag", async () => {

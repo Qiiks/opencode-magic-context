@@ -35,21 +35,33 @@ interface RecompConfirmation {
 
 const confirmationBySession = new Map<string, RecompConfirmation>();
 const RECOMP_CONFIRMATION_WINDOW_MS = 60_000;
+const RECOMP_USAGE = [
+	"Usage:",
+	"- `/ctx-recomp` — full rebuild from message 1 to the protected tail",
+	"- `/ctx-recomp <start>-<end>` — partial rebuild of a message range (e.g. `/ctx-recomp 1-11322`)",
+	"- `/ctx-recomp --upgrade` — upgrade legacy v1 compartments to v2 layout (Wave 3 runner)",
+].join("\n");
+
+export interface CtxRecompRuntimeDeps {
+	db: ContextDatabase;
+	runner: SubagentRunner;
+	historianModel: string | undefined;
+	historianChunkTokens: number;
+	historianFallbacks?: readonly string[];
+	historianTimeoutMs?: number;
+	historianThinkingLevel?: string;
+	language?: string;
+	memoryEnabled: boolean;
+	autoPromote: boolean;
+}
+
+export interface RegisterCtxRecompDeps extends CtxRecompRuntimeDeps {
+	resolveRuntimeDeps?: (ctx: { cwd: string }) => CtxRecompRuntimeDeps;
+}
 
 export function registerCtxRecompCommand(
 	pi: ExtensionAPI,
-	deps: {
-		db: ContextDatabase;
-		runner: SubagentRunner;
-		historianModel: string | undefined;
-		historianChunkTokens: number;
-		historianFallbacks?: readonly string[];
-		historianTimeoutMs?: number;
-		historianThinkingLevel?: string;
-		language?: string;
-		memoryEnabled: boolean;
-		autoPromote: boolean;
-	},
+	deps: RegisterCtxRecompDeps,
 ): void {
 	pi.registerCommand("ctx-recomp", {
 		description:
@@ -64,21 +76,31 @@ export function registerCtxRecompCommand(
 				});
 				return;
 			}
-
-			if (!deps.historianModel) {
-				sendCtxStatusMessage(pi, {
-					title: "/ctx-recomp",
-					text: "## Magic Recomp\n\n/ctx-recomp is unavailable because `historian.model` is not configured.",
-					level: "error",
-				});
-				return;
-			}
+			const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
 
 			const parsed = parseRecompArgs(args);
 			if (parsed.kind === "error") {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-recomp",
 					text: `## Magic Recomp — Invalid Arguments\n\n${parsed.message}`,
+					level: "error",
+				});
+				return;
+			}
+
+			if (parsed.kind === "upgrade") {
+				sendCtxStatusMessage(pi, {
+					title: "/ctx-recomp",
+					text: executeRecompUpgradeStub(currentDeps.db, sessionId),
+					level: "info",
+				});
+				return;
+			}
+
+			if (!currentDeps.historianModel) {
+				sendCtxStatusMessage(pi, {
+					title: "/ctx-recomp",
+					text: "## Magic Recomp\n\n/ctx-recomp is unavailable because `historian.model` is not configured.",
 					level: "error",
 				});
 				return;
@@ -96,7 +118,11 @@ export function registerCtxRecompCommand(
 				confirmation.argsKey === argsKey;
 
 			if (!confirmed) {
-				const warning = buildConfirmationWarning(deps.db, sessionId, parsed);
+				const warning = buildConfirmationWarning(
+					currentDeps.db,
+					sessionId,
+					parsed,
+				);
 				if (!warning.confirmable) confirmationBySession.delete(sessionId);
 				else confirmationBySession.set(sessionId, { timestamp: now, argsKey });
 				sendCtxStatusMessage(pi, {
@@ -107,7 +133,7 @@ export function registerCtxRecompCommand(
 				return;
 			}
 
-			if (isWrapupInProgress(deps.db, sessionId)) {
+			if (isWrapupInProgress(currentDeps.db, sessionId)) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-recomp",
 					text: "## Magic Recomp\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try `/ctx-recomp` again.",
@@ -148,21 +174,24 @@ export function registerCtxRecompCommand(
 				sessionId,
 				provider,
 				onStatusChange: () =>
-					updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd }),
+					updateStatusLine(ctx, {
+						db: currentDeps.db,
+						projectIdentity: ctx.cwd,
+					}),
 				work: async () => {
 					const result = await executeContextRecompWithResult(
 						{
 							client: createPiHistorianClient({
-								runner: deps.runner,
-								model: deps.historianModel as string,
+								runner: currentDeps.runner,
+								model: currentDeps.historianModel as string,
 								systemPrompt: withContentLanguageDirective(
 									COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT,
-									deps.language,
+									currentDeps.language,
 									{ preserveUserQuotes: true },
 								),
-								fallbackModels: deps.historianFallbacks,
-								timeoutMs: deps.historianTimeoutMs,
-								thinkingLevel: deps.historianThinkingLevel,
+								fallbackModels: currentDeps.historianFallbacks,
+								timeoutMs: currentDeps.historianTimeoutMs,
+								thinkingLevel: currentDeps.historianThinkingLevel,
 								directory: ctx.cwd,
 								accountingSessionId: sessionId,
 								notify: (text) => {
@@ -173,21 +202,21 @@ export function registerCtxRecompCommand(
 									});
 								},
 							}) as never,
-							db: deps.db,
+							db: currentDeps.db,
 							sessionId,
-							historianChunkTokens: deps.historianChunkTokens,
+							historianChunkTokens: currentDeps.historianChunkTokens,
 							directory: ctx.cwd,
-							historianTimeoutMs: deps.historianTimeoutMs,
-							memoryEnabled: deps.memoryEnabled,
-							autoPromote: deps.autoPromote,
+							historianTimeoutMs: currentDeps.historianTimeoutMs,
+							memoryEnabled: currentDeps.memoryEnabled,
+							autoPromote: currentDeps.autoPromote,
 							// Embedding substrate: register before the recomp publish
 							// path computes chunk embeddings, else rebuilt rows get
 							// none and drop out of ctx_search semantic results.
 							ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 							// Recomp-runner model chain parity with OpenCode: configured
 							// fallbacks + the session's own model as last-ditch retry.
-							fallbackModels: deps.historianFallbacks,
-							language: deps.language,
+							fallbackModels: currentDeps.historianFallbacks,
+							language: currentDeps.language,
 							fallbackModelId: ctx.model
 								? `${ctx.model.provider}/${ctx.model.id}`
 								: undefined,
@@ -200,7 +229,7 @@ export function registerCtxRecompCommand(
 						// bumping pressure to 95% every later pass (parity with
 						// OpenCode runManagedRecomp). detectedContextLimit is left intact.
 						try {
-							clearEmergencyRecovery(deps.db, sessionId);
+							clearEmergencyRecovery(currentDeps.db, sessionId);
 						} catch (recoveryError) {
 							sessionLog(
 								sessionId,
@@ -218,7 +247,7 @@ export function registerCtxRecompCommand(
 						// mid-turn, busting the cache. Mirrors the background
 						// historian's onPublished (signalPiDeferred*).
 						try {
-							stagePiRecompMarker({ db: deps.db, sessionId, ctx });
+							stagePiRecompMarker({ db: currentDeps.db, sessionId, ctx });
 						} catch (markerError) {
 							sessionLog(
 								sessionId,
@@ -244,15 +273,16 @@ function parseRecompArgs(
 ):
 	| { kind: "full" }
 	| { kind: "partial"; range: PartialRecompRange }
+	| { kind: "upgrade" }
 	| { kind: "error"; message: string } {
 	const trimmed = raw.trim();
 	if (trimmed.length === 0) return { kind: "full" };
+	if (trimmed === "--upgrade") return { kind: "upgrade" };
 	const match = trimmed.match(/^(\d+)\s*-\s*(\d+)$/);
 	if (!match) {
 		return {
 			kind: "error",
-			message:
-				"Usage:\n- `/ctx-recomp` — full rebuild from message 1 to the protected tail\n- `/ctx-recomp <start>-<end>` — partial rebuild of a message range",
+			message: `Invalid /ctx-recomp arguments: \`${trimmed}\`.\n\n${RECOMP_USAGE}`,
 		};
 	}
 	const start = Number.parseInt(match[1], 10);
@@ -265,6 +295,25 @@ function parseRecompArgs(
 			message: `End must be >= start (got ${start}-${end}).`,
 		};
 	return { kind: "partial", range: { start, end } };
+}
+
+function executeRecompUpgradeStub(
+	db: ContextDatabase,
+	sessionId: string,
+): string {
+	const legacyCount = getCompartments(db, sessionId).filter(
+		(compartment) => compartment.legacy === 1,
+	).length;
+	if (legacyCount === 0) {
+		return "## Magic Recomp Upgrade\n\nNothing to upgrade: this session has no legacy compartments.";
+	}
+
+	return [
+		"## Magic Recomp Upgrade",
+		"",
+		`Found ${legacyCount} legacy compartment${legacyCount === 1 ? "" : "s"} for this session.`,
+		"The `--upgrade` flag is deprecated. Run `/ctx-session-upgrade` to upgrade this session.",
+	].join("\n");
 }
 
 function buildConfirmationWarning(

@@ -557,6 +557,20 @@ channel) — it reflects `task_schedule_state` read-only.
 
 ---
 
+## 19a. `/ctx-aug` skips empty sidekick augmentation blocks
+
+When sidekick returns the empty-result sentinel (for example, "No relevant
+memories found"), **Pi sends the original prompt without a
+`<sidekick-augmentation>` block**. This is intentional: a no-op augmentation
+block consumes tokens and adds noise while giving the main agent no useful
+context.
+
+OpenCode currently injects a `<sidekick-augmentation>` block containing the
+empty sentinel text. Pi's behavior is the desired target; OpenCode should
+eventually adopt the same skip-empty behavior.
+
+---
+
 ## 20. Pi subagents discover extensions, then fail closed with per-agent tools
 
 Pi child agents are spawned as `pi --print --mode json --no-session` subprocesses.

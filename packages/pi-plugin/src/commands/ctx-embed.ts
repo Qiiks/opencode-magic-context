@@ -102,6 +102,7 @@ export function registerCtxEmbedCommand(
 		projectDir: string;
 		projectIdentity: string;
 		memoryEnabled?: boolean;
+		resolveMemoryEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 		resolveProject?: (ctx: { cwd: string }) => {
 			projectDir: string;
 			projectIdentity: string;
@@ -125,6 +126,8 @@ export function registerCtxEmbedCommand(
 				projectDir: deps.projectDir,
 				projectIdentity: deps.projectIdentity,
 			};
+			const memoryEnabled =
+				deps.resolveMemoryEnabled?.(ctx) ?? deps.memoryEnabled;
 			const sub = args.trim().toLowerCase();
 
 			if (sub === "pause") {
@@ -144,7 +147,7 @@ export function registerCtxEmbedCommand(
 				return;
 			}
 
-			if (deps.memoryEnabled === false) {
+			if (memoryEnabled === false) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-embed",
 					text: "## /ctx-embed\n\nMemory is disabled for this project, so there is no semantic embedding to backfill.",

@@ -71,6 +71,10 @@ export interface PiSidekickConfig {
 	language?: string;
 }
 
+type ResolveSidekickConfig = (ctx: {
+	cwd: string;
+}) => PiSidekickConfig | undefined;
+
 /**
  * Register the `/ctx-aug` slash command on Pi.
  *
@@ -82,7 +86,7 @@ export interface PiSidekickConfig {
  */
 export function registerCtxAugCommand(
 	pi: ExtensionAPI,
-	config: PiSidekickConfig | undefined,
+	config: PiSidekickConfig | undefined | ResolveSidekickConfig,
 ): void {
 	const runner = new PiSubagentRunner();
 
@@ -97,8 +101,9 @@ export function registerCtxAugCommand(
 			const lastEntryId =
 				branch.length > 0 ? branch[branch.length - 1]?.id : "unknown";
 			const sessionLabel = `pi-session-${lastEntryId}`;
+			const currentConfig = typeof config === "function" ? config(ctx) : config;
 
-			if (!config) {
+			if (!currentConfig) {
 				ctx.ui.notify(
 					"/ctx-aug: Sidekick is not configured. Add `sidekick.model` to your magic-context.jsonc to enable this command.",
 					"warning",
@@ -125,7 +130,7 @@ export function registerCtxAugCommand(
 			}
 
 			sessionLog(sessionLabel, "/ctx-aug: spawning sidekick", {
-				model: config.model,
+				model: currentConfig.model,
 			});
 
 			// Spawn sidekick as a Pi subprocess. The subagent inherits the
@@ -140,16 +145,16 @@ export function registerCtxAugCommand(
 			const result = await runner.run({
 				agent: "sidekick",
 				systemPrompt: withContentLanguageDirective(
-					config.systemPrompt ?? SIDEKICK_SYSTEM_PROMPT,
-					config.language,
+					currentConfig.systemPrompt ?? SIDEKICK_SYSTEM_PROMPT,
+					currentConfig.language,
 				),
 				userMessage: prompt,
-				model: config.model,
-				fallbackModels: config.fallbackModels,
-				timeoutMs: config.timeoutMs ?? 30_000,
+				model: currentConfig.model,
+				fallbackModels: currentConfig.fallbackModels,
+				timeoutMs: currentConfig.timeoutMs ?? 30_000,
 				cwd: ctx.cwd,
 				signal: ctx.signal,
-				thinkingLevel: config.thinking_level,
+				thinkingLevel: currentConfig.thinking_level,
 				accountingSessionId: sessionLabel,
 				accountingSubagent: "sidekick",
 			});

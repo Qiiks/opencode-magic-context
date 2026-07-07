@@ -60,7 +60,13 @@ export interface RegisterCtxWrapupDeps {
 		[modelKey: string]: number | undefined;
 	};
 	runPiHistorianForWrapup?: typeof runPiHistorian;
+	resolveRuntimeDeps?: (ctx: { cwd: string }) => CtxWrapupRuntimeDeps;
 }
+
+export type CtxWrapupRuntimeDeps = Omit<
+	RegisterCtxWrapupDeps,
+	"resolveRuntimeDeps"
+>;
 
 const DEFAULT_MESSAGES_TO_KEEP = 20;
 const LEASE_WAIT_MS = 1_000;
@@ -105,8 +111,9 @@ export function registerCtxWrapupCommand(
 				});
 				return;
 			}
+			const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
 
-			const sessionMeta = getOrCreateSessionMeta(deps.db, sessionId);
+			const sessionMeta = getOrCreateSessionMeta(currentDeps.db, sessionId);
 			if (sessionMeta.isSubagent) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-wrapup",
@@ -116,7 +123,7 @@ export function registerCtxWrapupCommand(
 				return;
 			}
 
-			if (!deps.historianModel) {
+			if (!currentDeps.historianModel) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-wrapup",
 					text: "## Magic Wrapup\n\n/ctx-wrapup is unavailable because `historian.model` is not configured.",
@@ -137,7 +144,7 @@ export function registerCtxWrapupCommand(
 
 			const result = await runPiWrapup(
 				pi,
-				deps,
+				currentDeps,
 				ctx,
 				sessionId,
 				parsed.messagesToKeep,

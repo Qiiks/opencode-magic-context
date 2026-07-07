@@ -30,6 +30,25 @@ import { readPiSessionMessages } from "../read-session-pi";
 import { updateStatusLine } from "../status-line";
 import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
 
+export interface CtxSessionUpgradeRuntimeDeps {
+	db: ContextDatabase;
+	runner: SubagentRunner;
+	historianModel: string | undefined;
+	historianChunkTokens: number;
+	historianFallbacks?: readonly string[];
+	historianTimeoutMs?: number;
+	historianThinkingLevel?: string;
+	language?: string;
+	memoryEnabled: boolean;
+	autoPromote: boolean;
+	userMemoriesEnabled?: boolean;
+}
+
+export interface RegisterCtxSessionUpgradeDeps
+	extends CtxSessionUpgradeRuntimeDeps {
+	resolveRuntimeDeps?: (ctx: { cwd: string }) => CtxSessionUpgradeRuntimeDeps;
+}
+
 /**
  * /ctx-session-upgrade (E6b/E6c parity with OpenCode E3.1/E3.2).
  *
@@ -44,19 +63,7 @@ import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
  */
 export function registerCtxSessionUpgradeCommand(
 	pi: ExtensionAPI,
-	deps: {
-		db: ContextDatabase;
-		runner: SubagentRunner;
-		historianModel: string | undefined;
-		historianChunkTokens: number;
-		historianFallbacks?: readonly string[];
-		historianTimeoutMs?: number;
-		historianThinkingLevel?: string;
-		language?: string;
-		memoryEnabled: boolean;
-		autoPromote: boolean;
-		userMemoriesEnabled?: boolean;
-	},
+	deps: RegisterCtxSessionUpgradeDeps,
 ): void {
 	pi.registerCommand("ctx-session-upgrade", {
 		description:
@@ -71,7 +78,8 @@ export function registerCtxSessionUpgradeCommand(
 				});
 				return;
 			}
-			if (!deps.historianModel) {
+			const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
+			if (!currentDeps.historianModel) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-session-upgrade",
 					text: "## Session Upgrade\n\nUnavailable because `historian.model` is not configured.",
@@ -80,7 +88,7 @@ export function registerCtxSessionUpgradeCommand(
 				return;
 			}
 
-			if (isWrapupInProgress(deps.db, sessionId)) {
+			if (isWrapupInProgress(currentDeps.db, sessionId)) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-session-upgrade",
 					text: "## Session Upgrade\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try again.",
@@ -103,7 +111,7 @@ export function registerCtxSessionUpgradeCommand(
 			// partial-v2 build). Matching ONLY `legacy=1` would trap a session
 			// whose rows are tierless-but-not-flagged-legacy (parity with
 			// OpenCode runManagedUpgrade; dogfood 2026-05-30 AFT).
-			const compartments = getCompartments(deps.db, sessionId);
+			const compartments = getCompartments(currentDeps.db, sessionId);
 			const upgradableCount = compartments.filter(
 				(c) => c.legacy === 1 || !c.p1 || c.p1.trim() === "",
 			).length;
@@ -122,7 +130,7 @@ export function registerCtxSessionUpgradeCommand(
 			// flag, NOT unconditionally). With memory disabled there is no memory
 			// pool to re-organize, so re-categorizing would be a no-op at best and
 			// could touch a pool the user opted out of at worst.
-			const migrationEnabled = deps.memoryEnabled;
+			const migrationEnabled = currentDeps.memoryEnabled;
 
 			const runMigration = async (): Promise<string> => {
 				if (!migrationEnabled) {
@@ -132,17 +140,17 @@ export function registerCtxSessionUpgradeCommand(
 				// once-per-project / empty-pool / USER_* guards.
 				try {
 					const outcome = await runPiMemoryMigration({
-						db: deps.db,
-						runner: deps.runner,
+						db: currentDeps.db,
+						runner: currentDeps.runner,
 						primaryModel: sessionMainModel,
-						model: deps.historianModel as string,
-						fallbackModels: deps.historianFallbacks,
-						timeoutMs: deps.historianTimeoutMs,
-						thinkingLevel: deps.historianThinkingLevel,
+						model: currentDeps.historianModel as string,
+						fallbackModels: currentDeps.historianFallbacks,
+						timeoutMs: currentDeps.historianTimeoutMs,
+						thinkingLevel: currentDeps.historianThinkingLevel,
 						directory: ctx.cwd,
 						sessionId,
-						userMemoriesEnabled: deps.userMemoriesEnabled,
-						language: deps.language,
+						userMemoriesEnabled: currentDeps.userMemoriesEnabled,
+						language: currentDeps.language,
 					});
 					return outcome.summary;
 				} catch (error) {
@@ -159,7 +167,8 @@ export function registerCtxSessionUpgradeCommand(
 				// migrationPending mirrors OpenCode: only pending when memory is
 				// enabled AND the project hasn't been migrated yet.
 				const migrationPending =
-					migrationEnabled && !isMemoryMigrationDone(deps.db, projectPath);
+					migrationEnabled &&
+					!isMemoryMigrationDone(currentDeps.db, projectPath);
 				if (!migrationPending) {
 					sendCtxStatusMessage(pi, {
 						title: "/ctx-session-upgrade",
@@ -188,7 +197,10 @@ export function registerCtxSessionUpgradeCommand(
 						readMessages: () => readPiSessionMessages(ctx),
 					} satisfies RawMessageProvider,
 					onStatusChange: () =>
-						updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd }),
+						updateStatusLine(ctx, {
+							db: currentDeps.db,
+							projectIdentity: ctx.cwd,
+						}),
 					work: async () => {
 						const summary = await runMigration();
 						sendCtxStatusMessage(pi, {
@@ -221,22 +233,25 @@ export function registerCtxSessionUpgradeCommand(
 				sessionId,
 				provider,
 				onStatusChange: () =>
-					updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd }),
+					updateStatusLine(ctx, {
+						db: currentDeps.db,
+						projectIdentity: ctx.cwd,
+					}),
 				work: async () => {
 					// Step 1 — compartment upgrade via full recomp.
 					const recompResult = await executeContextRecompWithResult(
 						{
 							client: createPiHistorianClient({
-								runner: deps.runner,
-								model: deps.historianModel as string,
-								fallbackModels: deps.historianFallbacks,
-								timeoutMs: deps.historianTimeoutMs,
-								thinkingLevel: deps.historianThinkingLevel,
+								runner: currentDeps.runner,
+								model: currentDeps.historianModel as string,
+								fallbackModels: currentDeps.historianFallbacks,
+								timeoutMs: currentDeps.historianTimeoutMs,
+								thinkingLevel: currentDeps.historianThinkingLevel,
 								directory: ctx.cwd,
 								accountingSessionId: sessionId,
 								systemPrompt: withContentLanguageDirective(
 									COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT,
-									deps.language,
+									currentDeps.language,
 									{ preserveUserQuotes: true },
 								),
 								notify: (text) =>
@@ -246,13 +261,13 @@ export function registerCtxSessionUpgradeCommand(
 										level: "info",
 									}),
 							}) as never,
-							db: deps.db,
+							db: currentDeps.db,
 							sessionId,
-							historianChunkTokens: deps.historianChunkTokens,
+							historianChunkTokens: currentDeps.historianChunkTokens,
 							directory: ctx.cwd,
-							historianTimeoutMs: deps.historianTimeoutMs,
-							memoryEnabled: deps.memoryEnabled,
-							autoPromote: deps.autoPromote,
+							historianTimeoutMs: currentDeps.historianTimeoutMs,
+							memoryEnabled: currentDeps.memoryEnabled,
+							autoPromote: currentDeps.autoPromote,
 							// Embedding substrate: without this the recomp publish path
 							// no-ops chunk embedding on an unregistered project, leaving
 							// rebuilt compartments out of ctx_search. Parity with OpenCode.
@@ -261,9 +276,9 @@ export function registerCtxSessionUpgradeCommand(
 							// recomp-orchestrator): configured fallbacks + the session's
 							// own model as the last-ditch retry, so an empty/invalid-but-
 							// HTTP-200 historian primary escalates instead of failing.
-							fallbackModels: deps.historianFallbacks,
+							fallbackModels: currentDeps.historianFallbacks,
 							fallbackModelId: sessionMainModel,
-							language: deps.language,
+							language: currentDeps.language,
 						},
 						{},
 					);
@@ -315,7 +330,7 @@ export function registerCtxSessionUpgradeCommand(
 					// migration, or the "Complete" message below — recomp already
 					// published.
 					try {
-						stagePiRecompMarker({ db: deps.db, sessionId, ctx });
+						stagePiRecompMarker({ db: currentDeps.db, sessionId, ctx });
 					} catch (markerError) {
 						sessionLog(
 							sessionId,

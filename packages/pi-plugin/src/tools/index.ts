@@ -38,10 +38,14 @@ export interface RegisterToolsOptions {
 	/** Number of recent tags that ctx_reduce should treat as protected
 	 *  (deferred drops instead of immediate). Should match `magic_context.protected_tags`. */
 	protectedTags?: number;
+	/** Resolve protected-tag config from the current cwd at tool-call time. */
+	resolveProtectedTags?: (ctx: { cwd: string }) => number | undefined;
 	/** When true, ctx_note accepts smart notes (surface_condition) because
 	 *  the dreamer is configured to evaluate them. When false, smart-note
 	 *  writes are rejected to avoid stuck-pending state. */
 	dreamerEnabled?: boolean;
+	/** Resolve smart-note enablement from the current cwd at tool-call time. */
+	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 	/** When false, omit ctx_memory from the registered surface. Sidekick only
 	 *  needs read-only ctx_search; dreamer and the main agent keep ctx_memory. */
 	memoryToolEnabled?: boolean;
@@ -89,6 +93,7 @@ export function registerMagicContextTools(
 			createCtxNoteTool({
 				db: opts.db,
 				dreamerEnabled: opts.dreamerEnabled ?? false,
+				resolveDreamerEnabled: opts.resolveDreamerEnabled,
 			}),
 		);
 
@@ -111,6 +116,7 @@ export function registerMagicContextTools(
 			createCtxReduceTool({
 				db: opts.db,
 				protectedTags: opts.protectedTags ?? 20,
+				resolveProtectedTags: opts.resolveProtectedTags,
 			}),
 		);
 	}

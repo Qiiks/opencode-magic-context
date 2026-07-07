@@ -14,6 +14,7 @@ import { getCompartments } from "@magic-context/core/features/magic-context/comp
 import { getMemoryCount } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
+import { getSessionWorkMetrics } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { getNotes } from "@magic-context/core/features/magic-context/storage-notes";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import { resolveExecuteThresholdDetail } from "@magic-context/core/hooks/magic-context/event-resolvers";
@@ -22,6 +23,7 @@ import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { countCompartmentsNeedingUpgrade } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
 import { formatThresholdPercent } from "@magic-context/core/shared/format-threshold";
+
 import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
@@ -98,6 +100,8 @@ interface StatusDialogDetail {
 	conversationTokens: number;
 	toolCallTokens: number;
 	toolDefinitionTokens: number;
+	newWorkTokens: number;
+	totalInputTokens: number;
 	/** Compartments still needing a v2 upgrade (legacy or tierless). */
 	upgradeNeededCount: number;
 	/** A detached /ctx-recomp or /ctx-session-upgrade is running in background. */
@@ -246,9 +250,10 @@ function renderInner(
 		`Context  ${theme.fg(
 			pctColor,
 			theme.bold(`${s.usagePercentage.toFixed(1)}%`),
-		)} · ${fmt(s.inputTokens)} / ${
-			s.contextLimit > 0 ? fmt(s.contextLimit) : "?"
-		} tokens`,
+		)} · ${fmt(s.inputTokens)} / ${s.contextLimit > 0 ? fmt(s.contextLimit) : "?"} tokens`,
+	);
+	lines.push(
+		`Work tokens ${fmt(s.newWorkTokens)} new · ${fmt(s.totalInputTokens)} total input`,
 	);
 
 	// Segmented bar (fills the full inner content width)
@@ -478,6 +483,7 @@ export function buildPiStatusDetail(
 			toolCallTokens -
 			toolDefinitionTokens,
 	);
+	const workMetrics = getSessionWorkMetrics(deps.db, sessionId);
 
 	const modelKey = ctx.model
 		? `${ctx.model.provider}/${ctx.model.id}`
@@ -576,6 +582,8 @@ export function buildPiStatusDetail(
 		conversationTokens,
 		toolCallTokens,
 		toolDefinitionTokens,
+		newWorkTokens: workMetrics.newWorkTokens,
+		totalInputTokens: workMetrics.totalInputTokens,
 		upgradeNeededCount: safeRead(
 			() => countCompartmentsNeedingUpgrade(deps.db, sessionId),
 			0,

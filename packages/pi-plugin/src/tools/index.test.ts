@@ -28,4 +28,51 @@ describe("registerMagicContextTools", () => {
 			closeQuietly(db);
 		}
 	});
+
+	it("registered tools resolve smart-note gating from the invocation cwd", async () => {
+		const db = createTestDb();
+		try {
+			const registered = new Map<
+				string,
+				{ execute: (...args: never[]) => unknown }
+			>();
+			const pi = {
+				registerTool: (tool: {
+					name: string;
+					execute: (...args: never[]) => unknown;
+				}) => {
+					registered.set(tool.name, tool);
+				},
+			} as never;
+
+			registerMagicContextTools(pi, {
+				db,
+				dreamerEnabled: false,
+				resolveDreamerEnabled: (ctx) => ctx.cwd === "/tmp/project-b",
+			});
+
+			const noteTool = registered.get("ctx_note");
+			expect(noteTool).toBeDefined();
+			const result = await noteTool?.execute(
+				"call-1" as never,
+				{
+					action: "write",
+					content: "Project B smart note",
+					surface_condition: "When project B condition is true",
+				} as never,
+				new AbortController().signal as never,
+				undefined as never,
+				{
+					cwd: "/tmp/project-b",
+					sessionManager: { getSessionId: () => "ses-tool-cd" },
+				} as never,
+			);
+
+			expect(
+				(result as { isError?: boolean } | undefined)?.isError,
+			).toBeUndefined();
+		} finally {
+			closeQuietly(db);
+		}
+	});
 });
