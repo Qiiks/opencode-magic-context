@@ -463,12 +463,20 @@ export function readSessionChunk(
     let totalTokens = 0;
     let messagesProcessed = 0;
     let lastOrdinal = startOrdinal - 1;
+    let highestScannedOrdinal = startOrdinal - 1;
     let lastMessageId = "";
     let firstMessageId = "";
     let currentBlock: ChunkBlock | null = null;
     let pendingNoiseMeta: SessionChunkLine[] = [];
     let commitClusters = 0;
     let lastFlushedRole = "";
+
+    function recordFilteredNoise(meta: SessionChunkLine): void {
+        pendingNoiseMeta.push(meta);
+        if (!currentBlock) {
+            highestScannedOrdinal = Math.max(highestScannedOrdinal, meta.ordinal);
+        }
+    }
 
     function flushCurrentBlock(): boolean {
         if (!currentBlock) return true;
@@ -491,6 +499,7 @@ export function readSessionChunk(
         if (!firstMessageId) firstMessageId = currentBlock.meta[0]?.messageId ?? "";
         lastOrdinal =
             currentBlock.meta[currentBlock.meta.length - 1]?.ordinal ?? currentBlock.endOrdinal;
+        highestScannedOrdinal = Math.max(highestScannedOrdinal, lastOrdinal);
         lastMessageId = currentBlock.meta[currentBlock.meta.length - 1]?.messageId ?? "";
         messagesProcessed += currentBlock.meta.length;
         lines.push(blockText);
@@ -524,7 +533,7 @@ export function readSessionChunk(
         if (msg.role === "user" && !hasMeaningfulUserText(msg.parts)) {
             const tcSummaries = extractToolCallSummaries(msg.parts);
             if (tcSummaries.length === 0) {
-                pendingNoiseMeta.push(meta);
+                recordFilteredNoise(meta);
                 continue;
             }
             // Tool-result-only user messages: merge TC summaries into the
@@ -570,7 +579,7 @@ export function readSessionChunk(
         const text = compacted.text;
 
         if (!text) {
-            pendingNoiseMeta.push(meta);
+            recordFilteredNoise(meta);
             continue;
         }
 
@@ -608,7 +617,12 @@ export function readSessionChunk(
         pendingNoiseMeta = [];
     }
 
-    flushCurrentBlock();
+    if (flushCurrentBlock() && pendingNoiseMeta.length > 0) {
+        highestScannedOrdinal = Math.max(
+            highestScannedOrdinal,
+            pendingNoiseMeta[pendingNoiseMeta.length - 1]?.ordinal ?? highestScannedOrdinal,
+        );
+    }
 
     // Merge adjacent tool-only block ranges into contiguous ranges. Adjacent
     // means `next.start === prev.end + 1` — a pure tool chain spread across
@@ -632,7 +646,7 @@ export function readSessionChunk(
         messageCount: messagesProcessed,
         tokenEstimate: totalTokens,
         hasMore:
-            lastOrdinal <
+            Math.max(lastOrdinal, highestScannedOrdinal) <
             (eligibleEndOrdinal !== undefined
                 ? Math.min(eligibleEndOrdinal - 1, totalMessageCount)
                 : totalMessageCount),

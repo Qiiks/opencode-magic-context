@@ -206,6 +206,8 @@ export interface ExecuteContextRecompOptions {
      * replacing all compartments and facts.
      */
     range?: PartialRecompRange;
+    /** @internal Exercises the lease/marker race without delaying production callers. */
+    onLeaseAcquired?: () => void;
 }
 
 export interface ExecuteContextRecompResult {
@@ -244,6 +246,19 @@ export async function executeContextRecompWithResult(
         return {
             message:
                 "## Magic Recomp — Skipped\n\nAnother process is already mutating compartment state for this session. Wait for it to finish, then try `/ctx-recomp` again.",
+            published: false,
+        };
+    }
+    options.onLeaseAcquired?.();
+    if (isWrapupInProgress(deps.db, sessionId)) {
+        // Close the marker/lease race: wrapup publishes its durable ownership
+        // marker before it waits for the compartment lease, so a recomp that
+        // checked early can still win the lease after wrapup has started.
+        sessionLog(sessionId, "recomp skipped: /ctx-wrapup became active");
+        releaseCompartmentLease(deps.db, sessionId, holderId);
+        return {
+            message:
+                "## Magic Recomp — Skipped\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try `/ctx-recomp` again.",
             published: false,
         };
     }

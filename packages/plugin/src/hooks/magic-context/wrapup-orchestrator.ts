@@ -40,6 +40,7 @@ export interface ManagedWrapupContext extends ManagedRecompContext {
     executeThresholdPercentage: number;
     hasPendingNaturalBust?: (sessionId: string) => boolean;
     runCompartmentAgentForWrapup?: typeof runCompartmentAgent;
+    wrapupLeaseWaitTimeoutMs?: number;
 }
 
 export interface WrapupOptions {
@@ -47,7 +48,16 @@ export interface WrapupOptions {
 }
 
 const WAIT_FOR_LEASE_MS = 1_000;
+const MAX_WRAPUP_LEASE_WAIT_MS = 10 * 60 * 1_000;
 type WrapupProgressUpdate = Parameters<typeof updateWrapupInProgress>[3];
+
+type WrapupLeaseAcquireResult =
+    | { ok: true; holderId: string }
+    | { ok: false; reason: "busy" | "ownership_lost" | "timeout" };
+
+type WrapupIterationResult =
+    | { ran: true }
+    | { ran: false; reason: "busy" | "ownership_lost" | "timeout" };
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -55,6 +65,25 @@ function sleep(ms: number): Promise<void> {
 
 function plural(value: number, word: string): string {
     return `${value} ${word}${value === 1 ? "" : "s"}`;
+}
+
+function resolveWrapupLeaseWaitTimeout(ctx: ManagedWrapupContext): number {
+    const configured = ctx.wrapupLeaseWaitTimeoutMs ?? MAX_WRAPUP_LEASE_WAIT_MS;
+    return Number.isFinite(configured) && configured >= 0 ? configured : MAX_WRAPUP_LEASE_WAIT_MS;
+}
+
+async function waitForActiveRunWithin(
+    promise: Promise<void>,
+    timeoutMs: number,
+): Promise<"settled" | "timeout"> {
+    if (timeoutMs <= 0) return "timeout";
+    return Promise.race([
+        promise.then(
+            () => "settled" as const,
+            () => "settled" as const,
+        ),
+        sleep(timeoutMs).then(() => "timeout" as const),
+    ]);
 }
 
 function formatAlreadyRunningMessage(state: ReturnType<typeof getWrapupInProgressState>): string {
@@ -112,16 +141,17 @@ function emitWrapupProgress(
     });
 }
 
-async function waitForExistingIncrementalRun(sessionId: string): Promise<"ok" | "busy"> {
+async function waitForExistingIncrementalRun(
+    sessionId: string,
+    maxWaitMs: number,
+): Promise<"ok" | "busy" | "timeout"> {
     const active = getActiveCompartmentRun(sessionId);
     if (!active) return "ok";
     if (active.kind === "recomp" || active.kind === "wrapup") return "busy";
-    try {
-        await active.promise;
-    } catch {
-        // The active runner records its own failure state; wrapup just resumes from
-        // the durable compartment boundary after it settles.
-    }
+    const outcome = await waitForActiveRunWithin(active.promise, maxWaitMs);
+    if (outcome === "timeout") return "timeout";
+    // The active runner records its own failure state; wrapup just resumes from
+    // the durable compartment boundary after it settles.
     return "ok";
 }
 
@@ -129,25 +159,34 @@ async function acquireCompartmentLeaseForWrapup(
     ctx: ManagedWrapupContext,
     sessionId: string,
     renewWrapupMarker: (updates: WrapupProgressUpdate) => boolean,
-): Promise<string | null> {
+): Promise<WrapupLeaseAcquireResult> {
     const holderId = crypto.randomUUID();
+    const waitStartedAt = Date.now();
+    const maxWaitMs = resolveWrapupLeaseWaitTimeout(ctx);
+    const remainingMs = (): number => Math.max(0, waitStartedAt + maxWaitMs - Date.now());
     for (;;) {
+        if (remainingMs() <= 0) {
+            sessionLog(sessionId, "wrapup: timed out waiting for the compartment-state lease");
+            return { ok: false, reason: "timeout" };
+        }
         const active = getActiveCompartmentRun(sessionId);
-        if (active?.kind === "recomp" || active?.kind === "wrapup") return null;
+        if (active?.kind === "recomp" || active?.kind === "wrapup") {
+            return { ok: false, reason: "busy" };
+        }
         if (active) {
             emitWrapupProgress(ctx, sessionId, { note: "Waiting for the active historian run…" });
-            try {
-                await active.promise;
-            } catch {
-                // Existing run owns its failure reporting.
+            const outcome = await waitForActiveRunWithin(active.promise, remainingMs());
+            if (outcome === "timeout") {
+                sessionLog(sessionId, "wrapup: timed out waiting for the active historian run");
+                return { ok: false, reason: "timeout" };
             }
             continue;
         }
         const lease = acquireCompartmentLease(ctx.db, sessionId, holderId);
-        if (lease) return holderId;
+        if (lease) return { ok: true, holderId };
         emitWrapupProgress(ctx, sessionId, { note: "Waiting for the compartment-state lease…" });
-        if (!renewWrapupMarker({})) return null;
-        await sleep(WAIT_FOR_LEASE_MS);
+        if (!renewWrapupMarker({})) return { ok: false, reason: "ownership_lost" };
+        await sleep(Math.min(WAIT_FOR_LEASE_MS, remainingMs()));
     }
 }
 
@@ -158,14 +197,11 @@ async function runOneWrapupIteration(args: {
     messagesToKeep: number;
     anchorRawMessageCount: number;
     renewWrapupMarker: (updates: WrapupProgressUpdate) => boolean;
-}): Promise<boolean> {
+}): Promise<WrapupIterationResult> {
     const { ctx, sessionId, plan, messagesToKeep, anchorRawMessageCount } = args;
-    const leaseHolderId = await acquireCompartmentLeaseForWrapup(
-        ctx,
-        sessionId,
-        args.renewWrapupMarker,
-    );
-    if (!leaseHolderId) return false;
+    const acquired = await acquireCompartmentLeaseForWrapup(ctx, sessionId, args.renewWrapupMarker);
+    if (!acquired.ok) return { ran: false, reason: acquired.reason };
+    const leaseHolderId = acquired.holderId;
     const renewal = setInterval(() => {
         try {
             if (!renewCompartmentLease(ctx.db, sessionId, leaseHolderId)) {
@@ -217,7 +253,7 @@ async function runOneWrapupIteration(args: {
     registerActiveCompartmentRun(sessionId, runnerPromise, "wrapup");
     try {
         await runnerPromise;
-        return true;
+        return { ran: true };
     } finally {
         clearInterval(renewal);
         releaseCompartmentLease(ctx.db, sessionId, leaseHolderId);
@@ -309,11 +345,19 @@ export async function runManagedWrapup(
     (markerRenewal as { unref?: () => void }).unref?.();
 
     try {
-        const activeAtStart = await waitForExistingIncrementalRun(sessionId);
+        const activeAtStart = await waitForExistingIncrementalRun(
+            sessionId,
+            resolveWrapupLeaseWaitTimeout(ctx),
+        );
         if (activeAtStart === "busy") {
             const message = "Another Magic Context rebuild is already running for this session.";
             setRecompTerminal(ctx.liveSessionState, sessionId, "skipped", message);
             return `## Magic Wrapup — Skipped\n\n${message}`;
+        }
+
+        if (activeAtStart === "timeout") {
+            stoppedForFailure = true;
+            stoppedReason = "Timed out waiting for the active historian run.";
         }
 
         // The command blocks until the drain finishes and fires no message events,
@@ -323,26 +367,28 @@ export async function runManagedWrapup(
         //    persisted ignored chat message (its only progress surface).
         //  - wrapup-progress-kick: starts the TUI sidebar's fast progress poll
         //    (the toast above cannot do that).
-        try {
-            void sendIgnoredMessage(
-                ctx.client,
-                sessionId,
-                `Magic Wrapup started — compacting about ${plural(expectedChunks, "chunk")} of history. This can take a few minutes; the result posts here when done.`,
-                ctx.getNotificationParams(sessionId),
-            );
-        } catch {
-            // Notification delivery must never affect the drain.
-        }
-        try {
-            pushNotification("action", { action: "wrapup-progress-kick" }, sessionId);
-        } catch {
-            // Notification delivery must never affect the drain.
+        if (!stoppedForFailure) {
+            try {
+                void sendIgnoredMessage(
+                    ctx.client,
+                    sessionId,
+                    `Magic Wrapup started — compacting about ${plural(expectedChunks, "chunk")} of history. This can take a few minutes; the result posts here when done.`,
+                    ctx.getNotificationParams(sessionId),
+                );
+            } catch {
+                // Notification delivery must never affect the drain.
+            }
+            try {
+                pushNotification("action", { action: "wrapup-progress-kick" }, sessionId);
+            } catch {
+                // Notification delivery must never affect the drain.
+            }
         }
 
-        if (ownershipLost) {
+        if (!stoppedForFailure && ownershipLost) {
             stoppedForFailure = true;
             stoppedReason = ownershipLostReason;
-        } else {
+        } else if (!stoppedForFailure) {
             emitWrapupProgress(ctx, sessionId, {
                 processedMessages: Math.max(0, lastEnd),
                 totalMessages: Math.max(0, initialPlan.targetEligibleEndOrdinal - 1),
@@ -404,7 +450,7 @@ export async function runManagedWrapup(
 
                 const beforeEnd = lastEnd;
                 const beforeFailures = getHistorianFailureState(ctx.db, sessionId).failureCount;
-                const ran = await runOneWrapupIteration({
+                const iteration = await runOneWrapupIteration({
                     ctx,
                     sessionId,
                     plan,
@@ -412,11 +458,14 @@ export async function runManagedWrapup(
                     anchorRawMessageCount: initialPlan.anchorRawMessageCount,
                     renewWrapupMarker,
                 });
-                if (!ran) {
+                if (!iteration.ran) {
                     stoppedForFailure = true;
-                    stoppedReason = ownershipLost
-                        ? ownershipLostReason
-                        : "Another Magic Context rebuild started while wrapup was waiting.";
+                    stoppedReason =
+                        ownershipLost || iteration.reason === "ownership_lost"
+                            ? ownershipLostReason
+                            : iteration.reason === "timeout"
+                              ? "Timed out waiting for another process to release the compartment-state lease."
+                              : "Another Magic Context rebuild started while wrapup was waiting.";
                     break;
                 }
                 const afterEnd = getLastCompartmentEndMessage(ctx.db, sessionId);

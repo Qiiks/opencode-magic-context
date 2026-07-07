@@ -510,6 +510,39 @@ it("fingerprints and true-raw tokens change when nested tool output grows with t
     expect(longTokens).toBeGreaterThan(shortTokens);
 });
 
+it("fingerprints same-length edits to counted content fields", () => {
+    const before: RawMessage[] = [
+        {
+            ordinal: 1,
+            id: "m1",
+            role: "assistant",
+            version: 1,
+            parts: [
+                { type: "text", text: "alpha" },
+                { type: "thinking", thinking: "bravo" },
+                { type: "tool", callID: "call-1", state: { input: { q: "one" }, output: "delta" } },
+            ],
+        },
+    ];
+    const after: RawMessage[] = [
+        {
+            ordinal: 1,
+            id: "m1",
+            role: "assistant",
+            version: 1,
+            parts: [
+                { type: "text", text: "omega" },
+                { type: "thinking", thinking: "gamma" },
+                { type: "tool", callID: "call-1", state: { input: { q: "two" }, output: "sigma" } },
+            ],
+        },
+    ];
+
+    expect(computeRawRangeFingerprint(before, 1, 2)).not.toBe(
+        computeRawRangeFingerprint(after, 1, 2),
+    );
+});
+
 it("moves a candidate boundary forward to the first later open tool invocation", () => {
     expect(
         fenceBoundaryForToolArcs(10, [{ callId: "open", invOrdinal: 20, resOrdinal: null }], 9, 10),

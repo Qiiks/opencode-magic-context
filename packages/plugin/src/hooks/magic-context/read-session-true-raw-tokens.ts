@@ -80,6 +80,8 @@ interface ToolSignal {
 
 const MAX_MESSAGE_CACHE_ENTRIES = 100_000;
 const MAX_MESSAGE_CACHE_KEY_BYTES = 64 * 1024 * 1024;
+const FNV1A_32_OFFSET = 0x811c9dc5;
+const FNV1A_32_PRIME = 0x01000193;
 const messageEstimateCache = new Map<string, CachedMessageEstimate>();
 let messageEstimateCacheBytes = 0;
 
@@ -196,6 +198,25 @@ function recursiveByteLength(value: unknown): number {
         return total;
     }
     return String(value).length;
+}
+
+function updateFnv1a32(hash: number, text: string): number {
+    let next = hash;
+    for (let index = 0; index < text.length; index += 1) {
+        next ^= text.charCodeAt(index);
+        next = Math.imul(next, FNV1A_32_PRIME) >>> 0;
+    }
+    return next;
+}
+
+function contentStringsHash(fields: readonly string[]): string {
+    let hash = FNV1A_32_OFFSET;
+    for (const field of fields) {
+        hash = updateFnv1a32(hash, `${field.length}:`);
+        hash = updateFnv1a32(hash, field);
+        hash = updateFnv1a32(hash, "\0");
+    }
+    return hash.toString(16).padStart(8, "0");
 }
 
 function rawPartVersion(part: Record<string, unknown>): unknown {
@@ -643,19 +664,18 @@ export function buildTrueRawTokenIndex(
  * timestamps) — and the fingerprint computed at trigger time from one view
  * must match the one recomputed at historian-start from the other, or every
  * memory-derived snapshot would be rejected as stale. Content edits and
- * message insertion/removal still change the fingerprint (lengths/ids/
+ * message insertion/removal still change the fingerprint (content hashes/ids/
  * ordinals), which is exactly the staleness the check exists to catch;
  * metadata-only drift never affects the historian's chunk content.
  */
 function partContentFingerprint(part: unknown): string {
     if (!isRecord(part)) return `${typeof part}:${recursiveByteLength(part)}`;
-    const type = partType(part);
     const tool = toolSignalFromPart(part);
     if (tool) {
-        return `${type}:${tool.callId}:${tool.inputText.length}:${tool.outputText.length}`;
+        return contentStringsHash([tool.inputText, tool.outputText]);
     }
     const text = firstStringField(part, ["text", "thinking", "reasoning", "content", "url"]) ?? "";
-    return `${type}:${text.length}`;
+    return contentStringsHash([text]);
 }
 
 export function computeRawRangeFingerprint(

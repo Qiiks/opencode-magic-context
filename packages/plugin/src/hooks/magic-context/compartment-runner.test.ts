@@ -34,6 +34,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     executeContextRecomp,
+    executeContextRecompWithResult,
     getActiveCompartmentRun,
     registerActiveCompartmentRun,
     runCompartmentAgent,
@@ -173,6 +174,68 @@ describe("executeContextRecomp", () => {
         // (facts are a promoted-memory concern, and recomp must not re-emit
         // facts that could degrade curated memories).
         expect(getSessionFacts(db, "ses-recomp")).toHaveLength(0);
+    });
+
+    it("aborts after winning the recomp lease if a wrapup marker appeared meanwhile", async () => {
+        useTempDataHome("magic-recomp-wrapup-race-");
+        const sessionId = "ses-recomp-wrapup-race";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "eligible one" },
+            { id: "m-2", role: "assistant", text: "eligible two" },
+            { id: "m-3", role: "user", text: "protected 1" },
+            { id: "m-4", role: "user", text: "protected 2" },
+            { id: "m-5", role: "user", text: "protected 3" },
+            { id: "m-6", role: "user", text: "protected 4" },
+            { id: "m-7", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+
+        const client = {
+            session: {
+                get: mock(async () => {
+                    throw new Error("recomp runner should not start under a live wrapup");
+                }),
+                create: mock(async () => ({ data: { id: "unused" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({ data: [] })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        const result = await executeContextRecompWithResult(
+            {
+                client,
+                db,
+                sessionId,
+                historianChunkTokens: 10_000,
+                directory: "/tmp",
+            },
+            {
+                onLeaseAcquired: () => {
+                    const acquired = acquireWrapupInProgress(db, sessionId, {
+                        holderId: "wrapup-holder",
+                        messagesToKeep: 5,
+                        anchorRawMessageCount: 7,
+                        targetEligibleEndOrdinal: 3,
+                        lastCompartmentEnd: -1,
+                        chunkIndex: 0,
+                        expectedChunks: 1,
+                    });
+                    expect(acquired.ok).toBe(true);
+                },
+            },
+        );
+
+        expect(result.published).toBe(false);
+        expect(result.message).toContain("/ctx-wrapup is already compacting");
+        expect(client.session.get).not.toHaveBeenCalled();
+        expect(getCompartments(db, sessionId)).toHaveLength(0);
+        expect(
+            db
+                .prepare("SELECT 1 FROM compartment_state_lease WHERE session_id = ?")
+                .get(sessionId) ?? null,
+        ).toBeNull();
     });
 
     it("keeps published state unchanged when a later recomp pass fails", async () => {
