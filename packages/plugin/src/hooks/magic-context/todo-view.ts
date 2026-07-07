@@ -25,13 +25,50 @@
 
 import { createHash } from "node:crypto";
 
-export interface TodoItem {
+export const TODO_STATUS_PENDING = "pending";
+export const TODO_STATUS_IN_PROGRESS = "in_progress";
+export const TODO_STATUS_COMPLETED = "completed";
+export const TODO_STATUS_CANCELLED = "cancelled";
+
+export const TODO_PRIORITY_HIGH = "high";
+export const TODO_PRIORITY_MEDIUM = "medium";
+export const TODO_PRIORITY_LOW = "low";
+
+export const TODO_STATUSES = [
+    TODO_STATUS_PENDING,
+    TODO_STATUS_IN_PROGRESS,
+    TODO_STATUS_COMPLETED,
+    TODO_STATUS_CANCELLED,
+] as const;
+
+export const TODO_PRIORITIES = [
+    TODO_PRIORITY_HIGH,
+    TODO_PRIORITY_MEDIUM,
+    TODO_PRIORITY_LOW,
+] as const;
+
+export type TodoStatus = (typeof TODO_STATUSES)[number];
+export type TodoPriority = (typeof TODO_PRIORITIES)[number];
+
+interface TodoInputItem {
     content: string;
-    status: string;
-    priority: string;
+    status: TodoStatus;
+    priority?: TodoPriority;
 }
 
-const TERMINAL_STATUSES = new Set(["completed", "cancelled"]);
+export interface TodoItem {
+    content: string;
+    status: TodoStatus;
+    priority: TodoPriority;
+}
+
+const TODO_STATUS_SET = new Set<TodoStatus>(TODO_STATUSES);
+const TODO_PRIORITY_SET = new Set<TodoPriority>(TODO_PRIORITIES);
+
+export const TERMINAL_STATUSES = new Set<TodoStatus>([
+    TODO_STATUS_COMPLETED,
+    TODO_STATUS_CANCELLED,
+]);
 
 /**
  * The set of statuses real OpenCode `todowrite` excludes when computing the
@@ -40,13 +77,18 @@ const TERMINAL_STATUSES = new Set(["completed", "cancelled"]);
  *
  * Source: ~/Work/OSS/opencode/packages/opencode/src/tool/todo.ts:47-52.
  */
-const TITLE_DONE_STATUSES = new Set(["completed"]);
+export const TITLE_DONE_STATUSES = new Set<TodoStatus>([TODO_STATUS_COMPLETED]);
 
 const SYNTHETIC_CALL_ID_PREFIX = "mc_synthetic_todo_";
 
 /**
  * Normalize a `todowrite` args.todos array into a stable JSON string.
  * Returns `null` if the input is not a valid todo array.
+ *
+ * Some Pi users disable Magic Context's built-in `todowrite` and install a
+ * third-party tool with the same name. Capture stays interoperable when that
+ * tool emits Magic Context's exact todo shape, but it must fail closed for any
+ * other status or priority values so bad state never reaches synthetic replay.
  *
  * Used by the snapshot capture path (`hook-handlers.ts`) to produce a
  * deterministic representation that survives JSON round-tripping with
@@ -61,7 +103,7 @@ export function normalizeTodoStateJson(todos: unknown): string | null {
         normalized.push({
             content: todo.content,
             status: todo.status,
-            priority: todo.priority ?? "medium",
+            priority: todo.priority ?? TODO_PRIORITY_MEDIUM,
         });
     }
 
@@ -190,11 +232,11 @@ function parseTodoState(stateJson: string): TodoItem[] | null {
         if (!Array.isArray(parsed)) return null;
         const result: TodoItem[] = [];
         for (const item of parsed) {
-            if (!isTodoItem(item)) continue;
+            if (!isTodoItem(item)) return null;
             result.push({
                 content: item.content,
                 status: item.status,
-                priority: item.priority ?? "medium",
+                priority: item.priority ?? TODO_PRIORITY_MEDIUM,
             });
         }
         return result;
@@ -203,12 +245,20 @@ function parseTodoState(stateJson: string): TodoItem[] | null {
     }
 }
 
-function isTodoItem(value: unknown): value is TodoItem {
+function isTodoStatus(value: unknown): value is TodoStatus {
+    return typeof value === "string" && TODO_STATUS_SET.has(value as TodoStatus);
+}
+
+function isTodoPriority(value: unknown): value is TodoPriority {
+    return typeof value === "string" && TODO_PRIORITY_SET.has(value as TodoPriority);
+}
+
+function isTodoItem(value: unknown): value is TodoInputItem {
     if (value === null || typeof value !== "object") return false;
     const todo = value as Record<string, unknown>;
     return (
         typeof todo.content === "string" &&
-        typeof todo.status === "string" &&
-        (todo.priority === undefined || typeof todo.priority === "string")
+        isTodoStatus(todo.status) &&
+        (todo.priority === undefined || isTodoPriority(todo.priority))
     );
 }

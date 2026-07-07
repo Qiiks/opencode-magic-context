@@ -9,20 +9,19 @@ import {
 	type TUI,
 	truncateToWidth,
 } from "@earendil-works/pi-tui";
+import {
+	TITLE_DONE_STATUSES,
+	TODO_PRIORITIES,
+	TODO_STATUSES,
+} from "@magic-context/core/hooks/magic-context/todo-view";
 
 export const TODO_TOOL_NAME = "todowrite";
 export const TODOS_COMMAND_NAME = "todos";
 
 const WIDGET_KEY = "magic-context-todos";
-const MAX_OVERLAY_CONTENT_ROWS = 12;
+const MAX_TODO_CONTENT_ROWS = 12;
 
-export const TODO_STATUSES = [
-	"pending",
-	"in_progress",
-	"completed",
-	"cancelled",
-] as const;
-const TODO_PRIORITIES = ["high", "medium", "low"] as const;
+export { TODO_PRIORITIES, TODO_STATUSES };
 
 export type TodoStatus = (typeof TODO_STATUSES)[number];
 export type TodoPriority = (typeof TODO_PRIORITIES)[number];
@@ -180,7 +179,7 @@ function countTodos(todos: readonly TodoItem[]): TodoCounts {
 function activeTitleCount(todos: readonly TodoItem[]): number {
 	// OpenCode's todowrite title excludes only completed todos; cancelled items
 	// remain in the model-visible active count for wire-shape parity.
-	return todos.filter((todo) => todo.status !== "completed").length;
+	return todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
 }
 
 function formatCounts(counts: TodoCounts): string {
@@ -218,6 +217,21 @@ function lineComponent(renderLines: (width: number) => string[]): Component {
 	return {
 		render: renderLines,
 		invalidate() {},
+	};
+}
+
+function capTodoRows<T>(rows: readonly T[]): {
+	visible: T[];
+	hiddenCount: number;
+} {
+	if (rows.length <= MAX_TODO_CONTENT_ROWS) {
+		return { visible: [...rows], hiddenCount: 0 };
+	}
+
+	const visibleCount = Math.max(0, MAX_TODO_CONTENT_ROWS - 1);
+	return {
+		visible: rows.slice(0, visibleCount),
+		hiddenCount: rows.length - visibleCount,
 	};
 }
 
@@ -259,13 +273,21 @@ export function renderTodowriteResult(
 	const renderedTodos = todos ?? [];
 	return lineComponent((width) => {
 		if (renderedTodos.length === 0) return [theme.fg("dim", "No todos")];
-		return renderedTodos.map((todo) =>
+
+		const { visible, hiddenCount } = capTodoRows(renderedTodos);
+		const lines = visible.map((todo) =>
 			truncateToWidth(
 				formatTodoLine(todo, theme, { showId: true }),
 				width,
 				"…",
 			),
 		);
+		if (hiddenCount > 0) {
+			lines.push(
+				truncateToWidth(theme.fg("dim", `+${hiddenCount} more`), width, "…"),
+			);
+		}
+		return lines;
 	});
 }
 
@@ -298,7 +320,9 @@ export function registerTodosCommand(
 				const group = todos.filter((todo) => todo.status === status);
 				if (group.length === 0) continue;
 				lines.push(heading);
-				for (const todo of group) lines.push(formatCommandLine(todo));
+				const { visible, hiddenCount } = capTodoRows(group);
+				for (const todo of visible) lines.push(formatCommandLine(todo));
+				if (hiddenCount > 0) lines.push(`  +${hiddenCount} more`);
 			}
 
 			ctx.ui.notify(lines.join("\n"), "info");
@@ -462,15 +486,10 @@ export class TodoOverlay {
 		const truncate = (line: string) => truncateToWidth(line, width, "…");
 		const lines = [truncate(heading)];
 
-		const hasTruncatedTail = overlayTodos.length > MAX_OVERLAY_CONTENT_ROWS;
-		const visibleRows = hasTruncatedTail
-			? MAX_OVERLAY_CONTENT_ROWS - 1
-			: MAX_OVERLAY_CONTENT_ROWS;
-		const truncatedTail = Math.max(0, overlayTodos.length - visibleRows);
-		const visible = overlayTodos.slice(0, visibleRows);
+		const { visible, hiddenCount } = capTodoRows(overlayTodos);
 
 		for (const [index, { todo, key }] of visible.entries()) {
-			const isLast = index === visible.length - 1 && truncatedTail === 0;
+			const isLast = index === visible.length - 1 && hiddenCount === 0;
 			const branch = theme.fg("dim", isLast ? "└─" : "├─");
 			lines.push(
 				truncate(`${branch} ${formatTodoLine(todo, theme, { showId: true })}`),
@@ -479,10 +498,10 @@ export class TodoOverlay {
 				this.completedTaskIdsPendingHide.add(key);
 		}
 
-		if (truncatedTail > 0) {
+		if (hiddenCount > 0) {
 			lines.push(
 				truncate(
-					`${theme.fg("dim", "└─")} ${theme.fg("dim", `+${truncatedTail} more`)}`,
+					`${theme.fg("dim", "└─")} ${theme.fg("dim", `+${hiddenCount} more`)}`,
 				),
 			);
 		}

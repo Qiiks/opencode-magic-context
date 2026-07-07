@@ -195,6 +195,99 @@ export function persistPiMessageEndModelMeta(args: {
 	}
 }
 
+type TodoOverlayUpdater = { update: (sessionId?: string) => void };
+
+type CompatiblePiTodoCapture = {
+	normalized: string;
+	todos: unknown[];
+};
+
+function getCompatiblePiTodoCapture(
+	todos: unknown,
+): CompatiblePiTodoCapture | null {
+	if (!Array.isArray(todos)) return null;
+	const normalized = normalizeTodoStateJson(todos);
+	if (normalized === null) return null;
+	return { normalized, todos };
+}
+
+function applyCompatiblePiTodoCapture(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	todowriteEnabled: boolean;
+	todoOverlay?: TodoOverlayUpdater;
+	persist: boolean;
+	capture: CompatiblePiTodoCapture;
+}): void {
+	if (args.todowriteEnabled) {
+		setTodoSnapshot(args.sessionId, args.capture.todos);
+		args.todoOverlay?.update(args.sessionId);
+	}
+	if (args.persist) {
+		updateSessionMeta(args.db, args.sessionId, {
+			lastTodoState: args.capture.normalized,
+		});
+	}
+}
+
+/**
+ * Capture a `todowrite` args.todos payload only when it matches Magic Context's
+ * exact todo enum contract. Third-party Pi extensions can reuse the same tool
+ * name, so incompatible shapes must leave `last_todo_state` untouched.
+ */
+export function capturePiTodowriteArgsIfCompatible(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	todos: unknown;
+	todowriteEnabled: boolean;
+	todoOverlay?: TodoOverlayUpdater;
+	persist: boolean;
+}): boolean {
+	const capture = getCompatiblePiTodoCapture(args.todos);
+	if (capture === null) return false;
+	applyCompatiblePiTodoCapture({ ...args, capture });
+	return true;
+}
+
+/**
+ * Scan an assistant `message_end` payload for the first compatible `todowrite`
+ * call. This keeps interop with third-party tools that share the name but only
+ * captures state when their payload matches Magic Context's todo enums exactly.
+ */
+export function capturePiTodowriteMessageIfCompatible(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	message: unknown;
+	todowriteEnabled: boolean;
+	todoOverlay?: TodoOverlayUpdater;
+	persist: boolean;
+}): boolean {
+	const msg = args.message as { role?: unknown; content?: unknown } | undefined;
+	if (msg?.role !== "assistant" || !Array.isArray(msg.content)) {
+		return false;
+	}
+
+	for (const block of msg.content) {
+		if (!block || typeof block !== "object") continue;
+		const b = block as {
+			type?: unknown;
+			name?: unknown;
+			arguments?: unknown;
+		};
+		if (b.type !== "toolCall") continue;
+		if (typeof b.name !== "string") continue;
+		if (b.name !== "todowrite") continue;
+		const capture = getCompatiblePiTodoCapture(
+			(b.arguments as { todos?: unknown } | null | undefined)?.todos,
+		);
+		if (capture === null) continue;
+		applyCompatiblePiTodoCapture({ ...args, capture });
+		return true;
+	}
+
+	return false;
+}
+
 function info(message: string, data?: unknown): void {
 	log(`${PREFIX} ${message}`, data);
 }
@@ -1470,10 +1563,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				const sessionMeta = Array.isArray(todos)
 					? getOrCreateSessionMeta(db, sessionId)
 					: null;
-				if (todowriteEnabled && Array.isArray(todos)) {
-					setTodoSnapshot(sessionId, todos);
-					todoOverlay?.update(sessionId);
-				}
 
 				// Synthetic-todowrite snapshot capture (Pi parity with
 				// OpenCode hook-handlers.ts:386-401). Persist normalized
@@ -1482,15 +1571,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				// snapshot to replay on the next cache-busting pass.
 				// Cache-safe: this is a pure DB write with no message
 				// mutation. Subagents skip — they do not get synthetic
-				// todowrite injection.
-				if (sessionMeta && !sessionMeta.isSubagent) {
-					const normalizedTodos = normalizeTodoStateJson(todos);
-					if (normalizedTodos !== null) {
-						updateSessionMeta(db, sessionId, {
-							lastTodoState: normalizedTodos,
-						});
-					}
-				}
+				// todowrite injection. Foreign Pi extensions can share the
+				// `todowrite` name, so only the exact Magic Context todo
+				// shape updates the stored snapshot.
+				capturePiTodowriteArgsIfCompatible({
+					db,
+					sessionId,
+					todos,
+					todowriteEnabled,
+					todoOverlay,
+					persist: Boolean(sessionMeta && !sessionMeta.isSubagent),
+				});
 
 				if (
 					Array.isArray(todos) &&
@@ -1725,43 +1816,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			try {
 				const sessionMetaForTodo = getOrCreateSessionMeta(db, sessionId);
 				if (!sessionMetaForTodo.isSubagent) {
-					const msg = event.message as
-						| { role?: string; content?: unknown }
-						| undefined;
-					if (msg && msg.role === "assistant" && Array.isArray(msg.content)) {
-						for (const block of msg.content) {
-							if (!block || typeof block !== "object") continue;
-							const b = block as {
-								type?: unknown;
-								name?: unknown;
-								arguments?: unknown;
-							};
-							if (b.type !== "toolCall") continue;
-							if (typeof b.name !== "string") continue;
-							if (b.name !== "todowrite") {
-								continue;
-							}
-							const args = b.arguments as
-								| { todos?: unknown }
-								| null
-								| undefined;
-							const todos = args?.todos;
-							if (!Array.isArray(todos)) continue;
-							const normalized = normalizeTodoStateJson(todos);
-							if (normalized === null) continue;
-							if (todowriteEnabled) {
-								setTodoSnapshot(sessionId, todos);
-								todoOverlay?.update(sessionId);
-							}
-							updateSessionMeta(db, sessionId, {
-								lastTodoState: normalized,
-							});
-							// First valid todowrite block wins — mirrors OpenCode's
-							// `tool.execute.after` behavior of capturing one
-							// snapshot per tool invocation.
-							break;
-						}
-					}
+					capturePiTodowriteMessageIfCompatible({
+						db,
+						sessionId,
+						message: event.message,
+						todowriteEnabled,
+						todoOverlay,
+						persist: true,
+					});
 				}
 			} catch (err) {
 				warn("message_end: synthetic todowrite capture failed:", err);
