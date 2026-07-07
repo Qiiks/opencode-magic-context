@@ -206,6 +206,7 @@ function shouldRedactKey(key: string): boolean {
 }
 
 export function sanitizeValue(value: unknown, key = ""): unknown {
+    if (value === null || typeof value === "number" || typeof value === "boolean") return value;
     if (shouldRedactKey(key)) return "<REDACTED>";
     if (typeof value === "string") return sanitizeString(value);
     if (Array.isArray(value)) return value.map((entry) => sanitizeValue(entry));

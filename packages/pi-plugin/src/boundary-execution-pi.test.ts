@@ -73,7 +73,36 @@ describe("boundary execution Pi integration", () => {
 		expect(peekDeferredExecutePending(db, "s1")?.id).toBe("flag-1");
 	});
 
-	it("13. Pi boundary execute drains prior flag when work executes", () => {
+	it("13. Pi stale-tail release executes and drains prior flag on a fresh user turn", () => {
+		const db = createDb();
+		ensureSessionMetaRow(db, "s1");
+		setDeferredExecutePendingIfAbsent(db, "s1", flag());
+		const midTurn = isMidTurnPi(
+			{
+				messages: [
+					{ role: "assistant", stopReason: "toolUse", content: [] },
+					{ role: "user", content: "new turn" },
+				],
+			},
+			"s1",
+		);
+		const result = applyMidTurnDeferral({
+			base: "execute",
+			bypassReason: "none",
+			midTurn,
+		});
+
+		expect(midTurn).toBe(false);
+		expect(result.midTurnAdjustedSchedulerDecision).toBe("execute");
+		const current = peekDeferredExecutePending(db, "s1");
+		expect(current).not.toBeNull();
+		if (current !== null) {
+			clearDeferredExecutePendingIfMatches(db, "s1", current);
+		}
+		expect(peekDeferredExecutePending(db, "s1")).toBeNull();
+	});
+
+	it("14. Pi boundary execute drains prior flag when work executes", () => {
 		const db = createDb();
 		setDeferredExecutePendingIfAbsent(db, "s1", flag());
 		const current = peekDeferredExecutePending(db, "s1");
@@ -84,7 +113,7 @@ describe("boundary execution Pi integration", () => {
 		expect(peekDeferredExecutePending(db, "s1")).toBeNull();
 	});
 
-	it("14. Pi preserves flag when execute-gated work fails", () => {
+	it("15. Pi preserves flag when execute-gated work fails", () => {
 		const db = createDb();
 		ensureSessionMetaRow(db, "s1");
 		setDeferredExecutePendingIfAbsent(db, "s1", flag());
@@ -96,7 +125,7 @@ describe("boundary execution Pi integration", () => {
 		expect(peekDeferredExecutePending(db, "s1")?.id).toBe("flag-1");
 	});
 
-	it("15. a prior deferred flag does NOT promote a defer decision to execute (parity with OpenCode contract #4)", () => {
+	it("16. a prior deferred flag does NOT promote a defer decision to execute (parity with OpenCode contract #4)", () => {
 		// Regression: Pi previously force-promoted schedulerDecision defer→execute
 		// whenever a deferred-execute flag existed and the pass wasn't mid-turn,
 		// diverging from OpenCode (which treats the flag as drain-on-success ONLY

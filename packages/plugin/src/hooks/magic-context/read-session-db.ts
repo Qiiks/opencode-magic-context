@@ -12,6 +12,11 @@ interface RawCountRow {
 interface AssistantMidTurnRow {
     id?: string;
     finish?: string | null;
+    timeCreated?: number;
+}
+
+interface ExistenceRow {
+    one?: number;
 }
 
 interface PartDataRow {
@@ -96,7 +101,8 @@ export function isMidTurnFromOpenCodeDb(db: Database, sessionId: string): boolea
     const latestAssistant = db
         .prepare(
             `SELECT id,
-                    json_extract(data, '$.finish') as finish
+                    json_extract(data, '$.finish') as finish,
+                    time_created as timeCreated
              FROM message
              WHERE session_id = ?
                AND json_extract(data, '$.role') = 'assistant'
@@ -106,6 +112,7 @@ export function isMidTurnFromOpenCodeDb(db: Database, sessionId: string): boolea
         .get(sessionId) as AssistantMidTurnRow | null;
 
     if (typeof latestAssistant?.id !== "string") return false;
+    if (hasNewerRealUserMessage(db, sessionId, latestAssistant.timeCreated)) return false;
     if (latestAssistant.finish === "tool-calls") return true;
 
     const partRows = db
@@ -121,6 +128,30 @@ export function isMidTurnFromOpenCodeDb(db: Database, sessionId: string): boolea
             return false;
         }
     });
+}
+
+function hasNewerRealUserMessage(
+    db: Database,
+    sessionId: string,
+    latestAssistantTimeCreated: unknown,
+): boolean {
+    if (typeof latestAssistantTimeCreated !== "number") return false;
+    const row = db
+        .prepare(
+            `SELECT 1 as one
+             FROM message
+             WHERE session_id = ?
+               AND time_created > ?
+               AND json_extract(data, '$.role') = 'user'
+               AND COALESCE(json_extract(data, '$.synthetic'), 0) NOT IN (1, 'true')
+             LIMIT 1`,
+        )
+        .get(sessionId, latestAssistantTimeCreated) as ExistenceRow | null;
+    // OpenCode persists promptAsync/channel-2 synthetic prompts as
+    // message.info.synthetic, which is the top-level $.synthetic field in the
+    // message table's data JSON. Those agent-directed nudges should not end a
+    // still-accumulating tool-use turn, but a later real user message does.
+    return row?.one === 1;
 }
 
 interface AssistantModelRow {

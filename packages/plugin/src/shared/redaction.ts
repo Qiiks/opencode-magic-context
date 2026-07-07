@@ -244,6 +244,7 @@ export function hasShareabilitySensitiveText(text: string): boolean {
 }
 
 export function sanitizeConfigValue(value: unknown, keyPath: string[] = []): unknown {
+    if (value === null || typeof value === "number" || typeof value === "boolean") return value;
     const key = keyPath.at(-1) ?? "";
     if (key && isSecretKey(key)) {
         return `<REDACTED:${redactionTypeForKey(key)}>`;

@@ -46,10 +46,23 @@ function insertAssistant(
     sessionId: string,
     id: string,
     data: Record<string, unknown>,
+    timeCreated = Date.now(),
 ): void {
     db.prepare(
         "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
-    ).run(id, sessionId, Date.now(), Date.now(), JSON.stringify({ role: "assistant", ...data }));
+    ).run(id, sessionId, timeCreated, timeCreated, JSON.stringify({ role: "assistant", ...data }));
+}
+
+function insertUser(
+    db: Database,
+    sessionId: string,
+    id: string,
+    data: Record<string, unknown>,
+    timeCreated: number,
+): void {
+    db.prepare(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+    ).run(id, sessionId, timeCreated, timeCreated, JSON.stringify({ role: "user", ...data }));
 }
 
 function insertPart(
@@ -67,20 +80,48 @@ function insertPart(
 describe("isMidTurnFromOpenCodeDb", () => {
     it("is mid-turn when the latest assistant finished with tool-calls", () => {
         const db = createMidTurnDb();
-        insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" });
+        insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
+
+        expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(true);
+    });
+
+    it("is not mid-turn when a newer real user message ends a stale tool-calls tail", () => {
+        const db = createMidTurnDb();
+        insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
+        insertUser(db, "session-1", "user-1", { content: "new turn" }, 200);
+
+        expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(false);
+    });
+
+    it("does not release mid-turn for synthetic user messages after a stale tool-calls tail", () => {
+        const db = createMidTurnDb();
+        insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
+        insertUser(db, "session-1", "user-1", { content: "agent nudge", synthetic: true }, 200);
 
         expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(true);
     });
 
     it("is mid-turn when the latest assistant has a non-provider-executed tool part", () => {
         const db = createMidTurnDb();
-        insertAssistant(db, "session-1", "assistant-1", { finish: "stop" });
+        insertAssistant(db, "session-1", "assistant-1", { finish: "stop" }, 100);
         insertPart(db, "session-1", "assistant-1", "part-1", {
             type: "tool",
             providerExecuted: false,
         });
 
         expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(true);
+    });
+
+    it("is not mid-turn when a newer real user message ends an unexecuted tool tail", () => {
+        const db = createMidTurnDb();
+        insertAssistant(db, "session-1", "assistant-1", { finish: "stop" }, 100);
+        insertPart(db, "session-1", "assistant-1", "part-1", {
+            type: "tool",
+            providerExecuted: false,
+        });
+        insertUser(db, "session-1", "user-1", { content: "new turn" }, 200);
+
+        expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(false);
     });
 
     it("is not mid-turn for provider-executed tool parts", () => {

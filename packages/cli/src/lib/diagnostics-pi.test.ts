@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectPathToPiDirSlug } from "../commands/migrate";
-import { collectDiagnostics } from "./diagnostics-pi";
+import { collectDiagnostics, sanitizeValue } from "./diagnostics-pi";
 
 const tempRoots: string[] = [];
 const originalHome = process.env.HOME;
@@ -33,6 +33,20 @@ afterEach(() => {
     for (const root of tempRoots.splice(0)) {
         rmSync(root, { recursive: true, force: true });
     }
+});
+
+describe("sanitizeValue Pi diagnostics redaction", () => {
+    it("preserves numeric thresholds while redacting string secrets", () => {
+        expect(
+            sanitizeValue({
+                execute_threshold_tokens: 200000,
+                api_key: "sk-x",
+            }),
+        ).toEqual({
+            execute_threshold_tokens: 200000,
+            api_key: "<REDACTED>",
+        });
+    });
 });
 
 describe("collectDiagnostics Pi path resolution", () => {
