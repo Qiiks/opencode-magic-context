@@ -367,6 +367,11 @@ export interface MagicContextConfig {
      *  of deleting them on success. For short-term inspection/data collection;
      *  kept sessions accumulate until manually cleared. Default false. */
     keep_subagents: boolean;
+    /** Pi-only controls for Magic Context's OpenCode-parity todowrite surface. */
+    todowrite: {
+        enabled: boolean;
+        overlay: boolean;
+    };
     /** Content-aware reclaim of tool output that a later call supersedes, added
      *  to the normal age-based auto-drop: superseded todowrite/ctx_reduce/meta
      *  outputs are dropped, and older edits to a file are compressed to a marker
@@ -609,6 +614,25 @@ export const MagicContextConfigSchema = z
             .default(false)
             .describe(
                 "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
+            ),
+        todowrite: z
+            .object({
+                enabled: z
+                    .boolean()
+                    .default(true)
+                    .describe(
+                        "Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there.",
+                    ),
+                overlay: z
+                    .boolean()
+                    .default(true)
+                    .describe(
+                        "Pi only: show the persistent todo overlay above the editor while tasks are active.",
+                    ),
+            })
+            .default({ enabled: true, overlay: true })
+            .describe(
+                "Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart.",
             ),
         smart_drops: z
             .boolean()

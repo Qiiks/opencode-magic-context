@@ -1748,6 +1748,14 @@ function ConfigForm(props: {
               return v == null ? true : Boolean(v);
             };
             const keepSubagents = () => Boolean(getNestedValue(formData(), "keep_subagents"));
+            const todowrite = () =>
+              (getNestedValue(formData(), "todowrite") as
+                | { enabled?: boolean; overlay?: boolean }
+                | undefined) ?? {};
+            const todowriteEnabled = () => todowrite().enabled ?? true;
+            const todowriteOverlay = () => todowrite().overlay ?? true;
+            const setTodowrite = (patch: Record<string, unknown>) =>
+              handleFieldChange("todowrite", { ...todowrite(), ...patch });
             const smartDrops = () => Boolean(getNestedValue(formData(), "smart_drops"));
             const sqlite = () =>
               (getNestedValue(formData(), "sqlite") as
@@ -1822,6 +1830,55 @@ function ConfigForm(props: {
                       <span class="toggle-label">{keepSubagents() ? "Enabled" : "Disabled"}</span>
                     </label>
                   </div>
+
+                  {/* Pi todowrite */}
+                  <div class="config-field">
+                    <div class="config-field-header">
+                      <span class="config-field-label">Pi Todowrite Tool</span>
+                      <span class="config-field-key">todowrite.enabled</span>
+                    </div>
+                    <span class="config-field-desc">
+                      Register Magic Context&apos;s Pi <code>todowrite</code> task-list tool.
+                      Disable this if you use another Pi todo extension. OpenCode has its own
+                      built-in todowrite, so this setting only affects Pi. Requires /reload or
+                      restart after changing.
+                    </span>
+                    <label class="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={todowriteEnabled()}
+                        onChange={(e) => setTodowrite({ enabled: e.currentTarget.checked })}
+                      />
+                      <span class="toggle-slider" />
+                      <span class="toggle-label">
+                        {todowriteEnabled() ? "Enabled" : "Disabled"}
+                      </span>
+                    </label>
+                  </div>
+
+                  <Show when={todowriteEnabled()}>
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">Pi Todo Overlay</span>
+                        <span class="config-field-key">todowrite.overlay</span>
+                      </div>
+                      <span class="config-field-desc">
+                        Show the persistent todo overlay above the editor while tasks are active.
+                        The /todos command and tool remain available when only the overlay is off.
+                      </span>
+                      <label class="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={todowriteOverlay()}
+                          onChange={(e) => setTodowrite({ overlay: e.currentTarget.checked })}
+                        />
+                        <span class="toggle-slider" />
+                        <span class="toggle-label">
+                          {todowriteOverlay() ? "Enabled" : "Disabled"}
+                        </span>
+                      </label>
+                    </div>
+                  </Show>
 
                   {/* Smart drops */}
                   <div class="config-field">
