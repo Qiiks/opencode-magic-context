@@ -14,7 +14,12 @@ import {
     OPENCODE_PLUGIN_NAME,
 } from "../lib/opencode-plugin-cache";
 import { runV22BackfillCommands } from "../lib/v22-backfill-commands";
-import { migrateLegacyAgentEnabledConfigForDoctor } from "./doctor-opencode";
+import {
+    collectNpmReleaseAgeWarnings,
+    getUserNpmrcPath,
+    isPinnedOpenCodePluginSpecifier,
+    migrateLegacyAgentEnabledConfigForDoctor,
+} from "./doctor-opencode";
 import { clearPluginCache } from "./doctor-opencode-cache";
 
 function migrate(input: Record<string, unknown>) {
@@ -77,6 +82,8 @@ describe("doctor OpenCode legacy agent enabled migration", () => {
 const tempDirs: string[] = [];
 const dbs: Database[] = [];
 let originalXdgCacheHome: string | undefined;
+let originalHome: string | undefined;
+let originalNpmUserConfig: string | undefined;
 
 function makeTempDir(prefix = "mc-v22-doctor-"): string {
     const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -132,7 +139,19 @@ afterEach(() => {
     } else {
         process.env.XDG_CACHE_HOME = originalXdgCacheHome;
     }
+    if (originalHome === undefined) {
+        delete process.env.HOME;
+    } else {
+        process.env.HOME = originalHome;
+    }
+    if (originalNpmUserConfig === undefined) {
+        delete process.env.NPM_CONFIG_USERCONFIG;
+    } else {
+        process.env.NPM_CONFIG_USERCONFIG = originalNpmUserConfig;
+    }
     originalXdgCacheHome = undefined;
+    originalHome = undefined;
+    originalNpmUserConfig = undefined;
     for (const db of dbs.splice(0)) {
         db.close();
     }
@@ -285,10 +304,46 @@ describe("doctor OpenCode plugin cache", () => {
             action: "error",
             path: versionlessCachePath,
             paths: [versionlessCachePath],
+            clearedPaths: [latestCachePath],
+            failedPaths: [versionlessCachePath],
             error: "EACCES: permission denied",
         });
         expect(removed).toEqual([latestCachePath]);
         expect(existsSync(latestCachePath)).toBe(false);
+    });
+});
+
+describe("doctor OpenCode helper logic", () => {
+    it("treats dist-tags like @next and @beta as pinned plugin entries", () => {
+        expect(isPinnedOpenCodePluginSpecifier("@cortexkit/opencode-magic-context@next")).toBe(
+            true,
+        );
+        expect(isPinnedOpenCodePluginSpecifier("@cortexkit/opencode-magic-context@beta")).toBe(
+            true,
+        );
+        expect(isPinnedOpenCodePluginSpecifier("@cortexkit/opencode-magic-context@0.29.1")).toBe(
+            true,
+        );
+        expect(isPinnedOpenCodePluginSpecifier("@cortexkit/opencode-magic-context")).toBe(false);
+        expect(isPinnedOpenCodePluginSpecifier("@cortexkit/opencode-magic-context@latest")).toBe(
+            false,
+        );
+    });
+
+    it("honors NPM_CONFIG_USERCONFIG before HOME for npmrc release-age warnings", () => {
+        const root = makeTempDir("mc-npmrc-");
+        const home = join(root, "home");
+        const customNpmrc = join(root, "custom.npmrc");
+        originalHome = process.env.HOME;
+        originalNpmUserConfig = process.env.NPM_CONFIG_USERCONFIG;
+        process.env.HOME = home;
+        process.env.NPM_CONFIG_USERCONFIG = customNpmrc;
+        mkdirSync(home, { recursive: true });
+        writeFileSync(join(home, ".npmrc"), "min-release-age=9999\n");
+        writeFileSync(customNpmrc, "before=2026-01-01\n");
+
+        expect(getUserNpmrcPath()).toBe(customNpmrc);
+        expect(collectNpmReleaseAgeWarnings()).toEqual([`${customNpmrc} has 'before=2026-01-01'`]);
     });
 });
 

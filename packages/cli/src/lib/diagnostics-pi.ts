@@ -16,6 +16,7 @@ import {
     getMagicContextHistorianDir,
     getMagicContextLogPath,
     getPiAgentConfigDir,
+    getPiSessionsRoot,
     getPiUserConfigPath,
     getPiUserExtensionsPath,
 } from "./paths";
@@ -284,10 +285,7 @@ function reverseSlugToDirectory(slug: string): string | null {
  * doesn't exist (Pi not installed or never used).
  */
 function collectPiRecentSessions(): PiRecentSessionSummary[] {
-    // env-first like the rest of this file: Bun's homedir() does not follow a
-    // runtime HOME override, which would let sandboxed doctor runs escape to
-    // the real ~/.pi/agent/sessions.
-    const sessionsRoot = join(process.env.HOME || homedir(), ".pi", "agent", "sessions");
+    const sessionsRoot = getPiSessionsRoot();
     if (!existsSync(sessionsRoot)) return [];
     try {
         const slugs = readdirSync(sessionsRoot, { withFileTypes: true })

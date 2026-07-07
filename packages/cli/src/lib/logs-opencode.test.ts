@@ -394,4 +394,78 @@ describe("bundleIssueReport secret redaction", () => {
             process.chdir(originalCwd);
         }
     });
+
+    it("sanitizes title, description, config paths, and recent session titles", async () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-issue-sanitize-"));
+        tempDirs.push(root);
+        const originalCwd = process.cwd();
+        process.chdir(root);
+        try {
+            const report: DiagnosticReport = {
+                timestamp: "2026-05-11T12:00:00.000Z",
+                platform: "darwin",
+                arch: "arm64",
+                nodeVersion: "v24.0.0",
+                pluginVersion: "0.18.0",
+                opencodeInstalled: true,
+                opencodeVersion: "1.0.0",
+                configPaths: {
+                    configDir: "/Users/alice/.config/opencode",
+                    opencodeConfig: "/Users/alice/.config/opencode/opencode.jsonc",
+                    opencodeConfigFormat: "jsonc",
+                    magicContextConfig: "/Users/alice/.config/cortexkit/magic-context.jsonc",
+                    tuiConfig: "/Users/alice/.config/opencode/tui.jsonc",
+                    tuiConfigFormat: "jsonc",
+                    omoConfig: null,
+                },
+                opencodeConfigHasPlugin: true,
+                tuiConfigHasPlugin: true,
+                magicContextConfig: {
+                    exists: true,
+                    flags: {},
+                },
+                pluginCache: { path: join(root, "cache") },
+                storageDir: { path: join(root, "storage"), exists: true, contextDbSizeBytes: 0 },
+                conflicts: { hasConflict: false, reasons: [] },
+                logFile: { path: join(root, "missing.log"), exists: false, sizeKb: 0 },
+                recentSessions: [
+                    {
+                        sessionId: "ses_1",
+                        title: "Problem at /Users/alice/private token=abc123",
+                        directory: "/Users/alice/project",
+                        lastActiveAt: "2026-05-11T12:00:00.000Z",
+                    },
+                ],
+                historianDumps: {
+                    byProject: [],
+                    legacyDumps: { dir: join(root, "dumps"), count: 0, recent: [] },
+                },
+                historianFailures: [],
+                historianRuns: [],
+            };
+
+            const bundled = await bundleIssueReport(
+                report,
+                "Description with /Users/alice/private and token=abc123",
+                "Title with /Users/alice/private and token=abc123",
+            );
+            const body = readFileSync(bundled.path, "utf-8");
+
+            expect(body).toContain("## Title");
+            expect(body).toContain("Title with /Users/<USER>/private and token=<REDACTED:token>");
+            expect(body).toContain(
+                "Description with /Users/<USER>/private and token=<REDACTED:token>",
+            );
+            expect(body).toContain(
+                "Config from `/Users/<USER>/.config/cortexkit/magic-context.jsonc`:",
+            );
+            expect(body).toContain(
+                '"title": "Problem at /Users/<USER>/private token=<REDACTED:token>"',
+            );
+            expect(body).not.toContain("alice");
+            expect(body).not.toContain("abc123");
+        } finally {
+            process.chdir(originalCwd);
+        }
+    });
 });

@@ -1,5 +1,4 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { type DiagnosticReport, renderDiagnosticsMarkdown } from "./diagnostics-opencode";
 import { capBodyToGithubLimit, extractRecentErrors } from "./issue-body";
@@ -109,7 +108,7 @@ function filterLogLinesBySession(lines: string[], sessionId: string | null): str
 export async function bundleIssueReport(
     report: DiagnosticReport,
     description: string,
-    _title: string,
+    title: string,
     sessionFilter: string | null = null,
 ): Promise<BundledIssueReport> {
     const LOG_TAIL_LINES = 400;
@@ -141,11 +140,14 @@ export async function bundleIssueReport(
         null,
         2,
     );
-    const sanitizedConfigPath = report.configPaths.magicContextConfig.replace(homedir(), "~");
+    const sanitizedConfigPath = sanitizeDiagnosticText(report.configPaths.magicContextConfig);
+    const sanitizedDescription = sanitizeDiagnosticText(description);
+    const sanitizedTitle = sanitizeDiagnosticText(title).trim();
 
     const rawBodyMarkdown = [
+        ...(sanitizedTitle ? ["## Title", sanitizedTitle, ""] : []),
         "## Description",
-        description,
+        sanitizedDescription,
         "",
         "## Environment",
         `- Plugin: v${report.pluginVersion}`,

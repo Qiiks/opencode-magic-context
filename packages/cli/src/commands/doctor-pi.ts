@@ -38,6 +38,7 @@ import { bundleIssueReport } from "../lib/logs-pi";
 import {
     getMagicContextLogPath,
     getPiAgentConfigDir,
+    getPiCacheRoot,
     getPiUserConfigPath,
     getPiUserExtensionsPath,
 } from "../lib/paths";
@@ -53,7 +54,7 @@ import {
     isPiMagicContextPackageEntry,
 } from "../lib/pi-package-entry";
 import { type PromptIO, promptIO } from "../lib/prompts";
-import { sanitizeDiagnosticText } from "../lib/redaction";
+import { sanitizeDiagnosticEndpoint, sanitizeDiagnosticText } from "../lib/redaction";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { writePiSettingsPackage } from "./setup-pi";
 
@@ -91,6 +92,7 @@ interface DoctorDeps {
     detectPiBinary: () => PiBinaryInfo | null;
     getPiVersion: (piPath: string) => string | null;
     getLatestNpmVersion: () => string | null;
+    selfVersion: () => string;
     probeEmbeddingEndpoint: typeof probeEmbeddingEndpoint;
     openDatabase: typeof openDatabase;
     isDatabasePersisted: typeof isDatabasePersisted;
@@ -115,6 +117,7 @@ const DEFAULT_DEPS: DoctorDeps = {
     detectPiBinary,
     getPiVersion,
     getLatestNpmVersion: () => getLatestNpmVersion(PACKAGE_NAME),
+    selfVersion,
     probeEmbeddingEndpoint,
     openDatabase,
     isDatabasePersisted,
@@ -312,7 +315,7 @@ function classifyEmbeddingOutcome(outcome: EmbeddingProbeOutcome): CheckResult {
         case "network_error":
             return {
                 status: "fail",
-                message: `Embedding endpoint network error: ${outcome.message}`,
+                message: `Embedding endpoint network error: ${sanitizeDiagnosticText(outcome.message)}`,
             };
         case "endpoint_unsupported":
             return {
@@ -327,7 +330,7 @@ function classifyEmbeddingOutcome(outcome: EmbeddingProbeOutcome): CheckResult {
         case "invalid_scheme":
             return {
                 status: "fail",
-                message: `Embedding endpoint must start with http:// or https://: ${outcome.endpoint}`,
+                message: `Embedding endpoint must start with http:// or https://: ${sanitizeDiagnosticEndpoint(outcome.endpoint)}`,
             };
     }
 }
@@ -344,11 +347,12 @@ function countTable(db: ContextDatabase, table: string): number | null {
 }
 
 function cacheRoots(): string[] {
-    const home = homedir();
-    const cacheHome = process.env.XDG_CACHE_HOME || join(home, ".cache");
+    const home = process.env.HOME?.trim();
+    const cacheHome = process.env.XDG_CACHE_HOME || join(home || homedir(), ".cache");
+    const piCacheRoot = getPiCacheRoot();
     return [
-        join(home, ".pi", "cache", "extensions"),
-        join(home, ".pi", "cache", "packages"),
+        join(piCacheRoot, "extensions"),
+        join(piCacheRoot, "packages"),
         join(cacheHome, "pi", "extensions"),
         join(cacheHome, "pi", "packages"),
         join(getPiAgentConfigDir(), "cache", "extensions"),
@@ -416,7 +420,7 @@ async function runHealthChecks(options: {
         writeUserConfig: false,
         clearCachePaths: [],
     };
-    const self = selfVersion();
+    const self = options.deps.selfVersion();
 
     const pi = options.deps.detectPiBinary();
     if (!pi) {
@@ -441,18 +445,21 @@ async function runHealthChecks(options: {
     }
 
     const latest = options.deps.getLatestNpmVersion();
-    if (latest && compareSemver(self, latest) === -1) {
+    const latestCompare = latest ? compareSemver(self, latest) : null;
+    if (latest && latestCompare === -1) {
         add(
             results,
             "warn",
             `Magic Context for Pi CLI v${self} is older than npm latest v${latest}`,
         );
-    } else if (latest) {
+    } else if (latest && latestCompare !== null) {
         add(
             results,
             "pass",
             `Magic Context for Pi CLI v${self} is current (npm latest v${latest})`,
         );
+    } else if (latest) {
+        add(results, "info", `Magic Context for Pi CLI version unknown; npm latest is v${latest}`);
     } else {
         add(results, "info", `Magic Context for Pi CLI v${self}; npm latest check unavailable`);
     }
@@ -668,7 +675,7 @@ async function runHealthChecks(options: {
                 add(
                     results,
                     "fail",
-                    `Embedding probe threw: ${error instanceof Error ? error.message : String(error)}`,
+                    `Embedding probe threw: ${sanitizeDiagnosticText(error instanceof Error ? error.message : String(error))}`,
                 );
             }
         }

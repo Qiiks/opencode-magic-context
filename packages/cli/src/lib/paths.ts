@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { resolveCortexKitUserConfigPath } from "@magic-context/core/config/migrate-config-location";
 import {
     getMagicContextHistorianDir as getMagicContextHistorianDirCore,
@@ -108,11 +108,31 @@ export function detectConfigPaths(): ConfigPaths {
 // Pi paths
 // ============================================================================
 
+function envFirstHomeDir(): string {
+    const home = process.env.HOME?.trim();
+    return home || homedir();
+}
+
 /** Pi's per-user agent dir; overridable via PI_CODING_AGENT_DIR. */
-export function getPiAgentConfigDir(): string {
+export function getPiAgentDir(): string {
     const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
     if (envDir) return envDir;
-    return join(homedir(), ".pi", "agent");
+    return join(envFirstHomeDir(), ".pi", "agent");
+}
+
+/** Pi's per-user agent dir; overridable via PI_CODING_AGENT_DIR. */
+export function getPiAgentConfigDir(): string {
+    return getPiAgentDir();
+}
+
+/** Pi session JSONL root (`<agentDir>/sessions`). */
+export function getPiSessionsRoot(): string {
+    return join(getPiAgentDir(), "sessions");
+}
+
+/** Pi cache root, kept beside the resolved agent dir (`<parent>/cache`). */
+export function getPiCacheRoot(): string {
+    return join(dirname(getPiAgentDir()), "cache");
 }
 
 /** Shared Magic Context user config, independent of the Pi agent settings dir. */

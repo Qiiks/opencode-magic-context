@@ -822,7 +822,7 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
 
     const recentSessions = report.recentSessions.map((session) => ({
         sessionId: session.sessionId,
-        title: session.title,
+        title: sanitizeDiagnosticText(session.title),
         directory: sanitizeString(session.directory),
         lastActiveAt: session.lastActiveAt,
     }));
