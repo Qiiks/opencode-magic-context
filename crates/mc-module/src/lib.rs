@@ -4236,7 +4236,7 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
-        let session = historian::historian_producer_session_id("proj", 3);
+        let session = historian::historian_producer_session_id("proj", "parent-session", 3);
         handler.bind_route(9, binding("/tmp/nonexistent-proj", &session));
         let messages = [ck("m1", 1, "seed block + new_messages payload")];
         let req = serde_json::json!({

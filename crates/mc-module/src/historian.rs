@@ -665,7 +665,21 @@ pub const MAX_NONEMERGENCY_REQUEST_BUDGET: Duration = Duration::from_secs(120);
 /// Build the llm-runner session id owned by Magic Context for one historian firing.
 /// The firing sequence is part of the id so a fallback model attempt never resumes a
 /// failed run under a different model.
-pub fn historian_producer_session_id(project_slug: &str, firing_seq: u64) -> String {
+///
+/// The id must be unique per (lineage, firing), not per (project, firing): multiple
+/// lineages under one project — a parent conversation plus concurrent subagent
+/// lineages under composite keys — fold concurrently in normal operation, and their
+/// firing sequences advance independently. A project-scoped id lets two lineages at
+/// the same sequence share one producer session, crossing their terminal-run
+/// tracking (expected run-id from one lineage, found run-id from the other) and
+/// losing the commit. A stable hash of the bound session key disambiguates without
+/// leaking composite-key bytes (which may carry non-slug-safe delimiters) into the
+/// id, and keeps the `mc-historian:` prefix the self-exemption matches on.
+pub fn historian_producer_session_id(
+    project_slug: &str,
+    session_id: &str,
+    firing_seq: u64,
+) -> String {
     let slug: String = project_slug
         .chars()
         .map(|c| {
@@ -678,7 +692,19 @@ pub fn historian_producer_session_id(project_slug: &str, firing_seq: u64) -> Str
         .collect();
     let slug = slug.trim_matches('-');
     let slug = if slug.is_empty() { "project" } else { slug };
-    format!("mc-historian:{slug}:{firing_seq}")
+    let lineage = fnv1a_hex8(session_id);
+    format!("mc-historian:{slug}:{lineage}:{firing_seq}")
+}
+
+/// FNV-1a 64-bit, rendered as the first 8 hex chars — enough to separate the
+/// handful of concurrent lineages a project realistically carries.
+fn fnv1a_hex8(input: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")[..8].to_string()
 }
 
 pub async fn run_historian_firing<P>(
@@ -711,8 +737,11 @@ where
         };
         persist_historian_state(request.store, request.session_id, fired.clone())?;
 
-        let producer_session_id =
-            historian_producer_session_id(request.project_slug, fired.firing_seq);
+        let producer_session_id = historian_producer_session_id(
+            request.project_slug,
+            request.session_id,
+            fired.firing_seq,
+        );
         let handle = match producer
             .start(&producer_session_id, request.system, request.prompt, model)
             .await
@@ -1307,6 +1336,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn producer_session_ids_are_lineage_scoped_under_one_project() {
+        // A parent conversation and a concurrent subagent lineage (composite key
+        // with the U+241F delimiter) share the project slug and can reach the
+        // same firing sequence at the same time. Their producer sessions must
+        // not collide, or the terminal-run tracking crosses lineages and one
+        // fold's commit is lost.
+        let parent = historian_producer_session_id("proj", "84b85b9f", 2);
+        let subagent = historian_producer_session_id("proj", "84b85b9f\u{241F}a063e\u{241F}0", 2);
+        assert_ne!(parent, subagent);
+        // Both stay inside the self-exemption namespace so the transform
+        // pass-through still recognizes them as MC-owned children.
+        assert!(parent.starts_with("mc-historian:"));
+        assert!(subagent.starts_with("mc-historian:"));
+        // Composite-key delimiter bytes never leak into the id (llm-runner
+        // session ids should stay slug-safe ASCII).
+        assert!(subagent.is_ascii());
+        // Same lineage, different firing: still unique per firing.
+        assert_ne!(parent, historian_producer_session_id("proj", "84b85b9f", 3));
+    }
+
     fn fire_request<'a>(
         store: &'a McStore,
         prompt: &'a str,
@@ -1397,9 +1447,10 @@ mod tests {
             panic!("expected completed outcome");
         };
         assert_eq!(success.model, "prov/model-a");
-        assert_eq!(success.producer_session_id, "mc-historian:proj:1");
+        let expected_session = historian_producer_session_id("proj", "ses", 1);
+        assert_eq!(success.producer_session_id, expected_session);
         assert_eq!(producer.observed_starts.len(), 1);
-        assert_eq!(producer.observed_starts[0].0, "mc-historian:proj:1");
+        assert_eq!(producer.observed_starts[0].0, expected_session);
         assert_eq!(
             producer.observed_systems,
             vec!["role guidance".to_string()],
@@ -1458,11 +1509,11 @@ mod tests {
             producer.observed_starts,
             vec![
                 (
-                    "mc-historian:proj:1".to_string(),
+                    historian_producer_session_id("proj", "ses", 1),
                     "prov/model-a".to_string()
                 ),
                 (
-                    "mc-historian:proj:2".to_string(),
+                    historian_producer_session_id("proj", "ses", 2),
                     "prov/model-b".to_string()
                 ),
             ],
@@ -1846,7 +1897,7 @@ mod tests {
         assert_eq!(
             producer.observed_starts,
             vec![(
-                "mc-historian:proj:1".to_string(),
+                historian_producer_session_id("proj", "ses", 1),
                 "prov/model-a".to_string()
             )],
             "paused runs abandon the slot instead of retrying the next model"
