@@ -1,6 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 
-import { createPinnedLookup, type SmartNoteResolver, validateSmartNoteHttpUrl } from "./ssrf-guard";
+import {
+    createPinnedLookup,
+    guardedSmartNoteHttpGet,
+    type SmartNoteResolver,
+    validateSmartNoteHttpUrl,
+} from "./ssrf-guard";
+import { SmartNoteNetworkError } from "./types";
 
 const signal = new AbortController().signal;
 
@@ -83,6 +89,80 @@ describe("smart-note SSRF guard", () => {
             "93.184.216.34",
             "2606:2800:220:1:248:1893:25c8:1946",
         ]);
+    });
+
+    test("stops after a terminal per-target failure", async () => {
+        const contacted: string[] = [];
+        const requestAddress = mock(async (_validation, candidate) => {
+            contacted.push(candidate.address);
+            throw new SmartNoteNetworkError("SMART_NOTE_NETWORK: response body too large", {
+                terminal: true,
+            });
+        });
+
+        const error = await guardedSmartNoteHttpGet("https://example.test/", {
+            signal,
+            resolver: resolver([
+                { address: "93.184.216.34", family: 4 },
+                { address: "1.1.1.1", family: 4 },
+            ]),
+            requestAddress,
+        }).catch((error) => error);
+
+        expect(error).toBeInstanceOf(SmartNoteNetworkError);
+        expect((error as SmartNoteNetworkError).terminal).toBe(true);
+        expect(contacted).toEqual(["93.184.216.34"]);
+        expect(requestAddress.mock.calls).toHaveLength(1);
+    });
+
+    test("advances to the next address after a connection-level failure", async () => {
+        const contacted: string[] = [];
+        const requestAddress = mock(async (_validation, candidate) => {
+            contacted.push(candidate.address);
+            if (candidate.address === "93.184.216.34") {
+                throw new SmartNoteNetworkError("SMART_NOTE_NETWORK: connect ECONNREFUSED");
+            }
+            return { status: 200, body: "ok" };
+        });
+
+        const response = await guardedSmartNoteHttpGet("https://example.test/", {
+            signal,
+            resolver: resolver([
+                { address: "93.184.216.34", family: 4 },
+                { address: "1.1.1.1", family: 4 },
+            ]),
+            requestAddress,
+        });
+
+        expect(response).toEqual({ status: 200, body: "ok" });
+        expect(contacted).toEqual(["93.184.216.34", "1.1.1.1"]);
+        expect(requestAddress.mock.calls).toHaveLength(2);
+    });
+
+    test("caps the validated address fanout", async () => {
+        const addresses = [
+            "93.184.216.34",
+            "1.1.1.1",
+            "8.8.8.8",
+            "151.101.1.69",
+            "13.107.42.14",
+            "208.67.222.222",
+        ].map((address) => ({ address, family: 4 as const }));
+        const contacted: string[] = [];
+        const requestAddress = mock(async (_validation, candidate) => {
+            contacted.push(candidate.address);
+            throw new SmartNoteNetworkError("SMART_NOTE_NETWORK: connect ECONNREFUSED");
+        });
+
+        const error = await guardedSmartNoteHttpGet("https://example.test/", {
+            signal,
+            resolver: resolver(addresses),
+            requestAddress,
+        }).catch((error) => error);
+
+        expect(error).toBeInstanceOf(SmartNoteNetworkError);
+        expect(contacted).toEqual(addresses.slice(0, 4).map((candidate) => candidate.address));
+        expect(requestAddress.mock.calls).toHaveLength(4);
     });
 });
 

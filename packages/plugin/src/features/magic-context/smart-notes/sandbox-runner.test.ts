@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { SmartNoteCapabilityApi } from "./capabilities";
 import { runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { SmartNoteNetworkError } from "./types";
 
 const fakeCap: SmartNoteCapabilityApi = {
     readFile: async (path) => (path === "ready.txt" ? "ready" : null),
@@ -35,6 +36,67 @@ describe("compiled smart-note QuickJS runner", () => {
             timeoutMs: 50,
         });
         expect(result.ok).toBe(false);
+    });
+
+    test("aborts host capabilities on the run timeout and frees the shared lock", async () => {
+        await runCompiledSmartNoteCheck({
+            compiledCheck: `function check() { return { met: true }; }`,
+            capabilities: fakeCap,
+        });
+
+        const startedAt = Date.now();
+        const timedOut = (await Promise.race([
+            runCompiledSmartNoteCheck({
+                compiledCheck: `function check(cap) { cap.httpGet("https://example.test/"); return { met: false }; }`,
+                capabilityFactory: (signal) => ({
+                    ...fakeCap,
+                    httpGet: () =>
+                        new Promise((_resolve, reject) => {
+                            const abort = () =>
+                                reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted"));
+                            if (signal.aborted) {
+                                abort();
+                                return;
+                            }
+                            signal.addEventListener("abort", abort, { once: true });
+                        }),
+                }),
+                timeoutMs: 100,
+            }),
+            new Promise<never>((_, reject) =>
+                setTimeout(
+                    () => reject(new Error("sandbox timeout did not abort the host capability")),
+                    1_000,
+                ),
+            ),
+        ])) as Awaited<ReturnType<typeof runCompiledSmartNoteCheck>>;
+        const elapsed = Date.now() - startedAt;
+
+        expect(timedOut.ok).toBe(false);
+        if (!timedOut.ok) {
+            expect(timedOut.network).toBe(true);
+        }
+        expect(elapsed).toBeGreaterThanOrEqual(50);
+        expect(elapsed).toBeLessThan(1_000);
+
+        const followup = (await Promise.race([
+            runCompiledSmartNoteCheck({
+                compiledCheck: `function check() { return { met: true }; }`,
+                capabilities: fakeCap,
+            }),
+            new Promise<never>((_, reject) =>
+                setTimeout(
+                    () =>
+                        reject(
+                            new Error(
+                                "follow-up sandbox run stayed blocked behind the timed-out host call",
+                            ),
+                        ),
+                    500,
+                ),
+            ),
+        ])) as Awaited<ReturnType<typeof runCompiledSmartNoteCheck>>;
+        expect(followup).toEqual({ ok: true, result: { met: true } });
     });
 
     test("serializes concurrent checks whose host calls suspend (shared-module asyncify safety)", async () => {

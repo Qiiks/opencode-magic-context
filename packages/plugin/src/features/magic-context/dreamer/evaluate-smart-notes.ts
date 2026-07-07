@@ -187,7 +187,8 @@ async function compileNote(
             sessionDirectory: args.sessionDirectory,
             projectIdentity: args.projectIdentity,
             note,
-            capabilities: createSmartNoteCapabilities({ projectRoot, signal: controller.signal }),
+            capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
+            signal: controller.signal,
             deadline: args.deadline,
             model: args.model,
             fallbackModels: args.fallbackModels,
@@ -261,7 +262,7 @@ async function runLivenessCheck(
     try {
         const result = await runCompiledSmartNoteCheck({
             compiledCheck: note.compiledCheck,
-            capabilities: createSmartNoteCapabilities({ projectRoot, signal: controller.signal }),
+            capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
             signal: controller.signal,
             timeoutMs: 2_000,
         });

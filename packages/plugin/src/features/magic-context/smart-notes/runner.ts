@@ -79,10 +79,11 @@ export async function runDueCompiledSmartNoteChecks(
         try {
             const result = await runCompiledSmartNoteCheck({
                 compiledCheck: note.compiledCheck,
-                capabilities: createSmartNoteCapabilities({
-                    projectRoot: args.projectRoot,
-                    signal: controller.signal,
-                }),
+                capabilityFactory: (signal) =>
+                    createSmartNoteCapabilities({
+                        projectRoot: args.projectRoot,
+                        signal,
+                    }),
                 signal: controller.signal,
                 timeoutMs: Math.min(2_000, remaining),
             });

@@ -3,7 +3,11 @@ import * as https from "node:https";
 import { isIP, type LookupFunction } from "node:net";
 import { domainToASCII } from "node:url";
 
-import { SmartNoteNetworkError, SmartNoteSecurityError } from "./types";
+import {
+    isTerminalSmartNoteNetworkError,
+    SmartNoteNetworkError,
+    SmartNoteSecurityError,
+} from "./types";
 
 export interface ResolvedSmartNoteAddress {
     address: string;
@@ -24,9 +28,24 @@ export interface SmartNoteResolver {
     ): Promise<Array<{ address: string; family: 4 | 6 }>>;
 }
 
+type SmartNoteAddressRequest = (
+    validation: SmartNoteUrlValidation,
+    candidate: ResolvedSmartNoteAddress,
+    options: { signal: AbortSignal; timeoutMs: number; bodyLimitBytes: number },
+) => Promise<{ status: number; body: string }>;
+
+export interface GuardedSmartNoteHttpGetOptions {
+    signal: AbortSignal;
+    resolver?: SmartNoteResolver;
+    timeoutMs?: number;
+    bodyLimitBytes?: number;
+    requestAddress?: SmartNoteAddressRequest;
+}
+
 const DNS_TIMEOUT_MS = 3_000;
 const DEFAULT_HTTP_TIMEOUT_MS = 5_000;
 const DEFAULT_HTTP_BODY_LIMIT_BYTES = 64 * 1024;
+const MAX_HTTP_ADDRESS_CANDIDATES = 4;
 
 const defaultResolver: SmartNoteResolver = {
     async lookup(hostname, signal) {
@@ -85,12 +104,7 @@ export async function validateSmartNoteHttpUrl(
 
 export async function guardedSmartNoteHttpGet(
     input: string,
-    options: {
-        signal: AbortSignal;
-        resolver?: SmartNoteResolver;
-        timeoutMs?: number;
-        bodyLimitBytes?: number;
-    },
+    options: GuardedSmartNoteHttpGetOptions,
 ): Promise<{ status: number; body: string }> {
     const validation = await validateSmartNoteHttpUrl(input, {
         signal: options.signal,
@@ -98,17 +112,30 @@ export async function guardedSmartNoteHttpGet(
     });
     const timeoutMs = options.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
     const bodyLimitBytes = options.bodyLimitBytes ?? DEFAULT_HTTP_BODY_LIMIT_BYTES;
+    const requestAddress = options.requestAddress ?? requestValidatedAddress;
+    // DNS can return long A/AAAA sets. Smart-note checks only sample a few
+    // validated IPs so one hostname cannot fan out unbounded egress.
+    const candidates = validation.addresses.slice(0, MAX_HTTP_ADDRESS_CANDIDATES);
     let lastError: unknown;
-    for (const candidate of validation.addresses) {
+    for (const candidate of candidates) {
         try {
-            return await requestValidatedAddress(validation, candidate, {
+            return await requestAddress(validation, candidate, {
                 signal: options.signal,
                 timeoutMs,
                 bodyLimitBytes,
             });
         } catch (error) {
             lastError = error;
-            if (error instanceof SmartNoteSecurityError || options.signal.aborted) throw error;
+            // Connection-level failures can try the next validated IP. Once the
+            // target itself is too large or too slow, retrying the rest of the
+            // address list only repeats the same request budget and egress.
+            if (
+                error instanceof SmartNoteSecurityError ||
+                options.signal.aborted ||
+                isTerminalSmartNoteNetworkError(error)
+            ) {
+                throw error;
+            }
         }
     }
     throw toNetworkError(lastError, "all validated addresses failed");
@@ -240,6 +267,7 @@ function requestValidatedAddress(
                         reject(
                             new SmartNoteNetworkError(
                                 "SMART_NOTE_NETWORK: response body too large",
+                                { terminal: true },
                             ),
                         );
                         response.destroy();
@@ -280,7 +308,11 @@ function requestValidatedAddress(
         };
         options.signal.addEventListener("abort", onAbort, { once: true });
         request.on("timeout", () => {
-            reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out"));
+            reject(
+                new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out", {
+                    terminal: true,
+                }),
+            );
             request.destroy();
         });
         request.on("error", (error) => {
