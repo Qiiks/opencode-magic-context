@@ -88,6 +88,45 @@ describe("workspace identity helpers", () => {
         }
     });
 
+    test("share categories default legacy NULL and fail closed for malformed rows", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec(`
+                CREATE TABLE workspaces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    share_categories TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE workspace_members (
+                    workspace_id INTEGER NOT NULL,
+                    project_path TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    display_path TEXT NOT NULL,
+                    added_at INTEGER NOT NULL,
+                    PRIMARY KEY (workspace_id, project_path)
+                );
+                INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
+                VALUES (1, 'legacy-null', NULL, 1, 1);
+                INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                VALUES (1, 'git:a', 'A', '/a', 1), (1, 'git:b', 'B', '/b', 1);
+            `);
+
+            expect(resolveWorkspaceShareCategories(db, "git:a")).toEqual(["CONSTRAINTS"]);
+
+            db.prepare("UPDATE workspaces SET share_categories = ? WHERE id = 1").run("not-json");
+            expect(resolveWorkspaceShareCategories(db, "git:a")).toEqual([]);
+
+            db.prepare("UPDATE workspaces SET share_categories = ? WHERE id = 1").run(
+                '["CONSTRAINTS","NOT_A_CATEGORY"]',
+            );
+            expect(resolveWorkspaceShareCategories(db, "git:a")).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("epoch fan-out bumps every member of the target workspace", () => {
         const db = openDb();
         try {

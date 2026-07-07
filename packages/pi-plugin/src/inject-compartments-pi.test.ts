@@ -109,6 +109,41 @@ describe("workspace memory sharing", () => {
 			closeQuietly(db);
 		}
 	});
+
+	it("does not render foreign memories when share_categories is malformed", () => {
+		const db = createTestDb();
+		const dir = mkdtempSync(join(tmpdir(), "mc-pi-share-malformed-"));
+		try {
+			db.exec(`
+				INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
+				VALUES (1, 'ws', 'not-json', 1, 1);
+				INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+				VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
+			`);
+			insertMemory(db, {
+				projectPath: "git:own",
+				category: "CONSTRAINTS",
+				content: "own malformed Pi memory remains visible",
+			});
+			insertMemory(db, {
+				projectPath: "git:foreign",
+				category: "CONSTRAINTS",
+				content: "foreign malformed Pi memory is hidden",
+			});
+			const state = {
+				sessionId: "pi-share-malformed",
+				projectIdentity: "git:own",
+				projectDirectory: dir,
+			};
+
+			const m0 = renderM0Pi(state, db, "");
+			expect(m0).toContain("own malformed Pi memory remains visible");
+			expect(m0).not.toContain("foreign malformed Pi memory is hidden");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
 });
 
 describe("trimPiMessagesToBoundary", () => {

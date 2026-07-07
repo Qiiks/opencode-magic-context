@@ -599,6 +599,7 @@ function uniqueValues(values: readonly string[]): string[] {
 
 export interface WorkspaceMemorySharingFilter {
     ownIdentities?: readonly string[];
+    /** null/undefined means no workspace filter is active; pass [] to share no foreign categories. */
     shareCategories?: readonly string[] | null;
 }
 
