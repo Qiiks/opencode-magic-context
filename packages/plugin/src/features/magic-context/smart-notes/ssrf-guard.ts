@@ -229,19 +229,30 @@ function requestValidatedAddress(
                     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
                     bytes += buf.byteLength;
                     if (bytes > options.bodyLimitBytes) {
-                        request.destroy(
+                        // Reject FIRST, then destroy WITHOUT an error argument.
+                        // destroy(err) hands the error to the stream machinery,
+                        // which under OpenCode's embedded Bun has been observed
+                        // re-surfacing it through the readable's flow() as an
+                        // UNCAUGHT stderr dump even with 'error' listeners on
+                        // both the request and the response. An errorless
+                        // destroy gives the internals nothing to re-emit; the
+                        // promise is already settled with the typed error.
+                        reject(
                             new SmartNoteNetworkError(
                                 "SMART_NOTE_NETWORK: response body too large",
                             ),
                         );
+                        response.destroy();
+                        request.destroy();
                         return;
                     }
                     chunks.push(buf);
                 });
-                // request.destroy(err) (body limit, timeout, abort) also destroys
-                // this response stream with the same error. Without a listener,
-                // that becomes an UNCAUGHT stream 'error' dumped to stderr — the
-                // request-level handler alone does not cover the response side.
+                // Genuine transport errors mid-body (connection reset, TLS
+                // failure) surface here. Local aborts (body limit, timeout,
+                // signal) reject the promise directly and destroy errorless,
+                // so this listener only sees real network failures — but it
+                // must exist: an unlistened stream 'error' dumps to stderr.
                 response.on("error", (error) => {
                     reject(toNetworkError(error, "response failed"));
                 });
@@ -260,11 +271,17 @@ function requestValidatedAddress(
             },
         );
 
-        const onAbort = () =>
-            request.destroy(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted"));
+        // Same reject-then-errorless-destroy discipline as the body-limit
+        // branch: passing an Error to destroy() lets stream internals re-throw
+        // it where no listener reaches.
+        const onAbort = () => {
+            reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted"));
+            request.destroy();
+        };
         options.signal.addEventListener("abort", onAbort, { once: true });
         request.on("timeout", () => {
-            request.destroy(new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out"));
+            reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out"));
+            request.destroy();
         });
         request.on("error", (error) => {
             options.signal.removeEventListener("abort", onAbort);
