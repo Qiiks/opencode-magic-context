@@ -142,6 +142,24 @@ describe("sanitizeConfigValue — preserves benign config keys", () => {
         expect(sanitized.execute_threshold_tokens.default).toBe(80000);
         expect(sanitized.execute_threshold_tokens["openai/gpt-5.5"]).toBe(200000);
     });
+
+    it("preserves non-string scalars under secret-looking keys", () => {
+        const sanitized = sanitizeConfigValue({
+            execute_threshold_tokens: 200000,
+            api_key: "sk-x",
+            access_token: 12345,
+            has_token: true,
+            refresh_token: null,
+        }) as Record<string, unknown>;
+
+        expect(sanitized).toEqual({
+            execute_threshold_tokens: 200000,
+            api_key: "<REDACTED:api_key>",
+            access_token: 12345,
+            has_token: true,
+            refresh_token: null,
+        });
+    });
 });
 
 describe("hasShareabilitySensitiveText", () => {

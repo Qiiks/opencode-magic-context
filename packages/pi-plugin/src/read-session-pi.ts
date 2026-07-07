@@ -163,6 +163,7 @@ export function isMidTurnPi(event: unknown, _sessionId: string): boolean {
 	}
 
 	if (latestAssistant === null) return false;
+	if (hasRealUserAfter(messages, latestAssistantIndex)) return false;
 	if (latestAssistant.stopReason === "toolUse") return true;
 
 	const toolCallIds = getToolCallIds(latestAssistant.content);
@@ -180,6 +181,21 @@ export function isMidTurnPi(event: unknown, _sessionId: string): boolean {
 
 	for (const id of toolCallIds) {
 		if (!pairedToolResultIds.has(id)) return true;
+	}
+	return false;
+}
+
+function hasRealUserAfter(
+	messages: readonly unknown[],
+	latestAssistantIndex: number,
+): boolean {
+	// If an interrupted assistant tool-use sequence is followed by a real user
+	// message, treat that user message as the turn boundary so the next pass can
+	// finish any work held back during tool-use. Custom-role nudge messages are
+	// not real user turns, so they should not trigger the boundary.
+	for (const msg of messages.slice(latestAssistantIndex + 1)) {
+		if (msg === null || typeof msg !== "object") continue;
+		if ((msg as Record<string, unknown>).role === "user") return true;
 	}
 	return false;
 }

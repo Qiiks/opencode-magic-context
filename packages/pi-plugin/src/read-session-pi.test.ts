@@ -20,6 +20,34 @@ describe("isMidTurnPi", () => {
 		).toBe(true);
 	});
 
+	it("is not mid-turn when a newer real user message ends a stale toolUse tail", () => {
+		expect(
+			isMidTurnPi(
+				{
+					messages: [
+						{ role: "assistant", stopReason: "toolUse", content: [] },
+						{ role: "user", content: "new turn" },
+					],
+				},
+				"session-1",
+			),
+		).toBe(false);
+	});
+
+	it("does not release mid-turn for custom-role nudges after a stale toolUse tail", () => {
+		expect(
+			isMidTurnPi(
+				{
+					messages: [
+						{ role: "assistant", stopReason: "toolUse", content: [] },
+						{ role: "custom", content: "agent nudge" },
+					],
+				},
+				"session-1",
+			),
+		).toBe(true);
+	});
+
 	it("is mid-turn when the latest assistant has an unpaired toolCall", () => {
 		expect(
 			isMidTurnPi(
@@ -34,6 +62,23 @@ describe("isMidTurnPi", () => {
 				"session-1",
 			),
 		).toBe(true);
+	});
+
+	it("is not mid-turn when a newer real user message ends an unpaired toolCall tail", () => {
+		expect(
+			isMidTurnPi(
+				{
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "toolCall", id: "call-1", name: "bash" }],
+						},
+						{ role: "user", content: "new turn" },
+					],
+				},
+				"session-1",
+			),
+		).toBe(false);
 	});
 
 	it("is not mid-turn when toolCall content is paired or absent", () => {
