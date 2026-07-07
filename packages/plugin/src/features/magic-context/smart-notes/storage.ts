@@ -26,17 +26,32 @@ export function commitSmartNoteState(
         write: () => void;
     },
 ): void {
+    // BEGIN IMMEDIATE, not a plain (deferred) transaction: the lease check reads
+    // before the write, and a deferred read→write lock upgrade returns
+    // SQLITE_BUSY immediately when another writer holds the lock — busy_timeout
+    // does not apply to upgrades, so concurrent processes produced spurious
+    // "database is locked" failures here. Taking the write lock at BEGIN time
+    // waits under busy_timeout like every other writer.
+    db.exec("BEGIN IMMEDIATE");
     let leaseLost = false;
-    db.transaction(() => {
+    try {
         // State transitions surface notes or change future scheduling. The lease
         // check must be inside the same write transaction so ownership cannot be
         // lost between a pre-check and the durable update.
         if (args.leaseHeld && !args.leaseHeld()) {
             leaseLost = true;
-            return;
+        } else {
+            args.write();
         }
-        args.write();
-    })();
+        db.exec("COMMIT");
+    } catch (error) {
+        try {
+            db.exec("ROLLBACK");
+        } catch {
+            // Connection-level failures leave nothing to roll back.
+        }
+        throw error;
+    }
     if (leaseLost) {
         throw new Error(`Dream lease lost during smart-note ${args.phase} commit`);
     }
