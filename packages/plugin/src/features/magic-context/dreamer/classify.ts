@@ -1,7 +1,10 @@
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
-import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
+import {
+    extractLatestAssistantText,
+    hasLengthCappedOutput,
+} from "../../../shared/assistant-message-extractor";
 import { describeError, getErrorMessage } from "../../../shared/error-message";
 import { shouldKeepSubagents } from "../../../shared/keep-subagents";
 import { log } from "../../../shared/logger";
@@ -22,7 +25,8 @@ import {
     type ClassifyPromptMemory,
     parseClassifyManifest,
 } from "./classify-prompt";
-import { peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
+import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
+import { assertManifestCoversExactly } from "./manifest-parser";
 
 /**
  * classify-memories: a NON-agentic single-shot transform. Scores each project
@@ -238,8 +242,12 @@ async function classifyOneChunk(
                     });
                 },
                 validateOutput: (messages) => {
+                    if (hasLengthCappedOutput(messages)) {
+                        throw new Error("classify returned length-capped output");
+                    }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("classify returned no output");
+                    parseClassifyManifest(text);
                     return text;
                 },
             },
@@ -273,26 +281,26 @@ async function classifyOneChunk(
     }
 }
 
-/** Apply the manifest host-side: only ids that were IN this chunk; shareable
- *  fails closed against sensitive text. setMemoryClassification stamps
+/** Apply the manifest host-side: the manifest must cover exactly this chunk;
+ *  shareable fails closed against sensitive text. setMemoryClassification stamps
  *  classified_at (the run-gate) and is cache-neutral. */
-function applyClassifications(
+export function applyClassifications(
     args: ClassifyArgs,
     chunk: Memory[],
     manifestText: string,
 ): { classified: number; changed: number } {
     const byId = new Map(chunk.map((m) => [m.id, m]));
-    const parsed = parseClassifyManifest(manifestText).filter((p) => byId.has(p.id));
+    const parsed = parseClassifyManifest(manifestText);
+    assertManifestCoversExactly(
+        parsed.map((entry) => entry.id),
+        new Set(byId.keys()),
+        "classify",
+    );
     if (parsed.length === 0) return { classified: 0, changed: 0 };
 
     let classified = 0;
     let changed = 0;
-    let leaseLost = false;
-    args.db.transaction(() => {
-        if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-            leaseLost = true;
-            return;
-        }
+    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
         for (const p of parsed) {
             const memory = byId.get(p.id);
             if (!memory) continue;
@@ -310,8 +318,7 @@ function applyClassifications(
             classified += 1; // stamped classified_at (run-gate satisfied)
             if (didChange) changed += 1; // an actual column value moved
         }
-    })();
-    if (leaseLost) throw new Error("Dream lease lost during classify commit");
+    });
     return { classified, changed };
 }
 

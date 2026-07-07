@@ -26,15 +26,29 @@ describe("parseMapMemoriesManifest", () => {
     });
 
     it("treats a memory with no files (and not explicit independent) as independent", () => {
-        const out = parseMapMemoriesManifest(`<memory id="9"/>`);
+        const out = parseMapMemoriesManifest(`<mappings><memory id="9"/></mappings>`);
         expect(out).toEqual([{ id: 9, files: [], independent: true }]);
     });
 
-    it("skips entries without a numeric id and trims/dedupes file whitespace", () => {
+    it("trims file whitespace", () => {
         const out = parseMapMemoriesManifest(
-            `<memory id="x" files="a.ts"/><memory id="5" files=" a.ts ,  b.ts "/>`,
+            `<mappings><memory id="5" files=" a.ts ,  b.ts "/></mappings>`,
         );
         expect(out).toEqual([{ id: 5, files: ["a.ts", "b.ts"], independent: false }]);
+    });
+
+    it("rejects truncated, duplicate, and invalid entries", () => {
+        expect(() => parseMapMemoriesManifest(`<mappings><memory id="5" files="a.ts"/>`)).toThrow(
+            /closing root/,
+        );
+        expect(() =>
+            parseMapMemoriesManifest(
+                `<mappings><memory id="5" files="a.ts"/><memory id="5" independent="true"/></mappings>`,
+            ),
+        ).toThrow(/duplicate id/);
+        expect(() =>
+            parseMapMemoriesManifest(`<mappings><memory id="x" files="a.ts"/></mappings>`),
+        ).toThrow(/numeric id/);
     });
 });
 

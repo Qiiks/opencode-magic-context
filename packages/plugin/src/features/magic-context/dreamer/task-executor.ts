@@ -28,7 +28,7 @@ import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
 import { runClassify } from "./classify";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
-import { peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
+import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import {
     enforceMaintainDocsProtectedRegions,
     snapshotMaintainDocsFiles,
@@ -758,12 +758,11 @@ async function runRetrospectiveTask(
         // so a crash between them can't leave the window un-recorded (which would
         // re-deepen + risk a duplicate observation next run, since
         // insertUserMemoryCandidates has no unique key). Both are plain DB writes.
-        const applied = db.transaction(
-            (): ReturnType<typeof applyRetrospectiveLearnings> | null => {
-                if (!peekLeaseHolderAndExpiry(db, holderId, leaseKey)) {
-                    leaseLost = true;
-                    return null;
-                }
+        const applied = runLeaseGuardedWrite(
+            db,
+            holderId,
+            leaseKey,
+            (): ReturnType<typeof applyRetrospectiveLearnings> => {
                 const result = applyRetrospectiveLearnings({
                     db,
                     projectIdentity,
@@ -780,7 +779,7 @@ async function runRetrospectiveTask(
                 recordRetrospectiveWindowProcessed(db, projectIdentity, windowKey);
                 return result;
             },
-        )();
+        );
         if (leaseLost || !applied) throw new Error("Dream lease lost during retrospective commit");
         log(
             `[dreamer] retrospective: flagged=${flagged.length} learnings=${learnings.length} memory=${applied.memoryWritten} observations=${applied.observationsInserted} dropped=${applied.observationsDropped} rejected=${applied.rejected.length}`,

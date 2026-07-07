@@ -107,7 +107,13 @@ class ScriptedProvider implements RetrospectiveRawProvider {
         private readonly rowsBySession: Map<string, RetrospectiveRawMessage[]>,
     ) {}
     listProjectSessions(): RetrospectiveProjectSession[] {
-        return this.sessions.map((sessionId) => ({ sessionId }));
+        return this.sessions.map((sessionId) => ({
+            sessionId,
+            updatedAt: Math.max(
+                0,
+                ...(this.rowsBySession.get(sessionId) ?? []).map((row) => row.ts),
+            ),
+        }));
     }
     readUserMessagesSince(
         sessionId: string,
@@ -121,6 +127,19 @@ class ScriptedProvider implements RetrospectiveRawProvider {
             .filter((r) => r.ts > sinceMs)
             .sort((a, b) => a.ts - b.ts);
         return { messages: eligible.slice(0, limit), truncated: eligible.length > limit };
+    }
+    readOldestMessageTimesSince(
+        sessionIds: readonly string[],
+        sinceMs: number,
+    ): Map<string, number> {
+        const out = new Map<string, number>();
+        for (const sessionId of sessionIds) {
+            const oldest = (this.rowsBySession.get(sessionId) ?? [])
+                .filter((r) => r.ts > sinceMs)
+                .sort((a, b) => a.ts - b.ts)[0];
+            if (oldest) out.set(sessionId, oldest.ts);
+        }
+        return out;
     }
     readUserMessagesBefore(
         sessionId: string,
@@ -270,7 +289,7 @@ describe("readRetrospectiveScanWindow", () => {
         expect(win.maxScannedTs).toBe(129);
     });
 
-    test("scans every in-window session before advancing the global watermark", async () => {
+    test("session cap drains oldest eligible sessions without skipping older backlog", async () => {
         const sessionIds = Array.from({ length: 25 }, (_, i) => `s${25 - i}`);
         const rows = new Map(
             sessionIds.map((sessionId) => {
@@ -286,9 +305,58 @@ describe("readRetrospectiveScanWindow", () => {
             maxSessionsPerRun: 20,
         });
 
-        expect(win.messages).toHaveLength(25);
-        expect(win.messages.map((m) => m.sessionId).sort()).toEqual(sessionIds.slice().sort());
-        expect(win.maxScannedTs).toBe(125);
+        expect(win.messages).toHaveLength(20);
+        expect(win.messages.map((m) => m.sessionId)).toEqual(
+            Array.from({ length: 20 }, (_, i) => `s${i + 1}`),
+        );
+        expect(win.maxScannedTs).toBe(120);
+
+        const win2 = await readRetrospectiveScanWindow(provider, "proj", win.maxScannedTs, 0, {
+            maxMessagesPerRun: 100,
+            capPerSession: 10,
+            maxSessionsPerRun: 20,
+        });
+        expect(win2.messages.map((m) => m.sessionId)).toEqual(["s21", "s22", "s23", "s24", "s25"]);
+        expect(win2.maxScannedTs).toBe(125);
+
+        const scanned = [...win.messages, ...win2.messages].map((message) => message.sessionId);
+        expect(new Set(scanned).size).toBe(25);
+        expect(scanned.sort()).toEqual(sessionIds.slice().sort());
+    });
+
+    test("session cap clamps to the oldest pending message in an excluded long session", async () => {
+        const rows = new Map([
+            ["recent-short", [u("recent-short", 120, "already later")]],
+            [
+                "long-session",
+                [u("long-session", 115, "older backlog"), u("long-session", 200, "tail")],
+            ],
+        ]);
+        const provider = new ScriptedProvider(["recent-short", "long-session"], rows);
+
+        const win = await readRetrospectiveScanWindow(provider, "proj", 100, 0, {
+            maxMessagesPerRun: 100,
+            capPerSession: 10,
+            maxSessionsPerRun: 1,
+        });
+        expect(win.messages.map((m) => m.text)).toEqual(["older backlog", "tail"]);
+        expect(win.maxScannedTs).toBe(119);
+
+        const win2 = await readRetrospectiveScanWindow(provider, "proj", win.maxScannedTs, 0, {
+            maxMessagesPerRun: 100,
+            capPerSession: 10,
+            maxSessionsPerRun: 1,
+        });
+        expect(win2.messages.map((m) => m.text)).toEqual(["already later"]);
+        expect(win2.maxScannedTs).toBe(120);
+
+        const win3 = await readRetrospectiveScanWindow(provider, "proj", win2.maxScannedTs, 0, {
+            maxMessagesPerRun: 100,
+            capPerSession: 10,
+            maxSessionsPerRun: 1,
+        });
+        expect(win3.messages.map((m) => m.text)).toEqual(["tail"]);
+        expect(win3.maxScannedTs).toBe(200);
     });
 
     test("dedupes a row that appears in both since and overlap reads", async () => {

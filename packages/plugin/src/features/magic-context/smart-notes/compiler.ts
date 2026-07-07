@@ -124,6 +124,7 @@ Remember: output only the JSON object described by the system prompt.`;
             },
             {
                 timeoutMs: remainingMs,
+                signal: args.signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:smart-note-compiler",
                 fetchOutput: async () => {

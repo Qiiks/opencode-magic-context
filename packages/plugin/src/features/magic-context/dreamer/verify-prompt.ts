@@ -13,6 +13,8 @@
  * prompt and the host apply both bias hard toward keeping memories.
  */
 
+import { assertNoDuplicateManifestIds, extractCompleteManifestBody } from "./manifest-parser";
+
 export const VERIFY_SYSTEM_PROMPT = `You are a memory verifier for the magic-context system. You verify project memories against the CURRENT code.
 
 Each memory below comes with its backing file(s) — the code it makes a claim about. For EACH memory: read its backing files (you may read more if needed) and decide whether the memory is still accurate.
@@ -81,24 +83,30 @@ function filesOf(s: string): string[] {
         .filter(Boolean);
 }
 
-/** Parse the agent's `<verify>` manifest. Tolerant of attribute order, and of
- *  `<update>` either self-closing or wrapping its corrected content. */
+/** Parse the agent's complete `<verify>` manifest. The root close tag is
+ *  mandatory so truncated output cannot apply a partial set of verdicts. */
 export function parseVerifyManifest(text: string): ParsedVerifyManifest {
     const out: ParsedVerifyManifest = { verified: [], updated: [], archived: [] };
+    const body = extractCompleteManifestBody(text, "verify");
 
-    for (const m of text.matchAll(/<verified\b([^>]*)\/?>/g)) {
+    for (const m of body.matchAll(/<verified\b([^>]*)\/?>/g)) {
         const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
-        if (Number.isInteger(id)) out.verified.push({ id, files: filesOf(m[1]) });
+        if (!Number.isInteger(id)) throw new Error("verify manifest entry missing numeric id");
+        out.verified.push({ id, files: filesOf(m[1]) });
     }
-    for (const m of text.matchAll(/<update\b([^>]*?)(?:\/>|>([\s\S]*?)<\/update>)/g)) {
+    for (const m of body.matchAll(/<update\b([^>]*?)(?:\/>|>([\s\S]*?)<\/update>)/g)) {
         const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
-        if (Number.isInteger(id)) {
-            out.updated.push({ id, files: filesOf(m[1]), content: (m[2] ?? "").trim() });
-        }
+        if (!Number.isInteger(id)) throw new Error("verify manifest entry missing numeric id");
+        out.updated.push({ id, files: filesOf(m[1]), content: (m[2] ?? "").trim() });
     }
-    for (const m of text.matchAll(/<archive\b([^>]*)\/?>/g)) {
+    for (const m of body.matchAll(/<archive\b([^>]*)\/?>/g)) {
         const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
-        if (Number.isInteger(id)) out.archived.push({ id, reason: attrOf(m[1], "reason") ?? "" });
+        if (!Number.isInteger(id)) throw new Error("verify manifest entry missing numeric id");
+        out.archived.push({ id, reason: attrOf(m[1], "reason") ?? "" });
     }
+    assertNoDuplicateManifestIds(
+        [...out.verified, ...out.updated, ...out.archived].map((entry) => entry.id),
+        "verify",
+    );
     return out;
 }

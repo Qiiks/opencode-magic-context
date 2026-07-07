@@ -118,20 +118,58 @@ describe("applyVerifyManifest", () => {
             });
             recordMemoryVerifications(db, memory.id, ["src/old.ts"], 1_000);
 
-            const result = await applyVerifyManifest(
-                verifyArgs(db, dir, projectIdentity),
-                [
-                    {
-                        id: memory.id,
-                        category: memory.category,
-                        content: memory.content,
-                        mappedFiles: ["src/old.ts"],
-                    },
-                ],
-                `<verify><verified id="${memory.id}" files="src/old.ts"/><archive id="${memory.id}" reason="stale"/></verify>`,
-            );
+            await expect(
+                applyVerifyManifest(
+                    verifyArgs(db, dir, projectIdentity),
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            mappedFiles: ["src/old.ts"],
+                        },
+                    ],
+                    `<verify><verified id="${memory.id}" files="src/old.ts"/><archive id="${memory.id}" reason="stale"/></verify>`,
+                ),
+            ).rejects.toThrow(/duplicate id/);
 
-            expect(result).toEqual({ verified: 0, updated: 0, archived: 0 });
+            expect(getMemoryById(db, memory.id)?.status).toBe("active");
+            const state = getMemoryVerifications(db, [memory.id]).get(memory.id);
+            expect(state?.files).toEqual(["src/old.ts"]);
+            expect(state?.verifiedAt).toBe(1_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rejects a truncated manifest before any DB write", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Old value lives in src/old.ts.",
+                sourceSessionId: "ses",
+            });
+            recordMemoryVerifications(db, memory.id, ["src/old.ts"], 1_000);
+
+            await expect(
+                applyVerifyManifest(
+                    verifyArgs(db, dir, projectIdentity),
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            mappedFiles: ["src/old.ts"],
+                        },
+                    ],
+                    `<verify><archive id="${memory.id}" reason="stale"/>`,
+                ),
+            ).rejects.toThrow(/closing root/);
+
             expect(getMemoryById(db, memory.id)?.status).toBe("active");
             const state = getMemoryVerifications(db, [memory.id]).get(memory.id);
             expect(state?.files).toEqual(["src/old.ts"]);

@@ -2,7 +2,10 @@ import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
-import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
+import {
+    extractLatestAssistantText,
+    hasLengthCappedOutput,
+} from "../../../shared/assistant-message-extractor";
 import { describeError, getErrorMessage } from "../../../shared/error-message";
 import { shouldKeepSubagents } from "../../../shared/keep-subagents";
 import { log } from "../../../shared/logger";
@@ -22,7 +25,8 @@ import {
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import { recordChildInvocation } from "../subagent-token-capture";
-import { peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
+import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
+import { assertManifestCoversExactly } from "./manifest-parser";
 import { partitionVerifyScope } from "./verify-gate";
 import {
     buildVerifyPrompt,
@@ -183,8 +187,12 @@ async function verifyOneBatch(
                     });
                 },
                 validateOutput: (messages) => {
+                    if (hasLengthCappedOutput(messages)) {
+                        throw new Error("verify returned length-capped output");
+                    }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("verify returned no output");
+                    parseVerifyManifest(text);
                     return text;
                 },
             },
@@ -240,6 +248,11 @@ export async function applyVerifyManifest(
 ): Promise<{ verified: number; updated: number; archived: number }> {
     const batchIds = new Set(batch.map((m) => m.id));
     const parsed = parseVerifyManifest(manifestText);
+    assertManifestCoversExactly(
+        [...parsed.verified, ...parsed.updated, ...parsed.archived].map((entry) => entry.id),
+        batchIds,
+        "verify",
+    );
     const now = Date.now();
 
     // Pre-normalize files OUTSIDE the transaction (git/realpath I/O). For each
@@ -249,24 +262,11 @@ export async function applyVerifyManifest(
         | { kind: "update"; id: number; files: string[]; content: string; hash: string }
         | { kind: "archive"; id: number; reason: string };
     const writes: VerifyWrite[] = [];
-    const verdictCounts = new Map<number, number>();
-    for (const verdict of [...parsed.verified, ...parsed.updated, ...parsed.archived]) {
-        if (!batchIds.has(verdict.id)) continue;
-        verdictCounts.set(verdict.id, (verdictCounts.get(verdict.id) ?? 0) + 1);
-    }
-    const conflictingIds = new Set(
-        Array.from(verdictCounts.entries())
-            .filter(([, count]) => count !== 1)
-            .map(([id]) => id),
-    );
-
     for (const v of parsed.verified) {
-        if (!batchIds.has(v.id) || conflictingIds.has(v.id)) continue;
         const files = await normalizeFiles(args, v.files);
         writes.push({ kind: "verify", id: v.id, files });
     }
     for (const u of parsed.updated) {
-        if (!batchIds.has(u.id) || conflictingIds.has(u.id)) continue;
         const content = u.content.trim();
         // An empty/oversized "update" is unsafe — fall back to a plain re-verify
         // (bank the progress, keep the old content) rather than wipe a memory.
@@ -285,7 +285,6 @@ export async function applyVerifyManifest(
         });
     }
     for (const a of parsed.archived) {
-        if (!batchIds.has(a.id) || conflictingIds.has(a.id)) continue;
         writes.push({ kind: "archive", id: a.id, reason: a.reason });
     }
     if (writes.length === 0) return { verified: 0, updated: 0, archived: 0 };
@@ -293,12 +292,7 @@ export async function applyVerifyManifest(
     let verified = 0;
     let updated = 0;
     let archived = 0;
-    let leaseLost = false;
-    args.db.transaction(() => {
-        if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-            leaseLost = true;
-            return;
-        }
+    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
         for (const w of writes) {
             const memory = getMemoryById(args.db, w.id);
             if (!isPrimaryMutable(memory)) continue; // archived/superseded → skip stale verdict
@@ -326,8 +320,7 @@ export async function applyVerifyManifest(
                 archived += 1;
             }
         }
-    })();
-    if (leaseLost) throw new Error("Dream lease lost during verify commit");
+    });
     return { verified, updated, archived };
 }
 

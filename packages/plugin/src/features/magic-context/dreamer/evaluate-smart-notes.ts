@@ -53,6 +53,28 @@ const MAX_COMPILATION_FAILURES = 3;
 const SMART_NOTE_CONFIRMATION_SYSTEM_PROMPT =
     'You are a no-tool smart-note confirmation evaluator. Output only JSON shaped as {"met": boolean}. Return true only when the supplied text alone proves the condition is satisfied.';
 
+function createPromptAbortSignal(
+    parent: AbortSignal,
+    timeoutMs: number,
+    timeoutMessage: string,
+): { signal: AbortSignal; cleanup: () => void } {
+    const controller = new AbortController();
+    const abortFromParent = () => {
+        controller.abort(parent.reason ?? new Error("smart-note prompt aborted by lease loss"));
+    };
+    if (parent.aborted) abortFromParent();
+    else parent.addEventListener("abort", abortFromParent, { once: true });
+
+    const timer = setTimeout(() => controller.abort(new Error(timeoutMessage)), timeoutMs);
+    return {
+        signal: controller.signal,
+        cleanup: () => {
+            clearTimeout(timer);
+            parent.removeEventListener("abort", abortFromParent);
+        },
+    };
+}
+
 /**
  * Compile and maintain smart-note checks. The legacy broad-tool agentic
  * evaluator is intentionally retired: this task uses a no-tool compiler agent,
@@ -70,6 +92,7 @@ export async function evaluateSmartNotes(
     }
 
     let leaseLost = false;
+    const leaseAbortController = new AbortController();
     const leaseHeld = (): boolean =>
         !leaseLost && peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey);
     const assertLeaseHeld = (phase: string): void => {
@@ -80,6 +103,7 @@ export async function evaluateSmartNotes(
     };
     const heartbeat = startLeaseHeartbeat(args.db, args.holderId, args.leaseKey, () => {
         leaseLost = true;
+        leaseAbortController.abort(new Error("Dream lease lost during smart notes"));
         log("[dreamer] smart notes: lease lost — aborting");
         args.onLeaseLost?.("smart notes");
     });
@@ -108,7 +132,14 @@ export async function evaluateSmartNotes(
             if (Date.now() >= args.deadline) break;
             assertLeaseHeld("compile start");
             didWork = true;
-            const compiled = await compileNote(args, note, projectRoot, assertLeaseHeld, leaseHeld);
+            const compiled = await compileNote(
+                args,
+                note,
+                projectRoot,
+                assertLeaseHeld,
+                leaseHeld,
+                leaseAbortController.signal,
+            );
             if (compiled) surfaced += 1;
         }
 
@@ -133,7 +164,13 @@ export async function evaluateSmartNotes(
             if (Date.now() >= args.deadline) break;
             assertLeaseHeld("fallback start");
             didWork = true;
-            const met = await confirmReadOnly(args, note.id, note.content, note.surfaceCondition);
+            const met = await confirmReadOnly(
+                args,
+                note.id,
+                note.content,
+                note.surfaceCondition,
+                leaseAbortController.signal,
+            );
             const now = Date.now();
             assertLeaseHeld("fallback commit");
             commitSmartNoteState(args.db, {
@@ -173,11 +210,12 @@ async function compileNote(
     projectRoot: string,
     assertLeaseHeld: (phase: string) => void,
     leaseHeld: () => boolean,
+    leaseSignal: AbortSignal,
 ): Promise<boolean> {
-    const controller = new AbortController();
-    const timer = setTimeout(
-        () => controller.abort(new Error("smart-note compile deadline")),
+    const promptSignal = createPromptAbortSignal(
+        leaseSignal,
         Math.max(1_000, args.deadline - Date.now()),
+        "smart-note compile deadline",
     );
     try {
         const result = await compileSmartNoteCheck({
@@ -188,7 +226,7 @@ async function compileNote(
             projectIdentity: args.projectIdentity,
             note,
             capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
-            signal: controller.signal,
+            signal: promptSignal.signal,
             deadline: args.deadline,
             model: args.model,
             fallbackModels: args.fallbackModels,
@@ -242,7 +280,7 @@ async function compileNote(
         });
         return result.dryRun.met;
     } finally {
-        clearTimeout(timer);
+        promptSignal.cleanup();
     }
 }
 
@@ -306,6 +344,7 @@ async function confirmReadOnly(
     noteId: number,
     content: string,
     surfaceCondition: string | null,
+    leaseSignal: AbortSignal,
 ): Promise<boolean> {
     let childSessionId: string | null = null;
     const startedAt = Date.now();
@@ -358,45 +397,56 @@ Note content: ${JSON.stringify(content)}
 Surface condition: ${JSON.stringify(surfaceCondition ?? "")}
 
 Output exactly JSON: {"met": false}`;
-        const run = await shared.promptSyncWithValidatedOutputRetry(
-            args.client,
-            {
-                path: { id: childSessionId },
-                query: { directory: args.sessionDirectory ?? args.projectIdentity },
-                body: {
-                    agent: SMART_NOTE_COMPILER_AGENT,
-                    system: SMART_NOTE_CONFIRMATION_SYSTEM_PROMPT,
-                    ...modelBodyField(args.model),
-                    parts: [{ type: "text", text: prompt, synthetic: true }],
-                },
-            },
-            {
-                timeoutMs: Math.max(1_000, args.deadline - Date.now()),
-                fallbackModels: args.fallbackModels,
-                callContext: "dreamer:smart-note-read-only-confirm",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: childSessionId as string },
-                        query: {
-                            directory: args.sessionDirectory ?? args.projectIdentity,
-                            limit: 20,
-                        },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
-                validateOutput: (messages) => {
-                    const text = extractLatestAssistantText(messages) ?? "";
-                    const match = text.match(/\{[\s\S]*\}/);
-                    if (!match) throw new Error("confirmation evaluator returned no JSON");
-                    const parsed = JSON.parse(match[0]) as { met?: unknown };
-                    if (typeof parsed.met !== "boolean")
-                        throw new Error("confirmation met missing");
-                    return parsed.met;
-                },
-            },
+        const promptSignal = createPromptAbortSignal(
+            leaseSignal,
+            Math.max(1_000, args.deadline - Date.now()),
+            "smart-note confirmation deadline",
         );
+        let run: { output: unknown[]; validated: boolean };
+        try {
+            run = await shared.promptSyncWithValidatedOutputRetry(
+                args.client,
+                {
+                    path: { id: childSessionId },
+                    query: { directory: args.sessionDirectory ?? args.projectIdentity },
+                    body: {
+                        agent: SMART_NOTE_COMPILER_AGENT,
+                        system: SMART_NOTE_CONFIRMATION_SYSTEM_PROMPT,
+                        ...modelBodyField(args.model),
+                        parts: [{ type: "text", text: prompt, synthetic: true }],
+                    },
+                },
+                {
+                    timeoutMs: Math.max(1_000, args.deadline - Date.now()),
+                    signal: promptSignal.signal,
+                    fallbackModels: args.fallbackModels,
+                    callContext: "dreamer:smart-note-read-only-confirm",
+                    fetchOutput: async () => {
+                        const messagesResponse = await args.client.session.messages({
+                            path: { id: childSessionId as string },
+                            query: {
+                                directory: args.sessionDirectory ?? args.projectIdentity,
+                                limit: 20,
+                            },
+                        });
+                        return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
+                            preferResponseOnMissingData: true,
+                        });
+                    },
+                    validateOutput: (messages) => {
+                        const text = extractLatestAssistantText(messages) ?? "";
+                        const match = text.match(/\{[\s\S]*\}/);
+                        if (!match) throw new Error("confirmation evaluator returned no JSON");
+                        const parsed = JSON.parse(match[0]) as { met?: unknown };
+                        if (typeof parsed.met !== "boolean")
+                            throw new Error("confirmation met missing");
+                        return parsed.met;
+                    },
+                },
+            );
+        } finally {
+            promptSignal.cleanup();
+        }
         recordInvocation({ status: "completed", messages: run.output });
         return run.validated;
     } catch (error) {

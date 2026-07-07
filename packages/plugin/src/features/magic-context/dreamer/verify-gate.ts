@@ -146,7 +146,7 @@ export async function partitionVerifyScope(args: {
             (file) =>
                 !verificationFileExists(gitRoot, file) || // deleted → re-check
                 uncommitted.has(file) || // pending working-tree edit
-                (changeTimes.get(file) ?? 0) > verifiedAt, // committed change after verify
+                (changeTimes.get(file) ?? 0) >= verifiedAt - 1_000, // git commit times are second-granular
         );
         if (needs) inScope.push(toPrompt(m));
         else skippedIds.push(m.id);
