@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { V2_MEMORY_CATEGORIES } from "./memory/constants";
 import { normalizeStoredProjectPath, storedPathBelongsToIdentity } from "./project-identity";
@@ -28,6 +29,7 @@ interface WorkspaceShareCategoriesRow {
 }
 
 const VALID_SHARE_CATEGORIES = new Set<string>(V2_MEMORY_CATEGORIES);
+const DEFAULT_WORKSPACE_SHARE_CATEGORIES = ["CONSTRAINTS"] as const;
 
 function tableExists(db: Database, tableName: string): boolean {
     const row = db
@@ -49,20 +51,44 @@ function placeholders(values: readonly unknown[]): string {
     return values.map(() => "?").join(", ");
 }
 
-function normalizeShareCategories(raw: unknown): string[] | null {
-    if (raw === null || raw === undefined) return null;
-    if (typeof raw !== "string") return null;
+function defaultWorkspaceShareCategories(): string[] {
+    return [...DEFAULT_WORKSPACE_SHARE_CATEGORIES];
+}
+
+function warnInvalidShareCategories(reason: string, raw: unknown): void {
+    log(
+        "[magic-context] WARN: invalid workspace share_categories; sharing no foreign memory categories",
+        {
+            reason,
+            raw,
+        },
+    );
+}
+
+function normalizeShareCategories(raw: unknown): string[] {
+    if (raw === null || raw === undefined) {
+        return defaultWorkspaceShareCategories();
+    }
+    if (typeof raw !== "string") {
+        warnInvalidShareCategories("not a string", raw);
+        return [];
+    }
     let parsed: unknown;
     try {
         parsed = JSON.parse(raw);
     } catch {
-        return null;
+        warnInvalidShareCategories("malformed JSON", raw);
+        return [];
     }
-    if (!Array.isArray(parsed)) return null;
+    if (!Array.isArray(parsed)) {
+        warnInvalidShareCategories("not a JSON array", raw);
+        return [];
+    }
     const categories: string[] = [];
     for (const value of parsed) {
         if (typeof value !== "string" || !VALID_SHARE_CATEGORIES.has(value)) {
-            return null;
+            warnInvalidShareCategories("unknown category", raw);
+            return [];
         }
         if (!categories.includes(value)) categories.push(value);
     }
@@ -74,14 +100,32 @@ function selectWorkspaceShareCategories(
     identities: readonly string[],
 ): string[] | null {
     const candidates = uniqueSorted(identities.filter((identity) => identity.length > 0));
-    if (
-        candidates.length === 0 ||
-        !tableExists(db, "workspace_members") ||
-        !tableExists(db, "workspaces") ||
-        !columnExists(db, "workspaces", "share_categories")
-    ) {
+    if (candidates.length === 0 || !tableExists(db, "workspace_members")) {
         return null;
     }
+
+    const hasMembership = Boolean(
+        db
+            .prepare(
+                `SELECT 1
+                   FROM workspace_members
+                  WHERE project_path IN (${placeholders(candidates)})
+                  LIMIT 1`,
+            )
+            .get(...candidates),
+    );
+    if (!hasMembership) return null;
+
+    if (!tableExists(db, "workspaces")) {
+        log(
+            "[magic-context] WARN: workspace member has no workspaces table; sharing no foreign memory categories",
+        );
+        return [];
+    }
+    if (!columnExists(db, "workspaces", "share_categories")) {
+        return defaultWorkspaceShareCategories();
+    }
+
     const row = db
         .prepare(
             `SELECT workspace.share_categories AS shareCategories
@@ -92,9 +136,23 @@ function selectWorkspaceShareCategories(
               LIMIT 1`,
         )
         .get(...candidates) as WorkspaceShareCategoriesRow | undefined;
-    return normalizeShareCategories(row?.shareCategories ?? null);
+    if (!row) {
+        log(
+            "[magic-context] WARN: workspace member has no workspace share_categories row; sharing no foreign memory categories",
+        );
+        return [];
+    }
+    return normalizeShareCategories(row.shareCategories);
 }
 
+/**
+ * Resolve the categories this workspace shares from foreign member projects.
+ *
+ * Return null when the project is not in a workspace. For workspace members,
+ * always return a list: [] means no foreign categories are shared, malformed
+ * JSON falls back to [], and older rows with missing or NULL share_categories
+ * default to CONSTRAINTS only.
+ */
 export function resolveWorkspaceShareCategories(
     db: Database,
     projectIdentity: string,
@@ -260,7 +318,10 @@ export function computeWorkspaceEpochFingerprint(
     const hash = createHash("sha256");
     hash.update("share_categories", "utf8");
     hash.update("\0");
-    hash.update(shareCategories === null ? "ALL" : JSON.stringify(shareCategories), "utf8");
+    hash.update(
+        shareCategories === null ? "NO_WORKSPACE" : JSON.stringify(shareCategories),
+        "utf8",
+    );
     hash.update("\n");
     for (const identity of canonical) {
         hash.update(identity, "utf8");

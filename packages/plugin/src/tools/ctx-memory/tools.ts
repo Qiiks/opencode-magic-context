@@ -320,18 +320,18 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                           expandedWorkspace.canonicalIdentityByStoredPath,
                       ) ?? projectIdentityForStoredPath(rawProjectPath))
                     : projectIdentityForStoredPath(rawProjectPath);
-            // The workspace's share-category policy, identical to the render path
-            // (resolveWorkspaceRenderContext): null = share all categories.
+            // The workspace's share-category policy matches the render path.
+            // null means there is no workspace filter; a workspaced caller gets
+            // an explicit list where [] shares no foreign categories.
             const toolShareCategories =
                 workspaceIdentitySet.identities.length > 1
                     ? resolveWorkspaceShareCategories(deps.db, projectPath)
                     : null;
-            // Tool visibility MUST match render visibility, or the agent could
-            // mutate (update/archive) a foreign workspace memory it can't even
-            // see. Own-project memories: every category is mutable. Foreign
-            // member memories: only when shared — shareCategories===null shares
-            // all, an empty list shares none, otherwise only the listed
-            // categories. Mirrors buildWorkspaceMemorySqlFilter's own/foreign split.
+            // Visibility is the READ contract: own memories are visible in every
+            // category, while foreign workspace memories are visible only in
+            // categories the workspace explicitly shares. Mutations by primary
+            // agents use memoryOwnedByTool below so shared visibility never
+            // grants write access to another project.
             const memoryVisibleToTool = (memory: Memory): boolean => {
                 if (workspaceIdentitySet.identities.length <= 1) {
                     return memoryBelongsToProject(memory, projectPath);
@@ -348,10 +348,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 }
                 const isOwn = targetIdentityForStoredPath(memory.projectPath) === projectPath;
                 if (isOwn) return true;
-                return (
-                    toolShareCategories === null || toolShareCategories.includes(memory.category)
-                );
+                return toolShareCategories?.includes(memory.category) ?? false;
             };
+            const memoryOwnedByTool = (memory: Memory): boolean =>
+                workspaceIdentitySet.identities.length > 1
+                    ? targetIdentityForStoredPath(memory.projectPath) === projectPath
+                    : memoryBelongsToProject(memory, projectPath);
             const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
             if (
                 embeddingSnapshot
@@ -433,7 +435,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
 
                 const rawProjectPath = projectPathForMemoryId(deps.db, updateId);
                 const memory = getMemoryById(deps.db, updateId);
-                if (!memory || !rawProjectPath || !memoryVisibleToTool(memory)) {
+                const updateAllowed = memory
+                    ? toolContext.agent === DREAMER_AGENT
+                        ? memoryVisibleToTool(memory)
+                        : memoryOwnedByTool(memory)
+                    : false;
+                if (!memory || !rawProjectPath || !updateAllowed) {
                     return `Error: Memory with ID ${updateId} was not found.`;
                 }
                 if (toolContext.agent !== DREAMER_AGENT && !isPrimaryMutableMemory(memory)) {
@@ -508,7 +515,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 // its own resolved project. The dreamer keeps the cross-identity
                 // path (see the "merging across identities" test).
                 if (toolContext.agent !== DREAMER_AGENT) {
-                    const foreign = sourceMemories.find((memory) => !memoryVisibleToTool(memory));
+                    const foreign = sourceMemories.find((memory) => !memoryOwnedByTool(memory));
                     if (foreign) {
                         return `Error: Memory with ID ${foreign.id} was not found.`;
                     }
@@ -686,7 +693,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 for (const memoryId of archiveIds) {
                     const rawProjectPath = projectPathForMemoryId(deps.db, memoryId);
                     const memory = getMemoryById(deps.db, memoryId);
-                    if (!memory || !rawProjectPath || !memoryVisibleToTool(memory)) {
+                    const archiveAllowed = memory
+                        ? toolContext.agent === DREAMER_AGENT
+                            ? memoryVisibleToTool(memory)
+                            : memoryOwnedByTool(memory)
+                        : false;
+                    if (!memory || !rawProjectPath || !archiveAllowed) {
                         return `Error: Memory with ID ${memoryId} was not found.`;
                     }
                     if (toolContext.agent !== DREAMER_AGENT && !isPrimaryMutableMemory(memory)) {

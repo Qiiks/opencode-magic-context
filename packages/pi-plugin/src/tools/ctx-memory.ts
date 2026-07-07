@@ -349,18 +349,18 @@ export function createCtxMemoryTool(
 							expandedWorkspace.canonicalIdentityByStoredPath,
 						) ?? normalizeStoredProjectPath(rawProjectPath))
 					: normalizeStoredProjectPath(rawProjectPath);
-			// The workspace's share-category policy, identical to the render path
-			// (resolveWorkspaceRenderContextPi): null = share all categories.
+			// The workspace's share-category policy matches the render path.
+			// null means there is no workspace filter; a workspaced caller gets
+			// an explicit list where [] shares no foreign categories.
 			const toolShareCategories =
 				workspaceIdentitySet.identities.length > 1
 					? resolveWorkspaceShareCategories(deps.db, projectIdentity)
 					: null;
-			// Tool visibility MUST match render visibility, or the agent could
-			// mutate (update/archive) a foreign workspace memory it can't even
-			// see. Own-project memories: every category is mutable. Foreign member
-			// memories: only when shared — shareCategories===null shares all, an
-			// empty list shares none, otherwise only the listed categories.
-			// Mirrors buildWorkspaceMemorySqlFilter's own/foreign split.
+			// Visibility is the READ contract: own memories are visible in every
+			// category, while foreign workspace memories are visible only in
+			// categories the workspace explicitly shares. Mutations by primary
+			// agents use memoryOwnedByTool below so shared visibility never
+			// grants write access to another project.
 			const memoryVisibleToTool = (memory: Memory): boolean => {
 				if (workspaceIdentitySet.identities.length <= 1) {
 					return storedPathBelongsToIdentity(
@@ -381,11 +381,12 @@ export function createCtxMemoryTool(
 				const isOwn =
 					targetIdentityForStoredPath(memory.projectPath) === projectIdentity;
 				if (isOwn) return true;
-				return (
-					toolShareCategories === null ||
-					toolShareCategories.includes(memory.category)
-				);
+				return toolShareCategories?.includes(memory.category) ?? false;
 			};
+			const memoryOwnedByTool = (memory: Memory): boolean =>
+				workspaceIdentitySet.identities.length > 1
+					? targetIdentityForStoredPath(memory.projectPath) === projectIdentity
+					: storedPathBelongsToIdentity(memory.projectPath, projectIdentity);
 			const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
 			if (
 				snapshot
@@ -463,7 +464,12 @@ export function createCtxMemoryTool(
 				}
 
 				const memory = getMemoryById(deps.db, updateId);
-				if (!memory || !memoryVisibleToTool(memory)) {
+				const updateAllowed = memory
+					? dreamerAllowed
+						? memoryVisibleToTool(memory)
+						: memoryOwnedByTool(memory)
+					: false;
+				if (!memory || !updateAllowed) {
 					return err(`Error: Memory with ID ${updateId} was not found.`);
 				}
 				if (!dreamerAllowed && !isPrimaryMutableMemory(memory)) {
@@ -542,7 +548,7 @@ export function createCtxMemoryTool(
 				// update/archive ownership (parity with OpenCode).
 				if (!dreamerAllowed) {
 					const foreign = sourceMemories.find(
-						(memory) => !memoryVisibleToTool(memory),
+						(memory) => !memoryOwnedByTool(memory),
 					);
 					if (foreign) {
 						return err(`Error: Memory with ID ${foreign.id} was not found.`);
@@ -749,7 +755,12 @@ export function createCtxMemoryTool(
 				// half-archive a batch (all-or-nothing, matching the transaction).
 				for (const memoryId of archiveIds) {
 					const memory = getMemoryById(deps.db, memoryId);
-					if (!memory || !memoryVisibleToTool(memory)) {
+					const archiveAllowed = memory
+						? dreamerAllowed
+							? memoryVisibleToTool(memory)
+							: memoryOwnedByTool(memory)
+						: false;
+					if (!memory || !archiveAllowed) {
 						return err(`Error: Memory with ID ${memoryId} was not found.`);
 					}
 					if (!dreamerAllowed && !isPrimaryMutableMemory(memory)) {

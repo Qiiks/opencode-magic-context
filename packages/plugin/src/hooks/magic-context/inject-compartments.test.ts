@@ -181,6 +181,78 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
     });
 });
 
+describe("prepareCompartmentInjection — workspace memory sharing", () => {
+    it("renders only explicitly shared foreign memory categories", () => {
+        db = makeDb();
+        db.exec(`
+            INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
+            VALUES (1, 'ws', '["CONSTRAINTS"]', 1, 1);
+            INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+            VALUES (1, '${PROJECT_PATH}', 'Own', '${PROJECT_PATH}', 1),
+                   (1, '/tmp/foreign-project', 'Foreign', '/tmp/foreign-project', 1);
+        `);
+        insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "NAMING",
+            content: "own workspace naming remains visible",
+        });
+        insertMemory(db, {
+            projectPath: "/tmp/foreign-project",
+            category: "CONSTRAINTS",
+            content: "foreign workspace constraint is shared",
+        });
+        insertMemory(db, {
+            projectPath: "/tmp/foreign-project",
+            category: "NAMING",
+            content: "foreign workspace naming is hidden",
+        });
+
+        const result = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory: "",
+        });
+
+        expect(result.m0Text).toContain("own workspace naming remains visible");
+        expect(result.m0Text).toContain("foreign workspace constraint is shared");
+        expect(result.m0Text).not.toContain("foreign workspace naming is hidden");
+    });
+
+    it("does not render foreign memories when share_categories is malformed", () => {
+        db = makeDb();
+        db.exec(`
+            INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
+            VALUES (1, 'ws', 'not-json', 1, 1);
+            INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+            VALUES (1, '${PROJECT_PATH}', 'Own', '${PROJECT_PATH}', 1),
+                   (1, '/tmp/foreign-project', 'Foreign', '/tmp/foreign-project', 1);
+        `);
+        insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "CONSTRAINTS",
+            content: "own malformed workspace memory remains visible",
+        });
+        insertMemory(db, {
+            projectPath: "/tmp/foreign-project",
+            category: "CONSTRAINTS",
+            content: "foreign malformed workspace memory is hidden",
+        });
+
+        const result = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory: "",
+        });
+
+        expect(result.m0Text).toContain("own malformed workspace memory remains visible");
+        expect(result.m0Text).not.toContain("foreign malformed workspace memory is hidden");
+    });
+});
+
 describe("prepareCompartmentInjection — transition from empty to compartment", () => {
     it("switches from memories-only to boundary-based splice after first compartment", () => {
         db = makeDb();

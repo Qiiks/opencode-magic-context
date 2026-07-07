@@ -450,7 +450,7 @@ describe("createCtxMemoryTools", () => {
         });
     });
 
-    it("archives a foreign workspace memory under the target identity", async () => {
+    it("rejects archiving a foreign workspace memory even when the category is shared", async () => {
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at) VALUES (1, 'ws', 1, 1);
                 INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
@@ -459,8 +459,8 @@ describe("createCtxMemoryTools", () => {
             `);
         const memory = insertMemory(db, {
             projectPath: "/repo/foreign",
-            category: "KNOWN_ISSUES",
-            content: "Foreign issue is visible through workspace.",
+            category: "CONSTRAINTS",
+            content: "Foreign shared constraint is readable but not mutable.",
         });
 
         const result = await tools.ctx_memory.execute(
@@ -468,9 +468,9 @@ describe("createCtxMemoryTools", () => {
             toolContext(),
         );
 
-        expect(result).toContain("Archived memory");
-        expect(getMemoryById(db, memory.id)?.status).toBe("archived");
-        expect(getMemoryMutationsForRender(db, "/repo/foreign", 0, [memory.id])).toHaveLength(1);
+        expect(result).toBe(`Error: Memory with ID ${memory.id} was not found.`);
+        expect(getMemoryById(db, memory.id)?.status).toBe("active");
+        expect(getMemoryMutationsForRender(db, "/repo/foreign", 0, [memory.id])).toHaveLength(0);
     });
 
     it("REFUSES to archive a foreign memory in a NON-shared category", async () => {
@@ -498,7 +498,7 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, foreignHidden.id)?.status).toBe("active");
     });
 
-    it("still archives a foreign memory in a SHARED category", async () => {
+    it("rejects archiving a foreign memory in a SHARED category", async () => {
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
                 VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
@@ -517,8 +517,8 @@ describe("createCtxMemoryTools", () => {
             toolContext(),
         );
 
-        expect(result).toContain("Archived memory");
-        expect(getMemoryById(db, foreignShared.id)?.status).toBe("archived");
+        expect(result).toBe(`Error: Memory with ID ${foreignShared.id} was not found.`);
+        expect(getMemoryById(db, foreignShared.id)?.status).toBe("active");
     });
 
     it("always allows mutating OWN-project memory regardless of share categories", async () => {
@@ -545,9 +545,9 @@ describe("createCtxMemoryTools", () => {
     });
 
     it("REFUSES a PRIMARY merge that pulls in a foreign memory in a NON-shared category", async () => {
-        // merge MUST gate on the same own/foreign-by-category visibility as
-        // update/archive: a primary agent cannot consolidate a foreign member's
-        // memory it can't even see in its rendered context.
+        // Primary mutations require ownership, not workspace visibility. A shared
+        // workspace may make foreign memories readable, but the caller may only
+        // update, archive, or merge memories from its own project identity set.
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
                 VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
@@ -581,7 +581,7 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, foreignHidden.id)?.status).toBe("active");
     });
 
-    it("allows a PRIMARY merge of a foreign memory in a SHARED category", async () => {
+    it("rejects a PRIMARY merge of a foreign memory in a SHARED category", async () => {
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
                 VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
@@ -610,9 +610,9 @@ describe("createCtxMemoryTools", () => {
             toolContext(),
         );
 
-        expect(result).not.toContain("was not found");
-        expect(getMemoryById(db, own.id)?.status).toBe("archived");
-        expect(getMemoryById(db, foreignShared.id)?.status).toBe("archived");
+        expect(result).toBe(`Error: Memory with ID ${foreignShared.id} was not found.`);
+        expect(getMemoryById(db, own.id)?.status).toBe("active");
+        expect(getMemoryById(db, foreignShared.id)?.status).toBe("active");
     });
 
     it("REJECTS merging memories from DIFFERENT categories (structural guard)", async () => {
@@ -680,6 +680,40 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, foreignHidden.id)?.status).toBe("active");
     });
 
+    it("REFUSES a DREAMER merge when workspace share_categories is malformed", async () => {
+        db.exec(`
+                INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+                VALUES (1, 'ws', 1, 1, 'not-json');
+                INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
+                       (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
+            `);
+        const own = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "CONSTRAINTS",
+            content: "Own constraint malformed policy.",
+        });
+        const foreign = insertMemory(db, {
+            projectPath: "/repo/foreign",
+            category: "CONSTRAINTS",
+            content: "Foreign constraint hidden by malformed policy.",
+        });
+
+        const result = await tools.ctx_memory.execute(
+            {
+                action: "merge",
+                ids: [own.id, foreign.id],
+                content: "Merged constraint under malformed policy.",
+                category: "CONSTRAINTS",
+            },
+            toolContext("ses-dreamer", DREAMER_AGENT),
+        );
+
+        expect(result).toContain("not shared with this workspace member");
+        expect(getMemoryById(db, own.id)?.status).toBe("active");
+        expect(getMemoryById(db, foreign.id)?.status).toBe("active");
+    });
+
     it("ALLOWS a DREAMER merge of a foreign SHARED-category memory INSIDE a workspace (D1)", async () => {
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
@@ -715,42 +749,33 @@ describe("createCtxMemoryTools", () => {
     });
 
     describe("#given update action", () => {
-        it("updates a foreign workspace memory with duplicate checks and mutations under the target identity", async () => {
+        it("rejects updating a foreign workspace memory even when the category is shared", async () => {
             db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at) VALUES (1, 'ws', 1, 1);
                 INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
                 VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
                        (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
             `);
-            insertMemory(db, {
-                projectPath: "/repo/project",
-                category: "USER_DIRECTIVES",
-                content: "Use the shared formatter.",
-            });
             const foreign = insertMemory(db, {
                 projectPath: "/repo/foreign",
-                category: "USER_DIRECTIVES",
-                content: "Old foreign directive.",
+                category: "CONSTRAINTS",
+                content: "Old foreign shared constraint.",
             });
 
             const result = await tools.ctx_memory.execute(
                 {
                     action: "update",
                     ids: [foreign.id],
-                    content: "Use the shared formatter.",
+                    content: "Updated foreign shared constraint.",
                 },
                 toolContext(),
             );
 
-            expect(result).toContain(`Updated memory [ID: ${foreign.id}]`);
-            expect(getMemoryById(db, foreign.id)?.content).toBe("Use the shared formatter.");
-            const ownMutations = getMemoryMutationsForRender(db, "/repo/project", 0, [foreign.id]);
-            const foreignMutations = getMemoryMutationsForRender(db, "/repo/foreign", 0, [
-                foreign.id,
-            ]);
-            expect(ownMutations).toHaveLength(0);
-            expect(foreignMutations).toHaveLength(1);
-            expect(foreignMutations[0]?.projectPath).toBe("/repo/foreign");
+            expect(result).toBe(`Error: Memory with ID ${foreign.id} was not found.`);
+            expect(getMemoryById(db, foreign.id)?.content).toBe("Old foreign shared constraint.");
+            expect(getMemoryMutationsForRender(db, "/repo/foreign", 0, [foreign.id])).toHaveLength(
+                0,
+            );
         });
 
         it("updates memory content and invalidates stale embeddings", async () => {
