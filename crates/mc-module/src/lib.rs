@@ -63,9 +63,10 @@ use historian_chunk::{
 };
 use historian_producer::{HistorianProducer, HistorianProducerConfig, HistorianProducerError};
 use selection::SelKind;
+#[cfg(test)]
+use session_resolver::ResolvedSession;
 use session_resolver::{
-    MissingSessionResolver, RealSessionResolver, ResolvedSession, SessionResolveError,
-    SessionResolver,
+    MissingSessionResolver, RealSessionResolver, SessionResolveError, SessionResolver,
 };
 use subc_protocol::{
     manifest::{
@@ -130,6 +131,11 @@ const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
 const SESSION_UNRESOLVED_MESSAGE: &str =
     "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
+
+struct FacadeScope {
+    memory_project_path: String,
+    conversation_key: String,
+}
 
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (channel → {project, session}).
@@ -1353,10 +1359,7 @@ impl McHandler {
         }
     }
 
-    async fn resolve_facade_session(
-        &self,
-        channel: u16,
-    ) -> Result<ResolvedSession, HandlerOutcome> {
+    async fn resolve_facade_scope(&self, channel: u16) -> Result<FacadeScope, HandlerOutcome> {
         let binding = self
             .facade_binding(channel)
             .map_err(|_| session_unresolved_error())?;
@@ -1369,7 +1372,10 @@ impl McHandler {
             .resolve_session(&binding.project_root, &binding.harness, instance_token)
             .await
         {
-            Ok(Some(resolved)) => Ok(resolved),
+            Ok(Some(resolved)) => Ok(FacadeScope {
+                memory_project_path: binding.project_root.to_string_lossy().to_string(),
+                conversation_key: resolved.session_id,
+            }),
             Ok(None) => Err(session_unresolved_error()),
             Err(SessionResolveError::Timeout) => Err(HandlerOutcome::Error {
                 code: "session_resolve_timeout".to_string(),
@@ -1389,15 +1395,16 @@ impl McHandler {
         let Some(action) = string_arg(args, "action") else {
             return invalid_params_error("ctx_memory requires an action");
         };
-        let resolved = match self.resolve_facade_session(channel).await {
-            Ok(resolved) => resolved,
+        let facade_scope = match self.resolve_facade_scope(channel).await {
+            Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
         let store = match self.store.get() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
-        let scope = resolved.session_id.as_str();
+        let memory_project = facade_scope.memory_project_path.as_str();
+        let conversation_key = facade_scope.conversation_key.as_str();
         match action {
             "write" => {
                 let Some(category) = non_empty_string_arg(args, "category") else {
@@ -1411,10 +1418,10 @@ impl McHandler {
                     );
                 };
                 match store.insert_memory(InsertMemoryInput {
-                    project_path: scope,
+                    project_path: memory_project,
                     category,
                     content,
-                    source_session_id: Some(scope),
+                    source_session_id: Some(conversation_key),
                     source_type: Some("agent"),
                     importance: Some(50),
                     expires_at: None,
@@ -1441,7 +1448,7 @@ impl McHandler {
                         "Error: 'content' is required when action is 'update'.",
                     );
                 };
-                match memory_tool::update_memory(store, scope, id, content, now_ms()) {
+                match memory_tool::update_memory(store, memory_project, id, content, now_ms()) {
                     Ok(memory) => mcp_text_result(
                         format!("Updated memory [ID: {}] in {}.", memory.id, memory.category),
                         false,
@@ -1459,7 +1466,7 @@ impl McHandler {
                 let reason = string_arg(args, "reason");
                 let mut archived = Vec::new();
                 for id in ids {
-                    match memory_tool::archive_memory(store, scope, id, reason, now_ms()) {
+                    match memory_tool::archive_memory(store, memory_project, id, reason, now_ms()) {
                         Ok(true) => archived.push(id),
                         Ok(false) => {}
                         Err(error) => return tool_error_result(format!("Error: {error}")),
@@ -1487,7 +1494,7 @@ impl McHandler {
                 };
                 match memory_tool::merge_memories(
                     store,
-                    scope,
+                    memory_project,
                     target_id,
                     &source_ids,
                     content,
@@ -1517,17 +1524,22 @@ impl McHandler {
             return tool_error_result("Error: 'query' is required for ctx_search.");
         };
         let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
-        let resolved = match self.resolve_facade_session(channel).await {
-            Ok(resolved) => resolved,
+        let facade_scope = match self.resolve_facade_scope(channel).await {
+            Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
         let store = match self.store.get() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
-        let scope = resolved.session_id.as_str();
+        let memory_project = facade_scope.memory_project_path.as_str();
+        let conversation_key = facade_scope.conversation_key.as_str();
         match memory_tool::search_memories_and_compartments_for_session(
-            store, scope, scope, query, limit,
+            store,
+            memory_project,
+            conversation_key,
+            query,
+            limit,
         ) {
             Ok(results) => {
                 let rendered = results
@@ -2695,6 +2707,14 @@ mod tests {
         tool_body(outcome)["isError"].as_bool().unwrap_or(false)
     }
 
+    fn tool_json_array(outcome: HandlerOutcome) -> Vec<Value> {
+        let body = tool_body(outcome);
+        let text = body["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool response missing text: {body}"));
+        serde_json::from_str(text).unwrap_or_else(|error| panic!("tool text was not JSON: {error}"))
+    }
+
     fn insert_memory(
         store: &McStore,
         project: &str,
@@ -2982,8 +3002,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_multi_instance_and_composite_key_scope_use_resolved_key_verbatim() {
+    async fn facade_multi_instance_shares_memory_pool_and_splits_compartment_scope() {
         let producer = Arc::new(ProducerState::default());
+        let project_root = "/same/repo";
         let key_a = "pm_a5ee3bf8/session-A/epoch-1";
         let key_b = "pm_a5ee3bf8/session-B/epoch-1";
         let resolver = FakeSessionResolver::with(&[
@@ -2992,40 +3013,98 @@ mod tests {
         ]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/same/repo", "token-a"));
-        handler.bind_route(8, binding("/same/repo", "token-b"));
+        handler.bind_route(7, binding(project_root, "token-a"));
+        handler.bind_route(8, binding(project_root, "token-b"));
+        store
+            .replace_compartments(
+                key_a,
+                &[stored_comp(1, 1, 10, "a10", "alpha-compartment-only")],
+            )
+            .unwrap();
+        store
+            .replace_compartments(
+                key_b,
+                &[stored_comp(1, 1, 10, "b10", "beta-compartment-only")],
+            )
+            .unwrap();
 
         let a = call_facade_on_channel(
             &handler,
             7,
             "ctx_memory",
-            json!({ "action": "write", "category": "CONSTRAINTS", "content": "A only fact" }),
+            json!({ "action": "write", "category": "CONSTRAINTS", "content": "shared project fact" }),
         )
         .await;
         assert!(!tool_is_error(a));
+        let b_search = tool_json_array(
+            call_facade_on_channel(
+                &handler,
+                8,
+                "ctx_search",
+                json!({ "query": "shared project fact", "limit": 5 }),
+            )
+            .await,
+        );
+        assert!(b_search.iter().any(|row| row["source"] == "memory"));
+
         let b = call_facade_on_channel(
             &handler,
             8,
             "ctx_memory",
-            json!({ "action": "write", "category": "CONSTRAINTS", "content": "B only fact" }),
+            json!({ "action": "write", "category": "CONSTRAINTS", "content": "second shared fact" }),
         )
         .await;
         assert!(!tool_is_error(b));
 
-        let a_rows = store.load_active_memories(key_a, now_ms()).unwrap();
-        let b_rows = store.load_active_memories(key_b, now_ms()).unwrap();
-        assert_eq!(a_rows.len(), 1);
-        assert_eq!(a_rows[0].content, "A only fact");
-        assert_eq!(b_rows.len(), 1);
-        assert_eq!(b_rows[0].content, "B only fact");
+        let project_rows = store.load_active_memories(project_root, now_ms()).unwrap();
+        assert_eq!(project_rows.len(), 2);
+        assert!(project_rows
+            .iter()
+            .any(|memory| memory.content == "shared project fact"));
+        assert!(project_rows
+            .iter()
+            .any(|memory| memory.content == "second shared fact"));
+        let first = store.get_memory_full(project_rows[0].id).unwrap().unwrap();
+        assert_eq!(first.source_session_id.as_deref(), Some(key_a));
         assert!(store
-            .load_active_memories("token-a", now_ms())
+            .load_active_memories(key_a, now_ms())
             .unwrap()
             .is_empty());
         assert!(store
-            .load_active_memories("session-A", now_ms())
+            .load_active_memories(key_b, now_ms())
             .unwrap()
             .is_empty());
+
+        let a_comp = tool_json_array(
+            call_facade_on_channel(
+                &handler,
+                7,
+                "ctx_search",
+                json!({ "query": "alpha-compartment-only", "limit": 5 }),
+            )
+            .await,
+        );
+        assert!(a_comp.iter().any(|row| row["source"] == "compartment_body"));
+        let a_cannot_see_b = tool_json_array(
+            call_facade_on_channel(
+                &handler,
+                7,
+                "ctx_search",
+                json!({ "query": "beta-compartment-only", "limit": 5 }),
+            )
+            .await,
+        );
+        assert!(a_cannot_see_b.is_empty());
+        let b_comp = tool_json_array(
+            call_facade_on_channel(
+                &handler,
+                8,
+                "ctx_search",
+                json!({ "query": "beta-compartment-only", "limit": 5 }),
+            )
+            .await,
+        );
+        assert!(b_comp.iter().any(|row| row["source"] == "compartment_body"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3056,12 +3135,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn facade_security_guards_run_through_public_handler_path() {
         let producer = Arc::new(ProducerState::default());
-        let own = "opaque-own-key";
+        let own = "/repo";
         let foreign = "opaque-foreign-key";
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit(own.to_string()))]);
+        let resolver = FakeSessionResolver::with(&[(
+            "token",
+            FakeResolve::Hit("opaque-own-conversation".to_string()),
+        )]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
+        handler.bind_route(7, binding(own, "token"));
         seed_workspace(&store, own, foreign);
 
         let foreign_private_update =
@@ -3150,7 +3232,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn facade_cache_mutations_drive_soft_memory_deltas_through_public_path() {
         let producer = Arc::new(ProducerState::default());
+        let project_root = "/repo/cache-project";
         let scope = "pm_a5ee3bf8/parent-session/epoch-1";
+        let additive_project_root = "/repo/additive-project";
         let additive_scope = "pm_a5ee3bf8/additive-session/epoch-1";
         let resolver = FakeSessionResolver::with(&[
             ("token", FakeResolve::Hit(scope.to_string())),
@@ -3161,12 +3245,12 @@ mod tests {
         ]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
-        handler.bind_route(8, binding(scope, scope));
+        handler.bind_route(7, binding(project_root, "token"));
+        handler.bind_route(8, binding(project_root, scope));
         store
             .replace_compartments(scope, &[stored_comp(1, 1, 10, "m10", "SUMMARY")])
             .unwrap();
-        let memory_id = insert_memory(&store, scope, "CONSTRAINTS", "original rule", 1);
+        let memory_id = insert_memory(&store, project_root, "CONSTRAINTS", "original rule", 1);
 
         let mut boot_req = request(vec![ck("m10", 10, "raw covered")]);
         boot_req["session_id"] = json!(scope);
@@ -3174,7 +3258,9 @@ mod tests {
         assert_eq!(boot["action"], "HARD");
         assert!(synthetic_text(&boot, 0).contains("original rule"));
 
-        let before = store.max_memory_mutation_id(&[scope.to_string()]).unwrap();
+        let before = store
+            .max_memory_mutation_id(&[project_root.to_string()])
+            .unwrap();
         assert!(!tool_is_error(
             call_facade(
                 &handler,
@@ -3183,7 +3269,9 @@ mod tests {
             )
             .await
         ));
-        let after = store.max_memory_mutation_id(&[scope.to_string()]).unwrap();
+        let after = store
+            .max_memory_mutation_id(&[project_root.to_string()])
+            .unwrap();
         assert!(
             after > before,
             "facade update must advance the mutation log"
@@ -3194,7 +3282,7 @@ mod tests {
         assert!(synthetic_text(&update_delta, 1).contains("<memory-updates>"));
         assert!(synthetic_text(&update_delta, 1).contains("updated rule"));
 
-        handler.bind_route(9, binding(additive_scope, additive_scope));
+        handler.bind_route(9, binding(additive_project_root, additive_scope));
         store
             .replace_compartments(
                 additive_scope,
@@ -3206,9 +3294,9 @@ mod tests {
         let add_boot = call_transform_request_on_channel(&handler, 9, add_req.clone()).await;
         assert_eq!(add_boot["action"], "HARD");
         let add_before = store
-            .max_memory_mutation_id(&[additive_scope.to_string()])
+            .max_memory_mutation_id(&[additive_project_root.to_string()])
             .unwrap();
-        handler.bind_route(7, binding("/repo", "token-additive"));
+        handler.bind_route(7, binding(additive_project_root, "token-additive"));
         let resolver_scope_memory = call_facade(
             &handler,
             "ctx_memory",
@@ -3218,11 +3306,25 @@ mod tests {
         assert!(!tool_is_error(resolver_scope_memory));
         assert_eq!(
             store
-                .max_memory_mutation_id(&[additive_scope.to_string()])
+                .max_memory_mutation_id(&[additive_project_root.to_string()])
                 .unwrap(),
             add_before,
             "additive writes must not append mutation-log rows"
         );
+        assert!(store
+            .load_active_memories(additive_project_root, now_ms())
+            .unwrap()
+            .iter()
+            .any(|memory| {
+                memory.content == "new additive memory"
+                    && store
+                        .get_memory_full(memory.id)
+                        .unwrap()
+                        .unwrap()
+                        .source_session_id
+                        .as_deref()
+                        == Some(additive_scope)
+            }));
         let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
         assert_eq!(add_delta["action"], "SOFT");
         assert!(synthetic_text(&add_delta, 1).contains("<new-memories>"));

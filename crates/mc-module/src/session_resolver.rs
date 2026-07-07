@@ -1,9 +1,10 @@
 //! Resolves Claude Code MCP facade instance tokens to the opaque conversation key.
 //!
-//! The MCP shim binds its route with a per-launch instance token, while the store is
-//! populated under the parent conversation key carried by the model traffic. The resolver
-//! is the only place that crosses that boundary: handlers pass the token as a lookup
-//! argument and then use the returned key verbatim as the store scope.
+//! The MCP shim binds its route with a per-launch instance token, while the parent
+//! conversation key is what names that Claude Code conversation's compartments. The
+//! resolver is the only place that crosses that boundary: handlers pass the token as a
+//! lookup argument, then use the returned key for conversation-scoped reads and as the
+//! source session recorded on memory writes.
 
 use std::{error::Error, fmt, path::Path, path::PathBuf, time::Duration};
 
@@ -19,8 +20,8 @@ const SESSION_RESOLVE_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSession {
-    /// Opaque composite conversation key returned by ai-proxy. Store callers must use it
-    /// exactly as returned; the instance token is only the lookup input.
+    /// Opaque composite conversation key returned by ai-proxy. Callers must not parse it;
+    /// the instance token is only the lookup input.
     pub session_id: String,
     pub last_traffic_ms: i64,
 }
