@@ -312,6 +312,33 @@ describe("todo state synthesis — cache-busting branches", () => {
         expect(anchor?.messageId).toBe("msg-asst-2"); // re-anchored
     });
 
+    it("cache-bust skips an errored persisted anchor and re-anchors to a replayable assistant", () => {
+        useTempDataHome("todo-errored-reanchor-");
+        const db = openDatabase();
+        const callId = computeSyntheticCallId(ACTIVE_TODOS_JSON);
+        updateSessionMeta(db, "ses-1", { lastTodoState: ACTIVE_TODOS_JSON });
+        setPersistedTodoSyntheticAnchor(db, "ses-1", callId, "msg-asst-2", ACTIVE_TODOS_JSON);
+
+        const messages = buildMessages();
+        const errored = messages.find((m) => m.info.id === "msg-asst-2");
+        if (!errored) throw new Error("errored anchor missing");
+        errored.info.error = { name: "MessageAbortedError", data: { message: "aborted" } };
+
+        runTodoSynthesis({
+            db,
+            sessionId: "ses-1",
+            messages,
+            isCacheBustingPass: true,
+            fullFeatureMode: true,
+        });
+
+        expect(countSyntheticParts(messages)).toBe(1);
+        const found = findSyntheticPart(messages);
+        expect(found?.messageId).toBe("msg-asst-1");
+        expect(errored.parts.some((part) => isSyntheticTodoPart(part))).toBe(false);
+        expect(getPersistedTodoSyntheticAnchor(db, "ses-1")?.messageId).toBe("msg-asst-1");
+    });
+
     it("Branch 5: cache-bust + render different from sticky → fresh inject + persist new callId", () => {
         useTempDataHome("todo-b5-");
         const db = openDatabase();
@@ -391,6 +418,30 @@ describe("todo state synthesis — defer branches and byte stability", () => {
             messageId: "msg-asst-2",
             stateJson: ACTIVE_TODOS_JSON,
         });
+    });
+
+    it("Branch 6b: defer skips an errored persisted anchor without relocating it", () => {
+        useTempDataHome("todo-errored-defer-");
+        const db = openDatabase();
+        const callId = computeSyntheticCallId(ACTIVE_TODOS_JSON);
+        updateSessionMeta(db, "ses-1", { lastTodoState: ACTIVE_TODOS_JSON });
+        setPersistedTodoSyntheticAnchor(db, "ses-1", callId, "msg-asst-2", ACTIVE_TODOS_JSON);
+
+        const messages = buildMessages();
+        const errored = messages.find((m) => m.info.id === "msg-asst-2");
+        if (!errored) throw new Error("errored anchor missing");
+        errored.info.error = { name: "APIError", data: { message: "failed" } };
+
+        runTodoSynthesis({
+            db,
+            sessionId: "ses-1",
+            messages,
+            isCacheBustingPass: false,
+            fullFeatureMode: true,
+        });
+
+        expect(countSyntheticParts(messages)).toBe(0);
+        expect(getPersistedTodoSyntheticAnchor(db, "ses-1")?.messageId).toBe("msg-asst-2");
     });
 
     it("Branch 7: defer + no sticky → no-op", () => {

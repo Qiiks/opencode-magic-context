@@ -631,7 +631,7 @@ export async function runPostTransformPhase(
             updateSessionMeta(args.db, args.sessionId, { lastResponseTime: Date.now() });
         }
 
-        const toolReclaimExecutePass = args.schedulerDecision === "execute";
+        const toolReclaimExecutePass = args.schedulerDecision === "execute" || m0HardFoldThisPass;
         const alreadyMutatingThisPass = pendingOpsDidMutate || heuristicOrReasoningDidMutate;
         let autoReclaimTargetCount = 0;
         let autoReclaimDidMutate = false;
@@ -774,12 +774,12 @@ export async function runPostTransformPhase(
     // that first strip on the live watermark let a DEFER pass cross an older
     // image message and remove its images mid-prefix, busting the cache.
     // Freeze the id set on cache-busting passes; replay it every pass.
-    if (canUseEmptySentinels && args.watermark > 0) {
+    if (canUseEmptySentinels) {
         try {
             const tImg = performance.now();
             const frozenImageIds = getProcessedImageStrippedIds(args.db, args.sessionId);
             const imageResult = stripProcessedImages(args.messages, frozenImageIds, {
-                detect: isCacheBustingPass,
+                detect: isCacheBustingPass && args.watermark > 0,
                 watermark: args.watermark,
                 messageTagNumbers: args.messageTagNumbers,
             });

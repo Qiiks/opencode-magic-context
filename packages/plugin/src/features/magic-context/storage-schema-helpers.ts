@@ -80,6 +80,7 @@ function healNullTextColumns(db: Database): void {
         ["cache_ttl", ""],
         ["last_nudge_band", ""],
         ["last_nudge_level", ""],
+        ["channel2_nudge_claim_token", ""],
         ["last_transform_error", ""],
         ["nudge_anchor_message_id", ""],
         ["nudge_anchor_text", ""],

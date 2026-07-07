@@ -78,13 +78,16 @@ export function countMessagesSinceLastUser(messages: MessageLike[]): number {
 }
 
 /**
- * Inject a tool part into the latest assistant message that has an ID.
+ * Inject a tool part into the latest replayable assistant message that has an ID.
  *
  * Idempotent on `callID` — if a part with the same `callID` already exists,
  * this is a no-op so defer-pass replays produce byte-identical output.
  *
  * Returns the message ID where the part landed, or `null` if no eligible
- * assistant message exists in the visible window.
+ * assistant message exists in the visible window. Assistant messages with an
+ * OpenCode `error` are skipped because provider serializers can omit failed or
+ * aborted assistants from the wire; anchoring a synthetic tool call there would
+ * make its replay disappear on subsequent passes.
  */
 export function injectToolPartIntoLatestAssistant(
     messages: MessageLike[],
@@ -94,6 +97,7 @@ export function injectToolPartIntoLatestAssistant(
         const message = messages[index];
         if (message.info.role !== "assistant") continue;
         if (typeof message.info.id !== "string") continue;
+        if (!isReplayableAssistantAnchor(message)) continue;
         if (hasToolPartWithCallId(message, part.callID)) {
             // Already present — idempotent no-op for cache stability.
             return message.info.id;
@@ -105,7 +109,7 @@ export function injectToolPartIntoLatestAssistant(
 }
 
 /**
- * Inject a tool part into the assistant message with the given ID.
+ * Inject a tool part into the replayable assistant message with the given ID.
  *
  * Idempotent on `callID`. Returns `true` if the message exists and the part
  * is present after the call, `false` if the anchor message is not in the
@@ -119,6 +123,7 @@ export function injectToolPartIntoAssistantById(
     for (const message of messages) {
         if (message.info.id !== messageId) continue;
         if (message.info.role !== "assistant") continue;
+        if (!isReplayableAssistantAnchor(message)) return false;
         if (hasToolPartWithCallId(message, part.callID)) return true;
         message.parts.push(part);
         return true;
@@ -134,6 +139,10 @@ function hasToolPartWithCallId(message: MessageLike, callId: string): boolean {
         if (p.callID === callId) return true;
     }
     return false;
+}
+
+function isReplayableAssistantAnchor(message: MessageLike): boolean {
+    return message.info.error === undefined || message.info.error === null;
 }
 
 function appendReminderToUserMessage(message: MessageLike, reminder: string): void {
