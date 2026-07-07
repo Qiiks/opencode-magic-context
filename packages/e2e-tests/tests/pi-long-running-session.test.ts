@@ -399,9 +399,29 @@ describe("long-running Pi Magic Context session", () => {
             const stateJson = normalizedTodos(ACTIVE_TODOS);
             expect(readMeta<{ last_todo_state: string }>(h, sessionId, "last_todo_state")?.last_todo_state).toBe(stateJson);
             await send("turn 20: Pi pressure to make synthetic todowrite visible on next execute", "pi phase 6 pressure", HIGH_USAGE);
-            await send("turn 21: Pi execute pass injects synthetic todowrite", "pi phase 6 synthetic execute");
+            // The injection lands on the next cache-busting pass that is NOT
+            // vetoed by an in-flight historian. Phase 5's publication can
+            // legitimately trigger a follow-up historian run over the remaining
+            // tail; while it runs, execute passes defer mutations (matching
+            // OpenCode's compartment-running veto). Retry the execute turn
+            // WITH pressure until a non-vetoed pass injects the pair — a
+            // low-usage turn after the historian finishes would never bust,
+            // so pressure is what invites the execute pass the injection rides.
             const syntheticCallId = computeSyntheticCallId(stateJson);
-            const syntheticPair = findSyntheticTodoPair(mainRequests().at(-1)!.body, syntheticCallId);
+            let syntheticPair: ReturnType<typeof findSyntheticTodoPair> = null;
+            for (let attempt = 0; attempt < 6 && syntheticPair === null; attempt += 1) {
+                // The historian holds the compartment lease while running; wait
+                // for it to free so this attempt's pass is not veto-deferred.
+                await h.waitFor(() => {
+                    const lease = h
+                        .contextDb()
+                        .prepare("SELECT holder_id FROM compartment_state_lease WHERE session_id = ?")
+                        .get(sessionId) as { holder_id: string } | null;
+                    return lease === null ? true : null;
+                }, { timeoutMs: 60_000, label: "historian lease free before synthetic-todo execute" });
+                await send(`turn 21 (try ${attempt + 1}): Pi execute pass injects synthetic todowrite`, "pi phase 6 synthetic execute", HIGH_USAGE);
+                syntheticPair = findSyntheticTodoPair(mainRequests().at(-1)!.body, syntheticCallId);
+            }
             expect(syntheticPair).not.toBeNull();
             expect(JSON.stringify(mainRequests().at(-1)!.body)).toContain("<session-history>");
             expect(JSON.stringify(mainRequests().at(-1)!.body)).toContain("Long Pi e2e chunk");
