@@ -438,7 +438,10 @@ function collectHistorianDumps(
  * historian dumps fall back to the legacy tmp-dir listing on the empty path.
  */
 async function collectRecentSessions(): Promise<RecentSessionSummary[]> {
-    const opencodeDbPath = join(homedir(), ".local", "share", "opencode", "opencode.db");
+    // env-first: honor XDG/HOME overrides (and sandboxed doctor test runs)
+    // instead of Bun's homedir(), which ignores a runtime HOME override.
+    const dataHome = process.env.XDG_DATA_HOME || join(process.env.HOME || homedir(), ".local", "share");
+    const opencodeDbPath = join(dataHome, "opencode", "opencode.db");
     if (!existsSync(opencodeDbPath)) return [];
 
     if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
