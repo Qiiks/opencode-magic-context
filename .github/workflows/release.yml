@@ -75,6 +75,9 @@ jobs:
       - name: Build
         run: bun run build
 
+      - name: Check compiled TUI freshness
+        run: bun run --cwd packages/plugin check:tui-compiled
+
       - name: Test
         run: bun run test
 
@@ -93,6 +96,9 @@ jobs:
       # before publishing — a missing dep ships a TUI that won't load.
       - name: Smoke (TUI entry import)
         run: bun packages/plugin/scripts/smoke-tui-import.ts
+
+      - name: Smoke (TUI pack install)
+        run: bun packages/plugin/scripts/smoke-tui-pack-install.ts
 
   test-pi:
     name: Test (pi-plugin)

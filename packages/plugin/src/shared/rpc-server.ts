@@ -52,6 +52,15 @@ function tokensMatch(presented: string, expected: string): boolean {
     return timingSafeEqual(a, b);
 }
 
+function bearerToken(req: Request): string {
+    const auth = req.headers.get("authorization");
+    return typeof auth === "string" ? auth.replace(/^Bearer\s+/i, "") : "";
+}
+
+function websocketToken(req: Request, url: URL): string {
+    return bearerToken(req) || url.searchParams.get("token") || "";
+}
+
 /**
  * Plugin-private localhost RPC server for TUI ↔ server-plugin communication.
  *
@@ -71,6 +80,7 @@ export class MagicContextRpcServer {
     private portFilePath: string;
     private portDir: string;
     private startedAt = Date.now();
+    private readonly instanceId = randomBytes(8).toString("hex");
     /** Every authenticated WS socket, so dispose can close them all. */
     private sockets = new Set<ServerWebSocket<WsData>>();
     // Unguessable per-process bearer token, published in the (user-private) port
@@ -81,7 +91,7 @@ export class MagicContextRpcServer {
     private readonly token = randomBytes(32).toString("hex");
 
     constructor(storageDir: string, directory: string) {
-        this.portFilePath = rpcPortFilePath(storageDir, directory);
+        this.portFilePath = rpcPortFilePath(storageDir, directory, process.pid, this.instanceId);
         this.portDir = rpcPortDir(storageDir, directory);
     }
 
@@ -92,6 +102,7 @@ export class MagicContextRpcServer {
 
     /** Start the server on a random port, write port to disk. */
     async start(): Promise<number> {
+        this.startedAt = Date.now();
         const self = this;
         const server = Bun.serve<WsData>({
             port: 0,
@@ -122,8 +133,8 @@ export class MagicContextRpcServer {
         this.server = server;
         this.port = server.port ?? 0;
 
-        // Write a per-process port file atomically. Multi-instance OpenCode is
-        // supported: TUI discovery scans all live pid files and picks the most
+        // Write a per-instance port file atomically. Multi-instance OpenCode is
+        // supported: TUI discovery scans all live files and picks the most
         // recent instead of cross-wiring via one shared project file.
         try {
             this.warnIfOtherLiveInstance();
@@ -157,6 +168,7 @@ export class MagicContextRpcServer {
                     pid: process.pid,
                     started_at: this.startedAt,
                     token: this.token,
+                    instance_id: this.instanceId,
                 }),
                 { encoding: "utf-8", mode: 0o600 },
             );
@@ -219,8 +231,12 @@ export class MagicContextRpcServer {
     private async handleFetch(req: Request, srv: Server<WsData>): Promise<Response | undefined> {
         const url = new URL(req.url);
 
-        // WebSocket upgrade — the persistent push channel.
+        // WebSocket upgrade — the persistent push channel. Authenticate before
+        // `srv.upgrade` so an unauthorized request never becomes a live socket.
         if (url.pathname === "/ws") {
+            if (!tokensMatch(websocketToken(req, url), this.token)) {
+                return new Response("Unauthorized", { status: 401 });
+            }
             const ok = srv.upgrade(req, { data: { authed: false } });
             if (ok) return undefined;
             return new Response("upgrade failed", { status: 400 });
@@ -237,9 +253,7 @@ export class MagicContextRpcServer {
         }
 
         // Require the per-process bearer token on every side-effecting call.
-        const auth = req.headers.get("authorization");
-        const presented = typeof auth === "string" ? auth.replace(/^Bearer\s+/i, "") : "";
-        if (!tokensMatch(presented, this.token)) {
+        if (!tokensMatch(bearerToken(req), this.token)) {
             return json({ error: "Unauthorized" }, 401);
         }
 
@@ -274,12 +288,21 @@ export class MagicContextRpcServer {
     /** WS message handler: hello (auth + sink registration + backlog drain) and
      *  ack (cursor advance → queue prune). All other messages are ignored. */
     private handleWsMessage(ws: ServerWebSocket<WsData>, raw: string | Buffer): void {
-        let msg: { type?: string; token?: string; sessionId?: string; lastReceivedId?: number };
+        let msg: {
+            type?: string;
+            token?: string;
+            sessionId?: string;
+            lastReceivedId?: number;
+            globalLastReceivedId?: number;
+            ackScope?: string;
+        };
         try {
             msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"));
         } catch {
             return;
         }
+
+        if (msg.type !== "hello" && !ws.data.authed) return;
 
         if (msg.type === "hello") {
             if (!tokensMatch(typeof msg.token === "string" ? msg.token : "", this.token)) {
@@ -297,6 +320,11 @@ export class MagicContextRpcServer {
                     ? msg.sessionId
                     : undefined;
 
+            // A session switch re-sends hello on the same socket. Remove the old
+            // sink first so the registry has exactly one live sink per socket.
+            ws.data.unregister?.();
+            ws.data.unregister = undefined;
+
             // Register a live sink so future pushes reach this socket immediately.
             const sink: NotificationSink = {
                 sessionId: ws.data.sessionId,
@@ -307,14 +335,28 @@ export class MagicContextRpcServer {
             ws.data.unregister = registerNotificationSink(sink);
             this.sockets.add(ws);
 
-            // Deliver any backlog the client hasn't seen (at-least-once). The
-            // client sends its highest-handled id in the hello; reconnects after a
-            // dropped socket re-deliver from here.
+            // Deliver any backlog the client hasn't seen (at-least-once). Modern
+            // clients send separate session and global cursors; keeping those
+            // watermarks independent prevents a high id in one session from pruning
+            // lower unseen notifications in another session.
             const lastReceivedId = Number(msg.lastReceivedId ?? 0);
-            const backlog = drainNotifications(
-                Number.isFinite(lastReceivedId) ? lastReceivedId : 0,
-                ws.data.sessionId,
-            );
+            const sessionCursor = Number.isFinite(lastReceivedId) ? lastReceivedId : 0;
+            const hasGlobalCursor = typeof msg.globalLastReceivedId === "number";
+            const globalLastReceivedId = hasGlobalCursor
+                ? Number.isFinite(msg.globalLastReceivedId)
+                    ? msg.globalLastReceivedId
+                    : 0
+                : 0;
+            const backlog =
+                ws.data.sessionId === undefined && hasGlobalCursor
+                    ? drainNotifications(globalLastReceivedId, undefined, { globalOnly: true })
+                    : drainNotifications(
+                          sessionCursor,
+                          ws.data.sessionId,
+                          hasGlobalCursor
+                              ? { globalLastReceivedId: globalLastReceivedId }
+                              : undefined,
+                      );
             for (const notification of backlog) {
                 ws.send(JSON.stringify({ type: "notification", notification }));
             }
@@ -323,11 +365,20 @@ export class MagicContextRpcServer {
         }
 
         if (msg.type === "ack") {
-            // Advance the cursor → prune acked notifications from the queue so it
-            // doesn't grow during a long-lived connection. Cheap, event-driven.
+            // Advance only the cursor scope the client handled. Acking session A
+            // must not prune session B, and acking a global notification must not
+            // become a session watermark. Cheap, event-driven queue cleanup.
             const lastReceivedId = Number(msg.lastReceivedId ?? 0);
             if (Number.isFinite(lastReceivedId) && lastReceivedId > 0) {
-                drainNotifications(lastReceivedId, ws.data.sessionId);
+                if (msg.ackScope === "global") {
+                    drainNotifications(lastReceivedId, undefined, { globalOnly: true });
+                } else if (typeof msg.sessionId === "string" && msg.sessionId.length > 0) {
+                    drainNotifications(lastReceivedId, msg.sessionId, { sessionOnly: true });
+                } else {
+                    // Compatibility path for older clients that only know one
+                    // cursor for their current socket scope.
+                    drainNotifications(lastReceivedId, ws.data.sessionId);
+                }
             }
         }
     }
