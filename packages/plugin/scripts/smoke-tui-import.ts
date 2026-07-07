@@ -1,19 +1,16 @@
-// Import smoke test for the raw-TSX TUI entry (`./tui` export).
+// Import smoke test for the bare-Bun TUI loader fallback.
 //
-// The TUI entry (src/tui/index.tsx) uses `/** @jsxImportSource @opentui/solid */`,
-// so loading it requires @opentui/solid + solid-js to resolve from the plugin
-// package itself. When those weren't declared as deps, OpenCode 1.17.10's
-// OpenTUI 0.4.2 bump surfaced an immediate load failure:
-//   Cannot find module '@opentui/solid/jsx-dev-runtime'
-// `bun test` doesn't catch this because no suite imports the TSX entry. This
-// script imports it exactly like OpenCode loads the `./tui` export, so a missing
-// or version-mismatched OpenTUI/Solid runtime fails the smoke instead of shipping
-// a TUI that won't load. Run: bun packages/plugin/scripts/smoke-tui-import.ts
+// The published `./tui` export points at src/tui/entry.mjs. When the host does
+// not provide OpenTUI's virtual runtime-module registry, the loader falls back
+// to src/tui/index.tsx, which still needs @opentui/solid + solid-js to resolve
+// from the plugin package itself. `bun test` does not import that entry, so this
+// catches missing or version-mismatched OpenTUI/Solid runtime deps before a TUI
+// that cannot load is shipped. Run: bun packages/plugin/scripts/smoke-tui-import.ts
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const entry = join(here, "../src/tui/index.tsx");
+const entry = join(here, "../src/tui/entry.mjs");
 
 let failures = 0;
 function check(name: string, cond: boolean, detail?: string): void {
@@ -26,10 +23,10 @@ function check(name: string, cond: boolean, detail?: string): void {
 }
 
 try {
-    // Resolving the OpenTUI JSX runtime the TSX entry compiles against is the
-    // exact thing that broke; importing the entry exercises it end to end.
+    // With no virtual runtime-module registry installed, the loader must catch the
+    // virtual import failure and load the raw TSX fallback end to end.
     const mod = (await import(entry)) as { default?: { id?: string; tui?: unknown } };
-    check("TUI entry imports without a missing-runtime error", true);
+    check("TUI loader imports through the raw-TSX fallback", true);
     check(
         "exports the { id, tui } plugin shape",
         mod.default?.id === "opencode-magic-context" && typeof mod.default?.tui === "function",
@@ -37,7 +34,7 @@ try {
     );
 } catch (error) {
     check(
-        "TUI entry imports without a missing-runtime error",
+        "TUI loader imports through the raw-TSX fallback",
         false,
         error instanceof Error ? error.message : String(error),
     );

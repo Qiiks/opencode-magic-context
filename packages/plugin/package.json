@@ -25,11 +25,13 @@
   "files": [
     "dist",
     "src/tui",
+    "src/tui-compiled",
     "src/shared",
     "README.md"
   ],
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target node --format esm --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
+    "build:tui": "bun scripts/build-tui.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun test",
     "lint": "biome check .",
@@ -37,7 +39,7 @@
     "format": "biome format --write .",
     "format:check": "biome format .",
     "clean": "rm -rf dist",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build && bun run build:tui"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.1.0",
@@ -67,7 +69,7 @@
     },
     "./tui": {
       "types": "./src/tui/index.tsx",
-      "import": "./src/tui/index.tsx"
+      "import": "./src/tui/entry.mjs"
     }
   },
   "oc-plugin": [
