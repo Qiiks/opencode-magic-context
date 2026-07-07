@@ -238,6 +238,13 @@ function requestValidatedAddress(
                     }
                     chunks.push(buf);
                 });
+                // request.destroy(err) (body limit, timeout, abort) also destroys
+                // this response stream with the same error. Without a listener,
+                // that becomes an UNCAUGHT stream 'error' dumped to stderr — the
+                // request-level handler alone does not cover the response side.
+                response.on("error", (error) => {
+                    reject(toNetworkError(error, "response failed"));
+                });
                 response.on("end", () => {
                     const status = response.statusCode ?? 0;
                     if (status >= 500) {
