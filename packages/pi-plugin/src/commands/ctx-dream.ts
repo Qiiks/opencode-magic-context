@@ -19,6 +19,7 @@ export function registerCtxDreamCommand(
 			projectIdentity: string;
 		};
 		dreamerEnabled?: boolean;
+		resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 		onProjectSeen?: (projectIdentity: string) => void;
 	},
 ): void {
@@ -29,6 +30,8 @@ export function registerCtxDreamCommand(
 				projectDir: deps.projectDir,
 				projectIdentity: deps.projectIdentity,
 			};
+			const dreamerEnabled =
+				deps.resolveDreamerEnabled?.(ctx) ?? deps.dreamerEnabled;
 			deps.onProjectSeen?.(project.projectIdentity);
 
 			// Optional single-task arg: `/ctx-dream verify`.
@@ -53,7 +56,7 @@ export function registerCtxDreamCommand(
 				}
 				task = requested;
 			}
-			if (deps.dreamerEnabled === false) {
+			if (dreamerEnabled === false) {
 				sendCtxStatusMessage(
 					pi,
 					{

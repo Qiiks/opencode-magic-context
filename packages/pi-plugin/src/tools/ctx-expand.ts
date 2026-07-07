@@ -38,12 +38,14 @@ import { readPiSessionMessages } from "../read-session-pi";
 const ParamsSchema = Type.Object({
 	start: Type.Optional(
 		Type.Number({
-			description: "Start message ordinal (from compartment start attribute)",
+			description:
+				'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
 		}),
 	),
 	end: Type.Optional(
 		Type.Number({
-			description: "End message ordinal (from compartment end attribute)",
+			description:
+				'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
 		}),
 	),
 	verbose: Type.Optional(
@@ -55,7 +57,7 @@ const ParamsSchema = Type.Object({
 	message: Type.Optional(
 		Type.Number({
 			description:
-				"Full untruncated recovery of ONE message by its ordinal (text + every tool call's full input/output). Recovers a tool output you dropped with ctx_reduce.",
+				"Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
 		}),
 	),
 });

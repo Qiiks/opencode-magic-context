@@ -16,6 +16,7 @@ import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
 export interface RegisterCtxStatusDeps {
 	db: ContextDatabase;
 	projectIdentity: string;
+	resolveStatusDeps?: (ctx: { cwd: string }) => CtxStatusRuntimeDeps;
 	resolveProject?: (ctx: { cwd: string }) => {
 		projectDir: string;
 		projectIdentity: string;
@@ -33,6 +34,11 @@ export interface RegisterCtxStatusDeps {
 	};
 	dreamer?: { runnable?: boolean; scheduleSummary?: string };
 }
+
+export type CtxStatusRuntimeDeps = Omit<
+	RegisterCtxStatusDeps,
+	"resolveStatusDeps"
+>;
 
 export interface CtxStatusDetails {
 	sessionId: string;
@@ -67,9 +73,11 @@ export function registerCtxStatusCommand(
 	pi.registerCommand("ctx-status", {
 		description: "Show Magic Context status for the current Pi session",
 		handler: async (_args, ctx) => {
+			const runtimeDeps = deps.resolveStatusDeps?.(ctx) ?? deps;
 			const projectIdentity =
-				deps.resolveProject?.(ctx).projectIdentity ?? deps.projectIdentity;
-			const currentDeps = { ...deps, projectIdentity };
+				runtimeDeps.resolveProject?.(ctx).projectIdentity ??
+				runtimeDeps.projectIdentity;
+			const currentDeps = { ...runtimeDeps, projectIdentity };
 			const sessionId = resolveSessionId(ctx);
 			if (!sessionId) {
 				sendCtxStatusMessage(pi, {

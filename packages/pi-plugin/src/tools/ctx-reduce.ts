@@ -56,6 +56,10 @@ function formatIds(ids: number[]): string {
 export interface CtxReduceToolDeps {
 	db: ContextDatabase;
 	protectedTags: number;
+	/** Resolve the protected-tail size from the current cwd at tool-call time.
+	 *  Pi keeps the tool registered across `/cd`, so the threshold must follow
+	 *  the active project rather than the launch project. */
+	resolveProtectedTags?: (ctx: { cwd: string }) => number | undefined;
 	/** Optional callback to read live session input tokens; falls back to
 	 *  `getOrCreateSessionMeta(...).lastInputTokens`. Mirrors OpenCode's
 	 *  `getSessionTokens` deps field. */
@@ -78,6 +82,10 @@ export function createCtxReduceTool(
 			ctx,
 		) {
 			const sessionId = ctx.sessionManager.getSessionId();
+			const protectedTags = Math.max(
+				0,
+				Math.floor(deps.resolveProtectedTags?.(ctx) ?? deps.protectedTags),
+			);
 
 			if (!params.drop) {
 				return err("Error: 'drop' must be provided.");
@@ -105,7 +113,7 @@ export function createCtxReduceTool(
 			const protectedTagIds = activeTags
 				.map((tag) => tag.tagNumber)
 				.sort((left, right) => right - left)
-				.slice(0, deps.protectedTags);
+				.slice(0, protectedTags);
 			const protectedSet = new Set(protectedTagIds);
 
 			const tagStatusMap = new Map(

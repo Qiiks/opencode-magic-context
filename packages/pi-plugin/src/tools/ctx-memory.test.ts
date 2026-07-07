@@ -53,6 +53,43 @@ describe("createCtxMemoryTool", () => {
 		}
 	});
 
+	it("formats list output with a header and verification column", async () => {
+		const db = createTestDb();
+		try {
+			const ctx = fakeContext("ses-memory") as never;
+			const projectIdentity = resolveProjectIdentity(
+				(ctx as { cwd: string }).cwd,
+			);
+			insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Use the shared formatter.",
+			});
+			const dreamer = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: true,
+			});
+
+			const result = await dreamer.execute(
+				"call-list",
+				{ action: "list" },
+				new AbortController().signal,
+				undefined,
+				ctx,
+			);
+
+			expect(result.isError).toBeUndefined();
+			const text = result.content[0]?.text ?? "";
+			expect(text).toContain("ID | CATEGORY");
+			expect(text).toContain("VERIFY");
+			expect(text).toContain("Use the shared formatter.");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("allows a primary agent to archive (no longer dreamer-only)", async () => {
 		const db = createTestDb();
 		try {

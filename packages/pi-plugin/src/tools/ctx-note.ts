@@ -176,6 +176,10 @@ export interface CtxNoteToolDeps {
 	 *  rejected because they'd be stuck `pending` forever with no
 	 *  evaluator. */
 	dreamerEnabled?: boolean;
+	/** Resolve dreamer enablement from the current cwd at tool-call time. Pi
+	 *  registers tools once, but `/cd` can switch to a project with different
+	 *  smart-note support. */
+	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 }
 
 export function createCtxNoteTool(
@@ -188,6 +192,8 @@ export function createCtxNoteTool(
 		parameters: ParamsSchema,
 		async execute(_toolCallId, params: CtxNoteParams, _signal, _onUpdate, ctx) {
 			const sessionId = ctx.sessionManager.getSessionId();
+			const dreamerEnabled =
+				deps.resolveDreamerEnabled?.(ctx) ?? deps.dreamerEnabled;
 			// Infer write only on NON-EMPTY content. GPT-family models fill every
 			// optional param (content:"" for a read), so a bare `typeof === "string"`
 			// check would mis-infer `write` and then reject the empty content.
@@ -206,7 +212,7 @@ export function createCtxNoteTool(
 
 				const surfaceCondition = params.surface_condition?.trim();
 				if (surfaceCondition) {
-					if (deps.dreamerEnabled !== true) {
+					if (dreamerEnabled !== true) {
 						return err(
 							"Error: Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.",
 						);
@@ -219,6 +225,7 @@ export function createCtxNoteTool(
 					}
 					const note = addNote(deps.db, "smart", {
 						content,
+						sessionId,
 						projectPath: projectIdentity,
 						surfaceCondition,
 						anchorOrdinal,

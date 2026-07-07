@@ -223,6 +223,33 @@ describe("Pi Magic Context commands", () => {
 		expect(sent[0]?.message.content).toContain("Dreamer is disabled");
 	});
 
+	it("/ctx-dream resolves dreamer enablement from the invocation cwd", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+
+		registerCtxDreamCommand(pi as never, {
+			db,
+			projectDir: "/tmp/project-a",
+			projectIdentity: "/tmp/project-a",
+			resolveProject: (ctx) => ({
+				projectDir: ctx.cwd,
+				projectIdentity: ctx.cwd,
+			}),
+			dreamerEnabled: false,
+			resolveDreamerEnabled: (ctx) => ctx.cwd === "/tmp/project-b",
+		});
+
+		await handlers.get("ctx-dream")?.("", {
+			...createCtx(),
+			cwd: "/tmp/project-b",
+		});
+
+		expect(sent[0]?.message.content).toContain(
+			"Starting dream run for /tmp/project-b",
+		);
+		expect(sent[0]?.message.content).not.toContain("Dreamer is disabled");
+	});
+
 	it("/ctx-status resolves project identity at command time", async () => {
 		const db = createDb();
 		const { pi, handlers, sent } = createMockPi();
@@ -287,6 +314,95 @@ describe("Pi Magic Context commands", () => {
 		expect(sent[0]?.message.customType).toBe("ctx-status");
 		expect(sent[0]?.message.content).toContain("Confirmation Required");
 		expect(sent[0]?.options?.triggerTurn).toBe(false);
+	});
+
+	it("/ctx-recomp resolves historian model from the invocation cwd", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+
+		registerCtxRecompCommand(pi as never, {
+			db,
+			runner: {
+				run: async () => ({
+					ok: true,
+					assistantText: "[]",
+					cost: 0,
+					durationMs: 1,
+				}),
+			},
+			historianModel: undefined,
+			historianChunkTokens: 32_000,
+			memoryEnabled: false,
+			autoPromote: false,
+			resolveRuntimeDeps: () => ({
+				db,
+				runner: {
+					run: async () => ({
+						ok: true,
+						assistantText: "[]",
+						cost: 0,
+						durationMs: 1,
+					}),
+				},
+				historianModel: "anthropic/claude-from-project-b",
+				historianChunkTokens: 32_000,
+				memoryEnabled: false,
+				autoPromote: false,
+			}),
+		});
+
+		await handlers.get("ctx-recomp")?.("", {
+			...createCtx("ses-recomp-dynamic"),
+			cwd: "/tmp/project-b",
+		});
+
+		expect(sent[0]?.message.content).toContain("Confirmation Required");
+		expect(sent[0]?.message.content).not.toContain("historian.model");
+	});
+
+	it("/ctx-recomp --upgrade returns the deprecation hint instead of usage", async () => {
+		const db = createDb();
+		replaceAllCompartmentState(
+			db,
+			"ses-upgrade",
+			[
+				{
+					sequence: 1,
+					startMessage: 1,
+					endMessage: 2,
+					startMessageId: "m1",
+					endMessageId: "m2",
+					title: "legacy",
+					content: "legacy content",
+				},
+			],
+			[],
+		);
+		const { pi, handlers, sent } = createMockPi();
+
+		registerCtxRecompCommand(pi as never, {
+			db,
+			runner: {
+				run: async () => ({
+					ok: true,
+					assistantText: "[]",
+					cost: 0,
+					durationMs: 1,
+				}),
+			},
+			historianModel: undefined,
+			historianChunkTokens: 32_000,
+			memoryEnabled: false,
+			autoPromote: false,
+		});
+
+		await handlers.get("ctx-recomp")?.("--upgrade", createCtx("ses-upgrade"));
+
+		expect(sent[0]?.message.content).toContain("Magic Recomp Upgrade");
+		expect(sent[0]?.message.content).toContain(
+			"The `--upgrade` flag is deprecated. Run `/ctx-session-upgrade` to upgrade this session.",
+		);
+		expect(sent[0]?.message.content).not.toContain("Invalid Arguments");
 	});
 
 	it("passes configured historian chunk budget into /ctx-recomp execution", async () => {

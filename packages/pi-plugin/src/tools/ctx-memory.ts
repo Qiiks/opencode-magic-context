@@ -158,26 +158,58 @@ function formatMemoryList(memories: Memory[]): string {
 		id: String(m.id),
 		category: m.category,
 		status: m.status,
+		verification: m.verificationStatus,
 		updated: new Date(m.updatedAt).toISOString(),
 		content: m.content.replace(/\s+/g, " ").trim(),
 	}));
-	const widths = {
-		id: Math.max(2, ...rows.map((r) => r.id.length)),
-		category: Math.max(8, ...rows.map((r) => r.category.length)),
-		status: Math.max(6, ...rows.map((r) => r.status.length)),
-		updated: Math.max(7, ...rows.map((r) => r.updated.length)),
+	const headers = {
+		id: "ID",
+		category: "CATEGORY",
+		status: "STATUS",
+		verification: "VERIFY",
+		updated: "UPDATED",
+		content: "CONTENT",
 	};
-	const fmt = (r: (typeof rows)[number]) =>
+	const widths = {
+		id: Math.max(headers.id.length, ...rows.map((r) => r.id.length)),
+		category: Math.max(
+			headers.category.length,
+			...rows.map((r) => r.category.length),
+		),
+		status: Math.max(
+			headers.status.length,
+			...rows.map((r) => r.status.length),
+		),
+		verification: Math.max(
+			headers.verification.length,
+			...rows.map((r) => r.verification.length),
+		),
+		updated: Math.max(
+			headers.updated.length,
+			...rows.map((r) => r.updated.length),
+		),
+	};
+	const fmt = (r: (typeof rows)[number] | typeof headers) =>
 		[
 			r.id.padEnd(widths.id),
 			r.category.padEnd(widths.category),
 			r.status.padEnd(widths.status),
+			r.verification.padEnd(widths.verification),
 			r.updated.padEnd(widths.updated),
 			r.content,
 		].join(" | ");
 	return [
 		`Found ${rows.length} active ${rows.length === 1 ? "memory" : "memories"}:`,
 		"",
+		fmt(headers),
+		[
+			"-".repeat(widths.id),
+			"-".repeat(widths.category),
+			"-".repeat(widths.status),
+			"-".repeat(widths.verification),
+			"-".repeat(widths.updated),
+			"-------",
+		].join("-+-"),
 		...rows.map(fmt),
 	].join("\n");
 }
