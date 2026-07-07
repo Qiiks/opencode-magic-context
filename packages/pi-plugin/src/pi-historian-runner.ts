@@ -113,6 +113,7 @@ import type { Database } from "@magic-context/core/shared/sqlite";
 import type {
 	SubagentProgressEvent,
 	SubagentRunner,
+	SubagentRunOptions,
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
 
@@ -124,10 +125,166 @@ import {
 
 const HISTORIAN_AGENT_NAME = "magic-context-historian";
 const DEFAULT_HISTORIAN_TIMEOUT_MS = 120_000;
+const MAX_HISTORIAN_RETRIES = 2;
 
 /** Keep historian alert noise to once per minute per session. */
 const HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
 const lastHistorianAlertBySession = new Map<string, number>();
+
+function getHistorianRetryBackoffMs(retryIndex: number): number {
+	if (retryIndex === 0) {
+		return 2_000 + Math.floor(Math.random() * 1_001);
+	}
+
+	return 6_000 + Math.floor(Math.random() * 2_001);
+}
+
+function isTransientHistorianPromptError(message: string): boolean {
+	const normalized = message.toLowerCase();
+	if (
+		normalized.includes("invalid request") ||
+		normalized.includes("bad request") ||
+		normalized.includes("unauthorized") ||
+		normalized.includes("forbidden") ||
+		normalized.includes("authentication") ||
+		normalized.includes("auth") ||
+		normalized.includes(" 400") ||
+		normalized.startsWith("400")
+	) {
+		return false;
+	}
+
+	return [
+		"429",
+		"rate limit",
+		"timeout",
+		"econnreset",
+		"etimedout",
+		"503",
+		"502",
+		"500",
+		"overloaded",
+	].some((token) => normalized.includes(token));
+}
+
+function isTransientHistorianRunFailure(
+	result: Extract<SubagentRunResult, { ok: false }>,
+): boolean {
+	if (result.reason === "abort") return false;
+	if (result.reason === "timeout") return true;
+	return isTransientHistorianPromptError(result.error);
+}
+
+function historianAbortResult(startedAt: number): SubagentRunResult {
+	return {
+		ok: false,
+		reason: "abort",
+		error: "pi subagent aborted by caller",
+		durationMs: Date.now() - startedAt,
+	};
+}
+
+async function sleepWithAbort(
+	ms: number,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	if (signal?.aborted) return true;
+	if (ms <= 0) return signal?.aborted === true;
+
+	return new Promise<boolean>((resolve) => {
+		let settled = false;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const finish = (aborted: boolean) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			signal?.removeEventListener("abort", onAbort);
+			resolve(aborted);
+		};
+		const onAbort = () => finish(true);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		timeout = setTimeout(() => finish(false), ms);
+	});
+}
+
+async function runHistorianSubagentWithTransientRetries(args: {
+	runner: SubagentRunner;
+	options: SubagentRunOptions;
+	sessionId: string;
+	passLabel: string;
+	retryBackoffMs?: (retryIndex: number) => number;
+}): Promise<SubagentRunResult> {
+	const startedAt = Date.now();
+	if (args.options.signal?.aborted) return historianAbortResult(startedAt);
+
+	for (
+		let retryIndex = 0;
+		retryIndex <= MAX_HISTORIAN_RETRIES;
+		retryIndex += 1
+	) {
+		const attemptStart = Date.now();
+		let result: SubagentRunResult;
+		try {
+			result = await args.runner.run({
+				...args.options,
+				// The historian runner owns fallback iteration because every candidate's
+				// output must be parsed and validated before the chain can stop.
+				fallbackModels: undefined,
+			});
+		} catch (error) {
+			const desc = describeError(error);
+			result = {
+				ok: false,
+				reason: "model_failed",
+				error: desc.brief,
+				durationMs: Date.now() - attemptStart,
+			};
+		}
+
+		if (result.ok) return result;
+		if (result.reason === "abort" || args.options.signal?.aborted) {
+			return result.reason === "abort"
+				? result
+				: historianAbortResult(startedAt);
+		}
+
+		const shouldRetry =
+			retryIndex < MAX_HISTORIAN_RETRIES &&
+			isTransientHistorianRunFailure(result);
+		if (!shouldRetry) return result;
+
+		const backoffMs =
+			args.retryBackoffMs?.(retryIndex) ??
+			getHistorianRetryBackoffMs(retryIndex);
+		sessionLog(
+			args.sessionId,
+			`historian[${args.passLabel}] transient failure; retry ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES} on same model after ${backoffMs}ms: ${result.error}`,
+		);
+		const aborted = await sleepWithAbort(backoffMs, args.options.signal);
+		if (aborted) return historianAbortResult(startedAt);
+	}
+
+	return historianAbortResult(startedAt);
+}
+
+function buildHistorianFallbackChain(
+	primaryModel: string,
+	fallbackModels?: readonly string[],
+	fallbackModelId?: string,
+): Array<{ modelId: string; kind: "configured" | "session" }> {
+	const seen = new Set<string>();
+	if (primaryModel) seen.add(primaryModel);
+	const chain: Array<{ modelId: string; kind: "configured" | "session" }> = [];
+	for (const candidate of fallbackModels ?? []) {
+		if (!candidate || seen.has(candidate)) continue;
+		seen.add(candidate);
+		chain.push({ modelId: candidate, kind: "configured" });
+	}
+	if (fallbackModelId && !seen.has(fallbackModelId)) {
+		chain.push({ modelId: fallbackModelId, kind: "session" });
+	}
+	return chain;
+}
 
 function parseSourceMessageTime(value: unknown): number | null {
 	if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -186,6 +343,8 @@ export interface PiHistorianDeps {
 	historianModel: string;
 	/** Optional ordered fallback chain. */
 	fallbackModels?: readonly string[];
+	/** Live session model used as the final fallback after configured fallbacks. */
+	fallbackModelId?: string;
 	/** Historian context window — used to derive chunk token budget. */
 	historianChunkTokens: number;
 	/** Boundary resolved by the Pi trigger/recovery decision with the real model context. */
@@ -199,6 +358,10 @@ export interface PiHistorianDeps {
 	currentContextLimit?: number;
 	/** Optional per-call timeout (default 120s). */
 	historianTimeoutMs?: number;
+	/** Optional cancellation signal for the historian run and retry backoff. */
+	signal?: AbortSignal;
+	/** Test seam for transient retry backoff. Defaults to OpenCode's retry cadence. */
+	retryBackoffMs?: (retryIndex: number) => number;
 	/** When true, run a second editor pass after a successful first pass to
 	 *  clean low-signal U: lines and cross-compartment duplicates. Mirrors
 	 *  OpenCode's `historian.two_pass` config. Editor validation falls back
@@ -252,11 +415,14 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		runner,
 		historianModel,
 		fallbackModels,
+		fallbackModelId,
 		historianChunkTokens,
 		boundarySnapshot: providedBoundarySnapshot,
 		refreshBoundarySnapshot,
 		currentContextLimit,
 		historianTimeoutMs = DEFAULT_HISTORIAN_TIMEOUT_MS,
+		signal,
+		retryBackoffMs,
 		twoPass,
 		thinkingLevel,
 		memoryEnabled,
@@ -271,7 +437,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		forceKeepLastCompartment,
 	} = deps;
 
+	let issueNotified = false;
 	const notify = async (message: string): Promise<void> => {
+		issueNotified = true;
 		if (shouldSuppressHistorianAlert(sessionId)) {
 			sessionLog(sessionId, "historian alert suppressed (cooldown)");
 			return;
@@ -632,18 +800,24 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			);
 
 			// First pass.
-			const firstResult = await runner.run({
-				agent: HISTORIAN_AGENT_NAME,
-				systemPrompt: historianSystemPrompt,
-				userMessage: prompt,
-				model: historianModel,
-				fallbackModels,
-				timeoutMs: historianTimeoutMs,
-				cwd: directory,
-				thinkingLevel,
-				onProgress: buildProgressLogger("first"),
-				accountingSessionId: sessionId,
-				accountingSubagent: "historian",
+			const firstResult = await runHistorianSubagentWithTransientRetries({
+				runner,
+				sessionId,
+				passLabel: "first",
+				retryBackoffMs,
+				options: {
+					agent: HISTORIAN_AGENT_NAME,
+					systemPrompt: historianSystemPrompt,
+					userMessage: prompt,
+					model: historianModel,
+					timeoutMs: historianTimeoutMs,
+					cwd: directory,
+					signal,
+					thinkingLevel,
+					onProgress: buildProgressLogger("first"),
+					accountingSessionId: sessionId,
+					accountingSubagent: "historian",
+				},
 			});
 
 			let validatedPass = await validateHistorianResult(
@@ -677,18 +851,24 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					validatedPass.error,
 					deps.language,
 				);
-				const repairResult = await runner.run({
-					agent: HISTORIAN_AGENT_NAME,
-					systemPrompt: historianSystemPrompt,
-					userMessage: repairPrompt,
-					model: historianModel,
-					fallbackModels,
-					timeoutMs: historianTimeoutMs,
-					cwd: directory,
-					thinkingLevel,
-					onProgress: buildProgressLogger("repair"),
-					accountingSessionId: sessionId,
-					accountingSubagent: "historian",
+				const repairResult = await runHistorianSubagentWithTransientRetries({
+					runner,
+					sessionId,
+					passLabel: "repair",
+					retryBackoffMs,
+					options: {
+						agent: HISTORIAN_AGENT_NAME,
+						systemPrompt: historianSystemPrompt,
+						userMessage: repairPrompt,
+						model: historianModel,
+						timeoutMs: historianTimeoutMs,
+						cwd: directory,
+						signal,
+						thinkingLevel,
+						onProgress: buildProgressLogger("repair"),
+						accountingSessionId: sessionId,
+						accountingSubagent: "historian",
+					},
 				});
 				validatedPass = await validateHistorianResult(
 					repairResult,
@@ -706,42 +886,48 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				}
 			}
 
-			// Escalate through the configured fallback chain on empty/invalid
-			// output. `runner.run({ fallbackModels })` only iterates the chain on
-			// HARD subagent failures (spawn/non-zero/truncated); a model that
-			// returns ok-but-empty (e.g. a misconfigured primary that emits
-			// nothing) or replies conversationally instead of emitting
-			// compartments passes that gate and lands here as no-output /
-			// validation-failed WITHOUT the chain ever being validated. Mirrors
-			// OpenCode's `runFallbackHistorianPass`: try each configured fallback
-			// model in order, validating output, before bailing. Pi has no
-			// live-session-model last resort (no interactive session model in the
-			// print-mode subagent context), so the chain is just `fallbackModels`.
-			if (validatedPass.kind !== "ok" && (fallbackModels?.length ?? 0) > 0) {
-				const seen = new Set<string>(
-					[historianModel].filter(Boolean) as string[],
-				);
-				for (const candidate of fallbackModels ?? []) {
-					if (!candidate || seen.has(candidate)) continue;
-					seen.add(candidate);
+			// Escalate through the fallback chain on empty/invalid output. Each
+			// candidate is run and validated explicitly because a model can complete
+			// successfully while producing no usable compartments. The live session's
+			// current model is appended as the final last-resort candidate.
+			const fallbackChain = buildHistorianFallbackChain(
+				historianModel,
+				fallbackModels,
+				fallbackModelId,
+			);
+			if (
+				validatedPass.kind !== "ok" &&
+				!(
+					validatedPass.kind === "spawn-failed" &&
+					validatedPass.reason === "abort"
+				) &&
+				fallbackChain.length > 0
+			) {
+				for (let i = 0; i < fallbackChain.length; i += 1) {
+					const candidate = fallbackChain[i];
 					sessionLog(
 						sessionId,
-						`historian: escalating to configured fallback model ${candidate}`,
+						`historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.modelId}`,
 					);
-					const fbResult = await runner.run({
-						agent: HISTORIAN_AGENT_NAME,
-						systemPrompt: historianSystemPrompt,
-						userMessage: prompt,
-						model: candidate,
-						// We drive the iteration here (validating each), so don't let
-						// the runner re-iterate its own throw-only chain.
-						fallbackModels: undefined,
-						timeoutMs: historianTimeoutMs,
-						cwd: directory,
-						thinkingLevel,
-						onProgress: buildProgressLogger("fallback"),
-						accountingSessionId: sessionId,
-						accountingSubagent: "historian",
+					const fbResult = await runHistorianSubagentWithTransientRetries({
+						runner,
+						sessionId,
+						passLabel:
+							candidate.kind === "session" ? "fallback-session" : "fallback",
+						retryBackoffMs,
+						options: {
+							agent: HISTORIAN_AGENT_NAME,
+							systemPrompt: historianSystemPrompt,
+							userMessage: prompt,
+							model: candidate.modelId,
+							timeoutMs: historianTimeoutMs,
+							cwd: directory,
+							signal,
+							thinkingLevel,
+							onProgress: buildProgressLogger("fallback"),
+							accountingSessionId: sessionId,
+							accountingSubagent: "historian",
+						},
 					});
 					const fbPass = await validateHistorianResult(
 						fbResult,
@@ -753,6 +939,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					if (fbPass.kind === "ok") {
 						validatedPass = fbPass;
 						if (fbResult.ok) validatedDraftText = fbResult.assistantText;
+						break;
+					}
+					if (fbPass.kind === "spawn-failed" && fbPass.reason === "abort") {
+						validatedPass = fbPass;
 						break;
 					}
 				}
@@ -792,17 +982,24 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				const draftAssistantText = validatedDraftText ?? "";
 				if (draftAssistantText.trim().length > 0) {
 					sessionLog(sessionId, "historian two-pass: running editor on draft");
-					const editorResult = await runner.run({
-						agent: HISTORIAN_AGENT_NAME,
-						systemPrompt: historianEditorSystemPrompt,
-						userMessage: buildHistorianEditorPrompt(draftAssistantText),
-						model: historianModel,
-						timeoutMs: historianTimeoutMs,
-						cwd: directory,
-						thinkingLevel,
-						onProgress: buildProgressLogger("editor"),
-						accountingSessionId: sessionId,
-						accountingSubagent: "historian_editor",
+					const editorResult = await runHistorianSubagentWithTransientRetries({
+						runner,
+						sessionId,
+						passLabel: "editor",
+						retryBackoffMs,
+						options: {
+							agent: HISTORIAN_AGENT_NAME,
+							systemPrompt: historianEditorSystemPrompt,
+							userMessage: buildHistorianEditorPrompt(draftAssistantText),
+							model: historianModel,
+							timeoutMs: historianTimeoutMs,
+							cwd: directory,
+							signal,
+							thinkingLevel,
+							onProgress: buildProgressLogger("editor"),
+							accountingSessionId: sessionId,
+							accountingSubagent: "historian_editor",
+						},
 					});
 					const editorPass = await validateHistorianResult(
 						editorResult,
@@ -1235,7 +1432,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			sessionId,
 			`historian failure: source=exception ${desc.brief}${desc.stackHead ? ` stackHead="${desc.stackHead}"` : ""}`,
 		);
-		{
+		if (!issueNotified) {
 			const failCount = incrementHistorianFailure(db, sessionId, desc.brief);
 			await notify(buildHistorianFailureNotice(failCount, desc.brief));
 		}
