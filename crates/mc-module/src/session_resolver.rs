@@ -1,0 +1,236 @@
+//! Resolves Claude Code MCP facade instance tokens to the opaque conversation key.
+//!
+//! The MCP shim binds its route with a per-launch instance token, while the store is
+//! populated under the parent conversation key carried by the model traffic. The resolver
+//! is the only place that crosses that boundary: handlers pass the token as a lookup
+//! argument and then use the returned key verbatim as the store scope.
+
+use std::{error::Error, fmt, path::Path, path::PathBuf, time::Duration};
+
+use serde_json::{json, Value};
+use subc_client_rs::{
+    async_trait, CallError, CallOptions, CloseRouteOptions, ConsumerOptions, RetryBackoff,
+    SubcConsumer,
+};
+use subc_protocol::{BindIdentity, RouteTarget};
+
+const DEFAULT_AI_PROXY_MODULE_ID: &str = "ai-proxy";
+const SESSION_RESOLVE_DEADLINE: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSession {
+    /// Opaque composite conversation key returned by ai-proxy. Store callers must use it
+    /// exactly as returned; the instance token is only the lookup input.
+    pub session_id: String,
+    pub last_traffic_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionResolveError {
+    Timeout,
+    Transport(String),
+    InvalidResponse(String),
+}
+
+impl fmt::Display for SessionResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "session.resolve timed out"),
+            Self::Transport(message) => write!(f, "session.resolve transport failed: {message}"),
+            Self::InvalidResponse(message) => {
+                write!(f, "session.resolve returned an invalid response: {message}")
+            }
+        }
+    }
+}
+
+impl Error for SessionResolveError {}
+
+#[async_trait]
+pub trait SessionResolver: Send + Sync {
+    async fn resolve_session(
+        &self,
+        project_root: &Path,
+        harness: &str,
+        instance_token: &str,
+    ) -> Result<Option<ResolvedSession>, SessionResolveError>;
+}
+
+pub struct RealSessionResolver {
+    connection_file: PathBuf,
+    module_id: String,
+}
+
+impl RealSessionResolver {
+    pub fn new(connection_file: PathBuf) -> Self {
+        Self {
+            connection_file,
+            module_id: DEFAULT_AI_PROXY_MODULE_ID.to_string(),
+        }
+    }
+
+    async fn resolve_once(
+        &self,
+        project_root: &Path,
+        harness: &str,
+        instance_token: &str,
+    ) -> Result<Option<ResolvedSession>, SessionResolveError> {
+        let target = RouteTarget::ManagementSurface {
+            module_id: self.module_id.clone(),
+        };
+        let identity = BindIdentity {
+            project_root: project_root.to_path_buf(),
+            harness: harness.to_string(),
+            session: instance_token.to_string(),
+        };
+        let consumer = SubcConsumer::connect(&self.connection_file, consumer_options())
+            .await
+            .map_err(|error| SessionResolveError::Transport(error.to_string()))?;
+        let response = consumer
+            .call(
+                target.clone(),
+                identity.clone(),
+                serde_json::to_vec(&json!({
+                    "method": "session.resolve",
+                    "params": { "instance_token": instance_token }
+                }))
+                .map_err(|error| SessionResolveError::Transport(error.to_string()))?,
+                call_options(),
+            )
+            .await;
+        consumer
+            .close_route(target, identity, CloseRouteOptions::default())
+            .await;
+        consumer.close().await;
+        let response = response.map_err(call_error_to_resolve_error)?;
+        let value: Value = serde_json::from_slice(&response).map_err(|error| {
+            SessionResolveError::InvalidResponse(format!("response was not JSON: {error}"))
+        })?;
+        parse_resolve_response(&value)
+    }
+}
+
+#[async_trait]
+impl SessionResolver for RealSessionResolver {
+    async fn resolve_session(
+        &self,
+        project_root: &Path,
+        harness: &str,
+        instance_token: &str,
+    ) -> Result<Option<ResolvedSession>, SessionResolveError> {
+        match tokio::time::timeout(
+            SESSION_RESOLVE_DEADLINE,
+            self.resolve_once(project_root, harness, instance_token),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(SessionResolveError::Timeout),
+        }
+    }
+}
+
+pub struct MissingSessionResolver;
+
+#[async_trait]
+impl SessionResolver for MissingSessionResolver {
+    async fn resolve_session(
+        &self,
+        _project_root: &Path,
+        _harness: &str,
+        _instance_token: &str,
+    ) -> Result<Option<ResolvedSession>, SessionResolveError> {
+        Err(SessionResolveError::Transport(
+            "mc-module was started without a subc connection file".to_string(),
+        ))
+    }
+}
+
+fn consumer_options() -> ConsumerOptions {
+    ConsumerOptions {
+        handshake_timeout: SESSION_RESOLVE_DEADLINE,
+        reconnect_backoff: RetryBackoff {
+            base: Duration::from_millis(25),
+            cap: Duration::from_millis(50),
+            max_attempts: 1,
+        },
+        restored_debounce: Duration::from_millis(10),
+    }
+}
+
+fn call_options() -> CallOptions {
+    CallOptions {
+        timeout: SESSION_RESOLVE_DEADLINE,
+        route_retry: RetryBackoff {
+            base: Duration::from_millis(25),
+            cap: Duration::from_millis(50),
+            max_attempts: 1,
+        },
+        route_retry_deadline: SESSION_RESOLVE_DEADLINE,
+        ..CallOptions::default()
+    }
+}
+
+fn call_error_to_resolve_error(error: CallError) -> SessionResolveError {
+    match error {
+        CallError::Module(body) if body.code == "session_resolve_timeout" => {
+            SessionResolveError::Timeout
+        }
+        other => SessionResolveError::Transport(other.to_string()),
+    }
+}
+
+fn parse_resolve_response(value: &Value) -> Result<Option<ResolvedSession>, SessionResolveError> {
+    let payload = value.get("result").unwrap_or(value);
+    match payload.get("session_id") {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::String(session_id)) => {
+            let last_traffic_ms = payload
+                .get("last_traffic_ms")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    SessionResolveError::InvalidResponse(
+                        "resolved session omitted integer last_traffic_ms".to_string(),
+                    )
+                })?;
+            Ok(Some(ResolvedSession {
+                session_id: session_id.clone(),
+                last_traffic_ms,
+            }))
+        }
+        Some(other) => Err(SessionResolveError::InvalidResponse(format!(
+            "session_id must be string or null, got {other}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_accepts_direct_or_json_rpc_result_and_null_unresolved() {
+        assert_eq!(
+            parse_resolve_response(&json!({"session_id": "conv:key", "last_traffic_ms": 7}))
+                .unwrap(),
+            Some(ResolvedSession {
+                session_id: "conv:key".to_string(),
+                last_traffic_ms: 7,
+            })
+        );
+        assert_eq!(
+            parse_resolve_response(
+                &json!({"result": {"session_id": "conv:2", "last_traffic_ms": 9}})
+            )
+            .unwrap(),
+            Some(ResolvedSession {
+                session_id: "conv:2".to_string(),
+                last_traffic_ms: 9,
+            })
+        );
+        assert_eq!(
+            parse_resolve_response(&json!({"session_id": null})).unwrap(),
+            None
+        );
+    }
+}
