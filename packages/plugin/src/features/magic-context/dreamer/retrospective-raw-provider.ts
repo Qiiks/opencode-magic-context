@@ -6,7 +6,7 @@ import { openOpenCodeDb } from "./open-opencode-db";
 
 export const RETROSPECTIVE_MAX_MESSAGES_PER_SESSION = 80;
 export const RETROSPECTIVE_MAX_MESSAGES_PER_RUN = 240;
-// Cap the number of (newest-first) sessions scanned per run. The first run
+// Cap the number of oldest eligible sessions scanned per run. The first run
 // (watermark=0) would otherwise fan out over the project's entire session
 // history; this bounds the scan/IO regardless of how many sessions exist.
 export const RETROSPECTIVE_MAX_SESSIONS_PER_RUN = 20;
@@ -48,6 +48,13 @@ export interface RetrospectiveRawProvider {
         sinceMs: number,
         capPerSession: number,
     ): RetrospectiveSinceRead | Promise<RetrospectiveSinceRead>;
+    /** Oldest raw message timestamp still pending per session. Providers with an
+     *  indexed store use this to order the bounded session scan by true backlog
+     *  frontier, not by coarse session updated_at. */
+    readOldestMessageTimesSince?(
+        sessionIds: readonly string[],
+        sinceMs: number,
+    ): Map<string, number> | Promise<Map<string, number>>;
     /** The ~`count` most recent typed USER messages at or before `beforeMs` — the
      *  run-boundary overlap so friction spanning two runs isn't missed. */
     readUserMessagesBefore(
@@ -101,20 +108,19 @@ export class OpenCodeRetrospectiveRawProvider implements RetrospectiveRawProvide
         // "user messages" are agent-authored task prompts whose audit/spec wording
         // ("fail", "error", "wrong", "no padding") trips the frustration regex and
         // whose tool fan-out trips repeated-tool-call. In a delegation-heavy period
-        // children also outnumber roots ~30:1, so the newest-first session cap is
+        // children also outnumber roots ~30:1, so a bounded session scan can be
         // entirely consumed by them and the real user session is never scanned.
         // is_subagent lives in session_meta (same DB); missing meta → treat as root.
         const rows = this.deps.contextDb
-            .prepare<[string, number], SessionProjectRow>(
+            .prepare<[string], SessionProjectRow>(
                 `SELECT sp.session_id, sp.updated_at
                    FROM session_projects sp
                    LEFT JOIN session_meta m ON m.session_id = sp.session_id
                   WHERE sp.project_path = ? AND sp.harness = 'opencode'
                     AND COALESCE(m.is_subagent, 0) = 0
-                  ORDER BY sp.updated_at DESC, sp.session_id DESC
-                  LIMIT ?`,
+                  ORDER BY sp.updated_at ASC, sp.session_id ASC`,
             )
-            .all(projectIdentity, RETROSPECTIVE_MAX_SESSIONS_PER_RUN);
+            .all(projectIdentity);
         return rows.map((row) => ({
             sessionId: row.session_id,
             updatedAt: typeof row.updated_at === "number" ? row.updated_at : undefined,
@@ -142,6 +148,15 @@ export class OpenCodeRetrospectiveRawProvider implements RetrospectiveRawProvide
         } catch {
             return { messages: [], truncated: false };
         }
+    }
+
+    readOldestMessageTimesSince(
+        sessionIds: readonly string[],
+        sinceMs: number,
+    ): Map<string, number> {
+        const db = this.resolveDb();
+        if (!db || sessionIds.length === 0) return new Map();
+        return readOpenCodeOldestMessageTimesSince(db, sessionIds, sinceMs);
     }
 
     readUserMessagesBefore(
@@ -199,18 +214,49 @@ export async function readRetrospectiveScanWindow(
 ): Promise<RetrospectiveScanWindow> {
     const maxMessages = options?.maxMessagesPerRun ?? RETROSPECTIVE_MAX_MESSAGES_PER_RUN;
     const capPerSession = options?.capPerSession ?? RETROSPECTIVE_MAX_MESSAGES_PER_SESSION;
-    const sessionReadPageSize = Math.max(
+    const sessionLimit = Math.max(
         1,
         Math.floor(options?.maxSessionsPerRun ?? RETROSPECTIVE_MAX_SESSIONS_PER_RUN),
     );
     try {
-        const sessions = await provider.listProjectSessions(projectIdentity);
+        const allSessions = await provider.listProjectSessions(projectIdentity);
+        const eligibleSessions = allSessions
+            .map((session, index) => ({ session, index }))
+            .filter(({ session }) => (session.updatedAt ?? Number.POSITIVE_INFINITY) > watermarkMs);
+        const oldestBySession = provider.readOldestMessageTimesSince
+            ? await provider.readOldestMessageTimesSince(
+                  eligibleSessions.map(({ session }) => session.sessionId),
+                  watermarkMs,
+              )
+            : null;
+        const sessions = (
+            oldestBySession
+                ? eligibleSessions.filter(({ session }) => oldestBySession.has(session.sessionId))
+                : eligibleSessions
+        ).sort((a, b) => {
+            const aFrontier = oldestBySession?.get(a.session.sessionId);
+            const bFrontier = oldestBySession?.get(b.session.sessionId);
+            if (aFrontier !== undefined || bFrontier !== undefined) {
+                return (
+                    (aFrontier ?? Number.POSITIVE_INFINITY) -
+                        (bFrontier ?? Number.POSITIVE_INFINITY) || a.index - b.index
+                );
+            }
+            const aUpdated = a.session.updatedAt ?? Number.POSITIVE_INFINITY;
+            const bUpdated = b.session.updatedAt ?? Number.POSITIVE_INFINITY;
+            const byUpdated = aUpdated - bUpdated;
+            return byUpdated || a.index - b.index;
+        });
+        const sessionsToRead = sessions.slice(0, sessionLimit).map(({ session }) => session);
+        const firstExcludedSession = sessions[sessionLimit]?.session;
+        const firstExcludedPendingTs = firstExcludedSession
+            ? oldestBySession?.get(firstExcludedSession.sessionId)
+            : undefined;
         const sinceReads: RetrospectiveSinceRead[] = [];
-        for (let i = 0; i < sessions.length; i += sessionReadPageSize) {
-            const page = sessions.slice(i, i + sessionReadPageSize);
+        if (sessionsToRead.length > 0) {
             sinceReads.push(
                 ...(await Promise.all(
-                    page.map((session) =>
+                    sessionsToRead.map((session) =>
                         provider.readUserMessagesSince(
                             session.sessionId,
                             watermarkMs,
@@ -246,12 +292,16 @@ export async function readRetrospectiveScanWindow(
         const droppedSince = allSince.slice(maxMessages);
 
         // Watermark = newest KEPT ts, clamped below any INCOMPLETELY-scanned
-        // ts-group so the exclusive `> watermark` next-run filter can never skip a
-        // same-ms sibling. Two truncation sources can split a ts-group:
+        // frontier so the exclusive `> watermark` next-run filter can never skip
+        // pending work. Three truncation sources can split the eligible backlog:
         //   • global maxMessages cap → never advance into the FIRST dropped row's
         //     ts (droppedSince[0].ts − 1); if it's strictly newer than newestKept
         //     the min() is a no-op (clean boundary).
         //   • per-session saturation → saturatedFrontier (computed above).
+        //   • session cap → first excluded session's oldest pending message − 1
+        //     (falling back to updated_at when a provider has no indexed frontier).
+        //     The scan is oldest-frontier first, so clamping cannot starve the
+        //     excluded session on the next run.
         // Take the tightest; never move backward.
         let maxScannedTs = watermarkMs;
         for (const row of keptSince) {
@@ -262,10 +312,17 @@ export async function readRetrospectiveScanWindow(
         if (firstDropped) {
             frontier = Math.min(frontier, firstDropped.ts - 1);
         }
+        if (typeof firstExcludedPendingTs === "number") {
+            frontier = Math.min(frontier, firstExcludedPendingTs - 1);
+        } else if (typeof firstExcludedSession?.updatedAt === "number") {
+            frontier = Math.min(frontier, firstExcludedSession.updatedAt - 1);
+        }
         maxScannedTs = Math.max(watermarkMs, Math.min(maxScannedTs, frontier));
 
         const keptSessionIds = new Set(keptSince.map((message) => message.sessionId));
-        const overlapSessions = sessions.filter((session) => keptSessionIds.has(session.sessionId));
+        const overlapSessions = sessionsToRead.filter((session) =>
+            keptSessionIds.has(session.sessionId),
+        );
         const overlapBatches =
             overlapUserCount > 0 && watermarkMs > 0
                 ? await Promise.all(
@@ -322,6 +379,32 @@ function readOpenCodeMessagesSince(
     const truncated = rows.length > limit;
     const kept = truncated ? rows.slice(0, limit) : rows;
     return { messages: normalizeOpenCodeRows(db, sessionId, kept), truncated };
+}
+
+function readOpenCodeOldestMessageTimesSince(
+    db: Database,
+    sessionIds: readonly string[],
+    sinceMs: number,
+): Map<string, number> {
+    const result = new Map<string, number>();
+    const uniqueIds = Array.from(new Set(sessionIds.filter((id) => id.length > 0)));
+    const chunkSize = 500;
+    for (let i = 0; i < uniqueIds.length; i += chunkSize) {
+        const chunk = uniqueIds.slice(i, i + chunkSize);
+        const placeholders = chunk.map(() => "?").join(", ");
+        const rows = db
+            .prepare<unknown[], { session_id: string; oldest_ts: number }>(
+                `SELECT session_id, MIN(time_created) AS oldest_ts
+                   FROM message
+                  WHERE time_created > ? AND session_id IN (${placeholders})
+                  GROUP BY session_id`,
+            )
+            .all(sinceMs, ...chunk);
+        for (const row of rows) {
+            if (typeof row.oldest_ts === "number") result.set(row.session_id, row.oldest_ts);
+        }
+    }
+    return result;
 }
 
 /**

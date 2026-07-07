@@ -139,10 +139,11 @@ describe("OpenCodeRetrospectiveRawProvider", () => {
             openOpenCodeDb: () => null,
         });
 
-        // sub1 is filtered out despite being newest; roots returned newest-first.
+        // sub1 is filtered out despite being newest; roots are returned oldest-first
+        // so the bounded scan drains historical backlog before newer sessions.
         expect(provider.listProjectSessions("project-a")).toEqual([
-            { sessionId: "root1", updatedAt: 50 },
             { sessionId: "root2", updatedAt: 40 },
+            { sessionId: "root1", updatedAt: 50 },
         ]);
     });
 

@@ -16,6 +16,7 @@ import {
     isLeaseActive,
     releaseLease,
     renewLease,
+    runLeaseGuardedWrite,
     startLeaseHeartbeat,
 } from "./lease";
 
@@ -123,6 +124,28 @@ describe("dreamer lease (atomic CAS)", () => {
         releaseLease(db, "holder-a");
         expect(getLeaseHolder(db)).toBe("holder-b");
         expect(isLeaseActive(db)).toBe(true);
+        closeQuietly(db);
+    });
+
+    it("lease-guarded writes reject a stolen lease before committing", () => {
+        const db = makeDb();
+        expect(acquireLease(db, "holder-a", "memory:proj")).toBe(true);
+        expect(db.prepare("CREATE TABLE guarded_writes (value TEXT)").run()).toBeDefined();
+
+        // Simulate the unsafe old pattern's gap: holder-a peeked successfully,
+        // then its lease expired and another runner claimed it before the write.
+        expect(getLeaseHolder(db, "memory:proj")).toBe("holder-a");
+        expireLease(db, "lease:memory:proj:expiry");
+        expect(acquireLease(db, "holder-b", "memory:proj")).toBe(true);
+
+        expect(() =>
+            runLeaseGuardedWrite(db, "holder-a", "memory:proj", () => {
+                db.prepare("INSERT INTO guarded_writes (value) VALUES ('committed')").run();
+            }),
+        ).toThrow(/lease lost/i);
+        expect(db.prepare("SELECT COUNT(*) AS count FROM guarded_writes").get()).toEqual({
+            count: 0,
+        });
         closeQuietly(db);
     });
 

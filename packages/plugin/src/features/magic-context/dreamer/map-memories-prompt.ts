@@ -1,6 +1,8 @@
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { assertNoDuplicateManifestIds, extractCompleteManifestBody } from "./manifest-parser";
+
 /**
  * map-memories prompt + host-side helpers.
  *
@@ -108,17 +110,17 @@ export interface ParsedMemoryMapping {
     independent: boolean;
 }
 
-/** Parse the agent's `<mappings>` manifest. Tolerant of attribute order and
- *  self-closing vs not; a memory with no files (and not explicitly independent)
- *  is treated as independent so it is recorded (never silently dropped). */
+/** Parse the agent's complete `<mappings>` manifest. A missing root close tag is
+ *  treated as truncation and rejects the whole batch. */
 export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
     const out: ParsedMemoryMapping[] = [];
-    for (const m of text.matchAll(/<memory\b([^>]*)\/?>/g)) {
+    const body = extractCompleteManifestBody(text, "mappings");
+    for (const m of body.matchAll(/<memory\b([^>]*)\/?>/g)) {
         const attrs = m[1];
         const idMatch = attrs.match(/\bid\s*=\s*"(\d+)"/);
-        if (!idMatch) continue;
+        if (!idMatch) throw new Error("mappings manifest entry missing numeric id");
         const id = Number.parseInt(idMatch[1], 10);
-        if (!Number.isInteger(id)) continue;
+        if (!Number.isInteger(id)) throw new Error("mappings manifest entry missing numeric id");
         const independent = /\bindependent\s*=\s*"(?:true|1)"/i.test(attrs);
         const filesMatch = attrs.match(/\bfiles\s*=\s*"([^"]*)"/);
         const files = filesMatch
@@ -129,5 +131,9 @@ export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
             : [];
         out.push({ id, files, independent: independent || files.length === 0 });
     }
+    assertNoDuplicateManifestIds(
+        out.map((entry) => entry.id),
+        "mappings",
+    );
     return out;
 }

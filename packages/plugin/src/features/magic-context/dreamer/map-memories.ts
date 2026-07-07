@@ -1,7 +1,10 @@
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
-import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
+import {
+    extractLatestAssistantText,
+    hasLengthCappedOutput,
+} from "../../../shared/assistant-message-extractor";
 import { describeError, getErrorMessage } from "../../../shared/error-message";
 import { shouldKeepSubagents } from "../../../shared/keep-subagents";
 import { log } from "../../../shared/logger";
@@ -14,7 +17,8 @@ import {
     recordMemoryMapping,
 } from "../memory";
 import { recordChildInvocation } from "../subagent-token-capture";
-import { peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
+import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
+import { assertManifestCoversExactly } from "./manifest-parser";
 import {
     buildMapMemoriesPrompt,
     extractMemoryCandidatePaths,
@@ -188,8 +192,12 @@ async function mapOneBatch(
                     });
                 },
                 validateOutput: (messages) => {
+                    if (hasLengthCappedOutput(messages)) {
+                        throw new Error("map-memories returned length-capped output");
+                    }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("map-memories returned no output");
+                    parseMapMemoriesManifest(text);
                     return text;
                 },
             },
@@ -225,16 +233,21 @@ async function mapOneBatch(
     }
 }
 
-/** Parse the manifest, normalize paths the same way verify does, and write the
- *  mappings under one lease-guarded transaction. Only ids that were IN this batch
- *  are applied (ignores any hallucinated id). */
-async function applyBatchMappings(
+/** Parse the complete manifest, normalize paths the same way verify does, and
+ *  write the mappings under one lease-guarded transaction. The manifest must
+ *  cover exactly this batch; unknown or missing ids reject the whole batch. */
+export async function applyBatchMappings(
     args: MapMemoriesArgs,
     batch: MapMemoryInput[],
     manifestText: string,
 ): Promise<{ mapped: number; independent: number }> {
     const batchIds = new Set(batch.map((m) => m.id));
-    const parsed = parseMapMemoriesManifest(manifestText).filter((p) => batchIds.has(p.id));
+    const parsed = parseMapMemoriesManifest(manifestText);
+    assertManifestCoversExactly(
+        parsed.map((entry) => entry.id),
+        batchIds,
+        "mappings",
+    );
     if (parsed.length === 0) return { mapped: 0, independent: 0 };
 
     // Pre-normalize each mapping's files OUTSIDE the transaction (path
@@ -259,19 +272,13 @@ async function applyBatchMappings(
     const now = Date.now();
     let mapped = 0;
     let independent = 0;
-    let leaseLost = false;
-    args.db.transaction(() => {
-        if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-            leaseLost = true;
-            return;
-        }
+    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
         for (const item of planned) {
             recordMemoryMapping(args.db, item.id, item.files, now);
             if (item.independent) independent += 1;
             else mapped += 1;
         }
-    })();
-    if (leaseLost) throw new Error("Dream lease lost during map-memories commit");
+    });
     return { mapped, independent };
 }
 

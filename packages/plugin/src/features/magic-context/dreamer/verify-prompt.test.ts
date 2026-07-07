@@ -21,16 +21,25 @@ describe("parseVerifyManifest", () => {
     });
 
     it("handles a self-closing update (no content)", () => {
-        const out = parseVerifyManifest(`<update id="7" files="a.ts"/>`);
+        const out = parseVerifyManifest(`<verify><update id="7" files="a.ts"/></verify>`);
         expect(out.updated).toEqual([{ id: 7, files: ["a.ts"], content: "" }]);
     });
 
-    it("skips entries without a numeric id", () => {
-        const out = parseVerifyManifest(
-            `<verified id="x" files="a.ts"/><archive id="9" reason="r"/>`,
+    it("rejects a truncated manifest with no closing root", () => {
+        expect(() => parseVerifyManifest(`<verify><archive id="9" reason="r"/>`)).toThrow(
+            /closing root/,
         );
-        expect(out.verified).toEqual([]);
-        expect(out.archived).toEqual([{ id: 9, reason: "r" }]);
+    });
+
+    it("rejects duplicate ids and invalid entries", () => {
+        expect(() =>
+            parseVerifyManifest(
+                `<verify><verified id="9" files="a.ts"/><archive id="9" reason="r"/></verify>`,
+            ),
+        ).toThrow(/duplicate id/);
+        expect(() =>
+            parseVerifyManifest(`<verify><verified id="x" files="a.ts"/></verify>`),
+        ).toThrow(/numeric id/);
     });
 });
 

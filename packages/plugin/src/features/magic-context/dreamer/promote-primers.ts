@@ -19,7 +19,7 @@ import {
     updatePrimerCandidateEmbedding,
     updatePrimerSupport,
 } from "../storage-primers";
-import { peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
+import { peekLeaseHolderAndExpiry, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 
 export interface PromotePrimersArgs {
     db: Database;
@@ -153,11 +153,7 @@ export async function promotePrimers(args: PromotePrimersArgs): Promise<PromoteP
             threshold: PRIMER_CLUSTER_THRESHOLD,
         });
 
-        args.db.transaction(() => {
-            if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-                leaseLost = true;
-                return;
-            }
+        runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
             for (const cluster of clusters) {
                 if (cluster.candidates.length === 0) continue;
                 const summary = summarizePrimerCluster(cluster);
@@ -193,7 +189,7 @@ export async function promotePrimers(args: PromotePrimersArgs): Promise<PromoteP
                 });
                 result.promoted += 1;
             }
-        })();
+        });
         if (leaseLost) throw new Error("Dream lease lost during promote-primers commit");
         log(
             `[dreamer] primers: candidates=${result.candidates} promoted=${result.promoted} updated=${result.updated}`,

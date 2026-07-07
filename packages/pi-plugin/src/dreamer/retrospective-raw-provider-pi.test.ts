@@ -15,6 +15,12 @@ describe("PiRetrospectiveRawProvider", () => {
 					modified: 30,
 				},
 				{
+					id: "s0",
+					cwd: "/repo/project",
+					path: "/sessions/s0.jsonl",
+					modified: 20,
+				},
+				{
 					id: "s2",
 					cwd: "/repo/other",
 					path: "/sessions/s2.jsonl",
@@ -25,6 +31,7 @@ describe("PiRetrospectiveRawProvider", () => {
 		});
 
 		expect(await provider.listProjectSessions("identity")).toEqual([
+			{ sessionId: "s0", path: "/sessions/s0.jsonl", updatedAt: 20 },
 			{ sessionId: "s1", path: "/sessions/s1.jsonl", updatedAt: 30 },
 		]);
 	});

@@ -18,19 +18,29 @@ describe("parseClassifyManifest", () => {
         ]);
     });
 
-    it("omits invalid scope and keeps the rest", () => {
-        const out = parseClassifyManifest(
-            `<memory id="5" importance="50" scope="bogus" shareable="true"/>`,
+    it("rejects invalid scope", () => {
+        expect(() =>
+            parseClassifyManifest(
+                `<classify><memory id="5" importance="50" scope="bogus" shareable="true"/></classify>`,
+            ),
+        ).toThrow(/invalid scope/);
+    });
+
+    it("rejects truncated, duplicate, and invalid entries", () => {
+        expect(() => parseClassifyManifest(`<classify><memory id="5" importance="50"/>`)).toThrow(
+            /closing root/,
         );
-        expect(out).toEqual([{ id: 5, importance: 50, shareable: true }]);
-    });
-
-    it("skips an entry that carries no classification fields", () => {
-        expect(parseClassifyManifest(`<memory id="9"/>`)).toEqual([]);
-    });
-
-    it("skips a non-numeric id", () => {
-        expect(parseClassifyManifest(`<memory id="x" importance="50"/>`)).toEqual([]);
+        expect(() =>
+            parseClassifyManifest(
+                `<classify><memory id="5" importance="50"/><memory id="5" shareable="true"/></classify>`,
+            ),
+        ).toThrow(/duplicate id/);
+        expect(() =>
+            parseClassifyManifest(`<classify><memory id="x" importance="50"/></classify>`),
+        ).toThrow(/numeric id/);
+        expect(() => parseClassifyManifest(`<classify><memory id="9"/></classify>`)).toThrow(
+            /classification fields/,
+        );
     });
 });
 

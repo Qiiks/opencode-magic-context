@@ -20,7 +20,7 @@ import {
     updatePrimerAnswer,
 } from "../storage-primers";
 import { recordChildInvocation } from "../subagent-token-capture";
-import { peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
+import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { buildPrimerSeed } from "./primer-seed";
 import { PRIMER_INVESTIGATOR_SYSTEM_PROMPT } from "./task-prompts";
 
@@ -292,15 +292,9 @@ async function refreshOnePrimer(
             return false;
         }
 
-        let leaseLost = false;
-        args.db.transaction(() => {
-            if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-                leaseLost = true;
-                return;
-            }
+        runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
             updatePrimerAnswer(args.db, primer.id, answer);
-        })();
-        if (leaseLost) throw new Error("Dream lease lost during refresh-primers commit");
+        });
         return true;
     } catch (error) {
         const desc = describeError(error);

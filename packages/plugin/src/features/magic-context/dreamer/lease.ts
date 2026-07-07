@@ -139,6 +139,23 @@ export function renewLease(
     });
 }
 
+export function runLeaseGuardedWrite<T>(
+    db: Database,
+    holderId: string,
+    leaseKey: string,
+    fn: () => T,
+): T {
+    return runImmediate(db, () => {
+        // The lease is checked after BEGIN IMMEDIATE has acquired SQLite's write
+        // lock. That removes the deferred-transaction gap where another process
+        // could steal the lease after a peek but before the durable mutation.
+        if (!peekLeaseHolderAndExpiry(db, holderId, leaseKey)) {
+            throw new Error("Dream lease lost before guarded write");
+        }
+        return fn();
+    });
+}
+
 /** Renewal beat interval. The lease TTL is LEASE_DURATION_MS (2×), so a single
  *  missed or contended beat still leaves a full interval of runway. */
 const LEASE_HEARTBEAT_INTERVAL_MS = 60 * 1000;

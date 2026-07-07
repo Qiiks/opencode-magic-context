@@ -11,6 +11,8 @@
  * 229 importances assigned, correct discrimination, 4/4 private controls held).
  */
 
+import { assertNoDuplicateManifestIds, extractCompleteManifestBody } from "./manifest-parser";
+
 export interface ClassifyPromptMemory {
     id: number;
     category: string;
@@ -116,16 +118,17 @@ export interface ParsedClassification {
 
 const SCOPES = new Set(["project", "ecosystem", "universe"]);
 
-/** Parse the agent's `<classify>` manifest. Tolerant of attribute order; a
- *  memory missing a valid attribute simply omits that field (host skips it). */
+/** Parse the agent's complete `<classify>` manifest. A missing root close tag is
+ *  treated as truncation and rejects the whole batch. */
 export function parseClassifyManifest(text: string): ParsedClassification[] {
     const out: ParsedClassification[] = [];
-    for (const m of text.matchAll(/<memory\b([^>]*)\/?>/g)) {
+    const body = extractCompleteManifestBody(text, "classify");
+    for (const m of body.matchAll(/<memory\b([^>]*)\/?>/g)) {
         const attrs = m[1];
         const idMatch = attrs.match(/\bid\s*=\s*"(\d+)"/);
-        if (!idMatch) continue;
+        if (!idMatch) throw new Error("classify manifest entry missing numeric id");
         const id = Number.parseInt(idMatch[1], 10);
-        if (!Number.isInteger(id)) continue;
+        if (!Number.isInteger(id)) throw new Error("classify manifest entry missing numeric id");
 
         const entry: ParsedClassification = { id };
         const impMatch = attrs.match(/\bimportance\s*=\s*"(\d+)"/);
@@ -134,18 +137,24 @@ export function parseClassifyManifest(text: string): ParsedClassification[] {
             if (Number.isInteger(imp)) entry.importance = Math.max(1, Math.min(100, imp));
         }
         const scopeMatch = attrs.match(/\bscope\s*=\s*"([a-z]+)"/i);
-        if (scopeMatch && SCOPES.has(scopeMatch[1].toLowerCase())) {
-            entry.scope = scopeMatch[1].toLowerCase() as ParsedClassification["scope"];
+        if (scopeMatch) {
+            const scope = scopeMatch[1].toLowerCase();
+            if (!SCOPES.has(scope)) throw new Error(`classify manifest invalid scope ${scope}`);
+            entry.scope = scope as ParsedClassification["scope"];
         }
         const shareMatch = attrs.match(/\bshareable\s*=\s*"(true|false|1|0)"/i);
         if (shareMatch) {
             const v = shareMatch[1].toLowerCase();
             entry.shareable = v === "true" || v === "1";
         }
-        // Only keep an entry that carries at least one classification field.
-        if (entry.importance !== undefined || entry.scope || entry.shareable !== undefined) {
-            out.push(entry);
+        if (entry.importance === undefined && !entry.scope && entry.shareable === undefined) {
+            throw new Error(`classify manifest entry ${id} missing classification fields`);
         }
+        out.push(entry);
     }
+    assertNoDuplicateManifestIds(
+        out.map((entry) => entry.id),
+        "classify",
+    );
     return out;
 }

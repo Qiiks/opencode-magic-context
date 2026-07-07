@@ -73,7 +73,7 @@ export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 			});
 		}
 
-		return result.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+		return result.sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0));
 	}
 
 	async readUserMessagesSince(
@@ -96,6 +96,20 @@ export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 			messages: eligible.slice(0, limit),
 			truncated: eligible.length > limit,
 		};
+	}
+
+	async readOldestMessageTimesSince(
+		sessionIds: readonly string[],
+		sinceMs: number,
+	): Promise<Map<string, number>> {
+		const out = new Map<string, number>();
+		for (const sessionId of sessionIds) {
+			const oldest = (await this.loadUserEntries(sessionId))
+				.filter((message) => message.ts > sinceMs)
+				.sort((a, b) => a.ts - b.ts || a.ordinal - b.ordinal)[0];
+			if (oldest) out.set(sessionId, oldest.ts);
+		}
+		return out;
 	}
 
 	async readUserMessagesBefore(

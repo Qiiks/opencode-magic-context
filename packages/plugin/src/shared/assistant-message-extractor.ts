@@ -72,3 +72,23 @@ export function extractLatestAssistantText(messages: unknown): string | null {
             .join("\n") || null
     );
 }
+
+export function hasLengthCappedOutput(value: unknown): boolean {
+    if (Array.isArray(value)) return value.some((item) => hasLengthCappedOutput(item));
+    if (!isRecord(value)) return false;
+
+    if (value.length_capped === true || value.lengthCapped === true) return true;
+    const finishReason = value.finish_reason ?? value.finishReason;
+    if (typeof finishReason === "string") {
+        const normalized = finishReason.toLowerCase();
+        if (
+            normalized === "length" ||
+            normalized === "max_tokens" ||
+            normalized === "max_output_tokens"
+        ) {
+            return true;
+        }
+    }
+
+    return Object.values(value).some((item) => hasLengthCappedOutput(item));
+}

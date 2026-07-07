@@ -192,6 +192,32 @@ describe("partitionVerifyScope (per-memory verified_at gate)", () => {
         }
     });
 
+    test("a same-second git change is in scope despite millisecond verification skew", async () => {
+        const db = freshDb();
+        const dir = makeGitMetadataDirectory("mc-verify-gate-same-second-");
+        installGitScript(
+            new Map([
+                [gitCommand(["rev-parse", "--show-toplevel"]), `${dir}\n`],
+                [gitCommand(["log", "--since=@10", "--name-only", "--format=%ct"]), "10\na.ts\n"],
+                [gitCommand(["rev-parse", "HEAD"]), `${HEAD_SHA}\n`],
+                [gitCommand(["diff", "--name-only", "-z", HEAD_SHA]), ""],
+            ]),
+        );
+        try {
+            const m = mem(db, PROJECT, "A in a.ts");
+            recordMemoryVerifications(db, m, ["a.ts"], 10_500);
+            const gate = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                now: 20_000,
+            });
+            expect(gate.inScopeIds).toEqual([m]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("an uncommitted edit keeps the mapped memory in scope", async () => {
         const db = freshDb();
         const dir = makeGitMetadataDirectory("mc-verify-gate-uncommitted-");
