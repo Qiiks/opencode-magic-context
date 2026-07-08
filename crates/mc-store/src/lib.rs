@@ -349,6 +349,9 @@ pub enum MediaKind {
 /// independent namespaces; this is ours).
 const NS: &str = "mc_cache";
 
+/// Durable namespace prefix for shadow-mode sessions and their mirror project rows.
+pub const SHADOW_SESSION_PREFIX: &str = "shadow:";
+
 /// Sentinel row_version meaning "no row present" (COALESCE default inside the txn).
 const NO_ROW: i64 = -1;
 
@@ -524,6 +527,77 @@ const MIGRATIONS: &[Migration] = &[
         );
         CREATE INDEX IF NOT EXISTS idx_pending_agent_drops_session
             ON pending_agent_drops(session_id, queued_at, id);
+    ",
+    },
+    Migration {
+        version: 8,
+        // Shadow-mode mirrors live under the shadow key instead of the production
+        // project-memory tables. This preserves source memory ids for byte-for-byte
+        // comparison without colliding with real mc_memories rows that share the same ids.
+        statements: "
+        CREATE TABLE IF NOT EXISTS shadow_memories (
+            shadow_project_path       TEXT NOT NULL,
+            id                        INTEGER NOT NULL,
+            category                  TEXT NOT NULL,
+            content                   TEXT NOT NULL,
+            normalized_hash           TEXT NOT NULL,
+            importance                INTEGER,
+            scope                     TEXT NOT NULL DEFAULT 'project',
+            shareable                 INTEGER NOT NULL DEFAULT 0,
+            source_session_id         TEXT,
+            source_type               TEXT DEFAULT 'historian',
+            seen_count                INTEGER DEFAULT 1,
+            retrieval_count           INTEGER DEFAULT 0,
+            first_seen_at             INTEGER NOT NULL DEFAULT 0,
+            created_at                INTEGER NOT NULL DEFAULT 0,
+            updated_at                INTEGER NOT NULL DEFAULT 0,
+            last_seen_at              INTEGER NOT NULL DEFAULT 0,
+            last_retrieved_at         INTEGER,
+            status                    TEXT DEFAULT 'active',
+            expires_at                INTEGER,
+            verification_status       TEXT DEFAULT 'unverified',
+            verified_at               INTEGER,
+            classified_at             INTEGER,
+            superseded_by_memory_id   INTEGER,
+            merged_from               TEXT,
+            metadata_json             TEXT,
+            PRIMARY KEY (shadow_project_path, id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_shadow_memories_project_status
+            ON shadow_memories(shadow_project_path, status);
+
+        CREATE TABLE IF NOT EXISTS shadow_memory_mutation_log (
+            shadow_project_path  TEXT NOT NULL,
+            id                   INTEGER NOT NULL,
+            mutation_type        TEXT NOT NULL,
+            target_memory_id     INTEGER NOT NULL,
+            superseded_by_id     INTEGER,
+            category             TEXT,
+            new_content          TEXT,
+            queued_at            INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (shadow_project_path, id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_shadow_memory_mutation_project
+            ON shadow_memory_mutation_log(shadow_project_path, id);
+
+        CREATE TABLE IF NOT EXISTS shadow_divergences (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id           TEXT NOT NULL,
+            pass_seq             INTEGER NOT NULL,
+            class                TEXT NOT NULL,
+            first_mid            TEXT,
+            first_block          TEXT,
+            first_field          TEXT,
+            ts_prefix            TEXT NOT NULL,
+            rs_prefix            TEXT NOT NULL,
+            normalizations       TEXT NOT NULL,
+            ts_decision          TEXT NOT NULL,
+            rs_decision          TEXT NOT NULL,
+            state_hash           TEXT NOT NULL,
+            created_at           INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_shadow_divergences_session
+            ON shadow_divergences(session_id, pass_seq, id);
     ",
     },
 ];
@@ -1010,6 +1084,27 @@ pub struct ModuleMeta {
     /// Sparse response-recency anchor, piggybacked only on passes already committing.
     #[serde(default)]
     pub last_committed_pass_at_ms: i64,
+
+    /// Tracks which shadow reset generation this record belongs to. Operations created
+    /// before the most recent reset are rejected so they cannot write rows from an older
+    /// session state.
+    #[serde(default)]
+    pub shadow_generation: u64,
+    /// Monotonic sequence number for accepted shadow state-sync transactions. Zero is a
+    /// valid first value, so callers must compare it directly instead of treating it as
+    /// missing.
+    #[serde(default)]
+    pub shadow_seq: u64,
+    /// Set when the shadow session first diverges from the source state. While
+    /// quarantined, the system still records lightweight decisions, but it stops
+    /// byte-for-byte comparison until a reset clears the flag.
+    #[serde(default)]
+    pub shadow_quarantined: bool,
+    /// Stores the last watermarks acknowledged from the sender, using the same
+    /// compare-and-swap update as the mirror rows so restarts and retries see one
+    /// consistent state.
+    #[serde(default)]
+    pub shadow_acked_watermarks: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1147,6 +1242,113 @@ pub struct LoadedState {
     pub row_version: Option<u64>,
 }
 
+/// Represents one mirrored project-memory row from shadow state-sync. It keeps the
+/// original memory id unchanged because that id is written into prompt data and
+/// referenced by mutation rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowMemoryRow {
+    pub id: i64,
+    pub category: String,
+    pub content: String,
+    pub normalized_hash: String,
+    pub importance: Option<i32>,
+    pub scope: String,
+    pub shareable: i32,
+    pub source_session_id: Option<String>,
+    pub source_type: Option<String>,
+    pub seen_count: i64,
+    pub retrieval_count: i64,
+    pub first_seen_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_seen_at: i64,
+    pub last_retrieved_at: Option<i64>,
+    pub status: String,
+    pub expires_at: Option<i64>,
+    pub verification_status: String,
+    pub verified_at: Option<i64>,
+    pub classified_at: Option<i64>,
+    pub superseded_by_memory_id: Option<i64>,
+    pub merged_from: Option<String>,
+    pub metadata_json: Option<String>,
+}
+
+pub struct ShadowStateSyncRequest<'a> {
+    pub session_id: &'a str,
+    pub shadow_project_path: &'a str,
+    pub shadow_generation: u64,
+    pub expected_shadow_seq: u64,
+    pub compartments: &'a [StoredCompartment],
+    pub memories: &'a [ShadowMemoryRow],
+    pub memory_mutations: &'a [StoredMemoryMutation],
+    pub last_todo_state: Option<String>,
+    pub acked_watermarks: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowStateSyncResult {
+    pub shadow_generation: u64,
+    pub shadow_seq: u64,
+    pub row_version: u64,
+}
+
+#[derive(Debug)]
+pub enum ShadowStateSyncError {
+    Store(McStoreError),
+    GenerationMismatch { expected: u64, found: u64 },
+    SeqMismatch { expected: u64, found: u64 },
+    Serde(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowResetResult {
+    pub shadow_generation: u64,
+    pub shadow_seq: u64,
+    pub row_version: u64,
+}
+
+pub struct ShadowDivergenceRecord<'a> {
+    pub session_id: &'a str,
+    pub shadow_generation: u64,
+    pub pass_seq: u64,
+    pub class: &'a str,
+    pub first_mid: Option<&'a str>,
+    pub first_block: Option<&'a str>,
+    pub first_field: Option<&'a str>,
+    pub ts_prefix: &'a str,
+    pub rs_prefix: &'a str,
+    pub normalizations_json: &'a str,
+    pub ts_decision_json: &'a str,
+    pub rs_decision_json: &'a str,
+    pub state_hash: &'a str,
+    pub created_at_ms: i64,
+    pub quarantine: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowDivergenceWriteResult {
+    pub quarantined: bool,
+    pub row_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowDivergenceRow {
+    pub id: i64,
+    pub session_id: String,
+    pub pass_seq: u64,
+    pub class: String,
+    pub first_mid: Option<String>,
+    pub first_block: Option<String>,
+    pub first_field: Option<String>,
+    pub ts_prefix: String,
+    pub rs_prefix: String,
+    pub normalizations_json: String,
+    pub ts_decision_json: String,
+    pub rs_decision_json: String,
+    pub state_hash: String,
+    pub created_at_ms: i64,
+}
+
 /// CAS / serialization errors layered over `cortexkit-store`.
 #[derive(Debug)]
 pub enum McStoreError {
@@ -1178,6 +1380,36 @@ impl From<StoreError> for McStoreError {
     }
 }
 
+impl std::fmt::Display for ShadowStateSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShadowStateSyncError::Store(e) => write!(f, "store: {e}"),
+            ShadowStateSyncError::GenerationMismatch { expected, found } => write!(
+                f,
+                "shadow generation mismatch: expected {expected}, found {found}"
+            ),
+            ShadowStateSyncError::SeqMismatch { expected, found } => {
+                write!(f, "shadow seq mismatch: expected {expected}, found {found}")
+            }
+            ShadowStateSyncError::Serde(e) => write!(f, "serde: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ShadowStateSyncError {}
+
+impl From<McStoreError> for ShadowStateSyncError {
+    fn from(e: McStoreError) -> Self {
+        ShadowStateSyncError::Store(e)
+    }
+}
+
+impl From<StoreError> for ShadowStateSyncError {
+    fn from(e: StoreError) -> Self {
+        ShadowStateSyncError::Store(McStoreError::Store(e))
+    }
+}
+
 /// Outcome of the fenced commit txn: either the new row_version, or a CAS conflict
 /// carrying the version observed on disk. Modeled as a return value (not an error)
 /// so a conflicting pass commits an empty txn and the caller re-loads cleanly.
@@ -1197,6 +1429,19 @@ enum PublishTxnOutcome {
 enum TruncateTxnOutcome {
     Committed(TruncateOutcome),
     CasConflict(u64),
+    Serde(String),
+}
+
+enum ShadowSyncTxnOutcome {
+    Committed(ShadowStateSyncResult),
+    GenerationMismatch { found: u64 },
+    SeqMismatch { found: u64 },
+    Serde(String),
+}
+
+enum ShadowDivergenceTxnOutcome {
+    Committed(ShadowDivergenceWriteResult),
+    GenerationMismatch { found: u64 },
     Serde(String),
 }
 
@@ -1375,6 +1620,309 @@ impl McStore {
             CommitOutcome::Committed(v) => Ok(v),
             CommitOutcome::CasConflict(found) => Err(McStoreError::CasConflict { expected, found }),
         }
+    }
+
+    /// Apply a shadow state mirror update in the same fenced transaction that advances
+    /// the shadow sequence. The generation and sequence checks run inside the transaction
+    /// before any mirror row is written, so a dropped/retried sync cannot partially apply.
+    pub fn apply_shadow_state_sync(
+        &self,
+        request: ShadowStateSyncRequest<'_>,
+    ) -> Result<ShadowStateSyncResult, ShadowStateSyncError> {
+        let core_json = serde_json::to_string(&CoreState::default())
+            .map_err(|e| ShadowStateSyncError::Serde(e.to_string()))?;
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![request.session_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            let (current, core_state_json, mut meta) = match row {
+                Some((row_version, core_state_json, meta_json)) => {
+                    let meta = match serde_json::from_str::<ModuleMeta>(&meta_json) {
+                        Ok(meta) => meta,
+                        Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+                    };
+                    (row_version, core_state_json, meta)
+                }
+                None => (NO_ROW, core_json.clone(), ModuleMeta::default()),
+            };
+
+            if meta.shadow_generation != request.shadow_generation {
+                return Ok(ShadowSyncTxnOutcome::GenerationMismatch {
+                    found: meta.shadow_generation,
+                });
+            }
+            if meta.shadow_seq != request.expected_shadow_seq {
+                return Ok(ShadowSyncTxnOutcome::SeqMismatch {
+                    found: meta.shadow_seq,
+                });
+            }
+
+            for compartment in request.compartments {
+                upsert_compartment_tx(tx, request.session_id, compartment)?;
+            }
+            replace_shadow_memories_tx(tx, request.shadow_project_path, request.memories)?;
+            replace_shadow_memory_mutations_tx(
+                tx,
+                request.shadow_project_path,
+                request.memory_mutations,
+            )?;
+
+            meta.last_todo_state = request.last_todo_state.clone();
+            meta.shadow_seq = meta.shadow_seq.saturating_add(1);
+            meta.shadow_acked_watermarks = request.acked_watermarks.clone();
+
+            let next = current.max(0) as u64 + 1;
+            let meta_json = match serde_json::to_string(&meta) {
+                Ok(json) => json,
+                Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+            };
+            tx.execute(
+                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     row_version = excluded.row_version,
+                     core_state  = excluded.core_state,
+                     meta        = excluded.meta",
+                params![request.session_id, next as i64, core_state_json, meta_json],
+            )?;
+
+            Ok(ShadowSyncTxnOutcome::Committed(ShadowStateSyncResult {
+                shadow_generation: meta.shadow_generation,
+                shadow_seq: meta.shadow_seq,
+                row_version: next,
+            }))
+        })?;
+
+        match outcome {
+            ShadowSyncTxnOutcome::Committed(result) => Ok(result),
+            ShadowSyncTxnOutcome::GenerationMismatch { found } => {
+                Err(ShadowStateSyncError::GenerationMismatch {
+                    expected: request.shadow_generation,
+                    found,
+                })
+            }
+            ShadowSyncTxnOutcome::SeqMismatch { found } => Err(ShadowStateSyncError::SeqMismatch {
+                expected: request.expected_shadow_seq,
+                found,
+            }),
+            ShadowSyncTxnOutcome::Serde(e) => Err(ShadowStateSyncError::Serde(e)),
+        }
+    }
+
+    /// Start a new shadow lineage by wiping shadow-owned rows and recreating the cache
+    /// state with generation+1, seq=0, and quarantine cleared.
+    pub fn reset_shadow_session(
+        &self,
+        session_id: &str,
+        shadow_project_path: &str,
+    ) -> Result<ShadowResetResult, McStoreError> {
+        let core_json = serde_json::to_string(&CoreState::default())
+            .map_err(|e| McStoreError::Serde(e.to_string()))?;
+        let result = self.inner.with_conn_fenced(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let (current, current_generation) = match row {
+                Some((row_version, meta_json)) => {
+                    let meta: ModuleMeta = serde_json::from_str(&meta_json)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    (row_version, meta.shadow_generation)
+                }
+                None => (NO_ROW, 0),
+            };
+            let mut meta = ModuleMeta {
+                shadow_generation: current_generation.saturating_add(1),
+                shadow_seq: 0,
+                shadow_quarantined: false,
+                ..ModuleMeta::default()
+            };
+            meta.shadow_acked_watermarks = Value::Null;
+
+            tx.execute(
+                "DELETE FROM mc_compartments WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM pending_agent_drops WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM shadow_memories WHERE shadow_project_path = ?1",
+                params![shadow_project_path],
+            )?;
+            tx.execute(
+                "DELETE FROM shadow_memory_mutation_log WHERE shadow_project_path = ?1",
+                params![shadow_project_path],
+            )?;
+            tx.execute(
+                "DELETE FROM shadow_divergences WHERE session_id = ?1",
+                params![session_id],
+            )?;
+
+            let next = current.max(0) as u64 + 1;
+            let meta_json = serde_json::to_string(&meta)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            tx.execute(
+                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     row_version = excluded.row_version,
+                     core_state  = excluded.core_state,
+                     meta        = excluded.meta",
+                params![session_id, next as i64, core_json, meta_json],
+            )?;
+            Ok(ShadowResetResult {
+                shadow_generation: meta.shadow_generation,
+                shadow_seq: meta.shadow_seq,
+                row_version: next,
+            })
+        })?;
+        Ok(result)
+    }
+
+    /// Stores one shadow divergence report and optionally marks the session quarantined in
+    /// a single compare-and-swap update. If the generation no longer matches, the write
+    /// fails so an older report cannot quarantine a newer shadow lineage.
+    pub fn record_shadow_divergence(
+        &self,
+        record: ShadowDivergenceRecord<'_>,
+    ) -> Result<ShadowDivergenceWriteResult, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![record.session_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((current, core_json, meta_json)) = row else {
+                return Ok(ShadowDivergenceTxnOutcome::GenerationMismatch { found: 0 });
+            };
+            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+                Ok(meta) => meta,
+                Err(e) => return Ok(ShadowDivergenceTxnOutcome::Serde(e.to_string())),
+            };
+            if meta.shadow_generation != record.shadow_generation {
+                return Ok(ShadowDivergenceTxnOutcome::GenerationMismatch {
+                    found: meta.shadow_generation,
+                });
+            }
+
+            tx.execute(
+                "INSERT INTO shadow_divergences
+                   (session_id, pass_seq, class, first_mid, first_block, first_field,
+                    ts_prefix, rs_prefix, normalizations, ts_decision, rs_decision,
+                    state_hash, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    record.session_id,
+                    record.pass_seq as i64,
+                    record.class,
+                    record.first_mid,
+                    record.first_block,
+                    record.first_field,
+                    record.ts_prefix,
+                    record.rs_prefix,
+                    record.normalizations_json,
+                    record.ts_decision_json,
+                    record.rs_decision_json,
+                    record.state_hash,
+                    record.created_at_ms,
+                ],
+            )?;
+
+            let mut next = current.max(0) as u64;
+            if record.quarantine && !meta.shadow_quarantined {
+                meta.shadow_quarantined = true;
+                next = next.saturating_add(1);
+                let meta_json = match serde_json::to_string(&meta) {
+                    Ok(json) => json,
+                    Err(e) => return Ok(ShadowDivergenceTxnOutcome::Serde(e.to_string())),
+                };
+                tx.execute(
+                    "UPDATE mc_cache_state SET row_version = ?2, core_state = ?3, meta = ?4
+                     WHERE session_id = ?1 AND row_version = ?5",
+                    params![record.session_id, next as i64, core_json, meta_json, current],
+                )?;
+            }
+
+            Ok(ShadowDivergenceTxnOutcome::Committed(
+                ShadowDivergenceWriteResult {
+                    quarantined: meta.shadow_quarantined,
+                    row_version: next,
+                },
+            ))
+        })?;
+
+        match outcome {
+            ShadowDivergenceTxnOutcome::Committed(result) => Ok(result),
+            ShadowDivergenceTxnOutcome::GenerationMismatch { found } => {
+                Err(McStoreError::CasConflict {
+                    expected: Some(record.shadow_generation),
+                    found,
+                })
+            }
+            ShadowDivergenceTxnOutcome::Serde(e) => Err(McStoreError::Serde(e)),
+        }
+    }
+
+    pub fn load_shadow_divergences(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ShadowDivergenceRow>, McStoreError> {
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, pass_seq, class, first_mid, first_block, first_field,
+                        ts_prefix, rs_prefix, normalizations, ts_decision, rs_decision,
+                        state_hash, created_at
+                   FROM shadow_divergences
+                  WHERE session_id = ?1
+                  ORDER BY pass_seq ASC, id ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![session_id], |r| {
+                    Ok(ShadowDivergenceRow {
+                        id: r.get(0)?,
+                        session_id: r.get(1)?,
+                        pass_seq: r.get::<_, i64>(2)?.max(0) as u64,
+                        class: r.get(3)?,
+                        first_mid: r.get(4)?,
+                        first_block: r.get(5)?,
+                        first_field: r.get(6)?,
+                        ts_prefix: r.get(7)?,
+                        rs_prefix: r.get(8)?,
+                        normalizations_json: r.get(9)?,
+                        ts_decision_json: r.get(10)?,
+                        rs_decision_json: r.get(11)?,
+                        state_hash: r.get(12)?,
+                        created_at_ms: r.get(13)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
     }
 
     /// Read a session's compartments in chronological order (oldest first), the order
@@ -2094,6 +2642,9 @@ impl McStore {
         project_path: &str,
         now_ms: i64,
     ) -> Result<Vec<StoredMemory>, McStoreError> {
+        if is_shadow_project_path(project_path) {
+            return self.load_active_shadow_memories(project_path, now_ms);
+        }
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, category, content, importance, status, expires_at,
@@ -2106,6 +2657,40 @@ impl McStore {
             )?;
             let mapped = stmt
                 .query_map(params![project_path, now_ms], |r| {
+                    Ok(StoredMemory {
+                        id: r.get(0)?,
+                        category: r.get(1)?,
+                        content: r.get(2)?,
+                        importance: r.get(3)?,
+                        status: r.get(4)?,
+                        expires_at: r.get(5)?,
+                        superseded_by_memory_id: r.get(6)?,
+                        updated_at: r.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
+    fn load_active_shadow_memories(
+        &self,
+        shadow_project_path: &str,
+        now_ms: i64,
+    ) -> Result<Vec<StoredMemory>, McStoreError> {
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, content, importance, status, expires_at,
+                        superseded_by_memory_id, updated_at
+                   FROM shadow_memories
+                  WHERE shadow_project_path = ?1
+                    AND status IN ('active', 'permanent')
+                    AND (expires_at IS NULL OR expires_at > ?2)
+                  ORDER BY COALESCE(importance, 50) DESC, id ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![shadow_project_path, now_ms], |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
                         category: r.get(1)?,
@@ -2146,6 +2731,16 @@ impl McStore {
     ) -> Result<Vec<StoredMemoryMutation>, McStoreError> {
         if rendered_memory_ids.is_empty() || project_paths.is_empty() {
             return Ok(Vec::new());
+        }
+        if project_paths
+            .iter()
+            .any(|path| is_shadow_project_path(path))
+        {
+            return self.shadow_memory_mutations_for_render(
+                project_paths,
+                after_id,
+                rendered_memory_ids,
+            );
         }
         // dedup + sort the id set for a stable IN-clause.
         let mut ids: Vec<i64> = rendered_memory_ids.to_vec();
@@ -2197,6 +2792,66 @@ impl McStore {
         Ok(coalesce_mutations(rows))
     }
 
+    fn shadow_memory_mutations_for_render(
+        &self,
+        project_paths: &[String],
+        after_id: i64,
+        rendered_memory_ids: &[i64],
+    ) -> Result<Vec<StoredMemoryMutation>, McStoreError> {
+        let mut ids: Vec<i64> = rendered_memory_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let id_ph = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut projects: Vec<String> = project_paths
+            .iter()
+            .filter(|path| is_shadow_project_path(path))
+            .cloned()
+            .collect();
+        projects.sort_unstable();
+        projects.dedup();
+        if projects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let proj_ph = std::iter::repeat_n("?", projects.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let rows = self.inner.with_conn(|conn| {
+            let sql = format!(
+                "SELECT id, mutation_type, target_memory_id, superseded_by_id, category,
+                        new_content, queued_at
+                   FROM shadow_memory_mutation_log
+                  WHERE shadow_project_path IN ({proj_ph}) AND id > ? AND target_memory_id IN ({id_ph})
+                  ORDER BY id ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut binds: Vec<rusqlite::types::Value> = projects
+                .iter()
+                .map(|p| rusqlite::types::Value::from(p.clone()))
+                .collect();
+            binds.push(rusqlite::types::Value::from(after_id));
+            binds.extend(ids.iter().map(|&i| rusqlite::types::Value::from(i)));
+            let mapped = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                    Ok(StoredMemoryMutation {
+                        id: r.get(0)?,
+                        mutation_type: r.get(1)?,
+                        target_memory_id: r.get(2)?,
+                        superseded_by_id: r.get(3)?,
+                        category: r.get(4)?,
+                        new_content: r.get(5)?,
+                        queued_at: r.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+
+        Ok(coalesce_mutations(rows))
+    }
+
     /// Resolve a project's workspace membership: the union of member identities it
     /// reads, the share-category allow-list, and per-foreign-member display attribution.
     /// Returns None when the project is in no workspace (the single-project fast path —
@@ -2206,6 +2861,9 @@ impl McStore {
         &self,
         project_path: &str,
     ) -> Result<Option<WorkspaceMembership>, McStoreError> {
+        if is_shadow_project_path(project_path) {
+            return Ok(None);
+        }
         let membership = self.inner.with_conn(|conn| {
             // which workspace (if any) does this project belong to?
             let ws: Option<(i64, String)> = conn
@@ -2444,6 +3102,36 @@ impl McStore {
         if project_paths.is_empty() {
             return Ok(0);
         }
+        if project_paths
+            .iter()
+            .any(|path| is_shadow_project_path(path))
+        {
+            let mut projects: Vec<String> = project_paths
+                .iter()
+                .filter(|path| is_shadow_project_path(path))
+                .cloned()
+                .collect();
+            projects.sort_unstable();
+            projects.dedup();
+            if projects.is_empty() {
+                return Ok(0);
+            }
+            let ph = std::iter::repeat_n("?", projects.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let max = self.inner.with_conn(|conn| {
+                let sql = format!(
+                    "SELECT COALESCE(MAX(id), 0) FROM shadow_memory_mutation_log
+                     WHERE shadow_project_path IN ({ph})"
+                );
+                let v: i64 =
+                    conn.query_row(&sql, rusqlite::params_from_iter(projects.iter()), |r| {
+                        r.get(0)
+                    })?;
+                Ok(v)
+            })?;
+            return Ok(max);
+        }
         let mut projects: Vec<String> = project_paths.to_vec();
         projects.sort_unstable();
         projects.dedup();
@@ -2471,6 +3159,36 @@ impl McStore {
     pub fn max_memory_id(&self, project_paths: &[String]) -> Result<i64, McStoreError> {
         if project_paths.is_empty() {
             return Ok(0);
+        }
+        if project_paths
+            .iter()
+            .any(|path| is_shadow_project_path(path))
+        {
+            let mut projects: Vec<String> = project_paths
+                .iter()
+                .filter(|path| is_shadow_project_path(path))
+                .cloned()
+                .collect();
+            projects.sort_unstable();
+            projects.dedup();
+            if projects.is_empty() {
+                return Ok(0);
+            }
+            let ph = std::iter::repeat_n("?", projects.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let max = self.inner.with_conn(|conn| {
+                let sql = format!(
+                    "SELECT COALESCE(MAX(id), 0) FROM shadow_memories WHERE shadow_project_path IN ({ph})"
+                );
+                let v: i64 = conn.query_row(
+                    &sql,
+                    rusqlite::params_from_iter(projects.iter()),
+                    |r| r.get(0),
+                )?;
+                Ok(v)
+            })?;
+            return Ok(max);
         }
         let mut projects: Vec<String> = project_paths.to_vec();
         projects.sort_unstable();
@@ -2608,6 +3326,163 @@ impl McStore {
         })?;
         Ok(())
     }
+}
+
+fn upsert_compartment_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    c: &StoredCompartment,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO mc_compartments
+           (session_id, sequence, start_message, end_message, start_message_id,
+            end_message_id, title, content, p1, p2, p3, p4, importance,
+            episode_type, legacy, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+         ON CONFLICT(session_id, sequence) DO UPDATE SET
+            start_message = excluded.start_message,
+            end_message = excluded.end_message,
+            start_message_id = excluded.start_message_id,
+            end_message_id = excluded.end_message_id,
+            title = excluded.title,
+            content = excluded.content,
+            p1 = excluded.p1,
+            p2 = excluded.p2,
+            p3 = excluded.p3,
+            p4 = excluded.p4,
+            importance = excluded.importance,
+            episode_type = excluded.episode_type,
+            legacy = excluded.legacy,
+            created_at = excluded.created_at",
+        params![
+            session_id,
+            c.sequence,
+            c.start_message,
+            c.end_message,
+            &c.start_message_id,
+            &c.end_message_id,
+            &c.title,
+            &c.content,
+            c.p1.as_deref(),
+            c.p2.as_deref(),
+            c.p3.as_deref(),
+            c.p4.as_deref(),
+            c.importance as i64,
+            c.episode_type.as_deref(),
+            c.legacy as i64,
+            c.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn replace_shadow_memories_tx(
+    tx: &rusqlite::Transaction<'_>,
+    shadow_project_path: &str,
+    memories: &[ShadowMemoryRow],
+) -> rusqlite::Result<()> {
+    if memories.is_empty() {
+        return Ok(());
+    }
+    for memory in memories {
+        tx.execute(
+            "INSERT INTO shadow_memories
+               (shadow_project_path, id, category, content, normalized_hash, importance,
+                scope, shareable, source_session_id, source_type, seen_count, retrieval_count,
+                first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
+                status, expires_at, verification_status, verified_at, classified_at,
+                superseded_by_memory_id, merged_from, metadata_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+             ON CONFLICT(shadow_project_path, id) DO UPDATE SET
+                category = excluded.category,
+                content = excluded.content,
+                normalized_hash = excluded.normalized_hash,
+                importance = excluded.importance,
+                scope = excluded.scope,
+                shareable = excluded.shareable,
+                source_session_id = excluded.source_session_id,
+                source_type = excluded.source_type,
+                seen_count = excluded.seen_count,
+                retrieval_count = excluded.retrieval_count,
+                first_seen_at = excluded.first_seen_at,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                last_seen_at = excluded.last_seen_at,
+                last_retrieved_at = excluded.last_retrieved_at,
+                status = excluded.status,
+                expires_at = excluded.expires_at,
+                verification_status = excluded.verification_status,
+                verified_at = excluded.verified_at,
+                classified_at = excluded.classified_at,
+                superseded_by_memory_id = excluded.superseded_by_memory_id,
+                merged_from = excluded.merged_from,
+                metadata_json = excluded.metadata_json",
+            params![
+                shadow_project_path,
+                memory.id,
+                &memory.category,
+                &memory.content,
+                &memory.normalized_hash,
+                memory.importance.map(i64::from),
+                &memory.scope,
+                memory.shareable as i64,
+                memory.source_session_id.as_deref(),
+                memory.source_type.as_deref(),
+                memory.seen_count,
+                memory.retrieval_count,
+                memory.first_seen_at,
+                memory.created_at,
+                memory.updated_at,
+                memory.last_seen_at,
+                memory.last_retrieved_at,
+                &memory.status,
+                memory.expires_at,
+                &memory.verification_status,
+                memory.verified_at,
+                memory.classified_at,
+                memory.superseded_by_memory_id,
+                memory.merged_from.as_deref(),
+                memory.metadata_json.as_deref(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_shadow_memory_mutations_tx(
+    tx: &rusqlite::Transaction<'_>,
+    shadow_project_path: &str,
+    mutations: &[StoredMemoryMutation],
+) -> rusqlite::Result<()> {
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    for mutation in mutations {
+        tx.execute(
+            "INSERT INTO shadow_memory_mutation_log
+               (shadow_project_path, id, mutation_type, target_memory_id, superseded_by_id,
+                category, new_content, queued_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(shadow_project_path, id) DO UPDATE SET
+                mutation_type = excluded.mutation_type,
+                target_memory_id = excluded.target_memory_id,
+                superseded_by_id = excluded.superseded_by_id,
+                category = excluded.category,
+                new_content = excluded.new_content,
+                queued_at = excluded.queued_at",
+            params![
+                shadow_project_path,
+                mutation.id,
+                &mutation.mutation_type,
+                mutation.target_memory_id,
+                mutation.superseded_by_id,
+                mutation.category.as_deref(),
+                mutation.new_content.as_deref(),
+                mutation.queued_at,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_compartment_tx(
@@ -2923,6 +3798,10 @@ fn stable_content_hash(content: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+fn is_shadow_project_path(project_path: &str) -> bool {
+    project_path.starts_with(SHADOW_SESSION_PREFIX)
 }
 
 fn idle_historian_after_success(firing_seq: u64) -> HistorianDurableState {
@@ -4023,5 +4902,181 @@ mod tests {
             store.load("ses").unwrap().meta.historian.state,
             HistorianPhase::Publishing
         );
+    }
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+    use cortexkit_store_types::{Isolation, StorageBackend};
+
+    fn store(dir: &std::path::Path) -> McStore {
+        McStore::open(&StorageDescriptor {
+            module_id: "magic-context-test".to_string(),
+            storage_namespace: "mc_cache".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.join("store.db").to_string_lossy().to_string(),
+            },
+        })
+        .unwrap()
+    }
+
+    fn comp(sequence: i64, end: i64, end_id: &str) -> StoredCompartment {
+        StoredCompartment {
+            sequence,
+            start_message: 0,
+            end_message: end,
+            start_message_id: "a#0".to_string(),
+            end_message_id: end_id.to_string(),
+            title: "c".to_string(),
+            content: "p1".to_string(),
+            p1: Some("p1".to_string()),
+            importance: 50,
+            ..Default::default()
+        }
+    }
+
+    fn memory(id: i64, content: &str) -> ShadowMemoryRow {
+        ShadowMemoryRow {
+            id,
+            category: "CONSTRAINTS".to_string(),
+            content: content.to_string(),
+            normalized_hash: compute_normalized_memory_hash(content),
+            importance: Some(70),
+            scope: "project".to_string(),
+            status: "active".to_string(),
+            verification_status: "unverified".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shadow_state_sync_is_generation_and_zero_seq_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "shadow:real";
+        let project = "shadow:real";
+        let compartments = vec![comp(0, 0, "a#0")];
+        let memories = vec![memory(1, "remember zero")];
+        let mutations = vec![StoredMemoryMutation {
+            id: 0,
+            mutation_type: "update".to_string(),
+            target_memory_id: 1,
+            new_content: Some("remember one".to_string()),
+            ..Default::default()
+        }];
+
+        let applied = store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: project,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                compartments: &compartments,
+                memories: &memories,
+                memory_mutations: &mutations,
+                last_todo_state: Some("[]".to_string()),
+                acked_watermarks: serde_json::json!({"seq": 0}),
+            })
+            .unwrap();
+        assert_eq!(applied.shadow_seq, 1);
+        let loaded = store.load(session).unwrap();
+        assert_eq!(loaded.meta.shadow_generation, 0);
+        assert_eq!(loaded.meta.shadow_seq, 1);
+        assert_eq!(loaded.meta.last_todo_state.as_deref(), Some("[]"));
+        assert_eq!(store.load_compartments(session).unwrap()[0].sequence, 0);
+        assert_eq!(store.load_active_memories(project, 0).unwrap()[0].id, 1);
+        assert_eq!(
+            store
+                .max_memory_mutation_id(&[project.to_string()])
+                .unwrap(),
+            0
+        );
+
+        let seq_reject = store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: project,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            seq_reject,
+            ShadowStateSyncError::SeqMismatch {
+                expected: 0,
+                found: 1
+            }
+        ));
+
+        let reset = store.reset_shadow_session(session, project).unwrap();
+        assert_eq!(reset.shadow_generation, 1);
+        assert_eq!(reset.shadow_seq, 0);
+        assert!(store.load_compartments(session).unwrap().is_empty());
+        assert!(store.load_active_memories(project, 0).unwrap().is_empty());
+
+        let stale_generation = store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: project,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            stale_generation,
+            ShadowStateSyncError::GenerationMismatch {
+                expected: 0,
+                found: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn shadow_divergence_quarantines_until_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "shadow:real";
+        let project = "shadow:real";
+        let reset = store.reset_shadow_session(session, project).unwrap();
+
+        let write = store
+            .record_shadow_divergence(ShadowDivergenceRecord {
+                session_id: session,
+                shadow_generation: reset.shadow_generation,
+                pass_seq: 0,
+                class: "byte-mismatch",
+                first_mid: Some("m0"),
+                first_block: Some("0"),
+                first_field: Some("content"),
+                ts_prefix: "ts",
+                rs_prefix: "rs",
+                normalizations_json: "[]",
+                ts_decision_json: "{}",
+                rs_decision_json: "{}",
+                state_hash: "hash",
+                created_at_ms: 7,
+                quarantine: true,
+            })
+            .unwrap();
+        assert!(write.quarantined);
+        assert!(store.load(session).unwrap().meta.shadow_quarantined);
+        assert_eq!(store.load_shadow_divergences(session).unwrap().len(), 1);
+
+        let reset = store.reset_shadow_session(session, project).unwrap();
+        assert_eq!(reset.shadow_generation, 2);
+        assert!(!store.load(session).unwrap().meta.shadow_quarantined);
+        assert!(store.load_shadow_divergences(session).unwrap().is_empty());
     }
 }

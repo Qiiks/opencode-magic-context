@@ -129,6 +129,33 @@ pub struct ProducerContext<'a> {
     pub injected_reductions: Vec<ReductionDecision>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeclaredTrim {
+    pub flat_boundary_id: String,
+    pub boundary_bare_message_id: String,
+    pub boundary_absolute_ordinal: u64,
+    pub next_absolute_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TrimMismatch {
+    pub predicate: &'static str,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundaryState {
+    LivePresent,
+    DeclaredTrimValidated,
+    Absent,
+}
+
+impl BoundaryState {
+    fn is_present(&self) -> bool {
+        matches!(self, Self::LivePresent | Self::DeclaredTrimValidated)
+    }
+}
+
 /// A transform pass request. `boundary_present` is deliberately NOT a field: it is a
 /// cache-correctness decision (replay-frozen vs reconcile) that the module computes
 /// from its own durable state, never caller-supplied (a caller-supplied value would be
@@ -160,6 +187,8 @@ pub struct TransformRequest {
     pub usage: Option<ModuleUsage>,
     #[serde(default)]
     pub provider_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_trim: Option<DeclaredTrim>,
 }
 
 fn default_wire_version() -> u32 {
@@ -188,6 +217,8 @@ struct TransformRequestWire {
     usage: Option<ModuleUsage>,
     #[serde(default)]
     provider_error: Option<String>,
+    #[serde(default)]
+    declared_trim: Option<DeclaredTrim>,
 }
 
 impl<'de> Deserialize<'de> for TransformRequest {
@@ -212,6 +243,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             tail_delta: wire.tail_delta,
             usage: wire.usage,
             provider_error: wire.provider_error,
+            declared_trim: wire.declared_trim,
         })
     }
 }
@@ -353,6 +385,8 @@ pub struct TransformWithProjection {
     pub response: TransformResponse,
     pub projection: FlatProjection,
     pub scheduler_pass: scheduler::PassDecision,
+    pub boundary_state: BoundaryState,
+    pub trim_mismatch: Option<TrimMismatch>,
 }
 
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
@@ -542,9 +576,12 @@ fn apply_once(
 
     let loaded = store.load(&req.session_id)?;
 
-    // --- boundary presence: computed over live source vs durable boundary_id ---
-    let boundary_present = !loaded.core.boundary_id.is_empty()
-        && live.iter().any(|i| i.id() == loaded.core.boundary_id);
+    // Check whether the boundary is present in the live messages, or through a shadow
+    // trim record that matches durable coverage and the first untrimmed message. A failed
+    // trim record is treated as Absent so the existing reconciliation error paths still run.
+    let (boundary_state, trim_mismatch) =
+        resolve_boundary_state(store, req, &loaded.core, &loaded.meta, &live)?;
+    let boundary_present = boundary_state.is_present();
     let boundary_token = if boundary_present {
         loaded.core.boundary_id.clone()
     } else {
@@ -590,6 +627,7 @@ fn apply_once(
                 req,
                 loaded.row_version.unwrap_or(0),
                 false,
+                trim_mismatch,
             ));
         }
 
@@ -626,6 +664,7 @@ fn apply_once(
             req,
             row_version,
             true,
+            trim_mismatch,
         ));
     }
 
@@ -888,7 +927,14 @@ fn apply_once(
             // and the fold mints the reserved empty anchor without entering this guard.
             if comp.coverage_ordinal.is_some() {
                 let minted = comp.boundary_id.as_str();
-                if minted.is_empty() || !live.iter().any(|i| i.id() == minted) {
+                if minted.is_empty()
+                    || !boundary_available(
+                        minted,
+                        &live,
+                        &boundary_state,
+                        req.declared_trim.as_ref(),
+                    )
+                {
                     if loaded.core.reconcile_pending {
                         let compartments = store.load_compartments(&req.session_id)?;
                         let keep_through_seq = surviving_revert_prefix_seq(&compartments, &live);
@@ -933,7 +979,14 @@ fn apply_once(
 
                         if comp.coverage_ordinal.is_some() {
                             let reminted = comp.boundary_id.as_str();
-                            if reminted.is_empty() || !live.iter().any(|i| i.id() == reminted) {
+                            if reminted.is_empty()
+                                || !boundary_available(
+                                    reminted,
+                                    &live,
+                                    &boundary_state,
+                                    req.declared_trim.as_ref(),
+                                )
+                            {
                                 return Err(TransformError::BoundaryNotPresent(format!(
                                     "re-cut kept compartments through sequence {keep_through_seq}, \
                                      but the fold still minted absent anchor {reminted:?}; \
@@ -1041,7 +1094,9 @@ fn apply_once(
             // pending reconcile to defer/HARD), so every advance is a fresh mint and the
             // check is unconditional.
             if let Some(id) = &new_boundary_id {
-                if id.is_empty() || !live.iter().any(|i| i.id() == id) {
+                if id.is_empty()
+                    || !boundary_available(id, &live, &boundary_state, req.declared_trim.as_ref())
+                {
                     return Err(TransformError::BoundaryNotPresent(format!(
                         "coverage-extending delta advanced the anchor to {id:?}, but no \
                          live block carries that id; the anchor must be the flat block id \
@@ -1152,6 +1207,8 @@ fn apply_once(
     Ok(TransformWithProjection {
         projection,
         scheduler_pass: scheduler_outcome.pass,
+        boundary_state,
+        trim_mismatch,
         response: TransformResponse {
             status: TransformStatus::Ok,
             served_from: ServedFrom::Transform,
@@ -1611,6 +1668,122 @@ fn first_uncovered_live_block<'a>(
         .min_by_key(|block| block.ordinal())
 }
 
+fn boundary_available(
+    id: &str,
+    live: &[&FlatBlock],
+    boundary_state: &BoundaryState,
+    declared: Option<&DeclaredTrim>,
+) -> bool {
+    live.iter().any(|block| block.id() == id)
+        || matches!(boundary_state, BoundaryState::DeclaredTrimValidated)
+            && declared.is_some_and(|declared| declared.flat_boundary_id == id)
+}
+
+fn resolve_boundary_state(
+    store: &McStore,
+    req: &TransformRequest,
+    core: &CoreState,
+    meta: &ModuleMeta,
+    live: &[&FlatBlock],
+) -> Result<(BoundaryState, Option<TrimMismatch>), TransformError> {
+    if !core.boundary_id.is_empty() && live.iter().any(|block| block.id() == core.boundary_id) {
+        return Ok((BoundaryState::LivePresent, None));
+    }
+
+    let Some(declared) = req.declared_trim.as_ref() else {
+        return Ok((BoundaryState::Absent, None));
+    };
+
+    if declared.flat_boundary_id != core.boundary_id {
+        return Ok((
+            BoundaryState::Absent,
+            Some(trim_mismatch(
+                "boundary_identity",
+                format!(
+                    "declared boundary {:?} did not match durable boundary {:?}",
+                    declared.flat_boundary_id, core.boundary_id
+                ),
+            )),
+        ));
+    }
+
+    if meta.coverage_ordinal != Some(declared.boundary_absolute_ordinal) {
+        return Ok((
+            BoundaryState::Absent,
+            Some(trim_mismatch(
+                "coverage_ordinal",
+                format!(
+                    "declared boundary ordinal {} did not match durable coverage {:?}",
+                    declared.boundary_absolute_ordinal, meta.coverage_ordinal
+                ),
+            )),
+        ));
+    }
+
+    let compartments = store.load_compartments(&req.session_id)?;
+    let tail = compartments
+        .iter()
+        .max_by_key(|compartment| compartment.sequence);
+    match tail {
+        Some(tail)
+            if tail.end_message_id == declared.flat_boundary_id
+                && tail.end_message == declared.boundary_absolute_ordinal as i64
+                && split_block_id(&tail.end_message_id)
+                    .map(|(mid, _)| mid == declared.boundary_bare_message_id)
+                    .unwrap_or(false) => {}
+        Some(tail) => {
+            return Ok((
+                BoundaryState::Absent,
+                Some(trim_mismatch(
+                    "tail_compartment",
+                    format!(
+                        "tail compartment ended at id {:?} ordinal {}, not declared id {:?} bare {:?} ordinal {}",
+                        tail.end_message_id,
+                        tail.end_message,
+                        declared.flat_boundary_id,
+                        declared.boundary_bare_message_id,
+                        declared.boundary_absolute_ordinal
+                    ),
+                )),
+            ));
+        }
+        None => {
+            return Ok((
+                BoundaryState::Absent,
+                Some(trim_mismatch(
+                    "tail_compartment",
+                    "declared trim had no durable tail compartment".to_string(),
+                )),
+            ));
+        }
+    }
+
+    let first_live_non_system = req
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic && message.ck.role != "system")
+        .map(|message| message.ordinal)
+        .min();
+    if first_live_non_system != Some(declared.next_absolute_ordinal) {
+        return Ok((
+            BoundaryState::Absent,
+            Some(trim_mismatch(
+                "continuity",
+                format!(
+                    "first non-system live ordinal {:?} did not match declared next ordinal {}",
+                    first_live_non_system, declared.next_absolute_ordinal
+                ),
+            )),
+        ));
+    }
+
+    Ok((BoundaryState::DeclaredTrimValidated, None))
+}
+
+fn trim_mismatch(predicate: &'static str, detail: String) -> TrimMismatch {
+    TrimMismatch { predicate, detail }
+}
+
 fn surviving_revert_prefix_seq(compartments: &[StoredCompartment], live: &[&FlatBlock]) -> i64 {
     let live_ids: BTreeSet<&str> = live.iter().map(|block| block.id()).collect();
     compartments
@@ -1666,6 +1839,7 @@ fn pending_passthrough_result(
     req: &TransformRequest,
     row_version: u64,
     committed: bool,
+    trim_mismatch: Option<TrimMismatch>,
 ) -> TransformWithProjection {
     let mut response = TransformResponse::passthrough(
         req.messages
@@ -1679,6 +1853,8 @@ fn pending_passthrough_result(
     TransformWithProjection {
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
+        boundary_state: BoundaryState::Absent,
+        trim_mismatch,
         response,
     }
 }
@@ -2098,6 +2274,7 @@ mod tests {
             tail_delta: None,
             usage: None,
             provider_error: None,
+            declared_trim: None,
         }
     }
 
@@ -5693,6 +5870,168 @@ mod tests {
     /// A leading system message is exempt from the coverage trim: the chunk builder
     /// never summarizes system content, so trimming it would drop content the fold
     /// never captured. It re-emits at the head, before m0/m1.
+    fn declared_trim_fixture() -> (
+        tempfile::TempDir,
+        McStore,
+        TransformRequest,
+        ProducerContext<'static>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let core = CoreState {
+            version: 1,
+            boundary_id: "b#0".to_string(),
+            reconcile_pending: false,
+            frozen_units: vec![
+                synth_region("m0", "m0".to_string()),
+                synth_region("m1", M1_PLACEHOLDER.to_string()),
+            ],
+            pending_changes: Vec::new(),
+        };
+        let meta = ModuleMeta {
+            initialized: true,
+            last_render_config: fold_m0_content_epoch(
+                "cfg",
+                &M0ContentEpoch {
+                    workspace_fingerprint: String::new(),
+                    upgrade_state: String::new(),
+                    memory_content_epoch: String::new(),
+                },
+            ),
+            coverage_ordinal: Some(0),
+            folded_compartment_seq: 0,
+            m1_revision: m1_revision_signal(&store, "git:proj", "decl").unwrap(),
+            ..Default::default()
+        };
+        store.commit("decl", None, &core, &meta).unwrap();
+        store
+            .replace_compartments("decl", &[comp(0, 0, 0, "b", "summary")])
+            .unwrap();
+        let mut request = req("decl", "cfg", vec![item("c", 1, "tail")]);
+        request.declared_trim = Some(DeclaredTrim {
+            flat_boundary_id: "b#0".to_string(),
+            boundary_bare_message_id: "b".to_string(),
+            boundary_absolute_ordinal: 0,
+            next_absolute_ordinal: 1,
+        });
+        (
+            dir,
+            store,
+            request,
+            pctx("git:proj", "/nonexistent-docs", 0),
+        )
+    }
+
+    #[test]
+    fn declared_trim_validates_absent_boundary_and_preserves_defer_path() {
+        let (_dir, store, request, ctx) = declared_trim_fixture();
+        let result = transform_with_projection(&store, &request, &ctx).unwrap();
+        assert_eq!(result.boundary_state, BoundaryState::DeclaredTrimValidated);
+        assert!(result.trim_mismatch.is_none());
+        assert_eq!(result.response.action, "SOFT+");
+        assert_eq!(store.load("decl").unwrap().meta.pending_rewrite, None);
+    }
+
+    #[test]
+    fn declared_trim_predicate_failures_are_absent_with_trim_mismatch() {
+        type TrimCase = (
+            &'static str,
+            Box<dyn FnOnce(&mut TransformRequest, &McStore)>,
+        );
+        let cases: Vec<TrimCase> = vec![
+            (
+                "boundary_identity",
+                Box::new(|request, _| {
+                    request.declared_trim.as_mut().unwrap().flat_boundary_id =
+                        "wrong#0".to_string();
+                }),
+            ),
+            (
+                "coverage_ordinal",
+                Box::new(|request, _| {
+                    request
+                        .declared_trim
+                        .as_mut()
+                        .unwrap()
+                        .boundary_absolute_ordinal = 99;
+                }),
+            ),
+            (
+                "tail_compartment",
+                Box::new(|_, store| {
+                    store
+                        .replace_compartments("decl", &[comp(0, 0, 0, "other", "summary")])
+                        .unwrap();
+                }),
+            ),
+            (
+                "continuity",
+                Box::new(|request, _| {
+                    request
+                        .declared_trim
+                        .as_mut()
+                        .unwrap()
+                        .next_absolute_ordinal = 2;
+                }),
+            ),
+        ];
+        for (predicate, mutate) in cases {
+            let (_dir, store, mut request, ctx) = declared_trim_fixture();
+            mutate(&mut request, &store);
+            let result = transform_with_projection(&store, &request, &ctx).unwrap();
+            assert_eq!(result.boundary_state, BoundaryState::Absent, "{predicate}");
+            assert_eq!(
+                result.trim_mismatch.as_ref().map(|m| m.predicate),
+                Some(predicate),
+                "{predicate}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_trim_continuity_exempts_covered_system_head() {
+        let (_dir, store, mut request, ctx) = declared_trim_fixture();
+        request
+            .messages
+            .insert(0, system_item("sys", 0, "covered system"));
+        let result = transform_with_projection(&store, &request, &ctx).unwrap();
+        assert_eq!(result.boundary_state, BoundaryState::DeclaredTrimValidated);
+        assert!(result.trim_mismatch.is_none());
+    }
+
+    #[test]
+    fn declared_trim_allows_minted_absent_anchor_only_when_validated() {
+        let (_dir, store, mut request, ctx) = declared_trim_fixture();
+        let mut loaded = store.load("decl").unwrap();
+        loaded.meta.last_render_config = "old".to_string();
+        store
+            .commit("decl", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        request.render_config = "new".to_string();
+        let result = transform_with_projection(&store, &request, &ctx).unwrap();
+        assert_eq!(result.response.action, "HARD");
+        assert_eq!(result.boundary_state, BoundaryState::DeclaredTrimValidated);
+
+        let (_dir, store, mut invalid, ctx) = declared_trim_fixture();
+        let mut loaded = store.load("decl").unwrap();
+        loaded.meta.last_render_config = "old".to_string();
+        store
+            .commit("decl", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        invalid.render_config = "new".to_string();
+        invalid
+            .declared_trim
+            .as_mut()
+            .unwrap()
+            .next_absolute_ordinal = 2;
+        let invalid_result = transform_with_projection(&store, &invalid, &ctx).unwrap();
+        assert_eq!(invalid_result.boundary_state, BoundaryState::Absent);
+        assert_eq!(
+            invalid_result.trim_mismatch.as_ref().map(|m| m.predicate),
+            Some("continuity")
+        );
+    }
+
     #[test]
     fn covered_system_message_is_never_trimmed_and_leads_the_output() {
         let dir = tempfile::tempdir().unwrap();

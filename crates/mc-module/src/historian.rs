@@ -1354,6 +1354,7 @@ mod tests {
             tail_delta: None,
             usage: None,
             provider_error: None,
+            declared_trim: None,
         }
     }
 

@@ -49,8 +49,13 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
-use mc_store::{HistorianPhase, InsertMemoryInput, McStore};
+use mc_store::{
+    HistorianPhase, InsertMemoryInput, McStore, ShadowDivergenceRecord, ShadowMemoryRow,
+    ShadowStateSyncError, ShadowStateSyncRequest, StoredCompartment, StoredMemoryMutation,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest};
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
@@ -77,7 +82,7 @@ use subc_protocol::{
 };
 #[cfg(test)]
 use transform::ReductionDecision;
-use transform::{transform_with_projection, HistorianDiagnostics, TransformRequest};
+use transform::{transform_with_projection, DeclaredTrim, HistorianDiagnostics, TransformRequest};
 
 /// The per-route binding: the project, harness, session-slot value, and render budget
 /// frozen at bind. Transform routes carry the durable session in `session`; MCP facade
@@ -131,10 +136,331 @@ const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
 const SESSION_UNRESOLVED_MESSAGE: &str =
     "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
+const SHADOW_SESSION_PREFIX: &str = mc_store::SHADOW_SESSION_PREFIX;
+const SHADOW_COMPARE_PREFIX_LIMIT: usize = 4096;
+
+#[derive(Debug, Deserialize)]
+struct ShadowStateSyncWire {
+    #[serde(default)]
+    session_id: Option<String>,
+    shadow_generation: u64,
+    expected_shadow_seq: u64,
+    #[serde(default)]
+    compartments: Vec<ShadowCompartmentWire>,
+    #[serde(default)]
+    memories: Vec<ShadowMemoryWire>,
+    #[serde(default)]
+    memory_mutations: Vec<ShadowMemoryMutationWire>,
+    #[serde(default)]
+    last_todo_state: Option<String>,
+    #[serde(default)]
+    acked_watermarks: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShadowResetWire {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    shadow_generation: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShadowTransformWire {
+    #[serde(default)]
+    session_id: Option<String>,
+    shadow_generation: u64,
+    #[serde(default)]
+    pass_seq: Option<u64>,
+    #[serde(default)]
+    serializer_profile: Option<String>,
+    #[serde(default)]
+    render_config: Option<String>,
+    #[serde(default)]
+    full_array_fingerprint: Option<String>,
+    #[serde(default)]
+    input: Vec<Value>,
+    #[serde(default)]
+    messages: Vec<crate::ck_wire::CkIngressMessage>,
+    #[serde(default)]
+    ts_output: Vec<Value>,
+    #[serde(default)]
+    ts_ck_messages: Vec<crate::ck_wire::CkWireMessage>,
+    pass_inputs: ShadowPassInputs,
+    #[serde(default)]
+    ts_decision: Value,
+    #[serde(default)]
+    declared_trim: Option<DeclaredTrim>,
+    #[serde(default)]
+    normalizations: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShadowPassInputs {
+    now_ms: i64,
+    #[serde(default)]
+    model_key: Option<String>,
+    #[serde(default)]
+    usage: Option<ShadowUsageWire>,
+    #[serde(
+        alias = "effective_execute_threshold",
+        alias = "execute_threshold_percentage"
+    )]
+    effective_execute_threshold: f64,
+    #[serde(default = "default_cache_ttl")]
+    cache_ttl: String,
+    #[serde(default)]
+    provider_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShadowUsageWire {
+    #[serde(alias = "current_total_input_tokens")]
+    input_tokens: u64,
+    #[serde(alias = "context_limit_tokens")]
+    limit: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShadowCompartmentWire {
+    sequence: i64,
+    start_message: i64,
+    end_message: i64,
+    #[serde(default)]
+    start_message_id: String,
+    #[serde(default)]
+    end_message_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    p1: Option<String>,
+    #[serde(default)]
+    p2: Option<String>,
+    #[serde(default)]
+    p3: Option<String>,
+    #[serde(default)]
+    p4: Option<String>,
+    #[serde(default = "default_importance")]
+    importance: i32,
+    #[serde(default)]
+    episode_type: Option<String>,
+    #[serde(default)]
+    legacy: i32,
+    #[serde(default)]
+    created_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShadowMemoryWire {
+    id: i64,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    normalized_hash: Option<String>,
+    #[serde(default)]
+    importance: Option<i32>,
+    #[serde(default = "default_memory_scope")]
+    scope: String,
+    #[serde(default)]
+    shareable: i32,
+    #[serde(default)]
+    source_session_id: Option<String>,
+    #[serde(default)]
+    source_type: Option<String>,
+    #[serde(default = "default_seen_count")]
+    seen_count: i64,
+    #[serde(default)]
+    retrieval_count: i64,
+    #[serde(default)]
+    first_seen_at: i64,
+    #[serde(default)]
+    created_at: i64,
+    #[serde(default)]
+    updated_at: i64,
+    #[serde(default)]
+    last_seen_at: i64,
+    #[serde(default)]
+    last_retrieved_at: Option<i64>,
+    #[serde(default = "default_memory_status")]
+    status: String,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default = "default_verification_status")]
+    verification_status: String,
+    #[serde(default)]
+    verified_at: Option<i64>,
+    #[serde(default)]
+    classified_at: Option<i64>,
+    #[serde(default)]
+    superseded_by_memory_id: Option<i64>,
+    #[serde(default)]
+    merged_from: Option<String>,
+    #[serde(default)]
+    metadata_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShadowMemoryMutationWire {
+    id: i64,
+    mutation_type: String,
+    target_memory_id: i64,
+    #[serde(default)]
+    superseded_by_id: Option<i64>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    new_content: Option<String>,
+    #[serde(default)]
+    queued_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ShadowReport {
+    ok: bool,
+    shadow_generation: u64,
+    shadow_seq: u64,
+    pass_seq: u64,
+    quarantined: bool,
+    compared: bool,
+    class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_mid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_block: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_field: Option<String>,
+    ts_decision: Value,
+    rs_decision: Value,
+    state_hash: String,
+    normalizations: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay: Option<Value>,
+}
+
+#[derive(Debug)]
+struct CompareOutcome {
+    class: String,
+    hard: bool,
+    compared: bool,
+    first_mid: Option<String>,
+    first_block: Option<String>,
+    first_field: Option<String>,
+    ts_prefix: String,
+    rs_prefix: String,
+}
+
+struct ShadowReportInput {
+    shadow_generation: u64,
+    pass_seq: u64,
+    outcome: CompareOutcome,
+    normalizations: Vec<Value>,
+    ts_decision: Value,
+    rs_decision: Value,
+    state_hash: String,
+    replay: Option<Value>,
+}
 
 struct FacadeScope {
     memory_project_path: String,
     conversation_key: String,
+}
+
+fn default_cache_ttl() -> String {
+    "5m".to_string()
+}
+
+fn default_importance() -> i32 {
+    50
+}
+
+fn default_memory_scope() -> String {
+    "project".to_string()
+}
+
+fn default_seen_count() -> i64 {
+    1
+}
+
+fn default_memory_status() -> String {
+    "active".to_string()
+}
+
+fn default_verification_status() -> String {
+    "unverified".to_string()
+}
+
+impl From<ShadowCompartmentWire> for StoredCompartment {
+    fn from(value: ShadowCompartmentWire) -> Self {
+        StoredCompartment {
+            sequence: value.sequence,
+            start_message: value.start_message,
+            end_message: value.end_message,
+            start_message_id: value.start_message_id,
+            end_message_id: value.end_message_id,
+            title: value.title,
+            content: value.content,
+            p1: value.p1,
+            p2: value.p2,
+            p3: value.p3,
+            p4: value.p4,
+            importance: value.importance,
+            episode_type: value.episode_type,
+            legacy: value.legacy,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<ShadowMemoryWire> for ShadowMemoryRow {
+    fn from(value: ShadowMemoryWire) -> Self {
+        let normalized_hash = value
+            .normalized_hash
+            .unwrap_or_else(|| mc_store::compute_normalized_memory_hash(&value.content));
+        ShadowMemoryRow {
+            id: value.id,
+            category: value.category,
+            content: value.content,
+            normalized_hash,
+            importance: value.importance,
+            scope: value.scope,
+            shareable: value.shareable,
+            source_session_id: value.source_session_id,
+            source_type: value.source_type,
+            seen_count: value.seen_count,
+            retrieval_count: value.retrieval_count,
+            first_seen_at: value.first_seen_at,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            last_seen_at: value.last_seen_at,
+            last_retrieved_at: value.last_retrieved_at,
+            status: value.status,
+            expires_at: value.expires_at,
+            verification_status: value.verification_status,
+            verified_at: value.verified_at,
+            classified_at: value.classified_at,
+            superseded_by_memory_id: value.superseded_by_memory_id,
+            merged_from: value.merged_from,
+            metadata_json: value.metadata_json,
+        }
+    }
+}
+
+impl From<ShadowMemoryMutationWire> for StoredMemoryMutation {
+    fn from(value: ShadowMemoryMutationWire) -> Self {
+        StoredMemoryMutation {
+            id: value.id,
+            mutation_type: value.mutation_type,
+            target_memory_id: value.target_memory_id,
+            superseded_by_id: value.superseded_by_id,
+            category: value.category,
+            new_content: value.new_content,
+            queued_at: value.queued_at,
+        }
+    }
 }
 
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
@@ -402,6 +728,199 @@ impl McHandler {
             return Err(BindingError::SessionMismatch);
         }
         Ok(binding.clone())
+    }
+
+    fn shadow_binding(
+        &self,
+        channel: u16,
+        request_session: Option<&str>,
+    ) -> Result<SessionBinding, HandlerOutcome> {
+        let binding = self
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .get(&channel)
+            .cloned()
+            .ok_or_else(|| HandlerOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: "shadow op on a channel with no session binding".to_string(),
+            })?;
+        if let Some(request_session) = request_session {
+            if binding.session != request_session {
+                return Err(HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                });
+            }
+        }
+        if !is_shadow_session(&binding.session) {
+            return Err(HandlerOutcome::Error {
+                code: "shadow_binding_required".to_string(),
+                message: "shadow ops require a route bound as shadow:<real_session>".to_string(),
+            });
+        }
+        Ok(binding)
+    }
+
+    fn evaluate_shadow_historian(
+        &self,
+        store: &McStore,
+        parsed: &TransformRequest,
+        projection: &crate::ck_wire::FlatProjection,
+        pass_inputs: &ShadowPassInputs,
+    ) -> HistorianDiagnostics {
+        let loaded = match store.load(&parsed.session_id) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                return HistorianDiagnostics {
+                    fired: false,
+                    reason: None,
+                    no_fire: Some(format!("state_load_failed:{e}")),
+                    state: "unknown".to_string(),
+                    progress: None,
+                    last_failure: None,
+                }
+            }
+        };
+        let state = loaded.meta.historian.state.as_str().to_string();
+        let last_failure = loaded.meta.historian.last_failure.clone();
+        if loaded.meta.pending_rewrite.is_some() {
+            return HistorianDiagnostics {
+                fired: false,
+                reason: None,
+                no_fire: Some("pending_rewrite".to_string()),
+                state,
+                progress: None,
+                last_failure,
+            };
+        }
+        let boundary_messages = boundary_messages(parsed, projection);
+        let last_compartment_end_ordinal = store
+            .load_compartments(&parsed.session_id)
+            .ok()
+            .and_then(|cs| cs.iter().map(|c| c.end_message as u64).max());
+        let (context_limit, input_tokens, usage_percentage) = usage_numbers(parsed.usage.as_ref());
+        let trigger = boundary::check_compartment_trigger(
+            &boundary_messages,
+            &TriggerContext {
+                boundary: BoundaryContext {
+                    context_limit,
+                    execute_threshold_percentage: pass_inputs.effective_execute_threshold,
+                    usage_percentage,
+                    usage_input_tokens: input_tokens,
+                    last_compartment_end_ordinal,
+                    prior_boundary_ordinal: last_compartment_end_ordinal.unwrap_or(0),
+                    migration_floor_active: last_compartment_end_ordinal.unwrap_or(0) > 0,
+                    emergency_tail_scale: None,
+                    trigger_budget: None,
+                },
+                projected_post_drop_percentage: None,
+                compartment_in_progress: loaded.meta.historian.state != HistorianPhase::Idle,
+                commit_cluster_trigger_enabled: DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED,
+                min_commit_clusters: DEFAULT_MIN_COMMIT_CLUSTERS,
+            },
+        );
+        let progress = trigger
+            .progress
+            .as_ref()
+            .map(|p| transform::HistorianTriggerProgress {
+                eligible_chunk_tokens: p.eligible_chunk_tokens,
+                tail_size_bar: p.tail_size_bar,
+                protected_tail_n_tokens: p.n_tokens,
+                protected_start_ordinal: p.protected_start_ordinal,
+            });
+        HistorianDiagnostics {
+            fired: trigger.fire,
+            reason: trigger.reason.map(|r| r.as_str().to_string()),
+            no_fire: (!trigger.fire).then_some(
+                if loaded.meta.historian.state == HistorianPhase::Idle {
+                    "trigger_false".to_string()
+                } else {
+                    "busy".to_string()
+                },
+            ),
+            state,
+            progress,
+            last_failure,
+        }
+    }
+
+    fn record_shadow_report(
+        &self,
+        store: &McStore,
+        session_id: &str,
+        input: ShadowReportInput,
+    ) -> HandlerOutcome {
+        let ShadowReportInput {
+            shadow_generation,
+            pass_seq,
+            outcome,
+            normalizations,
+            ts_decision,
+            rs_decision,
+            state_hash,
+            replay,
+        } = input;
+        let normalizations_json = serde_json::to_string(&normalizations).unwrap_or_default();
+        let ts_decision_json = serde_json::to_string(&ts_decision).unwrap_or_default();
+        let rs_decision_json = serde_json::to_string(&rs_decision).unwrap_or_default();
+        let quarantined = if outcome.class == "identical" {
+            store
+                .load(session_id)
+                .map(|state| state.meta.shadow_quarantined)
+                .unwrap_or(false)
+        } else {
+            match store.record_shadow_divergence(ShadowDivergenceRecord {
+                session_id,
+                shadow_generation,
+                pass_seq,
+                class: &outcome.class,
+                first_mid: outcome.first_mid.as_deref(),
+                first_block: outcome.first_block.as_deref(),
+                first_field: outcome.first_field.as_deref(),
+                ts_prefix: &outcome.ts_prefix,
+                rs_prefix: &outcome.rs_prefix,
+                normalizations_json: &normalizations_json,
+                ts_decision_json: &ts_decision_json,
+                rs_decision_json: &rs_decision_json,
+                state_hash: &state_hash,
+                created_at_ms: now_ms(),
+                quarantine: outcome.hard,
+            }) {
+                Ok(write) => write.quarantined,
+                Err(e) => {
+                    return HandlerOutcome::Error {
+                        code: "shadow_divergence_write_failed".to_string(),
+                        message: e.to_string(),
+                    }
+                }
+            }
+        };
+        let shadow_seq = store
+            .load(session_id)
+            .map(|state| state.meta.shadow_seq)
+            .unwrap_or(0);
+        respond(
+            serde_json::to_value(ShadowReport {
+                ok: true,
+                shadow_generation,
+                shadow_seq,
+                pass_seq,
+                quarantined,
+                compared: outcome.compared,
+                class: outcome.class,
+                first_mid: outcome.first_mid,
+                first_block: outcome.first_block,
+                first_field: outcome.first_field,
+                ts_decision,
+                rs_decision,
+                state_hash,
+                normalizations,
+                replay,
+            })
+            .unwrap_or(Value::Null),
+        )
     }
 
     /// Return the channel binding without comparing a request session. MCP facade routes
@@ -1065,17 +1584,26 @@ impl McHandler {
                 message: "ctx_reduce command requires session_id".to_string(),
             };
         };
-        if let Err(e) = self.resolve_binding(channel, session_id) {
-            return match e {
-                BindingError::Unbound => HandlerOutcome::Error {
-                    code: "route_unbound".to_string(),
-                    message: "ctx_reduce on a channel with no session binding".to_string(),
-                },
-                BindingError::SessionMismatch => HandlerOutcome::Error {
-                    code: "session_mismatch".to_string(),
-                    message: "request session_id does not match the channel's bound session"
-                        .to_string(),
-                },
+        let binding = match self.resolve_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(e) => {
+                return match e {
+                    BindingError::Unbound => HandlerOutcome::Error {
+                        code: "route_unbound".to_string(),
+                        message: "ctx_reduce on a channel with no session binding".to_string(),
+                    },
+                    BindingError::SessionMismatch => HandlerOutcome::Error {
+                        code: "session_mismatch".to_string(),
+                        message: "request session_id does not match the channel's bound session"
+                            .to_string(),
+                    },
+                };
+            }
+        };
+        if is_shadow_session(&binding.session) {
+            return HandlerOutcome::Error {
+                code: "non_shadow_op_on_shadow_binding".to_string(),
+                message: "ctx_reduce is not accepted on shadow:<real_session> routes".to_string(),
             };
         }
         let drop_ids = drop_ids_from_command(&request);
@@ -1148,6 +1676,13 @@ impl McHandler {
                 }
             }
         };
+        if is_shadow_session(&binding.session) {
+            return HandlerOutcome::Error {
+                code: "plain_transform_on_shadow_binding".to_string(),
+                message: "use shadow_transform for routes bound as shadow:<real_session>"
+                    .to_string(),
+            };
+        }
         let project_path = binding.project_root.to_string_lossy().to_string();
         let pass_now = now_ms();
         let run_transform = || {
@@ -1348,6 +1883,297 @@ impl McHandler {
     #[cfg(test)]
     async fn handle_transform_for_test(&self, channel: u16, request: Value) -> HandlerOutcome {
         self.handle_transform_value(channel, request).await
+    }
+
+    fn handle_shadow_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let parsed: ShadowStateSyncWire = match serde_json::from_value(request) {
+            Ok(req) => req,
+            Err(e) => return invalid_params_error(e.to_string()),
+        };
+        let binding = match self.shadow_binding(channel, parsed.session_id.as_deref()) {
+            Ok(binding) => binding,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+        let compartments: Vec<StoredCompartment> = parsed
+            .compartments
+            .into_iter()
+            .map(StoredCompartment::from)
+            .collect();
+        let memories: Vec<ShadowMemoryRow> = parsed
+            .memories
+            .into_iter()
+            .map(ShadowMemoryRow::from)
+            .collect();
+        let memory_mutations: Vec<StoredMemoryMutation> = parsed
+            .memory_mutations
+            .into_iter()
+            .map(StoredMemoryMutation::from)
+            .collect();
+        let acked_watermarks = parsed.acked_watermarks.unwrap_or_else(|| {
+            json!({
+                "compartment_seq": compartments.iter().map(|c| c.sequence).max(),
+                "memory_id": memories.iter().map(|m| m.id).max(),
+                "memory_mutation_id": memory_mutations.iter().map(|m| m.id).max(),
+                "last_todo_state": parsed.last_todo_state.is_some(),
+            })
+        });
+        match store.apply_shadow_state_sync(ShadowStateSyncRequest {
+            session_id: &binding.session,
+            shadow_project_path: &shadow_project_path(&binding.session),
+            shadow_generation: parsed.shadow_generation,
+            expected_shadow_seq: parsed.expected_shadow_seq,
+            compartments: &compartments,
+            memories: &memories,
+            memory_mutations: &memory_mutations,
+            last_todo_state: parsed.last_todo_state,
+            acked_watermarks,
+        }) {
+            Ok(result) => respond(json!({
+                "ok": true,
+                "shadow_generation": result.shadow_generation,
+                "shadow_seq": result.shadow_seq,
+                "row_version": result.row_version,
+            })),
+            Err(ShadowStateSyncError::GenerationMismatch { expected, found }) => {
+                HandlerOutcome::Error {
+                    code: "shadow_generation_mismatch".to_string(),
+                    message: format!(
+                        "shadow_generation {expected} is stale; current generation is {found}"
+                    ),
+                }
+            }
+            Err(ShadowStateSyncError::SeqMismatch { expected, found }) => HandlerOutcome::Error {
+                code: "shadow_seq_mismatch".to_string(),
+                message: format!(
+                    "expected_shadow_seq {expected} did not match current shadow_seq {found}"
+                ),
+            },
+            Err(e) => HandlerOutcome::Error {
+                code: "shadow_state_sync_failed".to_string(),
+                message: e.to_string(),
+            },
+        }
+    }
+
+    fn handle_shadow_reset_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let parsed: ShadowResetWire = match serde_json::from_value(request) {
+            Ok(req) => req,
+            Err(e) => return invalid_params_error(e.to_string()),
+        };
+        let binding = match self.shadow_binding(channel, parsed.session_id.as_deref()) {
+            Ok(binding) => binding,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+        match store.reset_shadow_session(&binding.session, &shadow_project_path(&binding.session)) {
+            Ok(result) => respond(json!({
+                "ok": true,
+                "shadow_generation": result.shadow_generation,
+                "shadow_seq": result.shadow_seq,
+                "row_version": result.row_version,
+                "previous_shadow_generation": parsed.shadow_generation,
+            })),
+            Err(e) => HandlerOutcome::Error {
+                code: "shadow_reset_failed".to_string(),
+                message: e.to_string(),
+            },
+        }
+    }
+
+    async fn handle_shadow_transform_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let parsed: ShadowTransformWire = match serde_json::from_value(request.clone()) {
+            Ok(req) => req,
+            Err(e) => return invalid_params_error(e.to_string()),
+        };
+        let binding = match self.shadow_binding(channel, parsed.session_id.as_deref()) {
+            Ok(binding) => binding,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+        let loaded = match store.load(&binding.session) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: e.to_string(),
+                }
+            }
+        };
+        if loaded.meta.shadow_generation != parsed.shadow_generation {
+            return HandlerOutcome::Error {
+                code: "shadow_generation_mismatch".to_string(),
+                message: format!(
+                    "shadow_generation {} is stale; current generation is {}",
+                    parsed.shadow_generation, loaded.meta.shadow_generation
+                ),
+            };
+        }
+        let pass_seq = parsed.pass_seq.unwrap_or(loaded.meta.shadow_seq);
+        if loaded.meta.shadow_quarantined {
+            let state_hash = shadow_state_hash(&store, &binding.session).unwrap_or_default();
+            let rs_decision = json!({ "class": "quarantined", "byte_compare": false });
+            let report = self.record_shadow_report(
+                &store,
+                &binding.session,
+                ShadowReportInput {
+                    shadow_generation: parsed.shadow_generation,
+                    pass_seq,
+                    outcome: CompareOutcome {
+                        class: "quarantined".to_string(),
+                        hard: false,
+                        compared: false,
+                        first_mid: None,
+                        first_block: None,
+                        first_field: None,
+                        ts_prefix: String::new(),
+                        rs_prefix: String::new(),
+                    },
+                    normalizations: parsed.normalizations,
+                    ts_decision: parsed.ts_decision,
+                    rs_decision,
+                    state_hash,
+                    replay: None,
+                },
+            );
+            return report;
+        }
+
+        let shadow_input = match shadow_input_messages(&parsed) {
+            Ok(messages) => messages,
+            Err(message) => {
+                return HandlerOutcome::Error {
+                    code: "bad_shadow_input".to_string(),
+                    message,
+                }
+            }
+        };
+        let serializer_profile = parsed
+            .serializer_profile
+            .clone()
+            .unwrap_or_else(|| SerializerProfile::OpencodeAiSdk.wire_id().to_string());
+        if SerializerProfile::parse(&serializer_profile).is_none() {
+            return unknown_serializer_profile_error();
+        }
+        let usage = parsed
+            .pass_inputs
+            .usage
+            .as_ref()
+            .map(|usage| mc_store::ModuleUsage {
+                current_total_input_tokens: usage.input_tokens,
+                context_limit_tokens: usage.limit,
+            });
+        let transform_request = TransformRequest {
+            kind: "transform".to_string(),
+            v: 2,
+            serializer_profile,
+            session_id: binding.session.clone(),
+            render_config: parsed.render_config.clone().unwrap_or_default(),
+            full_array_fingerprint: parsed.full_array_fingerprint.clone(),
+            messages: shadow_input,
+            tail_delta: None,
+            usage,
+            provider_error: parsed.pass_inputs.provider_error.clone(),
+            declared_trim: parsed.declared_trim.clone(),
+        };
+        let shadow_project = shadow_project_path(&binding.session);
+        let project_path = binding.project_root.to_string_lossy().to_string();
+        let producer_ctx = transform::ProducerContext {
+            project_path: &shadow_project,
+            project_directory: &project_path,
+            history_budget_tokens: binding.history_budget_tokens,
+            now_ms: parsed.pass_inputs.now_ms,
+            execute_threshold_percentage: parsed.pass_inputs.effective_execute_threshold,
+            smart_drops: binding.config.smart_drops,
+            cache_ttl: parsed.pass_inputs.cache_ttl.clone(),
+            model_key: parsed.pass_inputs.model_key.clone(),
+            observed_last_response_at_ms: None,
+            #[cfg(test)]
+            injected_reductions: self
+                .reduction_injection
+                .lock()
+                .expect("reduction injection mutex")
+                .remove(&binding.session)
+                .unwrap_or_default(),
+        };
+        let result = match transform_with_projection(&store, &transform_request, &producer_ctx) {
+            Ok(result) => result,
+            Err(e) => {
+                return HandlerOutcome::Error {
+                    code: "shadow_transform_failed".to_string(),
+                    message: e.to_string(),
+                }
+            }
+        };
+        let historian = self.evaluate_shadow_historian(
+            &store,
+            &transform_request,
+            &result.projection,
+            &parsed.pass_inputs,
+        );
+        let mut rs_decision = json!({
+            "class": rs_decision_class(&result.response.action),
+            "action": result.response.action,
+            "scheduler_pass": format!("{:?}", result.scheduler_pass),
+            "boundary_id": result.response.boundary_id,
+            "coverage_ordinal": result.response.coverage_ordinal,
+            "boundary_state": format!("{:?}", result.boundary_state),
+            "historian": historian,
+        });
+        if let Some(trim) = &result.trim_mismatch {
+            rs_decision["trim_mismatch"] = serde_json::to_value(trim).unwrap_or(Value::Null);
+        }
+        let ts_messages = match shadow_ts_messages(&parsed) {
+            Ok(messages) => messages,
+            Err(message) => {
+                return HandlerOutcome::Error {
+                    code: "bad_shadow_ts_output".to_string(),
+                    message,
+                }
+            }
+        };
+        let rs_messages = result.response.ck_messages.clone().unwrap_or_default();
+        let state_hash = shadow_state_hash(&store, &binding.session).unwrap_or_default();
+        let compare = compare_shadow_outputs(
+            &ts_messages,
+            &rs_messages,
+            &parsed.ts_decision,
+            &rs_decision,
+            &parsed.normalizations,
+            result.trim_mismatch.as_ref(),
+        );
+        let replay = compare.hard.then(|| {
+            json!({
+                "input": request.get("input").cloned().unwrap_or(Value::Null),
+                "pass_inputs": request.get("pass_inputs").cloned().unwrap_or(Value::Null),
+                "declared_trim": request.get("declared_trim").cloned().unwrap_or(Value::Null),
+                "ts_output": request.get("ts_output").cloned().unwrap_or(Value::Null),
+                "rs_output": rs_messages,
+            })
+        });
+        self.record_shadow_report(
+            &store,
+            &binding.session,
+            ShadowReportInput {
+                shadow_generation: parsed.shadow_generation,
+                pass_seq,
+                outcome: compare,
+                normalizations: parsed.normalizations,
+                ts_decision: parsed.ts_decision,
+                rs_decision,
+                state_hash,
+                replay,
+            },
+        )
     }
 
     async fn handle_facade_value(&self, channel: u16, request: Value) -> HandlerOutcome {
@@ -1686,6 +2512,9 @@ impl McHandler {
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
                 "transform" => self.handle_transform_value(channel, request).await,
+                "state_sync" => self.handle_shadow_state_sync_value(channel, request),
+                "shadow_transform" => self.handle_shadow_transform_value(channel, request).await,
+                "shadow_reset" => self.handle_shadow_reset_value(channel, request),
                 "ctx_reduce" | "append_agent_drops" | "agent_drops.append" => {
                     self.handle_agent_drops_value(channel, request)
                 }
@@ -1920,6 +2749,411 @@ fn drop_ids_from_command(request: &Value) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+fn is_shadow_session(session_id: &str) -> bool {
+    session_id.starts_with(SHADOW_SESSION_PREFIX)
+}
+
+fn shadow_project_path(session_id: &str) -> String {
+    session_id.to_string()
+}
+
+fn shadow_input_messages(
+    parsed: &ShadowTransformWire,
+) -> Result<Vec<crate::ck_wire::CkIngressMessage>, String> {
+    if !parsed.messages.is_empty() {
+        return Ok(parsed.messages.clone());
+    }
+    if parsed.input.is_empty() {
+        return Err("shadow_transform requires input or messages".to_string());
+    }
+    let ordinals = parsed
+        .input
+        .iter()
+        .map(absolute_ordinal)
+        .collect::<Result<Vec<_>, _>>()?;
+    let decoded = crate::codec::opencode::decode_opencode(&parsed.input);
+    if decoded.messages.len() != ordinals.len() {
+        return Err("opencode decode changed the message count".to_string());
+    }
+    Ok(decoded
+        .messages
+        .into_iter()
+        .zip(ordinals)
+        .map(|(mut message, ordinal)| {
+            message.ordinal = ordinal;
+            message.ck.meta.ordinal = Some(ordinal);
+            message
+        })
+        .collect())
+}
+
+fn shadow_ts_messages(
+    parsed: &ShadowTransformWire,
+) -> Result<Vec<crate::ck_wire::CkWireMessage>, String> {
+    if !parsed.ts_ck_messages.is_empty() {
+        return Ok(parsed.ts_ck_messages.clone());
+    }
+    let decoded = crate::codec::opencode::decode_opencode(&parsed.ts_output);
+    Ok(decoded
+        .messages
+        .into_iter()
+        .map(|message| message.ck)
+        .collect())
+}
+
+fn absolute_ordinal(value: &Value) -> Result<u64, String> {
+    ["absolute_ordinal", "absoluteOrdinal"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_u64))
+        .or_else(|| {
+            let info = value.get("info")?;
+            ["absolute_ordinal", "absoluteOrdinal"]
+                .iter()
+                .find_map(|key| info.get(*key).and_then(Value::as_u64))
+        })
+        .ok_or_else(|| "shadow input message is missing absolute_ordinal".to_string())
+}
+
+fn rs_decision_class(action: &str) -> &'static str {
+    match action {
+        "HARD" => "hard",
+        "SOFT" => "soft",
+        "SOFT+" | "PASSTHROUGH" => "defer",
+        _ => "error",
+    }
+}
+
+fn compare_shadow_outputs(
+    ts_messages: &[crate::ck_wire::CkWireMessage],
+    rs_messages: &[crate::ck_wire::CkWireMessage],
+    ts_decision: &Value,
+    rs_decision: &Value,
+    normalizations: &[Value],
+    trim_mismatch: Option<&transform::TrimMismatch>,
+) -> CompareOutcome {
+    let ts_canonical = canonical_messages(ts_messages);
+    let rs_canonical = canonical_messages(rs_messages);
+    let decision_mismatch = ts_decision
+        .get("class")
+        .and_then(Value::as_str)
+        .is_some_and(|class| {
+            class
+                != rs_decision
+                    .get("class")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+        });
+
+    if let Some(trim) = trim_mismatch {
+        let first = first_message_hint(ts_messages, rs_messages);
+        return CompareOutcome {
+            class: "trim-mismatch".to_string(),
+            hard: true,
+            compared: true,
+            first_mid: first.0,
+            first_block: first.1,
+            first_field: Some(trim.predicate.to_string()),
+            ts_prefix: bounded_prefix(&ts_canonical),
+            rs_prefix: bounded_prefix(&rs_canonical),
+        };
+    }
+
+    if ts_canonical == rs_canonical && !decision_mismatch {
+        return CompareOutcome {
+            class: "identical".to_string(),
+            hard: false,
+            compared: true,
+            first_mid: None,
+            first_block: None,
+            first_field: None,
+            ts_prefix: String::new(),
+            rs_prefix: String::new(),
+        };
+    }
+
+    if decision_mismatch {
+        let first = first_message_hint(ts_messages, rs_messages);
+        return CompareOutcome {
+            class: "decision-mismatch".to_string(),
+            hard: true,
+            compared: true,
+            first_mid: first.0,
+            first_block: first.1,
+            first_field: Some("class".to_string()),
+            ts_prefix: bounded_prefix(&canonical_value(ts_decision)),
+            rs_prefix: bounded_prefix(&canonical_value(rs_decision)),
+        };
+    }
+
+    if synthetic_todo_equivalent(ts_messages, rs_messages) {
+        return CompareOutcome {
+            class: "synthetic-todo".to_string(),
+            hard: false,
+            compared: true,
+            first_mid: None,
+            first_block: None,
+            first_field: Some("synthetic_todo_shape".to_string()),
+            ts_prefix: bounded_prefix(&ts_canonical),
+            rs_prefix: bounded_prefix(&rs_canonical),
+        };
+    }
+
+    if normalizations.iter().any(|value| {
+        value
+            .as_str()
+            .map(|s| s.contains("agent-drop") || s.contains("agent_drop"))
+            .unwrap_or_else(|| {
+                value.to_string().contains("agent-drop") || value.to_string().contains("agent_drop")
+            })
+    }) {
+        return CompareOutcome {
+            class: "agent-drop".to_string(),
+            hard: false,
+            compared: true,
+            first_mid: None,
+            first_block: None,
+            first_field: Some("normalization".to_string()),
+            ts_prefix: bounded_prefix(&ts_canonical),
+            rs_prefix: bounded_prefix(&rs_canonical),
+        };
+    }
+
+    let diff = first_diff(ts_messages, rs_messages);
+    CompareOutcome {
+        class: "byte-mismatch".to_string(),
+        hard: true,
+        compared: true,
+        first_mid: diff.0,
+        first_block: diff.1,
+        first_field: diff.2,
+        ts_prefix: bounded_prefix(&ts_canonical),
+        rs_prefix: bounded_prefix(&rs_canonical),
+    }
+}
+
+fn shadow_state_hash(store: &McStore, session_id: &str) -> Result<String, mc_store::McStoreError> {
+    let loaded = store.load(session_id)?;
+    let value = json!({ "core": loaded.core, "meta": loaded.meta });
+    let canonical = canonical_value(&value);
+    let digest = Sha256::digest(canonical.as_bytes());
+    Ok(format!("{digest:x}"))
+}
+
+fn canonical_messages(messages: &[crate::ck_wire::CkWireMessage]) -> String {
+    let values = messages
+        .iter()
+        .map(canonical_message_value)
+        .collect::<Vec<_>>();
+    canonical_value(&Value::Array(values))
+}
+
+fn canonical_message_value(message: &crate::ck_wire::CkWireMessage) -> Value {
+    let mut message = message.clone();
+    message.mark_modified();
+    serde_json::to_value(message).unwrap_or(Value::Null)
+}
+
+fn canonical_value(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(n) => canonical_number(n),
+        Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()),
+        Value::Array(values) => {
+            let inner = values
+                .iter()
+                .map(canonical_value)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{inner}]")
+        }
+        Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            let inner = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_default(),
+                        canonical_value(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+    }
+}
+
+fn canonical_number(number: &serde_json::Number) -> String {
+    if let Some(i) = number.as_i64() {
+        i.to_string()
+    } else if let Some(u) = number.as_u64() {
+        u.to_string()
+    } else if let Some(f) = number.as_f64() {
+        if f.fract() == 0.0 {
+            format!("{f:.0}")
+        } else {
+            let mut s = format!("{f}");
+            if s.contains('.') {
+                while s.ends_with('0') {
+                    s.pop();
+                }
+                if s.ends_with('.') {
+                    s.push('0');
+                }
+            }
+            s
+        }
+    } else {
+        number.to_string()
+    }
+}
+
+fn bounded_prefix(value: &str) -> String {
+    value.chars().take(SHADOW_COMPARE_PREFIX_LIMIT).collect()
+}
+
+fn first_message_hint(
+    ts_messages: &[crate::ck_wire::CkWireMessage],
+    rs_messages: &[crate::ck_wire::CkWireMessage],
+) -> (Option<String>, Option<String>) {
+    let index = (0..ts_messages.len().max(rs_messages.len()))
+        .find(|idx| ts_messages.get(*idx) != rs_messages.get(*idx))
+        .unwrap_or(0);
+    let mid = ts_messages
+        .get(index)
+        .or_else(|| rs_messages.get(index))
+        .and_then(|message| message.meta.harness_id.clone());
+    (mid, Some(index.to_string()))
+}
+
+fn first_diff(
+    ts_messages: &[crate::ck_wire::CkWireMessage],
+    rs_messages: &[crate::ck_wire::CkWireMessage],
+) -> (Option<String>, Option<String>, Option<String>) {
+    for index in 0..ts_messages.len().max(rs_messages.len()) {
+        match (ts_messages.get(index), rs_messages.get(index)) {
+            (Some(ts), Some(rs)) => {
+                let ts_value = canonical_message_value(ts);
+                let rs_value = canonical_message_value(rs);
+                if ts_value != rs_value {
+                    return (
+                        ts.meta
+                            .harness_id
+                            .clone()
+                            .or_else(|| rs.meta.harness_id.clone()),
+                        Some(index.to_string()),
+                        first_value_diff(&ts_value, &rs_value, "message"),
+                    );
+                }
+            }
+            (Some(ts), None) => {
+                return (
+                    ts.meta.harness_id.clone(),
+                    Some(index.to_string()),
+                    Some("missing_rs_message".to_string()),
+                )
+            }
+            (None, Some(rs)) => {
+                return (
+                    rs.meta.harness_id.clone(),
+                    Some(index.to_string()),
+                    Some("missing_ts_message".to_string()),
+                )
+            }
+            (None, None) => break,
+        }
+    }
+    (None, None, None)
+}
+
+fn first_value_diff(left: &Value, right: &Value, path: &str) -> Option<String> {
+    match (left, right) {
+        (Value::Object(l), Value::Object(r)) => {
+            let mut keys = l.keys().chain(r.keys()).collect::<Vec<_>>();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                match (l.get(key), r.get(key)) {
+                    (Some(a), Some(b)) if a == b => {}
+                    (Some(a), Some(b)) => {
+                        return first_value_diff(a, b, &format!("{path}.{key}"));
+                    }
+                    (Some(_), None) | (None, Some(_)) => return Some(format!("{path}.{key}")),
+                    (None, None) => {}
+                }
+            }
+            Some(path.to_string())
+        }
+        (Value::Array(l), Value::Array(r)) => {
+            for index in 0..l.len().max(r.len()) {
+                match (l.get(index), r.get(index)) {
+                    (Some(a), Some(b)) if a == b => {}
+                    (Some(a), Some(b)) => {
+                        return first_value_diff(a, b, &format!("{path}[{index}]"));
+                    }
+                    (Some(_), None) | (None, Some(_)) => return Some(format!("{path}[{index}]")),
+                    (None, None) => {}
+                }
+            }
+            Some(path.to_string())
+        }
+        _ => Some(path.to_string()),
+    }
+}
+
+fn synthetic_todo_equivalent(
+    ts_messages: &[crate::ck_wire::CkWireMessage],
+    rs_messages: &[crate::ck_wire::CkWireMessage],
+) -> bool {
+    let (ts_without, ts_todo) = split_synthetic_todo(ts_messages);
+    let (rs_without, rs_todo) = split_synthetic_todo(rs_messages);
+    !ts_todo.is_empty()
+        && !rs_todo.is_empty()
+        && canonical_value(&Value::Array(ts_without)) == canonical_value(&Value::Array(rs_without))
+        && sorted_strings(ts_todo) == sorted_strings(rs_todo)
+}
+
+fn split_synthetic_todo(messages: &[crate::ck_wire::CkWireMessage]) -> (Vec<Value>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut todo = Vec::new();
+    for message in messages {
+        let mut message = message.clone();
+        message.mark_modified();
+        let mut kept_blocks = Vec::new();
+        for block in &message.content {
+            let is_todo = match &block.kind {
+                crate::ck_wire::CkKind::ToolCall { id, name, .. } => {
+                    crate::injection::is_synthetic_todo_id(id) || name == "todowrite"
+                }
+                crate::ck_wire::CkKind::ToolResult { id, tool_name, .. } => {
+                    crate::injection::is_synthetic_todo_id(id) || tool_name == "todowrite"
+                }
+                _ => false,
+            };
+            if is_todo {
+                todo.push(canonical_value(
+                    &serde_json::to_value(block).unwrap_or(Value::Null),
+                ));
+            } else {
+                kept_blocks.push(block.clone());
+            }
+        }
+        if !kept_blocks.is_empty() || message.content.is_empty() {
+            message.content = kept_blocks;
+            kept.push(serde_json::to_value(message).unwrap_or(Value::Null));
+        }
+    }
+    (kept, todo)
+}
+
+fn sorted_strings(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values
 }
 
 fn boundary_messages(
@@ -4328,5 +5562,206 @@ mod tests {
         .unwrap();
         let without_value = serde_json::to_value(response_without_historian).unwrap();
         assert_eq!(with_historian["ck_messages"], without_value["ck_messages"]);
+    }
+
+    fn shadow_pass_inputs() -> Value {
+        json!({
+            "now_ms": 12345,
+            "model_key": "ts/model",
+            "usage": { "input_tokens": 45_000, "limit": 50_000 },
+            "effective_execute_threshold": 65.0,
+            "cache_ttl": "5m"
+        })
+    }
+
+    fn shadow_transform_body(
+        session: &str,
+        generation: u64,
+        ts_output: Vec<CkWireMessage>,
+    ) -> Value {
+        json!({
+            "kind": "shadow_transform",
+            "session_id": session,
+            "shadow_generation": generation,
+            "pass_seq": 0,
+            "serializer_profile": "owned-llmrunner",
+            "render_config": "cfg0",
+            "messages": vec![ck("m0", 0, "zero ordinal is real"), ck("m1", 1, "tail")],
+            "ts_ck_messages": ts_output,
+            "pass_inputs": shadow_pass_inputs(),
+            "ts_decision": { "class": "hard" },
+            "normalizations": [],
+        })
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_enforces_shadow_route_precedence() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+
+        let plain_on_shadow = handler
+            .dispatch_value(
+                8,
+                json!({
+                    "kind": "transform",
+                    "session_id": "shadow:ses",
+                    "serializer_profile": "owned-llmrunner",
+                    "render_config": "cfg0",
+                    "messages": [ck("m0", 0, "hi")],
+                }),
+            )
+            .await;
+        assert_eq!(
+            error_code(plain_on_shadow),
+            "plain_transform_on_shadow_binding"
+        );
+
+        let shadow_on_plain = handler
+            .dispatch_value(7, json!({ "kind": "shadow_reset", "session_id": "ses" }))
+            .await;
+        assert_eq!(error_code(shadow_on_plain), "shadow_binding_required");
+    }
+
+    #[tokio::test]
+    async fn shadow_reset_and_state_sync_gate_generation_and_seq() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+
+        let reset = match handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected reset outcome: {other:?}"),
+        };
+        assert_eq!(reset["shadow_generation"], 1);
+        let stale = handler
+            .dispatch_value(
+                8,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "shadow:ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                }),
+            )
+            .await;
+        assert_eq!(error_code(stale), "shadow_generation_mismatch");
+
+        let synced = match handler
+            .dispatch_value(
+                8,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "shadow:ses",
+                    "shadow_generation": 1,
+                    "expected_shadow_seq": 0,
+                    "compartments": [{
+                        "sequence": 0,
+                        "start_message": 0,
+                        "end_message": 0,
+                        "start_message_id": "m0#0",
+                        "end_message_id": "m0#0",
+                        "title": "c0",
+                        "content": "summary",
+                        "p1": "summary"
+                    }],
+                    "memories": [{ "id": 0, "category": "CONSTRAINTS", "content": "zero memory" }],
+                    "memory_mutations": [{
+                        "id": 0,
+                        "mutation_type": "update",
+                        "target_memory_id": 0,
+                        "new_content": "zero memory updated"
+                    }],
+                    "last_todo_state": "[]"
+                }),
+            )
+            .await
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected sync outcome: {other:?}"),
+        };
+        assert_eq!(synced["shadow_seq"], 1);
+        let loaded = store.load("shadow:ses").unwrap();
+        assert_eq!(loaded.meta.shadow_seq, 1);
+        assert_eq!(loaded.meta.last_todo_state.as_deref(), Some("[]"));
+        assert_eq!(
+            store.load_active_memories("shadow:ses", 0).unwrap()[0].id,
+            0
+        );
+
+        let duplicate = handler
+            .dispatch_value(
+                8,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "shadow:ses",
+                    "shadow_generation": 1,
+                    "expected_shadow_seq": 0,
+                }),
+            )
+            .await;
+        assert_eq!(error_code(duplicate), "shadow_seq_mismatch");
+    }
+
+    #[tokio::test]
+    async fn shadow_transform_quarantines_hard_divergence_and_then_records_decision_only() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&state), default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+
+        let report = match handler
+            .dispatch_value(8, shadow_transform_body("shadow:ses", 1, Vec::new()))
+            .await
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected shadow transform outcome: {other:?}"),
+        };
+        assert_eq!(report["class"], "byte-mismatch");
+        assert_eq!(report["quarantined"], true);
+        assert!(report.get("replay").is_some());
+        assert!(store.load("shadow:ses").unwrap().meta.shadow_quarantined);
+        assert_eq!(
+            store.load_shadow_divergences("shadow:ses").unwrap().len(),
+            1
+        );
+        assert_eq!(state.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store
+                .load("shadow:ses")
+                .unwrap()
+                .meta
+                .historian
+                .last_no_fire,
+            None
+        );
+
+        let before = store.load("shadow:ses").unwrap().row_version;
+        let decision_only = match handler
+            .dispatch_value(8, shadow_transform_body("shadow:ses", 1, Vec::new()))
+            .await
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected quarantined outcome: {other:?}"),
+        };
+        assert_eq!(decision_only["class"], "quarantined");
+        assert_eq!(decision_only["compared"], false);
+        assert_eq!(store.load("shadow:ses").unwrap().row_version, before);
+        assert_eq!(
+            store.load_shadow_divergences("shadow:ses").unwrap().len(),
+            2
+        );
     }
 }
