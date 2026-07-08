@@ -324,6 +324,7 @@ pub struct ValidatedPublishRequest<'a> {
     pub observed_chunk_fingerprint: &'a str,
     pub validated: &'a ValidatedChunk,
     pub publication_floor_ordinal: u64,
+    pub chunk_transcript: &'a str,
     /// Creation timestamp stamped on the appended compartment rows.
     pub created_at_ms: i64,
     pub failure_backoff_at_ms: i64,
@@ -373,6 +374,7 @@ pub fn publish_validated_chunk(
         compartments: &compartments,
         facts: &facts,
         publication_floor_ordinal: request.publication_floor_ordinal,
+        chunk_transcript: Some(request.chunk_transcript),
     }) {
         Ok(result) => Ok(result),
         Err(HistorianPublishError::CasConflict {
@@ -608,6 +610,7 @@ pub struct HistorianFireRequest<'a> {
     pub expected_revert_epoch: u64,
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
+    pub chunk_transcript: &'a str,
     pub prior_compartments: &'a [StoredCompartmentRange],
     pub validate_options: ValidateOptions,
     pub now_ms: i64,
@@ -620,6 +623,7 @@ pub struct HistorianReattachRequest<'a> {
     pub project_path: &'a str,
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
+    pub chunk_transcript: &'a str,
     pub prior_compartments: &'a [StoredCompartmentRange],
     pub validate_options: ValidateOptions,
     pub publication_floor_ordinal: u64,
@@ -1000,6 +1004,7 @@ where
             output,
             observed_chunk_fingerprint: request.observed_chunk_fingerprint,
             validation_chunk: request.validation_chunk,
+            chunk_transcript: request.chunk_transcript,
             prior_compartments: request.prior_compartments,
             validate_options: request.validate_options,
             created_at_ms: request.now_ms,
@@ -1126,6 +1131,7 @@ where
         output,
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
+        chunk_transcript: request.chunk_transcript,
         prior_compartments: request.prior_compartments,
         validate_options: request.validate_options,
         created_at_ms: request.now_ms,
@@ -1149,6 +1155,7 @@ struct PublishOutputRequest<'a> {
     output: ProducerOutput,
     observed_chunk_fingerprint: &'a str,
     validation_chunk: &'a HistorianChunk,
+    chunk_transcript: &'a str,
     prior_compartments: &'a [StoredCompartmentRange],
     validate_options: ValidateOptions,
     created_at_ms: i64,
@@ -1166,6 +1173,7 @@ fn publish_output_from_awaiting(
         output,
         observed_chunk_fingerprint,
         validation_chunk,
+        chunk_transcript,
         prior_compartments,
         validate_options,
         created_at_ms,
@@ -1221,6 +1229,7 @@ fn publish_output_from_awaiting(
             observed_chunk_fingerprint,
             validated: &validated,
             publication_floor_ordinal: validated.unprocessed_from,
+            chunk_transcript,
             created_at_ms,
             failure_backoff_at_ms,
         },
@@ -1369,6 +1378,7 @@ mod tests {
             cache_ttl: "5m".to_string(),
             model_key: None,
             observed_last_response_at_ms: None,
+            guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
             injected_reductions: Vec::new(),
         }
     }
@@ -1588,6 +1598,7 @@ mod tests {
             expected_revert_epoch: 0,
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
+            chunk_transcript: "U: transcript",
             prior_compartments: prior,
             validate_options: validate_options(),
             now_ms: 123,
@@ -1606,6 +1617,7 @@ mod tests {
             project_path: "git:proj",
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
+            chunk_transcript: "U: transcript",
             prior_compartments: prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
@@ -2479,6 +2491,7 @@ mod tests {
             project_path: "git:proj",
             observed_chunk_fingerprint: "fp-changed",
             validation_chunk: &chunk,
+            chunk_transcript: "U: transcript",
             prior_compartments: &prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
@@ -2642,6 +2655,7 @@ mod tests {
                 observed_chunk_fingerprint: "fp",
                 validated: &validated,
                 publication_floor_ordinal: 4,
+                chunk_transcript: "U: transcript",
                 created_at_ms: 123,
                 failure_backoff_at_ms: 0,
             },
@@ -2755,6 +2769,7 @@ mod tests {
                 observed_chunk_fingerprint: "different-fingerprint",
                 validated: &ValidatedChunk::default(),
                 publication_floor_ordinal: 5,
+                chunk_transcript: "U: transcript",
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
             },
@@ -2820,6 +2835,7 @@ mod tests {
                 observed_chunk_fingerprint: "fp",
                 validated: &ValidatedChunk::default(),
                 publication_floor_ordinal: 5,
+                chunk_transcript: "U: transcript",
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
             },
@@ -2949,6 +2965,7 @@ mod tests {
                 compartments: &[comp(1, 2, 4, "m4", "summary")],
                 facts: &[],
                 publication_floor_ordinal: 5,
+                chunk_transcript: Some("U: transcript"),
             })
             .unwrap();
 
@@ -3012,6 +3029,7 @@ mod tests {
                     ..Default::default()
                 }],
                 publication_floor_ordinal: 3,
+                chunk_transcript: None,
             })
             .unwrap();
 
