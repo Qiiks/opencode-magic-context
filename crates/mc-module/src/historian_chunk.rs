@@ -457,6 +457,7 @@ impl AssembledHistorianFiring {
             expected_revert_epoch: self.expected_revert_epoch,
             observed_chunk_fingerprint: &self.chunk_fingerprint,
             validation_chunk: &self.chunk.chunk,
+            chunk_transcript: &self.chunk.text,
             prior_compartments: &self.prior_compartments,
             validate_options: self.validate_options,
             now_ms: self.now_ms,

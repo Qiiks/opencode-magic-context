@@ -125,6 +125,10 @@ pub struct ProducerContext<'a> {
     /// In-process response observation. None disables TTL-hard even if durable metadata
     /// has an older sparse commit anchor.
     pub observed_last_response_at_ms: Option<i64>,
+    /// Current `Today's date: ...` guidance line. The transform copies it only when
+    /// this pass already rewrites cached context; updating wall-clock text during an
+    /// otherwise stable pass would make the date itself a reason to rewrite again.
+    pub guidance_date: Option<String>,
     #[cfg(test)]
     pub injected_reductions: Vec<ReductionDecision>,
 }
@@ -862,6 +866,11 @@ fn apply_once(
         plan,
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
     );
+    if is_bust_pass {
+        if let Some(guidance_date) = ctx.guidance_date.as_ref() {
+            meta.guidance_date = guidance_date.clone();
+        }
+    }
     let tail_for_capture = tail_for_selection.clone();
     if is_bust_pass && tail_reclaim_enabled {
         capture_todo_state_on_bust(&mut meta, &tail_for_capture, true);
@@ -1267,6 +1276,12 @@ fn apply_ingress_meta(meta: &mut ModuleMeta, req: &TransformRequest, projection:
             .entry(mid.clone())
             .or_insert_with(|| vector.clone());
     }
+    meta.newest_live_block_id = projection
+        .blocks
+        .iter()
+        .filter(|block| !block.synthetic)
+        .max_by_key(|block| block.ordinal)
+        .map(|block| block.id.clone());
     if let Some(usage) = req.usage.as_ref().filter(|usage| usage.is_non_zero()) {
         meta.last_usage = Some(usage.clone());
     }
@@ -2331,6 +2346,7 @@ mod tests {
             cache_ttl: "5m".to_string(),
             model_key: None,
             observed_last_response_at_ms: None,
+            guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
             injected_reductions: Vec::new(),
         }
     }

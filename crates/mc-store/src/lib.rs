@@ -16,10 +16,12 @@
 use cortexkit_cache_core::CoreState;
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
+use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::{Read, Write};
 
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
@@ -354,6 +356,8 @@ pub const SHADOW_SESSION_PREFIX: &str = "shadow:";
 
 /// Sentinel row_version meaning "no row present" (COALESCE default inside the txn).
 const NO_ROW: i64 = -1;
+const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
+const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -617,6 +621,40 @@ const MIGRATIONS: &[Migration] = &[
         );
     ",
     },
+    Migration {
+        version: 10,
+        // These transcript and session-note rows are append-only records. Transcript
+        // rows are stored in the same publish transaction as the compartment rows, so a
+        // failed publish cannot leave orphan transcripts and a crash after publish cannot
+        // leave a compartment without its recoverable transcript.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_chunk_transcripts (
+            session_id          TEXT NOT NULL,
+            compartment_seq     INTEGER NOT NULL,
+            start_ordinal       INTEGER NOT NULL,
+            end_ordinal         INTEGER NOT NULL,
+            transcript_deflate  BLOB NOT NULL,
+            created_at_ms       INTEGER NOT NULL,
+            PRIMARY KEY (session_id, compartment_seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_chunk_transcripts_session_range
+            ON mc_chunk_transcripts(session_id, start_ordinal, end_ordinal, compartment_seq);
+
+        CREATE TABLE IF NOT EXISTS mc_notes (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_path       TEXT NOT NULL,
+            session_id         TEXT NOT NULL,
+            content            TEXT NOT NULL,
+            status             TEXT NOT NULL CHECK (status IN ('active', 'dismissed')),
+            surface_condition  TEXT NULL,
+            anchor_block_id    TEXT NULL,
+            created_at_ms      INTEGER NOT NULL,
+            updated_at_ms      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_notes_scope_status
+            ON mc_notes(project_path, session_id, status, updated_at_ms DESC, id DESC);
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -822,6 +860,7 @@ pub struct HistorianPublishRequest<'a> {
     pub compartments: &'a [StoredCompartment],
     pub facts: &'a [FactCandidate],
     pub publication_floor_ordinal: u64,
+    pub chunk_transcript: Option<&'a str>,
 }
 
 /// Typed publish failures. CAS and state mismatches are deliberately separate so a
@@ -1000,6 +1039,10 @@ pub struct ModuleMeta {
     /// project-shared memory or preference.
     #[serde(default)]
     pub last_todo_state: Option<String>,
+    /// This session's `Today's date: ...` guidance line. Because it changes with the
+    /// wall clock, we update it only during a pass that already rewrites cached content.
+    #[serde(default)]
+    pub guidance_date: String,
     /// Monotonic session-level epoch bumped atomically with a revert re-cut. Historian
     /// firings carry the epoch observed at assembly so stale publishers cannot append
     /// rows after the covered prefix has been truncated.
@@ -1087,6 +1130,11 @@ pub struct ModuleMeta {
     /// a later request that changes a live message's block layout fails closed.
     #[serde(default)]
     pub block_identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
+    /// Record the newest non-synthetic flat block id seen in a successful live pass.
+    /// When a note is created, this value is used as a best-effort pointer to the end
+    /// of the conversation that the note refers to.
+    #[serde(default)]
+    pub newest_live_block_id: Option<String>,
     /// Last non-zero provider usage reported by the caller. Used when a retry or restart
     /// sends absent/zero usage, but overwritten by any later non-zero usage even when it
     /// decreases after reclaim.
@@ -1260,6 +1308,47 @@ pub struct StoredCompartmentSearchRow {
     pub p3: Option<String>,
     pub p4: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredChunkTranscript {
+    pub compartment_seq: i64,
+    pub start_ordinal: i64,
+    pub end_ordinal: i64,
+    pub transcript: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NoteInput<'a> {
+    pub project_path: &'a str,
+    pub session_id: &'a str,
+    pub content: &'a str,
+    pub surface_condition: Option<&'a str>,
+    pub anchor_block_id: Option<&'a str>,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredNote {
+    pub id: i64,
+    pub project_path: String,
+    pub session_id: String,
+    pub content: String,
+    pub status: String,
+    pub surface_condition: Option<String>,
+    pub anchor_block_id: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredNoteSearchRow {
+    pub id: i64,
+    pub content: String,
+    pub status: String,
+    pub surface_condition: Option<String>,
+    pub updated_at_ms: i64,
 }
 
 /// A loaded per-session row: the core state, the meta blob, and the CAS token.
@@ -2207,6 +2296,10 @@ impl McStore {
     ) -> Result<(), McStoreError> {
         self.inner.with_conn_fenced(|tx| {
             tx.execute(
+                "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
                 "DELETE FROM mc_compartments WHERE session_id = ?1",
                 params![session_id],
             )?;
@@ -2335,6 +2428,10 @@ impl McStore {
                 Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
             };
 
+            tx.execute(
+                "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq > ?2",
+                params![session_id, keep_through_seq],
+            )?;
             tx.execute(
                 "DELETE FROM mc_compartments WHERE session_id = ?1 AND sequence > ?2",
                 params![session_id, keep_through_seq],
@@ -2724,7 +2821,17 @@ impl McStore {
                 });
             }
 
+            let first_appended_sequence = next_compartment_sequence_tx(tx, session_id)?;
             append_compartments_tx(tx, session_id, request.compartments)?;
+            if let Some(transcript) = request.chunk_transcript {
+                insert_chunk_transcripts_tx(
+                    tx,
+                    session_id,
+                    first_appended_sequence,
+                    request.compartments,
+                    transcript,
+                )?;
+            }
             let promoted_refs = promote_facts_tx(tx, request.project_path, request.facts)?;
 
             meta.publication_floor_ordinal = Some(
@@ -3216,6 +3323,197 @@ impl McStore {
         Ok(rows)
     }
 
+    pub fn load_chunk_transcripts_for_range(
+        &self,
+        session_id: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<StoredChunkTranscript>, McStoreError> {
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT compartment_seq, start_ordinal, end_ordinal, transcript_deflate, created_at_ms
+                   FROM mc_chunk_transcripts
+                  WHERE session_id = ?1
+                    AND end_ordinal >= ?2
+                    AND start_ordinal <= ?3
+                  ORDER BY compartment_seq ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![session_id, start, end], |r| {
+                    let blob: Vec<u8> = r.get(3)?;
+                    Ok(StoredChunkTranscript {
+                        compartment_seq: r.get(0)?,
+                        start_ordinal: r.get(1)?,
+                        end_ordinal: r.get(2)?,
+                        transcript: decompress_transcript(&blob).ok(),
+                        created_at_ms: r.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
+    pub fn load_chunk_transcript_for_message(
+        &self,
+        session_id: &str,
+        ordinal: i64,
+    ) -> Result<Option<StoredChunkTranscript>, McStoreError> {
+        Ok(self
+            .load_chunk_transcripts_for_range(session_id, ordinal, ordinal)?
+            .into_iter()
+            .next())
+    }
+
+    pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, McStoreError> {
+        let content = input.content.trim();
+        self.inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_notes
+                   (project_path, session_id, content, status, surface_condition, anchor_block_id,
+                    created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?6)",
+                    params![
+                        input.project_path,
+                        input.session_id,
+                        content,
+                        input
+                            .surface_condition
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty()),
+                        input.anchor_block_id,
+                        input.now_ms,
+                    ],
+                )?;
+                let id = tx.last_insert_rowid();
+                load_note_tx(tx, id)
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn read_notes(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<StoredNote>, McStoreError> {
+        let limit = limit.clamp(1, 100) as i64;
+        let offset = offset as i64;
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_path, session_id, content, status, surface_condition,
+                        anchor_block_id, created_at_ms, updated_at_ms
+                   FROM mc_notes
+                  WHERE project_path = ?1 AND session_id = ?2 AND status = 'active'
+                  ORDER BY updated_at_ms DESC, id DESC
+                  LIMIT ?3 OFFSET ?4",
+            )?;
+            let mapped = stmt
+                .query_map(
+                    params![project_path, session_id, limit, offset],
+                    stored_note_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
+    pub fn update_note_content(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        note_id: i64,
+        content: &str,
+        now_ms: i64,
+    ) -> Result<Option<StoredNote>, McStoreError> {
+        let content = content.trim();
+        self.inner
+            .with_conn_fenced(|tx| {
+                let changed = tx.execute(
+                    "UPDATE mc_notes
+                    SET content = ?4, updated_at_ms = ?5
+                  WHERE id = ?1 AND project_path = ?2 AND session_id = ?3 AND status = 'active'",
+                    params![note_id, project_path, session_id, content, now_ms],
+                )?;
+                if changed == 0 {
+                    return Ok(None);
+                }
+                load_note_tx(tx, note_id).map(Some)
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn dismiss_note(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        note_id: i64,
+        resolution: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Option<StoredNote>, McStoreError> {
+        self.inner
+            .with_conn_fenced(|tx| {
+                let Some(mut note) = load_note_scoped_tx(tx, project_path, session_id, note_id)?
+                else {
+                    return Ok(None);
+                };
+                if note.status != "active" {
+                    return Ok(None);
+                }
+                if let Some(resolution) = resolution.map(str::trim).filter(|s| !s.is_empty()) {
+                    note.content =
+                        format!("{}\n\nDismissal resolution: {resolution}", note.content);
+                }
+                tx.execute(
+                    "UPDATE mc_notes
+                    SET content = ?2, status = 'dismissed', updated_at_ms = ?3
+                  WHERE id = ?1",
+                    params![note_id, note.content, now_ms],
+                )?;
+                load_note_tx(tx, note_id).map(Some)
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn search_notes_like(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        query: &str,
+    ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = sql_like_pattern(query);
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, content, status, surface_condition, updated_at_ms
+                   FROM mc_notes
+                  WHERE project_path = ?1 AND session_id = ?2
+                    AND (LOWER(content) LIKE ?3 ESCAPE '\\'
+                      OR LOWER(COALESCE(surface_condition, '')) LIKE ?3 ESCAPE '\\')
+                  ORDER BY updated_at_ms DESC, id DESC",
+            )?;
+            let mapped = stmt
+                .query_map(params![project_path, session_id, pattern], |r| {
+                    Ok(StoredNoteSearchRow {
+                        id: r.get(0)?,
+                        content: r.get(1)?,
+                        status: r.get(2)?,
+                        surface_condition: r.get(3)?,
+                        updated_at_ms: r.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
     /// Load active user-memory contents (the `<user-profile>` baseline source), ordered
     /// `promoted_at ASC, id ASC`. The id tiebreaker is load-bearing: `promoted_at` can
     /// tie at ms granularity and a non-deterministic order would drift the rendered
@@ -3668,15 +3966,143 @@ fn append_compartments_tx(
     if compartments.is_empty() {
         return Ok(());
     }
-    let tail: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
-        params![session_id],
-        |r| r.get(0),
-    )?;
+    let tail = next_compartment_sequence_tx(tx, session_id)? - 1;
     for (idx, compartment) in compartments.iter().enumerate() {
         insert_compartment_tx(tx, session_id, tail + idx as i64 + 1, compartment)?;
     }
     Ok(())
+}
+
+fn next_compartment_sequence_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> rusqlite::Result<i64> {
+    tx.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mc_compartments WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )
+}
+
+fn insert_chunk_transcripts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    first_sequence: i64,
+    compartments: &[StoredCompartment],
+    transcript: &str,
+) -> rusqlite::Result<()> {
+    if compartments.is_empty() {
+        return Ok(());
+    }
+    let compressed = match compress_transcript(transcript) {
+        Ok(compressed) if compressed.len() <= MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES => compressed,
+        _ => return Ok(()),
+    };
+    for (idx, compartment) in compartments.iter().enumerate() {
+        tx.execute(
+            "INSERT OR REPLACE INTO mc_chunk_transcripts
+               (session_id, compartment_seq, start_ordinal, end_ordinal, transcript_deflate, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id,
+                first_sequence + idx as i64,
+                compartment.start_message,
+                compartment.end_message,
+                &compressed,
+                compartment.created_at,
+            ],
+        )?;
+    }
+    evict_chunk_transcripts_tx(tx, session_id)
+}
+
+fn evict_chunk_transcripts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> rusqlite::Result<()> {
+    loop {
+        let total: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(LENGTH(transcript_deflate)), 0)
+               FROM mc_chunk_transcripts WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
+            return Ok(());
+        }
+        let victim: Option<i64> = tx
+            .query_row(
+                "SELECT compartment_seq
+                   FROM mc_chunk_transcripts
+                  WHERE session_id = ?1
+                  ORDER BY created_at_ms ASC, compartment_seq ASC
+                  LIMIT 1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(victim) = victim else {
+            return Ok(());
+        };
+        tx.execute(
+            "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq = ?2",
+            params![session_id, victim],
+        )?;
+    }
+}
+
+fn compress_transcript(transcript: &str) -> std::io::Result<Vec<u8>> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(transcript.as_bytes())?;
+    encoder.finish()
+}
+
+fn decompress_transcript(blob: &[u8]) -> std::io::Result<String> {
+    let mut decoder = DeflateDecoder::new(blob);
+    let mut out = String::new();
+    decoder.read_to_string(&mut out)?;
+    Ok(out)
+}
+
+fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
+    Ok(StoredNote {
+        id: r.get(0)?,
+        project_path: r.get(1)?,
+        session_id: r.get(2)?,
+        content: r.get(3)?,
+        status: r.get(4)?,
+        surface_condition: r.get(5)?,
+        anchor_block_id: r.get(6)?,
+        created_at_ms: r.get(7)?,
+        updated_at_ms: r.get(8)?,
+    })
+}
+
+fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<StoredNote> {
+    tx.query_row(
+        "SELECT id, project_path, session_id, content, status, surface_condition,
+                anchor_block_id, created_at_ms, updated_at_ms
+           FROM mc_notes WHERE id = ?1",
+        params![id],
+        stored_note_from_row,
+    )
+}
+
+fn load_note_scoped_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_path: &str,
+    session_id: &str,
+    id: i64,
+) -> rusqlite::Result<Option<StoredNote>> {
+    tx.query_row(
+        "SELECT id, project_path, session_id, content, status, surface_condition,
+                anchor_block_id, created_at_ms, updated_at_ms
+           FROM mc_notes
+          WHERE id = ?1 AND project_path = ?2 AND session_id = ?3",
+        params![id, project_path, session_id],
+        stored_note_from_row,
+    )
+    .optional()
 }
 
 fn promote_facts_tx(
@@ -4923,6 +5349,7 @@ mod tests {
                     ..Default::default()
                 }],
                 publication_floor_ordinal: 21,
+                chunk_transcript: None,
             })
             .unwrap();
         assert_eq!(first.row_version, 2);
@@ -4937,6 +5364,7 @@ mod tests {
                 compartments: &[publish_compartment()],
                 facts: &[],
                 publication_floor_ordinal: 21,
+                chunk_transcript: None,
             })
             .unwrap_err();
         assert!(
@@ -4949,6 +5377,158 @@ mod tests {
         assert_eq!(loaded.meta.historian.firing_seq, 7);
         assert_eq!(loaded.meta.publication_floor_ordinal, Some(21));
         assert_eq!(store.max_memory_id(&["git:proj".to_string()]).unwrap(), 1);
+    }
+
+    #[test]
+    fn publish_historian_chunk_persists_transcript_inside_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        let expected = store.load("ses").unwrap().row_version;
+        store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                expected_revert_epoch: 0,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[],
+                publication_floor_ordinal: 21,
+                chunk_transcript: Some("U: hello\nA: world"),
+            })
+            .unwrap();
+
+        let rows = store
+            .load_chunk_transcripts_for_range("ses", 10, 21)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].compartment_seq, 1);
+        assert_eq!(rows[0].transcript.as_deref(), Some("U: hello\nA: world"));
+    }
+
+    #[test]
+    fn publish_historian_chunk_cas_conflict_leaves_no_transcript_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        let err = store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: Some(99),
+                expected_revert_epoch: 0,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[],
+                publication_floor_ordinal: 21,
+                chunk_transcript: Some("U: orphan"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, HistorianPublishError::CasConflict { .. }));
+        assert!(store
+            .load_chunk_transcripts_for_range("ses", 10, 21)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn oversized_chunk_transcript_is_evicted_as_unrecoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        let transcript = (0..50_000)
+            .map(|i| format!("{:x}", md5::compute(i.to_string())))
+            .collect::<String>();
+        assert!(
+            compress_transcript(&transcript).unwrap().len() > MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES
+        );
+        let expected = store.load("ses").unwrap().row_version;
+        store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                expected_revert_epoch: 0,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[],
+                publication_floor_ordinal: 21,
+                chunk_transcript: Some(&transcript),
+            })
+            .unwrap();
+        assert!(store
+            .load_chunk_transcripts_for_range("ses", 10, 21)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn notes_crud_pagination_dismiss_resolution_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let first = store
+            .insert_note(NoteInput {
+                project_path: "git:proj",
+                session_id: "ses",
+                content: "Revisit frobnicator later",
+                surface_condition: Some("when release tag advances"),
+                anchor_block_id: Some("m9#0"),
+                now_ms: 10,
+            })
+            .unwrap();
+        let second = store
+            .insert_note(NoteInput {
+                project_path: "git:proj",
+                session_id: "ses",
+                content: "Check pagination",
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms: 20,
+            })
+            .unwrap();
+        assert_eq!(
+            store.read_notes("git:proj", "ses", 1, 0).unwrap()[0].id,
+            second.id
+        );
+        assert_eq!(
+            store.read_notes("git:proj", "ses", 1, 1).unwrap()[0].id,
+            first.id
+        );
+        store
+            .update_note_content(
+                "git:proj",
+                "ses",
+                first.id,
+                "Revisit updated frobnicator",
+                30,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .search_notes_like("git:proj", "ses", "updated")
+                .unwrap()[0]
+                .id,
+            first.id
+        );
+        let dismissed = store
+            .dismiss_note("git:proj", "ses", first.id, Some("done in v2"), 40)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dismissed.status, "dismissed");
+        assert!(dismissed.content.contains("done in v2"));
+        assert_eq!(store.read_notes("git:proj", "ses", 25, 0).unwrap().len(), 1);
+        assert!(store
+            .search_notes_like("git:other", "ses", "pagination")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -4978,6 +5558,7 @@ mod tests {
                     ..Default::default()
                 }],
                 publication_floor_ordinal: 21,
+                chunk_transcript: None,
             })
             .unwrap_err();
         assert!(matches!(err, HistorianPublishError::StateMismatch { .. }));
@@ -5008,6 +5589,7 @@ mod tests {
                 compartments: &[publish_compartment()],
                 facts: &[],
                 publication_floor_ordinal: 21,
+                chunk_transcript: None,
             })
             .unwrap_err();
         assert!(
@@ -5121,6 +5703,7 @@ mod tests {
                 compartments: &[publish_compartment()],
                 facts: &[],
                 publication_floor_ordinal: 21,
+                chunk_transcript: None,
             })
             .unwrap_err();
         assert!(matches!(

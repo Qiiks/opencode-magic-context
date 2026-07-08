@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use mc_store::{
     McStore, McStoreError, StoredCompartmentSearchRow, StoredMemoryFull, StoredMemorySearchRow,
+    StoredNoteSearchRow,
 };
 
 #[derive(Debug)]
@@ -63,17 +64,21 @@ pub enum MemorySearchSourceKind {
     Memory,
     CompartmentTitle,
     CompartmentBody,
+    Note,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemorySearchResult {
     pub source_kind: MemorySearchSourceKind,
-    /// Memory id for memory hits; compartment sequence for compartment hits.
+    /// Use the record's primary identifier: memory row id for memory results,
+    /// compartment sequence for compartment results, and note id for note results.
     pub id: i64,
     pub snippet: String,
     pub category: Option<String>,
     pub sequence: Option<i64>,
     pub title: Option<String>,
+    pub note_status: Option<String>,
+    pub surface_condition: Option<String>,
 }
 
 #[derive(Debug)]
@@ -208,6 +213,16 @@ pub fn search_memories_and_compartments_for_session(
             ranked.push(hit);
         }
     }
+    for note in store.search_notes_like(project_path, session_id, query)? {
+        if first_match(&note.content, query).is_some()
+            || note
+                .surface_condition
+                .as_deref()
+                .is_some_and(|condition| first_match(condition, query).is_some())
+        {
+            ranked.push(note_search_hit(note, query));
+        }
+    }
 
     ranked.sort_by(|left, right| {
         left.rank
@@ -292,6 +307,32 @@ fn memory_search_hit(memory: StoredMemorySearchRow, query: &str) -> RankedSearch
             category: Some(memory.category),
             sequence: None,
             title: None,
+            note_status: None,
+            surface_condition: None,
+        },
+    }
+}
+
+fn note_search_hit(note: StoredNoteSearchRow, query: &str) -> RankedSearchResult {
+    let matched_text = if first_match(&note.content, query).is_some() {
+        note.content.as_str()
+    } else {
+        note.surface_condition
+            .as_deref()
+            .unwrap_or(note.content.as_str())
+    };
+    RankedSearchResult {
+        rank: 1,
+        recency: note.updated_at_ms,
+        result: MemorySearchResult {
+            source_kind: MemorySearchSourceKind::Note,
+            id: note.id,
+            snippet: snippet_around_match(matched_text, query),
+            category: None,
+            sequence: None,
+            title: None,
+            note_status: Some(note.status),
+            surface_condition: note.surface_condition,
         },
     }
 }
@@ -311,6 +352,8 @@ fn compartment_search_hit(
                 category: None,
                 sequence: Some(compartment.sequence),
                 title: Some(compartment.title),
+                note_status: None,
+                surface_condition: None,
             },
         });
     }
@@ -326,6 +369,8 @@ fn compartment_search_hit(
             category: None,
             sequence: Some(compartment.sequence),
             title: Some(compartment.title),
+            note_status: None,
+            surface_condition: None,
         },
     })
 }

@@ -48,10 +48,12 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
+use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
-    HistorianPhase, InsertMemoryInput, McStore, ShadowDivergenceRecord, ShadowMemoryRow,
-    ShadowStateSyncError, ShadowStateSyncRequest, StoredCompartment, StoredMemoryMutation,
+    HistorianPhase, InsertMemoryInput, McStore, NoteInput, ShadowDivergenceRecord, ShadowMemoryRow,
+    ShadowStateSyncError, ShadowStateSyncRequest, StoredChunkTranscript, StoredCompartment,
+    StoredMemoryMutation, StoredNote,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -137,6 +139,7 @@ pub const TAGGER_FEATURE_EPOCH: u32 = 0;
 
 /// Storage namespace for the cache-state domain.
 const STORAGE_NAMESPACE: &str = "mc_cache";
+const GUIDANCE_TEXT: &str = include_str!("../assets/guidance_primary.txt");
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
@@ -490,6 +493,9 @@ pub struct McHandler {
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     live_historian_sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
+    guidance_dates: Mutex<HashMap<String, String>>,
+    #[cfg(test)]
+    guidance_now_ms: Mutex<Option<i64>>,
     #[cfg(test)]
     reduction_injection: Mutex<HashMap<String, Vec<ReductionDecision>>>,
     /// Test-only interleave seam: runs once between the request's transform and the
@@ -652,6 +658,9 @@ impl McHandler {
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             scheduler_observations: Mutex::new(HashMap::new()),
+            guidance_dates: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            guidance_now_ms: Mutex::new(None),
             #[cfg(test)]
             reduction_injection: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -702,6 +711,8 @@ impl McHandler {
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             scheduler_observations: Mutex::new(HashMap::new()),
+            guidance_dates: Mutex::new(HashMap::new()),
+            guidance_now_ms: Mutex::new(None),
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
             bindings: Mutex::new(HashMap::new()),
@@ -999,6 +1010,42 @@ impl McHandler {
             );
     }
 
+    fn guidance_now_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(now) = *self.guidance_now_ms.lock().expect("guidance clock mutex") {
+            return now;
+        }
+        now_ms()
+    }
+
+    fn guidance_date_line(&self) -> String {
+        self.guidance_date_line_for_ms(self.guidance_now_ms())
+    }
+
+    fn guidance_date_line_for_ms(&self, ms: i64) -> String {
+        let date = Local
+            .timestamp_millis_opt(ms)
+            .single()
+            .unwrap_or_else(Local::now)
+            .format("%a %b %d %Y");
+        format!("Today's date: {date}")
+    }
+
+    fn guidance_date_for_transform(&self, session_id: &str, pass_now: i64) -> String {
+        self.guidance_dates
+            .lock()
+            .expect("guidance date mutex")
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| self.guidance_date_line_for_ms(pass_now))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn set_guidance_now_ms_for_test(&self, now_ms: i64) {
+        *self.guidance_now_ms.lock().expect("guidance clock mutex") = Some(now_ms);
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     fn inject_reductions_for_test(&self, session_id: &str, reductions: Vec<ReductionDecision>) {
@@ -1149,6 +1196,7 @@ impl McHandler {
                                 project_path: &project_path,
                                 observed_chunk_fingerprint: &observed,
                                 validation_chunk: &chunk.chunk,
+                                chunk_transcript: &chunk.text,
                                 prior_compartments: &prior_compartments,
                                 validate_options: historian_validate::ValidateOptions {
                                     sequence_offset: prior_compartments.len() as u64 + 1,
@@ -1634,6 +1682,93 @@ impl McHandler {
         }
     }
 
+    fn handle_guidance_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "guidance.get requires session_id".to_string(),
+            };
+        };
+        if let Err(error) = self.resolve_binding(channel, session_id) {
+            return match error {
+                BindingError::Unbound => HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: "guidance.get on a channel with no session binding".to_string(),
+                },
+                BindingError::SessionMismatch => HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                },
+            };
+        }
+
+        let date_line = match self.guidance_date_for_session(&store, session_id) {
+            Ok(date) => date,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let bytes = guidance_bytes(&date_line);
+        respond(json!({
+            "ok": true,
+            "bytes": bytes,
+            "hash": sha256_hex(bytes.as_bytes()),
+            // The generated guidance text is the only part stored in render_config. The
+            // session date line changes every day, so content_hash excludes it; otherwise
+            // a date-only change would trigger cache refreshes even when guidance is unchanged.
+            "content_hash": sha256_hex(GUIDANCE_TEXT.as_bytes()),
+        }))
+    }
+
+    fn guidance_date_for_session(
+        &self,
+        store: &McStore,
+        session_id: &str,
+    ) -> Result<String, mc_store::McStoreError> {
+        for _ in 0..2 {
+            let loaded = store.load(session_id)?;
+            if !loaded.meta.guidance_date.is_empty() {
+                self.guidance_dates
+                    .lock()
+                    .expect("guidance date mutex")
+                    .remove(session_id);
+                return Ok(loaded.meta.guidance_date);
+            }
+            let date_line = self
+                .guidance_dates
+                .lock()
+                .expect("guidance date mutex")
+                .entry(session_id.to_string())
+                .or_insert_with(|| self.guidance_date_line())
+                .clone();
+            let Some(expected) = loaded.row_version else {
+                return Ok(date_line);
+            };
+            let mut meta = loaded.meta.clone();
+            meta.guidance_date.clone_from(&date_line);
+            match store.commit(session_id, Some(expected), &loaded.core, &meta) {
+                Ok(_) => return Ok(date_line),
+                Err(mc_store::McStoreError::CasConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(self
+            .guidance_dates
+            .lock()
+            .expect("guidance date mutex")
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| self.guidance_date_line()))
+    }
+
     fn handle_status_value(&self, request: &Value) -> HandlerOutcome {
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
@@ -1773,6 +1908,7 @@ impl McHandler {
                 model_key: binding.model_key.clone(),
                 observed_last_response_at_ms: self
                     .observed_last_response_at_ms(&store, &parsed.session_id),
+                guidance_date: Some(self.guidance_date_for_transform(&parsed.session_id, pass_now)),
                 #[cfg(test)]
                 injected_reductions: self
                     .reduction_injection
@@ -1934,6 +2070,12 @@ impl McHandler {
             }
         }
         let mut response = result.response;
+        if response.committed {
+            self.guidance_dates
+                .lock()
+                .expect("guidance date mutex")
+                .remove(&parsed.session_id);
+        }
         response.historian = Some(diagnostics);
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
@@ -2157,6 +2299,7 @@ impl McHandler {
             cache_ttl: parsed.pass_inputs.cache_ttl.clone(),
             model_key: parsed.pass_inputs.model_key.clone(),
             observed_last_response_at_ms: None,
+            guidance_date: Some(self.guidance_date_line_for_ms(parsed.pass_inputs.now_ms)),
             #[cfg(test)]
             injected_reductions: self
                 .reduction_injection
@@ -2243,6 +2386,8 @@ impl McHandler {
         match name {
             "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
+            "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
+            "ctx_note" => self.handle_ctx_note_facade(channel, &request).await,
             _ => unrecognized_request_error(&request),
         }
     }
@@ -2438,18 +2583,174 @@ impl McHandler {
                                 memory_tool::MemorySearchSourceKind::Memory => "memory",
                                 memory_tool::MemorySearchSourceKind::CompartmentTitle => "compartment_title",
                                 memory_tool::MemorySearchSourceKind::CompartmentBody => "compartment_body",
+                                memory_tool::MemorySearchSourceKind::Note => "note",
                             },
                             "id": result.id,
                             "snippet": result.snippet,
                             "category": result.category,
                             "sequence": result.sequence,
                             "title": result.title,
+                            "status": result.note_status,
+                            "surface_condition": result.surface_condition,
                         })
                     })
                     .collect::<Vec<_>>();
                 mcp_text_result(Value::Array(rendered).to_string(), false)
             }
             Err(error) => tool_error_result(format!("Error: {error}")),
+        }
+    }
+
+    async fn handle_ctx_expand_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request) else {
+            return invalid_params_error("ctx_expand arguments must be an object");
+        };
+        let facade_scope = match self.resolve_facade_scope(channel).await {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        let session_id = facade_scope.conversation_key.as_str();
+        if let Some(message) = i64_arg(args, "message").filter(|value| *value > 0) {
+            return match store.load_chunk_transcript_for_message(session_id, message) {
+                Ok(Some(row)) => mcp_text_result(render_message_expand(row, message), false),
+                Ok(None) => mcp_text_result(
+                    format!(
+                        "Message {message} is no longer recoverable from persisted chunk transcripts. The span was evicted or was compacted before transcript capture."
+                    ),
+                    false,
+                ),
+                Err(error) => tool_error_result(format!("Error: {error}")),
+            };
+        }
+        let Some(start) = i64_arg(args, "start") else {
+            return tool_error_result(
+                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+            );
+        };
+        let Some(end) = i64_arg(args, "end") else {
+            return tool_error_result(
+                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+            );
+        };
+        if start < 1 || end < start {
+            return tool_error_result(
+                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+            );
+        }
+        let compartments = match store.load_compartments(session_id) {
+            Ok(compartments) => compartments,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let transcripts = match store.load_chunk_transcripts_for_range(session_id, start, end) {
+            Ok(transcripts) => transcripts,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        mcp_text_result(
+            render_range_expand(start, end, &compartments, &transcripts),
+            false,
+        )
+    }
+
+    async fn handle_ctx_note_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request) else {
+            return invalid_params_error("ctx_note arguments must be an object");
+        };
+        let facade_scope = match self.resolve_facade_scope(channel).await {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        let project = facade_scope.memory_project_path.as_str();
+        let session = facade_scope.conversation_key.as_str();
+        let action = string_arg(args, "action")
+            .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
+            .unwrap_or("read");
+        match action {
+            "write" => {
+                let Some(content) = non_empty_string_arg(args, "content") else {
+                    return tool_error_result(
+                        "Error: 'content' is required when action is 'write'.",
+                    );
+                };
+                let anchor = store
+                    .load(session)
+                    .ok()
+                    .and_then(|loaded| loaded.meta.newest_live_block_id);
+                match store.insert_note(NoteInput {
+                    project_path: project,
+                    session_id: session,
+                    content,
+                    surface_condition: string_arg(args, "surface_condition"),
+                    anchor_block_id: anchor.as_deref(),
+                    now_ms: now_ms(),
+                }) {
+                    Ok(note) => {
+                        let mut message = format!("Saved session note #{}.", note.id);
+                        if note.surface_condition.is_some() {
+                            message.push_str(
+                                " Surface condition recorded; condition evaluation arrives later.",
+                            );
+                        }
+                        mcp_text_result(message, false)
+                    }
+                    Err(error) => tool_error_result(format!("Error: {error}")),
+                }
+            }
+            "read" => {
+                let limit = usize_arg(args, "limit").unwrap_or(25).clamp(1, 100);
+                let offset = usize_arg(args, "offset").unwrap_or(0);
+                match store.read_notes(project, session, limit, offset) {
+                    Ok(notes) => mcp_text_result(render_notes(notes, offset), false),
+                    Err(error) => tool_error_result(format!("Error: {error}")),
+                }
+            }
+            "update" => {
+                let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
+                    return tool_error_result(
+                        "Error: 'note_id' is required when action is 'update'.",
+                    );
+                };
+                let Some(content) = non_empty_string_arg(args, "content") else {
+                    return tool_error_result(
+                        "Error: 'content' is required when action is 'update'.",
+                    );
+                };
+                match store.update_note_content(project, session, note_id, content, now_ms()) {
+                    Ok(Some(_)) => mcp_text_result(format!("Updated note #{note_id}."), false),
+                    Ok(None) => tool_error_result(format!(
+                        "Error: Note #{note_id} not found in your session/project or already dismissed."
+                    )),
+                    Err(error) => tool_error_result(format!("Error: {error}")),
+                }
+            }
+            "dismiss" => {
+                let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
+                    return tool_error_result(
+                        "Error: 'note_id' is required when action is 'dismiss'.",
+                    );
+                };
+                match store.dismiss_note(
+                    project,
+                    session,
+                    note_id,
+                    string_arg(args, "content"),
+                    now_ms(),
+                ) {
+                    Ok(Some(_)) => mcp_text_result(format!("Note #{note_id} dismissed."), false),
+                    Ok(None) => tool_error_result(format!(
+                        "Error: Note #{note_id} not found in your session/project or already dismissed."
+                    )),
+                    Err(error) => tool_error_result(format!("Error: {error}")),
+                }
+            }
+            _ => tool_error_result("Error: Unknown ctx_note action.".to_string()),
         }
     }
 }
@@ -2552,6 +2853,7 @@ impl McHandler {
                 // Proves the store opened end-to-end and, when a session_id is supplied,
                 // returns the session's stored trace state directly from the module.
                 "health" | "status" | "diagnostics" => self.handle_status_value(&request),
+                "guidance.get" => self.handle_guidance_value(channel, &request),
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
                 "transform" => self.handle_transform_value(channel, request).await,
@@ -2657,6 +2959,15 @@ fn respond(value: Value) -> HandlerOutcome {
     }
 }
 
+fn guidance_bytes(date_line: &str) -> String {
+    format!("{GUIDANCE_TEXT}\n{date_line}")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
 fn mcp_text_result(text: String, is_error: bool) -> HandlerOutcome {
     respond(json!({
         "content": [{ "type": "text", "text": text }],
@@ -2711,6 +3022,102 @@ fn usize_arg(args: &Map<String, Value>, key: &str) -> Option<usize> {
     args.get(key)
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
+}
+
+fn render_message_expand(row: StoredChunkTranscript, message: i64) -> String {
+    let mut lines = vec![
+        format!(
+            "Message {message} is covered by compartment {} ({}-{}).",
+            row.compartment_seq, row.start_ordinal, row.end_ordinal
+        ),
+        "This Claude Code leg can recover the historian chunk-builder view, not full raw messages; tool calls may be summarized and long text may have been truncated before summarization.".to_string(),
+        String::new(),
+        format!(
+            "### Compartment {} ({}-{})",
+            row.compartment_seq, row.start_ordinal, row.end_ordinal
+        ),
+    ];
+    lines.push(row.transcript.unwrap_or_else(|| {
+        "[no longer recoverable: transcript bytes could not be decompressed]".to_string()
+    }));
+    lines.join("\n")
+}
+
+fn render_range_expand(
+    start: i64,
+    end: i64,
+    compartments: &[StoredCompartment],
+    transcripts: &[StoredChunkTranscript],
+) -> String {
+    let mut matching = compartments
+        .iter()
+        .filter(|comp| comp.end_message >= start && comp.start_message <= end)
+        .collect::<Vec<_>>();
+    matching.sort_by_key(|comp| comp.sequence);
+    if matching.is_empty() {
+        return format!(
+            "No compacted compartments found in range {start}-{end}. The range may be live tail, outside this session's history, or compacted before transcript capture."
+        );
+    }
+    let mut lines = vec![format!(
+        "Messages {start}-{end} from persisted historian chunk transcripts:"
+    )];
+    for compartment in matching {
+        lines.push(String::new());
+        lines.push(format!(
+            "### Compartment {} ({}-{})",
+            compartment.sequence, compartment.start_message, compartment.end_message
+        ));
+        match transcripts
+            .iter()
+            .find(|row| row.compartment_seq == compartment.sequence)
+        {
+            Some(row) => lines.push(row.transcript.clone().unwrap_or_else(|| {
+                "[no longer recoverable: transcript bytes could not be decompressed]".to_string()
+            })),
+            None => lines.push(
+                "[no longer recoverable: this compartment transcript was evicted or was not recorded]"
+                    .to_string(),
+            ),
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_notes(notes: Vec<StoredNote>, offset: usize) -> String {
+    if notes.is_empty() {
+        return "## Notes\n\nNo active session notes.".to_string();
+    }
+    let mut lines = vec!["## Session Notes".to_string(), String::new()];
+    for note in &notes {
+        let condition = note
+            .surface_condition
+            .as_ref()
+            .map(|condition| {
+                format!("\n  Condition (recorded, evaluation arrives later): {condition}")
+            })
+            .unwrap_or_default();
+        let anchor = note
+            .anchor_block_id
+            .as_ref()
+            .map(|anchor| format!(" ↳ @block {anchor}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- **#{}**: {}{}{}",
+            note.id, note.content, anchor, condition
+        ));
+    }
+    if notes.len() == 25 {
+        lines.push(String::new());
+        lines.push(format!(
+            "Showing {} notes (newest first). For older notes: ctx_note(action=\"read\", offset={}).",
+            notes.len(),
+            offset + notes.len()
+        ));
+    }
+    lines.push(String::new());
+    lines.push("To dismiss a stale note: ctx_note(action=\"dismiss\", note_id=N)".to_string());
+    lines.join("\n")
 }
 
 fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
@@ -3338,7 +3745,15 @@ fn ctx_memory_description() -> String {
 }
 
 fn ctx_search_description() -> String {
-    "Keyword-search saved project memories and summarized conversation history. This is literal word or phrase search, not semantic search; use it to find remembered facts or prior discussion snippets before answering.".to_string()
+    "Keyword-search saved project memories, session notes, and summarized conversation history. This is literal word or phrase search, not semantic search; use it to find remembered facts or prior discussion snippets before answering.".to_string()
+}
+
+fn ctx_expand_description() -> String {
+    "Recover persisted historian chunk transcripts for compacted conversation ranges. This Claude Code leg serves the chunk-builder U:/A:/TC: view, not full raw message recovery.".to_string()
+}
+
+fn ctx_note_description() -> String {
+    "Save or inspect durable session notes for future follow-ups. surface_condition is accepted and recorded, but condition evaluation arrives later on this leg.".to_string()
 }
 
 fn ctx_memory_schema() -> Value {
@@ -3409,6 +3824,33 @@ fn ctx_search_schema() -> Value {
     })
 }
 
+fn ctx_expand_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "start": { "type": "integer", "minimum": 1, "description": "First message ordinal to expand." },
+            "end": { "type": "integer", "minimum": 1, "description": "Last message ordinal to expand, inclusive." },
+            "message": { "type": "integer", "minimum": 1, "description": "Recover the single persisted chunk transcript covering this message ordinal." }
+        }
+    })
+}
+
+fn ctx_note_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "action": { "type": "string", "enum": ["write", "read", "update", "dismiss"], "description": "Operation to perform. Defaults to write when content is provided, otherwise read." },
+            "content": { "type": "string", "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
+            "note_id": { "type": "integer", "minimum": 1, "description": "Note id for update or dismiss." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Maximum active notes to return." },
+            "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes." },
+            "surface_condition": { "type": "string", "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." }
+        }
+    })
+}
+
 /// The module manifest registered at HELLO. Slice-1 declares the transform provider
 /// role + a project-scoped sqlite storage binding; the surface widens with the spine.
 pub fn manifest(module_id: &str) -> ModuleManifest {
@@ -3447,6 +3889,18 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
                     execution_mode: ExecutionMode::Pure,
                     schema: ctx_search_schema(),
                 },
+                Tool {
+                    name: "ctx_expand".to_string(),
+                    description: Some(ctx_expand_description()),
+                    execution_mode: ExecutionMode::Pure,
+                    schema: ctx_expand_schema(),
+                },
+                Tool {
+                    name: "ctx_note".to_string(),
+                    description: Some(ctx_note_description()),
+                    execution_mode: ExecutionMode::Mutating,
+                    schema: ctx_note_schema(),
+                },
             ],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
             concurrency: Concurrency::ModuleManaged,
@@ -3482,7 +3936,10 @@ mod tests {
         CkIngressMessage, CkKind, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
     };
     use historian_producer::{ProducerOutput, RunHandle, RunState};
-    use mc_store::{HistorianChunkRange, HistorianDurableState, ModuleUsage, StoredCompartment};
+    use mc_core::CoreState;
+    use mc_store::{
+        HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, StoredCompartment,
+    };
     use tokio::sync::Notify;
 
     #[test]
@@ -4163,6 +4620,13 @@ mod tests {
         tool_body(outcome)["isError"].as_bool().unwrap_or(false)
     }
 
+    fn tool_text(outcome: HandlerOutcome) -> String {
+        tool_body(outcome)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     fn tool_json_array(outcome: HandlerOutcome) -> Vec<Value> {
         let body = tool_body(outcome);
         let text = body["content"][0]["text"]
@@ -4389,6 +4853,176 @@ mod tests {
         let health =
             call_dispatch_request(&handler, json!({ "kind": "health", "session_id": "ses" })).await;
         assert_eq!(health["pass_trace"], status["pass_trace"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guidance_get_freezes_hashes_and_advances_only_on_busting_commit() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        handler.guidance_dates.lock().unwrap().insert(
+            "ses".to_string(),
+            "Today's date: Fri Jan 01 2016".to_string(),
+        );
+
+        let first = call_dispatch_request(
+            &handler,
+            json!({ "kind": "guidance.get", "session_id": "ses" }),
+        )
+        .await;
+        let first_bytes = first["bytes"].as_str().unwrap().to_string();
+        assert!(first_bytes.ends_with("Today's date: Fri Jan 01 2016"));
+        assert_eq!(
+            first["content_hash"],
+            json!(sha256_hex(GUIDANCE_TEXT.as_bytes()))
+        );
+        assert_eq!(
+            first["hash"],
+            json!(sha256_hex(first_bytes.as_bytes())),
+            "hash covers exact returned bytes"
+        );
+        let repeated = call_dispatch_request(
+            &handler,
+            json!({ "kind": "guidance.get", "session_id": "ses" }),
+        )
+        .await;
+        assert_eq!(repeated["bytes"], first["bytes"]);
+        assert_eq!(repeated["hash"], first["hash"]);
+
+        let still_frozen = call_dispatch_request(
+            &handler,
+            json!({ "kind": "guidance.get", "session_id": "ses" }),
+        )
+        .await;
+        assert_eq!(still_frozen["bytes"], first["bytes"]);
+
+        handler.guidance_dates.lock().unwrap().insert(
+            "ses".to_string(),
+            "Today's date: Sat Jan 02 2016".to_string(),
+        );
+        let _ = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
+        let advanced = call_dispatch_request(
+            &handler,
+            json!({ "kind": "guidance.get", "session_id": "ses" }),
+        )
+        .await;
+        assert!(advanced["bytes"]
+            .as_str()
+            .unwrap()
+            .ends_with("Today's date: Sat Jan 02 2016"));
+        assert_ne!(advanced["hash"], first["hash"]);
+        assert_eq!(advanced["content_hash"], first["content_hash"]);
+
+        handler.bind_route(8, binding("/tmp/other", "other"));
+        handler.guidance_dates.lock().unwrap().insert(
+            "other".to_string(),
+            "Today's date: Sun Jan 03 2016".to_string(),
+        );
+        let other = match handler
+            .dispatch_value(8, json!({ "kind": "guidance.get", "session_id": "other" }))
+            .await
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_ne!(other["hash"], advanced["hash"]);
+        assert_eq!(other["content_hash"], advanced["content_hash"]);
+        assert!(store.load("other").unwrap().row_version.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_expand_and_ctx_note_facades_are_session_scoped() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let meta = ModuleMeta {
+            historian: HistorianDurableState {
+                state: HistorianPhase::Publishing,
+                firing_seq: 7,
+                chunk_range: Some(HistorianChunkRange {
+                    from_ordinal: 10,
+                    to_ordinal: 12,
+                }),
+                chunk_fingerprint: "fp".to_string(),
+                producer_session_id: Some("producer".to_string()),
+                producer_run_id: Some("run".to_string()),
+                fired_at_ms: Some(1),
+                expected_revert_epoch: 0,
+                failure_backoff_at_ms: None,
+                last_failure: None,
+                last_no_fire: None,
+            },
+            ..Default::default()
+        };
+        store
+            .commit("ses", None, &CoreState::default(), &meta)
+            .unwrap();
+        store
+            .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: Some(1),
+                expected_revert_epoch: 0,
+                predicate: &mc_store::HistorianPublishPredicate {
+                    firing_seq: 7,
+                    producer_run_id: "run".to_string(),
+                    chunk_fingerprint: "fp".to_string(),
+                },
+                project_path: project.to_str().unwrap(),
+                compartments: &[stored_comp(1, 10, 12, "m12#0", "summary")],
+                facts: &[],
+                publication_floor_ordinal: 12,
+                chunk_transcript: Some("U: exact prompt text\nA: exact answer"),
+            })
+            .unwrap();
+
+        let expanded =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 10, "end": 12})).await);
+        assert!(expanded.contains("Compartment 1 (10-12)"));
+        assert!(expanded.contains("U: exact prompt text"));
+        let message = tool_text(call_facade(&handler, "ctx_expand", json!({"message": 11})).await);
+        assert!(message.contains("chunk-builder view"));
+
+        let write = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "write", "content": "remember the lattice", "surface_condition": "when tag v2 exists"}),
+            )
+            .await,
+        );
+        assert!(write.contains("Surface condition recorded"));
+        let read = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
+        assert!(read.contains("remember the lattice"));
+        let hits =
+            tool_json_array(call_facade(&handler, "ctx_search", json!({"query": "lattice"})).await);
+        assert!(hits.iter().any(|hit| hit["source"] == "note"));
+
+        let note_id = store
+            .search_notes_like(project.to_str().unwrap(), "ses", "lattice")
+            .unwrap()[0]
+            .id;
+        let _ = call_facade(
+            &handler,
+            "ctx_note",
+            json!({"action": "update", "note_id": note_id, "content": "remember the updated lattice"}),
+        )
+        .await;
+        let _ = call_facade(
+            &handler,
+            "ctx_note",
+            json!({"action": "dismiss", "note_id": note_id, "content": "finished"}),
+        )
+        .await;
+        let dismissed = store
+            .search_notes_like(project.to_str().unwrap(), "ses", "finished")
+            .unwrap();
+        assert_eq!(dismissed[0].status, "dismissed");
+        assert!(store
+            .search_notes_like("/different/project", "ses", "lattice")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5357,6 +5991,7 @@ mod tests {
                 cache_ttl: "5m".to_string(),
                 model_key: None,
                 observed_last_response_at_ms: None,
+                guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
                 injected_reductions: Vec::new(),
             },
         )
@@ -5916,6 +6551,7 @@ mod tests {
                 cache_ttl: "5m".to_string(),
                 model_key: None,
                 observed_last_response_at_ms: None,
+                guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
                 injected_reductions: Vec::new(),
             },
         )
