@@ -302,6 +302,25 @@ function inferAccountingSubagent(agent: string): SubagentKind {
 	return "historian";
 }
 
+type FailedRunResult = Extract<SubagentRunResult, { ok: false }>;
+
+type PiRunMode = {
+	disableDiscoveredExtensions: boolean;
+};
+
+const ALREADY_PROCESSING_PREFIX = "Agent is already processing";
+const ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE =
+	"model unavailable in isolated retry: it is provided by a disabled extension; configure it through models.json or add a built-in/provider-configured fallback";
+const MODEL_RESOLUTION_ERROR_PATTERNS = [
+	/unknown model/i,
+	/unknown provider/i,
+	/model.+not found/i,
+	/provider.+not found/i,
+	/could not resolve model/i,
+	/no models? (matched|available|configured)/i,
+	/model.+not configured/i,
+] as const;
+
 /**
  * Pi-side implementation of `SubagentRunner`.
  *
@@ -370,11 +389,13 @@ export class PiSubagentRunner implements SubagentRunner {
 	private readonly invocation: PiInvocation;
 	private readonly spawnImpl: typeof childProcess.spawn;
 	private readonly platform: NodeJS.Platform;
+	private readonly extraArgs: readonly string[];
 
 	constructor(
 		options: {
 			piBinary?: string;
 			platform?: NodeJS.Platform;
+			extraArgs?: readonly string[];
 			/** Test seam for subprocess lifecycle tests. Production uses child_process.spawn. */
 			spawnImpl?: typeof childProcess.spawn;
 		} = {},
@@ -384,9 +405,38 @@ export class PiSubagentRunner implements SubagentRunner {
 			: resolvePiInvocation();
 		this.spawnImpl = options.spawnImpl ?? childProcess.spawn;
 		this.platform = options.platform ?? process.platform;
+		this.extraArgs = options.extraArgs ?? [];
 	}
 
 	async run(options: SubagentRunOptions): Promise<SubagentRunResult> {
+		const primaryRunMode: PiRunMode = { disableDiscoveredExtensions: false };
+		const primaryResult = await this.runModelChain(options, primaryRunMode);
+		if (
+			this.spawnUsesNoExtensions(primaryRunMode) ||
+			!isPiExtensionCollisionFailure(primaryResult)
+		) {
+			return primaryResult;
+		}
+
+		const sessionId = options.accountingSessionId ?? "pi-subagent";
+		sessionLog(
+			sessionId,
+			"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)",
+		);
+		const isolatedResult = await this.runModelChain(options, {
+			disableDiscoveredExtensions: true,
+		});
+		if (!isolatedResult.ok && isIsolatedRetryModelUnavailable(isolatedResult)) {
+			sessionLog(sessionId, ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE);
+			return annotateIsolatedRetryModelUnavailable(isolatedResult);
+		}
+		return isolatedResult;
+	}
+
+	private async runModelChain(
+		options: SubagentRunOptions,
+		runMode: PiRunMode,
+	): Promise<SubagentRunResult> {
 		const models = [options.model, ...(options.fallbackModels ?? [])].filter(
 			(model): model is string => typeof model === "string" && model.length > 0,
 		);
@@ -399,20 +449,41 @@ export class PiSubagentRunner implements SubagentRunner {
 				model,
 				fallbackModels: undefined,
 			};
-			const result = await this.runOnce(attemptOptions);
+			const result = await this.runOnce(attemptOptions, runMode);
 			if (result.ok) return result;
 			lastResult = result;
+			// Pi print mode discovers extensions before reading stdin. If one of those
+			// extensions starts its own turn during startup, the child run hits a prompt
+			// conflict before it can accept Magic Context's input. Stop this
+			// extension-enabled attempt and let the outer caller retry the same run with
+			// discovered extensions disabled; later top-level runs still start with
+			// extensions enabled so extension-provided models keep working normally.
+			if (
+				!this.spawnUsesNoExtensions(runMode) &&
+				isPiExtensionCollisionFailure(result)
+			) {
+				return result;
+			}
 			if (index >= attempts.length - 1 || !isFallbackEligible(result.reason)) {
 				return result;
 			}
 		}
 		return (
-			lastResult ?? this.runOnce({ ...options, fallbackModels: undefined })
+			lastResult ??
+			this.runOnce({ ...options, fallbackModels: undefined }, runMode)
+		);
+	}
+
+	private spawnUsesNoExtensions(runMode: PiRunMode): boolean {
+		return (
+			runMode.disableDiscoveredExtensions ||
+			hasNoExtensionsArg([...this.invocation.prefixArgs, ...this.extraArgs])
 		);
 	}
 
 	private async runOnce(
 		options: SubagentRunOptions,
+		runMode: PiRunMode,
 	): Promise<SubagentRunResult> {
 		const startTime = Date.now();
 		let recordedAccounting = false;
@@ -526,6 +597,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			}
 		}
 		const args = buildArgs(options, {
+			disableDiscoveredExtensions: runMode.disableDiscoveredExtensions,
 			omitPositionalMessage: deliverViaStdin,
 			systemPromptPath,
 		});
@@ -577,7 +649,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			try {
 				child = this.spawnImpl(
 					this.invocation.command,
-					[...this.invocation.prefixArgs, ...args],
+					[...this.invocation.prefixArgs, ...this.extraArgs, ...args],
 					{
 						cwd: options.cwd,
 						// Merge over the parent env so PATH/HOME/auth variables flow
@@ -1055,6 +1127,47 @@ export class PiSubagentRunner implements SubagentRunner {
 	}
 }
 
+function getResultStderr(result: FailedRunResult): string {
+	const stderr = result.meta?.stderr;
+	return typeof stderr === "string" ? stderr : "";
+}
+
+function hasNoExtensionsArg(args: readonly string[]): boolean {
+	return args.includes("--no-extensions");
+}
+
+function isPiExtensionCollisionFailure(
+	result: SubagentRunResult,
+): result is FailedRunResult {
+	return (
+		!result.ok &&
+		result.reason === "non_zero_exit" &&
+		getResultStderr(result).includes(ALREADY_PROCESSING_PREFIX)
+	);
+}
+
+function isIsolatedRetryModelUnavailable(
+	result: SubagentRunResult,
+): result is FailedRunResult {
+	if (result.ok) return false;
+	const diagnosticText = `${result.error}\n${getResultStderr(result)}`;
+	return MODEL_RESOLUTION_ERROR_PATTERNS.some((pattern) =>
+		pattern.test(diagnosticText),
+	);
+}
+
+function annotateIsolatedRetryModelUnavailable(
+	result: FailedRunResult,
+): FailedRunResult {
+	if (result.error.startsWith(ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE)) {
+		return result;
+	}
+	return {
+		...result,
+		error: `${ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE}. Original failure: ${result.error}`,
+	};
+}
+
 function isFallbackEligible(reason: string): boolean {
 	return (
 		reason === "model_failed" ||
@@ -1088,7 +1201,12 @@ export const PROMPT_ARGV_MAX_BYTES = 96 * 1024;
  */
 export function buildArgs(
 	options: SubagentRunOptions,
-	opts?: { omitPositionalMessage?: boolean; systemPromptPath?: string },
+	opts?: {
+		disableDiscoveredExtensions?: boolean;
+		omitPositionalMessage?: boolean;
+		subagentEntryPath?: string;
+		systemPromptPath?: string;
+	},
 ): string[] {
 	const args: string[] = [
 		"--print",
@@ -1104,14 +1222,13 @@ export function buildArgs(
 		// historian etc. stay invisible to the user even though they're
 		// real LLM rounds the user pays for.
 		"--no-session",
-		// Keep extension discovery ON for child processes. Provider extensions
-		// (anthropic-auth, google-antigravity, OpenAI/Codex variants, etc.) must
-		// load so their models resolve, and AFT's Pi extension must load so optional
-		// aft_* read tools can register. Recursion is prevented at the Magic Context
-		// entry point instead: the child env sets MAGIC_CONTEXT_PI_SUBAGENT=1, and
-		// the full entry no-ops before registering hooks/tools/timers. Skills and
-		// prompt templates remain disabled because they are pure startup overhead for
-		// focused one-shot subagents.
+		// Leave extension discovery enabled in child processes so provider
+		// extensions can register their models and the Pi extension can expose
+		// optional read tools. Prevent recursive startup by setting
+		// MAGIC_CONTEXT_PI_SUBAGENT=1 in the child environment, which makes the
+		// main entry exit early before registering hooks, tools, or timers. Disable
+		// skills and prompt templates because subagents only need a minimal startup
+		// path.
 		"--no-skills",
 		"--no-prompt-templates",
 		// Hidden one-shot subagents must receive EXACTLY the system prompt we built.
@@ -1122,6 +1239,14 @@ export function buildArgs(
 		// Every known Magic Context child gets an explicit --tools allow-list so Pi's
 		// discovered extension registry cannot leak unrelated tools into subagents.
 	];
+	if (opts?.disableDiscoveredExtensions) {
+		// When a discovered extension starts a turn during startup, the child's
+		// first prompt can fail before Magic Context sends its own prompt. For that
+		// isolated retry, disable auto-discovered extensions with
+		// `--no-extensions`, but still allow explicit `--extension` entries so the
+		// lightweight ctx_* extension can load.
+		args.push("--no-extensions");
+	}
 
 	// Load Magic Context's lean subagent extension entry in children that need the
 	// scoped ctx_* tools. Discovered extensions are now intentionally enabled so
@@ -1140,12 +1265,13 @@ export function buildArgs(
 	// subagents. They do not use ctx_* tools, and loading the entry would add
 	// startup cost and an avoidable tool-registration surface. Tool-using agents
 	// (sidekick/dreamer) still receive the lean entry.
+	const subagentEntryPath = opts?.subagentEntryPath ?? SUBAGENT_ENTRY_PATH;
 	const shouldLoadSubagentExtension =
-		SUBAGENT_ENTRY_PATH &&
+		subagentEntryPath &&
 		(SEARCH_ONLY_SUBAGENT_TOOL_AGENTS.has(options.agent) ||
 			DREAMER_ACTION_AGENTS.has(options.agent));
 	if (shouldLoadSubagentExtension) {
-		args.push("--extension", SUBAGENT_ENTRY_PATH);
+		args.push("--extension", subagentEntryPath);
 
 		// Only dreamer subagents get ctx_memory in the child extension. Sidekick
 		// loads the same entry for ctx_search but must stay read-only. The flag is

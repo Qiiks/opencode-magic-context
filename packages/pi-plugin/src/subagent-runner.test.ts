@@ -1,8 +1,9 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { PassThrough } from "node:stream";
+import * as loggerModule from "@magic-context/core/shared/logger";
 import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-runner";
 
 import { __test, PiSubagentRunner } from "./subagent-runner";
@@ -13,6 +14,12 @@ const baseOptions: SubagentRunOptions = {
 	userMessage: "summarize this session",
 };
 const TEST_SYSTEM_PROMPT_PATH = "/tmp/mc-pi-system-prompt.txt";
+const COLLISION_STDERR =
+	"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+const ISOLATED_RETRY_LOG_MESSAGE =
+	"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)";
+const ISOLATED_RETRY_MODEL_UNAVAILABLE_LOG_MESSAGE =
+	"model unavailable in isolated retry: it is provided by a disabled extension; configure it through models.json or add a built-in/provider-configured fallback";
 
 type MockChild = ReturnType<typeof createMockChild>;
 
@@ -98,16 +105,30 @@ function createMockChild({ stdout = true }: { stdout?: boolean } = {}) {
 }
 
 function runnerWith(
-	child: MockChild,
+	childOrChildren: MockChild | MockChild[],
 	{
 		piBinary = "pi-test",
 		platform,
-	}: { piBinary?: string; platform?: NodeJS.Platform } = {},
+		extraArgs,
+	}: {
+		piBinary?: string;
+		platform?: NodeJS.Platform;
+		extraArgs?: readonly string[];
+	} = {},
 ) {
-	const spawnImpl = mock(() => child as never);
+	const remainingChildren = Array.isArray(childOrChildren)
+		? [...childOrChildren]
+		: null;
+	const spawnImpl = mock(() => {
+		if (remainingChildren === null) return childOrChildren as never;
+		const nextChild = remainingChildren.shift();
+		if (!nextChild) throw new Error("unexpected extra spawn");
+		return nextChild as never;
+	});
 	const runner = new PiSubagentRunner({
 		piBinary,
 		platform,
+		extraArgs,
 		spawnImpl: spawnImpl as never,
 	});
 	return { runner, spawnImpl };
@@ -130,6 +151,10 @@ function requirePromptPath(promptPath: string | undefined): string {
 
 function agentEnd(messages: unknown[]) {
 	return { type: "agent_end", messages };
+}
+
+function nextTick() {
+	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 describe("subagent-runner pure helpers", () => {
@@ -203,6 +228,28 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--no-extensions");
 		expect(args).toContain("--no-skills");
 		expect(args).toContain("--no-prompt-templates");
+	});
+
+	it("isolated retry disables discovered extensions but keeps explicit --extension paths", () => {
+		const args = buildArgsForTest(
+			{
+				...baseOptions,
+				agent: "sidekick",
+				model: "anthropic/claude-sonnet",
+			},
+			{
+				disableDiscoveredExtensions: true,
+				subagentEntryPath: "/tmp/subagent-entry.js",
+			},
+		);
+
+		expect(args).toEqual(
+			expect.arrayContaining([
+				"--no-extensions",
+				"--extension",
+				"/tmp/subagent-entry.js",
+			]),
+		);
 	});
 
 	it("disables project context files so hidden subagents see only our prompt", () => {
@@ -1159,6 +1206,267 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				signal: null,
 			});
 		}
+	});
+
+	it("retries once with --no-extensions after an extension turn collision", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/claude-sonnet",
+			});
+			first.writeStderr(COLLISION_STDERR);
+			first.emitClose(1);
+			await nextTick();
+			second.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "isolated success" }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			second.emitClose(0);
+
+			expect(await resultPromise).toEqual({
+				ok: true,
+				assistantText: "isolated success",
+				toolCallCount: 0,
+				durationMs: expect.any(Number),
+				meta: { stderr: undefined },
+			});
+			expect(spawnImpl).toHaveBeenCalledTimes(2);
+			expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
+			expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
+			expect(
+				logSpy.mock.calls.some(
+					(call) =>
+						call[0] === "pi-subagent" && call[1] === ISOLATED_RETRY_LOG_MESSAGE,
+				),
+			).toBe(true);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("does not retry forever when the isolated retry hits the same collision", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+		});
+		first.writeStderr(COLLISION_STDERR);
+		first.emitClose(1);
+		await nextTick();
+		second.writeStderr(COLLISION_STDERR);
+		second.emitClose(1);
+
+		const result = await resultPromise;
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.reason).toBe("non_zero_exit");
+			expect(result.meta).toEqual({
+				stderr: COLLISION_STDERR,
+				exitCode: 1,
+				signal: null,
+			});
+		}
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
+	});
+
+	it("does not insert an isolated retry for unrelated failures", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "anthropic/primary",
+			fallbackModels: ["openai/fallback"],
+		});
+		first.writeStderr("auth missing");
+		first.emitClose(1);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "fallback success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+
+		expect(await resultPromise).toEqual({
+			ok: true,
+			assistantText: "fallback success",
+			toolCallCount: 0,
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined },
+		});
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
+		expect(spawnImpl.mock.calls[1]?.[1]).not.toContain("--no-extensions");
+		expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "openai-codex/fallback"]),
+		);
+	});
+
+	it("does not start a retry loop when the spawn already disables extensions", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second], {
+			extraArgs: ["--no-extensions"],
+		});
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/primary",
+				fallbackModels: ["openai/fallback"],
+			});
+			first.writeStderr(COLLISION_STDERR);
+			first.emitClose(1);
+			await nextTick();
+			second.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "fallback without retry loop" }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			second.emitClose(0);
+
+			expect(await resultPromise).toEqual({
+				ok: true,
+				assistantText: "fallback without retry loop",
+				toolCallCount: 0,
+				durationMs: expect.any(Number),
+				meta: { stderr: undefined },
+			});
+			expect(spawnImpl).toHaveBeenCalledTimes(2);
+			expect(spawnImpl.mock.calls[0]?.[1]).toContain("--no-extensions");
+			expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
+			expect(
+				logSpy.mock.calls.some(
+					(call) => call[1] === ISOLATED_RETRY_LOG_MESSAGE,
+				),
+			).toBe(false);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("logs model-unavailable guidance when the isolated retry loses an extension-only model", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner } = runnerWith([first, second]);
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "openai/extension-model",
+			});
+			first.writeStderr(COLLISION_STDERR);
+			first.emitClose(1);
+			await nextTick();
+			second.writeStderr("Unknown model openai-codex/extension-model");
+			second.emitClose(1);
+
+			const result = await resultPromise;
+			expect(result.ok).toBe(false);
+			if (!result.ok) {
+				expect(result.reason).toBe("non_zero_exit");
+				expect(result.error).toContain(
+					ISOLATED_RETRY_MODEL_UNAVAILABLE_LOG_MESSAGE,
+				);
+				expect(result.error).toContain("Original failure:");
+			}
+			expect(
+				logSpy.mock.calls.some(
+					(call) => call[1] === ISOLATED_RETRY_LOG_MESSAGE,
+				),
+			).toBe(true);
+			expect(
+				logSpy.mock.calls.some(
+					(call) => call[1] === ISOLATED_RETRY_MODEL_UNAVAILABLE_LOG_MESSAGE,
+				),
+			).toBe(true);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("does not keep isolated mode for the next run", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const third = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second, third]);
+
+		const degradedRun = runner.run({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+		});
+		first.writeStderr(COLLISION_STDERR);
+		first.emitClose(1);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "isolated success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+		await degradedRun;
+
+		const freshRun = runner.run({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+		});
+		third.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "extensions restored" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		third.emitClose(0);
+
+		expect(await freshRun).toEqual({
+			ok: true,
+			assistantText: "extensions restored",
+			toolCallCount: 0,
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined },
+		});
+		expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
+		expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
+		expect(spawnImpl.mock.calls[2]?.[1]).not.toContain("--no-extensions");
 	});
 
 	it("returns parse_failed when stdout is missing", async () => {
