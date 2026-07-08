@@ -66,6 +66,12 @@ impl Drop for ModuleProcess {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mc_transform_spine_through_real_daemon() {
+    // Clear any inherited supervision environment variables so this test opens the
+    // real daemon as an ordinary client instead of reusing a reserved supervised
+    // identity.
+    std::env::remove_var(subc_protocol::SUBC_MODULE_ID_ENV);
+    std::env::remove_var(subc_protocol::SUBC_LAUNCH_NONCE_ENV);
+
     let workspace = workspace_root();
     let subconscious = subconscious_root(&workspace);
 
@@ -146,6 +152,24 @@ async fn mc_transform_spine_through_real_daemon() {
         "covered raw msg trimmed, tail kept"
     );
     assert_eq!(r["committed"], true);
+
+    let status = call_raw(
+        &consumer,
+        "spine",
+        json!({ "kind": "status", "session_id": "spine" }),
+    )
+    .await;
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["store_open"], true);
+    assert_eq!(status["session_id"], "spine");
+    assert_eq!(status["pass_trace"]["receive_count"], 1);
+    assert_eq!(status["pass_trace"]["reject_count"], 0);
+    assert!(
+        status["pass_trace"]["last_completed_at_ms"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
 
     // growing-tail defers. Send the FULL live array each pass (the module locates the
     // boundary "m10" over it). Prefix blocks byte-identical; tail verbatim; no write.
@@ -356,26 +380,29 @@ async fn call(consumer: &SubcConsumer, mut body: Value) -> Value {
         map.entry("serializer_profile".to_string())
             .or_insert_with(|| Value::String("owned-llmrunner".to_string()));
     }
-    // Route per logical session: the identity's session MUST equal the body's session_id
-    // (the module's channel-keyed cross-check rejects a mismatch), and one stable identity
-    // per session reuses the SAME route (one on_bind) — the production "one route per
-    // session" shape. Derive the identity from the body so the two can never diverge.
     let session = body
         .get("session_id")
         .and_then(Value::as_str)
         .expect("transform body carries session_id")
         .to_string();
+    call_raw(consumer, &session, body).await
+}
+
+async fn call_raw(consumer: &SubcConsumer, session: &str, body: Value) -> Value {
+    // Each logical session uses one stable consumer identity whose `session` matches the
+    // request body's session_id. That keeps every call for that session on one consistent
+    // daemon route, and the status/health requests reuse the same route on purpose.
     let bytes = consumer
         .call(
             RouteTarget::ToolProvider {
                 module_id: MODULE_ID.to_string(),
             },
-            identity_for(&session),
+            identity_for(session),
             serde_json::to_vec(&body).unwrap(),
             fast_call_options(),
         )
         .await
-        .unwrap_or_else(|e| panic!("transform call failed: {e:?}"));
+        .unwrap_or_else(|e| panic!("module call failed: {e:?}"));
     serde_json::from_slice(&bytes).unwrap()
 }
 

@@ -1619,6 +1619,55 @@ impl McHandler {
         }
     }
 
+    fn handle_status_value(&self, request: &Value) -> HandlerOutcome {
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            return match store.load("__health__") {
+                Ok(state) => respond(json!({
+                    "ok": true,
+                    "store_open": true,
+                    "initialized": state.meta.initialized,
+                    "row_version": state.row_version,
+                })),
+                Err(e) => HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: e.to_string(),
+                },
+            };
+        };
+        let loaded = match store.load(session_id) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: e.to_string(),
+                }
+            }
+        };
+        let pass_trace = match store.load_pass_trace(session_id) {
+            Ok(pass_trace) => pass_trace,
+            Err(e) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: e.to_string(),
+                }
+            }
+        };
+        respond(json!({
+            "ok": true,
+            "store_open": true,
+            "session_id": session_id,
+            "initialized": loaded.meta.initialized,
+            "row_version": loaded.row_version,
+            "historian": loaded.meta.historian,
+            "publication_floor_ordinal": loaded.meta.publication_floor_ordinal,
+            "pass_trace": pass_trace,
+        }))
+    }
+
     async fn handle_transform_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         let parsed: TransformRequest = match serde_json::from_value(request.clone()) {
             Ok(req) => req,
@@ -1685,6 +1734,10 @@ impl McHandler {
         }
         let project_path = binding.project_root.to_string_lossy().to_string();
         let pass_now = now_ms();
+        // This trace is intentionally outside the fenced cache-state commit: a rejected
+        // pass must still leave a durable breadcrumb, and a trace failure must never
+        // change the transform result.
+        let _ = store.trace_pass_received(&parsed.session_id, pass_now);
         let run_transform = || {
             let producer_ctx = transform::ProducerContext {
                 project_path: &project_path,
@@ -1707,14 +1760,17 @@ impl McHandler {
             };
             transform_with_projection(&store, &parsed, &producer_ctx)
         };
+        let reject_transform = |e: crate::transform::TransformError| {
+            let message = e.to_string();
+            let _ = store.trace_pass_rejected(&parsed.session_id, &message, now_ms());
+            HandlerOutcome::Error {
+                code: "transform_failed".to_string(),
+                message,
+            }
+        };
         let mut result = match run_transform() {
             Ok(result) => result,
-            Err(e) => {
-                return HandlerOutcome::Error {
-                    code: "transform_failed".to_string(),
-                    message: e.to_string(),
-                }
-            }
+            Err(e) => return reject_transform(e),
         };
         let mut emergency_pre_floor =
             if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
@@ -1751,12 +1807,7 @@ impl McHandler {
                     if self.await_live_historian_completion(completion).await {
                         result = match run_transform() {
                             Ok(result) => result,
-                            Err(e) => {
-                                return HandlerOutcome::Error {
-                                    code: "transform_failed".to_string(),
-                                    message: e.to_string(),
-                                }
-                            }
+                            Err(e) => return reject_transform(e),
                         };
                         emergency_pre_floor = store
                             .load(&parsed.session_id)
@@ -1778,12 +1829,7 @@ impl McHandler {
                                     Ok(_) => {
                                         result = match run_transform() {
                                             Ok(result) => result,
-                                            Err(e) => {
-                                                return HandlerOutcome::Error {
-                                                    code: "transform_failed".to_string(),
-                                                    message: e.to_string(),
-                                                }
-                                            }
+                                            Err(e) => return reject_transform(e),
                                         };
                                         emergency_pre_floor = store
                                             .load(&parsed.session_id)
@@ -1809,12 +1855,7 @@ impl McHandler {
                         Ok(_) => {
                             result = match run_transform() {
                                 Ok(result) => result,
-                                Err(e) => {
-                                    return HandlerOutcome::Error {
-                                        code: "transform_failed".to_string(),
-                                        message: e.to_string(),
-                                    }
-                                }
+                                Err(e) => return reject_transform(e),
                             };
                             emergency_pre_floor = store
                                 .load(&parsed.session_id)
@@ -1865,17 +1906,13 @@ impl McHandler {
             if floor_advanced {
                 result = match run_transform() {
                     Ok(result) => result,
-                    Err(e) => {
-                        return HandlerOutcome::Error {
-                            code: "transform_failed".to_string(),
-                            message: e.to_string(),
-                        }
-                    }
+                    Err(e) => return reject_transform(e),
                 };
             }
         }
         let mut response = result.response;
         response.historian = Some(diagnostics);
+        let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
         respond(serde_json::to_value(response).unwrap_or(Value::Null))
     }
@@ -2489,26 +2526,9 @@ impl McHandler {
             .or_else(|| request.get("kind").and_then(Value::as_str));
         if let Some(method) = method {
             return match method {
-                // Proves the store opened end-to-end: load a sentinel session through the
-                // real opened handle and report its presence/state.
-                "health" => match self.store.get() {
-                    Some(store) => match store.load("__health__") {
-                        Ok(state) => respond(json!({
-                            "ok": true,
-                            "store_open": true,
-                            "initialized": state.meta.initialized,
-                            "row_version": state.row_version,
-                        })),
-                        Err(e) => HandlerOutcome::Error {
-                            code: "store_load_failed".to_string(),
-                            message: e.to_string(),
-                        },
-                    },
-                    None => HandlerOutcome::Error {
-                        code: "store_unavailable".to_string(),
-                        message: "store not opened (no HELLO_ACK storage seam yet)".to_string(),
-                    },
-                },
+                // Proves the store opened end-to-end and, when a session_id is supplied,
+                // returns the session's stored trace state directly from the module.
+                "health" | "status" | "diagnostics" => self.handle_status_value(&request),
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
                 "transform" => self.handle_transform_value(channel, request).await,
@@ -3970,11 +3990,22 @@ mod tests {
         handler.handle_transform_for_test(7, request).await
     }
 
-    fn error_code(outcome: HandlerOutcome) -> String {
+    async fn call_dispatch_request(handler: &McHandler, request: Value) -> Value {
+        match handler.dispatch_value(7, request).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        }
+    }
+
+    fn error_frame(outcome: HandlerOutcome) -> (String, String) {
         match outcome {
-            HandlerOutcome::Error { code, .. } => code,
+            HandlerOutcome::Error { code, message } => (code, message),
             other => panic!("expected error outcome, got {other:?}"),
         }
+    }
+
+    fn error_code(outcome: HandlerOutcome) -> String {
+        error_frame(outcome).0
     }
 
     async fn call_facade(handler: &McHandler, name: &str, arguments: Value) -> HandlerOutcome {
@@ -4090,6 +4121,145 @@ mod tests {
         assert_eq!(child["action"], "PASSTHROUGH");
         assert_eq!(child["ck_messages"].as_array().unwrap().len(), 1);
         assert_eq!(child["ck_messages"][0]["role"], "user");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transform_reject_records_trace_without_advancing_row_version() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let loaded = store.load("ses").unwrap();
+        let seeded_row_version = store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let (code, message) = error_frame(
+            call_transform_outcome(
+                &handler,
+                request(vec![ck("m2", 2, "two"), ck("m1", 1, "one")]),
+            )
+            .await,
+        );
+        assert_eq!(code, "transform_failed");
+        assert_eq!(message, "live-source ordinals not strictly increasing");
+
+        let after = store.load("ses").unwrap();
+        assert_eq!(after.row_version, Some(seeded_row_version));
+        let trace = store.load_pass_trace("ses").unwrap().unwrap();
+        assert_eq!(trace.receive_count, 1);
+        assert_eq!(trace.reject_count, 1);
+        assert_eq!(trace.last_reject_error.as_deref(), Some(message.as_str()));
+        assert_eq!(trace.last_completed_at_ms, 0);
+        assert!(trace.last_received_at_ms > 0);
+        assert!(trace.last_reject_at_ms.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transform_success_records_received_and_completed_trace() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let response = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
+        assert_eq!(response["status"], "ok");
+
+        let trace = store.load_pass_trace("ses").unwrap().unwrap();
+        assert_eq!(trace.receive_count, 1);
+        assert_eq!(trace.reject_count, 0);
+        assert_eq!(trace.last_reject_error, None);
+        assert_eq!(trace.last_reject_at_ms, None);
+        assert!(trace.last_completed_at_ms >= trace.last_received_at_ms);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_rejects_increment_trace_and_overwrite_last_error() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let _ = error_frame(
+            call_transform_outcome(
+                &handler,
+                request(vec![ck("m2", 2, "two"), ck("m1", 1, "one")]),
+            )
+            .await,
+        );
+        let first = store.load_pass_trace("ses").unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let (code, message) = error_frame(
+            call_transform_outcome(&handler, request(vec![ck("mc_bad", 1, "reserved")])).await,
+        );
+        assert_eq!(code, "transform_failed");
+        assert_eq!(message, "non-synthetic item used a reserved mc_* id");
+
+        let second = store.load_pass_trace("ses").unwrap().unwrap();
+        assert_eq!(second.receive_count, 2);
+        assert_eq!(second.reject_count, 2);
+        assert_eq!(second.last_reject_error.as_deref(), Some(message.as_str()));
+        assert!(second.last_reject_at_ms.unwrap() >= first.last_reject_at_ms.unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sequential_failing_passes_trace_every_reject_while_cache_state_stays_frozen() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let loaded = store.load("ses").unwrap();
+        let seeded_row_version = store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        for _ in 0..4 {
+            let (code, message) = error_frame(
+                call_transform_outcome(
+                    &handler,
+                    request(vec![ck("m2", 2, "two"), ck("m1", 1, "one")]),
+                )
+                .await,
+            );
+            assert_eq!(code, "transform_failed");
+            assert_eq!(message, "live-source ordinals not strictly increasing");
+        }
+
+        let after = store.load("ses").unwrap();
+        assert_eq!(after.row_version, Some(seeded_row_version));
+        let trace = store.load_pass_trace("ses").unwrap().unwrap();
+        assert_eq!(trace.receive_count, 4);
+        assert_eq!(trace.reject_count, 4);
+        assert_eq!(trace.last_completed_at_ms, 0);
+        assert_eq!(
+            trace.last_reject_error.as_deref(),
+            Some("live-source ordinals not strictly increasing")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_and_health_surface_pass_trace_for_rejected_sessions() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let _ = error_frame(
+            call_transform_outcome(
+                &handler,
+                request(vec![ck("m2", 2, "two"), ck("m1", 1, "one")]),
+            )
+            .await,
+        );
+
+        let status =
+            call_dispatch_request(&handler, json!({ "kind": "status", "session_id": "ses" })).await;
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["store_open"], true);
+        assert_eq!(status["session_id"], "ses");
+        assert_eq!(status["row_version"], Value::Null);
+        assert_eq!(status["historian"]["last_no_fire"], Value::Null);
+        assert_eq!(status["pass_trace"]["receive_count"], 1);
+        assert_eq!(status["pass_trace"]["reject_count"], 1);
+        assert_eq!(
+            status["pass_trace"]["last_reject_error"],
+            json!("live-source ordinals not strictly increasing")
+        );
+
+        let health =
+            call_dispatch_request(&handler, json!({ "kind": "health", "session_id": "ses" })).await;
+        assert_eq!(health["pass_trace"], status["pass_trace"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5553,6 +5723,7 @@ mod tests {
         assert_eq!(out_msgs.len(), 1, "no m0/m1 prepends, no drops");
         // No store row was created and no historian evaluation ran for the child session.
         assert!(store.load(&session).unwrap().row_version.is_none());
+        assert!(store.load_pass_trace(&session).unwrap().is_none());
         assert!(v.get("historian").is_none());
     }
 

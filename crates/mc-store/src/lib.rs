@@ -600,6 +600,23 @@ const MIGRATIONS: &[Migration] = &[
             ON shadow_divergences(session_id, pass_seq, id);
     ",
     },
+    Migration {
+        version: 9,
+        // Durable per-session receive/complete/reject timestamps and counts. Rejected
+        // transforms still leave an audit trail here even when the cache-state table is
+        // intentionally left unchanged.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_pass_trace (
+            session_id             TEXT PRIMARY KEY,
+            last_received_at_ms    INTEGER NOT NULL,
+            last_completed_at_ms   INTEGER NOT NULL,
+            last_reject_error      TEXT NULL,
+            last_reject_at_ms      INTEGER NULL,
+            reject_count           INTEGER NOT NULL DEFAULT 0,
+            receive_count          INTEGER NOT NULL DEFAULT 0
+        );
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -729,6 +746,19 @@ impl Default for HistorianDurableState {
             last_no_fire: None,
         }
     }
+}
+
+/// Durable receive/complete/reject breadcrumbs for one session's transform passes.
+/// Stored separately from `mc_cache_state` so a rejected pass can still leave a readable
+/// trail without advancing the cache row_version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassTrace {
+    pub last_received_at_ms: i64,
+    pub last_completed_at_ms: i64,
+    pub last_reject_error: Option<String>,
+    pub last_reject_at_ms: Option<i64>,
+    pub reject_count: u64,
+    pub receive_count: u64,
 }
 
 /// A validated historian fact that may become a project memory. Validation owns
@@ -1493,6 +1523,117 @@ impl McStore {
                 row_version: Some(rv),
             }),
         }
+    }
+
+    /// Record that the module accepted a transform request for this session. This is a
+    /// plain one-statement UPSERT outside the fenced cache-state transaction so the
+    /// observability write never contends with or extends the pass commit.
+    pub fn trace_pass_received(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
+        self.inner.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO mc_pass_trace (
+                     session_id,
+                     last_received_at_ms,
+                     last_completed_at_ms,
+                     last_reject_error,
+                     last_reject_at_ms,
+                     reject_count,
+                     receive_count
+                 ) VALUES (?1, ?2, 0, NULL, NULL, 0, 1)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     last_received_at_ms = excluded.last_received_at_ms,
+                     receive_count = mc_pass_trace.receive_count + 1",
+                params![session_id, now_ms],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Record that a transform request finished successfully. This remains outside the
+    /// fenced cache-state transaction so a pass completion breadcrumb cannot alter CAS
+    /// semantics or hold the commit transaction open longer than the cache write itself.
+    pub fn trace_pass_completed(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
+        self.inner.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO mc_pass_trace (
+                     session_id,
+                     last_received_at_ms,
+                     last_completed_at_ms,
+                     last_reject_error,
+                     last_reject_at_ms,
+                     reject_count,
+                     receive_count
+                 ) VALUES (?1, 0, ?2, NULL, NULL, 0, 0)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     last_completed_at_ms = excluded.last_completed_at_ms",
+                params![session_id, now_ms],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Record the last rejected transform for a session. The error string is capped so
+    /// the durable diagnostic stays readable even if an upstream failure produces a huge
+    /// message. Like the other trace writes, this is a single plain UPSERT outside the
+    /// fenced cache-state transaction.
+    pub fn trace_pass_rejected(
+        &self,
+        session_id: &str,
+        error: &str,
+        now_ms: i64,
+    ) -> Result<(), McStoreError> {
+        let error = capped_trace_error(error);
+        self.inner.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO mc_pass_trace (
+                     session_id,
+                     last_received_at_ms,
+                     last_completed_at_ms,
+                     last_reject_error,
+                     last_reject_at_ms,
+                     reject_count,
+                     receive_count
+                 ) VALUES (?1, 0, 0, ?2, ?3, 1, 0)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     last_reject_error = excluded.last_reject_error,
+                     last_reject_at_ms = excluded.last_reject_at_ms,
+                     reject_count = mc_pass_trace.reject_count + 1",
+                params![session_id, error, now_ms],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Load the durable pass breadcrumbs for one session, if any have been written.
+    pub fn load_pass_trace(&self, session_id: &str) -> Result<Option<PassTrace>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT
+                     last_received_at_ms,
+                     last_completed_at_ms,
+                     last_reject_error,
+                     last_reject_at_ms,
+                     reject_count,
+                     receive_count
+                 FROM mc_pass_trace
+                 WHERE session_id = ?1",
+                params![session_id],
+                |r| {
+                    Ok(PassTrace {
+                        last_received_at_ms: r.get(0)?,
+                        last_completed_at_ms: r.get(1)?,
+                        last_reject_error: r.get(2)?,
+                        last_reject_at_ms: r.get(3)?,
+                        reject_count: r.get::<_, i64>(4)? as u64,
+                        receive_count: r.get::<_, i64>(5)? as u64,
+                    })
+                },
+            )
+            .optional()
+        })?)
     }
 
     /// Append flat block ids requested by ctx_reduce to the durable per-session queue.
@@ -3843,6 +3984,10 @@ fn coalesce_mutations(rows: Vec<StoredMemoryMutation>) -> Vec<StoredMemoryMutati
     out
 }
 
+fn capped_trace_error(error: &str) -> String {
+    error.chars().take(2000).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3968,6 +4113,94 @@ mod tests {
             .commit_with_consumed_drops("ses", None, &core, &meta, &[queued[0].id])
             .unwrap();
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pass_trace_upserts_counts_and_caps_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let long_error = "é".repeat(2_500);
+
+        store.trace_pass_received("trace", 11).unwrap();
+        store.trace_pass_received("trace", 12).unwrap();
+        store.trace_pass_rejected("trace", &long_error, 21).unwrap();
+        store
+            .trace_pass_rejected("trace", "second error", 22)
+            .unwrap();
+        store.trace_pass_completed("trace", 31).unwrap();
+
+        let trace = store.load_pass_trace("trace").unwrap().unwrap();
+        assert_eq!(trace.last_received_at_ms, 12);
+        assert_eq!(trace.last_completed_at_ms, 31);
+        assert_eq!(trace.last_reject_error.as_deref(), Some("second error"));
+        assert_eq!(trace.last_reject_at_ms, Some(22));
+        assert_eq!(trace.reject_count, 2);
+        assert_eq!(trace.receive_count, 2);
+
+        store
+            .trace_pass_rejected("trace-cap", &long_error, 41)
+            .unwrap();
+        let capped = store.load_pass_trace("trace-cap").unwrap().unwrap();
+        assert_eq!(
+            capped.last_reject_error.as_ref().unwrap().chars().count(),
+            2_000
+        );
+    }
+
+    #[test]
+    fn fresh_and_migrated_stores_have_pass_trace_table() {
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
+        let fresh_has_table = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mc_pass_trace'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(fresh_has_table.as_deref(), Some("mc_pass_trace"));
+
+        let migrated_dir = tempfile::tempdir().unwrap();
+        let path = migrated_dir.path().join("store.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cortexkit_schema_version (
+                 namespace TEXT NOT NULL,
+                 version INTEGER NOT NULL,
+                 applied_at_unix INTEGER NOT NULL,
+                 PRIMARY KEY (namespace, version)
+             )",
+            [],
+        )
+        .unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 8) {
+            conn.execute_batch(migration.statements).unwrap();
+            conn.execute(
+                "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                 VALUES (?1, ?2, 0)",
+                params![NS, migration.version],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let migrated = McStore::open(&descriptor(migrated_dir.path())).unwrap();
+        let migrated_has_table = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mc_pass_trace'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(migrated_has_table.as_deref(), Some("mc_pass_trace"));
     }
 
     #[test]
