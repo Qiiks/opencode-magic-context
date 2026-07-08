@@ -49,7 +49,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 **`src/config/`:**
 - Purpose: Parse and validate plugin configuration.
 - Contains: Config loaders, re-exports, and Zod schemas.
-- Key files: `src/config/index.ts`, `src/config/schema/magic-context.ts`, `src/config/schema/agent-overrides.ts`
+- Key files: `src/config/index.ts`, `src/config/schema/magic-context.ts`, `src/config/schema/agent-overrides.ts`, `src/config/project-security.ts`
 
 **`src/plugin/`:**
 - Purpose: Adapt internal services to OpenCode plugin interfaces.
@@ -71,7 +71,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 - Purpose: Group reusable subsystem logic by feature.
 - Contains: Magic-context services (storage, scheduler, tagger, search, message-index, overflow detection, compaction markers, session-project storage and backfill), dreamer runtime, sidekick support, memory system, user-memory pipeline, git-commit indexer, tool-definition token measurement, schema migrations, built-in commands, and the smart-notes evaluation engine.
 - Key subdirs: `src/features/magic-context/dreamer/`, `src/features/magic-context/memory/`, `src/features/magic-context/sidekick/`, `src/features/magic-context/user-memory/`, `src/features/magic-context/git-commits/`, `src/features/magic-context/smart-notes/`, `src/features/builtin-commands/`
-- Key files: `src/features/magic-context/storage-db.ts`, `src/features/magic-context/storage-schema-helpers.ts`, `src/features/magic-context/storage.ts` (barrel), `src/features/magic-context/migrations.ts`, `src/features/magic-context/message-index.ts`, `src/features/magic-context/search.ts`, `src/features/magic-context/session-project-storage.ts`, `src/features/magic-context/session-project-backfill.ts`, `src/features/magic-context/overflow-detection.ts`, `src/features/magic-context/dreamer/runner.ts`, `src/features/magic-context/memory/project-identity.ts`, `src/features/magic-context/memory/storage-memory.ts`, `src/features/magic-context/user-memory/storage-user-memory.ts`, `src/features/builtin-commands/commands.ts`
+- Key files: `src/features/magic-context/storage-db.ts`, `src/features/magic-context/storage-schema-helpers.ts`, `src/features/magic-context/storage.ts` (barrel), `src/features/magic-context/migrations.ts`, `src/features/magic-context/message-index.ts`, `src/features/magic-context/search.ts`, `src/features/magic-context/session-project-storage.ts`, `src/features/magic-context/session-project-backfill.ts`, `src/features/magic-context/overflow-detection.ts`, `src/features/magic-context/dreamer/runner.ts`, `src/features/magic-context/dreamer/lease.ts`, `src/features/magic-context/dreamer/manifest-parser.ts`, `src/features/magic-context/memory/project-identity.ts`, `src/features/magic-context/memory/storage-memory.ts`, `src/features/magic-context/user-memory/storage-user-memory.ts`, `src/features/builtin-commands/commands.ts`
 
 **`src/tools/`:**
 - Purpose: Define the agent-facing tool surface.
@@ -80,8 +80,8 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 
 **`src/shared/`:**
 - Purpose: Keep cross-feature utilities small and dependency-light.
-- Contains: Logging, path helpers, JSONC parsing, model helpers, runtime-detected SQLite backend (`bun:sqlite` / `node:sqlite`), harness identification, RPC server/client/types/utils/notifications, conflict detection & fixer, OpenCode compaction detector, fallback chain resolver, models.dev cache, tag-transcript primitive shared with Pi, model-suggestion-retry helper, subagent runner (Pi-only), the commit-detection utility, harness-specific provider translation, and process-wide exit-abort coordination.
-- Key files: `src/shared/logger.ts`, `src/shared/data-path.ts`, `src/shared/jsonc-parser.ts`, `src/shared/sqlite.ts`, `src/shared/rpc-server.ts`, `src/shared/rpc-client.ts`, `src/shared/conflict-detector.ts`, `src/shared/model-suggestion-retry.ts`, `src/shared/resolve-fallbacks.ts`, `src/shared/harness.ts`, `src/shared/tag-transcript.ts`, `src/shared/commit-detection.ts`, `src/shared/harness-provider-map.ts`, `src/shared/exit-abort-registry.ts`
+- Contains: Logging, path helpers, JSONC parsing, model helpers, runtime-detected SQLite backend (`bun:sqlite` / `node:sqlite`), harness identification, RPC server/client/types/utils/notifications, conflict detection & fixer, OpenCode compaction detector, fallback chain resolver, models.dev cache, tag-transcript primitive shared with Pi, model-suggestion-retry helper, subagent runner (Pi-only), the commit-detection utility, harness-specific provider translation, process-wide exit-abort coordination, and diagnostics numeric redaction.
+- Key files: `src/shared/logger.ts`, `src/shared/data-path.ts`, `src/shared/jsonc-parser.ts`, `src/shared/sqlite.ts`, `src/shared/rpc-server.ts`, `src/shared/rpc-client.ts`, `src/shared/conflict-detector.ts`, `src/shared/model-suggestion-retry.ts`, `src/shared/resolve-fallbacks.ts`, `src/shared/harness.ts`, `src/shared/tag-transcript.ts`, `src/shared/commit-detection.ts`, `src/shared/harness-provider-map.ts`, `src/shared/exit-abort-registry.ts`, `src/shared/redaction.ts`
 
 **`scripts/`:**
 - Purpose: Support local inspection and maintenance outside the plugin runtime.
@@ -160,6 +160,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `crates/mc-module/src/historian.rs`: Evaluates pressure and schedules/runs incremental historian summarizations in Rust.
 - `crates/mc-module/src/injection.rs`: Builds the `m0`/`m1` structures and injects synthetic message parts in Rust.
 - `crates/mc-module/src/boundary.rs`: Resolves the boundary between compactable history and the protected tail in Rust.
+- `crates/mc-module/src/session_resolver.rs`: Resolves incoming MCP facade requests to their backing project and session.
 - `crates/mc-module/src/codec/`: Decode harness-specific JSON messages (OpenCode, Pi) into canonical `CkIngressMessage` values and encode them back using harness model codecs.
 - `crates/mc-module/src/healing.rs`: Define serializer healing profiles and gate tail mutations for verbatim-tail consumers to prevent phantom reclaims.
 - `crates/mc-module/src/selection.rs`: Implement tail-reduction selection to decide which tail items to reduce and produce their `ReductionDecision`s.
