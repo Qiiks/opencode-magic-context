@@ -3541,16 +3541,22 @@ mod tests {
         }
     }
 
-    // Temporary diagnostic driver: replays captured module-request JSONs from a dump
-    // directory (MC_REPLAY_DIR) through the real dispatch path against a fresh store,
-    // printing per-capture outcome and wall time. No-op unless MC_REPLAY_DIR is set.
+    // Diagnostic driver: replays captured module-request JSONs from a dump directory
+    // (MC_REPLAY_DIR) through the real dispatch path against a fresh store, printing
+    // per-capture outcome and wall time. No-op unless MC_REPLAY_DIR is set.
+    //
+    // The run doubles as cache-stability evidence for byte-splice consumers moving to
+    // full-array apply: the same capture sequence is driven through TWO independent
+    // fresh stores and each pass's serialized output is byte-compared across runs
+    // (same input + same durable-state lineage must produce identical bytes), and
+    // within a run each non-busting pass's output prefix must reproduce the previous
+    // pass's output prefix byte-identically (the property the provider prompt cache
+    // keys on).
     #[tokio::test]
     async fn replay_module_request_dump() {
         let Ok(dir) = std::env::var("MC_REPLAY_DIR") else {
             return;
         };
-        let state = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -3562,43 +3568,143 @@ mod tests {
             })
             .collect();
         files.sort();
-        let mut bound = false;
-        for path in files {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let raw = std::fs::read_to_string(&path).unwrap();
-            let value: Value = serde_json::from_str(&raw).unwrap();
-            if !bound {
-                let session = value
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("replay-session")
-                    .to_string();
-                handler.bind_route(9, binding(project.to_str().unwrap(), &session));
-                bound = true;
-            }
-            let started = std::time::Instant::now();
-            let outcome = handler.dispatch_value(9, value).await;
-            let ms = started.elapsed().as_millis();
-            match outcome {
-                HandlerOutcome::Response(bytes) => {
-                    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-                    let action = parsed
-                        .get("action")
+
+        async fn drive_run(files: &[PathBuf]) -> Vec<(String, String, Option<Value>, u128)> {
+            let state = Arc::new(ProducerState::default());
+            let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+            let mut bound = false;
+            let mut outcomes = Vec::new();
+            for path in files {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                let raw = std::fs::read_to_string(path).unwrap();
+                let value: Value = serde_json::from_str(&raw).unwrap();
+                if !bound {
+                    let session = value
+                        .get("session_id")
                         .and_then(Value::as_str)
-                        .unwrap_or("?")
+                        .unwrap_or("replay-session")
                         .to_string();
-                    let n_out = parsed
-                        .get("ck_messages")
-                        .and_then(Value::as_array)
-                        .map_or(0, Vec::len);
-                    println!("[replay] {name} OK action={action} out_msgs={n_out} ms={ms}");
+                    handler.bind_route(9, binding(project.to_str().unwrap(), &session));
+                    bound = true;
                 }
-                HandlerOutcome::Error { code, message } => {
-                    println!("[replay] {name} ERROR code={code} ms={ms} message={message}");
+                let started = std::time::Instant::now();
+                let outcome = handler.dispatch_value(9, value.clone()).await;
+                let ms = started.elapsed().as_millis();
+                match outcome {
+                    HandlerOutcome::Response(bytes) => {
+                        let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                        let action = parsed
+                            .get("action")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_string();
+                        outcomes.push((name, action, Some(parsed), ms));
+                    }
+                    HandlerOutcome::Error { code, message } => {
+                        println!("[replay] {name} ERROR code={code} ms={ms} message={message}");
+                        outcomes.push((name, format!("ERROR:{code}"), None, ms));
+                    }
+                    other => {
+                        println!("[replay] {name} OTHER {other:?} ms={ms}");
+                        outcomes.push((name, "OTHER".to_string(), None, ms));
+                    }
                 }
-                other => println!("[replay] {name} OTHER {other:?} ms={ms}"),
+            }
+            outcomes
+        }
+
+        let run_a = drive_run(&files).await;
+        let run_b = drive_run(&files).await;
+
+        let mut determinism_ok = 0usize;
+        let mut determinism_bad = Vec::new();
+        for (a, b) in run_a.iter().zip(run_b.iter()) {
+            let bytes_a = a.3;
+            let _ = bytes_a;
+            match (&a.2, &b.2) {
+                (Some(va), Some(vb)) => {
+                    let sa = serde_json::to_string(va.get("ck_messages").unwrap_or(&Value::Null))
+                        .unwrap();
+                    let sb = serde_json::to_string(vb.get("ck_messages").unwrap_or(&Value::Null))
+                        .unwrap();
+                    if sa == sb {
+                        determinism_ok += 1;
+                    } else {
+                        determinism_bad.push(a.0.clone());
+                    }
+                }
+                _ => determinism_bad.push(a.0.clone()),
             }
         }
+
+        // Prefix stability within run A: on non-busting passes, the previous output's
+        // message sequence must reappear byte-identically as a prefix of this output.
+        let mut prefix_ok = 0usize;
+        let mut prefix_bad = Vec::new();
+        for w in run_a.windows(2) {
+            let (prev, cur) = (&w[0], &w[1]);
+            let (Some(pv), Some(cv)) = (&prev.2, &cur.2) else {
+                continue;
+            };
+            if cur.1 != "SOFT+" {
+                continue;
+            }
+            let pm = pv
+                .get("ck_messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let cm = cv
+                .get("ck_messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            // The previous pass's synthetic tail anchors (e.g. todo pair) may relocate
+            // relative to NEW tail messages; compare the non-synthetic sequence.
+            let strip = |arr: &[Value]| -> Vec<String> {
+                arr.iter()
+                    .filter(|m| {
+                        !m.get("ck")
+                            .and_then(|c| c.get("meta"))
+                            .and_then(|m| m.get("synthetic"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .map(|m| serde_json::to_string(m).unwrap())
+                    .collect()
+            };
+            let ps = strip(&pm);
+            let cs = strip(&cm);
+            if cs.len() >= ps.len() && cs[..ps.len()] == ps[..] {
+                prefix_ok += 1;
+            } else {
+                let diverge = ps
+                    .iter()
+                    .zip(cs.iter())
+                    .position(|(x, y)| x != y)
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "len".to_string());
+                prefix_bad.push(format!("{}@{}", cur.0, diverge));
+            }
+        }
+
+        for (name, action, parsed, ms) in &run_a {
+            let n_out = parsed
+                .as_ref()
+                .and_then(|p| p.get("ck_messages"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            println!("[replay] {name} action={action} out_msgs={n_out} ms={ms}");
+        }
+        println!(
+            "[replay] DETERMINISM cross-run: {determinism_ok}/{} identical, divergent: {:?}",
+            run_a.len(),
+            determinism_bad
+        );
+        println!(
+            "[replay] PREFIX-STABILITY (SOFT+ passes): {prefix_ok} stable, divergent: {:?}",
+            prefix_bad
+        );
     }
 
     #[derive(Clone)]
