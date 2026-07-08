@@ -140,6 +140,12 @@ pub const TAGGER_FEATURE_EPOCH: u32 = 0;
 /// Storage namespace for the cache-state domain.
 const STORAGE_NAMESPACE: &str = "mc_cache";
 const GUIDANCE_TEXT: &str = include_str!("../assets/guidance_primary.txt");
+/// Guidance variant for surfaces where ctx_reduce is not callable: the tagging and
+/// reduction sections are removed entirely, because instructing the model to reduce
+/// with a tool it cannot reach is a model-facing coherence bug. Consumers pick the
+/// variant that matches the live tool surface; the two variants have different
+/// content hashes, so a surface widening folds the prefix by construction.
+const GUIDANCE_TEXT_NO_REDUCE: &str = include_str!("../assets/guidance_no_reduce.txt");
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
@@ -1716,15 +1722,28 @@ impl McHandler {
                 }
             }
         };
-        let bytes = guidance_bytes(&date_line);
+        // Default is the full five-tool block; variant="no_reduce" serves the surface
+        // without ctx_reduce/tag discipline for consumers whose tool policy hides it.
+        let text = match request.get("variant").and_then(Value::as_str) {
+            None | Some("full") => GUIDANCE_TEXT,
+            Some("no_reduce") => GUIDANCE_TEXT_NO_REDUCE,
+            Some(other) => {
+                return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message: format!("unknown guidance variant: {other}"),
+                }
+            }
+        };
+        let bytes = guidance_bytes_for(text, &date_line);
         respond(json!({
             "ok": true,
             "bytes": bytes,
             "hash": sha256_hex(bytes.as_bytes()),
-            // The generated guidance text is the only part stored in render_config. The
-            // session date line changes every day, so content_hash excludes it; otherwise
-            // a date-only change would trigger cache refreshes even when guidance is unchanged.
-            "content_hash": sha256_hex(GUIDANCE_TEXT.as_bytes()),
+            // The guidance text is the only part reflected in render_config. The session
+            // date line changes every day, so content_hash excludes it; otherwise a
+            // date-only change would trigger cache refreshes even when guidance is
+            // unchanged.
+            "content_hash": sha256_hex(text.as_bytes()),
         }))
     }
 
@@ -2959,8 +2978,8 @@ fn respond(value: Value) -> HandlerOutcome {
     }
 }
 
-fn guidance_bytes(date_line: &str) -> String {
-    format!("{GUIDANCE_TEXT}\n{date_line}")
+fn guidance_bytes_for(text: &str, date_line: &str) -> String {
+    format!("{text}\n{date_line}")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -4853,6 +4872,40 @@ mod tests {
         let health =
             call_dispatch_request(&handler, json!({ "kind": "health", "session_id": "ses" })).await;
         assert_eq!(health["pass_trace"], status["pass_trace"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guidance_variant_no_reduce_omits_reduce_and_hashes_differ() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let full = call_dispatch_request(
+            &handler,
+            json!({ "kind": "guidance.get", "session_id": "ses" }),
+        )
+        .await;
+        let trimmed = call_dispatch_request(
+            &handler,
+            json!({ "kind": "guidance.get", "session_id": "ses", "variant": "no_reduce" }),
+        )
+        .await;
+        let full_bytes = full["bytes"].as_str().unwrap();
+        let trimmed_bytes = trimmed["bytes"].as_str().unwrap();
+        assert!(full_bytes.contains("ctx_reduce"));
+        assert!(!trimmed_bytes.contains("ctx_reduce"));
+        assert!(!trimmed_bytes.contains("\u{a7}")); // no tag-sigil references
+        assert!(trimmed_bytes.contains("ctx_memory"));
+        assert!(trimmed_bytes.contains("ctx_expand"));
+        assert_ne!(full["content_hash"], trimmed["content_hash"]);
+        // Both variants share the session's frozen date line.
+        let date = full_bytes.lines().last().unwrap();
+        assert_eq!(date, trimmed_bytes.lines().last().unwrap());
+        let unknown = handler
+            .dispatch_value(
+                7,
+                json!({ "kind": "guidance.get", "session_id": "ses", "variant": "bogus" }),
+            )
+            .await;
+        assert_eq!(error_code(unknown), "bad_request");
     }
 
     #[tokio::test(flavor = "current_thread")]
