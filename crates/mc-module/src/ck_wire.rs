@@ -144,8 +144,6 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
                         .push_back(block_id(&msg.mid, index));
                 }
             }
-        } else if role != "tool" {
-            pending_calls.clear();
         }
 
         let mut identities = Vec::new();
@@ -161,6 +159,17 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
                 });
             }
             blocks.push(flat);
+        }
+
+        // A tool arc ends at the next non-tool-carrying turn, but the clear must run
+        // AFTER this message's own blocks consume their pending calls: on the Anthropic
+        // wire a tool_result may ride inside a USER message together with the user's
+        // next text (Claude Code emits this when input arrives while a tool runs).
+        // Clearing before the block walk made that legal shape unpairable — and because
+        // ingress errors precede any state commit, one such message in the history
+        // rejected every subsequent pass for the session's lifetime.
+        if role != "assistant" && role != "tool" {
+            pending_calls.clear();
         }
         if !msg.ck.meta.synthetic {
             identity_by_mid.insert(msg.mid.clone(), identities);
@@ -333,13 +342,12 @@ fn ensure_output_supported(
                         kind: "tool_result.content.media".to_string(),
                     })
                 }
-                ResultBlockKind::Opaque { .. } => {
-                    return Err(CkWireError::UnsupportedBlock {
-                        mid: mid.to_string(),
-                        block_index,
-                        kind: "tool_result.content.opaque".to_string(),
-                    })
-                }
+                // Result-embedded Opaque carriers (e.g. screenshots inside MCP tool
+                // results) get the same treatment as top-level Opaque blocks: verbatim
+                // source-tagged bytes, never interpreted, projected back unchanged.
+                // Rejecting them here wedged real Claude Code sessions, since any
+                // image-returning tool poisons the history for every later pass.
+                ResultBlockKind::Opaque { .. } => {}
                 ResultBlockKind::Text { .. } => {}
             }
         }
@@ -413,4 +421,211 @@ pub fn duplicate_ids(blocks: &[FlatBlock]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_msg(mid: &str, ordinal: u64, role: &str, text: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                role,
+                vec![CkWireBlock::bare(CkKind::Text { text: text.into() })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        }
+    }
+
+    fn assistant_with_call(mid: &str, ordinal: u64, call_id: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    CkWireBlock::bare(CkKind::Text {
+                        text: "running a tool".into(),
+                    }),
+                    CkWireBlock::bare(CkKind::ToolCall {
+                        id: call_id.to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({}),
+                        provider_executed: false,
+                    }),
+                ],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        }
+    }
+
+    // Claude Code emits the tool_result INSIDE the next user message (alongside the
+    // user's queued text) when input arrives while a tool is still running. The result
+    // must pair against the prior assistant's call even though the carrying role is
+    // "user"; the arc-window clear runs after the message's own blocks are walked.
+    #[test]
+    fn user_carried_tool_result_pairs_with_prior_assistant_call() {
+        let user_with_result = CkIngressMessage {
+            mid: "m2".to_string(),
+            ordinal: 2,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![
+                    CkWireBlock::bare(CkKind::ToolResult {
+                        id: "toolu_1".to_string(),
+                        tool_name: "read".to_string(),
+                        output: CkToolOutput::bare(CkOutputKind::Text {
+                            text: "file contents".into(),
+                        }),
+                        provider_executed: false,
+                    }),
+                    CkWireBlock::bare(CkKind::Text {
+                        text: "queued user question".into(),
+                    }),
+                ],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        };
+        let messages = vec![
+            text_msg("m0", 0, "user", "start"),
+            assistant_with_call("m1", 1, "toolu_1"),
+            user_with_result,
+        ];
+        let projection = project_messages(&messages).expect("user-carried result must pair");
+        let result_block = projection
+            .blocks
+            .iter()
+            .find(|b| b.id == "m2#0")
+            .expect("result block present");
+        assert_eq!(
+            result_block.arc_id.as_deref(),
+            Some("m1#1"),
+            "result pairs to the prior assistant's call block"
+        );
+        // The user message still ends the arc window: a later stray result must fail.
+        let mut with_stray = messages.clone();
+        with_stray.push(CkIngressMessage {
+            mid: "m3".to_string(),
+            ordinal: 3,
+            ck: CkWireMessage::from_parts(
+                "tool",
+                vec![CkWireBlock::bare(CkKind::ToolResult {
+                    id: "toolu_1".to_string(),
+                    tool_name: "read".to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: "again".into(),
+                    }),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        });
+        let err = project_messages(&with_stray).expect_err("arc window closed by user turn");
+        assert!(matches!(err, CkWireError::UnpairedToolResult { .. }));
+    }
+
+    // A genuinely orphaned result in a user message (no prior assistant call) still
+    // fails loud — the fix moved the arc-window clear, it did not weaken pairing.
+    #[test]
+    fn user_carried_tool_result_without_prior_call_still_rejects() {
+        let messages = vec![
+            text_msg("m0", 0, "user", "start"),
+            CkIngressMessage {
+                mid: "m1".to_string(),
+                ordinal: 1,
+                ck: CkWireMessage::from_parts(
+                    "user",
+                    vec![CkWireBlock::bare(CkKind::ToolResult {
+                        id: "toolu_orphan".to_string(),
+                        tool_name: "read".to_string(),
+                        output: CkToolOutput::bare(CkOutputKind::Text { text: "x".into() }),
+                        provider_executed: false,
+                    })],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+        ];
+        let err = project_messages(&messages).expect_err("orphan result must reject");
+        assert!(matches!(err, CkWireError::UnpairedToolResult { .. }));
+    }
+
+    // Opaque carriers inside tool_result content blocks (e.g. screenshots returned by
+    // MCP tools) are first-class verbatim carriers, same as top-level Opaque blocks.
+    // Media inside results stays rejected.
+    #[test]
+    fn opaque_inside_tool_result_content_is_accepted_and_projected() {
+        let result_with_opaque = CkIngressMessage {
+            mid: "m2".to_string(),
+            ordinal: 2,
+            ck: CkWireMessage::from_parts(
+                "tool",
+                vec![CkWireBlock::bare(CkKind::ToolResult {
+                    id: "toolu_1".to_string(),
+                    tool_name: "computer".to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Content {
+                        blocks: vec![
+                            ResultBlock {
+                                kind: ResultBlockKind::Text {
+                                    text: "screenshot captured".into(),
+                                },
+                                provider_extras: ProviderExtras::new(),
+                            },
+                            ResultBlock {
+                                kind: ResultBlockKind::Opaque {
+                                    opaque: OpaqueBlock {
+                                        source: serde_json::json!({"source": "wire", "wire": "anthropic"}),
+                                        kind: "image".to_string(),
+                                        raw: serde_json::json!([1, 2, 3]),
+                                        arc: None,
+                                    },
+                                },
+                                provider_extras: ProviderExtras::new(),
+                            },
+                        ],
+                    }),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        };
+        let messages = vec![
+            text_msg("m0", 0, "user", "start"),
+            assistant_with_call("m1", 1, "toolu_1"),
+            result_with_opaque,
+        ];
+        let projection =
+            project_messages(&messages).expect("result-embedded opaque must be accepted");
+        assert!(projection.blocks.iter().any(|b| b.id == "m2#0"));
+
+        // Media inside a result is still rejected.
+        let mut with_media = messages;
+        if let CkKind::ToolResult { output, .. } = &mut with_media[2].ck.content[0].kind {
+            if let CkOutputKind::Content { blocks } = &mut output.kind {
+                blocks[1].kind = ResultBlockKind::Media {
+                    media: MediaBlock {
+                        kind: MediaKind::Image,
+                        media_type: "image/png".to_string(),
+                        filename: None,
+                        source: serde_json::json!({}),
+                    },
+                };
+            }
+        }
+        let err = project_messages(&with_media).expect_err("media in result stays rejected");
+        assert!(matches!(err, CkWireError::UnsupportedBlock { .. }));
+    }
 }

@@ -3521,6 +3521,66 @@ mod tests {
         }
     }
 
+    // Temporary diagnostic driver: replays captured module-request JSONs from a dump
+    // directory (MC_REPLAY_DIR) through the real dispatch path against a fresh store,
+    // printing per-capture outcome and wall time. No-op unless MC_REPLAY_DIR is set.
+    #[tokio::test]
+    async fn replay_module_request_dump() {
+        let Ok(dir) = std::env::var("MC_REPLAY_DIR") else {
+            return;
+        };
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("-module-req.json"))
+            })
+            .collect();
+        files.sort();
+        let mut bound = false;
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let value: Value = serde_json::from_str(&raw).unwrap();
+            if !bound {
+                let session = value
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("replay-session")
+                    .to_string();
+                handler.bind_route(9, binding(project.to_str().unwrap(), &session));
+                bound = true;
+            }
+            let started = std::time::Instant::now();
+            let outcome = handler.dispatch_value(9, value).await;
+            let ms = started.elapsed().as_millis();
+            match outcome {
+                HandlerOutcome::Response(bytes) => {
+                    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                    let action = parsed
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                        .to_string();
+                    let n_out = parsed
+                        .get("ck_messages")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    println!("[replay] {name} OK action={action} out_msgs={n_out} ms={ms}");
+                }
+                HandlerOutcome::Error { code, message } => {
+                    println!("[replay] {name} ERROR code={code} ms={ms} message={message}");
+                }
+                other => println!("[replay] {name} OTHER {other:?} ms={ms}"),
+            }
+        }
+    }
+
     #[derive(Clone)]
     enum FakeResolve {
         Hit(String),
