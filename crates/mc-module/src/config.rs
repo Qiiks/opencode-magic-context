@@ -101,23 +101,54 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
     let mut cfg = McModuleConfig::default();
 
     if let Some(user) = user {
-        if let Some(model) = user.pointer("/historian/model").and_then(Value::as_str) {
-            if !model.trim().is_empty() {
-                cfg.model_chain.push(model.trim().to_string());
+        // Module-leg model override. The shared config file serves two consumers whose
+        // model namespaces differ: the TS plugin resolves harness-namespace ids (e.g.
+        // OpenCode's auth plugins register "google/antigravity-gemini-3.5-flash"),
+        // while this module drives llm-runner, whose catalog uses canonical ids
+        // ("google/gemini-3.5-flash" + a vault auth method). When module_model is
+        // present it REPLACES the plugin-namespace chain entirely (no mixing — a
+        // half-translated chain would burn permanent-classified advances every fire);
+        // when absent, fall back to the plugin keys so single-namespace setups keep
+        // working with one set of keys.
+        let module_model = user
+            .pointer("/historian/module_model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(model) = module_model {
+            cfg.model_chain.push(model.to_string());
+            if let Some(fallbacks) = user
+                .pointer("/historian/module_fallback_models")
+                .and_then(Value::as_array)
+            {
+                cfg.model_chain.extend(
+                    fallbacks
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned),
+                );
             }
-        }
-        if let Some(fallbacks) = user
-            .pointer("/historian/fallback_models")
-            .and_then(Value::as_array)
-        {
-            cfg.model_chain.extend(
-                fallbacks
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToOwned::to_owned),
-            );
+        } else {
+            if let Some(model) = user.pointer("/historian/model").and_then(Value::as_str) {
+                if !model.trim().is_empty() {
+                    cfg.model_chain.push(model.trim().to_string());
+                }
+            }
+            if let Some(fallbacks) = user
+                .pointer("/historian/fallback_models")
+                .and_then(Value::as_array)
+            {
+                cfg.model_chain.extend(
+                    fallbacks
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned),
+                );
+            }
         }
         if let Some(threshold) = number_at(user, "/execute_threshold_percentage") {
             cfg.execute_threshold_percentage = threshold;
@@ -274,6 +305,68 @@ mod tests {
     fn default_threshold_matches_typescript_schema() {
         let cfg = merge_tiers(None, None);
         assert_eq!(cfg.execute_threshold_percentage, 65.0);
+    }
+
+    #[test]
+    fn module_model_replaces_plugin_chain_entirely() {
+        let user = serde_json::json!({
+            "historian": {
+                "model": "google/antigravity-gemini-3.5-flash",
+                "fallback_models": ["google/antigravity-claude-opus-4-6-thinking"],
+                "module_model": "google/gemini-3.5-flash",
+                "module_fallback_models": ["ollama-cloud/kimi-k2.7-code"]
+            }
+        });
+        let cfg = merge_tiers(Some(&user), None);
+        // No plugin-namespace ids may leak into the module chain — a mixed chain
+        // burns a permanent-classified advance on every historian fire.
+        assert_eq!(
+            cfg.model_chain,
+            vec!["google/gemini-3.5-flash", "ollama-cloud/kimi-k2.7-code"]
+        );
+    }
+
+    #[test]
+    fn module_model_absent_falls_back_to_plugin_keys() {
+        let user = serde_json::json!({
+            "historian": {
+                "model": "deepseek/deepseek-v4-flash",
+                "fallback_models": ["ollama-cloud/kimi-k2.7-code"],
+                "module_fallback_models": ["ignored/without-module-model"]
+            }
+        });
+        let cfg = merge_tiers(Some(&user), None);
+        assert_eq!(
+            cfg.model_chain,
+            vec!["deepseek/deepseek-v4-flash", "ollama-cloud/kimi-k2.7-code"]
+        );
+    }
+
+    #[test]
+    fn module_model_blank_is_treated_as_absent() {
+        let user = serde_json::json!({
+            "historian": {
+                "model": "deepseek/deepseek-v4-flash",
+                "module_model": "   "
+            }
+        });
+        let cfg = merge_tiers(Some(&user), None);
+        assert_eq!(cfg.model_chain, vec!["deepseek/deepseek-v4-flash"]);
+    }
+
+    #[test]
+    fn module_model_is_user_tier_only() {
+        let user = serde_json::json!({
+            "historian": { "module_model": "google/gemini-3.5-flash" }
+        });
+        let project = serde_json::json!({
+            "historian": {
+                "module_model": "evil/expensive-model",
+                "module_fallback_models": ["evil/other"]
+            }
+        });
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert_eq!(cfg.model_chain, vec!["google/gemini-3.5-flash"]);
     }
 
     #[test]
