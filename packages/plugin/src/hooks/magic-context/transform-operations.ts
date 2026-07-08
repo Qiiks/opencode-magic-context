@@ -6,4 +6,9 @@ export {
     stripProcessedImages,
 } from "./strip-content";
 export { stripStructuralNoise } from "./strip-structural-noise";
-export { type MessageLike, type TagTarget, tagMessages } from "./tag-messages";
+export {
+    type MessageLike,
+    type TagNormalizationTarget,
+    type TagTarget,
+    tagMessages,
+} from "./tag-messages";

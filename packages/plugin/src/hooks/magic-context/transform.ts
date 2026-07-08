@@ -42,7 +42,7 @@ import {
     normalizeMaterializeReason,
     recordPendingTransformDecision,
 } from "../../features/magic-context/transform-decision-log";
-import type { ContextUsage } from "../../features/magic-context/types";
+import type { ContextUsage, SchedulerDecision } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
@@ -87,6 +87,12 @@ import { extractInMemoryMessageViews } from "./read-session-raw";
 import { sendIgnoredMessage } from "./send-session-notification";
 import { modelAcceptsEmptyContent } from "./sentinel";
 import {
+    resolveDeclaredTrimForShadow,
+    type ShadowSender,
+    type ShadowTransformDecision,
+    type ShadowTransformPass,
+} from "./shadow-sender";
+import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
     stripClearedReasoning,
@@ -100,6 +106,7 @@ import {
     applyFlushedStatuses,
     type MessageLike,
     stripStructuralNoise,
+    type TagNormalizationTarget,
     type TagTarget,
     tagMessages,
 } from "./transform-operations";
@@ -166,6 +173,29 @@ export function clearMessageTokensCache(sessionId: string, messageId?: string): 
 // appears (or changes) for a session in this process — not on every transform
 // pass. Bounded so crashed/abandoned sessions can't leak the guard forever.
 const recordedSessionProjectIdentity = new BoundedSessionMap<string>(MESSAGE_TOKENS_CACHE_MAX);
+
+function cloneForShadow<T>(value: T): T {
+    return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function classifyShadowDecision(args: {
+    schedulerDecision: SchedulerDecision;
+    materialized: boolean;
+    bustedThisPass: boolean;
+}): ShadowTransformDecision["class"] {
+    if (args.materialized) return "hard";
+    if (args.schedulerDecision === "execute" || args.bustedThisPass) return "soft";
+    return "defer";
+}
+
+function didDeclaredTrimAdvance(
+    before: ShadowTransformPass["declaredTrim"] | null,
+    after: ShadowTransformPass["declaredTrim"] | null,
+): boolean {
+    if (!after) return false;
+    if (!before) return true;
+    return before.flat_boundary_id !== after.flat_boundary_id;
+}
 
 // Tagger / trigger load-scoping floor (OpenCode only). Several hot-path reads
 // preload an in-memory map or aggregate over a session's tags; on a large/old
@@ -398,6 +428,8 @@ export interface TransformDeps {
     };
     /** Fire-and-forget active-session embed backfill after transform returns. */
     maybeAutoEmbedSession?: (sessionId: string) => void;
+    /** Dev-only sender that mirrors transform events for comparison; undefined disables that debug path. */
+    shadowSender?: ShadowSender;
 }
 
 export function createTransform(deps: TransformDeps) {
@@ -422,6 +454,12 @@ export function createTransform(deps: TransformDeps) {
         logTransformTiming(sessionId, "findSessionId", startTime, `messages=${messages.length}`);
 
         const db = deps.db;
+        const shadowSender = deps.shadowSender;
+        const shadowNowMs = shadowSender ? Date.now() : 0;
+        const shadowInputMessages = shadowSender ? cloneForShadow(messages) : undefined;
+        const shadowDeclaredTrimBefore = shadowSender
+            ? resolveDeclaredTrimForShadow({ db, sessionId })
+            : null;
         if (deps.client !== undefined) {
             scheduleReconciliation(db, sessionId, readRawSessionMessages);
         }
@@ -1316,6 +1354,7 @@ export function createTransform(deps: TransformDeps) {
             { type: string; thinking?: string; text?: string }[]
         >();
         let messageTagNumbers = new Map<MessageLike, number>();
+        let tagNormalizationTargets: TagNormalizationTarget[] = [];
         let batch: { finalize: () => void } | null = null;
         let hasRecentReduceCall = false;
         // Inject temporal markers before tagging so the §N§ tag prefix wraps
@@ -1368,6 +1407,7 @@ export function createTransform(deps: TransformDeps) {
             targets = result.targets;
             reasoningByMessage = result.reasoningByMessage;
             messageTagNumbers = result.messageTagNumbers;
+            tagNormalizationTargets = result.normalizationTargets;
             batch = result.batch;
             hasRecentReduceCall = result.hasRecentReduceCall;
             const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;
@@ -2142,6 +2182,51 @@ export function createTransform(deps: TransformDeps) {
             sessionId,
             `transform completed in ${elapsed}ms (${messages.length} messages, ${targets.size} targets, watermark: ${watermark})`,
         );
+
+        if (shadowSender && shadowInputMessages) {
+            try {
+                const shadowDeclaredTrimAfter = resolveDeclaredTrimForShadow({ db, sessionId });
+                const shadowDecision: ShadowTransformDecision = {
+                    class: classifyShadowDecision({
+                        schedulerDecision,
+                        materialized: postTransformResult.materialized,
+                        bustedThisPass: postTransformResult.bustedThisPass,
+                    }),
+                    marker_state: {
+                        marker_message_id: shadowDeclaredTrimAfter?.boundary_bare_message_id,
+                        advanced_this_pass: didDeclaredTrimAdvance(
+                            shadowDeclaredTrimBefore,
+                            shadowDeclaredTrimAfter,
+                        ),
+                    },
+                    materialize_reason: postTransformResult.materializeReason,
+                    emergency: postTransformResult.emergency,
+                };
+                shadowSender.enqueue({
+                    sessionId,
+                    db,
+                    inputMessages: shadowInputMessages,
+                    outputMessages: messages,
+                    normalizationTargets: tagNormalizationTargets,
+                    projectRoot: sessionDirectory ?? deps.directory ?? process.cwd(),
+                    projectPath: sessionProjectIdentity,
+                    passInputs: {
+                        now_ms: shadowNowMs,
+                        model_key: deps.getModelKey?.(sessionId) ?? hardModelKey ?? null,
+                        usage: {
+                            input_tokens: contextUsage.inputTokens,
+                            limit: resolvedContextLimit ?? boundaryContextLimit,
+                        },
+                        effective_execute_threshold: boundaryExecuteThreshold,
+                        cache_ttl: sessionMeta.cacheTtl,
+                    },
+                    tsDecision: shadowDecision,
+                    declaredTrim: shadowDeclaredTrimAfter,
+                });
+            } catch (error) {
+                sessionLog(sessionId, "shadow: enqueue failed (ignored):", error);
+            }
+        }
 
         deps.maybeAutoEmbedSession?.(sessionId);
     };
