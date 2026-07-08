@@ -1,7 +1,7 @@
 //! The transform op: the CK-in / CK-out cache-stability transform.
 //!
 //! Emits the rewritten array: `pass_output.ck_messages = [m0, m1] ++ tail`.
-//! The covered contiguous prefix is REPLACED by two frozen synthesized-region blocks
+//! The covered sparse-but-ordered prefix is REPLACED by two frozen synthesized-region blocks
 //! (m0 cumulative baseline, frozen between HARD folds; m1 volatile delta, re-rendered
 //! on SOFT); the live tail (after the coverage watermark) is carried verbatim.
 //!
@@ -371,8 +371,8 @@ pub enum TransformError {
     /// bytes — a monotonicity-contract violation (a frozen reduction is immutable
     /// within an epoch). Fail loud instead of silently serving the stale frozen bytes.
     ReductionConflict,
-    /// The stored compartments don't tile contiguously — a raw message is covered by no
-    /// compartment, so composing m0/m1 would silently drop it from the tail. Fail loud.
+    /// A stored coverage range overlaps, or the live array proves a present raw message
+    /// would be trimmed without being covered by any compartment. Fail loud.
     CoverageGap(String),
     /// CK ingress rejected an unsupported or unpairable block before any partial projection.
     CkWire(CkWireError),
@@ -849,28 +849,24 @@ fn apply_once(
                 estimate_tokens,
             )?;
 
-            // Leading-gap guard (symmetric with the interior contiguity gap that
-            // resolve_coverage fails loud on): a live item BELOW the first covered ordinal
-            // is covered by no compartment, yet build_output trims everything at/under the
-            // coverage end (and the first covered ordinal is itself <= the coverage end), so
-            // it would be silently dropped from the tail. Store-pure validators only check
-            // inter-compartment tiling; they cannot know whether the first stored start is
-            // the session's real first ordinal. resolve_coverage can't see the live array,
-            // so the leading-anchor check lives here where the ordinals are.
-            if let Some(first) = comp.first_covered_ordinal {
-                if let Some(stray) = live
-                    .iter()
-                    .find(|i| i.ordinal() < first && i.role != "system")
-                {
-                    return Err(TransformError::CoverageGap(format!(
-                        "leading coverage gap: live item {} (ordinal {}) sits before the first \
-                         compartment start (ordinal {}); composing m0 would silently drop it \
-                         from the tail",
-                        stray.id(),
-                        stray.ordinal(),
-                        first
-                    )));
-                }
+            // Live coverage guard: store-pure validation allows sparse coordinate
+            // gaps because consumer producers can retire ordinal numbers permanently.
+            // Once the live array is available, every present non-system block at or
+            // below the coverage end must fall inside some compartment range; otherwise
+            // build_output would trim unsummarized raw bytes from the tail.
+            let compartments_for_live_coverage = store.load_compartments(&req.session_id)?;
+            if let Some(stray) = first_uncovered_live_block(
+                &compartments_for_live_coverage,
+                &live,
+                comp.coverage_ordinal,
+            ) {
+                return Err(TransformError::CoverageGap(format!(
+                    "coverage gap: live item {} (ordinal {}) sits at or below coverage end {:?} \
+                     but no compartment covers it; composing m0 would silently drop it from the tail",
+                    stray.id(),
+                    stray.ordinal(),
+                    comp.coverage_ordinal
+                )));
             }
 
             // Mint-absent guard: when this fold takes its anchor from a compartment
@@ -920,6 +916,20 @@ fn apply_once(
                         meta.last_execute_ordinal = meta
                             .last_execute_ordinal
                             .min(comp.coverage_ordinal.unwrap_or(0));
+
+                        let recut_compartments = store.load_compartments(&req.session_id)?;
+                        if let Some(stray) = first_uncovered_live_block(
+                            &recut_compartments,
+                            &live,
+                            comp.coverage_ordinal,
+                        ) {
+                            return Err(TransformError::CoverageGap(format!(
+                                "coverage gap after re-cut: live item {} (ordinal {}) is below coverage end {:?} but uncovered",
+                                stray.id(),
+                                stray.ordinal(),
+                                comp.coverage_ordinal
+                            )));
+                        }
 
                         if comp.coverage_ordinal.is_some() {
                             let reminted = comp.boundary_id.as_str();
@@ -1008,6 +1018,22 @@ fn apply_once(
             // A coverage-extending SOFT advances the boundary anchor (the bound core
             // primitive); a memory-only SOFT leaves it put (None).
             let new_boundary_id = m1.new_coverage.as_ref().map(|(id, _)| id.clone());
+            if let Some((_, coverage_end)) = &m1.new_coverage {
+                let compartments_for_live_coverage = store.load_compartments(&req.session_id)?;
+                if let Some(stray) = first_uncovered_live_block(
+                    &compartments_for_live_coverage,
+                    &live,
+                    Some(*coverage_end),
+                ) {
+                    return Err(TransformError::CoverageGap(format!(
+                        "coverage gap: live item {} (ordinal {}) sits at or below coverage end {} \
+                         but no compartment covers it; composing m1 would silently drop it from the tail",
+                        stray.id(),
+                        stray.ordinal(),
+                        coverage_end
+                    )));
+                }
+            }
             // Mint-absent guard, SOFT arm (same invariant as the fold's guard above): an
             // advanced anchor must exist in the live input this pass, or presence can
             // never hold afterward and the session decays into a reconcile-HARD loop. A
@@ -1560,6 +1586,29 @@ fn coverage_shrank(old: Option<u64>, new: Option<u64>) -> bool {
         (Some(_), None) => true,
         _ => false,
     }
+}
+
+fn stored_compartment_covers_ordinal(compartment: &StoredCompartment, ordinal: u64) -> bool {
+    let start = compartment.start_message.max(0) as u64;
+    let end = compartment.end_message.max(0) as u64;
+    start <= ordinal && ordinal <= end
+}
+
+fn first_uncovered_live_block<'a>(
+    compartments: &[StoredCompartment],
+    live: &[&'a FlatBlock],
+    coverage: Option<u64>,
+) -> Option<&'a FlatBlock> {
+    let coverage = coverage?;
+    live.iter()
+        .copied()
+        .filter(|block| block.role != "system" && block.ordinal() <= coverage)
+        .filter(|block| {
+            !compartments
+                .iter()
+                .any(|compartment| stored_compartment_covers_ordinal(compartment, block.ordinal()))
+        })
+        .min_by_key(|block| block.ordinal())
 }
 
 fn surviving_revert_prefix_seq(compartments: &[StoredCompartment], live: &[&FlatBlock]) -> i64 {
@@ -3811,9 +3860,8 @@ mod tests {
     fn leading_coverage_gap_fails_loud_not_silent_drop() {
         // Regression: the first compartment starts at ordinal 10, but the live array still
         // carries raw messages at ordinals 1..9 (before the first compartment). Those are
-        // covered by no compartment, yet they sit below coverage_ordinal so build_output
-        // would trim them — a SILENT drop. The leading-gap guard must fail loud instead
-        // (symmetric with the interior contiguity gap resolve_coverage already catches).
+        // covered by no compartment, yet they sit below coverage_ordinal. build_output
+        // would silently trim those raw messages, so the live coverage guard must fail loud.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 10, 20, "m20", "S")])
@@ -3832,6 +3880,36 @@ mod tests {
         assert!(
             matches!(err, TransformError::CoverageGap(_)),
             "a leading gap must fail loud, not silently drop the early live item: {err:?}"
+        );
+    }
+
+    #[test]
+    fn interior_live_coverage_gap_fails_loud_not_silent_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 2, "m2", "S1"), comp(2, 6, 7, "m7", "S2")],
+        )
+        .unwrap();
+        let items = vec![
+            item("m1", 1, "covered one"),
+            item("m2", 2, "covered two"),
+            item("m4", 4, "present but uncovered"),
+            item("m6", 6, "covered six"),
+            item("m7", 7, "covered seven"),
+            item("t8", 8, "tail"),
+        ];
+        let err = transform(
+            &s,
+            &req("ses", "cfg0", items),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap_err();
+        assert!(matches!(err, TransformError::CoverageGap(_)));
+        assert!(
+            err.to_string().contains("m4"),
+            "the uncovered live message should be named in the loud failure: {err:?}"
         );
     }
 

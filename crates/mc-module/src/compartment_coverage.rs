@@ -1,14 +1,14 @@
-//! Compartment coverage resolution: the contiguity-validated fold cut + the
-//! folded-vs-new partition for the m0/m1 split.
+//! Validate strictly ordered stored compartment ranges and partition them for
+//! the m0/m1 rendering split.
 //!
 //! Pure over a chronological compartment list (the order
 //! [`mc_store::McStore::load_compartments`] returns). Two settled, handshake-independent
 //! pieces of the slice-4d-m0 spine:
-//!  - [`resolve_coverage`] validates the compartments TILE the covered ordinal range
-//!    with no gap, then reports the coverage end (last compartment's end_message /
-//!    end_message_id) — the m0+m1 coverage anchor. A gap is FAIL-LOUD: silently taking
-//!    `last.end` as coverage would drop the gap's raw messages from the tail (they are
-//!    neither summarized nor carried), an unrecoverable loss.
+//!  - [`resolve_coverage`] validates that stored compartment ranges are strictly
+//!    increasing and non-overlapping, then reports the coverage end (last compartment's
+//!    end_message / end_message_id) — the m0+m1 coverage anchor. Store-pure checks
+//!    cannot tell a retired ordinal from a missing live message, so sparse coordinate
+//!    gaps are allowed here and live-aware callers guard against dropping present input.
 //!  - [`partition_by_folded_seq`] splits the compartments into the set already inside m0
 //!    (`sequence <= folded_seq`) and the new ones riding m1 at P1 (`sequence > folded_seq`).
 
@@ -85,8 +85,8 @@ pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -
     )
 }
 
-/// The coverage summary of a contiguous compartment set: the latest sequence, the
-/// terminal covered ordinal, and the boundary message id (the cache anchor).
+/// The coverage summary of a strictly ordered compartment set: the latest
+/// sequence, terminal covered ordinal, and boundary message id (the cache anchor).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompartmentCoverage {
     /// The highest compartment `sequence` in the set.
@@ -102,13 +102,13 @@ pub struct CompartmentCoverage {
     pub boundary_id: String,
 }
 
-/// A non-contiguous compartment set: a gap between two consecutive compartments would
-/// drop raw messages from the tail if coverage advanced past it.
+/// An overlapping or non-increasing compartment set. Sparse coordinate gaps are
+/// legal for consumer legs because retired ordinals are not present input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverageGap {
     /// The earlier compartment's end ordinal.
     pub prev_end: i64,
-    /// The later compartment's start ordinal (expected `prev_end + 1`).
+    /// The later compartment's start ordinal.
     pub next_start: i64,
 }
 
@@ -116,23 +116,21 @@ impl std::fmt::Display for CoverageGap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "compartment coverage gap: a compartment ends at ordinal {} but the next starts at {} (expected {}); messages {}..{} are covered by no compartment",
-            self.prev_end,
-            self.next_start,
-            self.prev_end + 1,
-            self.prev_end + 1,
-            self.next_start - 1
+            "compartment coverage overlap: a compartment ends at ordinal {} but the next starts at {}; ranges must be strictly increasing",
+            self.prev_end, self.next_start
         )
     }
 }
 
-/// Validate the compartments tile contiguously and report the coverage summary. None
-/// when the set is empty (nothing covered). Errors on the FIRST gap found.
+/// Validate the compartments are strictly increasing and report the coverage
+/// summary. None when the set is empty (nothing covered). Errors on the first
+/// overlap found.
 ///
-/// Contiguity rule: for consecutive compartments (chronological), the later one must
-/// start exactly one ordinal past the earlier one's end (`next.start == prev.end + 1`).
-/// An overlap (`next.start <= prev.end`) or a gap (`next.start > prev.end + 1`) both fail
-/// — the historian emits contiguous non-overlapping ranges, so either is corruption.
+/// Consumer-leg ordinals are sparse-but-strictly-increasing: the Claude Code
+/// proxy may retire numbers permanently when it re-mints message identities. This
+/// store-pure check therefore rejects overlaps (`next.start <= prev.end`) but
+/// allows coordinate gaps; live-aware transform validation catches any present
+/// raw message that would otherwise be trimmed without a compartment.
 pub fn resolve_coverage(
     compartments: &[StoredCompartment],
 ) -> Result<Option<CompartmentCoverage>, CoverageGap> {
@@ -141,7 +139,7 @@ pub fn resolve_coverage(
     };
     let mut prev = first;
     for next in &compartments[1..] {
-        if next.start_message != prev.end_message + 1 {
+        if next.start_message <= prev.end_message {
             return Err(CoverageGap {
                 prev_end: prev.end_message,
                 next_start: next.start_message,
@@ -193,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_set_reports_last_as_coverage() {
+    fn ordered_set_reports_last_as_coverage() {
         let comps = vec![
             comp(1, 1, 10, "m10"),
             comp(2, 11, 20, "m20"),
@@ -214,18 +212,19 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_fails_loud() {
-        // covers 1-10 then 20-30 → messages 11-19 covered by nothing → must error
+    fn sparse_coordinate_gap_is_store_pure_valid() {
+        // Consumer-leg producers can retire ordinal numbers permanently; without
+        // the live array, a store-only check cannot distinguish 11-19 being
+        // absent from being uncovered present input.
         let comps = vec![comp(1, 1, 10, "m10"), comp(2, 20, 30, "m30")];
-        let err = resolve_coverage(&comps).unwrap_err();
-        assert_eq!(err.prev_end, 10);
-        assert_eq!(err.next_start, 20);
-        assert!(err.to_string().contains("messages 11..19"), "{err}");
+        let cov = resolve_coverage(&comps).unwrap().unwrap();
+        assert_eq!(cov.coverage_end_ordinal, 30);
+        assert_eq!(cov.boundary_id, "m30");
     }
 
     #[test]
     fn an_overlap_fails_loud() {
-        // next starts at 8 but prev ended at 10 → overlap → not contiguous tiling
+        // next starts at 8 but prev ended at 10 → overlap → corrupt tiling
         let comps = vec![comp(1, 1, 10, "m10"), comp(2, 8, 15, "m15")];
         assert!(resolve_coverage(&comps).is_err());
     }

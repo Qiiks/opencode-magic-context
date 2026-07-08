@@ -1220,6 +1220,7 @@ mod tests {
                     message_id: "m4#0".into(),
                 },
             ],
+            present_ordinals: vec![1, 2, 3, 4],
             tool_only_ranges: vec![],
         }
     }
@@ -2057,6 +2058,7 @@ mod tests {
                     message_id: "m4#0".into(),
                 },
             ],
+            present_ordinals: vec![1, 2, 3, 4],
             tool_only_ranges: vec![],
         };
         let prior = [crate::historian_validate::StoredCompartmentRange {

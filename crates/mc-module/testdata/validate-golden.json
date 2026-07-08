@@ -398,7 +398,7 @@
     },
     "validation": {
       "ok": false,
-      "error": "Historian returned invalid compartment output: gap before message 19 (expected 3)"
+      "error": "Historian returned invalid compartment output: gap before present message 19 (expected 3)"
     }
   },
   {
@@ -835,11 +835,11 @@
     },
     "validation": {
       "ok": false,
-      "error": "Historian chunk coverage invalid: chunk coverage ends at 2 but chunk end is 3"
+      "error": "Historian chunk coverage invalid: chunk omits raw message 3 while still claiming coverage through 3"
     }
   },
   {
-    "label": "prior store contiguity accepts next raw ordinal",
+    "label": "prior live adjacency accepts next present raw ordinal",
     "input": {
       "text": "<output>\n<compartments>\n<compartment start=\"3\" end=\"5\" title=\"gamma\" episode_type=\"feature\" importance=\"50\">\n<p1>gamma full &amp; exact</p1>\n<p2>gamma short</p2>\n<p3>gamma</p3>\n<p4 />\n</compartment>\n</compartments>\n\n<meta><messages_processed>3-5</messages_processed><unprocessed_from>6</unprocessed_from></meta>\n</output>",
       "chunk": {
@@ -923,7 +923,7 @@
     }
   },
   {
-    "label": "prior store contiguity rejects skipped raw ordinal",
+    "label": "prior live adjacency rejects skipped present raw ordinal",
     "input": {
       "text": "<output>\n<compartments>\n<compartment start=\"4\" end=\"5\" title=\"gamma\" episode_type=\"feature\" importance=\"50\">\n<p1>gamma full &amp; exact</p1>\n<p2>gamma short</p2>\n<p3>gamma</p3>\n<p4 />\n</compartment>\n</compartments>\n\n<meta><messages_processed>4-5</messages_processed><unprocessed_from>6</unprocessed_from></meta>\n</output>",
       "chunk": {
@@ -939,6 +939,7 @@
             "message_id": "msg-5"
           }
         ],
+        "present_ordinals": [1, 2, 3, 4, 5],
         "tool_only_ranges": []
       },
       "prior_compartments": [
@@ -975,7 +976,7 @@
     },
     "validation": {
       "ok": false,
-      "error": "Historian chunk starts at raw message 4 but existing compartments end at 2; expected next raw message 3"
+      "error": "Historian chunk starts at raw message 4 but existing compartments end at 2; expected next present raw message 3"
     }
   },
   {

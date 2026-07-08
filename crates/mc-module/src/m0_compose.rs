@@ -22,8 +22,7 @@ use crate::project_docs::read_project_docs_canonical;
 pub enum M0ComposeError {
     /// A store read failed.
     Store(McStoreError),
-    /// The compartments don't tile contiguously — a raw message is covered by no
-    /// compartment, so composing m0 would silently drop it from the tail. Fail loud.
+    /// The stored compartment ranges overlap or otherwise fail strict ordering.
     CoverageGap(CoverageGap),
 }
 
@@ -103,8 +102,10 @@ pub fn compose_m0_from_store(
 ) -> Result<M0Composition, M0ComposeError> {
     // --- compartments: the session history, coverage anchor, and folded watermark ---
     let compartments = store.load_compartments(inputs.session_id)?;
-    // A contiguity gap means a raw message is covered by no compartment — composing m0
-    // anyway would drop it from the tail (unrecoverable). Fail loud.
+    // Store-pure coverage checks enforce strict ordering without assuming integer
+    // contiguity: consumer producers may retire ordinal numbers permanently. The
+    // transform layer has the live array and fails loud if a present message below
+    // the coverage end is not covered by any compartment.
     let coverage = resolve_coverage(&compartments).map_err(M0ComposeError::CoverageGap)?;
     let (boundary_id, coverage_ordinal, first_covered_ordinal, folded_compartment_seq) =
         match &coverage {
@@ -280,13 +281,14 @@ mod tests {
     }
 
     #[test]
-    fn coverage_gap_fails_loud() {
+    fn sparse_coordinate_gap_composes_store_pure() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let project_dir = dir.path().join("repo");
         std::fs::create_dir_all(&project_dir).unwrap();
 
-        // compartments 1-10 then 20-30 → messages 11-19 covered by nothing
+        // Store-only composition cannot tell whether 11-19 are retired ordinals
+        // or present uncovered messages, so sparse coordinate gaps compose here.
         store
             .replace_compartments("ses_gap", &[comp(1, 1, 10, "m10"), comp(2, 20, 30, "m30")])
             .unwrap();
@@ -297,8 +299,9 @@ mod tests {
             now_ms: 0,
             history_budget_tokens: 60_000.0,
         };
-        let err = compose_m0_from_store(&store, &inputs, no_estimate).unwrap_err();
-        assert!(format!("{err}").contains("coverage gap"), "{err}");
+        let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
+        assert_eq!(composed.coverage_ordinal, Some(30));
+        assert_eq!(composed.boundary_id, "m30");
     }
 
     #[test]

@@ -304,26 +304,38 @@ pub fn build_historian_chunk(
         .map(|message| message.ordinal)
         .max()
         .unwrap_or(0);
-    let start = start_ordinal;
+    let input_ordinals: Vec<u64> = messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+        .map(|message| message.ordinal)
+        .collect();
+    let start = messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+        .filter(|message| {
+            message.ordinal >= start_ordinal && message.ordinal < eligible_end_ordinal
+        })
+        .map(|message| message.ordinal)
+        .min()
+        .unwrap_or(start_ordinal);
     let tool_call_summaries = build_tool_call_summary_lookup(blocks);
     let mut builder = Builder::new(token_budget, start, tool_call_summaries);
     let blocks_by_mid = grouped_blocks_by_mid(blocks);
     for message in messages.iter().filter(|message| !message.ck.meta.synthetic) {
         if message.ordinal >= eligible_end_ordinal {
-            break;
+            continue;
         }
         let role = message.ck.role.as_str();
         if message.ordinal < start {
             continue;
         }
-        // System-role content never enters the chunk text (it is pinned prompt
-        // material, not conversation), but its ORDINAL must still ride the
-        // chunk's line meta: the coverage validator requires the claimed raw
-        // range to be contiguous, and a compartment covering the span genuinely
-        // folds the system message out of the tail (build_output re-emits
-        // covered system at the head). Feeding it through as a zero-block
-        // message reuses the pending-noise absorption that already handles
-        // empty messages, instead of silently gapping the coverage.
+        // System-role content is pinned prompt material, so it never enters
+        // chunk text. Its ordinal still enters line metadata when present in
+        // the claimed range. Consumer legs may retire other ordinal numbers
+        // permanently, so validation compares against the sparse live set
+        // instead of requiring integer contiguity. Feeding system messages
+        // through as zero-block messages reuses the empty-message path instead
+        // of leaving a silent coverage gap.
         let flat_message = FlatMessage {
             mid: message.mid.as_str(),
             ordinal: message.ordinal,
@@ -344,6 +356,7 @@ pub fn build_historian_chunk(
     let _ = builder.flush_current_block();
     let tool_only_ranges = merge_tool_only_ranges(&builder.tool_only_ranges);
     let end = builder.last_ordinal;
+    let present_ordinals = input_ordinals;
     let snapshot = blocks
         .iter()
         .filter(|block| {
@@ -364,6 +377,7 @@ pub fn build_historian_chunk(
             start_index: start,
             end_index: end,
             lines: builder.line_meta,
+            present_ordinals,
             tool_only_ranges,
         },
         snapshot,
@@ -475,7 +489,18 @@ pub fn assemble_historian_firing(
     let eligible_end = config.boundary.eligible_head.end;
     let chunk_start =
         if let Some(last_end) = compartments.iter().map(|c| c.end_message as u64).max() {
-            last_end.saturating_add(1)
+            let Some(next_present) = messages
+                .iter()
+                .filter(|message| !message.ck.meta.synthetic)
+                .map(|message| message.ordinal)
+                .filter(|ordinal| *ordinal > last_end && *ordinal < eligible_end)
+                .min()
+            else {
+                return Ok(AssembleHistorianFiringOutcome::NoFire(
+                    HistorianNoFireReason::EmptyChunk,
+                ));
+            };
+            next_present
         } else {
             let Some(first_live_eligible) = messages
                 .iter()
@@ -527,8 +552,11 @@ pub fn assemble_historian_firing(
         ));
     }
 
-    let reference_blocks =
-        build_reference_blocks_from_stored(&config.session_id, chunk_start as i64, &compartments);
+    let reference_blocks = build_reference_blocks_from_stored(
+        &config.session_id,
+        chunk.chunk.start_index as i64,
+        &compartments,
+    );
     let memories = store.load_active_memories(&config.project_path, now_ms)?;
     let memory_block = render_historian_memory_block(&memories);
     let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
@@ -912,7 +940,7 @@ mod tests {
     use crate::ck_wire::{
         project_messages, CkIngressMessage, CkWireBlock, CkWireMessage, HarnessMeta,
     };
-    use mc_store::{CkKind, ProviderExtras};
+    use mc_store::{CkKind, ProviderExtras, StoredCompartment};
     use serde::Deserialize;
     use serde_json::json;
 
@@ -990,6 +1018,50 @@ mod tests {
         }
     }
 
+    fn store_for_tests() -> (tempfile::TempDir, mc_store::McStore) {
+        use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = mc_store::McStore::open(&StorageDescriptor {
+            module_id: "magic-context-test".to_string(),
+            storage_namespace: "mc_cache".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().to_string(),
+            },
+        })
+        .unwrap();
+        (dir, store)
+    }
+
+    fn stored_compartment(seq: i64, start: i64, end: i64, end_id: &str) -> StoredCompartment {
+        StoredCompartment {
+            sequence: seq,
+            start_message: start,
+            end_message: end,
+            start_message_id: format!("m{start}#0"),
+            end_message_id: end_id.to_string(),
+            title: format!("compartment {seq}"),
+            content: "prior summary".to_string(),
+            p1: Some("prior summary".to_string()),
+            importance: 50,
+            ..Default::default()
+        }
+    }
+
+    fn historian_output(start: u64, end: u64, unprocessed_from: u64) -> String {
+        format!(
+            r#"<output>
+<compartments>
+<compartment start="{start}" end="{end}" title="sparse fold" episode_type="feature" importance="60">
+<p1>sparse fold full and exact</p1><p2>sparse fold short</p2><p3>sparse fold</p3><p4 />
+</compartment>
+</compartments>
+<meta><messages_processed>{start}-{end}</messages_processed><unprocessed_from>{unprocessed_from}</unprocessed_from></meta>
+</output>"#
+        )
+    }
+
     fn project_and_build(
         messages: &[CkIngressMessage],
         offset: u64,
@@ -1014,8 +1086,9 @@ mod tests {
         assert!(built.text.contains("U: hello"));
         assert!(built.text.contains("A: done"));
         assert_eq!(built.chunk.start_index, 1);
-        // ...but its ordinal rides the line meta: the claimed coverage range
-        // must be contiguous or validate_chunk_coverage rejects the firing.
+        // ...but its ordinal rides the line meta: every present ordinal in the
+        // claimed coverage range must be represented, even though consumer-leg
+        // ordinal spaces can be sparse.
         let ordinals: Vec<u64> = built.chunk.lines.iter().map(|line| line.ordinal).collect();
         assert_eq!(ordinals, vec![1, 2, 3]);
         assert_eq!(built.chunk.lines[0].message_id, "u1#0");
@@ -1196,6 +1269,121 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn assemble_and_validate_second_fold_accepts_sparse_consumer_ordinals() {
+        let (_dir, store) = store_for_tests();
+        store
+            .replace_compartments("ses-sparse", &[stored_compartment(1, 0, 2, "m2#0")])
+            .unwrap();
+        let messages = vec![
+            msg("m0", 0, "user", vec![text("first request")]),
+            msg("m1", 1, "assistant", vec![text("first answer")]),
+            msg(
+                "m2",
+                2,
+                "user",
+                vec![text("follow-up before the first fold")],
+            ),
+            msg(
+                "m3",
+                3,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: "call-3".to_string(),
+                    name: "read".to_string(),
+                    input: json!({"path":"src/lib.rs"}),
+                    provider_executed: false,
+                }],
+            ),
+            msg(
+                "m6",
+                6,
+                "tool",
+                vec![CkKind::ToolResult {
+                    id: "call-3".to_string(),
+                    tool_name: "read".to_string(),
+                    output: mc_store::CkToolOutput::bare(mc_store::CkOutputKind::Text {
+                        text: "file contents".to_string(),
+                    }),
+                    provider_executed: false,
+                }],
+            ),
+            msg("m7", 7, "user", vec![text("I found the issue")]),
+            msg("m9", 9, "assistant", vec![text("please continue")]),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        let outcome = assemble_historian_firing(
+            &store,
+            &messages,
+            &projection.blocks,
+            HistorianAssemblerConfig {
+                session_id: "ses-sparse".to_string(),
+                project_path: "/proj".to_string(),
+                project_slug: "proj".to_string(),
+                model_chain: vec!["prov/model".to_string()],
+                token_budget: 32_000,
+                boundary: crate::boundary::BoundaryResolution {
+                    protected_start_ordinal: 10,
+                    eligible_head: 0..10,
+                    n_tokens: 0.0,
+                    floored_by_live_prompt: false,
+                    fenced_by_open_arc: false,
+                    true_raw_eligible_tokens: 10_000.0,
+                    oversize_atomic_unit: false,
+                    raw_message_count: messages.len() as u64,
+                    boundary_reason: "test".to_string(),
+                },
+                memory_enabled: false,
+                extraction_free: false,
+                in_emergency: false,
+                failure_backoff_at_ms: 0,
+                min_chunk_tokens: 0,
+            },
+            1,
+        )
+        .unwrap();
+
+        let AssembleHistorianFiringOutcome::Fire(firing) = outcome else {
+            panic!("expected sparse second fold to fire, got {outcome:?}");
+        };
+        let line_ordinals: Vec<u64> = firing
+            .chunk
+            .chunk
+            .lines
+            .iter()
+            .map(|line| line.ordinal)
+            .collect();
+        assert_eq!(firing.from_ordinal, 3);
+        assert_eq!(firing.to_ordinal, 9);
+        assert_eq!(line_ordinals, vec![3, 6, 7, 9]);
+        let coverage_error =
+            crate::historian_validate::validate_chunk_coverage(&firing.chunk.chunk);
+        assert!(
+            !coverage_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("chunk omits raw message 4"),
+            "the sparse live set must not reproduce the retired-ordinal rejection"
+        );
+        assert!(
+            coverage_error.is_none(),
+            "retired ordinals 4, 5, and 8 must not be treated as omitted raw messages"
+        );
+
+        let output = historian_output(3, 9, 10);
+        let validated = crate::historian_validate::validate_historian_output(
+            &output,
+            &firing.chunk.chunk,
+            &firing.prior_compartments,
+            firing.validate_options,
+        )
+        .expect("sparse second fold validates");
+        assert_eq!(validated.compartments.len(), 1);
+        assert_eq!(validated.compartments[0].start_message, 3);
+        assert_eq!(validated.compartments[0].end_message, 9);
+        assert_eq!(validated.unprocessed_from, 10);
     }
 
     #[test]

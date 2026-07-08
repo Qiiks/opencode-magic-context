@@ -2492,10 +2492,11 @@ impl McStore {
     }
 }
 
-/// Test-support seed helpers for sibling crates (gated behind `test-support` so the
-/// writers never ship in production). mc-module composes over this store and needs to
-/// populate memories/mutations in its tests.
-#[cfg(feature = "test-support")]
+/// Test-support seed helpers for sibling crates and this crate's own tests (gated
+/// behind `test-support` or `cfg(test)` so the writers never ship in production).
+/// mc-module composes over this store and needs to populate memories/mutations in
+/// its tests.
+#[cfg(any(test, feature = "test-support"))]
 impl McStore {
     /// Insert an active memory for `project_path`.
     pub fn seed_memory(

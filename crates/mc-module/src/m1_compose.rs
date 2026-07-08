@@ -33,7 +33,7 @@ use crate::memory_render::{
 #[derive(Debug)]
 pub enum M1ComposeError {
     Store(McStoreError),
-    /// A compartment-coverage gap (a raw message covered by no compartment).
+    /// Stored compartment ranges overlap or otherwise fail strict ordering.
     CoverageGap(CoverageGap),
 }
 
@@ -149,6 +149,9 @@ pub fn compose_m1_from_store(
     };
 
     // --- new compartments (seq past the folded watermark) at P1 + coverage extension ---
+    // Store-only ordering deliberately allows sparse ordinal gaps; transform has
+    // the live array and rejects any coverage advance that would trim present,
+    // uncovered input.
     let compartments = store.load_compartments(session_id)?;
     let coverage = resolve_coverage(&compartments).map_err(M1ComposeError::CoverageGap)?;
     let (_folded, new_comps) = partition_by_folded_seq(&compartments, meta.folded_compartment_seq);

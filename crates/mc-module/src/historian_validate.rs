@@ -44,14 +44,20 @@ pub struct HistorianChunk {
     pub start_index: u64,
     pub end_index: u64,
     pub lines: Vec<ChunkLine>,
+    /// All non-synthetic input ordinals visible when this chunk was built, in
+    /// provider order. Claude Code proxy submissions can permanently retire
+    /// ordinals when message identities are re-minted, so validation filters
+    /// this sparse set to the claimed range instead of assuming 0..n density.
+    #[serde(default)]
+    pub present_ordinals: Vec<u64>,
     /// Gaps fully inside one of these ranges are safe to heal at any size because
     /// the omitted raw lines were tool-only transcript noise rather than narrative.
     #[serde(default)]
     pub tool_only_ranges: Vec<MessageRange>,
 }
 
-/// An already-persisted compartment range. Only the raw ordinal span is needed
-/// for validating store contiguity before appending new compartments.
+/// An already-persisted compartment range with the raw start and end ordinals
+/// needed to validate store ordering before appending new compartments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredCompartmentRange {
     pub start_message: u64,
@@ -395,6 +401,7 @@ pub fn validate_historian_output(
     prior_compartments: &[StoredCompartmentRange],
     options: ValidateOptions,
 ) -> Result<ValidatedChunk, HistorianValidationError> {
+    let present_ordinals = chunk_present_ordinals(chunk);
     if let Some(error) = validate_chunk_coverage(chunk) {
         return Err(validation_error(format!(
             "Historian chunk coverage invalid: {error}"
@@ -408,12 +415,19 @@ pub fn validate_historian_output(
     }
 
     if let Some(last) = prior_compartments.last() {
-        let expected_start = last.end_message.saturating_add(1);
-        if chunk.start_index != expected_start {
+        if chunk.start_index <= last.end_message {
             return Err(validation_error(format!(
-                "Historian chunk starts at raw message {} but existing compartments end at {}; expected next raw message {}",
-                chunk.start_index, last.end_message, expected_start
+                "Historian chunk starts at raw message {} but existing compartments end at {}; expected a strictly newer raw message",
+                chunk.start_index, last.end_message
             )));
+        }
+        if let Some(expected_start) = next_present_after(&present_ordinals, last.end_message) {
+            if chunk.start_index != expected_start {
+                return Err(validation_error(format!(
+                    "Historian chunk starts at raw message {} but existing compartments end at {}; expected next present raw message {}",
+                    chunk.start_index, last.end_message, expected_start
+                )));
+            }
         }
     }
 
@@ -424,7 +438,11 @@ pub fn validate_historian_output(
         ));
     }
 
-    heal_compartment_gaps(&mut parsed.compartments, &chunk.tool_only_ranges);
+    heal_compartment_gaps(
+        &mut parsed.compartments,
+        &chunk.tool_only_ranges,
+        &present_ordinals,
+    );
 
     let emitted =
         map_parsed_compartments_to_chunk(&parsed.compartments, chunk, options.sequence_offset)
@@ -438,6 +456,7 @@ pub fn validate_historian_output(
         &parsed.compartments,
         chunk.start_index,
         chunk.end_index,
+        &present_ordinals,
         parsed.unprocessed_from,
     ) {
         return Err(validation_error(format!(
@@ -521,6 +540,10 @@ pub fn validate_historian_output(
         events,
         primer_candidates,
         user_observations,
+        // This value is a publication floor, not a promise that the next integer
+        // ordinal exists. Consumer legs may retire ordinals permanently, so
+        // downstream scans treat it as a lower bound and advance to the next
+        // present input message.
         unprocessed_from: last_new_end.saturating_add(1),
         discarded_last,
     })
@@ -539,34 +562,72 @@ pub fn validate_stored_compartments(compartments: &[StoredCompartmentRange]) -> 
         ));
     }
 
-    let mut expected_start = first.end_message.saturating_add(1);
+    let mut previous_end = first.end_message;
     for compartment in &compartments[1..] {
-        if compartment.start_message != expected_start {
-            if compartment.start_message < expected_start {
-                return Some(format!(
-                    "overlap before message {expected_start} (saw {}-{})",
-                    compartment.start_message, compartment.end_message
-                ));
-            }
-            return Some(format!(
-                "gap before message {} (expected {expected_start})",
-                compartment.start_message
-            ));
-        }
         if compartment.end_message < compartment.start_message {
             return Some(format!(
                 "invalid range {}-{}",
                 compartment.start_message, compartment.end_message
             ));
         }
-        expected_start = compartment.end_message.saturating_add(1);
+        if compartment.start_message <= previous_end {
+            return Some(format!(
+                "overlap before message {} (saw {}-{})",
+                previous_end.saturating_add(1),
+                compartment.start_message,
+                compartment.end_message
+            ));
+        }
+        previous_end = compartment.end_message;
     }
 
     None
 }
 
-/// Ensure the chunk's ordinal lines cover exactly the advertised raw range.
+fn chunk_present_ordinals(chunk: &HistorianChunk) -> Vec<u64> {
+    if !chunk.present_ordinals.is_empty() {
+        return chunk.present_ordinals.clone();
+    }
+    chunk.lines.iter().map(|line| line.ordinal).collect()
+}
+
+fn validate_strictly_increasing_ordinals(ordinals: &[u64], label: &str) -> Option<String> {
+    for pair in ordinals.windows(2) {
+        let previous = pair[0];
+        let current = pair[1];
+        if current == previous {
+            return Some(format!(
+                "{label} contain duplicate raw message ordinal {current}"
+            ));
+        }
+        if current < previous {
+            return Some(format!(
+                "{label} decrease from raw message {previous} to {current}"
+            ));
+        }
+    }
+    None
+}
+
+fn next_present_after(ordinals: &[u64], after: u64) -> Option<u64> {
+    ordinals.iter().copied().find(|ordinal| *ordinal > after)
+}
+
+/// Ensure the chunk's ordinal lines cover exactly the present input ordinals in
+/// the advertised raw range. Consumer legs can retire ordinal numbers permanently,
+/// so a missing integer is valid when it is absent from the real input set.
 pub fn validate_chunk_coverage(chunk: &HistorianChunk) -> Option<String> {
+    if chunk.present_ordinals.is_empty() {
+        return validate_dense_chunk_coverage(chunk);
+    }
+    validate_chunk_coverage_against(chunk, &chunk.present_ordinals)
+}
+
+fn validate_dense_chunk_coverage(chunk: &HistorianChunk) -> Option<String> {
+    let line_ordinals: Vec<u64> = chunk.lines.iter().map(|line| line.ordinal).collect();
+    if let Some(error) = validate_strictly_increasing_ordinals(&line_ordinals, "chunk lines") {
+        return Some(error);
+    }
     if chunk.lines.is_empty() {
         return None;
     }
@@ -584,9 +645,70 @@ pub fn validate_chunk_coverage(chunk: &HistorianChunk) -> Option<String> {
 
     if expected_ordinal.saturating_sub(1) != chunk.end_index {
         return Some(format!(
-            "chunk coverage ends at {} but chunk end is {}",
-            expected_ordinal.saturating_sub(1),
+            "chunk omits raw message {} while still claiming coverage through {}",
+            expected_ordinal, chunk.end_index
+        ));
+    }
+
+    None
+}
+
+fn validate_chunk_coverage_against(
+    chunk: &HistorianChunk,
+    present_ordinals: &[u64],
+) -> Option<String> {
+    if let Some(error) = validate_strictly_increasing_ordinals(present_ordinals, "input ordinals") {
+        return Some(error);
+    }
+
+    let line_ordinals: Vec<u64> = chunk.lines.iter().map(|line| line.ordinal).collect();
+    if let Some(error) = validate_strictly_increasing_ordinals(&line_ordinals, "chunk lines") {
+        return Some(error);
+    }
+
+    if let Some(outside) = line_ordinals
+        .iter()
+        .find(|ordinal| **ordinal < chunk.start_index || **ordinal > chunk.end_index)
+    {
+        return Some(format!(
+            "chunk line raw message {outside} is outside claimed coverage {}-{}",
+            chunk.start_index, chunk.end_index
+        ));
+    }
+
+    let expected: Vec<u64> = present_ordinals
+        .iter()
+        .copied()
+        .filter(|ordinal| *ordinal >= chunk.start_index && *ordinal <= chunk.end_index)
+        .collect();
+
+    for (line, expected) in line_ordinals.iter().zip(expected.iter()) {
+        if line == expected {
+            continue;
+        }
+        if line > expected {
+            return Some(format!(
+                "chunk omits raw message {expected} while still claiming coverage through {}",
+                chunk.end_index
+            ));
+        }
+        return Some(format!(
+            "chunk includes raw message {line} that is not present in input range {}-{}",
+            chunk.start_index, chunk.end_index
+        ));
+    }
+
+    if let Some(missing) = expected.get(line_ordinals.len()) {
+        return Some(format!(
+            "chunk omits raw message {missing} while still claiming coverage through {}",
             chunk.end_index
+        ));
+    }
+
+    if let Some(extra) = line_ordinals.get(expected.len()) {
+        return Some(format!(
+            "chunk includes raw message {extra} that is not present in input range {}-{}",
+            chunk.start_index, chunk.end_index
         ));
     }
 
@@ -646,6 +768,7 @@ fn parse_events(text: &str) -> Vec<ParsedEvent> {
 fn heal_compartment_gaps(
     compartments: &mut [ParsedCompartment],
     tool_only_ranges: &[MessageRange],
+    present_ordinals: &[u64],
 ) {
     for i in 1..compartments.len() {
         let gap_start = compartments[i - 1].end_message.saturating_add(1);
@@ -653,12 +776,23 @@ fn heal_compartment_gaps(
         if gap_end < gap_start {
             continue;
         }
-        let gap_size = gap_end.saturating_sub(gap_start).saturating_add(1);
-        let fully_inside_tool_only = tool_only_ranges
+        let omitted_present: Vec<u64> = present_ordinals
             .iter()
-            .any(|range| range.start <= gap_start && range.end >= gap_end);
-        if fully_inside_tool_only || gap_size <= SAFETY_HEAL_GAP {
-            compartments[i - 1].end_message = gap_end;
+            .copied()
+            .filter(|ordinal| *ordinal >= gap_start && *ordinal <= gap_end)
+            .collect();
+        if omitted_present.is_empty() {
+            continue;
+        }
+        let fully_inside_tool_only = omitted_present.iter().all(|ordinal| {
+            tool_only_ranges
+                .iter()
+                .any(|range| range.start <= *ordinal && range.end >= *ordinal)
+        });
+        if fully_inside_tool_only || omitted_present.len() as u64 <= SAFETY_HEAL_GAP {
+            compartments[i - 1].end_message = *omitted_present
+                .last()
+                .expect("non-empty omitted present ordinals checked above");
         }
     }
 }
@@ -710,9 +844,15 @@ fn validate_parsed_compartments(
     compartments: &[ParsedCompartment],
     chunk_start: u64,
     chunk_end: u64,
+    present_ordinals: &[u64],
     unprocessed_from: Option<u64>,
 ) -> Option<String> {
-    let mut expected_start = chunk_start;
+    let chunk_ordinals: Vec<u64> = present_ordinals
+        .iter()
+        .copied()
+        .filter(|ordinal| *ordinal >= chunk_start && *ordinal <= chunk_end)
+        .collect();
+    let mut expected_start = chunk_ordinals.first().copied();
 
     for compartment in compartments {
         if compartment.end_message < compartment.start_message {
@@ -727,22 +867,48 @@ fn validate_parsed_compartments(
                 compartment.start_message, compartment.end_message, chunk_start, chunk_end
             ));
         }
-        if compartment.start_message != expected_start {
-            if compartment.start_message < expected_start {
+        if !chunk_ordinals.contains(&compartment.start_message) {
+            return Some(format!(
+                "range start {} is not a present raw message in chunk {}-{}",
+                compartment.start_message, chunk_start, chunk_end
+            ));
+        }
+        if !chunk_ordinals.contains(&compartment.end_message) {
+            return Some(format!(
+                "range end {} is not a present raw message in chunk {}-{}",
+                compartment.end_message, chunk_start, chunk_end
+            ));
+        }
+        let Some(expected) = expected_start else {
+            return Some(format!(
+                "range {}-{} starts after chunk coverage already ended",
+                compartment.start_message, compartment.end_message
+            ));
+        };
+        if compartment.start_message != expected {
+            if compartment.start_message < expected {
                 return Some(format!(
-                    "overlap before message {expected_start} (saw {}-{})",
+                    "overlap before message {expected} (saw {}-{})",
                     compartment.start_message, compartment.end_message
                 ));
             }
             return Some(format!(
-                "gap before message {} (expected {expected_start})",
+                "gap before present message {} (expected {expected})",
                 compartment.start_message
             ));
         }
-        expected_start = compartment.end_message.saturating_add(1);
+        expected_start = next_present_after(&chunk_ordinals, compartment.end_message);
     }
 
     if let Some(unprocessed_from) = unprocessed_from {
+        if let Some(expected) = expected_start {
+            if unprocessed_from != expected {
+                return Some(format!(
+                    "<unprocessed_from> {unprocessed_from} does not match next uncovered message {expected}"
+                ));
+            }
+            return None;
+        }
         if unprocessed_from == chunk_end.saturating_add(1) {
             return None;
         }
@@ -751,17 +917,15 @@ fn validate_parsed_compartments(
                 "<unprocessed_from> {unprocessed_from} is outside chunk {chunk_start}-{chunk_end}"
             ));
         }
-        if unprocessed_from != expected_start {
-            return Some(format!(
-                "<unprocessed_from> {unprocessed_from} does not match next uncovered message {expected_start}"
-            ));
-        }
-        return None;
+        return Some(format!(
+            "<unprocessed_from> {unprocessed_from} does not match completed chunk boundary {}",
+            chunk_end.saturating_add(1)
+        ));
     }
 
-    if expected_start <= chunk_end {
+    if let Some(expected) = expected_start {
         return Some(format!(
-            "output left uncovered messages {expected_start}-{chunk_end} without <unprocessed_from>"
+            "output left uncovered messages {expected}-{chunk_end} without <unprocessed_from>"
         ));
     }
 
@@ -993,6 +1157,7 @@ mod tests {
                     message_id: format!("msg-{ordinal}"),
                 })
                 .collect(),
+            present_ordinals: (start..=end).collect(),
             tool_only_ranges: Vec::new(),
         }
     }
@@ -1047,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_compartment_validation_is_basis_agnostic_but_rejects_internal_gaps() {
+    fn stored_compartment_validation_is_basis_agnostic_and_allows_sparse_gaps() {
         assert_eq!(
             validate_stored_compartments(&[
                 StoredCompartmentRange {
@@ -1062,18 +1227,20 @@ mod tests {
             None
         );
 
-        let gap = validate_stored_compartments(&[
-            StoredCompartmentRange {
-                start_message: 5,
-                end_message: 7,
-            },
-            StoredCompartmentRange {
-                start_message: 9,
-                end_message: 10,
-            },
-        ])
-        .expect("interior gap rejected");
-        assert!(gap.contains("gap before message 9"));
+        assert_eq!(
+            validate_stored_compartments(&[
+                StoredCompartmentRange {
+                    start_message: 5,
+                    end_message: 7,
+                },
+                StoredCompartmentRange {
+                    start_message: 9,
+                    end_message: 10,
+                },
+            ]),
+            None,
+            "store-pure validation cannot distinguish retired ordinals from gaps",
+        );
 
         let overlap = validate_stored_compartments(&[
             StoredCompartmentRange {
@@ -1087,6 +1254,55 @@ mod tests {
         ])
         .expect("overlap rejected");
         assert!(overlap.contains("overlap before message 5"));
+    }
+
+    #[test]
+    fn chunk_coverage_rejects_duplicate_and_decreasing_ordinals() {
+        let duplicate = HistorianChunk {
+            start_index: 1,
+            end_index: 2,
+            lines: vec![
+                ChunkLine {
+                    ordinal: 1,
+                    message_id: "m1#0".into(),
+                },
+                ChunkLine {
+                    ordinal: 1,
+                    message_id: "m1-dup#0".into(),
+                },
+                ChunkLine {
+                    ordinal: 2,
+                    message_id: "m2#0".into(),
+                },
+            ],
+            present_ordinals: vec![1, 1, 2],
+            tool_only_ranges: Vec::new(),
+        };
+        let duplicate_error = validate_chunk_coverage(&duplicate).expect("duplicate rejected");
+        assert!(duplicate_error.contains("duplicate raw message ordinal 1"));
+
+        let decreasing = HistorianChunk {
+            start_index: 1,
+            end_index: 3,
+            lines: vec![
+                ChunkLine {
+                    ordinal: 1,
+                    message_id: "m1#0".into(),
+                },
+                ChunkLine {
+                    ordinal: 3,
+                    message_id: "m3#0".into(),
+                },
+                ChunkLine {
+                    ordinal: 2,
+                    message_id: "m2#0".into(),
+                },
+            ],
+            present_ordinals: vec![1, 2, 3],
+            tool_only_ranges: Vec::new(),
+        };
+        let decreasing_error = validate_chunk_coverage(&decreasing).expect("decrease rejected");
+        assert!(decreasing_error.contains("chunk lines decrease from raw message 3 to 2"));
     }
 
     #[test]
