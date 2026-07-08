@@ -557,6 +557,19 @@ channel) — it reflects `task_schedule_state` read-only.
 
 ---
 
+## 19b. Processed-image stripping is OpenCode-only
+
+OpenCode replaces large base64 image payloads in user `file` parts with
+sentinels once the assistant has processed them (`stripProcessedImages`,
+frozen-id replay). Pi's image part shape differs (`kind: "image"` with a URL)
+and large base64 images are rare in Pi sessions — the equivalent strip would
+only fire for the pasted-screenshot case, which Pi does not currently
+optimize. A Pi-specific image-content stripper can be added later if that
+case becomes common. Intentional divergence (see the cleanup-stage notes in
+`context-handler.ts`).
+
+---
+
 ## 19a. `/ctx-aug` skips empty sidekick augmentation blocks
 
 When sidekick returns the empty-result sentinel (for example, "No relevant

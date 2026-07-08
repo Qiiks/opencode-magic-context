@@ -83,7 +83,11 @@ jobs:
       - name: Smoke (TUI entry import)
         run: bun packages/plugin/scripts/smoke-tui-import.ts
 
-      - name: Smoke (TUI pack install)
+      # The dev-path import above cannot catch packaging breaks: OpenTUI's Solid
+      # transform skips node_modules sources, so only a packed PROD install
+      # exercises the resolution path OpenCode's plugin cache uses (v0.31.1
+      # shipped without runtime deps and passed every dev-path check).
+      - name: Smoke (TUI packaged install import)
         run: bun packages/plugin/scripts/smoke-tui-pack-install.ts
 
   check-pi-plugin:

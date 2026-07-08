@@ -97,7 +97,9 @@ jobs:
       - name: Smoke (TUI entry import)
         run: bun packages/plugin/scripts/smoke-tui-import.ts
 
-      - name: Smoke (TUI pack install)
+      # Packaged-install import — the only check that exercises the published
+      # node_modules load path (the v0.31.1 failure class).
+      - name: Smoke (TUI packaged install import)
         run: bun packages/plugin/scripts/smoke-tui-pack-install.ts
 
   test-pi:
