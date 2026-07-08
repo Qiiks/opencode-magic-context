@@ -326,8 +326,12 @@ export async function getSessionCacheStats(
 
 export async function getSessionCacheStatsFromDb(
   limit?: number,
+  showUnmanaged?: boolean,
 ): Promise<import("./types").SessionCacheStats[]> {
-  return invoke("get_session_cache_stats_from_db", { limit: limit ?? 5 });
+  return invoke("get_session_cache_stats_from_db", {
+    limit: limit ?? 5,
+    showUnmanaged: showUnmanaged ?? false,
+  });
 }
 
 // ── Dreamer API ─────────────────────────────────────────────

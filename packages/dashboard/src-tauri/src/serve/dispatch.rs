@@ -216,6 +216,7 @@ struct CacheEventsFromDbArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LimitArgs {
     limit: Option<usize>,
+    show_unmanaged: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -607,7 +608,10 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
         }
         "get_session_cache_stats_from_db" => {
             let a: LimitArgs = parse_args(args)?;
-            json(db::get_session_cache_stats_from_db(a.limit.unwrap_or(5)))
+            json(db::get_session_cache_stats_from_db(
+                a.limit.unwrap_or(5),
+                a.show_unmanaged.unwrap_or(false),
+            ))
         }
         "get_config" => {
             let a: GetConfigArgs = parse_args(args)?;

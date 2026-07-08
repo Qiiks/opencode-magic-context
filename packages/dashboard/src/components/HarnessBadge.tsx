@@ -4,16 +4,23 @@ interface HarnessBadgeProps {
   harness: Harness;
 }
 
+const HARNESS_LABELS: Record<Harness, { short: string; title: string; color: string }> = {
+  opencode: { short: "OC", title: "OpenCode", color: "amber" },
+  pi: { short: "Pi", title: "Pi", color: "purple" },
+  claude_code: { short: "CC", title: "Claude Code", color: "blue" },
+  codex: { short: "Codex", title: "Codex", color: "green" },
+};
+
 export default function HarnessBadge(props: HarnessBadgeProps) {
-  const isPi = () => props.harness === "pi";
+  const info = () => HARNESS_LABELS[props.harness];
 
   return (
     <span
-      class={`pill ${isPi() ? "purple" : "amber"}`}
-      title={isPi() ? "Pi" : "OpenCode"}
+      class={`pill ${info().color}`}
+      title={info().title}
       style={{ "font-size": "9px", "line-height": "1.3", "text-transform": "uppercase" }}
     >
-      {isPi() ? "Pi" : "OC"}
+      {info().short}
     </span>
   );
 }

@@ -101,7 +101,7 @@ export interface SessionSummary {
   is_subagent: boolean;
 }
 
-export type Harness = "opencode" | "pi";
+export type Harness = "opencode" | "pi" | "claude_code" | "codex";
 
 export interface SessionFilter {
   harness?: Harness;
@@ -444,7 +444,11 @@ export interface SessionCacheStats {
   total_input: number;
   hit_ratio: number;
   last_timestamp: string;
+  last_activity_ms: number;
   bust_count: number;
+  managed: boolean;
+  is_subagent: boolean;
+  title: string | null;
 }
 
 export interface ConfigFile {

@@ -1,13 +1,18 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { formatDateTime, getSessionCacheEvents, listSessions, truncate } from "../../lib/api";
+import {
+  formatDateTime,
+  getSessionCacheEvents,
+  getSessionCacheStatsFromDb,
+  truncate,
+} from "../../lib/api";
 import { severityColorClass } from "../../lib/cache-format";
-import type { DbCacheEvent, Harness, SessionCacheStats, SessionRow } from "../../lib/types";
+import type { DbCacheEvent, Harness, SessionCacheStats } from "../../lib/types";
 import HarnessBadge from "../HarnessBadge";
 import CacheTimeline from "../shared/CacheTimeline";
 import FilterSelect from "../shared/FilterSelect";
 
 type HarnessFilter = "all" | Harness;
-type CacheSessionStats = SessionCacheStats & { harness: Harness };
+type CacheSessionStats = SessionCacheStats;
 type SelectedSession = { harness: Harness; sessionId: string };
 
 // Per-session event WINDOW: the most-recent ≤N events for one session, kept in
@@ -25,12 +30,26 @@ interface SessionWindow {
 // Module-level state — survives component unmount/remount so a return to the
 // page rehydrates instantly. Keyed by `${harness}:${sessionId}`.
 const cachedWindows = new Map<string, SessionWindow>();
-let cachedSessions: SessionRow[] = []; // titles + subagent flags + recency
+let cachedSessions: CacheSessionStats[] = []; // titles + subagent flags + recency
 let cachedSelectedSession: SelectedSession | null = null;
 // How many recent sessions to surface as cards. 10 (not 5) fills wide screens.
 const RECENT_SESSIONS_LIMIT = 10;
+const CACHE_STATS_FETCH_LIMIT = 50;
+const SHOW_UNMANAGED_STORAGE_KEY = "mc_cache_show_unmanaged";
 
 const windowKey = (harness: Harness, sessionId: string) => `${harness}:${sessionId}`;
+
+function loadShowUnmanagedPreference(): boolean {
+  try {
+    return localStorage.getItem(SHOW_UNMANAGED_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function isManagedFilterableHarness(harness: Harness): boolean {
+  return harness === "claude_code" || harness === "codex";
+}
 
 export default function CacheDiagnostics() {
   // The session windows live in a module-level Map (mutated in place during
@@ -47,6 +66,9 @@ export default function CacheDiagnostics() {
   );
   const [harnessFilter, setHarnessFilter] = createSignal<HarnessFilter>("all");
   const [hideSubagents, setHideSubagents] = createSignal(true);
+  const [showUnmanagedSessions, setShowUnmanagedSessionsSignal] = createSignal(
+    loadShowUnmanagedPreference(),
+  );
   const [expandedTurns, setExpandedTurns] = createSignal<Set<string>>(new Set());
   // Window size = how many recent events to keep per session (the picker). Drives
   // both the per-session card stats and the selected session's chart/list.
@@ -117,7 +139,7 @@ export default function CacheDiagnostics() {
   // session's window.
   const windowSize = () => timelineLimit();
 
-  const applySessionMeta = (sessions: SessionRow[]) => {
+  const applySessionMeta = (sessions: CacheSessionStats[]) => {
     cachedSessions = sessions;
     const names: Record<string, string> = {};
     for (const s of sessions) {
@@ -130,8 +152,11 @@ export default function CacheDiagnostics() {
   // The recent sessions we keep windows for: top-N by activity, non-subagent
   // (unless the user toggled them on), plus the selected session even if it has
   // aged out of the top-N so its chart stays live.
-  const recentSessionRows = (sessions: SessionRow[]): SessionRow[] => {
-    const want = hideSubagents() ? sessions.filter((s) => !s.is_subagent) : sessions;
+  const recentSessionRows = (sessions: CacheSessionStats[]): CacheSessionStats[] => {
+    const managedFiltered = showUnmanagedSessions()
+      ? sessions
+      : sessions.filter((s) => !isManagedFilterableHarness(s.harness) || s.managed);
+    const want = hideSubagents() ? managedFiltered.filter((s) => !s.is_subagent) : managedFiltered;
     const top = want.slice(0, RECENT_SESSIONS_LIMIT);
     const sel = cachedSelectedSession;
     if (sel && !top.some((s) => s.harness === sel.harness && s.session_id === sel.sessionId)) {
@@ -146,7 +171,7 @@ export default function CacheDiagnostics() {
   // Full window load for one session: the most-recent N events, replacing any
   // prior window. Used on initial load, for a newly-surfaced session, and after
   // a window-size change.
-  const loadFullWindow = async (row: SessionRow) => {
+  const loadFullWindow = async (row: CacheSessionStats) => {
     const events = await getSessionCacheEvents(row.harness, row.session_id, windowSize());
     const key = windowKey(row.harness, row.session_id);
     cachedWindows.set(key, {
@@ -162,7 +187,7 @@ export default function CacheDiagnostics() {
   // after the window's anchor (>= lastSeen, a 1-event overlap so the first new
   // event's cross-step severity is computed correctly), dedupe the overlap by
   // message_id, append, and trim to the last N. No-op when nothing is new.
-  const updateWindowIncremental = async (win: SessionWindow, row: SessionRow) => {
+  const updateWindowIncremental = async (win: SessionWindow, row: CacheSessionStats) => {
     const fresh = await getSessionCacheEvents(
       win.harness,
       win.sessionId,
@@ -184,10 +209,22 @@ export default function CacheDiagnostics() {
   // recent session (full load if new, incremental if its activity advanced,
   // skip if unchanged), and evict windows that fell out of the recent set.
   const reconcile = async () => {
-    const sessions = await listSessions();
+    const sessions = await getSessionCacheStatsFromDb(
+      CACHE_STATS_FETCH_LIMIT,
+      showUnmanagedSessions(),
+    );
     applySessionMeta(sessions);
     const recent = recentSessionRows(sessions);
     const recentKeys = new Set(recent.map((s) => windowKey(s.harness, s.session_id)));
+
+    const selected = selectedSession();
+    if (
+      selected &&
+      !sessions.some((s) => s.harness === selected.harness && s.session_id === selected.sessionId)
+    ) {
+      const top = recent.find((s) => !s.is_subagent) ?? recent[0];
+      selectSession(top ? { harness: top.harness, sessionId: top.session_id } : null);
+    }
 
     let changed = false;
     for (const row of recent) {
@@ -230,7 +267,10 @@ export default function CacheDiagnostics() {
     // Cold start: list sessions, load each recent session's full window, and
     // default the selection to the most-recent non-subagent session.
     try {
-      const sessions = await listSessions();
+      const sessions = await getSessionCacheStatsFromDb(
+        CACHE_STATS_FETCH_LIMIT,
+        showUnmanagedSessions(),
+      );
       applySessionMeta(sessions);
       const recent = recentSessionRows(sessions);
       if (!cachedSelectedSession) {
@@ -250,7 +290,7 @@ export default function CacheDiagnostics() {
     }
   });
 
-  // Single 1s reconciliation loop: cheap session-table re-list + incremental
+  // Single 1s reconciliation loop: cheap cache-stats re-list + incremental
   // per-session fetches (only for sessions whose activity advanced). In-flight
   // latched so a slow pass can't stack.
   let reconcileInFlight = false;
@@ -281,8 +321,23 @@ export default function CacheDiagnostics() {
     }
   };
 
+  const setShowUnmanagedSessions = (value: boolean) => {
+    setShowUnmanagedSessionsSignal(value);
+    try {
+      value
+        ? localStorage.setItem(SHOW_UNMANAGED_STORAGE_KEY, "true")
+        : localStorage.removeItem(SHOW_UNMANAGED_STORAGE_KEY);
+    } catch {}
+    cachedWindows.clear();
+    cachedSessions = [];
+    cachedSelectedSession = null;
+    setSelectedSession(null);
+    setLoading(true);
+    void reconcile().finally(() => setLoading(false));
+  };
+
   // Cards: per-session stats aggregated over each session's OWN window (never a
-  // shared global pool), ordered by the session table's recency. Reading
+  // shared global pool), ordered by the cache stats recency. Reading
   // windowsVersion() makes this re-run when any window changes.
   const filteredStats = (): CacheSessionStats[] => {
     windowsVersion();
@@ -315,7 +370,11 @@ export default function CacheDiagnostics() {
         total_input: input,
         hit_ratio: total > 0 ? read / total : 0,
         last_timestamp: new Date(lastTs).toISOString(),
+        last_activity_ms: lastTs,
         bust_count: busts,
+        managed: s.managed,
+        is_subagent: s.is_subagent,
+        title: s.title,
       });
     }
     // Render only as many cards as fit one non-wrapping row at CARD_MIN_WIDTH.
@@ -495,10 +554,20 @@ export default function CacheDiagnostics() {
               { value: "all", label: "Harness: All" },
               { value: "opencode", label: "OpenCode" },
               { value: "pi", label: "Pi" },
+              { value: "claude_code", label: "Claude Code" },
+              { value: "codex", label: "Codex" },
             ]}
           />
           {/* padding matches .fsel-trigger (6px 10px) so the buttons and the two
               pickers render at identical heights in this toolbar. */}
+          <button
+            type="button"
+            class={`btn ${showUnmanagedSessions() ? "primary" : ""}`}
+            style={{ padding: "6px 10px" }}
+            onClick={() => setShowUnmanagedSessions(!showUnmanagedSessions())}
+          >
+            {showUnmanagedSessions() ? "Hide unmanaged" : "Show unmanaged"}
+          </button>
           <button
             type="button"
             class={`btn ${!hideSubagents() ? "primary" : ""}`}
@@ -586,6 +655,14 @@ export default function CacheDiagnostics() {
                     >
                       <span style={{ display: "inline-flex", "align-items": "center", gap: "6px" }}>
                         <HarnessBadge harness={stat.harness} />
+                        <Show when={isManagedFilterableHarness(stat.harness) && stat.managed}>
+                          <span
+                            class="pill blue"
+                            style={{ "font-size": "9px", "line-height": "1.3" }}
+                          >
+                            Managed
+                          </span>
+                        </Show>
                         <span>{resolveTitle(stat.harness, stat.session_id)}</span>
                       </span>
                     </div>
@@ -626,7 +703,12 @@ export default function CacheDiagnostics() {
                 "justify-content": "space-between",
               }}
             >
-              <span>Cache Hit Timeline</span>
+              <span style={{ display: "inline-flex", "align-items": "center", gap: "6px" }}>
+                <Show when={selectedSession()}>
+                  {(selected) => <HarnessBadge harness={selected().harness} />}
+                </Show>
+                Cache Hit Timeline
+              </span>
               <span>
                 {totalTimelineSteps() > timelineEvents().length
                   ? `last ${timelineEvents().length} of ${totalTimelineSteps()} steps`
@@ -652,7 +734,7 @@ export default function CacheDiagnostics() {
                 <span class="empty-state-icon">📊</span>
                 <span>No cache events found</span>
                 <span style={{ "font-size": "11px" }}>
-                  Cache data is read from OpenCode DB and Pi JSONL
+                  Cache data is read from OpenCode, Pi, Claude Code, and Codex sessions
                 </span>
               </div>
             }

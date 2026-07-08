@@ -3,8 +3,9 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::external_cache_sessions;
 use crate::pi_sessions;
 use crate::project_identity::{basename, normalize_stored_project_path};
 
@@ -194,10 +195,31 @@ pub struct SessionSummary {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Harness {
     Opencode,
     Pi,
+    ClaudeCode,
+    Codex,
+}
+
+impl Harness {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Opencode => "opencode",
+            Self::Pi => "pi",
+            Self::ClaudeCode => "claude_code",
+            Self::Codex => "codex",
+        }
+    }
+
+    fn has_magic_context_plugin_state(self) -> bool {
+        matches!(self, Self::Opencode | Self::Pi)
+    }
+
+    fn uses_codex_no_write_cache_model(self) -> bool {
+        matches!(self, Self::Codex)
+    }
 }
 
 impl std::str::FromStr for Harness {
@@ -207,6 +229,8 @@ impl std::str::FromStr for Harness {
         match value.to_ascii_lowercase().as_str() {
             "opencode" => Ok(Self::Opencode),
             "pi" => Ok(Self::Pi),
+            "claude_code" | "claude-code" | "claudecode" | "cc" => Ok(Self::ClaudeCode),
+            "codex" => Ok(Self::Codex),
             other => Err(format!("unknown harness: {other}")),
         }
     }
@@ -603,7 +627,11 @@ pub struct SessionCacheStats {
     pub total_input: i64,
     pub hit_ratio: f64,
     pub last_timestamp: String,
+    pub last_activity_ms: i64,
     pub bust_count: usize,
+    pub managed: bool,
+    pub is_subagent: bool,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +646,7 @@ struct RawDbCacheEvent {
     total_tokens: i64,
     agent: Option<String>,
     finish: Option<String>,
+    context_limit: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -924,6 +953,7 @@ fn load_raw_db_cache_events(
             total_tokens: row.get(6)?,
             agent: row.get(7)?,
             finish: row.get(8)?,
+            context_limit: None,
         })
     })?;
 
@@ -970,11 +1000,84 @@ fn load_raw_pi_cache_events(limit: usize, since_timestamp: Option<i64>) -> Vec<R
                     total_tokens: usage.total as i64,
                     agent: None,
                     finish: message.stop_reason.clone(),
+                    context_limit: None,
                 })
             })
             .collect();
         // Per-session newest-first window so a long Pi session still surfaces
         // its latest events on the merged timeline.
+        session_rows.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
+        session_rows.truncate(per_session_limit);
+        all_rows.extend(session_rows);
+    }
+
+    all_rows.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
+    all_rows.truncate(global_cap);
+    all_rows
+}
+
+fn load_raw_claude_code_cache_events(
+    limit: usize,
+    since_timestamp: Option<i64>,
+) -> Vec<RawDbCacheEvent> {
+    load_raw_external_cache_events(
+        Harness::ClaudeCode,
+        external_cache_sessions::scan_claude_code_session_dir,
+        external_cache_sessions::read_claude_code_session_detail,
+        limit,
+        since_timestamp,
+    )
+}
+
+fn load_raw_codex_cache_events(limit: usize, since_timestamp: Option<i64>) -> Vec<RawDbCacheEvent> {
+    load_raw_external_cache_events(
+        Harness::Codex,
+        external_cache_sessions::scan_codex_session_dir,
+        external_cache_sessions::read_codex_session_detail,
+        limit,
+        since_timestamp,
+    )
+}
+
+fn load_raw_external_cache_events(
+    harness: Harness,
+    scan: fn() -> Vec<external_cache_sessions::JsonlSessionMeta>,
+    read_detail: fn(&std::path::Path) -> Option<external_cache_sessions::JsonlSessionDetail>,
+    limit: usize,
+    since_timestamp: Option<i64>,
+) -> Vec<RawDbCacheEvent> {
+    let per_session_limit = limit;
+    let global_cap = limit.saturating_mul(10);
+    let mut all_rows: Vec<RawDbCacheEvent> = Vec::new();
+
+    for meta in scan() {
+        let Some(detail) = read_detail(&meta.jsonl_path) else {
+            continue;
+        };
+        let mut session_rows: Vec<RawDbCacheEvent> = detail
+            .events
+            .iter()
+            .filter_map(|event| {
+                if let Some(since) = since_timestamp {
+                    if event.timestamp_ms <= since {
+                        return None;
+                    }
+                }
+                Some(RawDbCacheEvent {
+                    harness,
+                    message_id: event.message_id.clone(),
+                    session_id: event.session_id.clone(),
+                    timestamp: event.timestamp_ms,
+                    input_tokens: event.input_tokens,
+                    cache_read: event.cache_read,
+                    cache_write: event.cache_write,
+                    total_tokens: event.total_tokens,
+                    agent: event.model.clone(),
+                    finish: event.finish.clone(),
+                    context_limit: event.context_limit,
+                })
+            })
+            .collect();
         session_rows.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
         session_rows.truncate(per_session_limit);
         all_rows.extend(session_rows);
@@ -1022,9 +1125,8 @@ fn resolve_session_context_limits(
     });
     if let Ok(rows) = rows {
         for r in rows.flatten() {
-            let harness = match r.1.as_str() {
-                "pi" => Harness::Pi,
-                _ => Harness::Opencode,
+            let Ok(harness) = r.1.parse::<Harness>() else {
+                continue;
             };
             let key = (harness, r.0);
             if keys.contains(&key) {
@@ -1092,9 +1194,8 @@ fn load_transform_decision_causes_from_conn(
     });
     if let Ok(rows) = rows {
         for row in rows.flatten() {
-            let harness = match row.1.as_str() {
-                "pi" => Harness::Pi,
-                _ => Harness::Opencode,
+            let Ok(harness) = row.1.parse::<Harness>() else {
+                continue;
             };
             let session_key = (harness, row.0.clone());
             if keys.contains(&session_key) {
@@ -1237,9 +1338,33 @@ fn build_db_cache_events_with_decisions(
             }
         }
     }
+    let mut jsonl_true_first: HashSet<(Harness, String)> = HashSet::new();
+    for (harness, first_lookup) in [
+        (
+            Harness::ClaudeCode,
+            external_cache_sessions::claude_code_first_event_timestamp as fn(&str) -> Option<i64>,
+        ),
+        (
+            Harness::Codex,
+            external_cache_sessions::codex_first_event_timestamp as fn(&str) -> Option<i64>,
+        ),
+    ] {
+        for ((_, sid), window_earliest) in earliest_ts_in_window
+            .iter()
+            .filter(|((h, _), _)| *h == harness)
+        {
+            if let Some(db_earliest) = first_lookup(sid) {
+                if *window_earliest <= db_earliest {
+                    jsonl_true_first.insert((harness, sid.clone()));
+                }
+            }
+        }
+    }
+
     let true_first_sessions: HashSet<(Harness, String)> = true_first_sessions
         .into_iter()
         .chain(pi_true_first)
+        .chain(jsonl_true_first)
         .collect();
 
     // ── Pass 1: build chronological events (severity assigned in pass 2) ──
@@ -1277,7 +1402,7 @@ fn build_db_cache_events_with_decisions(
             finish: row.finish,
             turn_id: String::new(),
             is_turn_start: false,
-            context_limit: 0,               // filled in after sessions are known
+            context_limit: row.context_limit.unwrap_or(0),
             context_limit_estimated: false, // set with context_limit below
             is_drop: false,                 // computed in pass 2
         });
@@ -1356,10 +1481,12 @@ fn build_db_cache_events_with_decisions(
 
         // Severity.
         let is_first_in_window = seen_sessions.insert(session_key.clone());
-        let no_cache_session = !session_has_cache
-            .get(&session_key)
-            .copied()
-            .unwrap_or(false);
+        let uses_codex_no_write_model = chronological[i].harness.uses_codex_no_write_cache_model();
+        let no_cache_session = !uses_codex_no_write_model
+            && !session_has_cache
+                .get(&session_key)
+                .copied()
+                .unwrap_or(false);
         let cur_read = chronological[i].cache_read;
         let cur_session = chronological[i].session_id.clone();
         let decision_key = (
@@ -1370,7 +1497,9 @@ fn build_db_cache_events_with_decisions(
         let decision_row = transform_decisions.get(&decision_key);
         let cause_from_decision = || {
             transform_decision_cause(decision_row).or_else(|| {
-                if decision_row.is_none() {
+                if decision_row.is_none()
+                    && chronological[i].harness.has_magic_context_plugin_state()
+                {
                     Some("Provider-side (not Magic Context)".to_string())
                 } else {
                     None
@@ -1381,6 +1510,38 @@ fn build_db_cache_events_with_decisions(
         let (severity, cause, retention): (String, Option<String>, Option<f64>) =
             if no_cache_session {
                 ("unknown".to_string(), None, None)
+            } else if uses_codex_no_write_model {
+                if is_first_in_window {
+                    if true_first_sessions.contains(&session_key) {
+                        (
+                            "info".to_string(),
+                            Some("First message (new session)".to_string()),
+                            None,
+                        )
+                    } else {
+                        ("stable".to_string(), None, None)
+                    }
+                } else {
+                    // Codex/OpenAI implicit caching never reports cache writes.
+                    // Its input token count includes the cached portion, so health
+                    // is the current read share after normalizing input to the
+                    // uncached remainder.
+                    let prompt = chronological[i].cache_read + chronological[i].input_tokens;
+                    if prompt <= 0 {
+                        ("unknown".to_string(), None, None)
+                    } else if cur_read == 0 {
+                        ("full_bust".to_string(), None, Some(0.0))
+                    } else {
+                        let ret = cur_read as f64 / prompt as f64;
+                        if ret >= 0.95 {
+                            ("stable".to_string(), None, Some(ret))
+                        } else if ret >= 0.80 {
+                            ("warning".to_string(), None, Some(ret))
+                        } else {
+                            ("bust".to_string(), None, Some(ret))
+                        }
+                    }
+                }
             } else if is_first_in_window {
                 if true_first_sessions.contains(&session_key) {
                     (
@@ -1497,9 +1658,9 @@ fn build_db_cache_events_with_decisions(
     }
 
     // ── Context-window scale: attach each session's context limit ──
-    // Prefer the plugin's recorded limit; fall back to the session's own max
-    // prompt so the timeline still shows the sawtooth shape (it just loses the
-    // absolute "% of window" meaning for sessions the plugin never sized).
+    // Prefer a per-event JSONL limit (Codex reports the model context window
+    // on token_count events), then the plugin's recorded limit, then the
+    // session's own max prompt so the timeline still shows the sawtooth shape.
     let recorded_limits = resolve_session_context_limits(&session_keys);
     let mut max_prompt_by_session: HashMap<(Harness, String), i64> = HashMap::new();
     for e in &chronological {
@@ -1512,6 +1673,10 @@ fn build_db_cache_events_with_decisions(
         }
     }
     for e in &mut chronological {
+        if e.context_limit > 0 {
+            e.context_limit_estimated = false;
+            continue;
+        }
         let key = (e.harness, e.session_id.clone());
         let recorded = recorded_limits.get(&key).copied().filter(|&l| l > 0);
         match recorded {
@@ -1539,7 +1704,9 @@ fn build_db_cache_events_with_decisions(
 pub fn get_cache_events_from_db(limit: usize, since_timestamp: Option<i64>) -> Vec<DbCacheEvent> {
     let mut rows = load_raw_db_cache_events(limit, since_timestamp).unwrap_or_default();
     rows.extend(load_raw_pi_cache_events(limit, since_timestamp));
-    // Newest-first across both harnesses, then truncate to the same global cap
+    rows.extend(load_raw_claude_code_cache_events(limit, since_timestamp));
+    rows.extend(load_raw_codex_cache_events(limit, since_timestamp));
+    // Newest-first across all harnesses, then truncate to the same global cap
     // the OpenCode-only path used so the merged feed never balloons unbounded.
     rows.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
     rows.truncate(limit.saturating_mul(10));
@@ -1548,15 +1715,188 @@ pub fn get_cache_events_from_db(limit: usize, since_timestamp: Option<i64>) -> V
 
 type SessionCacheStatsAccumulator = (usize, i64, i64, i64, i64, usize);
 
-pub fn get_session_cache_stats_from_db(limit: usize) -> Vec<SessionCacheStats> {
-    // Reuse raw rows instead of re-querying + re-parsing logs
+fn resolve_store_db_path() -> Option<PathBuf> {
+    let data_dir = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".local")
+                .join("share")
+        });
+    let path = data_dir
+        .join("cortexkit")
+        .join("magic-context")
+        .join("store.db");
+    path.exists().then_some(path)
+}
+
+fn load_managed_cache_sessions(keys: &HashSet<(Harness, String)>) -> HashSet<(Harness, String)> {
+    let Some(path) = resolve_store_db_path() else {
+        return HashSet::new();
+    };
+    load_managed_cache_sessions_from_path(&path, keys)
+}
+
+fn load_managed_cache_sessions_from_path(
+    path: &Path,
+    keys: &HashSet<(Harness, String)>,
+) -> HashSet<(Harness, String)> {
+    let Ok(conn) = open_readonly(&path.to_path_buf()) else {
+        return HashSet::new();
+    };
+    load_managed_cache_sessions_from_conn(&conn, keys)
+}
+
+fn load_managed_cache_sessions_from_conn(
+    conn: &Connection,
+    keys: &HashSet<(Harness, String)>,
+) -> HashSet<(Harness, String)> {
+    let external_session_ids: Vec<String> = keys
+        .iter()
+        .filter(|(harness, _)| matches!(harness, Harness::ClaudeCode | Harness::Codex))
+        .map(|(_, session_id)| session_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if external_session_ids.is_empty() || !table_exists(conn, "mc_cache_state") {
+        return HashSet::new();
+    }
+
+    let values = vec!["(?)"; external_session_ids.len()].join(",");
+    let sql = format!(
+        "WITH wanted(session_id) AS (VALUES {values})
+         SELECT DISTINCT w.session_id
+         FROM wanted w
+         JOIN mc_cache_state m
+           ON m.session_id = w.session_id
+           OR (m.session_id >= (w.session_id || char(0x241F))
+               AND m.session_id < (w.session_id || char(0x2420)))"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return HashSet::new();
+    };
+    let rows = stmt.query_map(params_from_iter(external_session_ids.iter()), |row| {
+        row.get::<_, String>(0)
+    });
+    let Ok(rows) = rows else {
+        return HashSet::new();
+    };
+    let managed_ids: HashSet<String> = rows.flatten().collect();
+    keys.iter()
+        .filter(|(harness, session_id)| {
+            matches!(harness, Harness::ClaudeCode | Harness::Codex)
+                && managed_ids.contains(session_id)
+        })
+        .cloned()
+        .collect()
+}
+
+fn is_managed_cache_session(
+    harness: Harness,
+    session_id: &str,
+    detected: &HashSet<(Harness, String)>,
+) -> bool {
+    harness.has_magic_context_plugin_state()
+        || detected.contains(&(harness, session_id.to_string()))
+}
+
+fn load_cache_session_titles(
+    keys: &HashSet<(Harness, String)>,
+) -> HashMap<(Harness, String), String> {
+    let mut titles = HashMap::new();
+    let opencode_ids: Vec<String> = keys
+        .iter()
+        .filter(|(harness, _)| *harness == Harness::Opencode)
+        .map(|(_, sid)| sid.clone())
+        .collect();
+    if !opencode_ids.is_empty() {
+        if let Some(path) = resolve_opencode_db_path() {
+            if let Ok(conn) = open_readonly(&path) {
+                let placeholders = vec!["?"; opencode_ids.len()].join(",");
+                let sql = format!(
+                    "SELECT id, COALESCE(title, '') FROM session WHERE id IN ({placeholders})"
+                );
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    if let Ok(rows) = stmt.query_map(params_from_iter(opencode_ids.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for (sid, title) in rows.flatten() {
+                            if !title.is_empty() {
+                                titles.insert((Harness::Opencode, sid), title);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for meta in pi_sessions::scan_pi_session_dir() {
+        let key = (Harness::Pi, meta.session_id.clone());
+        if keys.contains(&key) {
+            titles.insert(key, clean_pi_title(meta.session_name, &meta.first_message));
+        }
+    }
+    for meta in external_cache_sessions::scan_claude_code_session_dir() {
+        let key = (Harness::ClaudeCode, meta.session_id.clone());
+        if keys.contains(&key) {
+            titles.insert(key, basename(&meta.cwd));
+        }
+    }
+    for meta in external_cache_sessions::scan_codex_session_dir() {
+        let key = (Harness::Codex, meta.session_id.clone());
+        if keys.contains(&key) {
+            titles.insert(key, basename(&meta.cwd));
+        }
+    }
+
+    titles
+}
+
+fn load_cache_subagent_flags(
+    keys: &HashSet<(Harness, String)>,
+) -> HashMap<(Harness, String), bool> {
+    let mut out = HashMap::new();
+    for harness in [Harness::Opencode, Harness::Pi] {
+        if keys.iter().any(|(h, _)| *h == harness) {
+            for (session_id, is_subagent) in load_subagent_map_for_harness(harness) {
+                let key = (harness, session_id);
+                if keys.contains(&key) {
+                    out.insert(key, is_subagent);
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn get_session_cache_stats_from_db(
+    limit: usize,
+    show_unmanaged: bool,
+) -> Vec<SessionCacheStats> {
+    // Reuse raw rows instead of re-querying + re-parsing logs.
     let mut rows = load_raw_db_cache_events(200, None).unwrap_or_default();
     rows.extend(load_raw_pi_cache_events(200, None));
+    rows.extend(load_raw_claude_code_cache_events(200, None));
+    rows.extend(load_raw_codex_cache_events(200, None));
+
+    let row_keys: HashSet<(Harness, String)> = rows
+        .iter()
+        .map(|row| (row.harness, row.session_id.clone()))
+        .collect();
+    let detected_managed = load_managed_cache_sessions(&row_keys);
+    if !show_unmanaged {
+        rows.retain(|row| {
+            is_managed_cache_session(row.harness, &row.session_id, &detected_managed)
+        });
+    }
+
     rows.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
     rows.truncate(2000); // 200 per-session × ~10 sessions cap
     let events = build_db_cache_events(rows, false); // skip log enrichment for stats
-                                                     // Key by (harness, session_id) so OC and Pi sessions never collide on a
-                                                     // shared short-prefix session ID.
+                                                     // Key by (harness, session_id) so sessions from different harnesses never
+                                                     // collide on a shared short-prefix session ID.
     let mut map: HashMap<(Harness, String), SessionCacheStatsAccumulator> = HashMap::new();
 
     for event in events {
@@ -1576,6 +1916,11 @@ pub fn get_session_cache_stats_from_db(limit: usize) -> Vec<SessionCacheStats> {
             entry.5 += 1;
         }
     }
+
+    let stat_keys: HashSet<(Harness, String)> = map.keys().cloned().collect();
+    let titles = load_cache_session_titles(&stat_keys);
+    let subagent_flags = load_cache_subagent_flags(&stat_keys);
+    let detected_managed = load_managed_cache_sessions(&stat_keys);
 
     let mut stats: Vec<(i64, SessionCacheStats)> = map
         .into_iter()
@@ -1597,6 +1942,7 @@ pub fn get_session_cache_stats_from_db(limit: usize) -> Vec<SessionCacheStats> {
                 } else {
                     0.0
                 };
+                let key = (harness, session_id.clone());
 
                 (
                     last_timestamp,
@@ -1609,7 +1955,11 @@ pub fn get_session_cache_stats_from_db(limit: usize) -> Vec<SessionCacheStats> {
                         total_input,
                         hit_ratio,
                         last_timestamp: format_timestamp_iso(last_timestamp),
+                        last_activity_ms: last_timestamp,
                         bust_count,
+                        managed: is_managed_cache_session(harness, &key.1, &detected_managed),
+                        is_subagent: subagent_flags.get(&key).copied().unwrap_or(false),
+                        title: titles.get(&key).cloned(),
                     },
                 )
             },
@@ -1644,6 +1994,10 @@ pub fn get_session_cache_events(
     match harness {
         Harness::Opencode => get_opencode_session_cache_events(session_id, limit, since_timestamp),
         Harness::Pi => get_pi_session_cache_events(session_id, limit, since_timestamp),
+        Harness::ClaudeCode => {
+            get_claude_code_session_cache_events(session_id, limit, since_timestamp)
+        }
+        Harness::Codex => get_codex_session_cache_events(session_id, limit, since_timestamp),
     }
 }
 
@@ -1683,6 +2037,10 @@ pub fn get_session_cache_events_by_turn_count(
     let raw = match harness {
         Harness::Opencode => get_opencode_session_cache_events(session_id, Some(max_events), None),
         Harness::Pi => get_pi_session_cache_events(session_id, Some(max_events), None),
+        Harness::ClaudeCode => {
+            get_claude_code_session_cache_events(session_id, Some(max_events), None)
+        }
+        Harness::Codex => get_codex_session_cache_events(session_id, Some(max_events), None),
     };
     trim_events_to_turns(raw, target_turns)
 }
@@ -1754,6 +2112,7 @@ fn get_opencode_session_cache_events(
             total_tokens: row.get(6)?,
             agent: row.get(7)?,
             finish: row.get(8)?,
+            context_limit: None,
         })
     }) else {
         return Vec::new();
@@ -1789,6 +2148,7 @@ fn get_pi_session_cache_events(
                 total_tokens: usage.total as i64,
                 agent: None,
                 finish: message.stop_reason,
+                context_limit: None,
             })
         })
         .collect();
@@ -1798,6 +2158,86 @@ fn get_pi_session_cache_events(
         Some(since) => rows.retain(|r| r.timestamp >= since),
         // Full: tail-truncate to the most-recent N (JSONL is chronological, so
         // the last N are the freshest).
+        None => {
+            if let Some(n) = limit {
+                if n > 0 && rows.len() > n {
+                    let start = rows.len() - n;
+                    rows.drain(..start);
+                }
+            }
+        }
+    }
+    build_db_cache_events(rows, false)
+}
+
+fn get_claude_code_session_cache_events(
+    session_id: &str,
+    limit: Option<usize>,
+    since_timestamp: Option<i64>,
+) -> Vec<DbCacheEvent> {
+    let Some(path) = external_cache_sessions::find_claude_code_session_path(session_id) else {
+        return Vec::new();
+    };
+    get_external_session_cache_events(
+        Harness::ClaudeCode,
+        session_id,
+        &path,
+        external_cache_sessions::read_claude_code_session_detail,
+        limit,
+        since_timestamp,
+    )
+}
+
+fn get_codex_session_cache_events(
+    session_id: &str,
+    limit: Option<usize>,
+    since_timestamp: Option<i64>,
+) -> Vec<DbCacheEvent> {
+    let Some(path) = external_cache_sessions::find_codex_session_path(session_id) else {
+        return Vec::new();
+    };
+    get_external_session_cache_events(
+        Harness::Codex,
+        session_id,
+        &path,
+        external_cache_sessions::read_codex_session_detail,
+        limit,
+        since_timestamp,
+    )
+}
+
+fn get_external_session_cache_events(
+    harness: Harness,
+    session_id: &str,
+    path: &Path,
+    read_detail: fn(&Path) -> Option<external_cache_sessions::JsonlSessionDetail>,
+    limit: Option<usize>,
+    since_timestamp: Option<i64>,
+) -> Vec<DbCacheEvent> {
+    let Some(detail) = read_detail(path) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<RawDbCacheEvent> = detail
+        .events
+        .into_iter()
+        .map(|event| RawDbCacheEvent {
+            harness,
+            message_id: event.message_id,
+            session_id: session_id.to_string(),
+            timestamp: event.timestamp_ms,
+            input_tokens: event.input_tokens,
+            cache_read: event.cache_read,
+            cache_write: event.cache_write,
+            total_tokens: event.total_tokens,
+            agent: event.model,
+            finish: event.finish,
+            context_limit: event.context_limit,
+        })
+        .collect();
+    match since_timestamp {
+        // Incremental: keep events at/after the anchor (>= for the 1-event
+        // severity overlap), already chronological from the JSONL order.
+        Some(since) => rows.retain(|r| r.timestamp >= since),
         None => {
             if let Some(n) = limit {
                 if n > 0 && rows.len() > n {
@@ -3885,10 +4325,7 @@ fn load_subagent_map_for_harness(harness: Harness) -> std::collections::HashMap<
     let Ok(conn) = open_readonly(&db_path) else {
         return map;
     };
-    let harness_str = match harness {
-        Harness::Opencode => "opencode",
-        Harness::Pi => "pi",
-    };
+    let harness_str = harness.as_str();
     let Ok(mut stmt) =
         conn.prepare("SELECT session_id, is_subagent FROM session_meta WHERE harness = ?1")
     else {
@@ -3915,6 +4352,7 @@ pub fn get_session_detail(
     match harness {
         Harness::Opencode => get_opencode_session_detail(conn, session_id),
         Harness::Pi => Ok(get_pi_session_detail(conn, session_id)),
+        Harness::ClaudeCode | Harness::Codex => Ok(None),
     }
 }
 
@@ -3954,6 +4392,7 @@ pub fn get_session_messages(
                 })
                 .collect())
         }
+        Harness::ClaudeCode | Harness::Codex => Ok(Vec::new()),
     }
 }
 
@@ -6209,6 +6648,7 @@ mod cache_turn_tests {
             total_tokens: total,
             agent: None,
             finish: finish.map(|s| s.to_string()),
+            context_limit: None,
         }
     }
 
@@ -6781,6 +7221,106 @@ mod cache_turn_tests {
         assert!(events[0].is_turn_start);
         assert!(!events[1].is_turn_start);
         assert_eq!(events[1].turn_id, "p1");
+    }
+
+    #[test]
+    fn codex_no_write_variant_uses_read_ratio() {
+        let rows = vec![
+            raw(
+                Harness::Codex,
+                "c1",
+                "codex-session",
+                100,
+                1_000,
+                0,
+                0,
+                1_100,
+                None,
+            ),
+            raw(
+                Harness::Codex,
+                "c2",
+                "codex-session",
+                200,
+                150,
+                850,
+                0,
+                1_050,
+                None,
+            ),
+            raw(
+                Harness::Codex,
+                "c3",
+                "codex-session",
+                300,
+                500,
+                500,
+                0,
+                1_050,
+                None,
+            ),
+        ];
+        let events = build_db_cache_events(rows, false);
+        assert_eq!(events[0].severity, "stable");
+        assert_eq!(events[1].severity, "warning");
+        assert!((events[1].hit_ratio - 0.85).abs() < f64::EPSILON);
+        assert_eq!(events[2].severity, "bust");
+        assert!((events[2].hit_ratio - 0.5).abs() < f64::EPSILON);
+        assert_eq!(events[2].cache_write, 0);
+    }
+}
+
+#[cfg(test)]
+mod managed_cache_tests {
+    use super::*;
+
+    #[test]
+    fn managed_detection_matches_exact_and_composite_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE mc_cache_state (session_id TEXT PRIMARY KEY)",
+                [],
+            )
+            .unwrap();
+            // Composite managed keys store the wire session id first, followed by
+            // U+241F and subagent/epoch parts. Matching by this prefix folds those
+            // rows back onto the visible Claude Code session.
+            conn.execute(
+                "INSERT INTO mc_cache_state (session_id) VALUES (?1), (?2), (?3), (?4)",
+                params![
+                    "cc-exact",
+                    "cc-composite␟agent␟1",
+                    "cc-other-suffix",
+                    "codex-exact",
+                ],
+            )
+            .unwrap();
+        }
+
+        let keys = HashSet::from([
+            (Harness::ClaudeCode, "cc-exact".to_string()),
+            (Harness::ClaudeCode, "cc-composite".to_string()),
+            (Harness::ClaudeCode, "cc-other".to_string()),
+            (Harness::Codex, "codex-exact".to_string()),
+            (Harness::Opencode, "oc-session".to_string()),
+        ]);
+        let managed = load_managed_cache_sessions_from_path(&path, &keys);
+        assert!(managed.contains(&(Harness::ClaudeCode, "cc-exact".to_string())));
+        assert!(managed.contains(&(Harness::ClaudeCode, "cc-composite".to_string())));
+        assert!(!managed.contains(&(Harness::ClaudeCode, "cc-other".to_string())));
+        assert!(managed.contains(&(Harness::Codex, "codex-exact".to_string())));
+        assert!(!managed.contains(&(Harness::Opencode, "oc-session".to_string())));
+    }
+
+    #[test]
+    fn managed_detection_absent_store_degrades_to_unmanaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-store.db");
+        let keys = HashSet::from([(Harness::ClaudeCode, "cc-session".to_string())]);
+        assert!(load_managed_cache_sessions_from_path(&path, &keys).is_empty());
     }
 }
 

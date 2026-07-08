@@ -517,8 +517,11 @@ pub fn get_cache_events_from_db(
 }
 
 #[tauri::command(async)]
-pub fn get_session_cache_stats_from_db(limit: Option<usize>) -> Vec<db::SessionCacheStats> {
-    db::get_session_cache_stats_from_db(limit.unwrap_or(5))
+pub fn get_session_cache_stats_from_db(
+    limit: Option<usize>,
+    show_unmanaged: Option<bool>,
+) -> Vec<db::SessionCacheStats> {
+    db::get_session_cache_stats_from_db(limit.unwrap_or(5), show_unmanaged.unwrap_or(false))
 }
 
 // ── Config commands ─────────────────────────────────────────
