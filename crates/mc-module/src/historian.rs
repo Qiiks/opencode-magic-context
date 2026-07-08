@@ -15,12 +15,20 @@ use mc_store::{
 };
 
 use crate::historian_producer::{
-    HistorianProducer, HistorianProducerError, ProducerOutput, RunHandle, RunState,
+    ErrorClass, ErrorClassification, HistorianProducer, HistorianProducerError, ProducerOutput,
+    RunHandle, RunState,
 };
 use crate::historian_validate::{
     validate_historian_output, HistorianChunk, HistorianValidationError, StoredCompartmentRange,
     ValidateOptions, ValidatedChunk, ValidatedCompartment,
 };
+
+/// Default cooldown after an abandoned historian firing.
+pub const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
+
+const CHAIN_EXHAUSTED_PERMANENT_PREFIX: &str = "chain-exhausted-permanent:";
+const AUTH_REQUIRED_PREFIX: &str = "auth-required:";
+const UNKNOWN_ERROR_CLASS_PREFIX: &str = "unknown-error-class:";
 
 /// Project a validated compartment onto the durable store row shape. Validation
 /// resolves the message-id endpoints and tiers; publication only stamps the
@@ -707,6 +715,145 @@ fn fnv1a_hex8(input: &str) -> String {
     format!("{hash:016x}")[..8].to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProducerFailureDecision {
+    try_next_model: bool,
+    failure_backoff_at_ms: i64,
+    detail_prefix: Option<&'static str>,
+}
+
+fn decide_producer_failure(
+    err: &HistorianProducerError,
+    model: &str,
+    remaining_models: &[String],
+    auth_blocked_providers: &mut Vec<String>,
+    all_failures_permanent: &mut bool,
+    now_ms: i64,
+    default_failure_backoff_at_ms: i64,
+) -> ProducerFailureDecision {
+    if let Some(classification) = err.classification() {
+        // The producer owns classification. Once a class tag is present, the consumer
+        // branches only on that field and its structured retry-after sibling; provider
+        // codes/messages stay diagnostic detail and never override the tag.
+        return match classification.class {
+            ErrorClass::Permanent => {
+                let try_next = has_eligible_model(remaining_models, auth_blocked_providers);
+                ProducerFailureDecision {
+                    try_next_model: try_next,
+                    failure_backoff_at_ms: default_failure_backoff_at_ms,
+                    detail_prefix: (!try_next && *all_failures_permanent)
+                        .then_some(CHAIN_EXHAUSTED_PERMANENT_PREFIX),
+                }
+            }
+            ErrorClass::Transient => {
+                *all_failures_permanent = false;
+                let try_next = has_eligible_model(remaining_models, auth_blocked_providers);
+                ProducerFailureDecision {
+                    try_next_model: try_next,
+                    failure_backoff_at_ms: if try_next {
+                        default_failure_backoff_at_ms
+                    } else {
+                        classified_backoff_at_ms(
+                            now_ms,
+                            default_failure_backoff_at_ms,
+                            classification,
+                        )
+                    },
+                    detail_prefix: None,
+                }
+            }
+            ErrorClass::AuthRequired => {
+                *all_failures_permanent = false;
+                add_auth_blocked_provider(auth_blocked_providers, provider_prefix(model));
+                let try_next = has_eligible_model(remaining_models, auth_blocked_providers);
+                ProducerFailureDecision {
+                    try_next_model: try_next,
+                    failure_backoff_at_ms: default_failure_backoff_at_ms,
+                    detail_prefix: (!try_next).then_some(AUTH_REQUIRED_PREFIX),
+                }
+            }
+            ErrorClass::ContextOverflow => {
+                *all_failures_permanent = false;
+                // Historian chunks are sized below every configured model window; a
+                // source-classified overflow means our estimator is wrong. Trying a
+                // larger fallback would mask the bad budget and hide the health signal.
+                ProducerFailureDecision {
+                    try_next_model: false,
+                    failure_backoff_at_ms: default_failure_backoff_at_ms,
+                    detail_prefix: None,
+                }
+            }
+        };
+    }
+
+    if err.has_class_field() {
+        *all_failures_permanent = false;
+        return ProducerFailureDecision {
+            try_next_model: false,
+            failure_backoff_at_ms: default_failure_backoff_at_ms,
+            detail_prefix: Some(UNKNOWN_ERROR_CLASS_PREFIX),
+        };
+    }
+
+    *all_failures_permanent = false;
+    let heuristic = err.deprecated_heuristic_decision();
+    let try_next = heuristic.retryable_model_failure
+        && !heuristic.abort_or_overflow
+        && has_eligible_model(remaining_models, auth_blocked_providers);
+    ProducerFailureDecision {
+        try_next_model: try_next,
+        failure_backoff_at_ms: default_failure_backoff_at_ms,
+        detail_prefix: None,
+    }
+}
+
+fn classified_backoff_at_ms(
+    now_ms: i64,
+    default_failure_backoff_at_ms: i64,
+    classification: ErrorClassification,
+) -> i64 {
+    let Some(retry_after_secs) = classification.retry_after_secs else {
+        return default_failure_backoff_at_ms;
+    };
+    let retry_after_ms = retry_after_secs.saturating_mul(1000).min(i64::MAX as u64) as i64;
+    now_ms.saturating_add(HISTORIAN_FAILURE_BACKOFF_MS.max(retry_after_ms))
+}
+
+fn has_eligible_model(models: &[String], auth_blocked_providers: &[String]) -> bool {
+    models
+        .iter()
+        .any(|model| !provider_is_auth_blocked(auth_blocked_providers, model))
+}
+
+fn provider_is_auth_blocked(auth_blocked_providers: &[String], model: &str) -> bool {
+    let provider = provider_prefix(model);
+    auth_blocked_providers
+        .iter()
+        .any(|blocked| blocked == provider)
+}
+
+fn add_auth_blocked_provider(auth_blocked_providers: &mut Vec<String>, provider: &str) {
+    if !auth_blocked_providers
+        .iter()
+        .any(|blocked| blocked == provider)
+    {
+        auth_blocked_providers.push(provider.to_string());
+    }
+}
+
+fn provider_prefix(model: &str) -> &str {
+    model
+        .split_once('/')
+        .map_or(model, |(provider, _)| provider)
+}
+
+fn prefixed_detail(prefix: Option<&str>, detail: String) -> String {
+    match prefix {
+        Some(prefix) => format!("{prefix}{detail}"),
+        None => detail,
+    }
+}
+
 pub async fn run_historian_firing<P>(
     producer: &mut P,
     request: HistorianFireRequest<'_>,
@@ -718,7 +865,13 @@ where
         return Err(HistorianDriveError::NoModels);
     }
 
+    let mut auth_blocked_providers = Vec::new();
+    let mut all_failures_permanent = true;
+
     for (index, model) in request.model_chain.iter().enumerate() {
+        if provider_is_auth_blocked(&auth_blocked_providers, model) {
+            continue;
+        }
         verify_chunk_fingerprint(
             request.chunk_fingerprint,
             request.observed_chunk_fingerprint,
@@ -748,20 +901,29 @@ where
         {
             Ok(handle) => handle,
             Err(err) => {
-                let retry = err.is_retryable_model_failure()
-                    && !err.is_abort_or_overflow()
-                    && index + 1 < request.model_chain.len();
+                let decision = decide_producer_failure(
+                    &err,
+                    model,
+                    &request.model_chain[index + 1..],
+                    &mut auth_blocked_providers,
+                    &mut all_failures_permanent,
+                    request.now_ms,
+                    request.failure_backoff_at_ms,
+                );
                 persist_historian_state(
                     request.store,
                     request.session_id,
                     abandon_with_detail(
                         &fired,
-                        request.failure_backoff_at_ms,
-                        Some(format!("producer start ({model}): {err:?}")),
+                        decision.failure_backoff_at_ms,
+                        Some(prefixed_detail(
+                            decision.detail_prefix,
+                            format!("producer start ({model}): {err:?}"),
+                        )),
                     ),
                 )?;
                 producer.close().await;
-                if retry {
+                if decision.try_next_model {
                     continue;
                 }
                 return Err(HistorianDriveError::Producer(err));
@@ -779,17 +941,18 @@ where
                     Ok(output) => output,
                     Err(recovery_err) => {
                         let _ = producer.cancel(&handle.run_id).await;
+                        let detail = format!(
+                            "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
+                        );
                         persist_historian_state(
-                        request.store,
-                        request.session_id,
-                        abandon_with_detail(
-                            &awaiting,
-                            request.failure_backoff_at_ms,
-                            Some(format!(
-                                "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
-                            )),
-                        ),
-                    )?;
+                            request.store,
+                            request.session_id,
+                            abandon_with_detail(
+                                &awaiting,
+                                request.failure_backoff_at_ms,
+                                Some(detail),
+                            ),
+                        )?;
                         producer.close().await;
                         return Err(HistorianDriveError::Producer(recovery_err));
                     }
@@ -797,20 +960,29 @@ where
             }
             Err(err) => {
                 let _ = producer.cancel(&handle.run_id).await;
-                let retry = err.is_retryable_model_failure()
-                    && !err.is_abort_or_overflow()
-                    && index + 1 < request.model_chain.len();
+                let decision = decide_producer_failure(
+                    &err,
+                    model,
+                    &request.model_chain[index + 1..],
+                    &mut auth_blocked_providers,
+                    &mut all_failures_permanent,
+                    request.now_ms,
+                    request.failure_backoff_at_ms,
+                );
                 persist_historian_state(
                     request.store,
                     request.session_id,
                     abandon_with_detail(
                         &awaiting,
-                        request.failure_backoff_at_ms,
-                        Some(format!("producer output ({model}): {err:?}")),
+                        decision.failure_backoff_at_ms,
+                        Some(prefixed_detail(
+                            decision.detail_prefix,
+                            format!("producer output ({model}): {err:?}"),
+                        )),
                     ),
                 )?;
                 producer.close().await;
-                if retry {
+                if decision.try_next_model {
                     continue;
                 }
                 return Err(HistorianDriveError::Producer(err));
@@ -907,10 +1079,37 @@ where
         Ok(output) => output,
         Err(err) => {
             let _ = producer.cancel(&producer_run_id).await;
-            abandon_current_state(
+            let detail_prefix = match err
+                .classification()
+                .map(|classification| classification.class)
+            {
+                Some(ErrorClass::AuthRequired) => Some(AUTH_REQUIRED_PREFIX),
+                _ if err.has_class_field() && err.classification().is_none() => {
+                    Some(UNKNOWN_ERROR_CLASS_PREFIX)
+                }
+                _ => None,
+            };
+            let backoff_at_ms =
+                err.classification()
+                    .map_or(request.failure_backoff_at_ms, |classification| {
+                        if classification.class == ErrorClass::Transient {
+                            classified_backoff_at_ms(
+                                request.now_ms,
+                                request.failure_backoff_at_ms,
+                                classification,
+                            )
+                        } else {
+                            request.failure_backoff_at_ms
+                        }
+                    });
+            abandon_current_state_with_detail(
                 request.store,
                 request.session_id,
-                request.failure_backoff_at_ms,
+                backoff_at_ms,
+                Some(prefixed_detail(
+                    detail_prefix,
+                    format!("producer reattach output ({producer_run_id}): {err:?}"),
+                )),
             )?;
             producer.close().await;
             return Err(HistorianDriveError::Producer(err));
@@ -1034,11 +1233,20 @@ fn abandon_current_state(
     session_id: &str,
     failure_backoff_at_ms: i64,
 ) -> Result<(), HistorianStateError> {
+    abandon_current_state_with_detail(store, session_id, failure_backoff_at_ms, None)
+}
+
+fn abandon_current_state_with_detail(
+    store: &McStore,
+    session_id: &str,
+    failure_backoff_at_ms: i64,
+    detail: Option<String>,
+) -> Result<(), HistorianStateError> {
     let loaded = store.load(session_id)?;
     persist_historian_state(
         store,
         session_id,
-        abandon(&loaded.meta.historian, failure_backoff_at_ms),
+        abandon_with_detail(&loaded.meta.historian, failure_backoff_at_ms, detail),
     )?;
     Ok(())
 }
@@ -1560,6 +1768,318 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permanent_class_advances_chain_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "model id does not exist",
+                ErrorClass::Permanent,
+                None,
+            )))
+            .with_start(Ok(run_handle("run-2")))
+            .with_output(Ok(producer_output(historian_xml(
+                "fallback after permanent",
+            ))));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+
+        let HistorianDriveOutcome::Completed(success) = outcome else {
+            panic!("expected permanent failure to advance to fallback model");
+        };
+        assert_eq!(success.model, "prov/model-b");
+        assert_eq!(producer.observed_starts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn chain_exhausted_all_permanent_records_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "model a is permanently unavailable",
+                ErrorClass::Permanent,
+                None,
+            )))
+            .with_start(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "model b is permanently unavailable",
+                ErrorClass::Permanent,
+                None,
+            )));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        assert_eq!(producer.observed_starts.len(), 2);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.failure_backoff_at_ms, Some(999));
+        assert!(
+            state
+                .last_failure
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with(CHAIN_EXHAUSTED_PERMANENT_PREFIX)),
+            "all-permanent chain exhaustion must be visible in durable state: {:?}",
+            state.last_failure
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_retry_after_sets_backoff_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut producer =
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "short retry-after should not shorten our schedule",
+                ErrorClass::Transient,
+                Some(5),
+            )));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            state.failure_backoff_at_ms,
+            Some(123 + HISTORIAN_FAILURE_BACKOFF_MS),
+            "retry_after_secs is a floor input and cannot shorten the historian schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_retry_after_longer_than_schedule_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut producer =
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "rate limit reset later",
+                ErrorClass::Transient,
+                Some(120),
+            )));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.failure_backoff_at_ms, Some(123 + 120_000));
+    }
+
+    #[tokio::test]
+    async fn auth_required_skips_same_provider_and_tries_different_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec![
+            "openai/model-a".to_string(),
+            "openai/model-b".to_string(),
+            "anthropic/model-c".to_string(),
+        ];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "credential needs re-authentication",
+                ErrorClass::AuthRequired,
+                None,
+            )))
+            .with_start(Ok(run_handle("run-3")))
+            .with_output(Ok(producer_output(historian_xml(
+                "different provider summary",
+            ))));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+
+        let HistorianDriveOutcome::Completed(success) = outcome else {
+            panic!("expected auth failure to try the different provider fallback");
+        };
+        assert_eq!(success.model, "anthropic/model-c");
+        assert_eq!(
+            producer.observed_starts,
+            vec![
+                (
+                    historian_producer_session_id("proj", "ses", 1),
+                    "openai/model-a".to_string()
+                ),
+                (
+                    historian_producer_session_id("proj", "ses", 2),
+                    "anthropic/model-c".to_string()
+                ),
+            ],
+            "same-provider auth alternatives are skipped without opening a producer session"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_required_all_same_provider_records_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["openai/model-a".to_string(), "openai/model-b".to_string()];
+        let mut producer =
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "credential needs re-authentication",
+                ErrorClass::AuthRequired,
+                None,
+            )));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        assert_eq!(producer.observed_starts.len(), 1);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert!(
+            state
+                .last_failure
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with(AUTH_REQUIRED_PREFIX)),
+            "same-provider auth exhaustion must be visible in durable state: {:?}",
+            state.last_failure
+        );
+    }
+
+    #[tokio::test]
+    async fn tagged_context_overflow_short_circuits_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
+        let mut producer =
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "context window exceeded",
+                ErrorClass::ContextOverflow,
+                None,
+            )));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        assert_eq!(producer.observed_starts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn untagged_error_uses_deprecated_heuristic_and_counts_it() {
+        crate::historian_producer::reset_deprecated_heuristic_uses_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::retryable_model_failure(
+                "provider overloaded",
+            )))
+            .with_start(Ok(run_handle("run-2")))
+            .with_output(Ok(producer_output(historian_xml("heuristic fallback"))));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, HistorianDriveOutcome::Completed(_)));
+        assert!(
+            crate::historian_producer::deprecated_heuristic_uses() >= 1,
+            "an untagged producer error must increment the migration counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn tagged_error_ignores_contradicting_heuristic_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::tagged_subc(
+                "context_overflow",
+                "overflow text would block retry under the deprecated heuristic",
+                ErrorClass::Permanent,
+                None,
+            )))
+            .with_start(Ok(run_handle("run-2")))
+            .with_output(Ok(producer_output(historian_xml("tag wins summary"))));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+
+        let HistorianDriveOutcome::Completed(success) = outcome else {
+            panic!("expected permanent tag to advance despite overflow text");
+        };
+        assert_eq!(success.model, "prov/model-b");
+    }
+
+    #[tokio::test]
     async fn reattach_terminal_redrains_from_start_without_second_send() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -1833,12 +2353,14 @@ mod tests {
         let chunk = historian_chunk();
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string()];
-        let mut producer = ScriptedProducer::default().with_start(Err(
-            HistorianProducerError::Subc(subc_protocol::ErrorBody {
-                code: "route_rejected".to_string(),
-                message: "no such module".to_string(),
-            }),
-        ));
+        let mut producer =
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::Subc(
+                subc_protocol::ErrorBody {
+                    code: "route_rejected".to_string(),
+                    message: "no such module".to_string(),
+                }
+                .into(),
+            )));
 
         let err = run_historian_firing(
             &mut producer,
@@ -1885,6 +2407,8 @@ mod tests {
             .with_output(Err(HistorianProducerError::RunPaused {
                 run_id: "run-1".into(),
                 reason: Some("auth_required".into()),
+                classification: None,
+                class_field_present: false,
             }));
 
         let err = run_historian_firing(

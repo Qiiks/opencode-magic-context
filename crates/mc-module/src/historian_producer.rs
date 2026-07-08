@@ -4,7 +4,13 @@
 //! does not depend on llm-runner Rust crates, so Magic Context remains an origin-
 //! agnostic consumer module.
 
-use std::{error::Error, fmt, path::PathBuf, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
@@ -47,6 +53,136 @@ const DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// 600s wait expires; one short replay salvages that durable output without
 /// letting the fallback path hang for another full production timeout.
 const RECOVERY_REDRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Fixed error-class strings used by the producer/consumer wire contract.
+pub const ERROR_CLASS_WIRE_SET: [&str; 4] = [
+    "transient",
+    "permanent",
+    "auth_required",
+    "context_overflow",
+];
+
+static DEPRECATED_HEURISTIC_USES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    Transient,
+    Permanent,
+    AuthRequired,
+    ContextOverflow,
+}
+
+impl ErrorClass {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            ErrorClass::Transient => ERROR_CLASS_WIRE_SET[0],
+            ErrorClass::Permanent => ERROR_CLASS_WIRE_SET[1],
+            ErrorClass::AuthRequired => ERROR_CLASS_WIRE_SET[2],
+            ErrorClass::ContextOverflow => ERROR_CLASS_WIRE_SET[3],
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "transient" => Some(ErrorClass::Transient),
+            "permanent" => Some(ErrorClass::Permanent),
+            "auth_required" | "auth" => Some(ErrorClass::AuthRequired),
+            "context_overflow" => Some(ErrorClass::ContextOverflow),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorClassification {
+    pub class: ErrorClass,
+    pub retry_after_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerErrorBody {
+    pub code: String,
+    pub message: String,
+    classification: Option<ErrorClassification>,
+    class_field_present: bool,
+}
+
+impl ProducerErrorBody {
+    pub fn untagged(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            classification: None,
+            class_field_present: false,
+        }
+    }
+
+    pub fn tagged(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        class: ErrorClass,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            classification: Some(ErrorClassification {
+                class,
+                retry_after_secs,
+            }),
+            class_field_present: true,
+        }
+    }
+
+    pub fn classification(&self) -> Option<ErrorClassification> {
+        self.classification
+    }
+
+    pub fn has_class_field(&self) -> bool {
+        self.class_field_present
+    }
+
+    fn from_value(value: Value) -> Self {
+        let code = value
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("producer_error")
+            .to_string();
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("producer error")
+            .to_string();
+        let (classification, class_field_present) = classification_from_object(&value);
+        Self {
+            code,
+            message,
+            classification,
+            class_field_present,
+        }
+    }
+}
+
+impl From<ErrorBody> for ProducerErrorBody {
+    fn from(body: ErrorBody) -> Self {
+        Self::untagged(body.code, body.message)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeprecatedHeuristicDecision {
+    pub retryable_model_failure: bool,
+    pub abort_or_overflow: bool,
+}
+
+pub fn deprecated_heuristic_uses() -> u64 {
+    DEPRECATED_HEURISTIC_USES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_deprecated_heuristic_uses_for_test() {
+    DEPRECATED_HEURISTIC_USES.store(0, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunHandle {
@@ -115,7 +251,7 @@ pub enum HistorianProducerError {
     FrameIo(FrameIoError),
     FrameBuild(FrameBuildError),
     Json(serde_json::Error),
-    Subc(ErrorBody),
+    Subc(ProducerErrorBody),
     UnexpectedControlResponse,
     MissingRunId,
     MissingSession,
@@ -124,6 +260,8 @@ pub enum HistorianProducerError {
     RunFailed {
         run_id: String,
         detail: String,
+        classification: Option<ErrorClassification>,
+        class_field_present: bool,
     },
     TerminalRunMismatch {
         expected: String,
@@ -132,50 +270,123 @@ pub enum HistorianProducerError {
     RunPaused {
         run_id: String,
         reason: Option<String>,
+        classification: Option<ErrorClassification>,
+        class_field_present: bool,
     },
 }
 
 impl HistorianProducerError {
     pub fn retryable_model_failure(message: impl Into<String>) -> Self {
-        HistorianProducerError::Subc(ErrorBody {
-            code: "retryable_model_failure".to_string(),
-            message: message.into(),
-        })
+        HistorianProducerError::Subc(ProducerErrorBody::untagged(
+            "retryable_model_failure",
+            message,
+        ))
     }
 
     pub fn context_overflow(message: impl Into<String>) -> Self {
-        HistorianProducerError::Subc(ErrorBody {
-            code: "context_overflow".to_string(),
-            message: message.into(),
-        })
+        HistorianProducerError::Subc(ProducerErrorBody::untagged("context_overflow", message))
     }
 
     pub fn aborted(message: impl Into<String>) -> Self {
-        HistorianProducerError::Subc(ErrorBody {
-            code: "aborted".to_string(),
-            message: message.into(),
-        })
+        HistorianProducerError::Subc(ProducerErrorBody::untagged("aborted", message))
+    }
+
+    pub fn tagged_subc(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        class: ErrorClass,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
+        HistorianProducerError::Subc(ProducerErrorBody::tagged(
+            code,
+            message,
+            class,
+            retry_after_secs,
+        ))
+    }
+
+    pub fn classification(&self) -> Option<ErrorClassification> {
+        match self {
+            HistorianProducerError::Subc(body) => body.classification(),
+            HistorianProducerError::RunFailed { classification, .. }
+            | HistorianProducerError::RunPaused { classification, .. } => *classification,
+            _ => None,
+        }
+    }
+
+    pub fn has_class_field(&self) -> bool {
+        match self {
+            HistorianProducerError::Subc(body) => body.has_class_field(),
+            HistorianProducerError::RunFailed {
+                class_field_present,
+                ..
+            }
+            | HistorianProducerError::RunPaused {
+                class_field_present,
+                ..
+            } => *class_field_present,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn deprecated_heuristic_decision(&self) -> DeprecatedHeuristicDecision {
+        record_deprecated_heuristic_use(self.heuristic_log_code());
+        self.heuristic_decision()
     }
 
     pub fn is_retryable_model_failure(&self) -> bool {
-        match self {
-            HistorianProducerError::Subc(body) => {
-                retryable_code(&body.code) || retryable_code(&body.message)
-            }
-            HistorianProducerError::RunFailed { detail, .. } => retryable_code(detail),
-            _ => false,
+        if let Some(classification) = self.classification() {
+            return classification.class == ErrorClass::Transient;
         }
+        if self.has_class_field() {
+            return false;
+        }
+        self.heuristic_decision().retryable_model_failure
     }
 
     pub fn is_abort_or_overflow(&self) -> bool {
+        if let Some(classification) = self.classification() {
+            return classification.class == ErrorClass::ContextOverflow;
+        }
+        if self.has_class_field() {
+            return false;
+        }
+        self.heuristic_decision().abort_or_overflow
+    }
+
+    fn heuristic_decision(&self) -> DeprecatedHeuristicDecision {
         match self {
-            HistorianProducerError::Subc(body) => {
-                abort_or_overflow(&body.code) || abort_or_overflow(&body.message)
-            }
-            HistorianProducerError::RunFailed { detail, .. } => abort_or_overflow(detail),
-            _ => false,
+            HistorianProducerError::Subc(body) => DeprecatedHeuristicDecision {
+                retryable_model_failure: retryable_code(&body.code)
+                    || retryable_code(&body.message),
+                abort_or_overflow: abort_or_overflow(&body.code)
+                    || abort_or_overflow(&body.message),
+            },
+            HistorianProducerError::RunFailed { detail, .. } => DeprecatedHeuristicDecision {
+                retryable_model_failure: retryable_code(detail),
+                abort_or_overflow: abort_or_overflow(detail),
+            },
+            _ => DeprecatedHeuristicDecision {
+                retryable_model_failure: false,
+                abort_or_overflow: false,
+            },
         }
     }
+
+    fn heuristic_log_code(&self) -> &str {
+        match self {
+            HistorianProducerError::Subc(body) => &body.code,
+            HistorianProducerError::RunFailed { .. } => "run_failed",
+            HistorianProducerError::RunPaused { .. } => "run_paused",
+            HistorianProducerError::TimedOut => "timed_out",
+            _ => "producer_error",
+        }
+    }
+}
+
+fn record_deprecated_heuristic_use(code: &str) {
+    DEPRECATED_HEURISTIC_USES.fetch_add(1, Ordering::Relaxed);
+    eprintln!("[mc-module] untagged producer error (deprecated heuristic used): code={code}");
 }
 
 fn retryable_code(s: &str) -> bool {
@@ -228,7 +439,7 @@ impl fmt::Display for HistorianProducerError {
                 "subscribe stream ended before the run terminal control unit"
             ),
             HistorianProducerError::TimedOut => write!(f, "historian producer timed out"),
-            HistorianProducerError::RunFailed { run_id, detail } => {
+            HistorianProducerError::RunFailed { run_id, detail, .. } => {
                 write!(f, "run {run_id} failed: {detail}")
             }
             HistorianProducerError::TerminalRunMismatch { expected, found } => {
@@ -238,7 +449,7 @@ impl fmt::Display for HistorianProducerError {
                     found
                 )
             }
-            HistorianProducerError::RunPaused { run_id, reason } => {
+            HistorianProducerError::RunPaused { run_id, reason, .. } => {
                 write!(f, "run {run_id} paused")?;
                 if let Some(reason) = reason {
                     write!(f, ": {reason}")?;
@@ -364,10 +575,10 @@ impl HistorianProducer {
         // string fails the whole send with invalid_params, which a live rig drive
         // surfaced as firings dying before any producer run existed.
         let (provider, model_name) = model.split_once('/').ok_or_else(|| {
-            HistorianProducerError::Subc(ErrorBody {
-                code: "invalid_model".to_string(),
-                message: format!("model '{model}' is not in canonical provider/model form"),
-            })
+            HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                "invalid_model",
+                format!("model '{model}' is not in canonical provider/model form"),
+            ))
         })?;
         let mut params = serde_json::Map::new();
         params.insert("prompt".into(), json!(prompt));
@@ -588,9 +799,12 @@ impl HistorianProducer {
                         // A paused run still holds the slot for this historian. Return
                         // an error so callers stop waiting and retry later instead of
                         // hanging forever on a run that is paused but not finished.
+                        let info = unit_error_info(unit);
                         return Err(HistorianProducerError::RunPaused {
                             run_id: run_id.to_string(),
                             reason: paused_reason(unit).map(ToString::to_string),
+                            classification: info.classification,
+                            class_field_present: info.class_field_present,
                         });
                     }
                     if let Some(piece) = unit_text(unit) {
@@ -607,9 +821,12 @@ impl HistorianProducer {
                             });
                         }
                         if is_error_unit(unit) {
+                            let info = unit_error_info(unit);
                             return Err(HistorianProducerError::RunFailed {
                                 run_id: run_id.to_string(),
-                                detail: unit_error_detail(unit).unwrap_or("run failed").to_string(),
+                                detail: info.detail.unwrap_or_else(|| "run failed".to_string()),
+                                classification: info.classification,
+                                class_field_present: info.class_field_present,
                             });
                         }
                         // The run terminal control unit is authoritative. StreamEnd is only
@@ -833,11 +1050,45 @@ fn is_error_unit(unit: &Value) -> bool {
         .is_some_and(|ty| ty == "error" || ty == "run_error")
 }
 
-fn unit_error_detail(unit: &Value) -> Option<&str> {
-    unit.get("detail")
-        .or_else(|| unit.get("error"))
+#[derive(Debug, Default)]
+struct UnitErrorInfo {
+    detail: Option<String>,
+    classification: Option<ErrorClassification>,
+    class_field_present: bool,
+}
+
+fn unit_error_info(unit: &Value) -> UnitErrorInfo {
+    if let Some(error) = unit.get("error") {
+        let (classification, class_field_present) = classification_from_object(error);
+        let detail = error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| unit.get("detail").and_then(Value::as_str))
+            .or_else(|| unit.get("message").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .or_else(|| error.as_str().map(ToString::to_string))
+            .or_else(|| Some(error.to_string()));
+        return UnitErrorInfo {
+            detail,
+            classification,
+            class_field_present,
+        };
+    }
+
+    let detail = unit
+        .get("detail")
         .or_else(|| unit.get("message"))
         .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let (classification, class_field_present) = detail
+        .as_deref()
+        .and_then(classification_from_json_text)
+        .unwrap_or((None, false));
+    UnitErrorInfo {
+        detail,
+        classification,
+        class_field_present,
+    }
 }
 
 fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
@@ -849,11 +1100,47 @@ fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
     })
 }
 
-fn error_body(body: &[u8]) -> ErrorBody {
-    serde_json::from_slice(body).unwrap_or_else(|e| ErrorBody {
-        code: "invalid_error_body".to_string(),
-        message: e.to_string(),
-    })
+fn error_body(body: &[u8]) -> ProducerErrorBody {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(value) => ProducerErrorBody::from_value(value),
+        Err(e) => ProducerErrorBody::untagged("invalid_error_body", e.to_string()),
+    }
+}
+
+fn classification_from_json_text(s: &str) -> Option<(Option<ErrorClassification>, bool)> {
+    serde_json::from_str::<Value>(s)
+        .ok()
+        .map(|value| classification_from_object(&value))
+}
+
+fn classification_from_object(value: &Value) -> (Option<ErrorClassification>, bool) {
+    let Some(class_value) = value.get("class") else {
+        return (None, false);
+    };
+    let Some(class) = class_value.as_str().and_then(ErrorClass::from_wire) else {
+        return (None, true);
+    };
+    (
+        Some(ErrorClassification {
+            class,
+            retry_after_secs: value
+                .get("retry_after_secs")
+                .and_then(retry_after_secs_from_value),
+        }),
+        true,
+    )
+}
+
+fn retry_after_secs_from_value(value: &Value) -> Option<u64> {
+    if let Some(secs) = value.as_u64() {
+        return Some(secs);
+    }
+    let secs = value.as_f64()?;
+    if secs.is_finite() && secs >= 0.0 {
+        Some(secs.ceil() as u64)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -868,6 +1155,75 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::{net::TcpListener, sync::Mutex};
+
+    #[test]
+    fn error_class_wire_strings_match_pinned_contract_set() {
+        assert_eq!(
+            ERROR_CLASS_WIRE_SET,
+            [
+                "transient",
+                "permanent",
+                "auth_required",
+                "context_overflow"
+            ]
+        );
+        assert_eq!(ErrorClass::Transient.as_wire_str(), "transient");
+        assert_eq!(ErrorClass::Permanent.as_wire_str(), "permanent");
+        assert_eq!(ErrorClass::AuthRequired.as_wire_str(), "auth_required");
+        assert_eq!(
+            ErrorClass::ContextOverflow.as_wire_str(),
+            "context_overflow"
+        );
+        assert_eq!(
+            ErrorClass::from_wire("auth"),
+            Some(ErrorClass::AuthRequired)
+        );
+    }
+
+    #[test]
+    fn parses_tagged_subc_error_body_from_contract_shape() {
+        let body = serde_json::to_vec(&json!({
+            "code": "provider_error",
+            "message": "rate limit window",
+            "class": "transient",
+            "retry_after_secs": 120,
+            "provider_code": "rate_limit_exceeded"
+        }))
+        .unwrap();
+
+        let parsed = error_body(&body);
+        assert_eq!(parsed.code, "provider_error");
+        assert_eq!(
+            parsed.classification(),
+            Some(ErrorClassification {
+                class: ErrorClass::Transient,
+                retry_after_secs: Some(120),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_current_llm_runner_control_error_shape() {
+        let unit = json!({
+            "type": "error",
+            "error": {
+                "class": "permanent",
+                "message": "model id does not exist",
+                "status": 404,
+                "provider_code": "model_not_found"
+            }
+        });
+
+        let info = unit_error_info(&unit);
+        assert_eq!(info.detail.as_deref(), Some("model id does not exist"));
+        assert_eq!(
+            info.classification,
+            Some(ErrorClassification {
+                class: ErrorClass::Permanent,
+                retry_after_secs: None,
+            })
+        );
+    }
 
     #[derive(Debug, Default)]
     struct ServerLog {
@@ -1214,6 +1570,7 @@ mod tests {
             HistorianProducerError::RunPaused {
                 run_id,
                 reason: Some(reason),
+                ..
             } if run_id == "run-1" && reason == "auth_required"
         ));
     }

@@ -128,7 +128,7 @@ const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
 const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
 /// After a historian abandon, suppress refires for this long so a persistently
 /// failing model does not burn a full summarization pass on every transform.
-const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
+const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
 const SESSION_UNRESOLVED_MESSAGE: &str =
     "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
 
@@ -1016,6 +1016,8 @@ impl McHandler {
                 HistorianProducerError::RunFailed {
                     run_id: String::new(),
                     detail: format!("inline firing task panicked: {join_err}"),
+                    classification: None,
+                    class_field_present: false,
                 },
             )),
             Err(_elapsed) => Err(historian::HistorianDriveError::Producer(
