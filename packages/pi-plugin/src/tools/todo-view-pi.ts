@@ -60,6 +60,17 @@ const STATUS_COLOR: Record<TodoStatus, Parameters<Theme["fg"]>[0]> = {
 };
 
 const snapshotsBySession = new Map<string, TodoSnapshot>();
+const MAX_TODOWRITE_RENDER_CACHE_ENTRIES = 50;
+
+// Current Pi versions build transcript tool components from streaming
+// assistant updates, so todowrite can first render with partial or missing
+// args. Later tool start/end events mark the call complete but do not replace
+// the args already captured on that component. Cache validated todos by
+// toolCallId so transcript renders can recover the final list when the
+// component keeps stale args.
+const cachedTodowriteTodosByToolCallId = new Map<string, TodoItem[]>();
+
+type ToolRenderContext = { toolCallId?: string } | undefined;
 
 function isTodoStatus(value: unknown): value is TodoStatus {
 	return TODO_STATUSES.includes(value as TodoStatus);
@@ -71,6 +82,34 @@ function isTodoPriority(value: unknown): value is TodoPriority {
 
 function cloneTodos(todos: readonly TodoItem[]): TodoItem[] {
 	return todos.map((todo) => ({ ...todo }));
+}
+
+export function rememberTodowriteToolCallTodos(
+	toolCallId: string | undefined,
+	todos: readonly TodoItem[],
+): void {
+	if (!toolCallId) return;
+	cachedTodowriteTodosByToolCallId.delete(toolCallId);
+	cachedTodowriteTodosByToolCallId.set(toolCallId, cloneTodos(todos));
+	while (
+		cachedTodowriteTodosByToolCallId.size > MAX_TODOWRITE_RENDER_CACHE_ENTRIES
+	) {
+		const oldestKey = cachedTodowriteTodosByToolCallId.keys().next().value;
+		if (typeof oldestKey !== "string") break;
+		cachedTodowriteTodosByToolCallId.delete(oldestKey);
+	}
+}
+
+function getCachedTodowriteToolCallTodos(
+	toolCallId: string | undefined,
+): TodoItem[] | null {
+	if (!toolCallId) return null;
+	const todos = cachedTodowriteTodosByToolCallId.get(toolCallId);
+	return todos ? cloneTodos(todos) : null;
+}
+
+export function clearTodowriteToolCallTodos(): void {
+	cachedTodowriteTodosByToolCallId.clear();
 }
 
 export function parseTodos(input: unknown): TodoItem[] | null {
@@ -136,6 +175,7 @@ export function clearTodoSnapshot(sessionId: string): void {
 
 export function __resetTodoSnapshotsForTests(): void {
 	snapshotsBySession.clear();
+	clearTodowriteToolCallTodos();
 }
 
 function getSessionId(ctx: {
@@ -238,8 +278,12 @@ function capTodoRows<T>(rows: readonly T[]): {
 export function renderTodowriteCall(
 	args: { todos?: unknown },
 	theme: Theme,
+	context?: ToolRenderContext,
 ): Component {
-	const todos = parseTodos(args.todos) ?? [];
+	const todos =
+		getCachedTodowriteToolCallTodos(context?.toolCallId) ??
+		parseTodos(args.todos) ??
+		[];
 	const active = activeTitleCount(todos);
 	const activeColor: Parameters<Theme["fg"]>[0] =
 		active > 0 ? "warning" : "success";
@@ -250,11 +294,12 @@ export function renderTodowriteCall(
 export function renderTodowriteResult(
 	result: { details?: unknown; content?: unknown },
 	theme: Theme,
+	context?: ToolRenderContext,
 ): Component {
 	const detailsTodos = (result.details as { todos?: unknown } | undefined)
 		?.todos;
 	let todos = parseTodos(detailsTodos);
-	if (todos === null && Array.isArray(result.content)) {
+	if ((todos === null || todos.length === 0) && Array.isArray(result.content)) {
 		const text = result.content.find(
 			(part): part is { type: "text"; text: string } =>
 				part !== null &&
@@ -264,13 +309,17 @@ export function renderTodowriteResult(
 		)?.text;
 		if (text) {
 			try {
-				todos = parseTodos(JSON.parse(text));
+				const parsed = parseTodos(JSON.parse(text));
+				if (parsed !== null) todos = parsed;
 			} catch {
 				// Leave the renderer empty if the tool result is not a todo list.
 			}
 		}
 	}
-	const renderedTodos = todos ?? [];
+	const renderedTodos =
+		todos !== null && todos.length > 0
+			? todos
+			: (getCachedTodowriteToolCallTodos(context?.toolCallId) ?? todos ?? []);
 	return lineComponent((width) => {
 		if (renderedTodos.length === 0) return [theme.fg("dim", "No todos")];
 
@@ -530,6 +579,7 @@ export function registerTodoOverlay(
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		clearTodowriteToolCallTodos();
 		const sessionId = getSessionId(ctx);
 		if (!sessionId) return;
 		clearTodoSnapshot(sessionId);
@@ -537,6 +587,7 @@ export function registerTodoOverlay(
 	});
 
 	pi.on("session_before_switch", async (_event, ctx) => {
+		clearTodowriteToolCallTodos();
 		const sessionId = getSessionId(ctx);
 		if (!sessionId) return;
 		clearTodoSnapshot(sessionId);
@@ -557,11 +608,13 @@ export function registerTodoStateLifecycle(
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		clearTodowriteToolCallTodos();
 		const sessionId = getSessionId(ctx);
 		if (sessionId) clearTodoSnapshot(sessionId);
 	});
 
 	pi.on("session_before_switch", async (_event, ctx) => {
+		clearTodowriteToolCallTodos();
 		const sessionId = getSessionId(ctx);
 		if (sessionId) clearTodoSnapshot(sessionId);
 	});

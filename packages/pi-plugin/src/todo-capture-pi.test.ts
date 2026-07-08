@@ -13,13 +13,42 @@ import { assistantToolCall, createTestDb } from "./test-utils.test";
 import {
 	__resetTodoSnapshotsForTests,
 	getTodoSnapshot,
+	renderTodowriteCall,
 } from "./tools/todo-view-pi";
+
+const identityTheme = {
+	fg: (_color: string, text: string) => text,
+	bold: (text: string) => text,
+} as never;
 
 beforeEach(() => {
 	__resetTodoSnapshotsForTests();
 });
 
 describe("Pi todowrite capture compatibility", () => {
+	it("tool_execution_start capture seeds the render cache for compatible payloads", () => {
+		const db = createTestDb();
+		try {
+			const captured = capturePiTodowriteArgsIfCompatible({
+				db,
+				sessionId: "ses-args-cache",
+				todos: [{ content: "Build", status: "in_progress" }],
+				todowriteEnabled: true,
+				persist: true,
+				toolCallId: "call-cache",
+			});
+
+			expect(captured).toBe(true);
+			expect(
+				renderTodowriteCall({}, identityTheme, {
+					toolCallId: "call-cache",
+				} as never).render(80)[0],
+			).toContain("Todos — 1 active");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("tool_execution_start capture ignores foreign status values", () => {
 		const db = createTestDb();
 		const previousState =
@@ -35,6 +64,7 @@ describe("Pi todowrite capture compatibility", () => {
 				todowriteEnabled: true,
 				todoOverlay: { update: () => overlayUpdates++ },
 				persist: true,
+				toolCallId: "call-foreign",
 			});
 
 			expect(captured).toBe(false);
@@ -43,6 +73,11 @@ describe("Pi todowrite capture compatibility", () => {
 			);
 			expect(getTodoSnapshot("ses-args").todos).toEqual([]);
 			expect(overlayUpdates).toBe(0);
+			expect(
+				renderTodowriteCall({}, identityTheme, {
+					toolCallId: "call-foreign",
+				} as never).render(80)[0],
+			).toContain("Todos — 0 active");
 		} finally {
 			closeQuietly(db);
 		}

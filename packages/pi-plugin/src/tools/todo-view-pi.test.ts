@@ -8,6 +8,7 @@ import {
 	getTodoSnapshot,
 	registerTodoOverlay,
 	registerTodosCommand,
+	rememberTodowriteToolCallTodos,
 	setTodoSnapshot,
 	TodoOverlay,
 } from "./todo-view-pi";
@@ -88,6 +89,129 @@ describe("todowrite tool rendering", () => {
 		expect(
 			renderCall({ todos } as never, identityTheme, {} as never).render(80)[0],
 		).toContain("Todos — 3 active");
+	});
+	it("uses cached todos when the transcript component was created with empty args", () => {
+		const tool = createTodowriteTool();
+		const renderCall = tool.renderCall;
+		if (!renderCall) throw new Error("todowrite renderCall missing");
+		const todos = [
+			{ id: "1", content: "Work", status: "in_progress" as const },
+			...Array.from({ length: 9 }, (_, index) => ({
+				id: String(index + 2),
+				content: `Done ${index + 2}`,
+				status: "completed" as const,
+			})),
+		];
+		rememberTodowriteToolCallTodos("call-stale", todos);
+		expect(
+			renderCall({}, identityTheme, {
+				toolCallId: "call-stale",
+			} as never).render(80)[0],
+		).toContain("Todos — 1 active");
+	});
+	it("falls back to args when no cached tool-call todos exist", () => {
+		const tool = createTodowriteTool();
+		const renderCall = tool.renderCall;
+		if (!renderCall) throw new Error("todowrite renderCall missing");
+		const todos = [
+			{ id: "1", content: "Plan", status: "pending" as const },
+			{ id: "2", content: "Build", status: "in_progress" as const },
+			{ id: "3", content: "Done", status: "completed" as const },
+		];
+		expect(
+			renderCall({ todos } as never, identityTheme, {
+				toolCallId: "call-miss",
+			} as never).render(80)[0],
+		).toContain("Todos — 2 active");
+	});
+	it("renders identically when cache and args already agree", () => {
+		const tool = createTodowriteTool();
+		const renderCall = tool.renderCall;
+		if (!renderCall) throw new Error("todowrite renderCall missing");
+		const todos = [
+			{ id: "1", content: "Plan", status: "pending" as const },
+			{ id: "2", content: "Done", status: "completed" as const },
+		];
+		rememberTodowriteToolCallTodos("call-equal", todos);
+		expect(
+			renderCall({ todos } as never, identityTheme, {
+				toolCallId: "call-equal",
+			} as never).render(80),
+		).toEqual(
+			renderCall({ todos } as never, identityTheme, {
+				toolCallId: "call-equal-miss",
+			} as never).render(80),
+		);
+	});
+	it("uses cached todos for stale-empty results", () => {
+		const tool = createTodowriteTool();
+		const renderResult = tool.renderResult;
+		if (!renderResult) throw new Error("todowrite renderResult missing");
+		const todos = [
+			{ id: "1", content: "Work", status: "in_progress" as const },
+			{ id: "2", content: "Done", status: "completed" as const },
+		];
+		rememberTodowriteToolCallTodos("call-stale-result", todos);
+		const rendered = renderResult(
+			{
+				details: { todos: [] },
+				content: [{ type: "text", text: "[]" }],
+			},
+			{ expanded: false, isPartial: false },
+			identityTheme,
+			{ toolCallId: "call-stale-result" } as never,
+		)
+			.render(120)
+			.join("\n");
+		expect(rendered).toContain("◐ #1 Work");
+		expect(rendered).toContain("✓ #2 Done");
+	});
+	it("prefers parsed tool results over cached todos when both are present", () => {
+		const tool = createTodowriteTool();
+		const renderResult = tool.renderResult;
+		if (!renderResult) throw new Error("todowrite renderResult missing");
+		rememberTodowriteToolCallTodos("call-real-result", [
+			{ id: "stale", content: "Stale", status: "pending" },
+		]);
+		const rendered = renderResult(
+			{
+				details: {
+					todos: [{ id: "fresh", content: "Fresh", status: "pending" }],
+				},
+				content: [{ type: "text", text: "[]" }],
+			},
+			{ expanded: false, isPartial: false },
+			identityTheme,
+			{ toolCallId: "call-real-result" } as never,
+		)
+			.render(120)
+			.join("\n");
+		expect(rendered).toContain("○ #fresh Fresh");
+		expect(rendered).not.toContain("Stale");
+	});
+	it("evicts the oldest cached tool-call todos after the cap", () => {
+		const tool = createTodowriteTool();
+		const renderCall = tool.renderCall;
+		if (!renderCall) throw new Error("todowrite renderCall missing");
+		for (let index = 1; index <= 51; index++) {
+			rememberTodowriteToolCallTodos(`call-${index}`, [
+				{
+					id: String(index),
+					content: `Task ${index}`,
+					status: "pending",
+				},
+			]);
+		}
+		expect(
+			renderCall({}, identityTheme, { toolCallId: "call-1" } as never).render(
+				80,
+			)[0],
+		).toContain("Todos — 0 active");
+		expect(
+			renderCall({}, identityTheme, { toolCallId: "call-51" } as never).render(
+				80,
+			)[0],
+		).toContain("Todos — 1 active");
 	});
 	it("caps result rows at 12 with a +N more tail", async () => {
 		const tool = createTodowriteTool();
@@ -258,10 +382,16 @@ describe("TodoOverlay lifecycle", () => {
 		expect(widget.render(120)).toEqual([]);
 	});
 	it("seeds from session_meta.last_todo_state and clears on session switch", async () => {
+		const tool = createTodowriteTool();
+		const renderCall = tool.renderCall;
+		if (!renderCall) throw new Error("todowrite renderCall missing");
 		const handlers = new Map<
 			string,
 			(event: unknown, ctx: unknown) => Promise<void> | void
 		>();
+		rememberTodowriteToolCallTodos("call-session-switch", [
+			{ id: "cached", content: "Cached", status: "pending" },
+		]);
 		registerTodoOverlay(
 			{
 				on: (event, handler) => handlers.set(event, handler as never),
@@ -293,6 +423,11 @@ describe("TodoOverlay lifecycle", () => {
 			"magic-context-todos",
 			undefined,
 		]);
+		expect(
+			renderCall({}, identityTheme, {
+				toolCallId: "call-session-switch",
+			} as never).render(80)[0],
+		).toContain("Todos — 0 active");
 	});
 	it("caps content rows with a +N more tail", () => {
 		setTodoSnapshot(

@@ -144,8 +144,10 @@ import {
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools } from "./tools";
 import {
+	parseTodos,
 	registerTodoOverlay,
 	registerTodoStateLifecycle,
+	rememberTodowriteToolCallTodos,
 	setTodoSnapshot,
 } from "./tools/todo-view-pi";
 
@@ -199,7 +201,7 @@ type TodoOverlayUpdater = { update: (sessionId?: string) => void };
 
 type CompatiblePiTodoCapture = {
 	normalized: string;
-	todos: unknown[];
+	todos: Exclude<ReturnType<typeof parseTodos>, null>;
 };
 
 function getCompatiblePiTodoCapture(
@@ -208,7 +210,9 @@ function getCompatiblePiTodoCapture(
 	if (!Array.isArray(todos)) return null;
 	const normalized = normalizeTodoStateJson(todos);
 	if (normalized === null) return null;
-	return { normalized, todos };
+	const parsed = parseTodos(todos);
+	if (parsed === null) return null;
+	return { normalized, todos: parsed };
 }
 
 function applyCompatiblePiTodoCapture(args: {
@@ -217,8 +221,10 @@ function applyCompatiblePiTodoCapture(args: {
 	todowriteEnabled: boolean;
 	todoOverlay?: TodoOverlayUpdater;
 	persist: boolean;
+	toolCallId?: string;
 	capture: CompatiblePiTodoCapture;
 }): void {
+	rememberTodowriteToolCallTodos(args.toolCallId, args.capture.todos);
 	if (args.todowriteEnabled) {
 		setTodoSnapshot(args.sessionId, args.capture.todos);
 		args.todoOverlay?.update(args.sessionId);
@@ -233,7 +239,8 @@ function applyCompatiblePiTodoCapture(args: {
 /**
  * Capture a `todowrite` args.todos payload only when it matches Magic Context's
  * exact todo enum contract. Third-party Pi extensions can reuse the same tool
- * name, so incompatible shapes must leave `last_todo_state` untouched.
+ * name, so incompatible shapes must not update `last_todo_state` or the
+ * transcript render cache.
  */
 export function capturePiTodowriteArgsIfCompatible(args: {
 	db: ContextDatabase;
@@ -242,6 +249,7 @@ export function capturePiTodowriteArgsIfCompatible(args: {
 	todowriteEnabled: boolean;
 	todoOverlay?: TodoOverlayUpdater;
 	persist: boolean;
+	toolCallId?: string;
 }): boolean {
 	const capture = getCompatiblePiTodoCapture(args.todos);
 	if (capture === null) return false;
@@ -1597,6 +1605,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				const todoArgs = event.args as
 					| { todos?: Array<{ status?: string }> }
 					| undefined;
+				const toolCallId =
+					typeof (event as { toolCallId?: unknown }).toolCallId === "string"
+						? (event as { toolCallId: string }).toolCallId
+						: undefined;
 				const todos = todoArgs?.todos;
 				const sessionMeta = Array.isArray(todos)
 					? getOrCreateSessionMeta(db, sessionId)
@@ -1607,8 +1619,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				// state on EVERY todowrite call so the transform-time
 				// injection path in pi-pipeline.ts always has a current
 				// snapshot to replay on the next cache-busting pass.
-				// Cache-safe: this is a pure DB write with no message
-				// mutation. Subagents skip — they do not get synthetic
+				// Render-safe: this only stores validated todos in shared
+				// session state and the local tool-call cache; it does not
+				// mutate Pi messages. Subagents skip — they do not get synthetic
 				// todowrite injection. Foreign Pi extensions can share the
 				// `todowrite` name, so only the exact Magic Context todo
 				// shape updates the stored snapshot.
@@ -1619,6 +1632,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					todowriteEnabled,
 					todoOverlay,
 					persist: Boolean(sessionMeta && !sessionMeta.isSubagent),
+					toolCallId,
 				});
 
 				if (

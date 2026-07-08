@@ -107,11 +107,11 @@ export function createTodowriteTool(): ToolDefinition<typeof TodowriteParams> {
 				},
 			};
 		},
-		renderCall(args, theme) {
-			return renderTodowriteCall(args, theme);
+		renderCall(args, theme, context) {
+			return renderTodowriteCall(args, theme, context);
 		},
-		renderResult(result, _opts, theme) {
-			return renderTodowriteResult(result, theme);
+		renderResult(result, _opts, theme, context) {
+			return renderTodowriteResult(result, theme, context);
 		},
 	};
 }
