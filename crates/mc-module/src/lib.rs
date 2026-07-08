@@ -120,6 +120,21 @@ pub enum BindingError {
 /// Canonical module id (overridable via `SUBC_MODULE_ID_ENV` at boot).
 pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
+/// Render-config epoch members, co-owned with byte-splice-consumer codecs (ai-proxy).
+/// Consumers fold these into the opaque render_config string they populate per
+/// request; the module compares render_config as opaque bytes against durable state
+/// and forces a HARD fold on any change. Bumping an epoch here is therefore the
+/// coordinated-deploy mechanism for byte-affecting behavior flips: every in-flight
+/// session folds once on the same lineage instead of straddling the feature boundary.
+/// Consumers read these at attach via the status op and refuse to serve on mismatch
+/// with their hardcoded fallbacks, so a diverged epoch map cannot silently skip the
+/// safety fold.
+/// Bumps when tail-mutation semantics change for the claude-code-anthropic profile
+/// (the full-array-apply / tail_reclaim flip is 0 -> 1).
+pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 0;
+/// Bumps when the visible tagging surface changes (tag prefixes shipping is 0 -> 1).
+pub const TAGGER_FEATURE_EPOCH: u32 = 0;
+
 /// Storage namespace for the cache-state domain.
 const STORAGE_NAMESPACE: &str = "mc_cache";
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
@@ -1631,6 +1646,10 @@ impl McHandler {
                     "store_open": true,
                     "initialized": state.meta.initialized,
                     "row_version": state.row_version,
+                    "epochs": {
+                        "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
+                        "tagger_epoch": TAGGER_FEATURE_EPOCH,
+                    },
                 })),
                 Err(e) => HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -1665,6 +1684,10 @@ impl McHandler {
             "historian": loaded.meta.historian,
             "publication_floor_ordinal": loaded.meta.publication_floor_ordinal,
             "pass_trace": pass_trace,
+            "epochs": {
+                "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
+                "tagger_epoch": TAGGER_FEATURE_EPOCH,
+            },
         }))
     }
 
