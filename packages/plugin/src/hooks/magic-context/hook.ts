@@ -70,6 +70,7 @@ import {
     setRecompStarting,
     setRecompTerminal,
 } from "./recomp-orchestrator";
+import { createShadowSender } from "./shadow-sender";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -141,6 +142,9 @@ export interface MagicContextDeps {
         caveman_text_compression?: {
             enabled: boolean;
             min_chars: number;
+        };
+        shadow_transform?: {
+            enabled: boolean;
         };
     };
 }
@@ -590,6 +594,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
+    const shadowSender =
+        deps.config.shadow_transform?.enabled === true ? createShadowSender() : undefined;
 
     const transform = createTransform({
         tagger: deps.tagger,
@@ -670,6 +676,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   }
                 : undefined,
         maybeAutoEmbedSession,
+        shadowSender,
     });
     const eventHandler = createEventHandler({
         contextUsageMap,
@@ -712,6 +719,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             recompProgressBySession.delete(sessionId);
             internalChildSessions.delete(sessionId);
             channel1StateBySession.delete(sessionId);
+            shadowSender?.clearSession(sessionId);
             clearEmbedSessionState(sessionId);
         },
     });

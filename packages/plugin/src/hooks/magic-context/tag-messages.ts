@@ -200,6 +200,13 @@ export interface ThinkingLikePart {
 
 export type MessageLike = { info: MessageInfo; parts: unknown[] };
 
+export interface TagNormalizationTarget {
+    tagNumber: number;
+    message: MessageLike;
+    part: unknown;
+    field: "text" | "tool_state_output" | "tool_result_content";
+}
+
 export type TagTarget = {
     setContent: (content: string) => boolean;
     getContent?: () => string | null;
@@ -228,6 +235,8 @@ export interface TagMessagesResult {
     hasRecentReduceCall: boolean;
     /** Whether recent assistant messages contain git commit hash patterns */
     hasRecentCommit: boolean;
+    /** Exact part references that received a Magic Context tag prefix while tagMessages processed them. */
+    normalizationTargets: TagNormalizationTarget[];
 }
 
 function collectRelevantSourceTagIds(
@@ -362,6 +371,7 @@ export function tagMessages(
     const skipPrefixInjection = options.skipPrefixInjection === true;
     const onToolOwnerFallbackLookup = options.onToolOwnerFallbackLookup;
     const targets = new Map<number, TagTarget>();
+    const normalizationTargets: TagNormalizationTarget[] = [];
     const reasoningByMessage = new Map<MessageLike, ThinkingLikePart[]>();
     const messageTagNumbers = new Map<MessageLike, number>();
     // v3.3.1 Layer C: keys are composite `<ownerMsgId>\x00<callId>`,
@@ -621,6 +631,12 @@ export function tagMessages(
                 );
                 if (!skipPrefixInjection) {
                     textPart.text = prependTag(tagId, textPart.text);
+                    normalizationTargets.push({
+                        tagNumber: tagId,
+                        message,
+                        part: textPart,
+                        field: "text",
+                    });
                 }
                 targets.set(tagId, {
                     message,
@@ -701,6 +717,12 @@ export function tagMessages(
                 );
                 if (!skipPrefixInjection) {
                     toolPart.state.output = prependTag(tagId, toolPart.state.output);
+                    normalizationTargets.push({
+                        tagNumber: tagId,
+                        message,
+                        part: toolPart,
+                        field: "tool_state_output",
+                    });
                 }
                 toolTagByCallId.set(compositeKey, tagId);
                 if (thinkingParts.length > 0 && !toolThinkingByCallId.has(compositeKey)) {
@@ -812,5 +834,6 @@ export function tagMessages(
         batch,
         hasRecentReduceCall,
         hasRecentCommit: commitDetected,
+        normalizationTargets,
     };
 }
