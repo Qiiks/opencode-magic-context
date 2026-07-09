@@ -4314,24 +4314,53 @@ mod tests {
 
         async fn drive_run(files: &[PathBuf]) -> Vec<(String, String, Option<Value>, u128)> {
             let state = Arc::new(ProducerState::default());
-            let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
-            let mut bound = false;
+            // Build the handler manually (instead of handler_with_store) so an optional
+            // production-store snapshot (MC_REPLAY_STORE=<sqlite3 .backup output>) can be
+            // copied into place BEFORE the store opens — the store takes a single-writer
+            // lease at open, so a post-open swap is impossible.
+            let dir = tempfile::tempdir().unwrap();
+            let data_home = dir.path().join("data");
+            std::fs::create_dir_all(&data_home).unwrap();
+            if let Ok(seed) = std::env::var("MC_REPLAY_STORE") {
+                let StorageBackend::Sqlite { path: target } =
+                    dev_descriptor_at(data_home.to_str().unwrap()).backend
+                else {
+                    panic!("replay seed requires the sqlite dev descriptor");
+                };
+                std::fs::create_dir_all(std::path::Path::new(&target).parent().unwrap()).unwrap();
+                std::fs::copy(&seed, &target).unwrap();
+            }
+            let store =
+                Arc::new(McStore::open(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
+            let handler = McHandler::with_producer_factory_config_resolver(
+                Arc::new(TestProducerFactory { state }),
+                default_test_config(),
+                Arc::new(MissingSessionResolver),
+            );
+            handler.store.set(Arc::clone(&store)).ok().unwrap();
+            let project = dir.path().join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            let _dir = dir;
+            let mut channels: HashMap<String, u16> = HashMap::new();
+            let mut next_channel: u16 = 9;
             let mut outcomes = Vec::new();
             for path in files {
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
                 let raw = std::fs::read_to_string(path).unwrap();
                 let value: Value = serde_json::from_str(&raw).unwrap();
-                if !bound {
-                    let session = value
-                        .get("session_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("replay-session")
-                        .to_string();
-                    handler.bind_route(9, binding(project.to_str().unwrap(), &session));
-                    bound = true;
-                }
+                let session = value
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("replay-session")
+                    .to_string();
+                let channel = *channels.entry(session.clone()).or_insert_with(|| {
+                    let ch = next_channel;
+                    next_channel += 1;
+                    handler.bind_route(ch, binding(project.to_str().unwrap(), &session));
+                    ch
+                });
                 let started = std::time::Instant::now();
-                let outcome = handler.dispatch_value(9, value.clone()).await;
+                let outcome = handler.dispatch_value(channel, value.clone()).await;
                 let ms = started.elapsed().as_millis();
                 match outcome {
                     HandlerOutcome::Response(bytes) => {
