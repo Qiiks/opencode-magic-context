@@ -29,4 +29,34 @@ describe("buildMagicContextHookConfig", () => {
 
         expect(config.toast_duration_ms).toBeUndefined();
     });
+
+    // The mapper was a hand-maintained field list once, and every hook-config
+    // field added after it was written (smart_drops, language, embedding,
+    // shadow_transform) silently read as undefined inside the hook — features
+    // the user opted into stayed off with no warning. The mapper now spreads
+    // the full plugin config; this test pins that contract so a regression to
+    // field-listing fails loudly for exactly the fields that were lost.
+    it("passes through every hook-consumed field, not a hand-maintained subset", () => {
+        const config = buildMagicContextHookConfig({
+            enabled: true,
+            smart_drops: true,
+            language: "de",
+            embedding: { provider: "openai-compatible" },
+            shadow_transform: { enabled: true },
+            temporal_awareness: true,
+        } as never) as Record<string, unknown>;
+
+        expect(config.smart_drops).toBe(true);
+        expect(config.language).toBe("de");
+        expect(config.embedding).toEqual({ provider: "openai-compatible" });
+        expect(config.shadow_transform).toEqual({ enabled: true });
+        expect(config.temporal_awareness).toBe(true);
+    });
+
+    it("still applies the two defaulted fields when unset", () => {
+        const config = buildMagicContextHookConfig({ enabled: true } as never);
+
+        expect(config.protected_tags).toBeGreaterThan(0);
+        expect(config.execute_threshold_percentage).toBeDefined();
+    });
 });
