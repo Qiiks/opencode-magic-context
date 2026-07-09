@@ -2230,6 +2230,76 @@ mod tests {
     }
 
     #[test]
+    fn fold_only_guard_protects_multi_result_newest_arc() {
+        // Documents the real CC wire shape (verified across 57 prod captures): parallel tool calls
+        // are ONE assistant message of N tool_use blocks paired to ONE user message of N tool_result
+        // blocks. build_tool_arcs yields N arcs all sharing inv=assistant_ord, res=user_ord, so the
+        // newest (user tool_result) message's protected floor = the shared invocation ordinal, and
+        // the whole 2-wide multi-result arc stays in the verbatim tail.
+        let head = text_msg(1, Role::Assistant, &"head ".repeat(60_000));
+        let multi_call = BoundaryMsg {
+            message_ordinal: 2,
+            message_id: "m-2".to_string(),
+            role: Role::Assistant,
+            blocks: ["arc-a", "arc-b", "arc-c"]
+                .iter()
+                .map(|arc| BoundaryBlock {
+                    id: format!("{arc}#call"),
+                    ordinal: 2,
+                    kind: SelKind::ToolCall {
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"description": "x"}),
+                    },
+                    provider_executed: false,
+                    byte_size: 16,
+                    arc_id: Some((*arc).to_string()),
+                    original: "{}".to_string(),
+                    rendered: None,
+                    ignored: false,
+                })
+                .collect(),
+        };
+        let multi_result = BoundaryMsg {
+            message_ordinal: 3,
+            message_id: "m-3".to_string(),
+            role: Role::User,
+            blocks: ["arc-a", "arc-b", "arc-c"]
+                .iter()
+                .map(|arc| BoundaryBlock {
+                    id: format!("{arc}#result"),
+                    ordinal: 3,
+                    kind: SelKind::ToolResult {
+                        tool_name: "bash".to_string(),
+                    },
+                    provider_executed: false,
+                    byte_size: 21_000,
+                    arc_id: Some((*arc).to_string()),
+                    original: "result ".repeat(3_000),
+                    rendered: None,
+                    ignored: false,
+                })
+                .collect(),
+        };
+        let tail = vec![head, multi_call, multi_result];
+        let mut ctx = ctx_for_tests();
+        ctx.usage_percentage = 97.0;
+        ctx.usage_input_tokens = 19_400.0;
+        ctx.fold_is_only_reclaim = true;
+
+        let boundary = resolve_protected_tail_boundary(&tail, &ctx);
+
+        assert_eq!(
+            boundary.protected_start_ordinal, 2,
+            "whole multi-result arc (inv=2, res=3) must be protected from its shared invocation"
+        );
+        assert_eq!(
+            boundary.eligible_head,
+            1..2,
+            "only the head before the arc folds"
+        );
+    }
+
+    #[test]
     fn fold_only_guard_folds_large_head_before_deep_newest_arc() {
         // AIPROXY over-protection edge: the newest message is a tool_result whose invocation is
         // several ordinals back, with large messages INSIDE the arc, and a large head precedes the
