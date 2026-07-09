@@ -139,6 +139,22 @@ pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 1;
 /// Bumps when the visible tagging surface changes (tag prefixes shipping is 0 -> 1).
 pub const TAGGER_FEATURE_EPOCH: u32 = 0;
 
+/// The module-owned rendered-prefix format epoch for a serializer profile.
+///
+/// Future profile-specific m0 format epochs slot in here so the module folds them into
+/// its effective render_config even when a consumer sends a static base render_config.
+/// `TAGGER_FEATURE_EPOCH` needs the same module-side folding treatment when the U1
+/// tagger surface flips, but it intentionally remains out of the fold while the feature
+/// epoch is zero.
+pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
+    match profile {
+        SerializerProfile::ClaudeCodeAnthropic => PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
+        SerializerProfile::OwnedLlmRunner
+        | SerializerProfile::OpencodeAiSdk
+        | SerializerProfile::Pi => 0,
+    }
+}
+
 /// Storage namespace for the cache-state domain.
 const STORAGE_NAMESPACE: &str = "mc_cache";
 const GUIDANCE_TEXT: &str = include_str!("../assets/guidance_primary.txt");
@@ -4204,6 +4220,17 @@ mod tests {
         let (limit, _, pct) = usage_numbers(Some(&one_m));
         assert_eq!(limit, 1_000_000.0);
         assert!((pct - 80.0).abs() < 0.01, "pct={pct}");
+    }
+
+    #[test]
+    fn profile_render_epoch_is_profile_specific_and_zero_for_unchanged_profiles() {
+        assert_eq!(
+            profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic),
+            PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
+        );
+        assert_eq!(profile_render_epoch(SerializerProfile::OwnedLlmRunner), 0);
+        assert_eq!(profile_render_epoch(SerializerProfile::Pi), 0);
+        assert_eq!(profile_render_epoch(SerializerProfile::OpencodeAiSdk), 0);
     }
 
     #[test]

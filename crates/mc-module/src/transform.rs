@@ -19,7 +19,7 @@ use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0Con
 use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
 use crate::m0_compose::compose_m0_from_store;
-use crate::m1_compose::{compose_m1_from_store, m1_revision_signal};
+use crate::m1_compose::{compose_m1_from_store, m1_revision_signal, m1_revision_signal_parts};
 use crate::memory_render::M1_PLACEHOLDER;
 use crate::scheduler::{
     self, BoundaryBypass, ContextUsage, DeferredExecute, ExecuteThresholdConfig, LatchState,
@@ -789,20 +789,28 @@ fn apply_once(
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
 
     // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
-    // The effective render_config folds the live m0-content-epoch (workspace_fingerprint)
-    // into the provider base, so a membership/policy change drives the render_config HARD.
+    // The effective render_config folds live module-owned m0 composition epochs into the
+    // provider base, so membership or serializer-format changes drive the existing
+    // render_config HARD path even if the caller's opaque base string is static.
     // upgrade_state + the external memory epoch have no mc_* source yet → empty (inert).
+    let profile_render_epoch = serializer_profile
+        .map(crate::profile_render_epoch)
+        .filter(|epoch| *epoch != 0)
+        .map(|epoch| format!("mpe{epoch}"))
+        .unwrap_or_default();
     let effective_render_config = fold_m0_content_epoch(
         &req.render_config,
         &M0ContentEpoch {
             workspace_fingerprint: store.workspace_fingerprint(ctx.project_path)?,
             upgrade_state: String::new(),
             memory_content_epoch: String::new(),
+            profile_render_epoch,
         },
     );
     // The cheap m1-change digest (watermark triple). Computed every pass to gate SOFT vs
     // defer WITHOUT composing the body; the body composes only on the bust arm below.
-    let mut current_m1_digest = m1_revision_signal(store, ctx.project_path, &req.session_id)?;
+    let m1_signal = m1_revision_signal_parts(store, ctx.project_path, &req.session_id)?;
+    let mut current_m1_digest = m1_signal.revision;
     let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
     let context_limit_tokens = effective_context_limit_tokens(&effective_usage);
     let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
@@ -863,9 +871,16 @@ fn apply_once(
     let render_config_changed =
         loaded.meta.initialized && effective_render_config != loaded.meta.last_render_config;
     let reconcile_hard_due = loaded.core.reconcile_pending && !boundary_present;
-    // If coverage advances over system messages, force a HARD render so those messages
-    // move into the m0 prefix before they are removed from the live tail.
-    let system_absorb_hard_due = if loaded.meta.initialized {
+    // If Claude-code coverage advances over system messages, force a HARD render so the
+    // messages move into the m0 prefix before the byte-splice profile suppresses their
+    // separate re-emission. The full compartment rows load only when the cheap max-seq
+    // scalar says coverage may have changed since meta last recorded it.
+    let compartment_seq_changed_since_meta = loaded.meta.initialized
+        && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
+    let system_absorb_hard_due = if serializer_profile
+        == Some(SerializerProfile::ClaudeCodeAnthropic)
+        && compartment_seq_changed_since_meta
+    {
         let compartments = store.load_compartments(&req.session_id)?;
         let new_coverage = coverage_ordinal_from_compartments(&compartments)?;
         coverage_advance_covers_new_system(req, loaded.meta.coverage_ordinal, new_coverage)
@@ -1008,9 +1023,13 @@ fn apply_once(
             // SAME memory set (a memory expiring mid-epoch stays rendered until the next
             // HARD re-freezes the cutoff — the byte-stability tradeoff).
             let compartments_for_live_coverage = store.load_compartments(&req.session_id)?;
+            let coverage_bounds =
+                coverage_bounds_from_compartments(&compartments_for_live_coverage)?;
             let covered_system_messages = covered_system_messages_for_coverage(
                 req,
-                coverage_ordinal_from_compartments(&compartments_for_live_coverage)?,
+                coverage_bounds.map(|(_, end)| end),
+                coverage_bounds.map(|(start, _)| start),
+                serializer_profile,
             );
             let mut comp = compose_m0_from_store(
                 store,
@@ -1085,9 +1104,13 @@ fn apply_once(
                         current_m1_digest =
                             m1_revision_signal(store, ctx.project_path, &req.session_id)?;
                         let recut_compartments = store.load_compartments(&req.session_id)?;
+                        let recut_coverage_bounds =
+                            coverage_bounds_from_compartments(&recut_compartments)?;
                         let recut_covered_system_messages = covered_system_messages_for_coverage(
                             req,
-                            coverage_ordinal_from_compartments(&recut_compartments)?,
+                            recut_coverage_bounds.map(|(_, end)| end),
+                            recut_coverage_bounds.map(|(start, _)| start),
+                            serializer_profile,
                         );
                         comp = compose_m0_from_store(
                             store,
@@ -1179,6 +1202,8 @@ fn apply_once(
                 capture_todo_state_on_bust(&mut meta, &post_truncate_tail, true);
             }
             meta.coverage_ordinal = comp.coverage_ordinal;
+            meta.coverage_start_ordinal = comp.first_covered_ordinal;
+            meta.coverage_compartment_seq = Some(comp.folded_compartment_seq);
             meta.folded_compartment_seq = comp.folded_compartment_seq;
             meta.rendered_memory_ids = comp.rendered_memory_ids;
             meta.memory_mutation_cursor = comp.memory_mutation_cursor;
@@ -1257,6 +1282,7 @@ fn apply_once(
             // coverage end — they must not desync).
             if let Some((_, ord)) = m1.new_coverage {
                 meta.coverage_ordinal = Some(ord);
+                meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
                 // A coverage advance folds items out of the tail, so frozen red:*
                 // units targeting them must go WITH the coverage. Only the HARD arm
                 // rebuilds the frozen set (surviving_red_units); without this prune a
@@ -1264,6 +1290,8 @@ fn apply_once(
                 // bloat — and a later re-decide of that target with different bytes
                 // would false-fire the monotonicity conflict guard.
                 prune_covered_red_units(&mut core, &live, meta.coverage_ordinal);
+            } else if compartment_seq_changed_since_meta {
+                meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
             }
             meta.m1_revision = current_m1_digest;
         }
@@ -1273,7 +1301,9 @@ fn apply_once(
                 boundary_present: boundary_token,
                 ..Default::default()
             });
-            // meta unchanged
+            if compartment_seq_changed_since_meta && current_m1_digest == loaded.meta.m1_revision {
+                meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
+            }
         }
     }
 
@@ -1583,12 +1613,35 @@ fn is_tail(ordinal: u64, coverage: Option<u64>) -> bool {
     coverage.is_none_or(|c| ordinal > c)
 }
 
+fn is_uncovered_leading_system(message: &CkIngressMessage, meta: &ModuleMeta) -> bool {
+    if message.ck.role != "system" || meta.coverage_ordinal.is_none() {
+        return false;
+    }
+    match meta.coverage_start_ordinal {
+        Some(start) => message.ordinal < start,
+        // Legacy metadata did not persist the first covered ordinal. Preserve the common
+        // pinned system prompt at absolute ordinal 0 rather than risk dropping it.
+        None => message.ordinal == 0,
+    }
+}
+
 fn coverage_ordinal_from_compartments(
     compartments: &[StoredCompartment],
 ) -> Result<Option<u64>, TransformError> {
+    coverage_bounds_from_compartments(compartments).map(|coverage| coverage.map(|(_, end)| end))
+}
+
+fn coverage_bounds_from_compartments(
+    compartments: &[StoredCompartment],
+) -> Result<Option<(u64, u64)>, TransformError> {
     resolve_coverage(compartments)
-        .map(|coverage| coverage.map(|c| c.coverage_end_ordinal))
+        .map(|coverage| coverage.map(|c| (c.first_covered_ordinal, c.coverage_end_ordinal)))
         .map_err(|gap| TransformError::CoverageGap(gap.to_string()))
+}
+
+fn meta_coverage_compartment_seq(meta: &ModuleMeta) -> i64 {
+    meta.coverage_compartment_seq
+        .unwrap_or(meta.folded_compartment_seq)
 }
 
 fn system_content_for_m0(message: &CkWireMessage) -> String {
@@ -1603,13 +1656,22 @@ fn system_content_for_m0(message: &CkWireMessage) -> String {
 fn covered_system_messages_for_coverage(
     req: &TransformRequest,
     coverage_ordinal: Option<u64>,
+    coverage_start_ordinal: Option<u64>,
+    profile: Option<SerializerProfile>,
 ) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut covered = Vec::new();
     for message in req.messages.iter().filter(|message| {
-        !message.ck.meta.synthetic
-            && message.ck.role == "system"
-            && !is_tail(message.ordinal, coverage_ordinal)
+        if message.ck.meta.synthetic
+            || message.ck.role != "system"
+            || is_tail(message.ordinal, coverage_ordinal)
+        {
+            return false;
+        }
+        if profile == Some(SerializerProfile::ClaudeCodeAnthropic) {
+            return true;
+        }
+        coverage_start_ordinal.is_none_or(|start| message.ordinal >= start)
     }) {
         let content = system_content_for_m0(&message.ck);
         if seen.insert(content.clone()) {
@@ -2764,12 +2826,17 @@ fn build_output(
     // before this code stops emitting those messages separately, preventing old m0 bytes
     // that lack the block from losing the prompt content.
 
+    let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
     let mut inserted_synthetic_todo = false;
-    // Tail messages are strictly after the coverage watermark. The outer loop is the
-    // inbound message list, not the reduced-block map, so a live tail message with zero
-    // content blocks still passes through instead of disappearing.
+    // Tail messages are strictly after the coverage watermark. Full-array profiles also
+    // keep pinned leading system prompts that sit before the first summarized ordinal.
+    // The outer loop is the inbound message list, not the reduced-block map, so a live
+    // tail message with zero content blocks still passes through instead of disappearing.
     for msg in req.messages.iter().filter(|m| !m.ck.meta.synthetic) {
-        if !is_tail(msg.ordinal, meta.coverage_ordinal) {
+        let keep_leading_system = serializer_profile
+            != Some(SerializerProfile::ClaudeCodeAnthropic)
+            && is_uncovered_leading_system(msg, meta);
+        if !is_tail(msg.ordinal, meta.coverage_ordinal) && !keep_leading_system {
             continue;
         }
         let rendered = if let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) {
@@ -2822,9 +2889,7 @@ fn build_output(
             return Err(TransformError::SyntheticTodoAnchorMissing(mid));
         }
     }
-    if SerializerProfile::parse(&req.serializer_profile)
-        == Some(SerializerProfile::ClaudeCodeAnthropic)
-    {
+    if serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic) {
         let first_tail = out
             .iter()
             .position(|message| !message.meta.synthetic)
@@ -2836,7 +2901,7 @@ fn build_output(
             "claude-code-anthropic synthetic prefix must not contain system-role messages"
         );
     }
-    if let Some(profile) = SerializerProfile::parse(&req.serializer_profile) {
+    if let Some(profile) = serializer_profile {
         apply_serializer_residuals(profile, &mut out);
     }
     Ok(out)
@@ -4940,6 +5005,48 @@ mod tests {
     }
 
     #[test]
+    fn leading_uncovered_system_passes_through_for_full_array_profiles() {
+        for profile in [
+            SerializerProfile::OwnedLlmRunner,
+            SerializerProfile::Pi,
+            SerializerProfile::OpencodeAiSdk,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let session = format!("lead-{}", profile.wire_id());
+            s.replace_compartments(&session, &[comp(1, 1, 1, "m1", "SUMMARY")])
+                .unwrap();
+            let leading_system = system_item("sys0", 0, "identity lead");
+            let r = run(
+                &s,
+                &profile_req(
+                    profile,
+                    &session,
+                    "cfg0",
+                    vec![
+                        leading_system.clone(),
+                        item("m1", 1, "covered"),
+                        item("t2", 2, "tail"),
+                    ],
+                ),
+                &spine(),
+            );
+            assert_eq!(r.action, "HARD");
+            assert!(
+                !m0_bytes(&r).contains("identity lead"),
+                "{} must not absorb the uncovered leading system into m0",
+                profile.wire_id()
+            );
+            let output_system = r
+                .messages()
+                .iter()
+                .find(|message| message.role == "system")
+                .unwrap_or_else(|| panic!("{} output lost the leading system", profile.wire_id()));
+            assert_eq!(output_system, &leading_system.ck);
+        }
+    }
+
+    #[test]
     fn growing_tail_defers_byte_stable_and_no_write() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -6133,6 +6240,8 @@ mod tests {
         let meta: ModuleMeta = serde_json::from_str(json).unwrap();
         assert_eq!(meta.m1_revision, 0);
         assert_eq!(meta.folded_compartment_seq, 0);
+        assert_eq!(meta.coverage_start_ordinal, None);
+        assert_eq!(meta.coverage_compartment_seq, None);
         assert_eq!(meta.expiry_cutoff_ms, 0);
         assert_eq!(meta.revert_epoch, 0);
         assert!(meta.last_recut.is_none());
@@ -6682,6 +6791,7 @@ mod tests {
                 workspace_fingerprint: s.workspace_fingerprint("git:proj").unwrap(),
                 upgrade_state: String::new(),
                 memory_content_epoch: String::new(),
+                profile_render_epoch: String::new(),
             },
         );
         let good_meta = ModuleMeta {
@@ -6769,10 +6879,36 @@ mod tests {
             "a defer replays frozen m0/m1 → estimator must NOT be called"
         );
     }
-    fn cc_req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
+    fn profile_req(
+        profile: SerializerProfile,
+        session: &str,
+        cfg: &str,
+        messages: Vec<CkIngressMessage>,
+    ) -> TransformRequest {
         let mut r = req(session, cfg, messages);
-        r.serializer_profile = "claude-code-anthropic".to_string();
+        r.serializer_profile = profile.wire_id().to_string();
         r
+    }
+
+    fn cc_req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
+        profile_req(
+            SerializerProfile::ClaudeCodeAnthropic,
+            session,
+            cfg,
+            messages,
+        )
+    }
+
+    fn epoch0_effective_render_config(store: &McStore, cfg: &str) -> String {
+        fold_m0_content_epoch(
+            cfg,
+            &M0ContentEpoch {
+                workspace_fingerprint: store.workspace_fingerprint("git:proj").unwrap(),
+                upgrade_state: String::new(),
+                memory_content_epoch: String::new(),
+                profile_render_epoch: String::new(),
+            },
+        )
     }
 
     /// The byte-splice consumer keeps tail bytes verbatim, so the module must not
@@ -6852,9 +6988,9 @@ mod tests {
         assert!(loaded.core.frozen_units.iter().any(|u| u.key == "m0"));
     }
 
-    /// A leading system message is exempt from the coverage trim: the chunk builder
-    /// never summarizes system content, so trimming it would drop content the fold
-    /// never captured. It re-emits at the head, before m0/m1.
+    /// A leading system message is exempt from coverage continuity checks: the chunk
+    /// builder never summarizes system content, so a pinned prompt before the first
+    /// chunk is not a live-coverage gap.
     fn declared_trim_fixture() -> (
         tempfile::TempDir,
         McStore,
@@ -6881,6 +7017,7 @@ mod tests {
                     workspace_fingerprint: String::new(),
                     upgrade_state: String::new(),
                     memory_content_epoch: String::new(),
+                    profile_render_epoch: String::new(),
                 },
             ),
             coverage_ordinal: Some(0),
@@ -7048,6 +7185,45 @@ mod tests {
     }
 
     #[test]
+    fn covered_system_fold_output_matches_byte_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 0, 3, "m3", "SUMMARY")])
+            .unwrap();
+        let tail_system = system_item("sys4", 4, "tail identity");
+        let items = vec![
+            system_item("sys0", 0, "identity alpha"),
+            system_item("sys1", 1, "identity beta"),
+            system_item("sys2", 2, "identity alpha"),
+            item("m3", 3, "covered"),
+            tail_system.clone(),
+            item("t5", 5, "tail"),
+        ];
+
+        let r = run(&s, &cc_req("ses", "cfg0", items), &spine());
+        assert_eq!(r.action, "HARD");
+        let expected: Value = serde_json::from_str(include_str!(
+            "../testdata/covered-system-transform-golden.json"
+        ))
+        .unwrap();
+        assert_eq!(serde_json::to_value(r.messages()).unwrap(), expected);
+        assert_eq!(
+            covered_system_entries(m0_bytes(&r)),
+            vec!["identity alpha".to_string(), "identity beta".to_string()]
+        );
+        assert_no_system_before_tail_system(&r, "tail identity");
+        let tail_index = r
+            .messages()
+            .iter()
+            .position(|message| {
+                message.role == "system"
+                    && ck_wire::text_from_message(message) == Some("tail identity")
+            })
+            .unwrap();
+        assert_eq!(&r.messages()[tail_index], &tail_system.ck);
+    }
+
+    #[test]
     fn covered_systems_absorb_into_m0_and_tail_system_survives() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -7166,34 +7342,125 @@ mod tests {
     }
 
     #[test]
-    fn profile_epoch_render_config_change_hards_epoch_zero_state() {
+    fn covered_system_content_drift_fails_identity_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1", "SUMMARY")])
+            .unwrap();
+        let original = vec![
+            system_item("sys0", 0, "identity alpha"),
+            item("m1", 1, "covered"),
+            item("t2", 2, "tail"),
+        ];
+        let first = run(&s, &cc_req("ses", "cfg0", original), &spine());
+        assert_eq!(first.action, "HARD");
+
+        let drift = transform(
+            &s,
+            &cc_req(
+                "ses",
+                "cfg0",
+                vec![
+                    system_item("sys0", 0, "identity beta"),
+                    item("m1", 1, "covered"),
+                    item("t2", 2, "tail"),
+                ],
+            ),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(drift, TransformError::IdentityDrift(ref mid) if mid == "sys0"),
+            "covered system content drift must fail via IdentityDrift, got {drift:?}"
+        );
+    }
+
+    #[test]
+    fn profile_epoch_fold_hards_epoch_zero_cc_state_once() {
         assert_eq!(crate::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 1);
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1", "SUMMARY")])
             .unwrap();
-        let epoch0 = cc_req(
-            "ses",
-            "base|profile_epoch=0",
-            vec![item("m1", 1, "covered"), item("t2", 2, "tail")],
-        );
-        let first = run(&s, &epoch0, &spine());
+        let messages = vec![
+            system_item("sys0", 0, "identity alpha"),
+            item("m1", 1, "covered"),
+            item("t2", 2, "tail"),
+        ];
+        let current = cc_req("ses", "cfg0", messages.clone());
+        let first = run(&s, &current, &spine());
         assert_eq!(first.action, "HARD");
-        let defer = run(&s, &epoch0, &spine());
-        assert_eq!(defer.action, "SOFT+");
 
-        let epoch1 = cc_req(
-            "ses",
-            &format!(
-                "base|profile_epoch={}",
-                crate::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
-            ),
-            vec![item("m1", 1, "covered"), item("t2", 2, "tail")],
-        );
-        let hard = run(&s, &epoch1, &spine());
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.last_render_config = epoch0_effective_render_config(&s, "cfg0");
+        loaded
+            .core
+            .frozen_units
+            .iter_mut()
+            .find(|unit| unit.key == "m0")
+            .unwrap()
+            .frozen_payload = "OLD-M0-WITHOUT-COVERED-SYSTEMS".to_string();
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let transitioned = run(&s, &current, &spine());
         assert_eq!(
-            hard.action, "HARD",
-            "the profile epoch participates in render_config identity and forces one fold"
+            transitioned.action, "HARD",
+            "module-side profile epoch folding must hard once even when the caller's cfg is static"
         );
+        assert!(
+            m0_bytes(&transitioned).contains("<covered-system-message>identity alpha"),
+            "the transition fold must recompose m0 with the covered-system block: {}",
+            m0_bytes(&transitioned)
+        );
+        assert!(!m0_bytes(&transitioned).contains("OLD-M0"));
+
+        let one_shot = run(&s, &current, &spine());
+        assert_eq!(
+            one_shot.action, "SOFT+",
+            "after last_render_config records mpe1, the profile fold must not loop"
+        );
+    }
+
+    #[test]
+    fn epoch_zero_profiles_keep_effective_render_config_byte_identical() {
+        for profile in [
+            SerializerProfile::OwnedLlmRunner,
+            SerializerProfile::Pi,
+            SerializerProfile::OpencodeAiSdk,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let session = format!("ses-{}", profile.wire_id());
+            s.replace_compartments(&session, &[comp(1, 1, 1, "m1", "SUMMARY")])
+                .unwrap();
+            let request = profile_req(
+                profile,
+                &session,
+                "cfg0",
+                vec![item("m1", 1, "covered"), item("t2", 2, "tail")],
+            );
+            let first = run(&s, &request, &spine());
+            assert_eq!(first.action, "HARD");
+
+            let loaded = s.load(&session).unwrap();
+            let epoch0_cfg = epoch0_effective_render_config(&s, "cfg0");
+            assert_eq!(
+                loaded.meta.last_render_config,
+                epoch0_cfg,
+                "{} must not render an empty profile epoch component",
+                profile.wire_id()
+            );
+            assert!(!epoch0_cfg.contains("mpe:"));
+
+            let steady = run(&s, &request, &spine());
+            assert_eq!(
+                steady.action,
+                "SOFT+",
+                "{} must not take a deploy fold while its profile epoch is zero",
+                profile.wire_id()
+            );
+            assert!(!steady.committed);
+        }
     }
 }

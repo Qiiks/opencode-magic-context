@@ -96,11 +96,28 @@ fn union_paths(store: &McStore, project_path: &str) -> Result<Vec<String>, McSto
 ///
 /// 0 is reserved for "no delta" (the placeholder), so a real signal is never 0 — fold a
 /// constant in and force the low bit set, keeping 0 exclusively the empty marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct M1RevisionSignal {
+    pub revision: u64,
+    /// Highest compartment sequence read while computing `revision`. The transform reuses
+    /// this scalar to decide whether it needs to load full compartment rows for rare
+    /// system-message absorption checks.
+    pub max_compartment_seq: i64,
+}
+
 pub fn m1_revision_signal(
     store: &McStore,
     project_path: &str,
     session_id: &str,
 ) -> Result<u64, McStoreError> {
+    Ok(m1_revision_signal_parts(store, project_path, session_id)?.revision)
+}
+
+pub fn m1_revision_signal_parts(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+) -> Result<M1RevisionSignal, McStoreError> {
     let paths = union_paths(store, project_path)?;
     let max_memory_id = store.max_memory_id(&paths)?;
     let max_mutation_id = store.max_memory_mutation_id(&paths)?;
@@ -112,7 +129,10 @@ pub fn m1_revision_signal(
     max_mutation_id.hash(&mut h);
     max_compartment_seq.hash(&mut h);
     // reserve 0 for the empty placeholder: never return 0 for a computed signal.
-    Ok(h.finish() | 1)
+    Ok(M1RevisionSignal {
+        revision: h.finish() | 1,
+        max_compartment_seq,
+    })
 }
 
 /// The composed m1 delta: its body, and, when a newly-published compartment extends the

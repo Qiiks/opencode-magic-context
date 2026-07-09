@@ -1121,6 +1121,18 @@ pub struct ModuleMeta {
     /// tail-trim point, which advances on a coverage-extending SOFT too).
     #[serde(default)]
     pub folded_compartment_seq: i64,
+    /// The first ordinal covered by the compartment span reflected in `coverage_ordinal`.
+    /// Leading system messages below this start are not summarized by compartments and
+    /// must remain pass-through on full-array profiles.
+    #[serde(default)]
+    pub coverage_start_ordinal: Option<u64>,
+    /// The highest compartment `sequence` reflected in `coverage_ordinal` after either a
+    /// HARD fold or a coverage-extending SOFT. The transform compares the live scalar max
+    /// against this before loading full rows for covered-system absorption, keeping steady
+    /// defer passes off the compartment-row hot path. `None` means legacy metadata; callers
+    /// fall back to `folded_compartment_seq`.
+    #[serde(default)]
+    pub coverage_compartment_seq: Option<i64>,
     /// The manifest of memory ids actually rendered into the frozen m0 (post-budget-trim).
     /// The supersede router uses membership here (NOT id<=max_memory_id, since a trim
     /// drops low-importance memories) to decide whether a memory UPDATE rides m1 as a

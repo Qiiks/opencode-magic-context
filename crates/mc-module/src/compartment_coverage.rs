@@ -62,6 +62,14 @@ pub struct M0ContentEpoch {
     /// (the mutation log + cursor) as a SOFT. Must NOT be derived from the mutation log,
     /// or in-session edits would HARD and the m1 correction path would be dead.
     pub memory_content_epoch: String,
+    /// The module's own rendered-prefix FORMAT epoch for this session's serializer
+    /// profile: the "m0 in an incompatible format" composition class (same reason as
+    /// `upgrade_state`). Folded module-side so a format flip self-coordinates ONE HARD
+    /// transition per session, independent of the caller's opaque render_config string.
+    /// Epoch zero is represented by the empty string and is not rendered into the folded
+    /// identity, preserving byte-identical effective render_config strings for profiles
+    /// whose serializer epoch is still zero.
+    pub profile_render_epoch: String,
 }
 
 /// Combine the base render_config (the provider-eviction triggers: system/model/
@@ -77,12 +85,15 @@ pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -
     fn part(label: &str, value: &str) -> String {
         format!("{label}:{}:{value}", value.len())
     }
-    format!(
-        "{base_render_config}|m0epoch[{};{};{}]",
+    let mut parts = vec![
         part("ws", &epoch.workspace_fingerprint),
         part("upg", &epoch.upgrade_state),
         part("mem", &epoch.memory_content_epoch),
-    )
+    ];
+    if !epoch.profile_render_epoch.is_empty() {
+        parts.push(part("mpe", &epoch.profile_render_epoch));
+    }
+    format!("{base_render_config}|m0epoch[{}]", parts.join(";"))
 }
 
 /// The coverage summary of a strictly ordered compartment set: the latest
@@ -236,6 +247,7 @@ mod tests {
             workspace_fingerprint: "wf1".into(),
             upgrade_state: "u1".into(),
             memory_content_epoch: "mc1".into(),
+            profile_render_epoch: String::new(),
         };
         let folded = fold_m0_content_epoch(base, &epoch);
         // the base is kept as a prefix (a provider change still alters the string) and
@@ -243,6 +255,15 @@ mod tests {
         assert!(folded.starts_with(base));
         assert!(folded.contains("ws:3:wf1"));
         assert!(folded.contains("mem:3:mc1"));
+        assert!(
+            !folded.contains("mpe:"),
+            "epoch zero must not add a component or non-CC sessions would fold spuriously"
+        );
+        let mut profile_epoch = epoch.clone();
+        profile_epoch.profile_render_epoch = "mpe1".into();
+        let profile_folded = fold_m0_content_epoch(base, &profile_epoch);
+        assert!(profile_folded.contains("mpe:4:mpe1"));
+        assert_ne!(folded, profile_folded);
         // docs hash is deliberately excluded from the fold (a docs-only edit must not
         // force a full m0 re-render)
         assert!(!folded.contains("docs"));
