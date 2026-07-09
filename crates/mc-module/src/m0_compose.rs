@@ -91,6 +91,10 @@ pub struct M0ComposeInputs<'a> {
     /// The history budget in tokens (frozen at route bind). The decay renderer fits the
     /// compartments to it; under a loose budget the render is estimator-independent.
     pub history_budget_tokens: f64,
+    /// System-role content that is no longer in the live tail because the current fold
+    /// covers its ordinal. Passing it explicitly keeps m0 composition deterministic and
+    /// replayable.
+    pub covered_system_messages: &'a [String],
 }
 
 /// Read the store and compose the HARD m0 bytes + watermarks. `estimate_tokens` is the
@@ -150,6 +154,7 @@ pub fn compose_m0_from_store(
         &M0Inputs {
             project_docs: &docs.rendered_block,
             user_profile: &user_profile,
+            covered_system_messages: inputs.covered_system_messages,
             compartments: &decay_compartments,
             memories: &memories,
             source_name_by_id: &source_name_by_id,
@@ -245,6 +250,7 @@ mod tests {
             project_directory: project_dir.to_str().unwrap(),
             now_ms: 0,
             history_budget_tokens: 60_000.0,
+            covered_system_messages: &[],
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -270,6 +276,7 @@ mod tests {
             project_directory: project_dir.to_str().unwrap(),
             now_ms: 0,
             history_budget_tokens: 60_000.0,
+            covered_system_messages: &[],
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -298,6 +305,7 @@ mod tests {
             project_directory: project_dir.to_str().unwrap(),
             now_ms: 0,
             history_budget_tokens: 60_000.0,
+            covered_system_messages: &[],
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(composed.coverage_ordinal, Some(30));
@@ -320,6 +328,7 @@ mod tests {
             project_directory: project_dir.to_str().unwrap(),
             now_ms: 1000,
             history_budget_tokens: 60_000.0,
+            covered_system_messages: &[],
         };
         let a = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         let b = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();

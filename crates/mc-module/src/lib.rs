@@ -132,9 +132,10 @@ pub const DEFAULT_MODULE_ID: &str = "magic-context";
 /// Consumers read these at attach via the status op and refuse to serve on mismatch
 /// with their hardcoded fallbacks, so a diverged epoch map cannot silently skip the
 /// safety fold.
-/// Bumps when tail-mutation semantics change for the claude-code-anthropic profile
-/// (the full-array-apply / tail_reclaim flip is 0 -> 1).
-pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 0;
+/// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
+/// profile; epoch 1 includes covered system messages in m0 instead of sending them as
+/// separate system-role messages.
+pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 1;
 /// Bumps when the visible tagging surface changes (tag prefixes shipping is 0 -> 1).
 pub const TAGGER_FEATURE_EPOCH: u32 = 0;
 
@@ -5146,6 +5147,12 @@ mod tests {
         assert_eq!(status["session_id"], "ses");
         assert_eq!(status["row_version"], Value::Null);
         assert_eq!(status["historian"]["last_no_fire"], Value::Null);
+        assert_eq!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 1);
+        assert_eq!(status["epochs"]["profile_epoch"], json!(1));
+        assert_eq!(
+            status["epochs"]["tagger_epoch"],
+            json!(TAGGER_FEATURE_EPOCH)
+        );
         assert_eq!(status["pass_trace"]["receive_count"], 1);
         assert_eq!(status["pass_trace"]["reject_count"], 1);
         assert_eq!(

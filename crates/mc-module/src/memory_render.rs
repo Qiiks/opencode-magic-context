@@ -99,14 +99,34 @@ pub fn render_user_profile_block(profile_lines: &[String], wrapper: &str) -> Str
     lines.join("\n")
 }
 
-/// Inputs to [`render_m0`]: the four sub-blocks' source content, already budget-trimmed
-/// by the caller (the trim needs the token estimator, a separate subsystem). The render
-/// here is the pure COMPOSITION: order + framing + the decay-pressure→budget mapping.
+/// Render covered system-role messages as m0 text. The caller supplies content that has
+/// already been deduplicated in first-ordinal order; this function deliberately does not
+/// escape it so the prompt bytes inside each entry remain the original system content.
+pub fn render_covered_system_messages_block(messages: &[String]) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from("<covered-system-messages>");
+    for content in messages {
+        block.push_str("\n<covered-system-message>");
+        block.push_str(content);
+        block.push_str("</covered-system-message>");
+    }
+    block.push_str("\n</covered-system-messages>");
+    block
+}
+
+/// Inputs to [`render_m0`] after the caller has already chosen and token-budget-trimmed
+/// each sub-block. This renderer only assembles those blocks in order with framing; it
+/// does not decide which rows or history compartments fit the budget.
 pub struct M0Inputs<'a> {
     /// The pre-rendered `<project-docs>` block (empty string when absent).
     pub project_docs: &'a str,
     /// User-profile memory contents (trimmed); rendered as `- <content>` lines.
     pub user_profile: &'a [String],
+    /// System-role prompt fragments whose ordinals are already covered by m0, deduplicated
+    /// and ordered by their first appearance before being passed in by the caller.
+    pub covered_system_messages: &'a [String],
     /// The compartment history (trimmed/ordered chronological), decay-rendered here.
     pub compartments: &'a [DecayRenderCompartment],
     /// The project memories (selected + ordered + trimmed) for the `<project-memory>` block.
@@ -123,13 +143,14 @@ pub struct M0Inputs<'a> {
     pub decay_pressure_multiplier: f64,
 }
 
-/// Compose the m0 baseline: `<project-docs>` + `<user-profile>` + `<session-history>` +
-/// `<project-memory>`, joined by blank lines and trimmed. The session-history block is
-/// always present (empty history uses the `M0_EMPTY_BODY` placeholder — see its doc for
-/// why); the other three are omitted when empty. `estimate_tokens` is used inside the
-/// decay renderer for its budget-fit check (injected; under a loose budget the render is
-/// pure and estimator-independent). This function only composes; sub-block budget trims
-/// happen in the caller (they need the token estimator, a separate subsystem).
+/// Compose the m0 baseline: `<project-docs>` + `<user-profile>` +
+/// `<covered-system-messages>` + `<session-history>` + `<project-memory>`, joined by
+/// blank lines and trimmed. The session-history block is always present (empty history
+/// uses the `M0_EMPTY_BODY` placeholder — see its doc for why); the other blocks are
+/// omitted when empty. `estimate_tokens` is used inside the decay renderer for its
+/// budget-fit check (injected; under a loose budget the render is pure and
+/// estimator-independent). This function only composes; sub-block budget trims happen in
+/// the caller (they need the token estimator, a separate subsystem).
 pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> String {
     let mut sections: Vec<String> = Vec::new();
     if !inputs.project_docs.is_empty() {
@@ -138,6 +159,10 @@ pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> 
     let user_profile = render_user_profile_block(inputs.user_profile, "user-profile");
     if !user_profile.is_empty() {
         sections.push(user_profile);
+    }
+    let covered_systems = render_covered_system_messages_block(inputs.covered_system_messages);
+    if !covered_systems.is_empty() {
+        sections.push(covered_systems);
     }
 
     let effective_budget = inputs.history_budget_tokens / inputs.decay_pressure_multiplier.max(1.0);
@@ -347,6 +372,7 @@ mod tests {
         let inputs = M0Inputs {
             project_docs: "<project-docs>\n<file name=\"A.md\">x</file>\n</project-docs>",
             user_profile: &["likes tests".to_string()],
+            covered_system_messages: &[],
             compartments: &comps,
             memories: &[mem(1, "ARCHITECTURE", "m1", Some(80))],
             source_name_by_id: &Default::default(),
@@ -367,10 +393,24 @@ mod tests {
     }
 
     #[test]
+    fn covered_system_block_omits_empty_and_preserves_content() {
+        assert_eq!(render_covered_system_messages_block(&[]), "");
+        let block = render_covered_system_messages_block(&[
+            "raw <system> bytes".to_string(),
+            "second\nline".to_string(),
+        ]);
+        assert_eq!(
+            block,
+            "<covered-system-messages>\n<covered-system-message>raw <system> bytes</covered-system-message>\n<covered-system-message>second\nline</covered-system-message>\n</covered-system-messages>"
+        );
+    }
+
+    #[test]
     fn m0_empty_history_uses_placeholder_not_absent() {
         let inputs = M0Inputs {
             project_docs: "",
             user_profile: &[],
+            covered_system_messages: &[],
             compartments: &[],
             memories: &[],
             source_name_by_id: &Default::default(),
