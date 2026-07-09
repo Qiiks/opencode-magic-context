@@ -4364,6 +4364,17 @@ mod tests {
                 let ms = started.elapsed().as_millis();
                 match outcome {
                     HandlerOutcome::Response(bytes) => {
+                        // Optional: dump the raw TransformResponse bytes per pass so a
+                        // consumer (e.g. ai-proxy's plan_outcome harness) can consume the
+                        // module's EXACT returned bytes (MC_REPLAY_OUT_DIR=<dir>).
+                        if let Ok(out_dir) = std::env::var("MC_REPLAY_OUT_DIR") {
+                            let _ = std::fs::create_dir_all(&out_dir);
+                            let _ = std::fs::write(
+                                std::path::Path::new(&out_dir)
+                                    .join(format!("{name}.response.json")),
+                                &bytes,
+                            );
+                        }
                         let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                         let action = parsed
                             .get("action")
