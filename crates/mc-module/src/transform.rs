@@ -1296,7 +1296,7 @@ fn effective_usage(request: Option<&ModuleUsage>, persisted: Option<&ModuleUsage
 }
 
 fn effective_context_limit_tokens(usage: &ModuleUsage) -> f64 {
-    if usage.context_limit_tokens > 0 {
+    if usage.context_limit_tokens >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT {
         usage.context_limit_tokens as f64
     } else {
         200_000.0
@@ -2169,7 +2169,32 @@ mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
-    use mc_store::{InsertMemoryInput, StoredCompartment};
+    use mc_store::{InsertMemoryInput, ModuleUsage, StoredCompartment};
+
+    #[test]
+    fn effective_context_limit_falls_back_below_plausible_floor() {
+        assert_eq!(
+            effective_context_limit_tokens(&ModuleUsage {
+                current_total_input_tokens: 1,
+                context_limit_tokens: 500,
+            }),
+            200_000.0
+        );
+        assert_eq!(
+            effective_context_limit_tokens(&ModuleUsage {
+                current_total_input_tokens: 1,
+                context_limit_tokens: 0,
+            }),
+            200_000.0
+        );
+        assert_eq!(
+            effective_context_limit_tokens(&ModuleUsage {
+                current_total_input_tokens: 1,
+                context_limit_tokens: crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT,
+            }),
+            crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT as f64
+        );
+    }
     use serde_json::{json, Value};
 
     fn store(dir: &std::path::Path) -> McStore {
@@ -2362,9 +2387,22 @@ mod tests {
         current_total_input_tokens: u64,
         context_limit_tokens: u64,
     ) -> TransformRequest {
+        let min = crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT;
+        let (input, limit) = if context_limit_tokens >= min {
+            (current_total_input_tokens, context_limit_tokens)
+        } else if context_limit_tokens > 0 {
+            // Shorthand fixtures (e.g. 70/100 for 70% usage): scale to a plausible limit
+            // while preserving the implied percentage.
+            let pct = current_total_input_tokens as f64 / context_limit_tokens as f64;
+            let limit = 100_000u64;
+            let input = (pct * limit as f64).round().max(1.0) as u64;
+            (input, limit)
+        } else {
+            (current_total_input_tokens, min)
+        };
         request.usage = Some(ModuleUsage {
-            current_total_input_tokens,
-            context_limit_tokens,
+            current_total_input_tokens: input,
+            context_limit_tokens: limit,
         });
         request
     }

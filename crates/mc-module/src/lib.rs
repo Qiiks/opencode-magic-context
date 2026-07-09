@@ -62,13 +62,14 @@ use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx, Rou
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use config::{ConfigCache, McModuleConfig};
-use healing::SerializerProfile;
+use healing::{tail_reclaim, SerializerProfile};
 use historian::{reattach_historian_producer, run_historian_firing, HistorianProducerDriver};
 use historian_chunk::{
     assemble_historian_firing, AssembleHistorianFiringOutcome, AssembledHistorianFiring,
     HistorianAssemblerConfig,
 };
 use historian_producer::{HistorianProducer, HistorianProducerConfig, HistorianProducerError};
+use scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT;
 use selection::SelKind;
 #[cfg(test)]
 use session_resolver::ResolvedSession;
@@ -1422,6 +1423,21 @@ impl McHandler {
             .cloned()
             .collect();
         let project_slug = project_slug(&binding.project_root);
+        let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
+            .expect("serializer_profile validated upstream");
+        let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
+        if fold_is_only_reclaim {
+            // CC sessions are born on this profile; tail reducers never run, so no frozen
+            // `red:*` units should exist when the fold is the sole reclaim path.
+            debug_assert!(
+                !loaded
+                    .core
+                    .frozen_units
+                    .iter()
+                    .any(|u| u.key.starts_with("red:")),
+                "fold-only profile must not carry frozen tail reductions"
+            );
+        }
         let assemble = assemble_historian_firing(
             &store,
             &parsed.messages,
@@ -1436,6 +1452,7 @@ impl McHandler {
                 memory_enabled: cfg.memory_enabled,
                 extraction_free: false,
                 in_emergency: usage_percentage >= 95.0,
+                fold_is_only_reclaim,
                 failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
                 min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
             },
@@ -3680,7 +3697,7 @@ fn usage_numbers(usage: Option<&mc_store::ModuleUsage>) -> (f64, f64, f64) {
         .unwrap_or(0.0);
     let limit = usage
         .map(|u| u.context_limit_tokens as f64)
-        .filter(|limit| *limit > 0.0)
+        .filter(|limit| *limit >= MIN_PLAUSIBLE_CONTEXT_LIMIT as f64)
         .unwrap_or(200_000.0);
     let pct = if limit > 0.0 {
         input / limit * 100.0
@@ -3960,6 +3977,33 @@ mod tests {
         HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, StoredCompartment,
     };
     use tokio::sync::Notify;
+
+    #[test]
+    fn usage_numbers_rejects_implausible_context_limit() {
+        let tiny = ModuleUsage {
+            current_total_input_tokens: 50_000,
+            context_limit_tokens: 500,
+        };
+        let (limit, _, pct) = usage_numbers(Some(&tiny));
+        assert_eq!(limit, 200_000.0);
+        assert!((pct - 25.0).abs() < 0.01, "pct={pct}");
+
+        let ok = ModuleUsage {
+            current_total_input_tokens: 133_000,
+            context_limit_tokens: 167_000,
+        };
+        let (limit, _, pct) = usage_numbers(Some(&ok));
+        assert_eq!(limit, 167_000.0);
+        assert!((pct - 79.64).abs() < 0.1, "pct={pct}");
+
+        let one_m = ModuleUsage {
+            current_total_input_tokens: 800_000,
+            context_limit_tokens: 1_000_000,
+        };
+        let (limit, _, pct) = usage_numbers(Some(&one_m));
+        assert_eq!(limit, 1_000_000.0);
+        assert!((pct - 80.0).abs() < 0.01, "pct={pct}");
+    }
 
     #[test]
     fn dev_descriptor_used_when_ack_has_no_storage() {

@@ -399,6 +399,9 @@ pub struct HistorianAssemblerConfig {
     pub memory_enabled: bool,
     pub extraction_free: bool,
     pub in_emergency: bool,
+    /// When true, tail reducers are off and the historian fold is the sole reclaim path
+    /// (e.g. Claude Code byte-splice). The substance floor must not block firing.
+    pub fold_is_only_reclaim: bool,
     pub failure_backoff_at_ms: i64,
     pub min_chunk_tokens: usize,
 }
@@ -540,11 +543,15 @@ pub fn assemble_historian_firing(
     // The chunked-content floor prevents spawning a producer for a chunk with
     // too little summarizable substance (tool arcs collapse to one-line TC:
     // summaries, so a tool-dominated tail can be huge in raw bytes yet tiny in
-    // chunk text). In emergency (>=95% usage) the floor is bypassed: on
-    // verbatim-tail profiles the fold is the ONLY reclaim mechanism, and even a
-    // low-substance compartment reclaims the full raw byte range it covers —
-    // refusing to fold there would leave the session with no reclaim at all.
-    if chunk.token_estimate < config.min_chunk_tokens && !config.in_emergency {
+    // chunk text). Bypass the floor when emergency (>=95% usage) OR when the fold
+    // is the only reclaim (`fold_is_only_reclaim`): on verbatim-tail profiles there
+    // is no other reducer, so blocking a small chunk leaves the session with zero
+    // reclaim at any pressure (CC hard-blocks below ~95%, so emergency alone is
+    // insufficient). Where tail reducers exist, keep the floor unless in emergency.
+    if chunk.token_estimate < config.min_chunk_tokens
+        && !config.in_emergency
+        && !config.fold_is_only_reclaim
+    {
         return Ok(AssembleHistorianFiringOutcome::NoFire(
             HistorianNoFireReason::BelowBudget {
                 token_estimate: chunk.token_estimate,
@@ -1264,6 +1271,58 @@ mod tests {
                 memory_enabled: false,
                 extraction_free: false,
                 in_emergency,
+                fold_is_only_reclaim: false,
+                failure_backoff_at_ms: 0,
+                min_chunk_tokens: 512,
+            },
+            1,
+        )
+        .unwrap()
+    }
+
+    fn tiny_chunk_assemble_fold_only(in_emergency: bool) -> AssembleHistorianFiringOutcome {
+        use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = mc_store::McStore::open(&StorageDescriptor {
+            module_id: "magic-context-test".to_string(),
+            storage_namespace: "mc_cache".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().to_string(),
+            },
+        })
+        .unwrap();
+        let messages = vec![
+            msg("u1", 0, "user", vec![text("tiny prompt")]),
+            msg("a2", 1, "assistant", vec![text("tiny reply")]),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        assemble_historian_firing(
+            &store,
+            &messages,
+            &projection.blocks,
+            HistorianAssemblerConfig {
+                session_id: "ses-fold-only".to_string(),
+                project_path: "/proj".to_string(),
+                project_slug: "proj".to_string(),
+                model_chain: vec!["prov/model".to_string()],
+                token_budget: 32_000,
+                boundary: crate::boundary::BoundaryResolution {
+                    protected_start_ordinal: 2,
+                    eligible_head: 0..2,
+                    n_tokens: 0.0,
+                    floored_by_live_prompt: false,
+                    fenced_by_open_arc: false,
+                    true_raw_eligible_tokens: 10.0,
+                    oversize_atomic_unit: false,
+                    raw_message_count: 2,
+                    boundary_reason: "test".to_string(),
+                },
+                memory_enabled: false,
+                extraction_free: false,
+                in_emergency,
+                fold_is_only_reclaim: true,
                 failure_backoff_at_ms: 0,
                 min_chunk_tokens: 512,
             },
@@ -1339,6 +1398,7 @@ mod tests {
                 memory_enabled: false,
                 extraction_free: false,
                 in_emergency: false,
+                fold_is_only_reclaim: false,
                 failure_backoff_at_ms: 0,
                 min_chunk_tokens: 0,
             },
@@ -1388,10 +1448,8 @@ mod tests {
     }
 
     #[test]
-    fn below_budget_refuses_normally_but_fires_in_emergency() {
-        // Normal pressure: a chunk under the substance floor must not spawn a
-        // producer (the floor exists to avoid burning a historian run on
-        // near-empty content).
+    fn below_budget_when_tail_reclaim_not_fold_only() {
+        // Tail reducers exist (owned-llmrunner leg): substance floor blocks below emergency.
         match tiny_chunk_assemble(false) {
             AssembleHistorianFiringOutcome::NoFire(HistorianNoFireReason::BelowBudget {
                 minimum,
@@ -1399,8 +1457,20 @@ mod tests {
             }) => assert_eq!(minimum, 512),
             other => panic!("expected BelowBudget no-fire, got {other:?}"),
         }
-        // Emergency (>=95%): the fold is the only reclaim on verbatim-tail
-        // profiles, so the floor yields and the firing assembles.
+    }
+
+    #[test]
+    fn fold_only_fires_below_substance_floor_without_emergency() {
+        // Claude Code leg: fold is sole reclaim; must fire even when chunk << min_chunk_tokens.
+        match tiny_chunk_assemble_fold_only(false) {
+            AssembleHistorianFiringOutcome::Fire(_) => {}
+            other => panic!("expected fold-only fire below min_chunk_tokens, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn below_budget_refuses_normally_but_fires_in_emergency() {
+        // Emergency (>=95%): bypasses floor even when tail reclaim exists (fold_is_only_reclaim false).
         match tiny_chunk_assemble(true) {
             AssembleHistorianFiringOutcome::Fire(_) => {}
             other => panic!("expected emergency fire despite tiny chunk, got {other:?}"),
