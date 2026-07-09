@@ -2230,6 +2230,43 @@ mod tests {
     }
 
     #[test]
+    fn fold_only_guard_folds_large_head_before_deep_newest_arc() {
+        // AIPROXY over-protection edge: the newest message is a tool_result whose invocation is
+        // several ordinals back, with large messages INSIDE the arc, and a large head precedes the
+        // arc. The whole newest arc [2..=5] must stay protected tail (never split), but the large
+        // head before the arc invocation must STILL fold — the guard only ever lowers
+        // protected_tail_start to the newest arc's invocation, never into the head.
+        let tail = vec![
+            text_msg(1, Role::Assistant, &"head ".repeat(60_000)),
+            tool_call_msg(2, "arc-deep"),
+            text_msg(3, Role::Assistant, &"mid arc chatter ".repeat(2_000)),
+            text_msg(4, Role::Assistant, &"more arc chatter ".repeat(2_000)),
+            tool_result_msg(5, "arc-deep", &"tool result ".repeat(2_500)),
+        ];
+        let mut ctx = ctx_for_tests();
+        ctx.usage_percentage = 97.0;
+        ctx.usage_input_tokens = 19_400.0;
+        ctx.fold_is_only_reclaim = true;
+
+        let boundary = resolve_protected_tail_boundary(&tail, &ctx);
+
+        assert_eq!(
+            boundary.protected_start_ordinal, 2,
+            "whole newest arc must be protected from its invocation ordinal"
+        );
+        assert_eq!(
+            boundary.eligible_head,
+            1..2,
+            "only the head before the newest arc is eligible"
+        );
+        assert!(
+            boundary.true_raw_eligible_tokens > 50_000.0,
+            "large head before the deep newest arc must still fold, got {}",
+            boundary.true_raw_eligible_tokens
+        );
+    }
+
+    #[test]
     fn boundary_determinism_same_tail_same_resolution() {
         let tail = vec![
             text_msg(1, Role::User, "start"),
