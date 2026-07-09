@@ -132,6 +132,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/hooks/magic-context/todo-view.ts`: Build the deterministic synthetic todowrite tool part and compute its hash-based `call_id`.
 - `src/hooks/magic-context/supersession-reclaim.ts`: Select superseded spent control-plane tool outputs (oldest todowrite, ctx_reduce, zero-value meta calls) and older edit/write calls for the same file under the `smart_drops` configuration flag.
 - `src/hooks/magic-context/edit-marker.ts`: Implement `edit_marker` mode to compress superseded edits, keeping the `filePath` and a region-hint prefix while dropping the bulky output content.
+- `src/hooks/magic-context/shadow-sender.ts`: Mirror finalized transform passes, inputs, and decisions to the Rust module over the subc protocol under the `shadow_transform` configuration flag.
 - `src/hooks/magic-context/inject-compartments.ts`: m[0]/m[1] history layout — `renderM0`/`renderM1`/`materializeM0`/`mustMaterialize` (mirrored in Pi's `inject-compartments-pi.ts`).
 - `src/hooks/magic-context/decay-curve.ts`: Council-validated deterministic tier-decay math (half-life, log-cost tier boundaries, budget pressure).
 - `src/hooks/magic-context/decay-render.ts`: Shared OpenCode+Pi compartment renderer built on the decay curve (replaces the removed LLM compressor).
@@ -161,6 +162,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `crates/mc-module/src/injection.rs`: Builds the `m0`/`m1` structures and injects synthetic message parts in Rust.
 - `crates/mc-module/src/boundary.rs`: Resolves the boundary between compactable history and the protected tail in Rust.
 - `crates/mc-module/src/session_resolver.rs`: Resolves incoming MCP facade requests to their backing project and session.
+- `crates/mc-module/src/lib.rs`: Route subc client requests, implement MCP tool facade routing, serve prompt guidance, and manage durable pass tracing for transform passes.
 - `crates/mc-module/src/codec/`: Decode harness-specific JSON messages (OpenCode, Pi) into canonical `CkIngressMessage` values and encode them back using harness model codecs.
 - `crates/mc-module/src/healing.rs`: Define serializer healing profiles and gate tail mutations for verbatim-tail consumers to prevent phantom reclaims.
 - `crates/mc-module/src/selection.rs`: Implement tail-reduction selection to decide which tail items to reduce and produce their `ReductionDecision`s.
