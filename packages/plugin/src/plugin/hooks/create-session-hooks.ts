@@ -16,29 +16,19 @@ import type { PluginContext } from "../types";
  * import the real hook shape.
  */
 export function buildMagicContextHookConfig(pluginConfig: MagicContextPluginConfig) {
+    // Pass the WHOLE plugin config through and only override the fields that
+    // need defaulting. This was a hand-maintained field-by-field mapping, which
+    // silently dropped every hook-config field added after the mapping was
+    // written: `smart_drops`, `language`, `embedding`, and `shadow_transform`
+    // all read as undefined inside the hook even when set by the user, turning
+    // opted-in features off with no warning. The hook only consumes the fields
+    // its config type declares, so the extra top-level keys carried by the
+    // spread are inert.
     return {
+        ...pluginConfig,
         protected_tags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
-        cache_ttl: pluginConfig.cache_ttl,
-        clear_reasoning_age: pluginConfig.clear_reasoning_age,
-        toast_duration_ms: pluginConfig.toast_duration_ms,
         execute_threshold_percentage:
             pluginConfig.execute_threshold_percentage ?? DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
-        execute_threshold_tokens: pluginConfig.execute_threshold_tokens,
-        historian: pluginConfig.historian,
-        history_budget_percentage: pluginConfig.history_budget_percentage,
-        historian_timeout_ms: pluginConfig.historian_timeout_ms,
-        memory: pluginConfig.memory,
-        sidekick: pluginConfig.sidekick,
-        dreamer: pluginConfig.dreamer,
-        commit_cluster_trigger: pluginConfig.commit_cluster_trigger,
-        // Issue #53: per-agent system-prompt injection opt-out.
-        system_prompt_injection: pluginConfig.system_prompt_injection,
-        // Graduated from experimental.* — temporal_awareness and caveman are
-        // top-level; auto_search now rides inside `memory` (passed above), and
-        // git_commit_indexing is consumed at the dream-timer level in index.ts,
-        // not per-session.
-        temporal_awareness: pluginConfig.temporal_awareness,
-        caveman_text_compression: pluginConfig.caveman_text_compression,
     };
 }
 
