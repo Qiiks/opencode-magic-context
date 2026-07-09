@@ -6,6 +6,9 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SerializerProfile {
     OwnedLlmRunner,
@@ -127,6 +130,34 @@ pub const fn tail_reclaim(profile: SerializerProfile) -> bool {
         | SerializerProfile::Pi
         | SerializerProfile::OpencodeAiSdk => true,
     }
+}
+
+/// Whether §N§ tagging + agent-facing reduction surface is active for this profile.
+/// Flipped per-profile at the cutover-3 deploy window together with TAGGER_FEATURE_EPOCH.
+#[cfg(not(test))]
+pub const fn tagging_enabled(_profile: SerializerProfile) -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for U1 coverage: production keeps a const all-false gate, while unit
+    /// tests can exercise the pre-built code path without changing the deploy flip shape.
+    static TAGGING_ENABLED_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Test-only injectable version of [`tagging_enabled`]. Keeping this under `cfg(test)`
+/// preserves the production const gate while allowing non-vacuous overlay tests.
+#[cfg(test)]
+pub fn tagging_enabled(_profile: SerializerProfile) -> bool {
+    TAGGING_ENABLED_OVERRIDE
+        .with(|value| value.get())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub fn set_tagging_enabled_for_tests(enabled: Option<bool>) {
+    TAGGING_ENABLED_OVERRIDE.with(|value| value.set(enabled));
 }
 
 pub const fn quirk_residual(profile: SerializerProfile) -> QuirkResidual {

@@ -655,6 +655,38 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_notes(project_path, session_id, status, updated_at_ms DESC, id DESC);
     ",
     },
+    Migration {
+        version: 11,
+        // U1 tagging surface. Tag rows are minted on first observation outside the
+        // cache-state CAS path, so a rejected transform still preserves the monotonic
+        // tag numbers the agent already saw. Channel-1 appends are an append-set keyed
+        // by block id; replay reads the exact stored reminder bytes instead of deriving
+        // them from mutable nudge state.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_tags (
+            session_id     TEXT NOT NULL,
+            tag_number    INTEGER NOT NULL,
+            block_id      TEXT NOT NULL,
+            kind          TEXT NOT NULL CHECK (kind IN ('message', 'tool_call', 'tool_result')),
+            token_count   INTEGER NOT NULL DEFAULT 0,
+            created_at_ms INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, tag_number),
+            UNIQUE(session_id, block_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_tags_session_block
+            ON mc_tags(session_id, block_id);
+
+        CREATE TABLE IF NOT EXISTS mc_channel1_appends (
+            session_id     TEXT NOT NULL,
+            block_id       TEXT NOT NULL,
+            reminder_text  TEXT NOT NULL,
+            fired_at_ms    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, block_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_channel1_appends_session
+            ON mc_channel1_appends(session_id, fired_at_ms, block_id);
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1140,6 +1172,21 @@ pub struct ModuleMeta {
     /// decreases after reclaim.
     #[serde(default)]
     pub last_usage: Option<ModuleUsage>,
+    /// The most recent serializer profile observed on this durable conversation key.
+    /// Facade tools resolve an instance token to a conversation key, then use this frozen
+    /// session fact to apply per-profile feature gates without trusting tool-call args.
+    #[serde(default)]
+    pub last_serializer_profile: String,
+    /// Reclaimable-token amount at the last Channel-1 append or suppression reset.
+    #[serde(default)]
+    pub channel1_last_nudge_undropped: i64,
+    /// Last Channel-1 severity band that appended a reminder. Empty means no active band.
+    #[serde(default)]
+    pub channel1_last_nudge_level: String,
+    /// Set by ctx_reduce after the agent has acted on a reminder. The next transform
+    /// suppresses new Channel-1 appends while still replaying every stored append row.
+    #[serde(default)]
+    pub channel1_reduce_suppressed: bool,
 
     /// Highest tail ordinal observed on an execute pass that actually froze reductions.
     #[serde(default)]
@@ -1190,6 +1237,29 @@ pub struct PendingAgentDrop {
     pub id: i64,
     pub target_id: String,
     pub queued_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagMintInput {
+    pub block_id: String,
+    pub kind: String,
+    pub token_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McTagRow {
+    pub tag_number: i64,
+    pub block_id: String,
+    pub kind: String,
+    pub token_count: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Channel1AppendRow {
+    pub block_id: String,
+    pub reminder_text: String,
+    pub fired_at_ms: i64,
 }
 
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
@@ -1768,6 +1838,145 @@ impl McStore {
                     id: r.get(0)?,
                     target_id: r.get(1)?,
                     queued_at_ms: r.get(2)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?)
+    }
+
+    /// Mint tag rows for newly-observed block ids and return every requested row.
+    /// Existing rows keep their original numbers; fresh rows consume the next numbers
+    /// in the caller's order inside one transaction.
+    pub fn mint_or_get_tags(
+        &self,
+        session_id: &str,
+        inputs: &[TagMintInput],
+        created_at_ms: i64,
+    ) -> Result<Vec<McTagRow>, McStoreError> {
+        Ok(self.inner.with_conn_fenced(|tx| {
+            let mut out = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let block_id = input.block_id.trim();
+                if block_id.is_empty() {
+                    continue;
+                }
+                if let Some(row) = tx
+                    .query_row(
+                        "SELECT tag_number, block_id, kind, token_count, created_at_ms
+                         FROM mc_tags
+                         WHERE session_id = ?1 AND block_id = ?2",
+                        params![session_id, block_id],
+                        tag_row_from_sql,
+                    )
+                    .optional()?
+                {
+                    out.push(row);
+                    continue;
+                }
+                let next = tx.query_row(
+                    "SELECT COALESCE(MAX(tag_number), 0) + 1 FROM mc_tags WHERE session_id = ?1",
+                    params![session_id],
+                    |r| r.get::<_, i64>(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_tags (session_id, tag_number, block_id, kind, token_count, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        session_id,
+                        next,
+                        block_id,
+                        input.kind.as_str(),
+                        input.token_count.max(0),
+                        created_at_ms,
+                    ],
+                )?;
+                out.push(McTagRow {
+                    tag_number: next,
+                    block_id: block_id.to_string(),
+                    kind: input.kind.clone(),
+                    token_count: input.token_count.max(0),
+                    created_at_ms,
+                });
+            }
+            Ok(out)
+        })?)
+    }
+
+    /// Load all minted tags for a session in tag-number order.
+    pub fn load_tags_for_session(&self, session_id: &str) -> Result<Vec<McTagRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT tag_number, block_id, kind, token_count, created_at_ms
+                 FROM mc_tags
+                 WHERE session_id = ?1
+                 ORDER BY tag_number ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id], tag_row_from_sql)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?)
+    }
+
+    /// Sum stored token counts for a caller-selected block-id set.
+    pub fn sum_tag_token_counts_for_blocks(
+        &self,
+        session_id: &str,
+        block_ids: &HashSet<String>,
+    ) -> Result<i64, McStoreError> {
+        if block_ids.is_empty() {
+            return Ok(0);
+        }
+        let rows = self.load_tags_for_session(session_id)?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| block_ids.contains(&row.block_id))
+            .map(|row| row.token_count.max(0))
+            .sum())
+    }
+
+    /// Insert one Channel-1 append row if this block has not already received one.
+    pub fn append_channel1_nudge(
+        &self,
+        session_id: &str,
+        block_id: &str,
+        reminder_text: &str,
+        fired_at_ms: i64,
+    ) -> Result<bool, McStoreError> {
+        Ok(self.inner.with_conn_fenced(|tx| {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO mc_channel1_appends
+                     (session_id, block_id, reminder_text, fired_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, block_id, reminder_text, fired_at_ms],
+            )?;
+            Ok(inserted > 0)
+        })?)
+    }
+
+    /// Load stored Channel-1 append bytes in deterministic order.
+    pub fn load_channel1_appends(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Channel1AppendRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT block_id, reminder_text, fired_at_ms
+                 FROM mc_channel1_appends
+                 WHERE session_id = ?1
+                 ORDER BY fired_at_ms ASC, block_id ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id], |r| {
+                Ok(Channel1AppendRow {
+                    block_id: r.get(0)?,
+                    reminder_text: r.get(1)?,
+                    fired_at_ms: r.get(2)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -4064,6 +4273,16 @@ fn decompress_transcript(blob: &[u8]) -> std::io::Result<String> {
     Ok(out)
 }
 
+fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
+    Ok(McTagRow {
+        tag_number: r.get(0)?,
+        block_id: r.get(1)?,
+        kind: r.get(2)?,
+        token_count: r.get(3)?,
+        created_at_ms: r.get(4)?,
+    })
+}
+
 fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
     Ok(StoredNote {
         id: r.get(0)?,
@@ -4539,6 +4758,81 @@ mod tests {
             .commit_with_consumed_drops("ses", None, &core, &meta, &[queued[0].id])
             .unwrap();
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tags_mint_monotonically_and_channel1_appends_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let first = vec![
+            TagMintInput {
+                block_id: "m1#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 11,
+            },
+            TagMintInput {
+                block_id: "m2#0".to_string(),
+                kind: "tool_result".to_string(),
+                token_count: 22,
+            },
+        ];
+        let rows = store.mint_or_get_tags("ses", &first, 100).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.tag_number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let second = vec![
+            TagMintInput {
+                block_id: "m1#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 999,
+            },
+            TagMintInput {
+                block_id: "m3#0".to_string(),
+                kind: "tool_call".to_string(),
+                token_count: 33,
+            },
+        ];
+        let rows = store.mint_or_get_tags("ses", &second, 200).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.tag_number).collect::<Vec<_>>(),
+            vec![1, 3],
+            "existing block keeps its tag; only new observations consume the next number"
+        );
+        let all = store.load_tags_for_session("ses").unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all[0].token_count, 11,
+            "token count is computed once at mint"
+        );
+        let token_sum_ids = ["m1#0".to_string(), "m3#0".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            store
+                .sum_tag_token_counts_for_blocks("ses", &token_sum_ids)
+                .unwrap(),
+            44
+        );
+
+        assert!(store
+            .append_channel1_nudge(
+                "ses",
+                "m2#0",
+                "\n\n<system-reminder>hi</system-reminder>",
+                300
+            )
+            .unwrap());
+        assert!(!store
+            .append_channel1_nudge("ses", "m2#0", "different", 400)
+            .unwrap());
+        let appends = store.load_channel1_appends("ses").unwrap();
+        assert_eq!(appends.len(), 1);
+        assert_eq!(
+            appends[0].reminder_text,
+            "\n\n<system-reminder>hi</system-reminder>"
+        );
     }
 
     #[test]

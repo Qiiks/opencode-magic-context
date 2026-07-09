@@ -30,8 +30,8 @@ use crate::selection::{
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
-    DeferredExecuteState, McStore, McStoreError, ModuleMeta, ModuleUsage, PendingRewriteState,
-    StoredCompartment,
+    Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, ModuleMeta,
+    ModuleUsage, PendingRewriteState, StoredCompartment, TagMintInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -61,6 +61,11 @@ const RED_KEY_PREFIX: &str = "red:";
 /// separated upstream session keys. Five edges corresponds to three arm/clear cycles
 /// when the initial arm is not counted as evidence of multiplexing by itself.
 const PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD: u32 = 5;
+const TAG_PREFIX_OPEN: char = '§';
+const CHANNEL1_FLOOR_TOKENS: i64 = 10_000;
+const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 10_000;
+const CHANNEL1_PRESSURE_FLOOR: f64 = 0.8;
+const CHANNEL1_USABLE_FRACTION: f64 = 1.0 / 3.0;
 
 /// The m1 delta content + its byte-affecting digest. `revision` is a digest over ALL
 /// byte-affecting m1 render inputs such that `render` is a pure function of what the
@@ -393,6 +398,91 @@ pub struct TransformWithProjection {
     pub trim_mismatch: Option<TrimMismatch>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaggableKind {
+    Message,
+    ToolCall,
+    ToolResult,
+}
+
+impl TaggableKind {
+    fn as_store_kind(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel1Level {
+    Gentle,
+    Firm,
+    Urgent,
+}
+
+impl Channel1Level {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Gentle => "gentle",
+            Self::Firm => "firm",
+            Self::Urgent => "urgent",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Gentle => 1,
+            Self::Firm => 2,
+            Self::Urgent => 3,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "gentle" => Some(Self::Gentle),
+            "firm" => Some(Self::Firm),
+            "urgent" => Some(Self::Urgent),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TagOverlayState {
+    tag_by_block_id: BTreeMap<String, i64>,
+    channel1_by_block_id: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveTagForNudge {
+    tag_number: i64,
+    kind: String,
+    token_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct Channel1Decision {
+    fire: bool,
+    level: Channel1Level,
+    reclaimable_tokens: i64,
+    next_last_nudge: i64,
+    next_last_level: String,
+}
+
+struct Channel1NudgeInputs<'a, 'ctx> {
+    store: &'a McStore,
+    req: &'a TransformRequest,
+    ctx: &'a ProducerContext<'ctx>,
+    core: &'a CoreState,
+    projection: &'a FlatProjection,
+    tag_rows: &'a [McTagRow],
+    channel1_appends: &'a [Channel1AppendRow],
+    context_limit_tokens: f64,
+    input_tokens: f64,
+}
+
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
 /// not advance), so the next pass replays the last good state or busts cleanly; the
 /// handler maps these to a clean Error frame rather than a partial/raw array.
@@ -578,6 +668,20 @@ fn apply_once(
         prev = Some(msg.ordinal);
     }
 
+    let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
+    let tagging_active = serializer_profile.is_some_and(healing::tagging_enabled);
+    let tag_rows = if tagging_active {
+        mint_tags_for_projection(store, &req.session_id, &projection, ctx.now_ms)?;
+        store.load_tags_for_session(&req.session_id)?
+    } else {
+        Vec::new()
+    };
+    let mut channel1_appends = if tagging_active {
+        store.load_channel1_appends(&req.session_id)?
+    } else {
+        Vec::new()
+    };
+
     let loaded = store.load(&req.session_id)?;
 
     // Check whether the boundary is present in the live messages, or through a shadow
@@ -626,12 +730,15 @@ fn apply_once(
                 "mc-module: pending_rewrite raw pass-through for {} fingerprint {}",
                 req.session_id, fingerprint
             );
+            let passthrough_overlay =
+                tagging_active.then(|| tag_overlay_state(&tag_rows, &channel1_appends));
             return Ok(pending_passthrough_result(
                 projection,
                 req,
                 loaded.row_version.unwrap_or(0),
                 false,
                 trim_mismatch,
+                passthrough_overlay.as_ref(),
             ));
         }
 
@@ -663,12 +770,15 @@ fn apply_once(
             "mc-module: armed pending_rewrite for {} fingerprint {} ambiguous={}",
             req.session_id, fingerprint, ambiguous
         );
+        let passthrough_overlay =
+            tagging_active.then(|| tag_overlay_state(&tag_rows, &channel1_appends));
         return Ok(pending_passthrough_result(
             projection,
             req,
             row_version,
             true,
             trim_mismatch,
+            passthrough_overlay.as_ref(),
         ));
     }
 
@@ -759,8 +869,7 @@ fn apply_once(
     // freeze reclaims that never reached the real context. The producer gate is the
     // single choke point for selection AND agent-drop consumption, so one AND covers
     // both; todo capture/advance and the watermark stamps are gated separately below.
-    let tail_reclaim_enabled =
-        SerializerProfile::parse(&req.serializer_profile).is_none_or(healing::tail_reclaim);
+    let tail_reclaim_enabled = serializer_profile.is_none_or(healing::tail_reclaim);
     let producer_gate = tail_reclaim_enabled
         && producer_gate(
             scheduler_outcome.pass,
@@ -860,6 +969,9 @@ fn apply_once(
         }
     }
     apply_ingress_meta(&mut meta, req, &projection);
+    if tagging_active {
+        meta.last_serializer_profile = req.serializer_profile.clone();
+    }
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
 
     let is_bust_pass = matches!(
@@ -1182,7 +1294,40 @@ fn apply_once(
 
     let result_action = action_str(&plan, &core);
 
-    let ck_messages = build_output(&core, &meta, &projection, req)?;
+    let mut tag_overlay = if tagging_active {
+        tag_overlay_state(&tag_rows, &channel1_appends)
+    } else {
+        TagOverlayState::default()
+    };
+    if tagging_active {
+        if let Some(row) = maybe_append_channel1_nudge(
+            Channel1NudgeInputs {
+                store,
+                req,
+                ctx,
+                core: &core,
+                projection: &projection,
+                tag_rows: &tag_rows,
+                channel1_appends: &channel1_appends,
+                context_limit_tokens,
+                input_tokens: usage_input_tokens,
+            },
+            &mut meta,
+        )? {
+            tag_overlay
+                .channel1_by_block_id
+                .insert(row.block_id.clone(), row.reminder_text.clone());
+            channel1_appends.push(row);
+        }
+    }
+
+    let ck_messages = build_output(
+        &core,
+        &meta,
+        &projection,
+        req,
+        tagging_active.then_some(&tag_overlay),
+    )?;
 
     // Build the output before committing so a missing synthetic-todo anchor cannot
     // persist an unusable frozen pair. Only commit when core or meta changed;
@@ -1855,11 +2000,25 @@ fn pending_passthrough_result(
     row_version: u64,
     committed: bool,
     trim_mismatch: Option<TrimMismatch>,
+    tag_overlay: Option<&TagOverlayState>,
 ) -> TransformWithProjection {
+    let blocks_by_mid = projection_blocks_by_mid(&projection);
     let mut response = TransformResponse::passthrough(
         req.messages
             .iter()
-            .map(|message| message.ck.clone())
+            .map(|message| {
+                let mut rendered = message.ck.clone();
+                if let Some(blocks) = blocks_by_mid.get(message.mid.as_str()) {
+                    apply_tag_overlay_to_message(
+                        &mut rendered,
+                        message,
+                        blocks,
+                        tag_overlay,
+                        |_| false,
+                    );
+                }
+                rendered
+            })
             .collect(),
         req.full_array_fingerprint.clone(),
     );
@@ -1956,6 +2115,541 @@ fn push_synthetic_todo_pair(out: &mut Vec<CkWireMessage>, meta: &ModuleMeta) {
     }
 }
 
+fn mint_tags_for_projection(
+    store: &McStore,
+    session_id: &str,
+    projection: &FlatProjection,
+    now_ms: i64,
+) -> Result<(), TransformError> {
+    let inputs = projection
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            let kind = taggable_kind(block)?;
+            let text = tag_token_text(block);
+            Some(TagMintInput {
+                block_id: block.id.clone(),
+                kind: kind.as_store_kind().to_string(),
+                token_count: mc_tokenizer::estimate_tokens(&text) as i64,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !inputs.is_empty() {
+        store.mint_or_get_tags(session_id, &inputs, now_ms)?;
+    }
+    Ok(())
+}
+
+fn taggable_kind(block: &FlatBlock) -> Option<TaggableKind> {
+    if block.synthetic || block.role == "system" {
+        return None;
+    }
+    match block.kind_tag.as_str() {
+        "text" if block.role == "user" || block.role == "assistant" => Some(TaggableKind::Message),
+        "tool_call" => Some(TaggableKind::ToolCall),
+        "tool_result" => Some(TaggableKind::ToolResult),
+        _ => None,
+    }
+}
+
+fn tag_token_text(block: &FlatBlock) -> String {
+    match &block.wire.kind {
+        ck_wire::CkKind::Text { text } => text.clone(),
+        ck_wire::CkKind::ToolCall { name, input, .. } => {
+            serde_json::to_string(&serde_json::json!({
+                "name": name,
+                "input": input,
+            }))
+            .unwrap_or_default()
+        }
+        ck_wire::CkKind::ToolResult { output, .. } => tool_output_text(output),
+        _ => block.bytes.clone(),
+    }
+}
+
+fn tool_output_text(output: &ck_wire::CkToolOutput) -> String {
+    match &output.kind {
+        ck_wire::CkOutputKind::Text { text } | ck_wire::CkOutputKind::ErrorText { text } => {
+            text.clone()
+        }
+        ck_wire::CkOutputKind::Json { value } | ck_wire::CkOutputKind::ErrorJson { value } => {
+            value.to_string()
+        }
+        ck_wire::CkOutputKind::ExecutionDenied { reason } => reason.clone().unwrap_or_default(),
+        ck_wire::CkOutputKind::Content { blocks } => blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                ck_wire::ResultBlockKind::Text { text } => Some(text.as_str()),
+                ck_wire::ResultBlockKind::Media { .. }
+                | ck_wire::ResultBlockKind::Opaque { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn tag_overlay_state(tag_rows: &[McTagRow], appends: &[Channel1AppendRow]) -> TagOverlayState {
+    TagOverlayState {
+        tag_by_block_id: tag_rows
+            .iter()
+            .map(|row| (row.block_id.clone(), row.tag_number))
+            .collect(),
+        channel1_by_block_id: appends
+            .iter()
+            .map(|row| (row.block_id.clone(), row.reminder_text.clone()))
+            .collect(),
+    }
+}
+
+fn apply_tag_overlay_to_message(
+    message: &mut CkWireMessage,
+    ingress: &CkIngressMessage,
+    blocks: &[&FlatBlock],
+    overlay: Option<&TagOverlayState>,
+    is_reduced: impl Fn(&FlatBlock) -> bool,
+) {
+    let Some(overlay) = overlay else {
+        return;
+    };
+    if ingress.ck.role == "system" || ingress.ck.meta.synthetic {
+        return;
+    }
+    let mut modified = false;
+    for block in blocks {
+        if block.block_index >= message.content.len() {
+            continue;
+        }
+        if !is_reduced(block) {
+            if let Some(kind) = taggable_kind(block) {
+                if let Some(tag_number) = overlay.tag_by_block_id.get(&block.id) {
+                    modified |= apply_tag_prefix_to_block(
+                        ingress.ck.role.as_str(),
+                        &mut message.content[block.block_index],
+                        kind,
+                        *tag_number,
+                    );
+                } else {
+                    debug_assert!(
+                        false,
+                        "taggable block {} was not minted before render",
+                        block.id
+                    );
+                }
+            }
+            if let Some(reminder) = overlay.channel1_by_block_id.get(&block.id) {
+                modified |=
+                    append_channel1_to_block(&mut message.content[block.block_index], reminder);
+            }
+        }
+    }
+    if modified {
+        message.mark_modified();
+    }
+}
+
+fn apply_tag_prefix_to_block(
+    role: &str,
+    block: &mut CkWireBlock,
+    kind: TaggableKind,
+    tag_number: i64,
+) -> bool {
+    match (&mut block.kind, kind) {
+        (ck_wire::CkKind::Text { text }, TaggableKind::Message)
+            if role == "user" || role == "assistant" =>
+        {
+            let next = prepend_tag(tag_number, text);
+            if *text != next {
+                *text = next;
+                return true;
+            }
+        }
+        (ck_wire::CkKind::ToolResult { output, .. }, TaggableKind::ToolResult) => {
+            return prepend_tag_to_tool_output(output, tag_number);
+        }
+        _ => {}
+    }
+    false
+}
+
+fn prepend_tag_to_tool_output(output: &mut ck_wire::CkToolOutput, tag_number: i64) -> bool {
+    match &mut output.kind {
+        ck_wire::CkOutputKind::Text { text } | ck_wire::CkOutputKind::ErrorText { text } => {
+            let next = prepend_tag(tag_number, text);
+            if *text != next {
+                *text = next;
+                return true;
+            }
+        }
+        ck_wire::CkOutputKind::Content { blocks } => {
+            for block in blocks {
+                if let ck_wire::ResultBlockKind::Text { text } = &mut block.kind {
+                    let next = prepend_tag(tag_number, text);
+                    if *text != next {
+                        *text = next;
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+        ck_wire::CkOutputKind::Json { .. }
+        | ck_wire::CkOutputKind::ErrorJson { .. }
+        | ck_wire::CkOutputKind::ExecutionDenied { .. } => {}
+    }
+    false
+}
+
+fn append_channel1_to_block(block: &mut CkWireBlock, reminder: &str) -> bool {
+    match &mut block.kind {
+        ck_wire::CkKind::ToolResult { output, .. } => append_channel1_to_output(output, reminder),
+        _ => false,
+    }
+}
+
+fn append_channel1_to_output(output: &mut ck_wire::CkToolOutput, reminder: &str) -> bool {
+    match &mut output.kind {
+        ck_wire::CkOutputKind::Text { text } | ck_wire::CkOutputKind::ErrorText { text } => {
+            if !text.ends_with(reminder) {
+                text.push_str(reminder);
+                return true;
+            }
+        }
+        ck_wire::CkOutputKind::Content { blocks } => {
+            for block in blocks {
+                if let ck_wire::ResultBlockKind::Text { text } = &mut block.kind {
+                    if !text.ends_with(reminder) {
+                        text.push_str(reminder);
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+        ck_wire::CkOutputKind::Json { .. }
+        | ck_wire::CkOutputKind::ErrorJson { .. }
+        | ck_wire::CkOutputKind::ExecutionDenied { .. } => {}
+    }
+    false
+}
+
+fn prepend_tag(tag_number: i64, value: &str) -> String {
+    format!("§{tag_number}§ {}", strip_tag_prefix(value))
+}
+
+fn strip_tag_prefix(value: &str) -> &str {
+    let mut rest = value;
+    loop {
+        let Some(after_open) = rest.strip_prefix(TAG_PREFIX_OPEN) else {
+            return rest;
+        };
+        let digit_len = after_open
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if digit_len == 0 {
+            return rest;
+        }
+        let after_digits = &after_open[digit_len..];
+        let Some(after_close) = after_digits.strip_prefix(TAG_PREFIX_OPEN) else {
+            return rest;
+        };
+        rest = after_close.trim_start();
+    }
+}
+
+fn maybe_append_channel1_nudge(
+    input: Channel1NudgeInputs<'_, '_>,
+    meta: &mut ModuleMeta,
+) -> Result<Option<Channel1AppendRow>, TransformError> {
+    let active_tags = active_tags_for_nudge(input.core, meta, input.projection, input.tag_rows);
+    let live_tail_tokens = active_tags
+        .iter()
+        .map(|tag| tag.token_count.max(0))
+        .sum::<i64>();
+    let working_window_tokens = (input.context_limit_tokens
+        * input.ctx.execute_threshold_percentage.clamp(1.0, 100.0)
+        / 100.0)
+        .round()
+        .max(0.0) as i64;
+    let reclaimable_tokens =
+        reclaimable_older_than_working_window(&active_tags, working_window_tokens);
+    let decision = decide_channel1(
+        reclaimable_tokens,
+        live_tail_tokens,
+        working_window_tokens,
+        input.context_limit_tokens,
+        input.input_tokens,
+        input.ctx.execute_threshold_percentage,
+        meta,
+    );
+    meta.channel1_last_nudge_undropped = decision.next_last_nudge;
+    meta.channel1_last_nudge_level = decision.next_last_level;
+    let was_suppressed = meta.channel1_reduce_suppressed;
+    meta.channel1_reduce_suppressed = false;
+    if was_suppressed || !decision.fire {
+        return Ok(None);
+    }
+    let existing_blocks = input
+        .channel1_appends
+        .iter()
+        .map(|row| row.block_id.as_str())
+        .collect::<HashSet<_>>();
+    let Some(block_id) =
+        newest_tool_result_for_channel1(input.core, meta, input.projection, &existing_blocks)
+    else {
+        return Ok(None);
+    };
+    let hint = oldest_reclaimable_hint(&active_tags, working_window_tokens);
+    let reminder = build_channel1_reminder(decision.level, decision.reclaimable_tokens, &hint);
+    let inserted = input.store.append_channel1_nudge(
+        &input.req.session_id,
+        &block_id,
+        &reminder,
+        input.ctx.now_ms,
+    )?;
+    if inserted {
+        Ok(Some(Channel1AppendRow {
+            block_id,
+            reminder_text: reminder,
+            fired_at_ms: input.ctx.now_ms,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn active_tags_for_nudge(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    tag_rows: &[McTagRow],
+) -> Vec<ActiveTagForNudge> {
+    let tag_by_block = tag_rows
+        .iter()
+        .map(|row| (row.block_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut out = Vec::new();
+    for block in projection.blocks.iter().filter(|block| {
+        taggable_kind(block).is_some()
+            && is_tail(block.ordinal, meta.coverage_ordinal)
+            && frozen_red_payload(core, block.id()).is_none()
+    }) {
+        if let Some(row) = tag_by_block.get(block.id.as_str()) {
+            out.push(ActiveTagForNudge {
+                tag_number: row.tag_number,
+                kind: row.kind.clone(),
+                token_count: row.token_count.max(0),
+            });
+        }
+    }
+    out.sort_by_key(|tag| tag.tag_number);
+    out
+}
+
+fn reclaimable_older_than_working_window(
+    active_tags: &[ActiveTagForNudge],
+    working_window_tokens: i64,
+) -> i64 {
+    let mut protected = HashSet::new();
+    let mut sum = 0i64;
+    for tag in active_tags.iter().rev() {
+        if sum >= working_window_tokens.max(0) {
+            break;
+        }
+        protected.insert(tag.tag_number);
+        sum += tag.token_count.max(0);
+    }
+    active_tags
+        .iter()
+        .filter(|tag| tag.kind != "tool_call" && !protected.contains(&tag.tag_number))
+        .map(|tag| tag.token_count.max(0))
+        .sum()
+}
+
+fn decide_channel1(
+    reclaimable_tokens: i64,
+    live_tail_tokens: i64,
+    working_window_tokens: i64,
+    context_limit_tokens: f64,
+    input_tokens: f64,
+    execute_threshold_percentage: f64,
+    meta: &ModuleMeta,
+) -> Channel1Decision {
+    let reset_cycle = meta.channel1_reduce_suppressed
+        || reclaimable_tokens < meta.channel1_last_nudge_undropped.max(0);
+    let last_nudge = if reset_cycle {
+        0
+    } else {
+        meta.channel1_last_nudge_undropped.max(0)
+    };
+    let last_level = if reset_cycle {
+        None
+    } else {
+        Channel1Level::parse(&meta.channel1_last_nudge_level)
+    };
+    let last_level_string = |level: Option<Channel1Level>| {
+        level
+            .map(|level| level.as_str().to_string())
+            .unwrap_or_default()
+    };
+    let quiet = |next_last_nudge: i64, next_last_level: String| Channel1Decision {
+        fire: false,
+        level: Channel1Level::Gentle,
+        reclaimable_tokens,
+        next_last_nudge,
+        next_last_level,
+    };
+    if meta.channel1_reduce_suppressed {
+        return quiet(0, String::new());
+    }
+    if reclaimable_tokens < CHANNEL1_FLOOR_TOKENS {
+        return quiet(last_nudge, last_level_string(last_level));
+    }
+    let pressure = if context_limit_tokens > 0.0 && execute_threshold_percentage > 0.0 {
+        ((input_tokens / context_limit_tokens) * 100.0 / execute_threshold_percentage)
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if pressure < CHANNEL1_PRESSURE_FLOOR {
+        return quiet(last_nudge, last_level_string(last_level));
+    }
+    let execute_threshold_tokens =
+        context_limit_tokens * execute_threshold_percentage.clamp(1.0, 100.0) / 100.0;
+    let usable_tokens =
+        (execute_threshold_tokens - input_tokens + live_tail_tokens as f64).max(0.0);
+    if usable_tokens > 0.0 && (reclaimable_tokens as f64) < usable_tokens * CHANNEL1_USABLE_FRACTION
+    {
+        return quiet(last_nudge, last_level_string(last_level));
+    }
+    let severity = if working_window_tokens > 0 {
+        (reclaimable_tokens as f64 / working_window_tokens as f64).min(1.0)
+    } else {
+        1.0
+    };
+    let level = if severity >= 0.65 {
+        Channel1Level::Urgent
+    } else if severity >= 0.4 {
+        Channel1Level::Firm
+    } else {
+        Channel1Level::Gentle
+    };
+    if let Some(last) = last_level {
+        if level.rank() <= last.rank() {
+            return quiet(last_nudge, last.as_str().to_string());
+        }
+    } else if reclaimable_tokens < last_nudge + channel1_refire_tokens(working_window_tokens) {
+        return quiet(last_nudge, String::new());
+    }
+    Channel1Decision {
+        fire: true,
+        level,
+        reclaimable_tokens,
+        next_last_nudge: reclaimable_tokens,
+        next_last_level: level.as_str().to_string(),
+    }
+}
+
+fn channel1_refire_tokens(working_window_tokens: i64) -> i64 {
+    let scaled = (0.05 * working_window_tokens.max(0) as f64).round() as i64;
+    CHANNEL1_REFIRE_FLOOR_TOKENS.max(scaled)
+}
+
+fn newest_tool_result_for_channel1(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    existing_blocks: &HashSet<&str>,
+) -> Option<String> {
+    projection
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.kind_tag == "tool_result"
+                && taggable_kind(block).is_some()
+                && is_tail(block.ordinal, meta.coverage_ordinal)
+                && frozen_red_payload(core, block.id()).is_none()
+                && !existing_blocks.contains(block.id.as_str())
+                && tool_result_can_carry_channel1(&block.wire)
+        })
+        .max_by_key(|block| (block.ordinal, block.block_index))
+        .map(|block| block.id.clone())
+}
+
+fn tool_result_can_carry_channel1(block: &CkWireBlock) -> bool {
+    match &block.kind {
+        ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
+            ck_wire::CkOutputKind::Text { .. } | ck_wire::CkOutputKind::ErrorText { .. } => true,
+            ck_wire::CkOutputKind::Content { blocks } => blocks
+                .iter()
+                .any(|block| matches!(block.kind, ck_wire::ResultBlockKind::Text { .. })),
+            ck_wire::CkOutputKind::Json { .. }
+            | ck_wire::CkOutputKind::ErrorJson { .. }
+            | ck_wire::CkOutputKind::ExecutionDenied { .. } => false,
+        },
+        _ => false,
+    }
+}
+
+fn oldest_reclaimable_hint(
+    active_tags: &[ActiveTagForNudge],
+    working_window_tokens: i64,
+) -> Vec<(i64, String)> {
+    let mut protected = HashSet::new();
+    let mut sum = 0i64;
+    for tag in active_tags.iter().rev() {
+        if sum >= working_window_tokens.max(0) {
+            break;
+        }
+        protected.insert(tag.tag_number);
+        sum += tag.token_count.max(0);
+    }
+    active_tags
+        .iter()
+        .filter(|tag| tag.kind == "tool_result" && !protected.contains(&tag.tag_number))
+        .take(4)
+        .map(|tag| (tag.tag_number, "tool".to_string()))
+        .collect()
+}
+
+fn build_channel1_reminder(
+    level: Channel1Level,
+    reclaimable_tokens: i64,
+    hint: &[(i64, String)],
+) -> String {
+    let amount = approx_thousands(reclaimable_tokens);
+    let hint_text = format_reclaimable_hint(hint);
+    let body = match level {
+        Channel1Level::Gentle => format!(
+            "You have ~{amount} tokens of tool output you have not reduced. When you are done with earlier outputs, dropping them with ctx_reduce keeps context lean."
+        ),
+        Channel1Level::Firm => format!(
+            "~{amount} tokens of unreduced tool output has built up. At your next natural stopping point, consider dropping what you have already processed with ctx_reduce."
+        ),
+        Channel1Level::Urgent => format!(
+            "~{amount} tokens of unreduced tool output remain, and a large span of this session will be comparted before long. Consider dropping spent outputs with ctx_reduce so the archived span is the part that matters."
+        ),
+    };
+    format!("\n\n<system-reminder>\n{body}{hint_text}\n</system-reminder>")
+}
+
+fn approx_thousands(tokens: i64) -> String {
+    format!("{}k", (tokens.max(0) as f64 / 1000.0).round() as i64)
+}
+
+fn format_reclaimable_hint(hint: &[(i64, String)]) -> String {
+    if hint.is_empty() {
+        return String::new();
+    }
+    let rendered = hint
+        .iter()
+        .map(|(tag, name)| format!("§{tag}§ {name}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("\noldest reclaimable: {rendered}.")
+}
+
 // --- output splice: [m0, m1] ++ tail(by coverage_ordinal) ---
 
 fn build_output(
@@ -1963,6 +2657,7 @@ fn build_output(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     req: &TransformRequest,
+    tag_overlay: Option<&TagOverlayState>,
 ) -> Result<Vec<CkWireMessage>, TransformError> {
     let mut out = Vec::with_capacity(4 + req.messages.len());
     if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m0") {
@@ -2021,17 +2716,15 @@ fn build_output(
         if !is_tail(msg.ordinal, meta.coverage_ordinal) {
             continue;
         }
-        if let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) {
+        let rendered = if let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) {
             let reduced: BTreeMap<usize, &str> = blocks
                 .iter()
                 .filter_map(|block| {
                     frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
                 })
                 .collect();
-            if reduced.is_empty() {
-                out.push(msg.ck.clone());
-            } else {
-                let mut rebuilt = msg.ck.clone();
+            let mut rebuilt = msg.ck.clone();
+            if !reduced.is_empty() {
                 rebuilt.mark_modified();
                 for block in blocks {
                     if let Some(payload) = reduced.get(&block.block_index) {
@@ -2039,11 +2732,17 @@ fn build_output(
                             reduced_block(&block.wire, payload, block.file_path.as_deref());
                     }
                 }
-                out.push(rebuilt);
             }
+            apply_tag_overlay_to_message(&mut rebuilt, msg, blocks, tag_overlay, |block| {
+                reduced.contains_key(&block.block_index)
+            });
+            rebuilt
         } else {
-            out.push(msg.ck.clone());
-        }
+            let mut rebuilt = msg.ck.clone();
+            apply_tag_overlay_to_message(&mut rebuilt, msg, &[], tag_overlay, |_| false);
+            rebuilt
+        };
+        out.push(rendered);
 
         if meta
             .synthetic_todo
@@ -2207,6 +2906,13 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    fn with_tagging_enabled<T>(f: impl FnOnce() -> T) -> T {
+        crate::healing::set_tagging_enabled_for_tests(Some(true));
+        let out = f();
+        crate::healing::set_tagging_enabled_for_tests(None);
+        out
     }
 
     fn text_message(id: &str, text: &str) -> CkWireMessage {
@@ -5404,6 +6110,162 @@ mod tests {
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
         run(s, &req("ses", "cfg0", vec![item("a", 1, "raw")]), &spine());
+    }
+
+    #[test]
+    fn tagging_gate_off_preserves_unreduced_golden_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let response = run(
+            &s,
+            &req("inert", "cfg0", vec![item("m1", 1, "hello")]),
+            &spine(),
+        );
+        assert_eq!(tail_bytes(&response, "m1"), "hello");
+        assert!(s.load_tags_for_session("inert").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tag_minting_is_deterministic_monotonic_and_survives_rejected_pass() {
+        with_tagging_enabled(|| {
+            let messages = vec![
+                item("m1", 1, "hello"),
+                assistant_tool_call("call", 2, "c1"),
+                tool_result("result", 3, "c1", "tool output"),
+            ];
+            let dir_a = tempfile::tempdir().unwrap();
+            let store_a = store(dir_a.path());
+            run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
+            let first = store_a.load_tags_for_session("mint").unwrap();
+            assert_eq!(
+                first
+                    .iter()
+                    .map(|row| (row.tag_number, row.block_id.as_str(), row.kind.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (1, "m1#0", "message"),
+                    (2, "call#0", "tool_call"),
+                    (3, "result#0", "tool_result")
+                ]
+            );
+            run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
+            assert_eq!(store_a.load_tags_for_session("mint").unwrap(), first);
+
+            let dir_b = tempfile::tempdir().unwrap();
+            let store_b = store(dir_b.path());
+            run(&store_b, &req("mint", "cfg0", messages), &spine());
+            assert_eq!(store_b.load_tags_for_session("mint").unwrap(), first);
+
+            let dir_c = tempfile::tempdir().unwrap();
+            let store_c = store(dir_c.path());
+            run(
+                &store_c,
+                &req("reject", "cfg0", vec![item("m1", 1, "old")]),
+                &spine(),
+            );
+            let err = transform(
+                &store_c,
+                &req(
+                    "reject",
+                    "cfg0",
+                    vec![item("m1", 1, "changed identity"), item("m2", 2, "new")],
+                ),
+                &pctx("git:proj", "/nonexistent-docs", 0),
+            )
+            .unwrap_err();
+            assert!(matches!(err, TransformError::IdentityDrift(_)));
+            let tags = store_c.load_tags_for_session("reject").unwrap();
+            assert_eq!(
+                tags.iter()
+                    .map(|row| row.block_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["m1#0", "m2#0"]
+            );
+        });
+    }
+
+    #[test]
+    fn tag_overlay_replays_stably_and_new_tail_gets_next_number() {
+        with_tagging_enabled(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first_req = req("stable", "cfg0", vec![item("m1", 1, "alpha")]);
+            let first = run(&s, &first_req, &spine());
+            let replay = run(&s, &first_req, &spine());
+            assert_eq!(tail_bytes(&first, "m1"), "§1§ alpha");
+            assert_eq!(tail_bytes(&first, "m1"), tail_bytes(&replay, "m1"));
+
+            let extended = run(
+                &s,
+                &req(
+                    "stable",
+                    "cfg0",
+                    vec![item("m1", 1, "alpha"), item("m2", 2, "beta")],
+                ),
+                &spine(),
+            );
+            assert_eq!(tail_bytes(&extended, "m1"), "§1§ alpha");
+            assert_eq!(tail_bytes(&extended, "m2"), "§2§ beta");
+        });
+    }
+
+    #[test]
+    fn reduced_block_renders_placeholder_without_tag_prefix() {
+        with_tagging_enabled(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let response = run(
+                &s,
+                &req(
+                    "drop-tag",
+                    "cfg0",
+                    vec![item("m1", 1, "drop me"), item("m2", 2, "keep me")],
+                ),
+                &with_reductions(vec![reduce("m1#0", "drop", "[dropped]")]),
+            );
+            assert_eq!(tail_bytes(&response, "m1"), "[dropped]");
+            assert_eq!(tail_bytes(&response, "m2"), "§2§ keep me");
+        });
+    }
+
+    #[test]
+    fn channel1_nudge_replays_and_suppresses_refire() {
+        with_tagging_enabled(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let huge = "word ".repeat(20_000);
+            let messages = vec![
+                assistant_tool_call("call1", 1, "c1"),
+                tool_result("result1", 2, "c1", &huge),
+                assistant_tool_call("call2", 3, "c2"),
+                tool_result("result2", 4, "c2", &huge),
+            ];
+            let request = with_usage(req("nudge", "cfg0", messages.clone()), 900, 1024);
+            let first = run(&s, &request, &spine());
+            let first_result = tail_bytes(&first, "result2").to_string();
+            assert!(first_result.contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+
+            let replay = run(&s, &request, &spine());
+            assert_eq!(tail_bytes(&replay, "result2"), first_result);
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+
+            let mut loaded = s.load("nudge").unwrap();
+            loaded.meta.channel1_reduce_suppressed = true;
+            s.commit("nudge", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+            let mut extended_messages = messages;
+            extended_messages.push(assistant_tool_call("call3", 5, "c3"));
+            extended_messages.push(tool_result("result3", 6, "c3", &huge));
+            let suppressed = run(
+                &s,
+                &with_usage(req("nudge", "cfg0", extended_messages), 900, 1024),
+                &spine(),
+            );
+            assert!(tail_bytes(&suppressed, "result2").contains("<system-reminder>"));
+            assert!(!tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+        });
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub mod selection;
 pub mod session_resolver;
 pub mod transform;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -2428,6 +2428,7 @@ impl McHandler {
             "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
+            "ctx_reduce" => self.handle_ctx_reduce_facade(channel, &request).await,
             "ctx_note" => self.handle_ctx_note_facade(channel, &request).await,
             _ => unrecognized_request_error(&request),
         }
@@ -2460,6 +2461,81 @@ impl McHandler {
                 message: error.to_string(),
             }),
         }
+    }
+
+    async fn handle_ctx_reduce_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request) else {
+            return invalid_params_error("ctx_reduce arguments must be an object");
+        };
+        let Some(drop_arg) = non_empty_string_arg(args, "drop") else {
+            return tool_error_result("Error: 'drop' must be provided.");
+        };
+        let facade_scope = match self.resolve_facade_scope(channel).await {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        let session_id = facade_scope.conversation_key.as_str();
+        let loaded = match store.load(session_id) {
+            Ok(loaded) => loaded,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let Some(profile) = SerializerProfile::parse(&loaded.meta.last_serializer_profile) else {
+            return tagging_inactive_error();
+        };
+        if !healing::tagging_enabled(profile) {
+            return tagging_inactive_error();
+        }
+
+        let requested = match parse_tag_range_string(drop_arg) {
+            Ok(ids) => ids,
+            Err(error) => {
+                return tool_error_result(format!("Error: Invalid range syntax. {error}"))
+            }
+        };
+        let tags = match store.load_tags_for_session(session_id) {
+            Ok(tags) => tags,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let by_number = tags
+            .iter()
+            .map(|row| (row.tag_number, row))
+            .collect::<HashMap<_, _>>();
+        let mut block_ids = Vec::new();
+        let mut queued_numbers = Vec::new();
+        let mut unknown_numbers = Vec::new();
+        for tag_number in requested {
+            match by_number.get(&(tag_number as i64)) {
+                Some(row) => {
+                    block_ids.push(row.block_id.clone());
+                    queued_numbers.push(tag_number as i64);
+                }
+                None => unknown_numbers.push(tag_number as i64),
+            }
+        }
+        let inserted = if block_ids.is_empty() {
+            0
+        } else {
+            match store.append_pending_agent_drops(session_id, &block_ids, now_ms()) {
+                Ok(count) => count,
+                Err(error) => return tool_error_result(format!("Error: {error}")),
+            }
+        };
+        if inserted > 0 {
+            suppress_channel1_after_ctx_reduce(store, session_id);
+        }
+        mcp_text_result(
+            render_ctx_reduce_response(
+                inserted,
+                queued_numbers.len(),
+                &queued_numbers,
+                &unknown_numbers,
+            ),
+            false,
+        )
     }
 
     async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -3221,6 +3297,125 @@ fn join_i64s(ids: &[i64]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn tagging_inactive_error() -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "tagging_inactive".to_string(),
+        message: "tagging not active for this session's profile".to_string(),
+    }
+}
+
+fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
+    const MAX_RANGE_ELEMENTS: u64 = 1000;
+    let trimmed = input.replace('§', "").trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Range string must not be empty".to_string());
+    }
+    let mut numbers = BTreeSet::new();
+    for segment in trimmed.split(',') {
+        let part = segment.trim();
+        if part.contains('-') {
+            let Some((start_raw, end_raw)) = part.split_once('-') else {
+                return Err(format!("Invalid range \"{part}\""));
+            };
+            let start = parse_tag_integer(start_raw.trim())?;
+            let end = parse_tag_integer(end_raw.trim())?;
+            if start > end {
+                return Err(format!(
+                    "Invalid range \"{part}\": start ({start}) must be <= end ({end})"
+                ));
+            }
+            let range_size = end - start + 1;
+            if range_size > MAX_RANGE_ELEMENTS {
+                return Err(format!(
+                    "Range \"{part}\" exceeds maximum size of {MAX_RANGE_ELEMENTS} elements (got {range_size})"
+                ));
+            }
+            for value in start..=end {
+                numbers.insert(value);
+            }
+        } else {
+            numbers.insert(parse_tag_integer(part)?);
+        }
+    }
+    if numbers.len() as u64 > MAX_RANGE_ELEMENTS {
+        return Err(format!(
+            "Total range size exceeds maximum of {MAX_RANGE_ELEMENTS} elements (got {})",
+            numbers.len()
+        ));
+    }
+    Ok(numbers.into_iter().collect())
+}
+
+fn parse_tag_integer(raw: &str) -> Result<u64, String> {
+    if raw.is_empty() || !raw.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("Invalid integer: \"{raw}\""));
+    }
+    raw.parse::<u64>()
+        .map_err(|_| format!("Invalid integer: \"{raw}\""))
+}
+
+fn format_tag_numbers(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|id| format!("§{id}§"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_ctx_reduce_response(
+    inserted: usize,
+    valid_requested: usize,
+    queued_numbers: &[i64],
+    unknown_numbers: &[i64],
+) -> String {
+    let already_queued = valid_requested.saturating_sub(inserted);
+    let mut parts = Vec::new();
+    if inserted > 0 {
+        parts.push(format!(
+            "Queued: drop {}.",
+            format_tag_numbers(&queued_numbers[..inserted.min(queued_numbers.len())])
+        ));
+    } else if valid_requested > 0 {
+        parts.push(
+            "All requested tags were already queued or processed. No new action is needed."
+                .to_string(),
+        );
+    } else {
+        parts.push("No tags queued.".to_string());
+    }
+    if already_queued > 0 {
+        parts.push(format!(
+            "{already_queued} requested tag{} already queued and need no action.",
+            if already_queued == 1 {
+                " was"
+            } else {
+                "s were"
+            }
+        ));
+    }
+    if !unknown_numbers.is_empty() {
+        parts.push(format!(
+            "Unknown tag(s) {} skipped.",
+            format_tag_numbers(unknown_numbers)
+        ));
+    }
+    parts.join(" ")
+}
+
+fn suppress_channel1_after_ctx_reduce(store: &McStore, session_id: &str) {
+    let Ok(loaded) = store.load(session_id) else {
+        return;
+    };
+    let mut meta = loaded.meta.clone();
+    meta.channel1_reduce_suppressed = true;
+    meta.channel1_last_nudge_level = "urgent".to_string();
+    let tag_tokens = store
+        .load_tags_for_session(session_id)
+        .map(|tags| tags.iter().map(|tag| tag.token_count.max(0)).sum::<i64>())
+        .unwrap_or(0);
+    meta.channel1_last_nudge_undropped = meta.channel1_last_nudge_undropped.max(tag_tokens);
+    let _ = store.commit(session_id, loaded.row_version, &loaded.core, &meta);
 }
 
 fn drop_ids_from_command(request: &Value) -> Vec<String> {
@@ -5258,7 +5453,7 @@ mod tests {
         let facade = handler
             .dispatch_value(
                 7,
-                json!({ "name": "ctx_reduce", "arguments": { "drop": "1-3" } }),
+                json!({ "name": "ctx_unknown", "arguments": { "drop": "1-3" } }),
             )
             .await;
         assert_eq!(error_code(facade), "facade_envelope_not_supported");
@@ -5439,7 +5634,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_flat_envelope_precedence_keeps_kind_arm_and_rejects_ctx_reduce_name() {
+    async fn facade_flat_envelope_precedence_keeps_kind_arm_and_gates_ctx_reduce_name() {
         let producer = Arc::new(ProducerState::default());
         let resolver = FakeSessionResolver::with(&[(
             "token",
@@ -5460,7 +5655,47 @@ mod tests {
         assert_eq!(echo_body["echo"]["kind"], "echo");
 
         let reduce = call_facade(&handler, "ctx_reduce", json!({ "drop": "1-3" })).await;
-        assert_eq!(error_code(reduce), "facade_envelope_not_supported");
+        assert_eq!(error_code(reduce), "tagging_inactive");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_ctx_reduce_parses_ranges_resolves_tags_and_dedups_queue() {
+        crate::healing::set_tagging_enabled_for_tests(Some(true));
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(8, binding(project.to_str().unwrap(), "token"));
+
+        let transformed =
+            call_transform(&handler, vec![ck("m1", 1, "one"), ck("m2", 2, "two")]).await;
+        assert_eq!(transformed["status"], "ok");
+        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 2);
+
+        let mixed = tool_text(
+            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "§1§,99" })).await,
+        );
+        assert!(mixed.contains("Queued: drop §1§."), "{mixed}");
+        assert!(mixed.contains("Unknown tag(s) §99§ skipped."), "{mixed}");
+        let queued = store.load_pending_agent_drops("ses").unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].target_id, "m1#0");
+
+        let duplicate = tool_text(
+            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "1" })).await,
+        );
+        assert!(duplicate.contains("already queued"), "{duplicate}");
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+
+        let malformed = tool_body(
+            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "3-1" })).await,
+        );
+        assert_eq!(malformed["isError"], json!(true));
+        assert!(malformed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid range syntax"));
+        crate::healing::set_tagging_enabled_for_tests(None);
     }
 
     #[tokio::test(flavor = "current_thread")]
