@@ -834,6 +834,9 @@ impl McHandler {
             .ok()
             .and_then(|cs| cs.iter().map(|c| c.end_message as u64).max());
         let (context_limit, input_tokens, usage_percentage) = usage_numbers(parsed.usage.as_ref());
+        let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
+            .expect("serializer_profile validated upstream");
+        let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
         let trigger = boundary::check_compartment_trigger(
             &boundary_messages,
             &TriggerContext {
@@ -847,6 +850,7 @@ impl McHandler {
                     migration_floor_active: last_compartment_end_ordinal.unwrap_or(0) > 0,
                     emergency_tail_scale: None,
                     trigger_budget: None,
+                    fold_is_only_reclaim,
                 },
                 projected_post_drop_percentage: None,
                 compartment_in_progress: loaded.meta.historian.state != HistorianPhase::Idle,
@@ -1315,6 +1319,9 @@ impl McHandler {
             .ok()
             .and_then(|cs| cs.iter().map(|c| c.end_message as u64).max());
         let (context_limit, input_tokens, usage_percentage) = usage_numbers(parsed.usage.as_ref());
+        let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
+            .expect("serializer_profile validated upstream");
+        let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
         let trigger = boundary::check_compartment_trigger(
             &boundary_messages,
             &TriggerContext {
@@ -1328,6 +1335,7 @@ impl McHandler {
                     migration_floor_active: last_compartment_end_ordinal.unwrap_or(0) > 0,
                     emergency_tail_scale: None,
                     trigger_budget: None,
+                    fold_is_only_reclaim,
                 },
                 projected_post_drop_percentage: None,
                 compartment_in_progress: loaded.meta.historian.state != HistorianPhase::Idle,
@@ -1423,9 +1431,6 @@ impl McHandler {
             .cloned()
             .collect();
         let project_slug = project_slug(&binding.project_root);
-        let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
-            .expect("serializer_profile validated upstream");
-        let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
         if fold_is_only_reclaim {
             // CC sessions are born on this profile; tail reducers never run, so no frozen
             // `red:*` units should exist when the fold is the sole reclaim path.

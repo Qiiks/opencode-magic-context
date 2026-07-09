@@ -154,6 +154,8 @@ pub struct BoundaryContext {
     pub emergency_tail_scale: Option<f64>,
     /// Optional pre-derived trigger budget; when omitted, [`derive_trigger_budget`] is used.
     pub trigger_budget: Option<f64>,
+    /// True when folding is the only reclaim path and the live tail is forwarded verbatim.
+    pub fold_is_only_reclaim: bool,
 }
 
 impl Default for BoundaryContext {
@@ -168,6 +170,7 @@ impl Default for BoundaryContext {
             migration_floor_active: false,
             emergency_tail_scale: None,
             trigger_budget: None,
+            fold_is_only_reclaim: false,
         }
     }
 }
@@ -479,6 +482,15 @@ pub fn resolve_protected_tail_boundary(
         protected_tail_start = offset;
     }
     protected_tail_start = index.clamp_ordinal(protected_tail_start);
+
+    if ctx.fold_is_only_reclaim && raw_message_count > 0 {
+        // On verbatim-tail profiles, folding is the only reclaim path, while the newest message
+        // is still forwarded in full. Keep the newest message and its tool pair out of the
+        // fold so the live turn cannot become a durable compartment boundary.
+        let newest_floor = newest_message_protected_floor(&arcs, &index);
+        protected_tail_start = protected_tail_start.min(newest_floor).max(offset);
+        protected_tail_start = index.clamp_ordinal(protected_tail_start);
+    }
 
     let per_run_cap = select_per_run_cap(
         usage_percentage,
@@ -1014,6 +1026,17 @@ fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
         })
     });
     arcs
+}
+
+/// Return the earliest ordinal that must stay in the protected tail so the newest message and its
+/// whole tool arc are never folded into a compartment.
+fn newest_message_protected_floor(arcs: &[ToolArc], index: &TokenIndex) -> u64 {
+    let last = index.last_ordinal;
+    arcs.iter()
+        .filter(|arc| arc.inv_ordinal == last || arc.res_ordinal == Some(last))
+        .map(|arc| arc.inv_ordinal)
+        .min()
+        .unwrap_or(last)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1805,6 +1828,7 @@ mod tests {
             migration_floor_active: json.migration_floor_active,
             emergency_tail_scale: json.emergency_tail_scale,
             trigger_budget: json.trigger_budget,
+            fold_is_only_reclaim: false,
         }
     }
 
@@ -2056,6 +2080,35 @@ mod tests {
         }
     }
 
+    fn tool_result_msg(ord: u64, arc_id: &str, text: &str) -> BoundaryMsg {
+        BoundaryMsg {
+            message_ordinal: ord,
+            message_id: format!("m-{ord}"),
+            role: Role::User,
+            blocks: vec![BoundaryBlock {
+                id: format!("{arc_id}#result"),
+                ordinal: ord,
+                kind: SelKind::ToolResult {
+                    tool_name: "bash".to_string(),
+                },
+                provider_executed: false,
+                byte_size: text.len(),
+                arc_id: Some(arc_id.to_string()),
+                original: text.to_string(),
+                rendered: None,
+                ignored: false,
+            }],
+        }
+    }
+
+    fn completed_newest_tool_arc_tail() -> Vec<BoundaryMsg> {
+        vec![
+            text_msg(1, Role::Assistant, &"head ".repeat(600)),
+            tool_call_msg(2, "arc-newest"),
+            tool_result_msg(3, "arc-newest", &"tool result ".repeat(2_500)),
+        ]
+    }
+
     fn ctx_for_tests() -> BoundaryContext {
         BoundaryContext {
             context_limit: 20_000.0,
@@ -2067,7 +2120,113 @@ mod tests {
             migration_floor_active: false,
             emergency_tail_scale: None,
             trigger_budget: None,
+            fold_is_only_reclaim: false,
         }
+    }
+
+    fn fold_only_pressure_ctx() -> BoundaryContext {
+        let mut ctx = ctx_for_tests();
+        ctx.context_limit = 80_000.0;
+        ctx.usage_percentage = 97.0;
+        ctx.usage_input_tokens = 77_600.0;
+        ctx.fold_is_only_reclaim = true;
+        ctx
+    }
+
+    #[test]
+    fn fold_only_guard_keeps_newest_tool_result_out_of_eligible_head() {
+        let tail = completed_newest_tool_arc_tail();
+        let terminal_ordinal = 4;
+        let newest_ordinal = 3;
+        let mut pre_guard_ctx = fold_only_pressure_ctx();
+        pre_guard_ctx.fold_is_only_reclaim = false;
+        let pre_guard = resolve_protected_tail_boundary(&tail, &pre_guard_ctx);
+        assert_eq!(
+            pre_guard.eligible_head.end, terminal_ordinal,
+            "control case must exercise the old terminal eligible-head path"
+        );
+
+        let boundary = resolve_protected_tail_boundary(&tail, &fold_only_pressure_ctx());
+
+        assert!(boundary.eligible_head.end < terminal_ordinal);
+        assert!(boundary.eligible_head.end <= boundary.protected_start_ordinal);
+        assert!(
+            boundary.protected_start_ordinal <= newest_ordinal && newest_ordinal < terminal_ordinal,
+            "newest message must stay in the protected tail"
+        );
+    }
+
+    #[test]
+    fn fold_only_guard_protects_whole_newest_tool_arc() {
+        let tail = vec![
+            text_msg(1, Role::Assistant, &"first ".repeat(500)),
+            text_msg(2, Role::Assistant, "between before tool"),
+            tool_call_msg(3, "arc-newest"),
+            text_msg(
+                4,
+                Role::Assistant,
+                "assistant text while the tool is active",
+            ),
+            tool_result_msg(5, "arc-newest", &"tool result ".repeat(2_500)),
+        ];
+        let boundary = resolve_protected_tail_boundary(&tail, &fold_only_pressure_ctx());
+
+        assert_eq!(boundary.protected_start_ordinal, 3);
+        assert!(
+            boundary.eligible_head.end <= 3,
+            "eligible head must not split the newest tool arc"
+        );
+        assert!(!(3 < boundary.eligible_head.end && boundary.eligible_head.end <= 5));
+    }
+
+    #[test]
+    fn fold_only_guard_still_folds_large_plain_head() {
+        let tail = vec![
+            text_msg(1, Role::Assistant, &"x ".repeat(200_000)),
+            text_msg(2, Role::Assistant, &"newest plain message ".repeat(3_000)),
+        ];
+        let mut ctx = ctx_for_tests();
+        ctx.usage_percentage = 97.0;
+        ctx.usage_input_tokens = 19_400.0;
+        ctx.fold_is_only_reclaim = true;
+
+        let boundary = resolve_protected_tail_boundary(&tail, &ctx);
+
+        assert_eq!(boundary.protected_start_ordinal, 2);
+        assert_eq!(boundary.eligible_head, 1..2);
+        assert!(
+            boundary.true_raw_eligible_tokens > 100_000.0,
+            "large head should remain eligible for folding"
+        );
+    }
+
+    #[test]
+    fn newest_guard_is_off_by_default() {
+        let tail = completed_newest_tool_arc_tail();
+        let mut ctx = fold_only_pressure_ctx();
+        ctx.fold_is_only_reclaim = false;
+
+        let boundary = resolve_protected_tail_boundary(&tail, &ctx);
+
+        assert_eq!(boundary.protected_start_ordinal, 4);
+        assert_eq!(boundary.eligible_head.end, 4);
+    }
+
+    #[test]
+    fn fold_only_guard_applies_during_emergency_tail_scaling() {
+        let tail = completed_newest_tool_arc_tail();
+        let mut ctx = fold_only_pressure_ctx();
+        ctx.emergency_tail_scale = Some(0.25);
+
+        let boundary = resolve_protected_tail_boundary(&tail, &ctx);
+        let terminal_ordinal = 4;
+        let newest_ordinal = 3;
+
+        assert_eq!(boundary.protected_start_ordinal, 2);
+        assert!(boundary.eligible_head.end <= 2);
+        assert!(
+            boundary.protected_start_ordinal <= newest_ordinal && newest_ordinal < terminal_ordinal
+        );
     }
 
     #[test]
