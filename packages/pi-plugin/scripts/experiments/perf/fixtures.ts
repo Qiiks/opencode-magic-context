@@ -92,8 +92,8 @@ export function generateSyntheticFixture(
 		});
 		if (sequence >= options.messages) break;
 
-		// Deliberately reuse call ids across turns. Composite owner identity must
-		// keep these arcs separate when stable-prefix work is skipped.
+		// Reuse call IDs across turns to verify that owner message IDs prevent
+		// distinct tool calls from merging when stable parts reuse persisted tags.
 		const callId = `call-${turn % 11}`;
 		append({
 			role: "assistant",
