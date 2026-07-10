@@ -25,6 +25,20 @@ async function main(): Promise<void> {
 		["git", "rev-parse", "--show-toplevel"],
 		process.cwd(),
 	);
+	if (options.baseline === "AUTO") {
+		const history = await commandOutput(
+			[
+				"git",
+				"log",
+				"--reverse",
+				"--format=%H",
+				"--",
+				"packages/pi-plugin/scripts/experiments/perf/compare.ts",
+			],
+			repoRoot,
+		);
+		options.baseline = history.split("\n")[0] || "HEAD^";
+	}
 	const tempRoot = mkdtempSync(join(tmpdir(), "mc-pi-perf-compare-"));
 	const baselineRoot = join(tempRoot, "baseline");
 	const archive = join(tempRoot, "baseline.tar");
@@ -202,7 +216,7 @@ async function run(
 }
 
 function parseOptions(args: readonly string[]): Options {
-	const options: Options = { baseline: "HEAD^", messages: 1_000, step: 500 };
+	const options: Options = { baseline: "AUTO", messages: 1_000, step: 500 };
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		const value = args[index + 1];
