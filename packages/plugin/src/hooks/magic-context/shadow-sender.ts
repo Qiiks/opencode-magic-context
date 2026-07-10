@@ -58,6 +58,7 @@ export interface ShadowPassInputs {
         limit: number;
     };
     effective_execute_threshold: number;
+    history_budget_tokens: number;
     cache_ttl: string;
     provider_error?: string;
 }

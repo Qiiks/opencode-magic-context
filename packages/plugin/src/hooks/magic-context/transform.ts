@@ -67,6 +67,7 @@ import {
 } from "./event-resolvers";
 import type { LiveModelBySession } from "./hook-handlers";
 import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
+import { DEFAULT_HISTORY_BUDGET_TOKENS } from "./decay-render";
 import {
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
@@ -2214,6 +2215,8 @@ export function createTransform(deps: TransformDeps) {
                             limit: resolvedContextLimit ?? boundaryContextLimit,
                         },
                         effective_execute_threshold: boundaryExecuteThreshold,
+                        history_budget_tokens:
+                            historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
                         cache_ttl: sessionMeta.cacheTtl,
                     },
                     tsDecision: shadowDecision,

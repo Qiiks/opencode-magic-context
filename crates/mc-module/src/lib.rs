@@ -251,6 +251,8 @@ struct ShadowPassInputs {
         alias = "execute_threshold_percentage"
     )]
     effective_execute_threshold: f64,
+    #[serde(default)]
+    history_budget_tokens: Option<f64>,
     #[serde(default = "default_cache_ttl")]
     cache_ttl: String,
     #[serde(default)]
@@ -2359,7 +2361,10 @@ impl McHandler {
         let producer_ctx = transform::ProducerContext {
             project_path: &shadow_project,
             project_directory: &project_path,
-            history_budget_tokens: binding.history_budget_tokens,
+            history_budget_tokens: parsed
+                .pass_inputs
+                .history_budget_tokens
+                .unwrap_or(binding.history_budget_tokens),
             now_ms: parsed.pass_inputs.now_ms,
             execute_threshold_percentage: parsed.pass_inputs.effective_execute_threshold,
             smart_drops: binding.config.smart_drops,
@@ -7090,6 +7095,7 @@ mod tests {
         model_key: String,
         usage: StrictShadowUsage,
         effective_execute_threshold: f64,
+        history_budget_tokens: f64,
         cache_ttl: String,
         provider_error: String,
     }
@@ -7171,6 +7177,10 @@ mod tests {
         assert_eq!(fixture.state_sync.compartments.len(), 1);
         assert_eq!(fixture.state_sync.memories.len(), 1);
         assert_eq!(fixture.state_sync.memory_mutations.len(), 1);
+        assert_eq!(
+            fixture.shadow_transform.pass_inputs.history_budget_tokens,
+            19_500.0
+        );
         assert_eq!(fixture.local_watermarks.m0_mutation_id, 1);
     }
 

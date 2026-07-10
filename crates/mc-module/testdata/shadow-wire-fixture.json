@@ -150,6 +150,7 @@
         "limit": 200000
       },
       "effective_execute_threshold": 65,
+      "history_budget_tokens": 19500,
       "cache_ttl": "ephemeral",
       "provider_error": "fixture provider warning"
     },

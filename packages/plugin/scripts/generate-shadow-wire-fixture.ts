@@ -233,6 +233,7 @@ export function generateShadowWireFixture(): string {
                 model_key: "fixture/provider-model",
                 usage: { input_tokens: 12_345, limit: 200_000 },
                 effective_execute_threshold: 65,
+                history_budget_tokens: 19_500,
                 cache_ttl: "ephemeral",
                 provider_error: "fixture provider warning",
             },
