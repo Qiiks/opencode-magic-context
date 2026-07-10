@@ -782,7 +782,7 @@ export function updateTagMessageId(
     getUpdateTagMessageIdStatement(db).run(messageId, sessionId, tagId);
 }
 
-/** Return whether a session still has any message tag bound to an unstable Pi id. */
+/** Return whether this session has any message tag bound to a fallback Pi id. */
 export function hasPiFallbackMessageTags(db: Database, sessionId: string): boolean {
     let statement = hasPiFallbackMessageTagStatements.get(db);
     if (!statement) {

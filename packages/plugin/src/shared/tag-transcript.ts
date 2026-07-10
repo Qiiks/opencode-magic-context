@@ -85,7 +85,8 @@ export interface TagTranscriptOptions {
     entryFingerprintByMessageId?: ReadonlyMap<string, string>;
     /**
      * Stable Pi message ids observed on a prior pass. Their immutable parts may
-     * reuse tag assignments while still rebuilding prefixes and target closures.
+     * reuse tag assignments while this pass still reapplies visible prefixes and
+     * rebuilds the complete set of messages affected by each tag.
      */
     reuseMessageIds?: ReadonlySet<string>;
     /** Process-local benchmark hook; omitted by both production harnesses. */

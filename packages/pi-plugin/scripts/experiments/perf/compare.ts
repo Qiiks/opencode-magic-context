@@ -4,6 +4,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +22,30 @@ interface Options {
 
 async function main(): Promise<void> {
 	const options = parseOptions(process.argv.slice(2));
+	if (options.fixture && statSync(options.fixture).isDirectory()) {
+		const fixtures = Array.from(
+			new Bun.Glob("**/*.jsonl").scanSync({
+				cwd: options.fixture,
+				absolute: true,
+			}),
+		).sort();
+		if (fixtures.length === 0) {
+			throw new Error(`No JSONL fixtures under ${options.fixture}`);
+		}
+		const fixtureArgIndex = process.argv.indexOf("--fixture") + 1;
+		for (const fixture of fixtures) {
+			const childArgs = process.argv.slice(2);
+			childArgs[fixtureArgIndex - 2] = fixture;
+			await run(
+				[process.execPath, process.argv[1] ?? "compare.ts", ...childArgs],
+				process.cwd(),
+			);
+		}
+		console.log(
+			`\nfixture corpus identity: ${fixtures.length} files, all comparisons passed`,
+		);
+		return;
+	}
 	const repoRoot = await commandOutput(
 		["git", "rev-parse", "--show-toplevel"],
 		process.cwd(),
