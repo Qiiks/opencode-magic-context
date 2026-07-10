@@ -83,6 +83,17 @@ export interface TagTranscriptOptions {
      * contentId) since all parts of a message share one fingerprint.
      */
     entryFingerprintByMessageId?: ReadonlyMap<string, string>;
+    /**
+     * Stable Pi message ids observed on a prior pass. Their immutable parts may
+     * reuse tag assignments while this pass still reapplies visible prefixes and
+     * rebuilds the complete set of messages affected by each tag.
+     */
+    reuseMessageIds?: ReadonlySet<string>;
+    /** Optional process-local benchmark callback; production callers omit it. */
+    onTiming?: (
+        phase: "identity" | "prefix" | "targets" | "tokenCounting",
+        elapsedMs: number,
+    ) => void;
 }
 
 export interface TagTranscriptResult {
@@ -134,8 +145,17 @@ interface ToolOccurrence {
     kind: "tool_use" | "tool_result";
 }
 
+interface TagTranscriptTiming {
+    identity: number;
+    prefix: number;
+    targets: number;
+    tokenCounting: number;
+}
+
 interface ToolAggregate {
     callId: string;
+    /** Every occurrence seen so far belongs to a previously tagged stable message. */
+    identityReusable: boolean;
     occurrences: ToolOccurrence[];
     /** Largest byteSize seen across occurrences — used as the tag size. */
     maxByteSize: number;
@@ -158,6 +178,9 @@ export function tagTranscript(
 ): TagTranscriptResult {
     const skipPrefixInjection = options.skipPrefixInjection === true;
     const targets = new Map<number, TagTarget>();
+    const timing: TagTranscriptTiming | undefined = options.onTiming
+        ? { identity: 0, prefix: 0, targets: 0, tokenCounting: 0 }
+        : undefined;
 
     // Tool aggregation is keyed by the same owner+callId identity used by
     // assignToolTag. OpenCode/Pi callId counters can repeat across turns, so
@@ -179,6 +202,8 @@ export function tagTranscript(
         if (message === undefined) continue;
         activeToolResultRun = undefined;
         const messageId = message.info.id;
+        const reuseIdentity =
+            messageId !== undefined && options.reuseMessageIds?.has(messageId) === true;
 
         let textOrdinal = 0;
         const parts = message.parts;
@@ -213,6 +238,8 @@ export function tagTranscript(
                     targets,
                     skipPrefixInjection,
                     entryFingerprint: options.entryFingerprintByMessageId?.get(messageId) ?? null,
+                    reuseIdentity,
+                    timing,
                 });
                 textOrdinal += 1;
                 continue;
@@ -224,13 +251,8 @@ export function tagTranscript(
                     continue;
                 }
 
+                const identityStart = timing ? performance.now() : 0;
                 const callId = part.id;
-                const text = part.getText() ?? "";
-                const toolByteSize = getToolPartByteSize(part, text);
-                const toolTokenCount = getToolPartTokenCount(part, text);
-                const meta = part.getToolMetadata();
-                const inputTokenCount = meta.inputTokenCount;
-
                 if (typeof callId !== "string" || callId.length === 0) {
                     activeToolResultRun = undefined;
                     // No stable callId to aggregate on. Tag independently.
@@ -245,6 +267,8 @@ export function tagTranscript(
                         db,
                         targets,
                         skipPrefixInjection,
+                        reuseIdentity,
+                        timing,
                     });
                     continue;
                 }
@@ -267,58 +291,72 @@ export function tagTranscript(
                 const aggregateKey: string = existingKey ?? makeToolCompositeKey(messageId, callId);
                 const existing = toolAggregates.get(aggregateKey);
                 if (existing) {
-                    // Later occurrence for this owner+callId pair. Merge into the
-                    // aggregate, update byte accounting if larger, and rebuild the
-                    // TagTarget so drops mutate both invocation and result.
-                    existing.occurrences.push({
-                        message,
+                    existing.occurrences.push({ message, part, kind: part.kind });
+                    const canReuseIdentity = reuseIdentity && existing.identityReusable;
+                    let text = "";
+                    if (canReuseIdentity) {
+                        // Prefix replay still needs the visible result text. Invocation
+                        // JSON, tokenizer work, source writes, and tag updates do not.
+                        if (part.kind === "tool_result") text = part.getText() ?? "";
+                        if (timing) timing.identity += performance.now() - identityStart;
+                    } else {
+                        const accounting = readAggregateToolAccounting(part, timing);
+                        text = accounting.text;
+                        if (
+                            part.kind === "tool_result" &&
+                            accounting.byteSize > existing.maxByteSize
+                        ) {
+                            existing.maxByteSize = accounting.byteSize;
+                            existing.maxTokenCount = accounting.tokenCount;
+                            updateTagByteSize(db, sessionId, existing.tagId, accounting.byteSize);
+                            updateTagTokenCount(
+                                db,
+                                sessionId,
+                                existing.tagId,
+                                accounting.tokenCount,
+                            );
+                        }
+                        if (existing.toolName === null && accounting.toolName) {
+                            existing.toolName = accounting.toolName;
+                        }
+                        if (
+                            existing.inputByteSize === 0 &&
+                            part.kind === "tool_use" &&
+                            accounting.inputByteSize > 0
+                        ) {
+                            existing.inputByteSize = accounting.inputByteSize;
+                            updateTagInputByteSize(
+                                db,
+                                sessionId,
+                                existing.tagId,
+                                accounting.inputByteSize,
+                            );
+                        }
+                        if (
+                            !existing.inputTokenStored &&
+                            part.kind === "tool_use" &&
+                            accounting.inputTokenCount > 0
+                        ) {
+                            existing.inputTokenStored = true;
+                            updateTagInputTokenCount(
+                                db,
+                                sessionId,
+                                existing.tagId,
+                                accounting.inputTokenCount,
+                            );
+                        }
+                        if (timing) timing.identity += performance.now() - identityStart;
+                    }
+                    existing.identityReusable &&= reuseIdentity;
+                    applyToolPrefixAndTarget({
+                        skipPrefixInjection,
                         part,
-                        kind: part.kind,
+                        text,
+                        tagId: existing.tagId,
+                        aggregate: existing,
+                        targets,
+                        timing,
                     });
-                    // byte_size tracks OUTPUT bytes only (the tool_result
-                    // occurrence). The invocation args are captured separately in
-                    // inputByteSize below; counting tool_use bytes here too would
-                    // double-count args in the emergency-drop reclaim formula
-                    // (byteSize + inputByteSize + reasoning). Mirrors OpenCode,
-                    // which assigns the tool tag on the result path.
-                    if (part.kind === "tool_result" && toolByteSize > existing.maxByteSize) {
-                        existing.maxByteSize = toolByteSize;
-                        existing.maxTokenCount = toolTokenCount;
-                        updateTagByteSize(db, sessionId, existing.tagId, toolByteSize);
-                        // Keep token_count in lockstep with the byte bump so the
-                        // grown output's tokens aren't undercounted by readers.
-                        updateTagTokenCount(db, sessionId, existing.tagId, toolTokenCount);
-                    }
-                    if (existing.toolName === null && meta.toolName) {
-                        existing.toolName = meta.toolName;
-                    }
-                    if (
-                        existing.inputByteSize === 0 &&
-                        part.kind === "tool_use" &&
-                        meta.inputByteSize > 0
-                    ) {
-                        existing.inputByteSize = meta.inputByteSize;
-                        updateTagInputByteSize(db, sessionId, existing.tagId, meta.inputByteSize);
-                    }
-                    if (
-                        !existing.inputTokenStored &&
-                        part.kind === "tool_use" &&
-                        inputTokenCount > 0
-                    ) {
-                        existing.inputTokenStored = true;
-                        updateTagInputTokenCount(db, sessionId, existing.tagId, inputTokenCount);
-                    }
-                    // Inject §N§ prefix into this tool_result occurrence
-                    // (matches OpenCode behavior — only result gets the prefix).
-                    if (!skipPrefixInjection && part.kind === "tool_result") {
-                        part.setText(prependTag(existing.tagId, text));
-                    }
-                    // Rebuild the aggregate target so it walks the now-
-                    // longer occurrences list.
-                    targets.set(
-                        existing.tagId,
-                        buildAggregateTarget(existing.tagId, existing.occurrences),
-                    );
                     if (part.kind === "tool_result") {
                         markToolAggregateResolved(
                             callId,
@@ -327,18 +365,39 @@ export function tagTranscript(
                         );
                         activeToolResultRun = { callId, aggregateKey };
                     }
+                    continue;
+                }
+
+                const reusableTagId = reuseIdentity
+                    ? tagger.getToolTag(sessionId, callId, messageId)
+                    : undefined;
+                let aggregate: ToolAggregate & { tagId: number };
+                let text = "";
+                if (reusableTagId !== undefined) {
+                    if (part.kind === "tool_result") text = part.getText() ?? "";
+                    aggregate = {
+                        callId,
+                        tagId: reusableTagId,
+                        identityReusable: true,
+                        occurrences: [{ message, part, kind: part.kind }],
+                        // Persisted accounting is authoritative for a stable part.
+                        // Infinity prevents another stable result block from issuing a
+                        // redundant size write during this rebuilt aggregate.
+                        maxByteSize: part.kind === "tool_result" ? Number.POSITIVE_INFINITY : 0,
+                        maxTokenCount: 0,
+                        toolName: null,
+                        inputByteSize: part.kind === "tool_use" ? Number.POSITIVE_INFINITY : 0,
+                        inputTokenStored: part.kind === "tool_use",
+                    };
+                    if (timing) timing.identity += performance.now() - identityStart;
                 } else {
-                    // First occurrence for this owner+callId identity — reserve
-                    // the tag number. Owner stays stable across passes because
-                    // transcript message ids are durable.
-                    // byte_size is OUTPUT-only (0 until the tool_result occurrence
-                    // is seen); the invocation args live in inputByteSize. This
-                    // keeps the emergency-drop reclaim formula (byteSize +
-                    // inputByteSize + reasoning) from double-counting args when the
-                    // first occurrence is a large tool_use. Mirrors OpenCode.
-                    const outputByteSize = part.kind === "tool_result" ? toolByteSize : 0;
-                    const outputTokenCount = part.kind === "tool_result" ? toolTokenCount : 0;
-                    const firstInputTokenCount = part.kind === "tool_use" ? inputTokenCount : 0;
+                    const accounting = readAggregateToolAccounting(part, timing);
+                    text = accounting.text;
+                    const outputByteSize = part.kind === "tool_result" ? accounting.byteSize : 0;
+                    const outputTokenCount =
+                        part.kind === "tool_result" ? accounting.tokenCount : 0;
+                    const firstInputTokenCount =
+                        part.kind === "tool_use" ? accounting.inputTokenCount : 0;
                     const tagId = tagger.assignToolTag(
                         sessionId,
                         callId,
@@ -346,56 +405,110 @@ export function tagTranscript(
                         outputByteSize,
                         db,
                         0,
-                        meta.toolName ?? null,
-                        meta.inputByteSize,
+                        accounting.toolName,
+                        accounting.inputByteSize,
                         () => ({
                             tokenCount: outputTokenCount,
                             inputTokenCount: firstInputTokenCount,
                             reasoningTokenCount: null,
                         }),
                     );
-                    const aggregate = {
+                    aggregate = {
                         callId,
                         tagId,
-                        occurrences: [
-                            {
-                                message,
-                                part,
-                                kind: part.kind,
-                            },
-                        ],
+                        identityReusable: false,
+                        occurrences: [{ message, part, kind: part.kind }],
                         maxByteSize: outputByteSize,
                         maxTokenCount: outputTokenCount,
-                        toolName: meta.toolName ?? null,
-                        inputByteSize: part.kind === "tool_use" ? meta.inputByteSize : 0,
+                        toolName: accounting.toolName,
+                        inputByteSize: part.kind === "tool_use" ? accounting.inputByteSize : 0,
                         inputTokenStored: part.kind === "tool_use" && firstInputTokenCount > 0,
                     };
-                    toolAggregates.set(aggregateKey, aggregate);
-                    if (part.kind === "tool_use") {
-                        openToolAggregateKeysByCallId.set(callId, [...pendingKeys, aggregateKey]);
-                    }
-                    // Inject §N§ prefix into this occurrence's visible text
-                    // when it's a tool_result. (OpenCode parity: prefix
-                    // only goes on the result, not the invocation.)
-                    if (!skipPrefixInjection && part.kind === "tool_result") {
-                        part.setText(prependTag(tagId, text));
-                    }
-                    targets.set(tagId, buildAggregateTarget(tagId, aggregate.occurrences));
-                    if (part.kind === "tool_result") {
-                        markToolAggregateResolved(
-                            callId,
-                            aggregateKey,
-                            openToolAggregateKeysByCallId,
-                        );
-                        activeToolResultRun = { callId, aggregateKey };
-                    }
+                    if (timing) timing.identity += performance.now() - identityStart;
+                }
+
+                toolAggregates.set(aggregateKey, aggregate);
+                if (part.kind === "tool_use") {
+                    openToolAggregateKeysByCallId.set(callId, [...pendingKeys, aggregateKey]);
+                }
+                applyToolPrefixAndTarget({
+                    skipPrefixInjection,
+                    part,
+                    text,
+                    tagId: aggregate.tagId,
+                    aggregate,
+                    targets,
+                    timing,
+                });
+                if (part.kind === "tool_result") {
+                    markToolAggregateResolved(callId, aggregateKey, openToolAggregateKeysByCallId);
+                    activeToolResultRun = { callId, aggregateKey };
                 }
             }
             // thinking, image, file, structural, unknown → skip.
         }
     }
 
+    if (timing && options.onTiming) {
+        options.onTiming("identity", timing.identity);
+        options.onTiming("prefix", timing.prefix);
+        options.onTiming("targets", timing.targets);
+        options.onTiming("tokenCounting", timing.tokenCounting);
+    }
     return { targets };
+}
+
+interface AggregateToolAccounting {
+    text: string;
+    byteSize: number;
+    tokenCount: number;
+    toolName: string | null;
+    inputByteSize: number;
+    inputTokenCount: number;
+}
+
+function readAggregateToolAccounting(
+    part: TranscriptPart,
+    timing: TagTranscriptTiming | undefined,
+): AggregateToolAccounting {
+    const text = part.getText() ?? "";
+    const byteSize = getToolPartByteSize(part, text);
+    const metadata = part.getToolMetadata();
+    let tokenCount = 0;
+    if (part.kind === "tool_result") {
+        const tokenStart = timing ? performance.now() : 0;
+        tokenCount = getToolPartTokenCount(part, text);
+        if (timing) timing.tokenCounting += performance.now() - tokenStart;
+    }
+    return {
+        text,
+        byteSize,
+        tokenCount,
+        toolName: metadata.toolName ?? null,
+        inputByteSize: metadata.inputByteSize,
+        inputTokenCount: metadata.inputTokenCount,
+    };
+}
+
+interface ApplyToolPrefixAndTargetArgs {
+    skipPrefixInjection: boolean;
+    part: TranscriptPart;
+    text: string;
+    tagId: number;
+    aggregate: ToolAggregate;
+    targets: Map<number, TagTarget>;
+    timing: TagTranscriptTiming | undefined;
+}
+
+function applyToolPrefixAndTarget(args: ApplyToolPrefixAndTargetArgs): void {
+    if (!args.skipPrefixInjection && args.part.kind === "tool_result") {
+        const prefixStart = args.timing ? performance.now() : 0;
+        args.part.setText(prependTag(args.tagId, args.text));
+        if (args.timing) args.timing.prefix += performance.now() - prefixStart;
+    }
+    const targetStart = args.timing ? performance.now() : 0;
+    args.targets.set(args.tagId, buildAggregateTarget(args.tagId, args.aggregate.occurrences));
+    if (args.timing) args.timing.targets += performance.now() - targetStart;
 }
 
 function findLastUnresolvedToolAggregateKey(
@@ -508,11 +621,22 @@ interface TagTextPartArgs {
     targets: Map<number, TagTarget>;
     skipPrefixInjection: boolean;
     entryFingerprint: string | null;
+    reuseIdentity: boolean;
+    timing?: TagTranscriptTiming;
 }
 
 function tagTextPart(args: TagTextPartArgs): void {
+    const identityStart = args.timing ? performance.now() : 0;
     const text = args.part.getText() ?? "";
     const contentId = `${args.messageId}:p${args.textOrdinal}`;
+    const reusableTagId = args.reuseIdentity
+        ? args.tagger.getTag(args.sessionId, contentId, "message")
+        : undefined;
+    if (reusableTagId !== undefined) {
+        if (args.timing) args.timing.identity += performance.now() - identityStart;
+        applyTextPrefixAndTarget(args, reusableTagId, text);
+        return;
+    }
     const tagId = args.tagger.assignTag(
         args.sessionId,
         contentId,
@@ -525,11 +649,16 @@ function tagTextPart(args: TagTextPartArgs): void {
         args.entryFingerprint,
         // Lazy: fires only on fresh insert. Strip any §N§ prefix so a re-tag
         // from already-prefixed text still tokenizes the pristine content.
-        () => ({
-            tokenCount: estimateTagTextTokens(stripTagPrefix(text)),
-            inputTokenCount: null,
-            reasoningTokenCount: null,
-        }),
+        () => {
+            const tokenStart = args.timing ? performance.now() : 0;
+            const counts = {
+                tokenCount: estimateTagTextTokens(stripTagPrefix(text)),
+                inputTokenCount: null,
+                reasoningTokenCount: null,
+            };
+            if (args.timing) args.timing.tokenCounting += performance.now() - tokenStart;
+            return counts;
+        },
     );
 
     // Persist the original (pre-tagged) source content so caveman
@@ -547,12 +676,20 @@ function tagTextPart(args: TagTextPartArgs): void {
     if (sourceContent.trim().length > 0) {
         saveSourceContent(args.db, args.sessionId, tagId, sourceContent);
     }
+    if (args.timing) args.timing.identity += performance.now() - identityStart;
+    applyTextPrefixAndTarget(args, tagId, text);
+}
 
+function applyTextPrefixAndTarget(args: TagTextPartArgs, tagId: number, text: string): void {
     if (!args.skipPrefixInjection) {
+        const prefixStart = args.timing ? performance.now() : 0;
         args.part.setText(prependTag(tagId, text));
+        if (args.timing) args.timing.prefix += performance.now() - prefixStart;
     }
 
+    const targetStart = args.timing ? performance.now() : 0;
     args.targets.set(tagId, buildTextTarget(args.part, args.message));
+    if (args.timing) args.timing.targets += performance.now() - targetStart;
 }
 
 interface TagToolPartArgs {
@@ -566,9 +703,12 @@ interface TagToolPartArgs {
     db: ContextDatabase;
     targets: Map<number, TagTarget>;
     skipPrefixInjection: boolean;
+    reuseIdentity: boolean;
+    timing?: TagTranscriptTiming;
 }
 
 function tagToolPart(args: TagToolPartArgs): void {
+    const identityStart = args.timing ? performance.now() : 0;
     // Prefer the part's stable id (tool call id from Pi/OpenCode); fall
     // back to a synthetic locator. Tool calls and their results MAY
     // share an id (Pi sets toolCallId on ToolResultMessage to match the
@@ -577,10 +717,21 @@ function tagToolPart(args: TagToolPartArgs): void {
     // target the call-id pair as a unit.
     const stableId = args.part.id;
     const contentId = stableId ?? `${args.messageId}:t${args.partIndex}`;
+    const reusableTagId = args.reuseIdentity
+        ? args.tagger.getToolTag(args.sessionId, contentId, contentId)
+        : undefined;
+    if (reusableTagId !== undefined) {
+        const text = args.part.kind === "tool_result" ? (args.part.getText() ?? "") : "";
+        if (args.timing) args.timing.identity += performance.now() - identityStart;
+        applySingleToolPrefixAndTarget(args, reusableTagId, text);
+        return;
+    }
     const text = args.part.getText() ?? "";
     const toolByteSize = getToolPartByteSize(args.part, text);
-    const toolTokenCount = getToolPartTokenCount(args.part, text);
     const meta = args.part.getToolMetadata();
+    const tokenStart = args.timing ? performance.now() : 0;
+    const toolTokenCount = getToolPartTokenCount(args.part, text);
+    if (args.timing) args.timing.tokenCounting += performance.now() - tokenStart;
     // v3.3.1 Layer C: synthetic ownership for the no-callId Pi
     // fallback. Owner == callId == contentId. The composite key
     // collapses to a unique synthetic identifier per part, preserving
@@ -596,22 +747,34 @@ function tagToolPart(args: TagToolPartArgs): void {
         0,
         meta.toolName ?? null,
         meta.inputByteSize,
-        () => ({
-            tokenCount: toolTokenCount,
-            inputTokenCount: meta.inputTokenCount,
-            reasoningTokenCount: null,
-        }),
+        () => {
+            const tokenStart = args.timing ? performance.now() : 0;
+            const counts = {
+                tokenCount: toolTokenCount,
+                inputTokenCount: meta.inputTokenCount,
+                reasoningTokenCount: null,
+            };
+            if (args.timing) args.timing.tokenCounting += performance.now() - tokenStart;
+            return counts;
+        },
     );
+    if (args.timing) args.timing.identity += performance.now() - identityStart;
+    applySingleToolPrefixAndTarget(args, tagId, text);
+}
 
+function applySingleToolPrefixAndTarget(args: TagToolPartArgs, tagId: number, text: string): void {
     // For tool parts, the visible payload is the tool result text. We
     // can inject the tag prefix into it for in-text references; this
     // matches the OpenCode behavior of tagging tool outputs.
     if (!args.skipPrefixInjection && args.part.kind === "tool_result") {
-        const tagged = prependTag(tagId, text);
-        args.part.setText(tagged);
+        const prefixStart = args.timing ? performance.now() : 0;
+        args.part.setText(prependTag(tagId, text));
+        if (args.timing) args.timing.prefix += performance.now() - prefixStart;
     }
 
+    const targetStart = args.timing ? performance.now() : 0;
     args.targets.set(tagId, buildToolTarget(args.part, args.message, tagId));
+    if (args.timing) args.timing.targets += performance.now() - targetStart;
 }
 
 function setToolContentOrText(part: TranscriptPart, content: string): boolean {

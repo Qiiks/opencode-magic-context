@@ -271,6 +271,148 @@ describe("tagTranscript tool aggregation", () => {
         expect(result.getText()).toBe(`[dropped §${nearestTag}§]`);
     });
 
+    it("reuses owner-scoped identities without collapsing duplicate callIds", () => {
+        const tagger = new FakeTagger();
+        const seedDb = new FakeDb();
+        const seedTranscript: Transcript = {
+            harness: "pi",
+            messages: [
+                {
+                    info: { id: "assistant-old", role: "assistant" },
+                    parts: [new TestPart("tool_use", "duplicate-call", '{"turn":1}')],
+                },
+                {
+                    info: { id: "user-old", role: "user" },
+                    parts: [new TestPart("tool_result", "duplicate-call", "old result")],
+                },
+                {
+                    info: { id: "assistant-new", role: "assistant" },
+                    parts: [new TestPart("tool_use", "duplicate-call", '{"turn":2}')],
+                },
+                {
+                    info: { id: "user-new", role: "user" },
+                    parts: [new TestPart("tool_result", "duplicate-call", "new result")],
+                },
+            ],
+            commit() {},
+        };
+        tagTranscript(
+            "session-duplicate-reuse",
+            seedTranscript,
+            tagger,
+            seedDb as unknown as ContextDatabase,
+        );
+
+        const reusedParts = {
+            oldUse: new TestPart("tool_use", "duplicate-call", '{"turn":1}'),
+            oldResult: new TestPart("tool_result", "duplicate-call", "old result"),
+            newUse: new TestPart("tool_use", "duplicate-call", '{"turn":2}'),
+            newResult: new TestPart("tool_result", "duplicate-call", "new result"),
+        };
+        const reusedTranscript: Transcript = {
+            harness: "pi",
+            messages: [
+                {
+                    info: { id: "assistant-old", role: "assistant" },
+                    parts: [reusedParts.oldUse],
+                },
+                {
+                    info: { id: "user-old", role: "user" },
+                    parts: [reusedParts.oldResult],
+                },
+                {
+                    info: { id: "assistant-new", role: "assistant" },
+                    parts: [reusedParts.newUse],
+                },
+                {
+                    info: { id: "user-new", role: "user" },
+                    parts: [reusedParts.newResult],
+                },
+            ],
+            commit() {},
+        };
+        const reuseDb = new FakeDb();
+        const reused = tagTranscript(
+            "session-duplicate-reuse",
+            reusedTranscript,
+            tagger,
+            reuseDb as unknown as ContextDatabase,
+            {
+                reuseMessageIds: new Set([
+                    "assistant-old",
+                    "user-old",
+                    "assistant-new",
+                    "user-new",
+                ]),
+            },
+        );
+
+        const oldTag = tagger.getToolTag(
+            "session-duplicate-reuse",
+            "duplicate-call",
+            "assistant-old",
+        );
+        const newTag = tagger.getToolTag(
+            "session-duplicate-reuse",
+            "duplicate-call",
+            "assistant-new",
+        );
+        expect(oldTag).toBeDefined();
+        expect(newTag).toBeDefined();
+        expect(oldTag).not.toBe(newTag);
+        expect(reused.targets.size).toBe(2);
+        expect(reusedParts.oldResult.getText()).toBe(`§${oldTag}§ old result`);
+        expect(reusedParts.newResult.getText()).toBe(`§${newTag}§ new result`);
+        expect(reuseDb.byteSizeUpdates).toEqual([]);
+    });
+
+    it("backfills a newly appended result after reusing its stable invocation", () => {
+        const tagger = new FakeTagger();
+        const callId = "late-result";
+        tagTranscript(
+            "session-late-result",
+            {
+                harness: "pi",
+                messages: [
+                    {
+                        info: { id: "assistant-owner", role: "assistant" },
+                        parts: [new TestPart("tool_use", callId, '{"path":"a"}')],
+                    },
+                ],
+                commit() {},
+            },
+            tagger,
+            new FakeDb() as unknown as ContextDatabase,
+        );
+
+        const result = new TestPart("tool_result", callId, "late output");
+        const db = new FakeDb();
+        tagTranscript(
+            "session-late-result",
+            {
+                harness: "pi",
+                messages: [
+                    {
+                        info: { id: "assistant-owner", role: "assistant" },
+                        parts: [new TestPart("tool_use", callId, '{"path":"a"}')],
+                    },
+                    {
+                        info: { id: "user-result", role: "user" },
+                        parts: [result],
+                    },
+                ],
+                commit() {},
+            },
+            tagger,
+            db as unknown as ContextDatabase,
+            { reuseMessageIds: new Set(["assistant-owner"]) },
+        );
+
+        const tag = tagger.getToolTag("session-late-result", callId, "assistant-owner");
+        expect(result.getText()).toBe(`§${tag}§ late output`);
+        expect(db.byteSizeUpdates.some((update) => update.tagNumber === tag)).toBe(true);
+    });
+
     it("accounts non-text tool_result content when ranking tool output byte size", () => {
         const tagger = new FakeTagger();
         const db = new FakeDb();

@@ -254,6 +254,7 @@ export {
     getTagsBySession,
     getTopNBySize,
     getTriggerTagTokenUpperBound,
+    hasPiFallbackMessageTags,
     hasPiFallbackToolOwnerTags,
     insertTag,
     type MessageTokenTotal,

@@ -10,6 +10,7 @@ const getTagNumbersByMessageIdStatements = new WeakMap<Database, PreparedStateme
 const deleteTagsByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
 const getMaxTagNumberBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getTagNumberByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
+const hasPiFallbackMessageTagStatements = new WeakMap<Database, PreparedStatement>();
 
 function getInsertTagStatement(db: Database): PreparedStatement {
     let stmt = insertTagStatements.get(db);
@@ -779,6 +780,23 @@ export function updateTagMessageId(
     messageId: string,
 ): void {
     getUpdateTagMessageIdStatement(db).run(messageId, sessionId, tagId);
+}
+
+/** Return whether this session has any message tag bound to a fallback Pi id. */
+export function hasPiFallbackMessageTags(db: Database, sessionId: string): boolean {
+    let statement = hasPiFallbackMessageTagStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT 1
+             FROM tags
+             WHERE session_id = ?
+               AND type = 'message'
+               AND message_id LIKE 'pi-msg-%'
+             LIMIT 1`,
+        );
+        hasPiFallbackMessageTagStatements.set(db, statement);
+    }
+    return statement.get(sessionId) != null;
 }
 
 /**
