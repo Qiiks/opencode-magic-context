@@ -89,7 +89,7 @@ export interface TagTranscriptOptions {
      * rebuilds the complete set of messages affected by each tag.
      */
     reuseMessageIds?: ReadonlySet<string>;
-    /** Process-local benchmark hook; omitted by both production harnesses. */
+    /** Optional process-local benchmark callback; production callers omit it. */
     onTiming?: (
         phase: "identity" | "prefix" | "targets" | "tokenCounting",
         elapsedMs: number,
