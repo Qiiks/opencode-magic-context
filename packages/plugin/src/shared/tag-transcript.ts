@@ -83,6 +83,11 @@ export interface TagTranscriptOptions {
      * contentId) since all parts of a message share one fingerprint.
      */
     entryFingerprintByMessageId?: ReadonlyMap<string, string>;
+    /** Process-local benchmark hook; omitted by both production harnesses. */
+    onTiming?: (
+        phase: "identity" | "prefix" | "targets" | "tokenCounting",
+        elapsedMs: number,
+    ) => void;
 }
 
 export interface TagTranscriptResult {
@@ -134,6 +139,13 @@ interface ToolOccurrence {
     kind: "tool_use" | "tool_result";
 }
 
+interface TagTranscriptTiming {
+    identity: number;
+    prefix: number;
+    targets: number;
+    tokenCounting: number;
+}
+
 interface ToolAggregate {
     callId: string;
     occurrences: ToolOccurrence[];
@@ -158,6 +170,9 @@ export function tagTranscript(
 ): TagTranscriptResult {
     const skipPrefixInjection = options.skipPrefixInjection === true;
     const targets = new Map<number, TagTarget>();
+    const timing: TagTranscriptTiming | undefined = options.onTiming
+        ? { identity: 0, prefix: 0, targets: 0, tokenCounting: 0 }
+        : undefined;
 
     // Tool aggregation is keyed by the same owner+callId identity used by
     // assignToolTag. OpenCode/Pi callId counters can repeat across turns, so
@@ -213,6 +228,7 @@ export function tagTranscript(
                     targets,
                     skipPrefixInjection,
                     entryFingerprint: options.entryFingerprintByMessageId?.get(messageId) ?? null,
+                    timing,
                 });
                 textOrdinal += 1;
                 continue;
@@ -224,12 +240,16 @@ export function tagTranscript(
                     continue;
                 }
 
+                const identityStart = timing ? performance.now() : 0;
                 const callId = part.id;
                 const text = part.getText() ?? "";
                 const toolByteSize = getToolPartByteSize(part, text);
-                const toolTokenCount = getToolPartTokenCount(part, text);
                 const meta = part.getToolMetadata();
                 const inputTokenCount = meta.inputTokenCount;
+                if (timing) timing.identity += performance.now() - identityStart;
+                const tokenStart = timing ? performance.now() : 0;
+                const toolTokenCount = getToolPartTokenCount(part, text);
+                if (timing) timing.tokenCounting += performance.now() - tokenStart;
 
                 if (typeof callId !== "string" || callId.length === 0) {
                     activeToolResultRun = undefined;
@@ -245,6 +265,7 @@ export function tagTranscript(
                         db,
                         targets,
                         skipPrefixInjection,
+                        timing,
                     });
                     continue;
                 }
@@ -311,14 +332,18 @@ export function tagTranscript(
                     // Inject §N§ prefix into this tool_result occurrence
                     // (matches OpenCode behavior — only result gets the prefix).
                     if (!skipPrefixInjection && part.kind === "tool_result") {
+                        const prefixStart = timing ? performance.now() : 0;
                         part.setText(prependTag(existing.tagId, text));
+                        if (timing) timing.prefix += performance.now() - prefixStart;
                     }
                     // Rebuild the aggregate target so it walks the now-
                     // longer occurrences list.
+                    const targetStart = timing ? performance.now() : 0;
                     targets.set(
                         existing.tagId,
                         buildAggregateTarget(existing.tagId, existing.occurrences),
                     );
+                    if (timing) timing.targets += performance.now() - targetStart;
                     if (part.kind === "tool_result") {
                         markToolAggregateResolved(
                             callId,
@@ -339,6 +364,7 @@ export function tagTranscript(
                     const outputByteSize = part.kind === "tool_result" ? toolByteSize : 0;
                     const outputTokenCount = part.kind === "tool_result" ? toolTokenCount : 0;
                     const firstInputTokenCount = part.kind === "tool_use" ? inputTokenCount : 0;
+                    const assignStart = timing ? performance.now() : 0;
                     const tagId = tagger.assignToolTag(
                         sessionId,
                         callId,
@@ -348,12 +374,18 @@ export function tagTranscript(
                         0,
                         meta.toolName ?? null,
                         meta.inputByteSize,
-                        () => ({
-                            tokenCount: outputTokenCount,
-                            inputTokenCount: firstInputTokenCount,
-                            reasoningTokenCount: null,
-                        }),
+                        () => {
+                            const tokenStart = timing ? performance.now() : 0;
+                            const counts = {
+                                tokenCount: outputTokenCount,
+                                inputTokenCount: firstInputTokenCount,
+                                reasoningTokenCount: null,
+                            };
+                            if (timing) timing.tokenCounting += performance.now() - tokenStart;
+                            return counts;
+                        },
                     );
+                    if (timing) timing.identity += performance.now() - assignStart;
                     const aggregate = {
                         callId,
                         tagId,
@@ -378,9 +410,13 @@ export function tagTranscript(
                     // when it's a tool_result. (OpenCode parity: prefix
                     // only goes on the result, not the invocation.)
                     if (!skipPrefixInjection && part.kind === "tool_result") {
+                        const prefixStart = timing ? performance.now() : 0;
                         part.setText(prependTag(tagId, text));
+                        if (timing) timing.prefix += performance.now() - prefixStart;
                     }
+                    const targetStart = timing ? performance.now() : 0;
                     targets.set(tagId, buildAggregateTarget(tagId, aggregate.occurrences));
+                    if (timing) timing.targets += performance.now() - targetStart;
                     if (part.kind === "tool_result") {
                         markToolAggregateResolved(
                             callId,
@@ -395,6 +431,12 @@ export function tagTranscript(
         }
     }
 
+    if (timing && options.onTiming) {
+        options.onTiming("identity", timing.identity);
+        options.onTiming("prefix", timing.prefix);
+        options.onTiming("targets", timing.targets);
+        options.onTiming("tokenCounting", timing.tokenCounting);
+    }
     return { targets };
 }
 
@@ -508,9 +550,11 @@ interface TagTextPartArgs {
     targets: Map<number, TagTarget>;
     skipPrefixInjection: boolean;
     entryFingerprint: string | null;
+    timing?: TagTranscriptTiming;
 }
 
 function tagTextPart(args: TagTextPartArgs): void {
+    const identityStart = args.timing ? performance.now() : 0;
     const text = args.part.getText() ?? "";
     const contentId = `${args.messageId}:p${args.textOrdinal}`;
     const tagId = args.tagger.assignTag(
@@ -525,11 +569,16 @@ function tagTextPart(args: TagTextPartArgs): void {
         args.entryFingerprint,
         // Lazy: fires only on fresh insert. Strip any §N§ prefix so a re-tag
         // from already-prefixed text still tokenizes the pristine content.
-        () => ({
-            tokenCount: estimateTagTextTokens(stripTagPrefix(text)),
-            inputTokenCount: null,
-            reasoningTokenCount: null,
-        }),
+        () => {
+            const tokenStart = args.timing ? performance.now() : 0;
+            const counts = {
+                tokenCount: estimateTagTextTokens(stripTagPrefix(text)),
+                inputTokenCount: null,
+                reasoningTokenCount: null,
+            };
+            if (args.timing) args.timing.tokenCounting += performance.now() - tokenStart;
+            return counts;
+        },
     );
 
     // Persist the original (pre-tagged) source content so caveman
@@ -547,12 +596,17 @@ function tagTextPart(args: TagTextPartArgs): void {
     if (sourceContent.trim().length > 0) {
         saveSourceContent(args.db, args.sessionId, tagId, sourceContent);
     }
+    if (args.timing) args.timing.identity += performance.now() - identityStart;
 
     if (!args.skipPrefixInjection) {
+        const prefixStart = args.timing ? performance.now() : 0;
         args.part.setText(prependTag(tagId, text));
+        if (args.timing) args.timing.prefix += performance.now() - prefixStart;
     }
 
+    const targetStart = args.timing ? performance.now() : 0;
     args.targets.set(tagId, buildTextTarget(args.part, args.message));
+    if (args.timing) args.timing.targets += performance.now() - targetStart;
 }
 
 interface TagToolPartArgs {
@@ -566,9 +620,11 @@ interface TagToolPartArgs {
     db: ContextDatabase;
     targets: Map<number, TagTarget>;
     skipPrefixInjection: boolean;
+    timing?: TagTranscriptTiming;
 }
 
 function tagToolPart(args: TagToolPartArgs): void {
+    const identityStart = args.timing ? performance.now() : 0;
     // Prefer the part's stable id (tool call id from Pi/OpenCode); fall
     // back to a synthetic locator. Tool calls and their results MAY
     // share an id (Pi sets toolCallId on ToolResultMessage to match the
@@ -579,8 +635,10 @@ function tagToolPart(args: TagToolPartArgs): void {
     const contentId = stableId ?? `${args.messageId}:t${args.partIndex}`;
     const text = args.part.getText() ?? "";
     const toolByteSize = getToolPartByteSize(args.part, text);
-    const toolTokenCount = getToolPartTokenCount(args.part, text);
     const meta = args.part.getToolMetadata();
+    const tokenStart = args.timing ? performance.now() : 0;
+    const toolTokenCount = getToolPartTokenCount(args.part, text);
+    if (args.timing) args.timing.tokenCounting += performance.now() - tokenStart;
     // v3.3.1 Layer C: synthetic ownership for the no-callId Pi
     // fallback. Owner == callId == contentId. The composite key
     // collapses to a unique synthetic identifier per part, preserving
@@ -596,22 +654,32 @@ function tagToolPart(args: TagToolPartArgs): void {
         0,
         meta.toolName ?? null,
         meta.inputByteSize,
-        () => ({
-            tokenCount: toolTokenCount,
-            inputTokenCount: meta.inputTokenCount,
-            reasoningTokenCount: null,
-        }),
+        () => {
+            const tokenStart = args.timing ? performance.now() : 0;
+            const counts = {
+                tokenCount: toolTokenCount,
+                inputTokenCount: meta.inputTokenCount,
+                reasoningTokenCount: null,
+            };
+            if (args.timing) args.timing.tokenCounting += performance.now() - tokenStart;
+            return counts;
+        },
     );
+    if (args.timing) args.timing.identity += performance.now() - identityStart;
 
     // For tool parts, the visible payload is the tool result text. We
     // can inject the tag prefix into it for in-text references; this
     // matches the OpenCode behavior of tagging tool outputs.
     if (!args.skipPrefixInjection && args.part.kind === "tool_result") {
+        const prefixStart = args.timing ? performance.now() : 0;
         const tagged = prependTag(tagId, text);
         args.part.setText(tagged);
+        if (args.timing) args.timing.prefix += performance.now() - prefixStart;
     }
 
+    const targetStart = args.timing ? performance.now() : 0;
     args.targets.set(tagId, buildToolTarget(args.part, args.message, tagId));
+    if (args.timing) args.timing.targets += performance.now() - targetStart;
 }
 
 function setToolContentOrText(part: TranscriptPart, content: string): boolean {

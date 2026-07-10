@@ -160,6 +160,10 @@ import {
 	applyDeferredPiCompactionMarker,
 } from "./compaction-marker-manager-pi";
 import {
+	hasPiTransformTimingObserver,
+	recordPiTransformTiming,
+} from "./context-perf-hooks";
+import {
 	clearPiChannel1State,
 	computeTailTokenEstimatePi,
 	setPiChannel1Baseline,
@@ -364,8 +368,10 @@ function logTransformTiming(
 	start: number,
 	extra?: string,
 ): void {
-	const elapsed = (performance.now() - start).toFixed(1);
+	const elapsedMs = performance.now() - start;
+	const elapsed = elapsedMs.toFixed(1);
 	const suffix = extra ? ` ${extra}` : "";
+	recordPiTransformTiming({ sessionId, stage, elapsedMs, extra });
 	sessionLog(
 		sessionId,
 		`transform stage: stage=${stage} elapsed=${elapsed}ms${suffix}`,
@@ -1606,6 +1612,7 @@ export function registerPiContextHandler(
 				`messages=${event.messages.length}`,
 			);
 
+			const tEntryBranch = performance.now();
 			const branchEntries = readPiBranchEntriesForContext(ctx, sessionId);
 			schedulePiTransformDecisionResolve({
 				db: options.db,
@@ -1652,6 +1659,12 @@ export function registerPiContextHandler(
 			// strip), so post-mutation consumers must resolve by identity, not by
 			// the stale positional strictEntryIds.
 			const entryIdByRef = buildEntryIdByRefMap(branchEntries);
+			logTransformTiming(
+				sessionId,
+				"entryParseAndBranchResolution",
+				tEntryBranch,
+				`branchEntries=${branchEntries?.length ?? 0}`,
+			);
 
 			const tLastUser = performance.now();
 			const latestUser = findLatestUserMessageIdPi(
@@ -2014,6 +2027,7 @@ export function registerPiContextHandler(
 				);
 			}
 
+			const tBoundaryChecks = performance.now();
 			const schedulerDecisionEarly = schedulerDecision;
 			const midTurn = isMidTurnPi(event, sessionId);
 			const bypassReason = detectMidTurnBypassReason({
@@ -2163,6 +2177,7 @@ export function registerPiContextHandler(
 			// same TTL window still hit the cached injection result
 			// because the consumer compares against the cached cutoff.
 			const isCacheBusting = historyRefreshSessions.has(sessionId);
+			logTransformTiming(sessionId, "boundaryTriggerChecks", tBoundaryChecks);
 
 			sessionLog(
 				sessionId,
@@ -2581,9 +2596,16 @@ export function registerPiContextHandler(
 			}
 
 			logTransformTiming(sessionId, "postTransformPhase", tPostTransform);
+			const transformElapsedMs = performance.now() - transformStartTime;
+			recordPiTransformTiming({
+				sessionId,
+				stage: "total",
+				elapsedMs: transformElapsedMs,
+				extra: `messages=${outputMessages.length} targets=${result.targetCount}`,
+			});
 			sessionLog(
 				sessionId,
-				`transform completed in ${(performance.now() - transformStartTime).toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
+				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
 
 			// Cast the rebuilt array back to the AgentMessage[] shape Pi's
@@ -3555,11 +3577,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// when the visible array shifts (compaction trim / custom_message inserts),
 	// orphaning tags/source_contents/caveman/drop-state. Positional entryIds is
 	// exactly aligned here: tagging runs at transcript-build time, before any splice.
+	const tTranscriptBuild = performance.now();
 	const transcript = createPiTranscript(
 		args.messages,
 		args.sessionId,
 		args.entryIds,
 	);
+	logTransformTiming(args.sessionId, "transcriptBuild", tTranscriptBuild);
 	// Reasoning clearing/replay mutate `part.thinking` in place. They MUST target
 	// the transcript's `working` array (the channel commit() flushes), not the
 	// original `args.messages`: tagging/drops/caveman reassign working[idx] to
@@ -3707,6 +3731,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// text) and migrate any fallback-id tag onto the real id up front, so the
 	// message keeps its tag_number/§N§ instead of getting a fresh tag. No-op for
 	// OpenCode (this path is Pi-only) and for messages already on a real id.
+	const tFallbackIdentity = performance.now();
 	const entryFingerprintByMessageId = buildEntryFingerprintMap(
 		args.messages as PiAgentMessage[],
 		stableIdResolver,
@@ -3723,6 +3748,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				? PI_STABLE_ID_SCHEME
 				: undefined,
 		},
+	);
+	logTransformTiming(
+		args.sessionId,
+		"fallbackIdentityAndAdoption",
+		tFallbackIdentity,
 	);
 	if (args.stableIdSchemeCutover === true) {
 		invalidateTrueRawTokenCache({
@@ -3743,6 +3773,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		{
 			skipPrefixInjection: !ctxReduceCallable,
 			entryFingerprintByMessageId,
+			onTiming: hasPiTransformTimingObserver()
+				? (phase, elapsedMs) => {
+						recordPiTransformTiming({
+							sessionId: args.sessionId,
+							stage: `tag:${phase}`,
+							elapsedMs,
+						});
+					}
+				: undefined,
 		},
 	);
 	logTransformTiming(args.sessionId, "tagMessages", tTag);
@@ -4577,11 +4616,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// receives. Mirrors OpenCode's transform.ts:996-1127. Best-effort —
 	// never fail the pipeline on a stats write error.
 	try {
+		const tTokenAccounting = performance.now();
 		const counts = tokenizePiMessages(outputMessages as unknown[]);
 		updateSessionMeta(args.db, args.sessionId, {
 			conversationTokens: counts.conversation,
 			toolCallTokens: counts.toolCall,
 		});
+		logTransformTiming(args.sessionId, "tokenAccounting", tTokenAccounting);
 	} catch (err) {
 		sessionLog(
 			args.sessionId,
