@@ -48,6 +48,32 @@
         "superseded_by_memory_id": 99,
         "merged_from": "[7,8]",
         "metadata_json": "{\"fixture\":true}"
+      },
+      {
+        "id": 2,
+        "project_path": "/fixture/foreign",
+        "category": "CONSTRAINTS",
+        "content": "Fixture foreign workspace constraint",
+        "normalized_hash": "8f43ff0598ac4b110005d84ca1bcca36",
+        "importance": 84,
+        "scope": "project",
+        "shareable": 1,
+        "source_session_id": "fixture-foreign-session",
+        "source_type": "dreamer",
+        "seen_count": 2,
+        "retrieval_count": 1,
+        "first_seen_at": 1735689582000,
+        "created_at": 1735689583000,
+        "updated_at": 1735689584000,
+        "last_seen_at": 1735689585000,
+        "last_retrieved_at": 1735689586000,
+        "status": "active",
+        "expires_at": 1735862400000,
+        "verification_status": "verified",
+        "verified_at": 1735689587000,
+        "superseded_by_memory_id": 101,
+        "merged_from": "[9,10]",
+        "metadata_json": "{\"foreign\":true}"
       }
     ],
     "memory_mutations": [
@@ -62,6 +88,23 @@
         "queued_at": 1735689599000
       }
     ],
+    "workspace": {
+      "fingerprint": "b09c30fd5c913f0b993abafc7798be85dc74dcaf1c1df59a0216083f87164822",
+      "members": [
+        {
+          "project_path": "/fixture/project",
+          "share_categories": [
+            "CONSTRAINTS"
+          ]
+        },
+        {
+          "project_path": "/fixture/foreign",
+          "share_categories": [
+            "CONSTRAINTS"
+          ]
+        }
+      ]
+    },
     "last_todo_state": "[{\"content\":\"fixture todo\",\"status\":\"pending\"}]"
   },
   "shadow_transform": {
@@ -177,7 +220,7 @@
   },
   "local_watermarks": {
     "compartment_sequence": 1,
-    "memory_id": 1,
+    "memory_id": 2,
     "m0_mutation_id": 1,
     "memory_mutation_id": 1,
     "last_todo_state_hash": "1d9122e1b8a66758890684eba25ec2577a82b9c66407a55a903de3b5132bd905"

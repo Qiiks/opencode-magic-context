@@ -16,6 +16,7 @@ import {
     replaceAllCompartmentState,
 } from "../../features/magic-context/compartment-storage";
 import { queueM0Mutation } from "../../features/magic-context/storage-m0-mutation-log";
+import { insertMemory } from "../../features/magic-context/memory/storage-memory";
 import { appendAutoSearchHintDecision } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -121,6 +122,7 @@ function basePass(args: {
     inputMessages?: MessageLike[];
     outputMessages?: MessageLike[];
     normalizationTargets?: TagNormalizationTarget[];
+    projectPath?: string;
     nowMs?: number;
 }): ShadowTransformPass {
     const inputMessages = args.inputMessages ?? [message(args.sessionId, "m1", "hello")];
@@ -131,7 +133,7 @@ function basePass(args: {
         outputMessages: args.outputMessages ?? structuredClone(inputMessages),
         normalizationTargets: args.normalizationTargets ?? [],
         projectRoot: process.cwd(),
-        projectPath: "/tmp/project",
+        projectPath: args.projectPath ?? "/tmp/project",
         passInputs: {
             now_ms: args.nowMs ?? 1,
             model_key: "test/provider",
@@ -555,6 +557,81 @@ describe("shadow sender", () => {
         expect(flatTransform.pass_inputs).toEqual(
             expect.objectContaining({ now_ms: expect.any(Number) }),
         );
+    });
+
+    it("syncs the visible workspace memory union with real project attribution", () => {
+        useTempDataHome("shadow-workspace-");
+        const sessionId = "s-workspace";
+        const projectPath = "/workspace/owner";
+        createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "one" }]);
+        const db = openDatabase();
+        db.prepare(
+            `INSERT INTO workspaces (name, created_at, updated_at, share_categories)
+             VALUES ('Workspace', 1, 1, '["CONSTRAINTS"]')`,
+        ).run();
+        const workspaceId = Number(
+            (db.prepare("SELECT id FROM workspaces WHERE name = 'Workspace'").get() as {
+                id: number;
+            }).id,
+        );
+        const insertMember = db.prepare(
+            `INSERT INTO workspace_members
+                (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES (?, ?, ?, ?, 1)`,
+        );
+        insertMember.run(workspaceId, projectPath, "owner", projectPath);
+        insertMember.run(workspaceId, "/workspace/foreign", "foreign", "/workspace/foreign");
+        const own = insertMemory(db, {
+            projectPath,
+            category: "ARCHITECTURE",
+            content: "owner architecture",
+        });
+        const shared = insertMemory(db, {
+            projectPath: "/workspace/foreign",
+            category: "CONSTRAINTS",
+            content: "shared foreign constraint",
+        });
+        insertMemory(db, {
+            projectPath: "/workspace/foreign",
+            category: "NAMING",
+            content: "private foreign naming convention",
+        });
+        const state = __shadowSenderTest.createSessionQueueState();
+
+        const sync = __shadowSenderTest.buildStateSyncPayload({
+            state,
+            pass: basePass({ db, sessionId, projectPath }),
+            force: true,
+        });
+        if (
+            sync === null ||
+            sync === "m0_mutation" ||
+            sync === "mismatch" ||
+            sync === "unresolved"
+        ) {
+            throw new Error(`unexpected workspace sync result: ${sync}`);
+        }
+        const body = __shadowSenderTest.toFlatWireBody(sync) as {
+            workspace: {
+                fingerprint: string;
+                members: Array<{ project_path: string; share_categories: string[] }>;
+            };
+            memories: Array<{ id: number; project_path: string; content: string }>;
+        };
+
+        expect(body.workspace.members).toEqual([
+            { project_path: projectPath, share_categories: ["CONSTRAINTS"] },
+            { project_path: "/workspace/foreign", share_categories: ["CONSTRAINTS"] },
+        ]);
+        expect(body.workspace.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+        expect(body.memories).toEqual([
+            expect.objectContaining({ id: own.id, project_path: projectPath }),
+            expect.objectContaining({
+                id: shared.id,
+                project_path: "/workspace/foreign",
+                content: "shared foreign constraint",
+            }),
+        ]);
     });
 
     it("resends a dropped sync before the next transform and gates after peer rejects", async () => {

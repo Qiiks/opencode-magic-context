@@ -10,11 +10,11 @@
 
 use std::collections::HashMap;
 
-use mc_store::{McStore, McStoreError, StoredMemory};
+use mc_store::{McStore, McStoreError};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
 use crate::decay_render::DecayRenderCompartment;
-use crate::memory_render::{render_m0, M0Inputs};
+use crate::memory_render::{render_m0, workspace_source_names, M0Inputs};
 use crate::project_docs::read_project_docs_canonical;
 
 /// Why composing the HARD m0 from the store failed.
@@ -128,7 +128,7 @@ pub fn compose_m0_from_store(
     let (memories, source_name_by_id, union_paths) = match &membership {
         Some(m) => {
             let mems = store.load_workspace_union_memories(m, inputs.now_ms)?;
-            let source = source_names_for_union(&mems, m);
+            let source = workspace_source_names(&mems, m);
             (mems, source, m.union_identities.clone())
         }
         None => {
@@ -175,25 +175,6 @@ pub fn compose_m0_from_store(
         max_memory_id,
         docs_hash: docs.canonical_hash,
     })
-}
-
-/// Build the memory-id → source-project-name map for a workspace union: a FOREIGN
-/// member's memory is attributed to its project's display name; the OWN project's
-/// memories carry no source (empty = no attribution prefix).
-fn source_names_for_union(
-    memories: &[StoredMemory],
-    membership: &mc_store::WorkspaceMembership,
-) -> HashMap<i64, String> {
-    // The union read already filtered to own + foreign-shared, but the StoredMemory rows
-    // don't carry project_path; the membership's display map is keyed by project_path.
-    // Attribution is by which member a memory belongs to — but since the row lacks
-    // project_path here, only the workspace's foreign-display names are available. The
-    // union read tags ownership by the manifest, not the row; production attributes via a
-    // parallel id→project map. For now, with the row lacking project_path, return the
-    // empty map (no attribution) — the LIVE attribution arrives when the store read
-    // returns the owning project per memory (a follow-up to the StoredMemory shape).
-    let _ = (memories, membership);
-    HashMap::new()
 }
 
 #[cfg(test)]

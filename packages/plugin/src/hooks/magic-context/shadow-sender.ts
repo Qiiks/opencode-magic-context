@@ -3,17 +3,30 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import net from "node:net";
 import { join } from "node:path";
 import { getCompartmentsByEndMessageId } from "../../features/magic-context/compartment-storage";
-import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
+import {
+    getMaxMemoryIdForProjects,
+    getMemoriesByProject,
+    getMemoriesByProjects,
+} from "../../features/magic-context/memory/storage-memory";
 import {
     type ContextDatabase,
     getCompartments,
     getOrCreateSessionMeta,
 } from "../../features/magic-context/storage";
-import { getMemoryMutationsForRenderByProjects } from "../../features/magic-context/storage-memory-mutation-log";
+import {
+    getMaxMemoryMutationIdForProjects,
+    getMemoryMutationsForRenderByProjects,
+} from "../../features/magic-context/storage-memory-mutation-log";
 import {
     getAutoSearchHintDecisions,
     getPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import {
+    computeWorkspaceEpochFingerprint,
+    expandWorkspaceIdentitySetWithAliases,
+    resolveWorkspaceIdentitySet,
+    resolveWorkspaceShareCategories,
+} from "../../features/magic-context/workspaces";
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
@@ -163,6 +176,18 @@ interface ShadowWatermarks {
     last_todo_state_hash: string;
 }
 
+interface ShadowWorkspacePayload {
+    fingerprint: string;
+    members: Array<{ project_path: string; share_categories: string[] }>;
+}
+
+interface ShadowWorkspaceContext {
+    workspace: ShadowWorkspacePayload | null;
+    expandedIdentities: string[];
+    ownIdentities: string[];
+    shareCategories: string[] | null;
+}
+
 interface ShadowStateSyncPayload {
     method: "state_sync";
     params: {
@@ -171,6 +196,7 @@ interface ShadowStateSyncPayload {
         compartments: unknown[];
         memories: unknown[];
         memory_mutations: unknown[];
+        workspace: ShadowWorkspacePayload | null;
         last_todo_state: string;
     };
     watermarks: ShadowWatermarks;
@@ -526,10 +552,58 @@ function didDeclaredTrimAdvance(
     return before.flat_boundary_id !== after.flat_boundary_id;
 }
 
+function resolveShadowWorkspaceContext(
+    db: ContextDatabase,
+    projectPath?: string,
+): ShadowWorkspaceContext {
+    if (!projectPath) {
+        return {
+            workspace: null,
+            expandedIdentities: [],
+            ownIdentities: [],
+            shareCategories: null,
+        };
+    }
+    const identitySet = resolveWorkspaceIdentitySet(db, projectPath);
+    if (identitySet.identities.length <= 1) {
+        return {
+            workspace: null,
+            expandedIdentities: [projectPath],
+            ownIdentities: [projectPath],
+            shareCategories: null,
+        };
+    }
+    const expanded = expandWorkspaceIdentitySetWithAliases(db, identitySet.identities);
+    const ownIdentities = expanded.expandedIdentities.filter(
+        (identity) => expanded.canonicalIdentityByStoredPath.get(identity) === projectPath,
+    );
+    if (ownIdentities.length === 0) ownIdentities.push(projectPath);
+    const shareCategories = resolveWorkspaceShareCategories(db, projectPath) ?? [];
+    const members = [
+        projectPath,
+        ...expanded.expandedIdentities
+            .filter((identity) => identity !== projectPath)
+            .sort((left, right) => left.localeCompare(right)),
+    ];
+    return {
+        workspace: {
+            fingerprint: computeWorkspaceEpochFingerprint(db, identitySet.identities),
+            members: members.map((member) => ({
+                project_path: member,
+                share_categories: [...shareCategories],
+            })),
+        },
+        expandedIdentities: members,
+        ownIdentities,
+        shareCategories,
+    };
+}
+
 function loadWatermarks(args: {
     db: ContextDatabase;
     sessionId: string;
     projectPath?: string;
+    workspace: ShadowWorkspaceContext;
 }): ShadowWatermarks {
     const sessionMeta = getOrCreateSessionMeta(args.db, args.sessionId);
     const compartmentRow = args.db
@@ -537,26 +611,25 @@ function loadWatermarks(args: {
             "SELECT COALESCE(MAX(sequence), -1) AS max_sequence FROM compartments WHERE session_id = ?",
         )
         .get(args.sessionId) as { max_sequence?: number } | undefined;
-    const memoryRow = args.projectPath
-        ? (args.db
-              .prepare("SELECT COALESCE(MAX(id), 0) AS max_id FROM memories WHERE project_path = ?")
-              .get(args.projectPath) as { max_id?: number } | undefined)
-        : undefined;
+    const memoryId = args.projectPath
+        ? getMaxMemoryIdForProjects(
+              args.db,
+              args.workspace.expandedIdentities,
+              args.workspace.ownIdentities,
+              args.workspace.shareCategories,
+          )
+        : 0;
     const m0Row = args.db
         .prepare("SELECT COALESCE(MAX(id), 0) AS max_id FROM m0_mutation_log WHERE session_id = ?")
         .get(args.sessionId) as { max_id?: number } | undefined;
-    const memoryMutationRow = args.projectPath
-        ? (args.db
-              .prepare(
-                  "SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_mutation_log WHERE project_path = ?",
-              )
-              .get(args.projectPath) as { max_id?: number } | undefined)
-        : undefined;
+    const memoryMutationId = args.projectPath
+        ? (getMaxMemoryMutationIdForProjects(args.db, args.workspace.expandedIdentities) ?? 0)
+        : 0;
     return {
         compartment_sequence: compartmentRow?.max_sequence ?? -1,
-        memory_id: memoryRow?.max_id ?? 0,
+        memory_id: memoryId,
         m0_mutation_id: m0Row?.max_id ?? 0,
-        memory_mutation_id: memoryMutationRow?.max_id ?? 0,
+        memory_mutation_id: memoryMutationId,
         last_todo_state_hash: stableHash(sessionMeta.lastTodoState ?? ""),
     };
 }
@@ -621,13 +694,15 @@ function serializeCompartment(args: {
 
 function buildStateSyncPayload(args: {
     state: SessionQueueState;
-    pass: Pick<ShadowTransformPass, "db" | "sessionId" | "projectPath">;
+    pass: Pick<ShadowTransformPass, "db" | "sessionId" | "projectPath" | "passInputs">;
     force: boolean;
 }): ShadowStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" {
+    const workspace = resolveShadowWorkspaceContext(args.pass.db, args.pass.projectPath);
     const currentWatermarks = loadWatermarks({
         db: args.pass.db,
         sessionId: args.pass.sessionId,
         projectPath: args.pass.projectPath,
+        workspace,
     });
     if (
         !args.force &&
@@ -668,12 +743,21 @@ function buildStateSyncPayload(args: {
     }
 
     const allMemories = args.pass.projectPath
-        ? getMemoriesByProject(
-              args.pass.db,
-              args.pass.projectPath,
-              ["active", "permanent"],
-              Date.now(),
-          )
+        ? workspace.workspace
+            ? getMemoriesByProjects(
+                  args.pass.db,
+                  workspace.expandedIdentities,
+                  ["active", "permanent"],
+                  args.pass.passInputs.now_ms,
+                  workspace.ownIdentities,
+                  workspace.shareCategories,
+              )
+            : getMemoriesByProject(
+                  args.pass.db,
+                  args.pass.projectPath,
+                  ["active", "permanent"],
+                  args.pass.passInputs.now_ms,
+              )
         : [];
     const memories = allMemories
         .filter((memory) => memory.id > acked.memory_id)
@@ -708,7 +792,7 @@ function buildStateSyncPayload(args: {
     const memoryMutations = args.pass.projectPath
         ? getMemoryMutationsForRenderByProjects(
               args.pass.db,
-              [args.pass.projectPath],
+              workspace.expandedIdentities,
               acked.memory_mutation_id,
               renderedMemoryIds,
           ).map((row) => ({
@@ -732,6 +816,7 @@ function buildStateSyncPayload(args: {
             compartments,
             memories,
             memory_mutations: memoryMutations,
+            workspace: workspace.workspace,
             last_todo_state: sessionMeta.lastTodoState ?? "",
         },
         watermarks: currentWatermarks,

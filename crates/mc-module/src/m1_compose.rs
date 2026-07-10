@@ -26,7 +26,7 @@ use crate::compartment_coverage::{partition_by_folded_seq, resolve_coverage, Cov
 use crate::decay_render::DecayRenderCompartment;
 use crate::memory_render::{
     assemble_m1, render_memory_block, render_memory_updates, render_new_compartments,
-    M1_PLACEHOLDER,
+    workspace_source_names, M1_PLACEHOLDER,
 };
 
 /// Why composing the SOFT m1 from the store failed.
@@ -209,11 +209,11 @@ pub fn compose_m1_from_store(
         meta.max_memory_id,
         now_ms,
     )?;
-    let new_memories_block = render_memory_block(
-        &new_memories,
-        "new-memories",
-        &std::collections::HashMap::new(),
-    );
+    let source_name_by_id = membership
+        .as_ref()
+        .map(|workspace| workspace_source_names(&new_memories, workspace))
+        .unwrap_or_default();
+    let new_memories_block = render_memory_block(&new_memories, "new-memories", &source_name_by_id);
 
     // NOTE: <new-user-profile> is deferred in this slice — it gates on a profile-version
     // marker that has no mc_* source yet (the same no-source-inert bucket as

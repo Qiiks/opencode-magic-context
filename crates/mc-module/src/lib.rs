@@ -51,8 +51,9 @@ use tokio::sync::Notify;
 use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
-    HistorianPhase, InsertMemoryInput, McStore, NoteInput, ShadowDivergenceRecord, ShadowMemoryRow,
-    ShadowStateSyncError, ShadowStateSyncRequest, StoredChunkTranscript, StoredCompartment,
+    HistorianPhase, InsertMemoryInput, McStore, NoteInput, ShadowDivergenceRecord,
+    ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest,
+    ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StoredChunkTranscript, StoredCompartment,
     StoredMemoryMutation, StoredNote,
 };
 use serde::{Deserialize, Serialize};
@@ -194,6 +195,8 @@ struct ShadowStateSyncWire {
     #[serde(default)]
     memory_mutations: Vec<ShadowMemoryMutationWire>,
     #[serde(default)]
+    workspace: Option<ShadowWorkspaceWire>,
+    #[serde(default)]
     last_todo_state: Option<String>,
     #[serde(default)]
     acked_watermarks: Option<Value>,
@@ -296,6 +299,19 @@ struct ShadowCompartmentWire {
     legacy: i32,
     #[serde(default)]
     created_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShadowWorkspaceWire {
+    fingerprint: String,
+    members: Vec<ShadowWorkspaceMemberWire>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShadowWorkspaceMemberWire {
+    project_path: String,
+    #[serde(default)]
+    share_categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -465,52 +481,54 @@ impl From<ShadowCompartmentWire> for StoredCompartment {
     }
 }
 
-impl From<ShadowMemoryWire> for ShadowMemoryRow {
-    fn from(value: ShadowMemoryWire) -> Self {
-        let _source_project_path = value.project_path.as_deref();
-        let normalized_hash = value
+impl ShadowMemoryWire {
+    fn into_row(self, project_path: String) -> ShadowMemoryRow {
+        let normalized_hash = self
             .normalized_hash
-            .unwrap_or_else(|| mc_store::compute_normalized_memory_hash(&value.content));
+            .unwrap_or_else(|| mc_store::compute_normalized_memory_hash(&self.content));
         ShadowMemoryRow {
-            id: value.id,
-            category: value.category,
-            content: value.content,
+            id: self.id,
+            project_path,
+            category: self.category,
+            content: self.content,
             normalized_hash,
-            importance: value.importance,
-            scope: value.scope,
-            shareable: value.shareable,
-            source_session_id: value.source_session_id,
-            source_type: value.source_type,
-            seen_count: value.seen_count,
-            retrieval_count: value.retrieval_count,
-            first_seen_at: value.first_seen_at,
-            created_at: value.created_at,
-            updated_at: value.updated_at,
-            last_seen_at: value.last_seen_at,
-            last_retrieved_at: value.last_retrieved_at,
-            status: value.status,
-            expires_at: value.expires_at,
-            verification_status: value.verification_status,
-            verified_at: value.verified_at,
-            classified_at: value.classified_at,
-            superseded_by_memory_id: value.superseded_by_memory_id,
-            merged_from: value.merged_from,
-            metadata_json: value.metadata_json,
+            importance: self.importance,
+            scope: self.scope,
+            shareable: self.shareable,
+            source_session_id: self.source_session_id,
+            source_type: self.source_type,
+            seen_count: self.seen_count,
+            retrieval_count: self.retrieval_count,
+            first_seen_at: self.first_seen_at,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            last_seen_at: self.last_seen_at,
+            last_retrieved_at: self.last_retrieved_at,
+            status: self.status,
+            expires_at: self.expires_at,
+            verification_status: self.verification_status,
+            verified_at: self.verified_at,
+            classified_at: self.classified_at,
+            superseded_by_memory_id: self.superseded_by_memory_id,
+            merged_from: self.merged_from,
+            metadata_json: self.metadata_json,
         }
     }
 }
 
-impl From<ShadowMemoryMutationWire> for StoredMemoryMutation {
-    fn from(value: ShadowMemoryMutationWire) -> Self {
-        let _source_project_path = value.project_path.as_deref();
-        StoredMemoryMutation {
-            id: value.id,
-            mutation_type: value.mutation_type,
-            target_memory_id: value.target_memory_id,
-            superseded_by_id: value.superseded_by_id,
-            category: value.category,
-            new_content: value.new_content,
-            queued_at: value.queued_at,
+impl ShadowMemoryMutationWire {
+    fn into_row(self, project_path: String) -> ShadowMemoryMutationRow {
+        ShadowMemoryMutationRow {
+            project_path,
+            mutation: StoredMemoryMutation {
+                id: self.id,
+                mutation_type: self.mutation_type,
+                target_memory_id: self.target_memory_id,
+                superseded_by_id: self.superseded_by_id,
+                category: self.category,
+                new_content: self.new_content,
+                queued_at: self.queued_at,
+            },
         }
     }
 }
@@ -2173,32 +2191,67 @@ impl McHandler {
             .into_iter()
             .map(StoredCompartment::from)
             .collect();
-        let memories: Vec<ShadowMemoryRow> = parsed
+        let has_workspace = parsed.workspace.is_some();
+        let (workspace, member_paths) =
+            match prepare_shadow_workspace(&binding.session, parsed.workspace) {
+                Ok(prepared) => prepared,
+                Err(error) => return invalid_params_error(error),
+            };
+        let root_path = shadow_project_path(&binding.session);
+        let memories: Vec<ShadowMemoryRow> = match parsed
             .memories
             .into_iter()
-            .map(ShadowMemoryRow::from)
-            .collect();
-        let memory_mutations: Vec<StoredMemoryMutation> = parsed
+            .map(|memory| {
+                let project_path = shadow_source_path(
+                    memory.project_path.as_deref(),
+                    &root_path,
+                    &member_paths,
+                    has_workspace,
+                )?;
+                Ok(memory.into_row(project_path))
+            })
+            .collect::<Result<Vec<_>, String>>()
+        {
+            Ok(memories) => memories,
+            Err(error) => return invalid_params_error(error),
+        };
+        let memory_mutations: Vec<ShadowMemoryMutationRow> = match parsed
             .memory_mutations
             .into_iter()
-            .map(StoredMemoryMutation::from)
-            .collect();
+            .map(|mutation| {
+                let project_path = shadow_source_path(
+                    mutation.project_path.as_deref(),
+                    &root_path,
+                    &member_paths,
+                    has_workspace,
+                )?;
+                Ok(mutation.into_row(project_path))
+            })
+            .collect::<Result<Vec<_>, String>>()
+        {
+            Ok(mutations) => mutations,
+            Err(error) => return invalid_params_error(error),
+        };
         let acked_watermarks = parsed.acked_watermarks.unwrap_or_else(|| {
             json!({
                 "compartment_seq": compartments.iter().map(|c| c.sequence).max(),
                 "memory_id": memories.iter().map(|m| m.id).max(),
-                "memory_mutation_id": memory_mutations.iter().map(|m| m.id).max(),
+                "memory_mutation_id": memory_mutations
+                    .iter()
+                    .map(|m| m.mutation.id)
+                    .max(),
                 "last_todo_state": parsed.last_todo_state.is_some(),
             })
         });
         match store.apply_shadow_state_sync(ShadowStateSyncRequest {
             session_id: &binding.session,
-            shadow_project_path: &shadow_project_path(&binding.session),
+            shadow_project_path: &root_path,
             shadow_generation: parsed.shadow_generation,
             expected_shadow_seq: parsed.expected_shadow_seq,
             compartments: &compartments,
             memories: &memories,
             memory_mutations: &memory_mutations,
+            workspace: workspace.as_ref(),
             last_todo_state: parsed.last_todo_state,
             acked_watermarks,
         }) {
@@ -3474,6 +3527,98 @@ fn is_shadow_session(session_id: &str) -> bool {
 
 fn shadow_project_path(session_id: &str) -> String {
     session_id.to_string()
+}
+
+fn shadow_member_path(session_id: &str, real_project_path: &str) -> String {
+    format!(
+        "{session_id}:member:{}",
+        sha256_hex(real_project_path.as_bytes())
+    )
+}
+
+fn shadow_source_path(
+    source_path: Option<&str>,
+    root_path: &str,
+    member_paths: &HashMap<String, String>,
+    has_workspace: bool,
+) -> Result<String, String> {
+    let Some(source_path) = source_path else {
+        return Ok(root_path.to_string());
+    };
+    if !has_workspace {
+        return Ok(root_path.to_string());
+    }
+    member_paths
+        .get(source_path)
+        .cloned()
+        .ok_or_else(|| format!("shadow memory project is not a workspace member: {source_path}"))
+}
+
+fn prepare_shadow_workspace(
+    session_id: &str,
+    workspace: Option<ShadowWorkspaceWire>,
+) -> Result<(Option<ShadowWorkspaceRow>, HashMap<String, String>), String> {
+    let Some(workspace) = workspace else {
+        return Ok((None, HashMap::new()));
+    };
+    let Some(owner) = workspace.members.first() else {
+        return Err("shadow workspace must include its owning project first".to_string());
+    };
+    let share_categories = owner.share_categories.clone();
+    if workspace
+        .members
+        .iter()
+        .any(|member| member.share_categories != share_categories)
+    {
+        return Err("shadow workspace members must carry one consistent share policy".to_string());
+    }
+
+    let root_path = shadow_project_path(session_id);
+    let mut member_paths = HashMap::new();
+    let mut members = Vec::with_capacity(workspace.members.len());
+    for (index, member) in workspace.members.into_iter().enumerate() {
+        if member.project_path.is_empty() {
+            return Err("shadow workspace member project_path must not be empty".to_string());
+        }
+        let namespaced = if index == 0 {
+            root_path.clone()
+        } else {
+            shadow_member_path(session_id, &member.project_path)
+        };
+        if !namespaced.starts_with(SHADOW_SESSION_PREFIX) {
+            return Err("shadow workspace path escaped the reserved namespace".to_string());
+        }
+        if member_paths
+            .insert(member.project_path.clone(), namespaced.clone())
+            .is_some()
+        {
+            return Err("shadow workspace contains a duplicate member".to_string());
+        }
+        let display_name = Path::new(&member.project_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&member.project_path)
+            .to_string();
+        members.push(ShadowWorkspaceMemberRow {
+            project_path: namespaced,
+            display_name,
+            display_path: member.project_path,
+        });
+    }
+    let name = format!(
+        "shadow-workspace-{}-{}",
+        sha256_hex(session_id.as_bytes()),
+        workspace.fingerprint
+    );
+    Ok((
+        Some(ShadowWorkspaceRow {
+            name,
+            share_categories,
+            members,
+        }),
+        member_paths,
+    ))
 }
 
 fn shadow_input_messages(
@@ -7005,6 +7150,7 @@ mod tests {
         compartments: Vec<StrictShadowCompartment>,
         memories: Vec<StrictShadowMemory>,
         memory_mutations: Vec<StrictShadowMemoryMutation>,
+        workspace: Option<StrictShadowWorkspace>,
         last_todo_state: String,
     }
 
@@ -7027,6 +7173,22 @@ mod tests {
         episode_type: String,
         legacy: i32,
         created_at: i64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowWorkspace {
+        fingerprint: String,
+        members: Vec<StrictShadowWorkspaceMember>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowWorkspaceMember {
+        project_path: String,
+        share_categories: Vec<String>,
     }
 
     #[allow(dead_code)]
@@ -7157,6 +7319,45 @@ mod tests {
     }
 
     #[test]
+    fn shadow_workspace_namespace_never_reuses_real_project_paths() {
+        let real_owner = "/real/owner";
+        let real_foreign = "/real/foreign";
+        let (workspace, paths) = prepare_shadow_workspace(
+            "shadow:session",
+            Some(ShadowWorkspaceWire {
+                fingerprint: "fixture".to_string(),
+                members: vec![
+                    ShadowWorkspaceMemberWire {
+                        project_path: real_owner.to_string(),
+                        share_categories: vec!["CONSTRAINTS".to_string()],
+                    },
+                    ShadowWorkspaceMemberWire {
+                        project_path: real_foreign.to_string(),
+                        share_categories: vec!["CONSTRAINTS".to_string()],
+                    },
+                ],
+            }),
+        )
+        .unwrap();
+        let workspace = workspace.expect("workspace");
+        assert!(workspace
+            .members
+            .iter()
+            .all(|member| member.project_path.starts_with(SHADOW_SESSION_PREFIX)));
+        assert_eq!(
+            paths.get(real_owner).map(String::as_str),
+            Some("shadow:session")
+        );
+        assert_ne!(
+            paths.get(real_foreign).map(String::as_str),
+            Some(real_foreign)
+        );
+        assert!(
+            shadow_source_path(Some("/real/not-a-member"), "shadow:session", &paths, true).is_err()
+        );
+    }
+
+    #[test]
     fn generated_shadow_wire_fixture_matches_strict_and_production_parsers() {
         let fixture_value: Value =
             serde_json::from_str(include_str!("../testdata/shadow-wire-fixture.json"))
@@ -7175,8 +7376,18 @@ mod tests {
         assert_eq!(fixture.shadow_transform.method, "shadow_transform");
         assert_eq!(fixture.shadow_reset.method, "shadow_reset");
         assert_eq!(fixture.state_sync.compartments.len(), 1);
-        assert_eq!(fixture.state_sync.memories.len(), 1);
+        assert_eq!(fixture.state_sync.memories.len(), 2);
         assert_eq!(fixture.state_sync.memory_mutations.len(), 1);
+        assert_eq!(
+            fixture
+                .state_sync
+                .workspace
+                .as_ref()
+                .expect("fixture workspace")
+                .members
+                .len(),
+            2
+        );
         assert_eq!(
             fixture.shadow_transform.pass_inputs.history_budget_tokens,
             19_500.0

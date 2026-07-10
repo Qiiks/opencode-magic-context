@@ -133,6 +133,32 @@ export function generateShadowWireFixture(): string {
         createOpenCodeFixtureDb(tempRoot);
         const db = openDatabase();
         if (!db) throw new Error("fixture database did not open");
+        db.prepare(
+            `INSERT INTO workspaces (name, created_at, updated_at, share_categories)
+             VALUES (?, ?, ?, ?)`,
+        ).run("Fixture workspace", FIXED_NOW, FIXED_NOW, '["CONSTRAINTS"]');
+        const workspaceId = Number(
+            (db.prepare("SELECT id FROM workspaces WHERE name = ?").get("Fixture workspace") as {
+                id: number;
+            }).id,
+        );
+        db.prepare(
+            `INSERT INTO workspace_members
+                (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run(workspaceId, PROJECT_PATH, "fixture-project", PROJECT_PATH, FIXED_NOW);
+        db.prepare(
+            `INSERT INTO workspace_members
+                (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run(
+            workspaceId,
+            "/fixture/foreign",
+            "fixture-foreign",
+            "/fixture/foreign",
+            FIXED_NOW,
+        );
+
         appendCompartments(db, SESSION_ID, [
             {
                 sequence: 1,
@@ -180,6 +206,36 @@ export function generateShadowWireFixture(): string {
             99,
             "[7,8]",
             memory.id,
+        );
+        const foreignMemory = insertMemory(db, {
+            projectPath: "/fixture/foreign",
+            category: "CONSTRAINTS",
+            content: "Fixture foreign workspace constraint",
+            importance: 84,
+            sourceSessionId: "fixture-foreign-session",
+            sourceType: "dreamer",
+            expiresAt: FIXED_NOW + 172_800_000,
+            metadataJson: '{"foreign":true}',
+        });
+        db.prepare(
+            `UPDATE memories
+                SET scope = 'project', shareable = 1, seen_count = 2,
+                    retrieval_count = 1, first_seen_at = ?, created_at = ?, updated_at = ?,
+                    last_seen_at = ?, last_retrieved_at = ?, status = 'active',
+                    verification_status = 'verified', verified_at = ?, classified_at = ?,
+                    superseded_by_memory_id = ?, merged_from = ?
+              WHERE id = ?`,
+        ).run(
+            FIXED_NOW - 18_000,
+            FIXED_NOW - 17_000,
+            FIXED_NOW - 16_000,
+            FIXED_NOW - 15_000,
+            FIXED_NOW - 14_000,
+            FIXED_NOW - 13_000,
+            FIXED_NOW - 12_000,
+            101,
+            "[9,10]",
+            foreignMemory.id,
         );
         queueMemoryMutation(db, {
             projectPath: PROJECT_PATH,

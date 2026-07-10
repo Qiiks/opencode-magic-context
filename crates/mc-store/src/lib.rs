@@ -1306,6 +1306,7 @@ pub struct StoredCompartment {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredMemory {
     pub id: i64,
+    pub project_path: String,
     pub category: String,
     pub content: String,
     /// Decay-rate / budget-trim ordering signal (1..100); None when unclassified.
@@ -1449,6 +1450,7 @@ pub struct LoadedState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShadowMemoryRow {
     pub id: i64,
+    pub project_path: String,
     pub category: String,
     pub content: String,
     pub normalized_hash: String,
@@ -1474,6 +1476,26 @@ pub struct ShadowMemoryRow {
     pub metadata_json: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowWorkspaceMemberRow {
+    pub project_path: String,
+    pub display_name: String,
+    pub display_path: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowWorkspaceRow {
+    pub name: String,
+    pub share_categories: Vec<String>,
+    pub members: Vec<ShadowWorkspaceMemberRow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowMemoryMutationRow {
+    pub project_path: String,
+    pub mutation: StoredMemoryMutation,
+}
+
 pub struct ShadowStateSyncRequest<'a> {
     pub session_id: &'a str,
     pub shadow_project_path: &'a str,
@@ -1481,7 +1503,8 @@ pub struct ShadowStateSyncRequest<'a> {
     pub expected_shadow_seq: u64,
     pub compartments: &'a [StoredCompartment],
     pub memories: &'a [ShadowMemoryRow],
-    pub memory_mutations: &'a [StoredMemoryMutation],
+    pub memory_mutations: &'a [ShadowMemoryMutationRow],
+    pub workspace: Option<&'a ShadowWorkspaceRow>,
     pub last_todo_state: Option<String>,
     pub acked_watermarks: Value,
 }
@@ -2122,12 +2145,9 @@ impl McStore {
             for compartment in request.compartments {
                 upsert_compartment_tx(tx, request.session_id, compartment)?;
             }
-            replace_shadow_memories_tx(tx, request.shadow_project_path, request.memories)?;
-            replace_shadow_memory_mutations_tx(
-                tx,
-                request.shadow_project_path,
-                request.memory_mutations,
-            )?;
+            replace_shadow_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
+            replace_shadow_memories_tx(tx, request.memories)?;
+            replace_shadow_memory_mutations_tx(tx, request.memory_mutations)?;
 
             meta.last_todo_state = request.last_todo_state.clone();
             meta.shadow_seq = meta.shadow_seq.saturating_add(1);
@@ -2213,11 +2233,34 @@ impl McStore {
                 params![session_id],
             )?;
             tx.execute(
-                "DELETE FROM shadow_memories WHERE shadow_project_path = ?1",
+                "DELETE FROM shadow_memories
+                  WHERE shadow_project_path = ?1
+                     OR shadow_project_path IN (
+                         SELECT member.project_path
+                           FROM mc_workspace_members AS anchor
+                           JOIN mc_workspace_members AS member
+                             ON member.workspace_id = anchor.workspace_id
+                          WHERE anchor.project_path = ?1
+                     )",
                 params![shadow_project_path],
             )?;
             tx.execute(
-                "DELETE FROM shadow_memory_mutation_log WHERE shadow_project_path = ?1",
+                "DELETE FROM shadow_memory_mutation_log
+                  WHERE shadow_project_path = ?1
+                     OR shadow_project_path IN (
+                         SELECT member.project_path
+                           FROM mc_workspace_members AS anchor
+                           JOIN mc_workspace_members AS member
+                             ON member.workspace_id = anchor.workspace_id
+                          WHERE anchor.project_path = ?1
+                     )",
+                params![shadow_project_path],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_workspaces
+                  WHERE id IN (
+                      SELECT workspace_id FROM mc_workspace_members WHERE project_path = ?1
+                  )",
                 params![shadow_project_path],
             )?;
             tx.execute(
@@ -3116,7 +3159,7 @@ impl McStore {
         }
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, category, content, importance, status, expires_at,
+                "SELECT id, project_path, category, content, importance, status, expires_at,
                         superseded_by_memory_id, updated_at
                  FROM mc_memories
                  WHERE project_path = ?1
@@ -3128,13 +3171,14 @@ impl McStore {
                 .query_map(params![project_path, now_ms], |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
-                        category: r.get(1)?,
-                        content: r.get(2)?,
-                        importance: r.get(3)?,
-                        status: r.get(4)?,
-                        expires_at: r.get(5)?,
-                        superseded_by_memory_id: r.get(6)?,
-                        updated_at: r.get(7)?,
+                        project_path: r.get(1)?,
+                        category: r.get(2)?,
+                        content: r.get(3)?,
+                        importance: r.get(4)?,
+                        status: r.get(5)?,
+                        expires_at: r.get(6)?,
+                        superseded_by_memory_id: r.get(7)?,
+                        updated_at: r.get(8)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3150,7 +3194,7 @@ impl McStore {
     ) -> Result<Vec<StoredMemory>, McStoreError> {
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, category, content, importance, status, expires_at,
+                "SELECT id, shadow_project_path, category, content, importance, status, expires_at,
                         superseded_by_memory_id, updated_at
                    FROM shadow_memories
                   WHERE shadow_project_path = ?1
@@ -3162,13 +3206,14 @@ impl McStore {
                 .query_map(params![shadow_project_path, now_ms], |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
-                        category: r.get(1)?,
-                        content: r.get(2)?,
-                        importance: r.get(3)?,
-                        status: r.get(4)?,
-                        expires_at: r.get(5)?,
-                        superseded_by_memory_id: r.get(6)?,
-                        updated_at: r.get(7)?,
+                        project_path: r.get(1)?,
+                        category: r.get(2)?,
+                        content: r.get(3)?,
+                        importance: r.get(4)?,
+                        status: r.get(5)?,
+                        expires_at: r.get(6)?,
+                        superseded_by_memory_id: r.get(7)?,
+                        updated_at: r.get(8)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3330,9 +3375,6 @@ impl McStore {
         &self,
         project_path: &str,
     ) -> Result<Option<WorkspaceMembership>, McStoreError> {
-        if is_shadow_project_path(project_path) {
-            return Ok(None);
-        }
         let membership = self.inner.with_conn(|conn| {
             // which workspace (if any) does this project belong to?
             let ws: Option<(i64, String)> = conn
@@ -3406,12 +3448,8 @@ impl McStore {
 
     /// Load render-eligible memories across a workspace UNION: every member's `active` +
     /// `permanent` non-expired memories, but a FOREIGN member's only in the shared
-    /// categories (`share_categories`); the OWN project sees all its own. Ordered by
-    /// importance desc then id asc (the same order budget-trimming uses — highest
-    /// importance survives a trim, id breaks ties). The own-vs-foreign-by-category
-    /// filter is the security boundary — a foreign memory outside the shared categories
-    /// must never render here. `now_ms` is the frozen expiry cutoff (see
-    /// [`Self::load_active_memories`]).
+    /// categories (`share_categories`); the OWN project sees all its own. Shadow
+    /// workspaces use the isolated mirror table while following the same visibility path.
     pub fn load_workspace_union_memories(
         &self,
         membership: &WorkspaceMembership,
@@ -3420,17 +3458,29 @@ impl McStore {
         if membership.union_identities.is_empty() {
             return Ok(Vec::new());
         }
-        let (sharing, binds) = workspace_union_memory_visibility_filter(membership);
+        let shadow = is_shadow_project_path(&membership.own_identity);
+        let path_column = if shadow {
+            "shadow_project_path"
+        } else {
+            "project_path"
+        };
+        let table = if shadow {
+            "shadow_memories"
+        } else {
+            "mc_memories"
+        };
+        let (sharing, binds) =
+            workspace_union_memory_visibility_filter_for_column(membership, path_column);
 
         let rows = self.inner.with_conn(|conn| {
             let sql = format!(
-                "SELECT id, category, content, importance, status, expires_at,
+                "SELECT id, {path_column}, category, content, importance, status, expires_at,
                         superseded_by_memory_id, updated_at
-                 FROM mc_memories
-                 WHERE ({sharing})
-                   AND status IN ('active', 'permanent')
-                   AND (expires_at IS NULL OR expires_at > ?)
-                 ORDER BY COALESCE(importance, 50) DESC, id ASC"
+                   FROM {table}
+                  WHERE ({sharing})
+                    AND status IN ('active', 'permanent')
+                    AND (expires_at IS NULL OR expires_at > ?)
+                  ORDER BY COALESCE(importance, 50) DESC, id ASC"
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut all_binds = binds.clone();
@@ -3439,13 +3489,14 @@ impl McStore {
                 .query_map(rusqlite::params_from_iter(all_binds.iter()), |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
-                        category: r.get(1)?,
-                        content: r.get(2)?,
-                        importance: r.get(3)?,
-                        status: r.get(4)?,
-                        expires_at: r.get(5)?,
-                        superseded_by_memory_id: r.get(6)?,
-                        updated_at: r.get(7)?,
+                        project_path: r.get(1)?,
+                        category: r.get(2)?,
+                        content: r.get(3)?,
+                        importance: r.get(4)?,
+                        status: r.get(5)?,
+                        expires_at: r.get(6)?,
+                        superseded_by_memory_id: r.get(7)?,
+                        updated_at: r.get(8)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -4036,9 +4087,47 @@ fn upsert_compartment_tx(
     Ok(())
 }
 
-fn replace_shadow_memories_tx(
+fn replace_shadow_workspace_tx(
     tx: &rusqlite::Transaction<'_>,
     shadow_project_path: &str,
+    workspace: Option<&ShadowWorkspaceRow>,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM mc_workspaces
+          WHERE id IN (
+              SELECT workspace_id FROM mc_workspace_members WHERE project_path = ?1
+          )",
+        params![shadow_project_path],
+    )?;
+    let Some(workspace) = workspace else {
+        return Ok(());
+    };
+    let share_categories = serde_json::to_string(&workspace.share_categories)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    tx.execute(
+        "INSERT INTO mc_workspaces (name, created_at, updated_at, share_categories)
+         VALUES (?1, 0, 0, ?2)",
+        params![&workspace.name, share_categories],
+    )?;
+    let workspace_id = tx.last_insert_rowid();
+    for member in &workspace.members {
+        tx.execute(
+            "INSERT INTO mc_workspace_members
+                (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            params![
+                workspace_id,
+                &member.project_path,
+                &member.display_name,
+                &member.display_path
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_shadow_memories_tx(
+    tx: &rusqlite::Transaction<'_>,
     memories: &[ShadowMemoryRow],
 ) -> rusqlite::Result<()> {
     if memories.is_empty() {
@@ -4078,7 +4167,7 @@ fn replace_shadow_memories_tx(
                 merged_from = excluded.merged_from,
                 metadata_json = excluded.metadata_json",
             params![
-                shadow_project_path,
+                &memory.project_path,
                 memory.id,
                 &memory.category,
                 &memory.content,
@@ -4111,13 +4200,13 @@ fn replace_shadow_memories_tx(
 
 fn replace_shadow_memory_mutations_tx(
     tx: &rusqlite::Transaction<'_>,
-    shadow_project_path: &str,
-    mutations: &[StoredMemoryMutation],
+    mutations: &[ShadowMemoryMutationRow],
 ) -> rusqlite::Result<()> {
     if mutations.is_empty() {
         return Ok(());
     }
-    for mutation in mutations {
+    for row in mutations {
+        let mutation = &row.mutation;
         tx.execute(
             "INSERT INTO shadow_memory_mutation_log
                (shadow_project_path, id, mutation_type, target_memory_id, superseded_by_id,
@@ -4131,7 +4220,7 @@ fn replace_shadow_memory_mutations_tx(
                 new_content = excluded.new_content,
                 queued_at = excluded.queued_at",
             params![
-                shadow_project_path,
+                &row.project_path,
                 mutation.id,
                 &mutation.mutation_type,
                 mutation.target_memory_id,
@@ -4527,6 +4616,13 @@ fn project_memory_visibility_filter(project_path: &str) -> (String, Vec<rusqlite
 fn workspace_union_memory_visibility_filter(
     membership: &WorkspaceMembership,
 ) -> (String, Vec<rusqlite::types::Value>) {
+    workspace_union_memory_visibility_filter_for_column(membership, "project_path")
+}
+
+fn workspace_union_memory_visibility_filter_for_column(
+    membership: &WorkspaceMembership,
+    path_column: &str,
+) -> (String, Vec<rusqlite::types::Value>) {
     let WorkspaceMembership {
         union_identities,
         own_identity,
@@ -4541,7 +4637,7 @@ fn workspace_union_memory_visibility_filter(
 
     let mut binds: Vec<rusqlite::types::Value> =
         vec![rusqlite::types::Value::from(own_identity.clone())];
-    let mut sharing = String::from("project_path = ?");
+    let mut sharing = format!("{path_column} = ?");
     if !foreign.is_empty() && !share_categories.is_empty() {
         let fph = std::iter::repeat_n("?", foreign.len())
             .collect::<Vec<_>>()
@@ -4550,7 +4646,7 @@ fn workspace_union_memory_visibility_filter(
             .collect::<Vec<_>>()
             .join(", ");
         sharing.push_str(&format!(
-            " OR (project_path IN ({fph}) AND category IN ({cph}))"
+            " OR ({path_column} IN ({fph}) AND category IN ({cph}))"
         ));
         for p in &foreign {
             binds.push(rusqlite::types::Value::from((*p).clone()));
@@ -6062,6 +6158,7 @@ mod shadow_tests {
     fn memory(id: i64, content: &str) -> ShadowMemoryRow {
         ShadowMemoryRow {
             id,
+            project_path: "shadow:real".to_string(),
             category: "CONSTRAINTS".to_string(),
             content: content.to_string(),
             normalized_hash: compute_normalized_memory_hash(content),
@@ -6074,6 +6171,82 @@ mod shadow_tests {
     }
 
     #[test]
+    fn shadow_workspace_union_stays_isolated_from_real_project_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "shadow:workspace-session";
+        let foreign = "shadow:workspace-session:member:foreign";
+        let workspace = ShadowWorkspaceRow {
+            name: "shadow-workspace-isolation".to_string(),
+            share_categories: vec!["CONSTRAINTS".to_string()],
+            members: vec![
+                ShadowWorkspaceMemberRow {
+                    project_path: session.to_string(),
+                    display_name: "owner".to_string(),
+                    display_path: "/real/owner".to_string(),
+                },
+                ShadowWorkspaceMemberRow {
+                    project_path: foreign.to_string(),
+                    display_name: "foreign".to_string(),
+                    display_path: "/real/foreign".to_string(),
+                },
+            ],
+        };
+        let mut own = memory(1, "own architecture");
+        own.project_path = session.to_string();
+        own.category = "ARCHITECTURE".to_string();
+        let mut shared = memory(2, "foreign constraint");
+        shared.project_path = foreign.to_string();
+        let mut private = memory(3, "foreign preference");
+        private.project_path = foreign.to_string();
+        private.category = "PREFERENCES".to_string();
+
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                compartments: &[],
+                memories: &[own, shared, private],
+                memory_mutations: &[],
+                workspace: Some(&workspace),
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+
+        let membership = store
+            .resolve_workspace_membership(session)
+            .unwrap()
+            .expect("shadow workspace membership");
+        assert!(membership
+            .union_identities
+            .iter()
+            .all(|path| path.starts_with(SHADOW_SESSION_PREFIX)));
+        let visible = store.load_workspace_union_memories(&membership, 0).unwrap();
+        assert_eq!(
+            visible.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(store
+            .resolve_workspace_membership("/real/foreign")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_active_memories("/real/foreign", 0)
+            .unwrap()
+            .is_empty());
+
+        store.reset_shadow_session(session, session).unwrap();
+        assert!(store
+            .resolve_workspace_membership(session)
+            .unwrap()
+            .is_none());
+        assert!(store.load_active_memories(foreign, 0).unwrap().is_empty());
+    }
+
+    #[test]
     fn shadow_state_sync_is_generation_and_zero_seq_gated() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -6081,12 +6254,15 @@ mod shadow_tests {
         let project = "shadow:real";
         let compartments = vec![comp(0, 0, "a#0")];
         let memories = vec![memory(1, "remember zero")];
-        let mutations = vec![StoredMemoryMutation {
-            id: 0,
-            mutation_type: "update".to_string(),
-            target_memory_id: 1,
-            new_content: Some("remember one".to_string()),
-            ..Default::default()
+        let mutations = vec![ShadowMemoryMutationRow {
+            project_path: project.to_string(),
+            mutation: StoredMemoryMutation {
+                id: 0,
+                mutation_type: "update".to_string(),
+                target_memory_id: 1,
+                new_content: Some("remember one".to_string()),
+                ..Default::default()
+            },
         }];
 
         let applied = store
@@ -6098,6 +6274,7 @@ mod shadow_tests {
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &mutations,
+                workspace: None,
                 last_todo_state: Some("[]".to_string()),
                 acked_watermarks: serde_json::json!({"seq": 0}),
             })
@@ -6125,6 +6302,7 @@ mod shadow_tests {
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
+                workspace: None,
                 last_todo_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
@@ -6152,6 +6330,7 @@ mod shadow_tests {
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
+                workspace: None,
                 last_todo_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })

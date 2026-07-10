@@ -15,7 +15,7 @@
 //! is the slice-4d integration decision, already ruled; the byte render here is pure.
 
 use crate::decay_render::{render_decayed_compartments, DecayRenderCompartment};
-use mc_store::{StoredMemory, StoredMemoryMutation};
+use mc_store::{StoredMemory, StoredMemoryMutation, WorkspaceMembership};
 use std::collections::HashSet;
 
 /// The body for an empty session history. The `<session-history>` tag is always present
@@ -64,6 +64,23 @@ pub fn render_memory_line(memory: &StoredMemory, source_name: Option<&str>) -> S
 /// Render the `<project-memory>` (or workspace-`wrapper`) baseline block from the
 /// already-selected, already-ordered memory set. Empty set → empty string.
 /// `source_name_by_id` supplies per-memory repo attribution for a workspace union.
+pub fn workspace_source_names(
+    memories: &[StoredMemory],
+    membership: &WorkspaceMembership,
+) -> std::collections::HashMap<i64, String> {
+    memories
+        .iter()
+        .filter(|memory| memory.project_path != membership.own_identity)
+        .filter_map(|memory| {
+            membership
+                .display_name_by_path
+                .get(&memory.project_path)
+                .filter(|name| !name.is_empty())
+                .map(|name| (memory.id, name.clone()))
+        })
+        .collect()
+}
+
 pub fn render_memory_block(
     memories: &[StoredMemory],
     wrapper: &str,
@@ -307,6 +324,28 @@ mod tests {
             new_content: Some(content.to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn workspace_sources_attribute_only_foreign_memories() {
+        let mut own = mem(1, "ARCHITECTURE", "own", Some(80));
+        own.project_path = "shadow:owner".to_string();
+        let mut foreign = mem(2, "CONSTRAINTS", "foreign", Some(70));
+        foreign.project_path = "shadow:foreign".to_string();
+        let membership = WorkspaceMembership {
+            union_identities: vec![own.project_path.clone(), foreign.project_path.clone()],
+            own_identity: own.project_path.clone(),
+            share_categories: vec!["CONSTRAINTS".to_string()],
+            display_name_by_path: std::collections::HashMap::from([
+                (own.project_path.clone(), "owner".to_string()),
+                (foreign.project_path.clone(), "foreign-repo".to_string()),
+            ]),
+        };
+
+        assert_eq!(
+            workspace_source_names(&[own, foreign], &membership),
+            std::collections::HashMap::from([(2, "foreign-repo".to_string())])
+        );
     }
 
     #[test]
