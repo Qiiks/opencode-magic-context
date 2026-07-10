@@ -24,7 +24,11 @@ use subc_transport::{
 };
 use tokio::net::TcpStream;
 
-const DEFAULT_LLM_RUNNER_MODULE_ID: &str = "llm-runner";
+/// The owned-leg runner module the historian producer opens routes to. Renamed
+/// llm-runner -> broca in the fleet cut; this binary ships in the same deploy
+/// beat as the daemon's module-key rename, so the default flips with it
+/// atomically (a full daemon kickstart bounces every module in that window).
+const DEFAULT_RUNNER_MODULE_ID: &str = "broca";
 
 /// Output budget for a historian summarization pass. llm-runner's default (4k) truncated
 /// a real 50k-input chunk mid-XML on the rig: a tiered compartment doc for a full chunk
@@ -226,7 +230,7 @@ impl HistorianProducerConfig {
             connection_file: connection_file.into(),
             project_root: project_root.into(),
             harness: harness.into(),
-            module_id: DEFAULT_LLM_RUNNER_MODULE_ID.to_string(),
+            module_id: DEFAULT_RUNNER_MODULE_ID.to_string(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             await_timeout: DEFAULT_AWAIT_TIMEOUT,
