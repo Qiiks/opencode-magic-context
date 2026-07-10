@@ -582,26 +582,19 @@ function serializeCompartment(args: {
     if (startOrdinal === "mismatch" || endOrdinal === "mismatch") return "mismatch";
     if (startOrdinal === null || endOrdinal === null) return null;
     return {
-        id: args.compartment.id,
         sequence: args.compartment.sequence,
-        start: {
-            flat_id: flatBlockIdForRawMessage(
-                args.compartment.startMessageId,
-                args.rawById.get(args.compartment.startMessageId),
-                "start",
-            ),
-            bare_message_id: args.compartment.startMessageId,
-            absolute_ordinal: startOrdinal,
-        },
-        end: {
-            flat_id: flatBlockIdForRawMessage(
-                args.compartment.endMessageId,
-                args.rawById.get(args.compartment.endMessageId),
-                "end",
-            ),
-            bare_message_id: args.compartment.endMessageId,
-            absolute_ordinal: endOrdinal,
-        },
+        start_message: startOrdinal,
+        end_message: endOrdinal,
+        start_message_id: flatBlockIdForRawMessage(
+            args.compartment.startMessageId,
+            args.rawById.get(args.compartment.startMessageId),
+            "start",
+        ),
+        end_message_id: flatBlockIdForRawMessage(
+            args.compartment.endMessageId,
+            args.rawById.get(args.compartment.endMessageId),
+            "end",
+        ),
         title: args.compartment.title,
         content: args.compartment.content,
         p1: args.compartment.p1,

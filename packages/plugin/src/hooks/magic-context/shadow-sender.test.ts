@@ -9,6 +9,7 @@ import {
     closeDatabase,
     openDatabase,
 } from "../../features/magic-context/storage";
+import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { appendAutoSearchHintDecision } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -350,8 +351,28 @@ describe("shadow sender", () => {
     it("serializes state_sync and shadow_transform with the shadow wire field inventory", () => {
         useTempDataHome("shadow-wire-");
         const sessionId = "s-wire";
-        createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "one" }]);
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", text: "one" },
+            { id: "m2", role: "assistant", text: "two" },
+        ]);
         const db = openDatabase();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 1,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m1",
+                endMessageId: "m2",
+                title: "Populated compartment",
+                content: "full content",
+                p1: "tier one",
+                p2: "tier two",
+                p3: "tier three",
+                p4: "tier four",
+                importance: 73,
+                episodeType: "feature",
+            },
+        ]);
         const state = __shadowSenderTest.createSessionQueueState();
         state.lastAckedWatermarks = {
             compartment_sequence: -1,
@@ -432,7 +453,25 @@ describe("shadow sender", () => {
         expect(flatSync.params).toBeUndefined();
         expect(flatSync.shadow_generation).toEqual(expect.any(Number));
         expect(flatSync.expected_shadow_seq).toEqual(expect.any(Number));
-        expect(flatSync.compartments).toEqual(expect.any(Array));
+        expect(flatSync.compartments).toEqual([
+            {
+                sequence: 1,
+                start_message: 1,
+                end_message: 2,
+                start_message_id: "m1#0",
+                end_message_id: "m2#0",
+                title: "Populated compartment",
+                content: "full content",
+                p1: "tier one",
+                p2: "tier two",
+                p3: "tier three",
+                p4: "tier four",
+                importance: 73,
+                episode_type: "feature",
+                legacy: 0,
+                created_at: expect.any(Number),
+            },
+        ]);
 
         const flatTransform = __shadowSenderTest.toFlatWireBody(transformBody) as Record<
             string,
