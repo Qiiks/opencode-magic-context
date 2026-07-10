@@ -157,6 +157,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `packages/pi-plugin/src/context-handler.ts`: Core context transform and hook handler for the Pi plugin.
 - `packages/pi-plugin/src/subagent-runner.ts`: Win32/POSIX-safe subagent executor with command-line length cap mitigations.
 - `packages/pi-plugin/src/commands/ctx-wrapup.ts`: Implement the `/ctx-wrapup` command and orchestrator for Pi sessions.
+- `packages/pi-plugin/src/dreamer/pi-session-api.ts`: Resolve `pi-coding-agent` module and session APIs, using a memoized resolution ladder to support symlinked or nonstandard Pi installs.
 - `crates/mc-module/src/transform.rs`: Evaluates transform passes and applies modifications like metadata tag injection and history compaction in Rust.
 - `crates/mc-module/src/historian.rs`: Evaluates pressure and schedules/runs incremental historian summarizations in Rust.
 - `crates/mc-module/src/injection.rs`: Builds the `m0`/`m1` structures and injects synthetic message parts in Rust.
