@@ -343,6 +343,10 @@ describe("shadow sender", () => {
             }),
         );
 
+        // m2 vanished from the DB (revert) but the memo remembers ordinal 2. The
+        // trailing-suffix rule assigns it a provisional ordinal that disagrees, so
+        // the drift check reports mismatch and the caller's shadow_reset re-seeds —
+        // stronger healing than the old skip-forever behavior.
         createOpenCodeDb(sessionId, [{ id: "m3", role: "assistant", text: "new" }]);
         expect(
             __shadowSenderTest.resolveOrdinalsForShadow({
@@ -352,7 +356,50 @@ describe("shadow sender", () => {
                 memoGeneration: state.idOrdinalMemoGeneration,
                 memo: state.idOrdinalMemo,
             }),
-        ).toEqual(expect.objectContaining({ ok: false, reason: "unresolved" }));
+        ).toEqual(expect.objectContaining({ ok: false, reason: "mismatch" }));
+
+        // Live tail: a not-yet-persisted assistant suffix gets provisional ordinals
+        // (last persisted + n) instead of starving the active pass; a HOLE before a
+        // persisted message still fail-skips (never fabricate history mid-array).
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", text: "old" },
+            { id: "m2", role: "assistant", text: "visible" },
+        ]);
+        const liveTail = __shadowSenderTest.resolveOrdinalsForShadow({
+            sessionId,
+            messages: [
+                message(sessionId, "m2", "visible"),
+                message(sessionId, "m-live-user", "new prompt"),
+                message(sessionId, "m-live-assistant", "in flight"),
+            ],
+            generation: state.shadowGeneration,
+            memoGeneration: state.idOrdinalMemoGeneration,
+            memo: new Map(),
+        });
+        expect(liveTail).toEqual(
+            expect.objectContaining({
+                ok: true,
+                annotatedInput: [
+                    expect.objectContaining({ absolute_ordinal: 2 }),
+                    expect.objectContaining({ absolute_ordinal: 3 }),
+                    expect.objectContaining({ absolute_ordinal: 4 }),
+                ],
+            }),
+        );
+        expect(
+            __shadowSenderTest.resolveOrdinalsForShadow({
+                sessionId,
+                messages: [
+                    message(sessionId, "m-hole", "never persisted"),
+                    message(sessionId, "m2", "visible"),
+                ],
+                generation: state.shadowGeneration,
+                memoGeneration: state.idOrdinalMemoGeneration,
+                memo: new Map(),
+            }),
+        ).toEqual(
+            expect.objectContaining({ ok: false, reason: "unresolved", messageId: "m-hole" }),
+        );
 
         state.idOrdinalMemo.set("m2", 7);
         createOpenCodeDb(sessionId, [

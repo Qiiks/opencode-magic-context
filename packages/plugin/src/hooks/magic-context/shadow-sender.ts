@@ -407,6 +407,8 @@ export function resolveOrdinalsForShadow(args: {
     // The transform captured this array before mutating the live messages. Annotate
     // that private snapshot directly instead of cloning the full history again.
     const annotated = args.messages as unknown as Array<Record<string, unknown>>;
+    const resolved: Array<number | undefined> = new Array(annotated.length);
+    let firstUnresolvedId: string | undefined;
     for (let index = 0; index < annotated.length; index += 1) {
         const messageId = getMessageId(args.messages[index]);
         if (!messageId) return { ok: false, reason: "unresolved" };
@@ -423,9 +425,41 @@ export function resolveOrdinalsForShadow(args: {
             // extra point reads stay off the hot-path cost radar.
             ordinal = readRawSessionMessageById(args.sessionId, messageId)?.ordinal;
         }
-        if (ordinal === undefined) {
-            return { ok: false, reason: "unresolved", messageId };
+        if (ordinal === undefined && firstUnresolvedId === undefined) {
+            firstUnresolvedId = messageId;
         }
+        resolved[index] = ordinal;
+    }
+
+    // OpenCode persists assistant rows at step/turn completion while the transform
+    // runs mid-turn, so the newest wire message(s) routinely have no DB row yet.
+    // Those live-tail messages are always a contiguous SUFFIX of the wire array in
+    // canonical order, so their eventual ordinals are exactly "last persisted + n".
+    // Assign those provisionally instead of skipping the pass — otherwise every
+    // ACTIVE pass (the ones the byte-compare exists for) starves. If interleaved
+    // persistence ever lands a different real ordinal, the memo drift check below
+    // reports "mismatch" on the next pass and the caller's shadow_reset self-heals.
+    let suffixStart = annotated.length;
+    while (suffixStart > 0 && resolved[suffixStart - 1] === undefined) {
+        suffixStart -= 1;
+    }
+    for (let index = 0; index < suffixStart; index += 1) {
+        if (resolved[index] === undefined) {
+            // A hole BEFORE a resolved message is not the live tail (deleted or
+            // foreign id) — keep the fail-skip so we never fabricate history.
+            return { ok: false, reason: "unresolved", messageId: firstUnresolvedId };
+        }
+    }
+    if (suffixStart < annotated.length) {
+        const base = suffixStart > 0 ? (resolved[suffixStart - 1] as number) : -1;
+        for (let index = suffixStart; index < annotated.length; index += 1) {
+            resolved[index] = base + (index - suffixStart) + 1;
+        }
+    }
+
+    for (let index = 0; index < annotated.length; index += 1) {
+        const messageId = getMessageId(args.messages[index]) as string;
+        const ordinal = resolved[index] as number;
         const prior = memo.get(messageId);
         if (prior !== undefined && prior !== ordinal) {
             return { ok: false, reason: "mismatch", messageId };
