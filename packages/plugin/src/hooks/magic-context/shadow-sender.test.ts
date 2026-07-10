@@ -394,16 +394,8 @@ describe("shadow sender", () => {
                 params: expect.objectContaining({
                     shadow_generation: expect.any(Number),
                     expected_shadow_seq: expect.any(Number),
-                    watermarks: expect.objectContaining({
-                        compartment_sequence: expect.any(Number),
-                        memory_id: expect.any(Number),
-                        m0_mutation_id: expect.any(Number),
-                        memory_mutation_id: expect.any(Number),
-                        last_todo_state_hash: expect.any(String),
-                    }),
                     compartments: expect.any(Array),
                     memories: expect.any(Array),
-                    m0_mutations: expect.any(Array),
                     memory_mutations: expect.any(Array),
                     last_todo_state: expect.any(String),
                 }),
@@ -453,6 +445,19 @@ describe("shadow sender", () => {
         expect(flatSync.params).toBeUndefined();
         expect(flatSync.shadow_generation).toEqual(expect.any(Number));
         expect(flatSync.expected_shadow_seq).toEqual(expect.any(Number));
+        expect(flatSync.watermarks).toBeUndefined();
+        expect(flatSync.m0_mutations).toBeUndefined();
+        expect(stateSync).toEqual(
+            expect.objectContaining({
+                watermarks: expect.objectContaining({
+                    compartment_sequence: expect.any(Number),
+                    memory_id: expect.any(Number),
+                    m0_mutation_id: expect.any(Number),
+                    memory_mutation_id: expect.any(Number),
+                    last_todo_state_hash: expect.any(String),
+                }),
+            }),
+        );
         expect(flatSync.compartments).toEqual([
             {
                 sequence: 1,

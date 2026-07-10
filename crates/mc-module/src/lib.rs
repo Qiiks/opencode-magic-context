@@ -205,6 +205,8 @@ struct ShadowResetWire {
     session_id: Option<String>,
     #[serde(default)]
     shadow_generation: Option<u64>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +300,8 @@ struct ShadowCompartmentWire {
 struct ShadowMemoryWire {
     id: i64,
     #[serde(default)]
+    project_path: Option<String>,
+    #[serde(default)]
     category: String,
     #[serde(default)]
     content: String,
@@ -348,6 +352,8 @@ struct ShadowMemoryWire {
 #[derive(Debug, Clone, Deserialize)]
 struct ShadowMemoryMutationWire {
     id: i64,
+    #[serde(default)]
+    project_path: Option<String>,
     mutation_type: String,
     target_memory_id: i64,
     #[serde(default)]
@@ -459,6 +465,7 @@ impl From<ShadowCompartmentWire> for StoredCompartment {
 
 impl From<ShadowMemoryWire> for ShadowMemoryRow {
     fn from(value: ShadowMemoryWire) -> Self {
+        let _source_project_path = value.project_path.as_deref();
         let normalized_hash = value
             .normalized_hash
             .unwrap_or_else(|| mc_store::compute_normalized_memory_hash(&value.content));
@@ -493,6 +500,7 @@ impl From<ShadowMemoryWire> for ShadowMemoryRow {
 
 impl From<ShadowMemoryMutationWire> for StoredMemoryMutation {
     fn from(value: ShadowMemoryMutationWire) -> Self {
+        let _source_project_path = value.project_path.as_deref();
         StoredMemoryMutation {
             id: value.id,
             mutation_type: value.mutation_type,
@@ -2239,6 +2247,7 @@ impl McHandler {
                 "shadow_seq": result.shadow_seq,
                 "row_version": result.row_version,
                 "previous_shadow_generation": parsed.shadow_generation,
+                "reason": parsed.reason,
             })),
             Err(e) => HandlerOutcome::Error {
                 code: "shadow_reset_failed".to_string(),
@@ -6969,6 +6978,200 @@ mod tests {
         .unwrap();
         let without_value = serde_json::to_value(response_without_historian).unwrap();
         assert_eq!(with_historian["ck_messages"], without_value["ck_messages"]);
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ShadowWireFixture {
+        state_sync: StrictShadowStateSync,
+        shadow_transform: StrictShadowTransform,
+        shadow_reset: StrictShadowReset,
+        local_watermarks: StrictShadowWatermarks,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowStateSync {
+        method: String,
+        shadow_generation: u64,
+        expected_shadow_seq: u64,
+        compartments: Vec<StrictShadowCompartment>,
+        memories: Vec<StrictShadowMemory>,
+        memory_mutations: Vec<StrictShadowMemoryMutation>,
+        last_todo_state: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowCompartment {
+        sequence: i64,
+        start_message: i64,
+        end_message: i64,
+        start_message_id: String,
+        end_message_id: String,
+        title: String,
+        content: String,
+        p1: String,
+        p2: String,
+        p3: String,
+        p4: String,
+        importance: i32,
+        episode_type: String,
+        legacy: i32,
+        created_at: i64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowMemory {
+        id: i64,
+        project_path: String,
+        category: String,
+        content: String,
+        normalized_hash: String,
+        importance: i32,
+        scope: String,
+        shareable: i32,
+        source_session_id: String,
+        source_type: String,
+        seen_count: i64,
+        retrieval_count: i64,
+        first_seen_at: i64,
+        created_at: i64,
+        updated_at: i64,
+        last_seen_at: i64,
+        last_retrieved_at: i64,
+        status: String,
+        expires_at: i64,
+        verification_status: String,
+        verified_at: i64,
+        superseded_by_memory_id: i64,
+        merged_from: String,
+        metadata_json: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowMemoryMutation {
+        id: i64,
+        project_path: String,
+        mutation_type: String,
+        target_memory_id: i64,
+        superseded_by_id: i64,
+        category: String,
+        new_content: String,
+        queued_at: i64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowTransform {
+        method: String,
+        shadow_generation: u64,
+        input: Vec<Value>,
+        ts_output: Vec<Value>,
+        normalizations: Vec<Value>,
+        pass_inputs: StrictShadowPassInputs,
+        ts_decision: StrictShadowDecision,
+        declared_trim: StrictDeclaredTrim,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowPassInputs {
+        now_ms: i64,
+        model_key: String,
+        usage: StrictShadowUsage,
+        effective_execute_threshold: f64,
+        cache_ttl: String,
+        provider_error: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowUsage {
+        input_tokens: u64,
+        limit: u64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowDecision {
+        class: String,
+        marker_state: StrictShadowMarkerState,
+        materialize_reason: String,
+        emergency: bool,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowMarkerState {
+        marker_message_id: String,
+        advanced_this_pass: bool,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictDeclaredTrim {
+        flat_boundary_id: String,
+        boundary_bare_message_id: String,
+        boundary_absolute_ordinal: u64,
+        next_absolute_ordinal: u64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowReset {
+        method: String,
+        shadow_generation: u64,
+        reason: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictShadowWatermarks {
+        compartment_sequence: i64,
+        memory_id: i64,
+        m0_mutation_id: i64,
+        memory_mutation_id: i64,
+        last_todo_state_hash: String,
+    }
+
+    #[test]
+    fn generated_shadow_wire_fixture_matches_strict_and_production_parsers() {
+        let fixture_value: Value =
+            serde_json::from_str(include_str!("../testdata/shadow-wire-fixture.json"))
+                .expect("shadow wire fixture must be valid JSON");
+        let fixture: ShadowWireFixture = serde_json::from_value(fixture_value.clone())
+            .expect("shadow wire fixture contains an unknown or missing field");
+
+        serde_json::from_value::<ShadowStateSyncWire>(fixture_value["state_sync"].clone())
+            .expect("state_sync fixture must parse through the production wire struct");
+        serde_json::from_value::<ShadowTransformWire>(fixture_value["shadow_transform"].clone())
+            .expect("shadow_transform fixture must parse through the production wire struct");
+        serde_json::from_value::<ShadowResetWire>(fixture_value["shadow_reset"].clone())
+            .expect("shadow_reset fixture must parse through the production wire struct");
+
+        assert_eq!(fixture.state_sync.method, "state_sync");
+        assert_eq!(fixture.shadow_transform.method, "shadow_transform");
+        assert_eq!(fixture.shadow_reset.method, "shadow_reset");
+        assert_eq!(fixture.state_sync.compartments.len(), 1);
+        assert_eq!(fixture.state_sync.memories.len(), 1);
+        assert_eq!(fixture.state_sync.memory_mutations.len(), 1);
+        assert_eq!(fixture.local_watermarks.m0_mutation_id, 1);
     }
 
     fn shadow_pass_inputs() -> Value {

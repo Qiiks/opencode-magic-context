@@ -7,7 +7,6 @@ import { getMemoriesByProject } from "../../features/magic-context/memory/storag
 import {
     type ContextDatabase,
     getCompartments,
-    getM0MutationsAfterId,
     getOrCreateSessionMeta,
 } from "../../features/magic-context/storage";
 import { getMemoryMutationsForRenderByProjects } from "../../features/magic-context/storage-memory-mutation-log";
@@ -167,13 +166,12 @@ interface ShadowStateSyncPayload {
     params: {
         shadow_generation: number;
         expected_shadow_seq: number;
-        watermarks: ShadowWatermarks;
         compartments: unknown[];
         memories: unknown[];
-        m0_mutations: unknown[];
         memory_mutations: unknown[];
         last_todo_state: string;
     };
+    watermarks: ShadowWatermarks;
 }
 
 interface ConnectionInfo {
@@ -686,17 +684,6 @@ function buildStateSyncPayload(args: {
             metadata_json: memory.metadataJson,
         }));
 
-    const m0Mutations = getM0MutationsAfterId(
-        args.pass.db,
-        args.pass.sessionId,
-        acked.m0_mutation_id,
-    ).map((row) => ({
-        id: row.id,
-        session_id: row.sessionId,
-        mutation_type: row.mutationType,
-        target_id: row.targetId,
-        queued_at: row.queuedAt,
-    }));
     const renderedMemoryIds = allMemories.map((memory) => memory.id);
     const memoryMutations = args.pass.projectPath
         ? getMemoryMutationsForRenderByProjects(
@@ -722,13 +709,12 @@ function buildStateSyncPayload(args: {
         params: {
             shadow_generation: args.state.shadowGeneration,
             expected_shadow_seq: args.state.lastAckedSeq,
-            watermarks: currentWatermarks,
             compartments,
             memories,
-            m0_mutations: m0Mutations,
             memory_mutations: memoryMutations,
             last_todo_state: sessionMeta.lastTodoState ?? "",
         },
+        watermarks: currentWatermarks,
     } satisfies ShadowStateSyncPayload;
 }
 
@@ -791,6 +777,19 @@ function isConnectionFailure(error: unknown): boolean {
  */
 function toFlatWireBody(payload: { method: string; params: Record<string, unknown> }): unknown {
     return { method: payload.method, ...payload.params };
+}
+
+function buildShadowResetBody(args: { state: SessionQueueState; reason: string }): {
+    method: "shadow_reset";
+    params: Record<string, unknown>;
+} {
+    return {
+        method: "shadow_reset",
+        params: {
+            shadow_generation: args.state.shadowGeneration,
+            reason: args.reason,
+        },
+    };
 }
 
 function buildShadowTransformBody(args: { pass: PreparedShadowPass; state: SessionQueueState }): {
@@ -905,13 +904,7 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
         projectRoot?: string;
     }): Promise<void> => {
         const projectRoot = args.projectRoot ?? process.cwd();
-        const body = toFlatWireBody({
-            method: "shadow_reset",
-            params: {
-                shadow_generation: args.state.shadowGeneration,
-                reason: args.reason,
-            },
-        });
+        const body = toFlatWireBody(buildShadowResetBody(args));
         const response = await transport.call({
             sessionId: args.sessionId,
             projectRoot,
@@ -988,7 +981,7 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
                 ["shadow_seq", "seq"],
                 syncPayload.params.expected_shadow_seq + 1,
             );
-            state.lastAckedWatermarks = syncPayload.params.watermarks;
+            state.lastAckedWatermarks = syncPayload.watermarks;
         }
 
         const transformBody = toFlatWireBody(buildShadowTransformBody({ pass, state }));
@@ -1411,6 +1404,7 @@ function parseErrorBody(body: Buffer): Error & { code?: string } {
 }
 
 export const __shadowSenderTest = {
+    buildShadowResetBody,
     buildShadowTransformBody,
     buildStateSyncPayload,
     createSessionQueueState,
