@@ -90,7 +90,6 @@ import {
     resolveDeclaredTrimForShadow,
     type ShadowSender,
     type ShadowTransformDecision,
-    type ShadowTransformPass,
 } from "./shadow-sender";
 import {
     replayClearedReasoning,
@@ -186,15 +185,6 @@ function classifyShadowDecision(args: {
     if (args.materialized) return "hard";
     if (args.schedulerDecision === "execute" || args.bustedThisPass) return "soft";
     return "defer";
-}
-
-function didDeclaredTrimAdvance(
-    before: ShadowTransformPass["declaredTrim"] | null,
-    after: ShadowTransformPass["declaredTrim"] | null,
-): boolean {
-    if (!after) return false;
-    if (!before) return true;
-    return before.flat_boundary_id !== after.flat_boundary_id;
 }
 
 // Tagger / trigger load-scoping floor (OpenCode only). Several hot-path reads
@@ -455,11 +445,24 @@ export function createTransform(deps: TransformDeps) {
 
         const db = deps.db;
         const shadowSender = deps.shadowSender;
-        const shadowNowMs = shadowSender ? Date.now() : 0;
-        const shadowInputMessages = shadowSender ? cloneForShadow(messages) : undefined;
-        const shadowDeclaredTrimBefore = shadowSender
-            ? resolveDeclaredTrimForShadow({ db, sessionId })
-            : null;
+        let shadowCapture:
+            | {
+                  nowMs: number;
+                  inputMessages: MessageLike[];
+                  declaredTrimBefore: ReturnType<typeof resolveDeclaredTrimForShadow>;
+              }
+            | undefined;
+        if (shadowSender) {
+            try {
+                shadowCapture = {
+                    nowMs: Date.now(),
+                    inputMessages: cloneForShadow(messages),
+                    declaredTrimBefore: resolveDeclaredTrimForShadow({ db, sessionId }),
+                };
+            } catch (error) {
+                sessionLog(sessionId, "shadow: capture failed (ignored):", error);
+            }
+        }
         if (deps.client !== undefined) {
             scheduleReconciliation(db, sessionId, readRawSessionMessages);
         }
@@ -2183,35 +2186,28 @@ export function createTransform(deps: TransformDeps) {
             `transform completed in ${elapsed}ms (${messages.length} messages, ${targets.size} targets, watermark: ${watermark})`,
         );
 
-        if (shadowSender && shadowInputMessages) {
+        if (shadowSender && shadowCapture) {
             try {
-                const shadowDeclaredTrimAfter = resolveDeclaredTrimForShadow({ db, sessionId });
                 const shadowDecision: ShadowTransformDecision = {
                     class: classifyShadowDecision({
                         schedulerDecision,
                         materialized: postTransformResult.materialized,
                         bustedThisPass: postTransformResult.bustedThisPass,
                     }),
-                    marker_state: {
-                        marker_message_id: shadowDeclaredTrimAfter?.boundary_bare_message_id,
-                        advanced_this_pass: didDeclaredTrimAdvance(
-                            shadowDeclaredTrimBefore,
-                            shadowDeclaredTrimAfter,
-                        ),
-                    },
+                    marker_state: { advanced_this_pass: false },
                     materialize_reason: postTransformResult.materializeReason,
                     emergency: postTransformResult.emergency,
                 };
                 shadowSender.enqueue({
                     sessionId,
                     db,
-                    inputMessages: shadowInputMessages,
+                    inputMessages: shadowCapture.inputMessages,
                     outputMessages: messages,
                     normalizationTargets: tagNormalizationTargets,
                     projectRoot: sessionDirectory ?? deps.directory ?? process.cwd(),
                     projectPath: sessionProjectIdentity,
                     passInputs: {
-                        now_ms: shadowNowMs,
+                        now_ms: shadowCapture.nowMs,
                         model_key: deps.getModelKey?.(sessionId) ?? hardModelKey ?? null,
                         usage: {
                             input_tokens: contextUsage.inputTokens,
@@ -2221,10 +2217,10 @@ export function createTransform(deps: TransformDeps) {
                         cache_ttl: sessionMeta.cacheTtl,
                     },
                     tsDecision: shadowDecision,
-                    declaredTrim: shadowDeclaredTrimAfter,
+                    declaredTrimBefore: shadowCapture.declaredTrimBefore,
                 });
             } catch (error) {
-                sessionLog(sessionId, "shadow: enqueue failed (ignored):", error);
+                sessionLog(sessionId, "shadow: capture failed (ignored):", error);
             }
         }
 

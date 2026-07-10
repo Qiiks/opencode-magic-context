@@ -213,12 +213,19 @@ export function generateShadowWireFixture(): string {
             last_todo_state_hash: "",
         };
         const messages = fixtureMessages();
+        const inputMessages = structuredClone(messages);
+        const declaredTrim = {
+            flat_boundary_id: "message-1#0",
+            boundary_bare_message_id: "message-1",
+            boundary_absolute_ordinal: 1,
+            next_absolute_ordinal: 2,
+        };
         const pass: ShadowTransformPass = {
             sessionId: SESSION_ID,
             db,
             projectRoot: "/fixture/root",
             projectPath: PROJECT_PATH,
-            inputMessages: messages,
+            inputMessages,
             outputMessages: messages,
             normalizationTargets: [],
             passInputs: {
@@ -238,22 +245,21 @@ export function generateShadowWireFixture(): string {
                 materialize_reason: "fixture",
                 emergency: false,
             },
-            declaredTrim: {
-                flat_boundary_id: "message-1#0",
-                boundary_bare_message_id: "message-1",
-                boundary_absolute_ordinal: 1,
-                next_absolute_ordinal: 2,
-            },
+            declaredTrimBefore: declaredTrim,
         };
         const resolved = __shadowSenderTest.resolveOrdinalsForShadow({
             sessionId: SESSION_ID,
-            messages,
+            messages: inputMessages,
             generation: state.shadowGeneration,
             memoGeneration: state.idOrdinalMemoGeneration,
             memo: state.idOrdinalMemo,
         });
         if (!resolved.ok) throw new Error(`fixture ordinal resolution failed: ${resolved.reason}`);
-        const preparedPass = { ...pass, annotatedInput: resolved.annotatedInput };
+        const preparedPass = {
+            ...pass,
+            annotatedInput: resolved.annotatedInput,
+            declaredTrim,
+        };
         const sync = __shadowSenderTest.buildStateSyncPayload({ state, pass, force: true });
         if (sync === null || sync === "mismatch" || sync === "unresolved") {
             throw new Error(`fixture state sync failed: ${String(sync)}`);

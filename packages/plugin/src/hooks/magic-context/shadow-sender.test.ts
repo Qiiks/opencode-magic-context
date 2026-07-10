@@ -14,6 +14,10 @@ import { appendAutoSearchHintDecision } from "../../features/magic-context/stora
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
+    primeInMemoryTailRawMessageCache,
+    withRawSessionMessageCache,
+} from "./read-session-chunk";
+import {
     __shadowSenderTest,
     createShadowSender,
     type ShadowTransformPass,
@@ -118,7 +122,7 @@ function basePass(args: {
         sessionId: args.sessionId,
         db: args.db,
         inputMessages,
-        outputMessages: args.outputMessages ?? inputMessages,
+        outputMessages: args.outputMessages ?? structuredClone(inputMessages),
         normalizationTargets: args.normalizationTargets ?? [],
         projectRoot: process.cwd(),
         projectPath: "/tmp/project",
@@ -130,7 +134,7 @@ function basePass(args: {
             cache_ttl: "ephemeral",
         },
         tsDecision: { class: "defer", marker_state: { advanced_this_pass: false } },
-        declaredTrim: null,
+        declaredTrimBefore: null,
     };
 }
 
@@ -279,6 +283,27 @@ describe("shadow sender", () => {
             }),
         );
 
+        const belowFloor = withRawSessionMessageCache(() => {
+            primeInMemoryTailRawMessageCache({
+                sessionId,
+                messages: [{ ordinal: 2, id: "m2", role: "assistant", parts: [] }],
+                absoluteMessageCount: 2,
+            });
+            return __shadowSenderTest.resolveOrdinalsForShadow({
+                sessionId,
+                messages: [message(sessionId, "m1", "old")],
+                generation: state.shadowGeneration,
+                memoGeneration: state.idOrdinalMemoGeneration,
+                memo: new Map(),
+            });
+        });
+        expect(belowFloor).toEqual(
+            expect.objectContaining({
+                ok: true,
+                annotatedInput: [expect.objectContaining({ absolute_ordinal: 1 })],
+            }),
+        );
+
         createOpenCodeDb(sessionId, [{ id: "m3", role: "assistant", text: "new" }]);
         expect(
             __shadowSenderTest.resolveOrdinalsForShadow({
@@ -407,6 +432,7 @@ describe("shadow sender", () => {
             pass: {
                 ...pass,
                 annotatedInput: [{ ...pass.inputMessages[0], absolute_ordinal: 1 }],
+                declaredTrim: null,
             },
         });
         expect(transformBody).toEqual(

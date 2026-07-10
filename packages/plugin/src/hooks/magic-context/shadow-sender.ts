@@ -89,7 +89,7 @@ export interface ShadowTransformPass {
     normalizationTargets: readonly TagNormalizationTarget[];
     passInputs: ShadowPassInputs;
     tsDecision: ShadowTransformDecision;
-    declaredTrim: ShadowDeclaredTrim | null;
+    declaredTrimBefore: ShadowDeclaredTrim | null;
 }
 
 export interface ShadowTransport {
@@ -137,7 +137,7 @@ interface SessionQueueState {
 }
 
 type ShadowWorkItem =
-    | { kind: "pass"; pass: PreparedShadowPass }
+    | { kind: "pass"; pass: ShadowTransformPass }
     | {
           kind: "reset";
           sessionId: string;
@@ -151,6 +151,7 @@ interface PreparedShadowPass extends ShadowTransformPass {
     annotatedInput: unknown[];
     shadowTsOutput?: unknown[];
     shadowNormalizations?: ShadowNormalizationRecord[];
+    declaredTrim: ShadowDeclaredTrim | null;
 }
 
 interface ShadowWatermarks {
@@ -375,8 +376,10 @@ export function resolveOrdinalsForShadow(args: {
         return new Map(raw.map((message) => [message.id, message.ordinal]));
     });
 
-    const annotated = cloneJson(args.messages) as Array<Record<string, unknown>>;
-    for (let index = 0; index < args.messages.length; index += 1) {
+    // The transform captured this array before mutating the live messages. Annotate
+    // that private snapshot directly instead of cloning the full history again.
+    const annotated = args.messages as unknown as Array<Record<string, unknown>>;
+    for (let index = 0; index < annotated.length; index += 1) {
         const messageId = getMessageId(args.messages[index]);
         if (!messageId) return { ok: false, reason: "unresolved" };
         let ordinal = ordinalById.get(messageId);
@@ -511,6 +514,15 @@ export function resolveDeclaredTrimForShadow(args: {
 
 function clearDeclaredTrimForSession(sessionId: string): void {
     declaredTrimBySession.delete(sessionId);
+}
+
+function didDeclaredTrimAdvance(
+    before: ShadowDeclaredTrim | null,
+    after: ShadowDeclaredTrim | null,
+): boolean {
+    if (!after) return false;
+    if (!before) return true;
+    return before.flat_boundary_id !== after.flat_boundary_id;
 }
 
 function loadWatermarks(args: {
@@ -933,7 +945,7 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
 
     const processPass = async (
         state: SessionQueueState,
-        pass: PreparedShadowPass,
+        pass: ShadowTransformPass,
     ): Promise<void> => {
         if (!state.initialized || state.requireResetReason) {
             await performReset({
@@ -945,11 +957,82 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
         }
         if (state.blockedUntilReset) return;
 
-        const syncPayload = buildStateSyncPayload({
-            state,
-            pass,
-            force: state.lastAckedWatermarks === null,
-        });
+        let resolved: ReturnType<typeof resolveOrdinalsForShadow>;
+        try {
+            resolved = resolveOrdinalsForShadow({
+                sessionId: pass.sessionId,
+                messages: pass.inputMessages,
+                generation: state.shadowGeneration,
+                memoGeneration: state.idOrdinalMemoGeneration,
+                memo: state.idOrdinalMemo,
+            });
+        } catch (error) {
+            sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
+            return;
+        }
+        if (!resolved.ok) {
+            if (resolved.reason === "mismatch") {
+                state.counters.ordinal_mismatch += 1;
+                state.requireResetReason = "ordinal_mismatch";
+                state.blockedUntilReset = true;
+                state.idOrdinalMemo.clear();
+                await performReset({
+                    sessionId: pass.sessionId,
+                    state,
+                    reason: "ordinal_mismatch",
+                    projectRoot: pass.projectRoot,
+                });
+            } else {
+                state.counters.ordinal_unresolved += 1;
+                sessionLog(
+                    pass.sessionId,
+                    `shadow: pass skipped; unresolved ordinal for ${resolved.messageId ?? "unknown"}`,
+                );
+            }
+            return;
+        }
+        state.idOrdinalMemoGeneration = resolved.memoGeneration;
+
+        let preparedPass: PreparedShadowPass;
+        let syncPayload: ReturnType<typeof buildStateSyncPayload>;
+        try {
+            const declaredTrim = resolveDeclaredTrimForShadow({
+                db: pass.db,
+                sessionId: pass.sessionId,
+            });
+            const denormalized = denormalizeShadowOutput({
+                db: pass.db,
+                sessionId: pass.sessionId,
+                outputMessages: pass.outputMessages,
+                normalizationTargets: pass.normalizationTargets,
+            });
+            preparedPass = {
+                ...pass,
+                annotatedInput: resolved.annotatedInput,
+                shadowTsOutput: denormalized.ts_output,
+                shadowNormalizations: denormalized.normalizations,
+                declaredTrim,
+                tsDecision: {
+                    ...pass.tsDecision,
+                    marker_state: {
+                        marker_message_id: declaredTrim?.boundary_bare_message_id,
+                        advanced_this_pass: didDeclaredTrimAdvance(
+                            pass.declaredTrimBefore,
+                            declaredTrim,
+                        ),
+                    },
+                },
+            };
+            syncPayload = buildStateSyncPayload({
+                state,
+                pass: preparedPass,
+                force: state.lastAckedWatermarks === null,
+            });
+        } catch (error) {
+            sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
+            return;
+        }
+
         if (syncPayload === "mismatch") {
             state.counters.ordinal_mismatch += 1;
             state.requireResetReason = "ordinal_mismatch";
@@ -984,7 +1067,9 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
             state.lastAckedWatermarks = syncPayload.watermarks;
         }
 
-        const transformBody = toFlatWireBody(buildShadowTransformBody({ pass, state }));
+        const transformBody = toFlatWireBody(
+            buildShadowTransformBody({ pass: preparedPass, state }),
+        );
         const response = await transport.call({
             sessionId: pass.sessionId,
             projectRoot: pass.projectRoot,
@@ -1000,58 +1085,7 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
 
     return {
         enqueue(pass: ShadowTransformPass): void {
-            const state = getState(pass.sessionId);
-            const resolved = resolveOrdinalsForShadow({
-                sessionId: pass.sessionId,
-                messages: pass.inputMessages,
-                generation: state.shadowGeneration,
-                memoGeneration: state.idOrdinalMemoGeneration,
-                memo: state.idOrdinalMemo,
-            });
-            if (!resolved.ok) {
-                if (resolved.reason === "mismatch") {
-                    state.counters.ordinal_mismatch += 1;
-                    state.queue.length = 0;
-                    state.requireResetReason = "ordinal_mismatch";
-                    state.blockedUntilReset = true;
-                    state.idOrdinalMemo.clear();
-                    sessionLog(
-                        pass.sessionId,
-                        `shadow: ordinal mismatch for ${resolved.messageId ?? "unknown"}; reset queued`,
-                    );
-                    pushWork(pass.sessionId, {
-                        kind: "reset",
-                        sessionId: pass.sessionId,
-                        reason: "ordinal_mismatch",
-                        projectRoot: pass.projectRoot,
-                        db: pass.db,
-                        projectPath: pass.projectPath,
-                    });
-                } else {
-                    state.counters.ordinal_unresolved += 1;
-                    sessionLog(
-                        pass.sessionId,
-                        `shadow: pass skipped; unresolved ordinal for ${resolved.messageId ?? "unknown"}`,
-                    );
-                }
-                return;
-            }
-            state.idOrdinalMemoGeneration = resolved.memoGeneration;
-            const denormalized = denormalizeShadowOutput({
-                db: pass.db,
-                sessionId: pass.sessionId,
-                outputMessages: pass.outputMessages,
-                normalizationTargets: pass.normalizationTargets,
-            });
-            pushWork(pass.sessionId, {
-                kind: "pass",
-                pass: {
-                    ...pass,
-                    annotatedInput: resolved.annotatedInput,
-                    shadowTsOutput: denormalized.ts_output,
-                    shadowNormalizations: denormalized.normalizations,
-                },
-            });
+            pushWork(pass.sessionId, { kind: "pass", pass });
         },
         resetSession(sessionId: string, reason: string): void {
             const state = getState(sessionId);
