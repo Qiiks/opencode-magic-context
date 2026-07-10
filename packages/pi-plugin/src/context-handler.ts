@@ -68,6 +68,7 @@ import {
 	getPendingOps,
 	getPendingPiCompactionMarkerState,
 	getTagsByNumbers,
+	hasPiFallbackMessageTags,
 	hasPiFallbackToolOwnerTags,
 	isWrapupInProgress,
 	setSessionWorkMetrics,
@@ -361,6 +362,7 @@ const activeContextHandlerSessions = new Set<string>();
 const lastHeuristicsTurnIdBySession = new Map<string, string>();
 const firstContextPassSeenBySession = new Set<string>();
 const liveModelBySession = new Map<string, string>();
+const taggedStableMessageIdsBySession = new Map<string, Set<string>>();
 
 function logTransformTiming(
 	sessionId: string,
@@ -1317,12 +1319,15 @@ function firstPiTextContent(content: unknown): string | null {
 function buildEntryFingerprintMap(
 	messages: readonly PiAgentMessage[],
 	resolveStableId: (msg: unknown, index: number) => string | undefined,
+	reusableMessageIds?: ReadonlySet<string>,
+	includeReusable = true,
 ): Map<string, string> {
 	const map = new Map<string, string>();
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
 		const id = resolveStableId(msg, i);
 		if (!id) continue;
+		if (!includeReusable && reusableMessageIds?.has(id)) continue;
 		const fp = piMessageEntryFingerprint(msg);
 		if (fp) map.set(id, fp);
 	}
@@ -1407,6 +1412,8 @@ interface AdoptPiFallbackTagsOptions {
 	messages?: readonly PiAgentMessage[];
 	resolveStableId?: (msg: unknown, index: number) => string | undefined;
 	stampStableIdScheme?: number;
+	hasFallbackMessageTags?: boolean;
+	hasFallbackToolOwnerTags?: boolean;
 }
 
 function hasAdoptablePiFallbackMessageTags(
@@ -1440,11 +1447,13 @@ function adoptPiFallbackTags(
 ): void {
 	const shouldRunMessageMigration =
 		options.stampStableIdScheme !== undefined ||
-		hasAdoptablePiFallbackMessageTags(db, sessionId, fingerprintById);
+		((options.hasFallbackMessageTags ?? true) &&
+			hasAdoptablePiFallbackMessageTags(db, sessionId, fingerprintById));
 	const shouldRunToolOwnerMigration = Boolean(
 		options.messages &&
 			options.resolveStableId &&
-			hasPiFallbackToolOwnerTags(db, sessionId),
+			(options.hasFallbackToolOwnerTags ??
+				hasPiFallbackToolOwnerTags(db, sessionId)),
 	);
 	if (!shouldRunMessageMigration && !shouldRunToolOwnerMigration) return;
 
@@ -1659,6 +1668,16 @@ export function registerPiContextHandler(
 			// strip), so post-mutation consumers must resolve by identity, not by
 			// the stale positional strictEntryIds.
 			const entryIdByRef = buildEntryIdByRefMap(branchEntries);
+			const previouslyTaggedIds =
+				taggedStableMessageIdsBySession.get(sessionId);
+			const reusableMessageIds = new Set<string>();
+			if (strictEntryIds && previouslyTaggedIds) {
+				for (const entryId of strictEntryIds) {
+					if (entryId && previouslyTaggedIds.has(entryId)) {
+						reusableMessageIds.add(entryId);
+					}
+				}
+			}
 			logTransformTiming(
 				sessionId,
 				"entryParseAndBranchResolution",
@@ -2254,6 +2273,7 @@ export function registerPiContextHandler(
 					: undefined,
 				entryIds,
 				entryIdByRef,
+				reusableMessageIds,
 				stableIdSchemeCutover,
 				schedulerDecision,
 				// 95% emergency forces drop-all-tools regardless of the
@@ -2276,6 +2296,18 @@ export function registerPiContextHandler(
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
 				isSubagent: sessionMeta.isSubagent,
 			});
+			// SessionEntry message ids are append-only. Mark only after the pipeline
+			// succeeds so a failed first observation retries full derivation next time.
+			if (strictEntryIds) {
+				let taggedIds = taggedStableMessageIdsBySession.get(sessionId);
+				if (!taggedIds) {
+					taggedIds = new Set();
+					taggedStableMessageIdsBySession.set(sessionId, taggedIds);
+				}
+				for (const entryId of strictEntryIds) {
+					if (entryId) taggedIds.add(entryId);
+				}
+			}
 			const piDecisionSnapshotNewestAssistant =
 				branchEntries === null
 					? undefined
@@ -3423,6 +3455,8 @@ interface RunPipelineArgs {
 	 * SAME id for a message (the cross-path lookup invariant).
 	 */
 	entryIdByRef?: ReadonlyMap<object, string> | null;
+	/** Real entry ids whose append-only Pi message objects were tagged previously. */
+	reusableMessageIds?: ReadonlySet<string>;
 	/**
 	 * True on the one-time stable-id-scheme cutover pass (Pi message identity
 	 * switched from index-based to real-entry-id). Forces placeholder rediscovery
@@ -3732,9 +3766,24 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// message keeps its tag_number/§N§ instead of getting a fresh tag. No-op for
 	// OpenCode (this path is Pi-only) and for messages already on a real id.
 	const tFallbackIdentity = performance.now();
+	// Two indexed existence probes replace one fallback-candidate query per
+	// message on steady-state passes. Without fallback rows, append-only messages
+	// observed on an earlier pass already have their persisted fingerprints.
+	const hasFallbackMessageTags = hasPiFallbackMessageTags(
+		args.db,
+		args.sessionId,
+	);
+	const hasFallbackToolOwnerTags = hasPiFallbackToolOwnerTags(
+		args.db,
+		args.sessionId,
+	);
 	const entryFingerprintByMessageId = buildEntryFingerprintMap(
 		args.messages as PiAgentMessage[],
 		stableIdResolver,
+		args.reusableMessageIds,
+		// Existing fallback rows may match any old real-id message. Once the
+		// indexed gate is empty, only the newly observed tail needs fingerprints.
+		hasFallbackMessageTags,
 	);
 	adoptPiFallbackTags(
 		args.db,
@@ -3747,6 +3796,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			stampStableIdScheme: args.stableIdSchemeCutover
 				? PI_STABLE_ID_SCHEME
 				: undefined,
+			hasFallbackMessageTags,
+			hasFallbackToolOwnerTags,
 		},
 	);
 	logTransformTiming(
@@ -3773,6 +3824,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		{
 			skipPrefixInjection: !ctxReduceCallable,
 			entryFingerprintByMessageId,
+			reuseMessageIds: args.reusableMessageIds,
 			onTiming: hasPiTransformTimingObserver()
 				? (phase, elapsedMs) => {
 						recordPiTransformTiming({
@@ -5082,6 +5134,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	firstContextPassSeenBySession.delete(sessionId);
 	commitSeenLastPass.delete(sessionId);
 	liveModelBySession.delete(sessionId);
+	taggedStableMessageIdsBySession.delete(sessionId);
 	clearPiChannel1State(sessionId);
 	lastHeuristicsTurnIdBySession.delete(sessionId);
 	lastSeenProjectIdentityBySession.delete(sessionId);
