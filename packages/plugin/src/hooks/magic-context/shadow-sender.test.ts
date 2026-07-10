@@ -7,23 +7,20 @@ import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+    appendCompartments,
+    replaceAllCompartmentState,
+} from "../../features/magic-context/compartment-storage";
+import { insertMemory } from "../../features/magic-context/memory/storage-memory";
+import {
     type ContextDatabase,
     closeDatabase,
     openDatabase,
 } from "../../features/magic-context/storage";
-import {
-    appendCompartments,
-    replaceAllCompartmentState,
-} from "../../features/magic-context/compartment-storage";
 import { queueM0Mutation } from "../../features/magic-context/storage-m0-mutation-log";
-import { insertMemory } from "../../features/magic-context/memory/storage-memory";
 import { appendAutoSearchHintDecision } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import {
-    primeInMemoryTailRawMessageCache,
-    withRawSessionMessageCache,
-} from "./read-session-chunk";
+import { primeInMemoryTailRawMessageCache, withRawSessionMessageCache } from "./read-session-chunk";
 import {
     __shadowSenderTest,
     createShadowSender,
@@ -570,9 +567,11 @@ describe("shadow sender", () => {
              VALUES ('Workspace', 1, 1, '["CONSTRAINTS"]')`,
         ).run();
         const workspaceId = Number(
-            (db.prepare("SELECT id FROM workspaces WHERE name = 'Workspace'").get() as {
-                id: number;
-            }).id,
+            (
+                db.prepare("SELECT id FROM workspaces WHERE name = 'Workspace'").get() as {
+                    id: number;
+                }
+            ).id,
         );
         const insertMember = db.prepare(
             `INSERT INTO workspace_members
@@ -762,7 +761,10 @@ describe("shadow sender", () => {
         ]);
         const syncBodies = transport.calls
             .filter((call) => call.method === "state_sync")
-            .map((call) => call.body as { compartments: Array<{ sequence: number; content: string }> });
+            .map(
+                (call) =>
+                    call.body as { compartments: Array<{ sequence: number; content: string }> },
+            );
         expect(syncBodies[1].compartments).toHaveLength(3);
         expect(syncBodies[1].compartments).toContainEqual(
             expect.objectContaining({ sequence: 2, content: "recreated sequence two" }),
@@ -800,7 +802,9 @@ describe("shadow sender", () => {
         const first = new FakeSocket();
         const second = new FakeSocket();
         second.onWrite = () => {
-            queueMicrotask(() => second.emit("data", responseFrame(1, 2, { result: { ok: true } })));
+            queueMicrotask(() =>
+                second.emit("data", responseFrame(1, 2, { result: { ok: true } })),
+            );
         };
         const sockets = [first, second];
         const transport = new __shadowSenderTest.SubcShadowTransport(
@@ -820,9 +824,7 @@ describe("shadow sender", () => {
             if (internals.socket && !internals.socket.destroyed && internals.reader) return;
             const socket = sockets[nextSocket++];
             internals.socket = socket as unknown as Socket;
-            internals.reader = new __shadowSenderTest.SocketReader(
-                socket as unknown as Socket,
-            );
+            internals.reader = new __shadowSenderTest.SocketReader(socket as unknown as Socket);
         };
         const request = {
             sessionId: "s-socket",
