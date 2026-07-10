@@ -19,7 +19,11 @@ import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
-import { readRawSessionMessages, withRawSessionMessageCache } from "./read-session-chunk";
+import {
+    readRawSessionMessageById,
+    readRawSessionMessages,
+    withRawSessionMessageCache,
+} from "./read-session-chunk";
 import type { RawMessage } from "./read-session-raw";
 import type { MessageLike, TagNormalizationTarget } from "./tag-messages";
 
@@ -377,7 +381,19 @@ export function resolveOrdinalsForShadow(args: {
     for (let index = 0; index < args.messages.length; index += 1) {
         const messageId = getMessageId(args.messages[index]);
         if (!messageId) return { ok: false, reason: "unresolved" };
-        const ordinal = ordinalById.get(messageId);
+        let ordinal = ordinalById.get(messageId);
+        if (ordinal === undefined) {
+            // The active raw-message cache can be primed TAIL-ONLY (post-boundary)
+            // by the transform on large sessions, so wire messages below the prime
+            // floor never appear in it and would starve the shadow lane forever.
+            // Fall back to a canonical by-id DB read — it computes the absolute
+            // ordinal with the same ORDER BY/COUNT semantics as the full read, so
+            // the memo drift check below keeps its exact meaning (a fresh value is
+            // re-derived every pass; deleted messages stay "unresolved"). Below-
+            // floor ids per pass are bounded by the marker lag (a handful), so the
+            // extra point reads stay off the hot-path cost radar.
+            ordinal = readRawSessionMessageById(args.sessionId, messageId)?.ordinal;
+        }
         if (ordinal === undefined) {
             return { ok: false, reason: "unresolved", messageId };
         }
@@ -720,7 +736,7 @@ function buildStateSyncPayload(args: {
             memory_mutations: memoryMutations,
             last_todo_state: sessionMeta.lastTodoState ?? "",
         },
-    };
+    } satisfies ShadowStateSyncPayload;
 }
 
 function extractAckValue(response: unknown): Record<string, unknown> {
@@ -771,10 +787,23 @@ function isConnectionFailure(error: unknown): boolean {
     return text.includes("backoff") || text.includes("connection") || text.includes("ECONN");
 }
 
-function buildShadowTransformBody(args: {
-    pass: PreparedShadowPass;
-    state: SessionQueueState;
-}): unknown {
+/**
+ * Flatten a `{method, params}` payload into the wire shape the module expects.
+ * The Rust handlers deserialize the WHOLE request value (serde_json::from_value
+ * on ShadowStateSyncWire / ShadowTransformWire / ShadowResetWire), so op fields
+ * must live at the top level beside `method` — a nested `params` object never
+ * reaches the parser and hard-required fields like `shadow_generation` reject
+ * with invalid_params. Builders keep the typed `{method, params}` shape for
+ * testability; this is the single serialization point.
+ */
+function toFlatWireBody(payload: { method: string; params: Record<string, unknown> }): unknown {
+    return { method: payload.method, ...payload.params };
+}
+
+function buildShadowTransformBody(args: { pass: PreparedShadowPass; state: SessionQueueState }): {
+    method: string;
+    params: Record<string, unknown>;
+} {
     const denormalized =
         args.pass.shadowTsOutput !== undefined && args.pass.shadowNormalizations !== undefined
             ? {
@@ -883,13 +912,13 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
         projectRoot?: string;
     }): Promise<void> => {
         const projectRoot = args.projectRoot ?? process.cwd();
-        const body = {
+        const body = toFlatWireBody({
             method: "shadow_reset",
             params: {
                 shadow_generation: args.state.shadowGeneration,
                 reason: args.reason,
             },
-        };
+        });
         const response = await transport.call({
             sessionId: args.sessionId,
             projectRoot,
@@ -959,7 +988,7 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
                 sessionId: pass.sessionId,
                 projectRoot: pass.projectRoot,
                 method: "state_sync",
-                body: syncPayload,
+                body: toFlatWireBody(syncPayload),
             });
             state.lastAckedSeq = numericAck(
                 response,
@@ -969,7 +998,7 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
             state.lastAckedWatermarks = syncPayload.params.watermarks;
         }
 
-        const transformBody = buildShadowTransformBody({ pass, state });
+        const transformBody = toFlatWireBody(buildShadowTransformBody({ pass, state }));
         const response = await transport.call({
             sessionId: pass.sessionId,
             projectRoot: pass.projectRoot,
@@ -1396,4 +1425,5 @@ export const __shadowSenderTest = {
     flatBlockIdForRawMessage,
     resolveDeclaredTrimForShadow,
     resolveOrdinalsForShadow,
+    toFlatWireBody,
 };

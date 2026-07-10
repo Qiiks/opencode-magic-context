@@ -339,13 +339,11 @@ describe("shadow sender", () => {
             () => transport.calls.filter((call) => call.method === "shadow_transform").length === 5,
         );
 
+        // Wire bodies are FLAT (op fields beside `method`) — the module's serde
+        // parsers reject a nested `params` object with invalid_params.
         const sentNowMs = transport.calls
             .filter((call) => call.method === "shadow_transform")
-            .map(
-                (call) =>
-                    (call.body as { params: { pass_inputs: { now_ms: number } } }).params
-                        .pass_inputs.now_ms,
-            );
+            .map((call) => (call.body as { pass_inputs: { now_ms: number } }).pass_inputs.now_ms);
         expect(sentNowMs).toEqual([1, 3, 4, 5, 6]);
     });
 
@@ -420,6 +418,31 @@ describe("shadow sender", () => {
                     declared_trim: null,
                 }),
             }),
+        );
+
+        // The on-wire form is FLAT: the module's serde parsers (ShadowStateSyncWire /
+        // ShadowTransformWire) deserialize the whole request value, so op fields sit
+        // beside `method` and a nested `params` key must NOT survive serialization.
+        // This is the exact mismatch that made every live state_sync/shadow_transform
+        // reject with invalid_params: missing field `shadow_generation`.
+        const flatSync = __shadowSenderTest.toFlatWireBody(
+            stateSync as { method: string; params: Record<string, unknown> },
+        ) as Record<string, unknown>;
+        expect(flatSync.method).toBe("state_sync");
+        expect(flatSync.params).toBeUndefined();
+        expect(flatSync.shadow_generation).toEqual(expect.any(Number));
+        expect(flatSync.expected_shadow_seq).toEqual(expect.any(Number));
+        expect(flatSync.compartments).toEqual(expect.any(Array));
+
+        const flatTransform = __shadowSenderTest.toFlatWireBody(transformBody) as Record<
+            string,
+            unknown
+        >;
+        expect(flatTransform.method).toBe("shadow_transform");
+        expect(flatTransform.params).toBeUndefined();
+        expect(flatTransform.shadow_generation).toEqual(expect.any(Number));
+        expect(flatTransform.pass_inputs).toEqual(
+            expect.objectContaining({ now_ms: expect.any(Number) }),
         );
     });
 
