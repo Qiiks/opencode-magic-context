@@ -81,6 +81,7 @@ import { log } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
 
+import { handlePiCloneSessionStart } from "./clone-inheritance";
 import {
 	type PiSidekickConfig,
 	registerCtxAugCommand,
@@ -929,6 +930,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos"
 			: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
 	);
+
+	pi.on("session_start", async (event, ctx) => {
+		await handlePiCloneSessionStart(event, ctx, {
+			db,
+			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
+		});
+	});
 
 	const readLastTodoState = (sessionId: string) =>
 		getOrCreateSessionMeta(db, sessionId).lastTodoState;
