@@ -67,6 +67,9 @@ export const RENDERED_PREFIXES: readonly string[] = [
   "smart_drops",
   "sqlite",
   "system_prompt_injection.enabled",
+  // Development-only: mirrors transform passes to the Rust subc module for
+  // byte-compare soaks. User-tier-only, undocumented, never a dashboard knob.
+  "shadow_transform",
 ];
 
 /**
