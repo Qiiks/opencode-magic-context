@@ -32,7 +32,9 @@ const UNKNOWN_ERROR_CLASS_PREFIX: &str = "unknown-error-class:";
 
 /// Project a validated compartment onto the durable store row shape. Validation
 /// resolves the message-id endpoints and tiers; publication only stamps the
-/// creation time and marks the row as v2 (non-legacy).
+/// creation time and marks the row as v2 (non-legacy). Boundary dates currently
+/// arrive only through OpenCode shadow sync because the native harness does not
+/// provide a canonical message-timestamp source.
 fn to_stored_compartment(c: &ValidatedCompartment, created_at_ms: i64) -> StoredCompartment {
     StoredCompartment {
         sequence: c.sequence as i64,
@@ -40,6 +42,8 @@ fn to_stored_compartment(c: &ValidatedCompartment, created_at_ms: i64) -> Stored
         end_message: c.end_message as i64,
         start_message_id: c.start_message_id.clone(),
         end_message_id: c.end_message_id.clone(),
+        start_date: None,
+        end_date: None,
         title: c.title.clone(),
         content: c.content.clone(),
         p1: c.p1.clone(),

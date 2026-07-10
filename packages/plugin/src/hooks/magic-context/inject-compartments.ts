@@ -662,6 +662,7 @@ export interface M0M1RenderOptions {
     memoryInjectionBudgetTokens?: number;
     historyBudgetTokens?: number;
     userProfileBudgetTokens?: number;
+    temporalAwareness?: boolean;
     isCacheBustingPass?: boolean;
     /** Provider-side cache-eviction signals for HARD-bust detection. */
     hardSignals?: M0HardSignals;
@@ -712,8 +713,11 @@ export class RenderM1InvalidMarkersError extends Error {
 }
 
 // Compartment already carries p1..p4, importance, episodeType, legacy (v2 model B).
-// Alias retained for readability at render call sites.
-type M0Compartment = Compartment;
+// Boundary dates are render-only values resolved from OpenCode's message database.
+type M0Compartment = Compartment & {
+    startDate?: string | null;
+    endDate?: string | null;
+};
 
 /**
  * The boundary (OpenCode message id) covered by a compartment set rendered into
@@ -1298,6 +1302,36 @@ function nullableString(value: unknown): string | null {
     return typeof value === "string" ? value : null;
 }
 
+/**
+ * Resolve every boundary in one OpenCode DB query for a fresh m[0] or m[1] render.
+ * Callers invoke this only on existing materialize/refresh paths; defer passes replay
+ * persisted bytes without consulting live timestamps.
+ */
+function withCompartmentDates(
+    sessionId: string,
+    compartments: M0Compartment[],
+    temporalAwareness: boolean | undefined,
+): M0Compartment[] {
+    if (!temporalAwareness || compartments.length === 0) return compartments;
+
+    const messageIds = new Set<string>();
+    for (const compartment of compartments) {
+        if (compartment.startMessageId) messageIds.add(compartment.startMessageId);
+        if (compartment.endMessageId) messageIds.add(compartment.endMessageId);
+    }
+    const times = getMessageTimesFromOpenCodeDb(sessionId, Array.from(messageIds));
+    return compartments.map((compartment) => {
+        const startMs = times.get(compartment.startMessageId);
+        const endMs = times.get(compartment.endMessageId);
+        if (startMs === undefined || endMs === undefined) return compartment;
+        return {
+            ...compartment,
+            startDate: formatDate(startMs),
+            endDate: formatDate(endMs),
+        };
+    });
+}
+
 function rowToM0Compartment(row: Record<string, unknown>): M0Compartment {
     return {
         id: Number(row.id ?? 0),
@@ -1590,6 +1624,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         }
         throw error;
     }
+
+    compartments = withCompartmentDates(options.sessionId, compartments, options.temporalAwareness);
 
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     const memoryRenderOptions: MemoryRenderOptions = {
@@ -1894,10 +1930,10 @@ function renderM1WithMetadata(
     });
     if (memoryUpdates.block) blocks.push(memoryUpdates.block);
 
-    const newCompartments = readNewCompartments(
-        options.db,
+    const newCompartments = withCompartmentDates(
         options.sessionId,
-        markers.maxCompartmentSeq,
+        readNewCompartments(options.db, options.sessionId, markers.maxCompartmentSeq),
+        options.temporalAwareness,
     );
     if (newCompartments.length > 0) {
         blocks.push(
@@ -2269,7 +2305,11 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     // cleared this pass), use 0 (stable: renders all memories with no expiry
     // filtering, deterministic across passes — matches Pi fallback).
     snapshotMarkers.materializedAt = options.state.cachedM0MaterializedAt ?? 0;
-    const compartments = readM0Compartments(options.db, options.sessionId);
+    const compartments = withCompartmentDates(
+        options.sessionId,
+        readM0Compartments(options.db, options.sessionId),
+        options.temporalAwareness,
+    );
     // Use the SAME frozen cutoff for the baseline memory read as m[1] does, so a
     // memory crossing expires_at between two fallback passes can't shift the m[0]
     // baseline bytes either (live Date.now() default would reintroduce drift).

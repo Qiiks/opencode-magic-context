@@ -86,7 +86,7 @@ function createOpenCodeDb(
             "INSERT INTO part (message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
         );
         messages.forEach((message, index) => {
-            const timestamp = index + 1;
+            const timestamp = new Date(2025, 0, index + 2, 12).getTime();
             insertMessage.run(
                 message.id,
                 sessionId,
@@ -531,6 +531,8 @@ describe("shadow sender", () => {
                 end_message: 2,
                 start_message_id: "m1#0",
                 end_message_id: "m2#0",
+                start_date: "2025-01-02",
+                end_date: "2025-01-03",
                 title: "Populated compartment",
                 content: "full content",
                 p1: "tier one",

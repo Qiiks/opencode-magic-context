@@ -1,10 +1,13 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { replaceAllCompartmentState } from "../../features/magic-context/compartment-storage";
+import { dirname, join } from "node:path";
+import {
+    appendCompartments,
+    replaceAllCompartmentState,
+} from "../../features/magic-context/compartment-storage";
 import {
     getMemoriesByProject,
     insertMemory,
@@ -31,6 +34,7 @@ import {
     renderCompartmentInjection,
     trimMemoriesToBudgetV2,
 } from "./inject-compartments";
+import { closeReadOnlySessionDb } from "./read-session-db";
 import type { MessageLike } from "./tag-messages";
 
 const SESSION_ID = "ses_test_inject";
@@ -38,6 +42,8 @@ const PROJECT_PATH = "/tmp/test-inject-project";
 
 let db: Database;
 const tempDirs: string[] = [];
+const originalXdgDataHome = process.env.XDG_DATA_HOME;
+const originalXdgCacheHome = process.env.XDG_CACHE_HOME;
 
 function makeDb(): Database {
     const d = new Database(":memory:");
@@ -51,6 +57,33 @@ function makeProjectDir(): string {
     const dir = mkdtempSync(join(tmpdir(), "mc-renderer-test-"));
     tempDirs.push(dir);
     return dir;
+}
+
+function createOpenCodeMessageTimes(rows: Array<{ id: string; timestamp: number }>): void {
+    const dataHome = mkdtempSync(join(tmpdir(), "mc-inject-dates-"));
+    tempDirs.push(dataHome);
+    process.env.XDG_DATA_HOME = dataHome;
+    process.env.XDG_CACHE_HOME = dataHome;
+    closeReadOnlySessionDb();
+
+    const dbPath = join(dataHome, "opencode", "opencode.db");
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const source = new Database(dbPath);
+    try {
+        source.exec(`
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL
+            );
+        `);
+        const insert = source.prepare(
+            "INSERT INTO message (id, session_id, time_created) VALUES (?, ?, ?)",
+        );
+        for (const row of rows) insert.run(row.id, SESSION_ID, row.timestamp);
+    } finally {
+        source.close();
+    }
 }
 
 function readStateFromMeta(): ReturnType<typeof getOrCreateSessionMeta> {
@@ -69,8 +102,37 @@ function userMessage(id: string, text: string): MessageLike {
     };
 }
 
+function storeDatedCompartment(): void {
+    replaceAllCompartmentState(
+        db,
+        SESSION_ID,
+        [
+            {
+                sequence: 1,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m1",
+                endMessageId: "m2",
+                title: "dated compartment",
+                content: "full summary",
+                p1: "full summary",
+                p2: "dense summary",
+                p3: "brief summary",
+                p4: "anchor",
+                importance: 80,
+            },
+        ],
+        [],
+    );
+}
+
 afterEach(() => {
     if (db) db.close();
+    closeReadOnlySessionDb();
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = originalXdgCacheHome;
     clearInjectionCache(SESSION_ID);
     for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
     tempDirs.length = 0;
@@ -459,6 +521,83 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
 });
 
 describe("m[0]/m[1] materialization", () => {
+    it("renders complete date ranges into m[0] only when temporal awareness is enabled", () => {
+        db = makeDb();
+        storeDatedCompartment();
+        createOpenCodeMessageTimes([
+            { id: "m1", timestamp: new Date(2026, 0, 2, 12).getTime() },
+            { id: "m2", timestamp: new Date(2026, 0, 3, 12).getTime() },
+        ]);
+
+        const rendered = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            temporalAwareness: true,
+        });
+
+        expect(rendered.m0Text).toContain(
+            'start="1" end="2" start-date="2026-01-02" end-date="2026-01-03" title="dated compartment"',
+        );
+    });
+
+    it("omits compartment date ranges from m[0] when temporal awareness is disabled", () => {
+        db = makeDb();
+        storeDatedCompartment();
+        createOpenCodeMessageTimes([
+            { id: "m1", timestamp: new Date(2026, 0, 2, 12).getTime() },
+            { id: "m2", timestamp: new Date(2026, 0, 3, 12).getTime() },
+        ]);
+
+        const rendered = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            temporalAwareness: false,
+        });
+
+        expect(rendered.m0Text).not.toContain("start-date=");
+        expect(rendered.m0Text).not.toContain("end-date=");
+    });
+
+    it("replays date-bearing m[0]/m[1] bytes unchanged on consecutive defer passes", () => {
+        db = makeDb();
+        storeDatedCompartment();
+        createOpenCodeMessageTimes([
+            { id: "m1", timestamp: new Date(2026, 0, 2, 12).getTime() },
+            { id: "m2", timestamp: new Date(2026, 0, 3, 12).getTime() },
+        ]);
+        const state = readStateFromMeta();
+
+        const first = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            temporalAwareness: true,
+            isCacheBustingPass: true,
+        });
+        const second = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            temporalAwareness: true,
+            isCacheBustingPass: false,
+        });
+        const third = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            temporalAwareness: true,
+            isCacheBustingPass: false,
+        });
+
+        expect(first.m0Bytes?.toString("utf8")).toContain('start-date="2026-01-02"');
+        expect(second.m0Bytes).toEqual(first.m0Bytes);
+        expect(second.m1Text).toBe(first.m1Text);
+        expect(third.m0Bytes).toEqual(second.m0Bytes);
+        expect(third.m1Text).toBe(second.m1Text);
+    });
+
     it("mustMaterialize returns true on first call", () => {
         db = makeDb();
         const decision = mustMaterialize({
@@ -594,6 +733,7 @@ describe("m[0]/m[1] materialization", () => {
         // split exists to prevent. New compartments fold into m[0] only on a HARD
         // bust (TTL/system/tools/model change).
         db = makeDb();
+        createOpenCodeMessageTimes([{ id: "m1", timestamp: new Date(2026, 0, 4, 12).getTime() }]);
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
@@ -601,25 +741,21 @@ describe("m[0]/m[1] materialization", () => {
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
             projectDirectory,
+            temporalAwareness: true,
         });
         const state = readStateFromMeta();
-        replaceAllCompartmentState(
-            db,
-            SESSION_ID,
-            [
-                {
-                    sequence: 2,
-                    startMessage: 1,
-                    endMessage: 1,
-                    startMessageId: "m1",
-                    endMessageId: "m1",
-                    title: "New",
-                    content: "New summary",
-                    p1: "New summary",
-                },
-            ],
-            [],
-        );
+        appendCompartments(db, SESSION_ID, [
+            {
+                sequence: 2,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                title: "New",
+                content: "New summary",
+                p1: "New summary",
+            },
+        ]);
 
         expect(
             mustMaterialize({
@@ -630,6 +766,19 @@ describe("m[0]/m[1] materialization", () => {
                 projectDirectory,
             }).value,
         ).toBe(false);
+        const refreshed = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            temporalAwareness: true,
+            isCacheBustingPass: true,
+        });
+        expect(refreshed.m0RematerializedThisPass).toBe(false);
+        expect(refreshed.m1Text).toContain(
+            'start="1" end="1" start-date="2026-01-04" end-date="2026-01-04" title="New"',
+        );
     });
 
     it("mustMaterialize does NOT materialize m[0] on a retrospective memory write", () => {

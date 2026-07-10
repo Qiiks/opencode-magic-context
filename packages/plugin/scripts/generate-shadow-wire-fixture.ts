@@ -71,7 +71,7 @@ function createOpenCodeFixtureDb(dataHome: string): void {
             },
         ];
         rows.forEach((row, messageIndex) => {
-            const timestamp = messageIndex + 1;
+            const timestamp = new Date(2025, 0, messageIndex + 2, 12).getTime();
             insertMessage.run(
                 row.id,
                 SESSION_ID,

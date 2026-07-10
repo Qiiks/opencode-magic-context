@@ -280,6 +280,10 @@ struct ShadowCompartmentWire {
     #[serde(default)]
     end_message_id: String,
     #[serde(default)]
+    start_date: Option<String>,
+    #[serde(default)]
+    end_date: Option<String>,
+    #[serde(default)]
     title: String,
     #[serde(default)]
     content: String,
@@ -467,6 +471,8 @@ impl From<ShadowCompartmentWire> for StoredCompartment {
             end_message: value.end_message,
             start_message_id: value.start_message_id,
             end_message_id: value.end_message_id,
+            start_date: value.start_date,
+            end_date: value.end_date,
             title: value.title,
             content: value.content,
             p1: value.p1,
@@ -7163,6 +7169,8 @@ mod tests {
         end_message: i64,
         start_message_id: String,
         end_message_id: String,
+        start_date: String,
+        end_date: String,
         title: String,
         content: String,
         p1: String,
@@ -7498,6 +7506,8 @@ mod tests {
                         "end_message": 0,
                         "start_message_id": "m0#0",
                         "end_message_id": "m0#0",
+                        "start_date": "2026-01-02",
+                        "end_date": "2026-01-03",
                         "title": "c0",
                         "content": "summary",
                         "p1": "summary"
@@ -7521,6 +7531,31 @@ mod tests {
         let loaded = store.load("shadow:ses").unwrap();
         assert_eq!(loaded.meta.shadow_seq, 1);
         assert_eq!(loaded.meta.last_todo_state.as_deref(), Some("[]"));
+        let stored_compartments = store.load_compartments("shadow:ses").unwrap();
+        assert_eq!(
+            stored_compartments[0].start_date.as_deref(),
+            Some("2026-01-02")
+        );
+        assert_eq!(
+            stored_compartments[0].end_date.as_deref(),
+            Some("2026-01-03")
+        );
+        let composed = crate::m0_compose::compose_m0_from_store(
+            &store,
+            &crate::m0_compose::M0ComposeInputs {
+                session_id: "shadow:ses",
+                project_path: "shadow:ses",
+                project_directory: project.to_str().unwrap(),
+                now_ms: 0,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+            },
+            |_| 0,
+        )
+        .unwrap();
+        assert!(composed.m0_bytes.contains(
+            "start=\"0\" end=\"0\" start-date=\"2026-01-02\" end-date=\"2026-01-03\" title=\"c0\""
+        ));
         assert_eq!(
             store.load_active_memories("shadow:ses", 0).unwrap()[0].id,
             0

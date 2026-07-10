@@ -121,6 +121,14 @@ pushRender(
 );
 // XML escaping in title + body
 pushRender([v2(1, 2, 'a<b>&"c"', 50, ["x < y & z", "d", "e", "f"])]);
+// Complete temporal range: attributes render after end and before title.
+pushRender([
+    {
+        ...v2(1, 2, "Dated", 50, ["dated body", "dense", "brief", "anchor"]),
+        startDate: "2026-01-02",
+        endDate: "2026-01-03",
+    },
+]);
 // legacy (pre-v2 flat-content) rows: one whose content has a "U:" line, one without
 // (the renderer starts the former one tier less truncated than the latter)
 pushRender([

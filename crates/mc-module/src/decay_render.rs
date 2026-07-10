@@ -31,6 +31,8 @@ pub struct DecayRenderCompartment {
     pub end_message: i64,
     pub title: String,
     pub content: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
     pub p1: Option<String>,
     pub p2: Option<String>,
     pub p3: Option<String>,
@@ -49,6 +51,8 @@ impl From<&StoredCompartment> for DecayRenderCompartment {
             end_message: c.end_message,
             title: c.title.clone(),
             content: c.content.clone(),
+            start_date: c.start_date.clone(),
+            end_date: c.end_date.clone(),
             p1: c.p1.clone(),
             p2: c.p2.clone(),
             p3: c.p3.clone(),
@@ -159,8 +163,18 @@ pub fn render_compartment_at_tier(c: &DecayRenderCompartment, tier: u8) -> Strin
 }
 
 fn render_one_compartment(c: &DecayRenderCompartment, tier: u8) -> String {
+    let date_attrs = match (&c.start_date, &c.end_date) {
+        (Some(start_date), Some(end_date)) if !start_date.is_empty() && !end_date.is_empty() => {
+            format!(
+                " start-date=\"{}\" end-date=\"{}\"",
+                escape_xml_attr(start_date),
+                escape_xml_attr(end_date)
+            )
+        }
+        _ => String::new(),
+    };
     let base_attrs = format!(
-        "start=\"{}\" end=\"{}\" title=\"{}\"",
+        "start=\"{}\" end=\"{}\"{date_attrs} title=\"{}\"",
         c.start_message,
         c.end_message,
         escape_xml_attr(&c.title)
@@ -453,6 +467,8 @@ mod tests {
             end_message: 9,
             title: "Stored".into(),
             content: "P1 full".into(),
+            start_date: Some("2026-01-02".into()),
+            end_date: Some("2026-01-03".into()),
             p1: Some("P1 full".into()),
             p2: Some("P2".into()),
             importance: 50,
@@ -460,7 +476,12 @@ mod tests {
             ..Default::default()
         };
         let out = render_stored_compartments(std::slice::from_ref(&stored), 60_000.0, no_guard);
-        assert!(out.contains("title=\"Stored\""), "{out}");
+        assert!(
+            out.contains(
+                "start=\"1\" end=\"9\" start-date=\"2026-01-02\" end-date=\"2026-01-03\" title=\"Stored\""
+            ),
+            "{out}"
+        );
         assert!(
             out.contains(">\nP1 full\n<"),
             "newest stored row at p1: {out}"
@@ -477,6 +498,19 @@ mod tests {
         let out2 =
             render_stored_compartments(std::slice::from_ref(&legacy_ish), 60_000.0, no_guard);
         assert!(out2.contains(">\nflat\n<"), "empty p1 → flat: {out2}");
+
+        let partial = DecayRenderCompartment {
+            start_message: 1,
+            end_message: 2,
+            title: "Partial".into(),
+            content: "flat".into(),
+            start_date: Some("2026-01-02".into()),
+            legacy: Some(1),
+            ..Default::default()
+        };
+        let partial_out = render_compartment_at_tier(&partial, 1);
+        assert!(!partial_out.contains("start-date="), "{partial_out}");
+        assert!(!partial_out.contains("end-date="), "{partial_out}");
     }
 
     #[test]
@@ -498,6 +532,10 @@ mod tests {
         #[serde(rename = "endMessage")]
         end: i64,
         title: String,
+        #[serde(default, rename = "startDate")]
+        start_date: Option<String>,
+        #[serde(default, rename = "endDate")]
+        end_date: Option<String>,
         #[serde(default)]
         content: String,
         p1: Option<String>,
@@ -537,6 +575,8 @@ mod tests {
                     end_message: r.end,
                     title: r.title.clone(),
                     content: r.content.clone(),
+                    start_date: r.start_date.clone(),
+                    end_date: r.end_date.clone(),
                     p1: r.p1.clone(),
                     p2: r.p2.clone(),
                     p3: r.p3.clone(),
@@ -575,6 +615,8 @@ mod tests {
                     end_message: r.end,
                     title: r.title.clone(),
                     content: r.content.clone(),
+                    start_date: r.start_date.clone(),
+                    end_date: r.end_date.clone(),
                     p1: r.p1.clone(),
                     p2: r.p2.clone(),
                     p3: r.p3.clone(),

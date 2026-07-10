@@ -687,6 +687,16 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_channel1_appends(session_id, fired_at_ms, block_id);
     ",
     },
+    Migration {
+        version: 12,
+        // OpenCode shadow sync can carry pre-formatted compartment boundary dates.
+        // Native historian rows leave these nullable until their harness provides a
+        // canonical message-timestamp source.
+        statements: "
+        ALTER TABLE mc_compartments ADD COLUMN start_date TEXT;
+        ALTER TABLE mc_compartments ADD COLUMN end_date TEXT;
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1283,6 +1293,8 @@ pub struct StoredCompartment {
     pub end_message: i64,
     pub start_message_id: String,
     pub end_message_id: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
     pub title: String,
     /// v2 P1 text, or the flat legacy body. Always present.
     pub content: String,
@@ -2428,7 +2440,8 @@ impl McStore {
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                        title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at
+                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
+                        episode_type, legacy, created_at
                  FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
             )?;
             let mapped = stmt
@@ -2439,16 +2452,18 @@ impl McStore {
                         end_message: r.get(2)?,
                         start_message_id: r.get(3)?,
                         end_message_id: r.get(4)?,
-                        title: r.get(5)?,
-                        content: r.get(6)?,
-                        p1: r.get(7)?,
-                        p2: r.get(8)?,
-                        p3: r.get(9)?,
-                        p4: r.get(10)?,
-                        importance: r.get::<_, Option<i64>>(11)?.unwrap_or(50) as i32,
-                        episode_type: r.get(12)?,
-                        legacy: r.get::<_, Option<i64>>(13)?.unwrap_or(0) as i32,
-                        created_at: r.get(14)?,
+                        start_date: r.get(5)?,
+                        end_date: r.get(6)?,
+                        title: r.get(7)?,
+                        content: r.get(8)?,
+                        p1: r.get(9)?,
+                        p2: r.get(10)?,
+                        p3: r.get(11)?,
+                        p4: r.get(12)?,
+                        importance: r.get::<_, Option<i64>>(13)?.unwrap_or(50) as i32,
+                        episode_type: r.get(14)?,
+                        legacy: r.get::<_, Option<i64>>(15)?.unwrap_or(0) as i32,
+                        created_at: r.get(16)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2473,7 +2488,8 @@ impl McStore {
                 .optional()?;
             let mut stmt = conn.prepare(
                 "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                        title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at
+                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
+                        episode_type, legacy, created_at
                  FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
             )?;
             let compartments = stmt
@@ -2484,16 +2500,18 @@ impl McStore {
                         end_message: r.get(2)?,
                         start_message_id: r.get(3)?,
                         end_message_id: r.get(4)?,
-                        title: r.get(5)?,
-                        content: r.get(6)?,
-                        p1: r.get(7)?,
-                        p2: r.get(8)?,
-                        p3: r.get(9)?,
-                        p4: r.get(10)?,
-                        importance: r.get::<_, Option<i64>>(11)?.unwrap_or(50) as i32,
-                        episode_type: r.get(12)?,
-                        legacy: r.get::<_, Option<i64>>(13)?.unwrap_or(0) as i32,
-                        created_at: r.get(14)?,
+                        start_date: r.get(5)?,
+                        end_date: r.get(6)?,
+                        title: r.get(7)?,
+                        content: r.get(8)?,
+                        p1: r.get(9)?,
+                        p2: r.get(10)?,
+                        p3: r.get(11)?,
+                        p4: r.get(12)?,
+                        importance: r.get::<_, Option<i64>>(13)?.unwrap_or(50) as i32,
+                        episode_type: r.get(14)?,
+                        legacy: r.get::<_, Option<i64>>(15)?.unwrap_or(0) as i32,
+                        created_at: r.get(16)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2568,31 +2586,7 @@ impl McStore {
                 params![session_id],
             )?;
             for c in compartments {
-                tx.execute(
-                    "INSERT INTO mc_compartments
-                       (session_id, sequence, start_message, end_message, start_message_id,
-                        end_message_id, title, content, p1, p2, p3, p4, importance,
-                        episode_type, legacy, created_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-                    params![
-                        session_id,
-                        c.sequence,
-                        c.start_message,
-                        c.end_message,
-                        c.start_message_id,
-                        c.end_message_id,
-                        c.title,
-                        c.content,
-                        c.p1,
-                        c.p2,
-                        c.p3,
-                        c.p4,
-                        c.importance as i64,
-                        c.episode_type,
-                        c.legacy as i64,
-                        c.created_at,
-                    ],
-                )?;
+                insert_compartment_tx(tx, session_id, c.sequence, c)?;
             }
             Ok(())
         })?;
@@ -4047,14 +4041,16 @@ fn upsert_compartment_tx(
     tx.execute(
         "INSERT INTO mc_compartments
            (session_id, sequence, start_message, end_message, start_message_id,
-            end_message_id, title, content, p1, p2, p3, p4, importance,
-            episode_type, legacy, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+            end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
+            importance, episode_type, legacy, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
          ON CONFLICT(session_id, sequence) DO UPDATE SET
             start_message = excluded.start_message,
             end_message = excluded.end_message,
             start_message_id = excluded.start_message_id,
             end_message_id = excluded.end_message_id,
+            start_date = excluded.start_date,
+            end_date = excluded.end_date,
             title = excluded.title,
             content = excluded.content,
             p1 = excluded.p1,
@@ -4072,6 +4068,8 @@ fn upsert_compartment_tx(
             c.end_message,
             &c.start_message_id,
             &c.end_message_id,
+            c.start_date.as_deref(),
+            c.end_date.as_deref(),
             &c.title,
             &c.content,
             c.p1.as_deref(),
@@ -4243,9 +4241,9 @@ fn insert_compartment_tx(
     tx.execute(
         "INSERT INTO mc_compartments
            (session_id, sequence, start_message, end_message, start_message_id,
-            end_message_id, title, content, p1, p2, p3, p4, importance,
-            episode_type, legacy, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
+            importance, episode_type, legacy, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
         params![
             session_id,
             sequence,
@@ -4253,6 +4251,8 @@ fn insert_compartment_tx(
             c.end_message,
             &c.start_message_id,
             &c.end_message_id,
+            c.start_date.as_deref(),
+            c.end_date.as_deref(),
             &c.title,
             &c.content,
             c.p1.as_deref(),
@@ -4976,7 +4976,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_and_migrated_stores_have_pass_trace_table() {
+    fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
         let fresh_has_table = fresh
@@ -5029,6 +5029,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_has_table.as_deref(), Some("mc_pass_trace"));
+        let migrated_date_columns = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('mc_compartments')
+                     WHERE name IN ('start_date', 'end_date')",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(migrated_date_columns, 2);
     }
 
     #[test]
@@ -5062,6 +5074,8 @@ mod tests {
                 sequence: 2,
                 start_message: 10,
                 end_message: 19,
+                start_date: Some("2026-01-02".into()),
+                end_date: Some("2026-01-03".into()),
                 title: "v2 row".into(),
                 content: "P1 full".into(),
                 p1: Some("P1 full".into()),

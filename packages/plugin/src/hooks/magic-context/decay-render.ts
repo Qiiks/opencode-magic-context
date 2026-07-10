@@ -32,6 +32,8 @@ export interface DecayRenderCompartment {
     endMessage: number;
     title: string;
     content: string;
+    startDate?: string | null;
+    endDate?: string | null;
     p1?: string | null;
     p2?: string | null;
     p3?: string | null;
@@ -101,7 +103,11 @@ export function renderCompartmentAtTier(c: DecayRenderCompartment, tier: number)
 }
 
 function renderOneCompartment(c: DecayRenderCompartment, tier: number): string {
-    const baseAttrs = `start="${c.startMessage}" end="${c.endMessage}" title="${escapeXmlAttr(c.title)}"`;
+    const dateAttrs =
+        c.startDate && c.endDate
+            ? ` start-date="${escapeXmlAttr(c.startDate)}" end-date="${escapeXmlAttr(c.endDate)}"`
+            : "";
+    const baseAttrs = `start="${c.startMessage}" end="${c.endMessage}"${dateAttrs} title="${escapeXmlAttr(c.title)}"`;
     if (tier >= 5) return ""; // archived
 
     // Legacy rows AND malformed pseudo-v2 rows (legacy=0 but no usable p1, e.g.

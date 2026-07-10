@@ -5,6 +5,7 @@ export interface RawMessage {
     id: string;
     role: string;
     parts: unknown[];
+    createdAt?: number | null;
     version?: string | number | null;
 }
 
@@ -76,7 +77,7 @@ function attachRawPartVersion(value: unknown, timeUpdated: number | undefined): 
 export function readRawSessionMessagesFromDb(db: Database, sessionId: string): RawMessage[] {
     const messageRows = db
         .prepare(
-            "SELECT id, data, time_updated FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC",
+            "SELECT id, data, time_created, time_updated FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC",
         )
         .all(sessionId)
         .filter(isRawMessageRow);
@@ -112,6 +113,7 @@ export function readRawSessionMessagesFromDb(db: Database, sessionId: string): R
             id: row.id,
             role,
             parts: partsByMessageId.get(row.id) ?? [],
+            createdAt: row.time_created ?? null,
             version: row.time_updated ?? null,
         };
     });
@@ -178,7 +180,7 @@ export function readRawSessionTailFromDb(
 
     const messageRows = db
         .prepare(
-            `SELECT id, data, time_updated FROM message
+            `SELECT id, data, time_created, time_updated FROM message
              WHERE session_id = ?
                AND (time_created > ? OR (time_created = ? AND id >= ?))
              ORDER BY time_created ASC, id ASC`,
@@ -229,6 +231,7 @@ export function readRawSessionTailFromDb(
             id: row.id,
             role: typeof info.role === "string" ? info.role : "unknown",
             parts: partsByMessageId.get(row.id) ?? [],
+            createdAt: row.time_created ?? null,
             version: row.time_updated ?? null,
         });
         ord += 1;
@@ -410,6 +413,7 @@ export function readRawSessionMessageByIdFromDb(
         parts: partRows.map((part) =>
             attachRawPartVersion(parseJsonUnknown(part.data), part.time_updated),
         ),
+        createdAt: row.time_created,
         version: row.time_updated ?? null,
     };
 }

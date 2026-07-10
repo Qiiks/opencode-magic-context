@@ -38,6 +38,7 @@ import {
 } from "./read-session-chunk";
 import type { RawMessage } from "./read-session-raw";
 import type { MessageLike, TagNormalizationTarget } from "./tag-messages";
+import { formatDate } from "./temporal-awareness";
 
 const DEFAULT_MODULE_ID = "magic-context";
 function getDefaultConnectionFile(): string {
@@ -665,6 +666,15 @@ function serializeCompartment(args: {
     });
     if (startOrdinal === "mismatch" || endOrdinal === "mismatch") return "mismatch";
     if (startOrdinal === null || endOrdinal === null) return null;
+    const startCreatedAt = args.rawById.get(args.compartment.startMessageId)?.createdAt;
+    const endCreatedAt = args.rawById.get(args.compartment.endMessageId)?.createdAt;
+    const dateRange =
+        typeof startCreatedAt === "number" && typeof endCreatedAt === "number"
+            ? {
+                  start_date: formatDate(startCreatedAt),
+                  end_date: formatDate(endCreatedAt),
+              }
+            : {};
     return {
         sequence: args.compartment.sequence,
         start_message: startOrdinal,
@@ -679,6 +689,7 @@ function serializeCompartment(args: {
             args.rawById.get(args.compartment.endMessageId),
             "end",
         ),
+        ...dateRange,
         title: args.compartment.title,
         content: args.compartment.content,
         p1: args.compartment.p1,

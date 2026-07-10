@@ -1822,6 +1822,7 @@ export function createTransform(deps: TransformDeps) {
                 injectDocs: deps.injectDocs,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
+                temporalAwareness: deps.experimentalTemporalAwareness,
                 hardSignals: m0HardSignals,
             },
         });

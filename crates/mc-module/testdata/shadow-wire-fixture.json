@@ -10,6 +10,8 @@
         "end_message": 2,
         "start_message_id": "message-1#0",
         "end_message_id": "message-2#2",
+        "start_date": "2025-01-02",
+        "end_date": "2025-01-03",
         "title": "Fixture compartment",
         "content": "Fixture full compartment content",
         "p1": "Fixture P1",
