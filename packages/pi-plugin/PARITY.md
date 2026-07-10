@@ -721,6 +721,16 @@ sidekick, a separate security concern, unaffected by this divergence.
 
 ---
 
+## 25. Pi clone/fork inherits session state; OpenCode `/fork` does not yet
+
+Pi preserves JSONL entry ids when cloning a branch, so the clone-start hook can
+copy compartments, tags, reductions, and deferred Pi marker state while filtering
+them to the copied prefix. OpenCode re-mints message ids during `/fork`, making
+entry-id-keyed migration unsafe there. OpenCode fork inheritance therefore needs
+a separate future design based on a stable cross-fork identity.
+
+---
+
 ## Maintenance
 
 Update this file whenever a deliberate Pi↔OpenCode divergence is introduced or
