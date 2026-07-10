@@ -888,12 +888,20 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
             const item = state.queue.shift();
             if (!item) continue;
             if (item.kind === "reset") {
-                await performReset({
-                    sessionId,
-                    state,
-                    reason: item.reason,
-                    projectRoot: item.projectRoot,
-                });
+                try {
+                    await performReset({
+                        sessionId,
+                        state,
+                        reason: item.reason,
+                        projectRoot: item.projectRoot,
+                    });
+                } catch (error) {
+                    state.counters.send_failures += 1;
+                    state.initialized = false;
+                    state.blockedUntilReset = true;
+                    state.requireResetReason ??= item.reason || "reset_retry";
+                    sessionLog(sessionId, "shadow: reset failed (ignored):", error);
+                }
                 continue;
             }
             try {
@@ -955,6 +963,9 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
         state: SessionQueueState,
         pass: ShadowTransformPass,
     ): Promise<void> => {
+        if (state.blockedUntilReset && !state.requireResetReason) {
+            state.requireResetReason = "unknown_block";
+        }
         if (!state.initialized || state.requireResetReason) {
             await performReset({
                 sessionId: pass.sessionId,
@@ -1142,10 +1153,16 @@ class SubcShadowTransport implements ShadowTransport {
     private pending = Promise.resolve();
     private nextProbeMs = 0;
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
+    private requestTimeoutMs: number;
 
-    constructor(connectionFile?: string, moduleId = DEFAULT_MODULE_ID) {
+    constructor(
+        connectionFile?: string,
+        moduleId = DEFAULT_MODULE_ID,
+        requestTimeoutMs = REQUEST_TIMEOUT_MS,
+    ) {
         this.connectionFile = connectionFile ?? getDefaultConnectionFile();
         this.moduleId = moduleId;
+        this.requestTimeoutMs = requestTimeoutMs;
     }
 
     async call(args: {
@@ -1207,32 +1224,38 @@ class SubcShadowTransport implements ShadowTransport {
         if (now < this.nextProbeMs) {
             throw new Error(`connection backoff active until ${this.nextProbeMs}`);
         }
+        let candidate: net.Socket | null = null;
         try {
             const conn = readConnectionInfo(this.connectionFile);
             const endpoint = conn.endpoints[0];
             if (!endpoint) throw new Error("connection file has no endpoint");
-            const socket = await connectTcp(endpoint.host, endpoint.port, HANDSHAKE_TIMEOUT_MS);
-            const reader = new SocketReader(socket);
-            await authenticateSubcClient(socket, reader, conn, HANDSHAKE_TIMEOUT_MS);
+            candidate = await connectTcp(endpoint.host, endpoint.port, HANDSHAKE_TIMEOUT_MS);
+            const reader = new SocketReader(candidate);
+            await authenticateSubcClient(candidate, reader, conn, HANDSHAKE_TIMEOUT_MS);
+            const socket = candidate;
             this.socket = socket;
             this.reader = reader;
             this.routes.clear();
             this.backoffMs = CONNECT_BACKOFF_INITIAL_MS;
             this.nextProbeMs = 0;
             socket.once("close", () => {
-                this.socket = null;
-                this.reader = null;
-                this.routes.clear();
+                if (this.socket === socket) this.invalidateConnection(socket);
             });
         } catch (error) {
-            this.socket?.destroy();
-            this.socket = null;
-            this.reader = null;
-            this.routes.clear();
+            candidate?.destroy();
+            this.invalidateConnection();
             this.nextProbeMs = Date.now() + this.backoffMs;
             this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
             throw error;
         }
+    }
+
+    private invalidateConnection(socket: net.Socket | null = this.socket): void {
+        if (socket && this.socket && socket !== this.socket) return;
+        this.socket = null;
+        this.reader = null;
+        this.routes.clear();
+        socket?.destroy();
     }
 
     private async unaryJson(channel: number, body: unknown): Promise<unknown> {
@@ -1241,21 +1264,28 @@ class SubcShadowTransport implements ShadowTransport {
         const reader = this.reader;
         if (!socket || !reader) throw new Error("connection unavailable");
         const corr = this.nextCorr++;
-        await writeFrame(socket, {
-            type: FRAME_REQUEST,
-            channel,
-            corr,
-            body: Buffer.from(JSON.stringify(body)),
-        });
-        const frame = await readTerminalFor(reader, channel, corr, REQUEST_TIMEOUT_MS);
-        if (frame.type === FRAME_ERROR) {
-            throw parseErrorBody(frame.body);
+        try {
+            await writeFrame(socket, {
+                type: FRAME_REQUEST,
+                channel,
+                corr,
+                body: Buffer.from(JSON.stringify(body)),
+            });
+            const frame = await readTerminalFor(reader, channel, corr, this.requestTimeoutMs);
+            if (frame.type === FRAME_ERROR) {
+                throw parseErrorBody(frame.body);
+            }
+            if (frame.type !== FRAME_RESPONSE) {
+                throw new Error(`unexpected subc frame type ${frame.type}`);
+            }
+            if (frame.body.length === 0) return null;
+            return JSON.parse(frame.body.toString("utf8"));
+        } catch (error) {
+            // A timeout or malformed/error frame can leave unread bytes buffered.
+            // Reusing that stream would make the next response start mid-frame.
+            this.invalidateConnection(socket);
+            throw error;
         }
-        if (frame.type !== FRAME_RESPONSE) {
-            throw new Error(`unexpected subc frame type ${frame.type}`);
-        }
-        if (frame.body.length === 0) return null;
-        return JSON.parse(frame.body.toString("utf8"));
     }
 }
 
@@ -1464,6 +1494,8 @@ function parseErrorBody(body: Buffer): Error & { code?: string } {
 }
 
 export const __shadowSenderTest = {
+    SocketReader,
+    SubcShadowTransport,
     buildShadowResetBody,
     buildShadowTransformBody,
     buildStateSyncPayload,

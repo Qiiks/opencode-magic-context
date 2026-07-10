@@ -1,7 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
+import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -154,6 +156,7 @@ class FakeTransport implements ShadowTransport {
     calls: Array<{ method: string; body: unknown }> = [];
     syncFailuresRemaining = 0;
     rejectNextTransform = false;
+    resetFailuresRemaining = 0;
     seq = 0;
     releaseReset: (() => void) | null = null;
     private resetGate: Promise<void> | null = null;
@@ -169,6 +172,10 @@ class FakeTransport implements ShadowTransport {
         if (req.method === "shadow_reset" && this.resetGate) {
             await this.resetGate;
             this.resetGate = null;
+        }
+        if (req.method === "shadow_reset" && this.resetFailuresRemaining > 0) {
+            this.resetFailuresRemaining -= 1;
+            throw new Error("reset interrupted");
         }
         if (req.method === "state_sync" && this.syncFailuresRemaining > 0) {
             this.syncFailuresRemaining -= 1;
@@ -196,6 +203,34 @@ class FakeTransport implements ShadowTransport {
         }
         return { result: {} };
     }
+}
+
+class FakeSocket extends EventEmitter {
+    destroyed = false;
+    onWrite: ((chunk: Buffer) => void) | null = null;
+
+    write(chunk: Uint8Array): boolean {
+        this.onWrite?.(Buffer.from(chunk));
+        return true;
+    }
+
+    destroy(): this {
+        if (this.destroyed) return this;
+        this.destroyed = true;
+        this.emit("close");
+        return this;
+    }
+}
+
+function responseFrame(channel: number, corr: number, body: unknown): Buffer {
+    const payload = Buffer.from(JSON.stringify(body));
+    const header = Buffer.alloc(17);
+    header.writeUInt32LE(payload.length, 0);
+    header.writeUInt8(1, 4);
+    header.writeUInt8(1, 5);
+    header.writeUInt16LE(channel, 7);
+    header.writeBigUInt64LE(BigInt(corr), 9);
+    return Buffer.concat([header, payload]);
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -655,6 +690,75 @@ describe("shadow sender", () => {
         expect(syncBodies[1].compartments).toContainEqual(
             expect.objectContaining({ sequence: 2, content: "recreated sequence two" }),
         );
+    });
+
+    it("retries a reset on the next pass after a queued reset fails", async () => {
+        useTempDataHome("shadow-reset-retry-");
+        const sessionId = "s-reset-retry";
+        createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "one" }]);
+        const db = openDatabase();
+        const transport = new FakeTransport();
+        transport.resetFailuresRemaining = 1;
+        const sender = createShadowSender({ transport });
+
+        sender.resetSession(sessionId, "manual_recovery");
+        await waitFor(() => sender.getStats(sessionId).send_failures === 1);
+        const msg = message(sessionId, "m1", "one");
+        sender.enqueue(
+            basePass({ db, sessionId, inputMessages: [msg], outputMessages: [msg], nowMs: 1 }),
+        );
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 1,
+        );
+
+        expect(transport.calls.map((call) => call.method)).toEqual([
+            "shadow_reset",
+            "shadow_reset",
+            "state_sync",
+            "shadow_transform",
+        ]);
+    });
+
+    it("destroys a timed-out socket and succeeds immediately on a clean socket", async () => {
+        const first = new FakeSocket();
+        const second = new FakeSocket();
+        second.onWrite = () => {
+            queueMicrotask(() => second.emit("data", responseFrame(1, 2, { result: { ok: true } })));
+        };
+        const sockets = [first, second];
+        const transport = new __shadowSenderTest.SubcShadowTransport(
+            "/unused/connection.json",
+            "magic-context",
+            20,
+        );
+        const internals = transport as unknown as {
+            socket: Socket | null;
+            reader: unknown;
+            ensureConnected: () => Promise<void>;
+            ensureRoute: () => Promise<number>;
+        };
+        let nextSocket = 0;
+        internals.ensureRoute = async () => 1;
+        internals.ensureConnected = async () => {
+            if (internals.socket && !internals.socket.destroyed && internals.reader) return;
+            const socket = sockets[nextSocket++];
+            internals.socket = socket as unknown as Socket;
+            internals.reader = new __shadowSenderTest.SocketReader(
+                socket as unknown as Socket,
+            );
+        };
+        const request = {
+            sessionId: "s-socket",
+            projectRoot: "/tmp/project",
+            method: "shadow_transform" as const,
+            body: { method: "shadow_transform" },
+        };
+
+        await expect(transport.call(request)).rejects.toThrow("read timeout");
+        expect(first.destroyed).toBe(true);
+        await expect(transport.call(request)).resolves.toEqual({ result: { ok: true } });
+        expect(nextSocket).toBe(2);
+        expect(second.destroyed).toBe(false);
     });
 
     it("keeps sender exceptions off the transform hot path", () => {
