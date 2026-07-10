@@ -199,6 +199,8 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *  - `embedding.endpoint` / `embedding.provider` — a repo must not choose
  *    where private memory/search/commit text is embedded. User-level config is
  *    the trust boundary for embedding destinations.
+ *  - `shadow_transform` — developer-only subc mirror lane. A repository must
+ *    not enable extra local module traffic or comparison telemetry.
  *  - `historian.model` / `historian.fallback_models` — historian model spend is
  *    user-level only; a cloned repo cannot force extra compaction cost.
  *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
@@ -226,6 +228,13 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         warnings.push(
             "Ignoring sqlite.* from project config (security: SQLite cache/mmap PRAGMAs apply to the " +
                 "process-global shared database handle; only user-level config may set them).",
+        );
+    }
+
+    if ("shadow_transform" in projectRaw) {
+        delete projectRaw.shadow_transform;
+        warnings.push(
+            "Ignoring shadow_transform from project config (security: this developer-only mirror lane is user-level only).",
         );
     }
 

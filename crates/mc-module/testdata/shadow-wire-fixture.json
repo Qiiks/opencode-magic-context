@@ -1,0 +1,230 @@
+{
+  "state_sync": {
+    "method": "state_sync",
+    "shadow_generation": 7,
+    "expected_shadow_seq": 11,
+    "compartments": [
+      {
+        "sequence": 1,
+        "start_message": 1,
+        "end_message": 2,
+        "start_message_id": "message-1#0",
+        "end_message_id": "message-2#2",
+        "start_date": "2025-01-02",
+        "end_date": "2025-01-03",
+        "title": "Fixture compartment",
+        "content": "Fixture full compartment content",
+        "p1": "Fixture P1",
+        "p2": "Fixture P2",
+        "p3": "Fixture P3",
+        "p4": "Fixture P4",
+        "importance": 87,
+        "episode_type": "feature,verification",
+        "legacy": 0,
+        "created_at": 1735689600000
+      }
+    ],
+    "memories": [
+      {
+        "id": 1,
+        "project_path": "/fixture/project",
+        "category": "ARCHITECTURE",
+        "content": "Fixture workspace memory",
+        "normalized_hash": "25313df7b2535f6980ccfebe30bd40bc",
+        "importance": 91,
+        "scope": "ecosystem",
+        "shareable": 1,
+        "source_session_id": "shadow-wire-fixture-session",
+        "source_type": "historian",
+        "seen_count": 3,
+        "retrieval_count": 4,
+        "first_seen_at": 1735689592000,
+        "created_at": 1735689593000,
+        "updated_at": 1735689594000,
+        "last_seen_at": 1735689595000,
+        "last_retrieved_at": 1735689596000,
+        "status": "permanent",
+        "expires_at": 1735776000000,
+        "verification_status": "verified",
+        "verified_at": 1735689597000,
+        "superseded_by_memory_id": 99,
+        "merged_from": "[7,8]",
+        "metadata_json": "{\"fixture\":true}"
+      },
+      {
+        "id": 2,
+        "project_path": "/fixture/foreign",
+        "category": "CONSTRAINTS",
+        "content": "Fixture foreign workspace constraint",
+        "normalized_hash": "8f43ff0598ac4b110005d84ca1bcca36",
+        "importance": 84,
+        "scope": "project",
+        "shareable": 1,
+        "source_session_id": "fixture-foreign-session",
+        "source_type": "dreamer",
+        "seen_count": 2,
+        "retrieval_count": 1,
+        "first_seen_at": 1735689582000,
+        "created_at": 1735689583000,
+        "updated_at": 1735689584000,
+        "last_seen_at": 1735689585000,
+        "last_retrieved_at": 1735689586000,
+        "status": "active",
+        "expires_at": 1735862400000,
+        "verification_status": "verified",
+        "verified_at": 1735689587000,
+        "superseded_by_memory_id": 101,
+        "merged_from": "[9,10]",
+        "metadata_json": "{\"foreign\":true}"
+      }
+    ],
+    "memory_mutations": [
+      {
+        "id": 1,
+        "project_path": "/fixture/project",
+        "mutation_type": "superseded",
+        "target_memory_id": 1,
+        "superseded_by_id": 99,
+        "category": "ARCHITECTURE",
+        "new_content": "Fixture superseding content",
+        "queued_at": 1735689599000
+      }
+    ],
+    "workspace": {
+      "fingerprint": "b09c30fd5c913f0b993abafc7798be85dc74dcaf1c1df59a0216083f87164822",
+      "members": [
+        {
+          "project_path": "/fixture/project",
+          "share_categories": [
+            "CONSTRAINTS"
+          ]
+        },
+        {
+          "project_path": "/fixture/foreign",
+          "share_categories": [
+            "CONSTRAINTS"
+          ]
+        }
+      ]
+    },
+    "last_todo_state": "[{\"content\":\"fixture todo\",\"status\":\"pending\"}]"
+  },
+  "shadow_transform": {
+    "method": "shadow_transform",
+    "shadow_generation": 7,
+    "input": [
+      {
+        "info": {
+          "id": "message-1",
+          "role": "user",
+          "sessionID": "shadow-wire-fixture-session"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "fixture input"
+          }
+        ],
+        "absolute_ordinal": 1
+      },
+      {
+        "info": {
+          "id": "message-2",
+          "role": "assistant",
+          "sessionID": "shadow-wire-fixture-session"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "fixture output"
+          },
+          {
+            "type": "tool",
+            "callID": "fixture-call",
+            "state": {
+              "status": "completed",
+              "output": "fixture tool output"
+            }
+          }
+        ],
+        "absolute_ordinal": 2
+      }
+    ],
+    "ts_output": [
+      {
+        "info": {
+          "id": "message-1",
+          "role": "user",
+          "sessionID": "shadow-wire-fixture-session"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "fixture input"
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "message-2",
+          "role": "assistant",
+          "sessionID": "shadow-wire-fixture-session"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "fixture output"
+          },
+          {
+            "type": "tool",
+            "callID": "fixture-call",
+            "state": {
+              "status": "completed",
+              "output": "fixture tool output"
+            }
+          }
+        ]
+      }
+    ],
+    "normalizations": [],
+    "pass_inputs": {
+      "now_ms": 1735689600000,
+      "model_key": "fixture/provider-model",
+      "usage": {
+        "input_tokens": 12345,
+        "limit": 200000
+      },
+      "effective_execute_threshold": 65,
+      "history_budget_tokens": 19500,
+      "cache_ttl": "ephemeral",
+      "provider_error": "fixture provider warning"
+    },
+    "ts_decision": {
+      "class": "hard",
+      "marker_state": {
+        "marker_message_id": "message-1",
+        "advanced_this_pass": true
+      },
+      "materialize_reason": "fixture",
+      "emergency": false
+    },
+    "declared_trim": {
+      "flat_boundary_id": "message-1#0",
+      "boundary_bare_message_id": "message-1",
+      "boundary_absolute_ordinal": 1,
+      "next_absolute_ordinal": 2
+    }
+  },
+  "shadow_reset": {
+    "method": "shadow_reset",
+    "shadow_generation": 7,
+    "reason": "fixture_reset"
+  },
+  "local_watermarks": {
+    "compartment_sequence": 1,
+    "memory_id": 2,
+    "m0_mutation_id": 1,
+    "memory_mutation_id": 1,
+    "last_todo_state_hash": "1d9122e1b8a66758890684eba25ec2577a82b9c66407a55a903de3b5132bd905"
+  }
+}

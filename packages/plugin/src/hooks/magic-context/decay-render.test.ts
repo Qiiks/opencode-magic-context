@@ -66,6 +66,59 @@ describe("decay-render", () => {
         expect(rendered).not.toMatch(/<compartment[^>]*\/>/);
     });
 
+    it("renders complete date ranges in canonical order across tiered, legacy, and self-close arms", () => {
+        const attrs =
+            'start="1" end="2" start-date="2026-01-02" end-date="2026-01-03" title="dated"';
+        const base: DecayRenderCompartment = {
+            startMessage: 1,
+            endMessage: 2,
+            startDate: "2026-01-02",
+            endDate: "2026-01-03",
+            title: "dated",
+            content: "U: prompt\nflat body",
+        };
+
+        const tiered = renderDecayedCompartments({
+            compartments: [{ ...base, p1: "tiered body", legacy: 0 }],
+            historyBudgetTokens: 100_000,
+        });
+        const legacy = renderDecayedCompartments({
+            compartments: [{ ...base, legacy: 1 }],
+            historyBudgetTokens: 100_000,
+        });
+        const selfClosing = renderDecayedCompartments({
+            compartments: [{ ...base, content: "", legacy: 1 }],
+            historyBudgetTokens: 100_000,
+        });
+
+        expect(tiered).toContain(`<compartment ${attrs}>`);
+        expect(legacy).toContain(`<compartment ${attrs}>`);
+        expect(selfClosing).toBe(`<compartment ${attrs} />`);
+    });
+
+    it("omits date attributes when a range is absent or partial", () => {
+        const base: DecayRenderCompartment = {
+            startMessage: 1,
+            endMessage: 2,
+            title: "undated",
+            content: "body",
+            legacy: 1,
+        };
+        const withoutDates = renderDecayedCompartments({
+            compartments: [base],
+            historyBudgetTokens: 100_000,
+        });
+        const partial = renderDecayedCompartments({
+            compartments: [{ ...base, startDate: "2026-01-02" }],
+            historyBudgetTokens: 100_000,
+        });
+
+        expect(withoutDates).not.toContain("start-date=");
+        expect(withoutDates).not.toContain("end-date=");
+        expect(partial).not.toContain("start-date=");
+        expect(partial).not.toContain("end-date=");
+    });
+
     it("keeps a VALID v2 row with empty p4 self-closing when demoted to P4", () => {
         // A genuine v2 row (non-empty p1) with an empty p4 must still self-close
         // at tier 4 — the isTieredRow fix must NOT regress this. Force P4 via a

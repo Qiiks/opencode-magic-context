@@ -10,10 +10,8 @@ import {
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
 import {
-    CATEGORY_PRIORITY,
-    MEMORY_CATEGORY_ORDER_PRIORITY,
     MEMORY_CATEGORY_ORDER_SQL,
-    MEMORY_CATEGORY_ORDER_UNKNOWN,
+    V2_MEMORY_CATEGORIES,
 } from "../../features/magic-context/memory/constants";
 import {
     getMaxMemoryIdForProjects,
@@ -23,7 +21,7 @@ import {
     isMemoryRow,
     readNewMemoriesForM1Union,
 } from "../../features/magic-context/memory/storage-memory";
-import type { Memory, MemoryCategory } from "../../features/magic-context/memory/types";
+import type { Memory } from "../../features/magic-context/memory/types";
 import {
     computeProjectDocsHash,
     GLOBAL_USER_PROFILE_PROJECT_PATH,
@@ -134,34 +132,7 @@ export interface CompartmentInjectionResult {
 }
 
 export function renderMemoryBlock(memories: Memory[]): string | null {
-    const byCategory = new Map<MemoryCategory, Memory[]>();
-    for (const m of memories) {
-        const existing = byCategory.get(m.category);
-        if (existing) {
-            existing.push(m);
-        } else {
-            byCategory.set(m.category, [m]);
-        }
-    }
-
-    const sections: string[] = [];
-    for (const category of CATEGORY_PRIORITY) {
-        const categoryMemories = byCategory.get(category);
-        if (!categoryMemories || categoryMemories.length === 0) {
-            continue;
-        }
-        sections.push(
-            `<${category}>`,
-            ...categoryMemories.map((m) => `- ${escapeXmlContent(m.content)}`),
-            `</${category}>`,
-        );
-    }
-
-    if (sections.length === 0) {
-        return null;
-    }
-
-    return `<project-memory>\n${sections.join("\n")}\n</project-memory>`;
+    return renderMemoryBlockV2(memories) || null;
 }
 
 /** Constraint keywords that signal a memory encodes a rule rather than a description. */
@@ -219,21 +190,15 @@ export function trimMemoriesToBudget(
     });
 
     const result: Memory[] = [];
-    let usedTokens = 0;
 
     for (const memory of sorted) {
-        // Estimate the rendered memory line ("- {content}") with the real
-        // Claude tokenizer, plus a fixed ~6-token allowance for opening and
-        // closing XML category tags amortized per item. Keeps units
-        // consistent with rpc-handlers.ts / transform.ts / system-prompt-hash.ts
-        // so the sidebar's "Memories" segment matches what actually lands in
-        // the injection block.
-        const memoryTokens = estimateTokens(`- ${memory.content}`) + 6;
-        if (usedTokens + memoryTokens > budgetTokens) {
+        // Render the candidate block so legacy callers measure the same grouped
+        // bytes they inject, including a category's tags only when it survives.
+        const candidate = [...result, memory];
+        if (estimateTokens(renderMemoryBlockV2(candidate)) > budgetTokens) {
             break;
         }
         result.push(memory);
-        usedTokens += memoryTokens;
     }
 
     if (result.length < memories.length) {
@@ -662,6 +627,7 @@ export interface M0M1RenderOptions {
     memoryInjectionBudgetTokens?: number;
     historyBudgetTokens?: number;
     userProfileBudgetTokens?: number;
+    temporalAwareness?: boolean;
     isCacheBustingPass?: boolean;
     /** Provider-side cache-eviction signals for HARD-bust detection. */
     hardSignals?: M0HardSignals;
@@ -712,8 +678,11 @@ export class RenderM1InvalidMarkersError extends Error {
 }
 
 // Compartment already carries p1..p4, importance, episodeType, legacy (v2 model B).
-// Alias retained for readability at render call sites.
-type M0Compartment = Compartment;
+// Boundary dates are render-only values resolved from OpenCode's message database.
+type M0Compartment = Compartment & {
+    startDate?: string | null;
+    endDate?: string | null;
+};
 
 /**
  * The boundary (OpenCode message id) covered by a compartment set rendered into
@@ -729,12 +698,6 @@ function lastCompartmentBoundaryId(compartments: readonly M0Compartment[]): stri
 const DEFAULT_HISTORY_BUDGET_TOKENS = 60_000;
 export const DEFAULT_MEMORY_BUDGET_TOKENS = 8_000;
 
-/**
- * Token cost of the `<project-memory>` … `</project-memory>` wrapper itself,
- * seeded into the v2 trim accounting so the budget covers the whole injected
- * block (wrapper + lines), not just the line bodies.
- */
-const MEMORY_BLOCK_WRAPPER_TOKENS = 6;
 export const DEFAULT_USER_PROFILE_BUDGET_TOKENS = 4_000;
 const M0_EMPTY_BODY = "<session-history></session-history>";
 const M1_EMPTY_PLACEHOLDER =
@@ -845,14 +808,19 @@ function memorySelectionOrder(left: Memory, right: Memory): number {
 }
 
 function memoryRenderOrder(left: Memory, right: Memory): number {
-    const aPriority =
-        (MEMORY_CATEGORY_ORDER_PRIORITY as Record<string, number>)[left.category] ??
-        MEMORY_CATEGORY_ORDER_UNKNOWN;
-    const bPriority =
-        (MEMORY_CATEGORY_ORDER_PRIORITY as Record<string, number>)[right.category] ??
-        MEMORY_CATEGORY_ORDER_UNKNOWN;
-    const categoryDiff = aPriority - bPriority;
-    if (categoryDiff !== 0) return categoryDiff;
+    const leftPriority = V2_MEMORY_CATEGORIES.indexOf(
+        left.category as (typeof V2_MEMORY_CATEGORIES)[number],
+    );
+    const rightPriority = V2_MEMORY_CATEGORIES.indexOf(
+        right.category as (typeof V2_MEMORY_CATEGORIES)[number],
+    );
+    if (leftPriority >= 0 || rightPriority >= 0) {
+        if (leftPriority < 0) return 1;
+        if (rightPriority < 0) return -1;
+        if (leftPriority !== rightPriority) return leftPriority - rightPriority;
+    } else if (left.category !== right.category) {
+        return left.category < right.category ? -1 : 1;
+    }
     return left.id - right.id;
 }
 
@@ -1146,23 +1114,14 @@ export function trimMemoriesToBudgetV2(
     renderOptions: MemoryRenderOptions = {},
 ): TrimMemoriesResultV2 {
     const selectionOrder = [...memories].sort(memorySelectionOrder);
-
     const selected: Memory[] = [];
-    // Seed with the <project-memory> wrapper cost so the budget covers the whole
-    // injected block, not just the line bodies.
-    let usedTokens = MEMORY_BLOCK_WRAPPER_TOKENS;
+    const accounting = createMemoryBlockAccounting(renderOptions);
+
     for (const memory of selectionOrder) {
-        // Measure the EXACT v2 line that renderMemoryBlockV2 emits (with
-        // id/category/importance attributes). Using a lighter shape here
-        // under-counts and lets the rendered block overshoot the budget
-        // (e.g. a v1 "- content" estimate fit 202 memories at ~8K while the v2
-        // render actually injected ~11.3K against a 10K budget).
-        const memoryTokens = estimateTokens(
-            renderMemoryLineV2(memory, renderOptions.sourceNameByMemoryId?.get(memory.id)),
-        );
-        if (usedTokens + memoryTokens > budgetTokens) continue;
+        const cost = accounting.candidateCost(memory);
+        if (accounting.usedTokens + cost > budgetTokens) continue;
+        accounting.admit(memory, cost);
         selected.push(memory);
-        usedTokens += memoryTokens;
     }
 
     if (selected.length < memories.length) {
@@ -1190,18 +1149,14 @@ export function trimWorkspaceMemoriesToBudgetV2(
 
     const selected: Memory[] = [];
     const selectedIds = new Set<number>();
-    let usedTokens = MEMORY_BLOCK_WRAPPER_TOKENS;
-    const tokenCost = (memory: Memory) =>
-        estimateTokens(
-            renderMemoryLineV2(memory, renderOptions.sourceNameByMemoryId?.get(memory.id)),
-        );
+    const accounting = createMemoryBlockAccounting(renderOptions);
     const trySelect = (memory: Memory): boolean => {
         if (selectedIds.has(memory.id)) return false;
-        const tokens = tokenCost(memory);
-        if (usedTokens + tokens > budgetTokens) return false;
+        const cost = accounting.candidateCost(memory);
+        if (accounting.usedTokens + cost > budgetTokens) return false;
         selected.push(memory);
         selectedIds.add(memory.id);
-        usedTokens += tokens;
+        accounting.admit(memory, cost);
         return true;
     };
 
@@ -1211,7 +1166,7 @@ export function trimWorkspaceMemoriesToBudgetV2(
         trySelect(memory);
     }
 
-    const remainingAfterPermanent = Math.max(0, budgetTokens - usedTokens);
+    const remainingAfterPermanent = Math.max(0, budgetTokens - accounting.usedTokens);
     const floorTokens = remainingAfterPermanent / Math.max(1, workspace.identities.length);
     const byIdentity = new Map<string, Memory[]>();
     for (const memory of memories) {
@@ -1228,13 +1183,13 @@ export function trimWorkspaceMemoriesToBudgetV2(
         const candidates = (byIdentity.get(identity) ?? []).sort(memorySelectionOrder);
         for (const memory of candidates) {
             if (selectedIds.has(memory.id)) continue;
-            const tokens = tokenCost(memory);
-            if (memberTokens + tokens > floorTokens) continue;
-            if (usedTokens + tokens > budgetTokens) continue;
+            const cost = accounting.candidateCost(memory);
+            if (memberTokens + cost > floorTokens) continue;
+            if (accounting.usedTokens + cost > budgetTokens) continue;
             selected.push(memory);
             selectedIds.add(memory.id);
-            usedTokens += tokens;
-            memberTokens += tokens;
+            accounting.admit(memory, cost);
+            memberTokens += cost;
         }
     }
 
@@ -1296,6 +1251,36 @@ function readM0Compartments(db: Database, sessionId: string): M0Compartment[] {
 
 function nullableString(value: unknown): string | null {
     return typeof value === "string" ? value : null;
+}
+
+/**
+ * Resolve every boundary in one OpenCode DB query for a fresh m[0] or m[1] render.
+ * Callers invoke this only on existing materialize/refresh paths; defer passes replay
+ * persisted bytes without consulting live timestamps.
+ */
+function withCompartmentDates(
+    sessionId: string,
+    compartments: M0Compartment[],
+    temporalAwareness: boolean | undefined,
+): M0Compartment[] {
+    if (!temporalAwareness || compartments.length === 0) return compartments;
+
+    const messageIds = new Set<string>();
+    for (const compartment of compartments) {
+        if (compartment.startMessageId) messageIds.add(compartment.startMessageId);
+        if (compartment.endMessageId) messageIds.add(compartment.endMessageId);
+    }
+    const times = getMessageTimesFromOpenCodeDb(sessionId, Array.from(messageIds));
+    return compartments.map((compartment) => {
+        const startMs = times.get(compartment.startMessageId);
+        const endMs = times.get(compartment.endMessageId);
+        if (startMs === undefined || endMs === undefined) return compartment;
+        return {
+            ...compartment,
+            startDate: formatDate(startMs),
+            endDate: formatDate(endMs),
+        };
+    });
 }
 
 function rowToM0Compartment(row: Record<string, unknown>): M0Compartment {
@@ -1367,16 +1352,52 @@ function readNewMemoriesForM1(
 }
 
 /**
- * Render ONE memory's v2 line exactly as it lands in the <project-memory> block.
- * Shared by renderMemoryBlockV2 (the wire render) and trimMemoriesToBudgetV2
- * (the budget accounting) so the budget is measured against the SAME bytes that
- * get injected — including the id/category/importance attributes. Measuring a
- * lighter shape (e.g. "- content") under-counts and lets the injected block
- * exceed the configured budget.
+ * Incremental token accounting for the grouped memory block. Trimming probes
+ * hundreds of candidates against the budget; re-rendering and re-tokenizing the
+ * whole block per probe is O(n²) in tokenizer passes (~250ms at a 260-memory
+ * pool — a hot-path stall on materialize and the sidebar RPC). Instead: measure
+ * the wrapper once, each candidate line once, and each category's open/close
+ * tags once when that category first appears. BPE merges across the newline
+ * joins can only shrink the whole relative to the sum of its parts, so this
+ * additive account is a slight UPPER bound on the rendered block — trims stay
+ * conservative and the injected block can only land under the budget, never
+ * over it.
  */
+function createMemoryBlockAccounting(renderOptions: MemoryRenderOptions) {
+    const seenCategories = new Set<string>();
+    const categoryCost = new Map<string, number>();
+    return {
+        usedTokens: estimateTokens("<project-memory>\n</project-memory>"),
+        candidateCost(memory: Memory): number {
+            const line = renderMemoryLineV2(
+                memory,
+                renderOptions.sourceNameByMemoryId?.get(memory.id),
+            );
+            let cost = estimateTokens(`${line}\n`);
+            if (!seenCategories.has(memory.category)) {
+                let tags = categoryCost.get(memory.category);
+                if (tags === undefined) {
+                    tags = estimateTokens(
+                        `<${escapeXmlAttr(memory.category)}>\n</${escapeXmlAttr(memory.category)}>\n`,
+                    );
+                    categoryCost.set(memory.category, tags);
+                }
+                cost += tags;
+            }
+            return cost;
+        },
+        admit(memory: Memory, cost: number): void {
+            this.usedTokens += cost;
+            seenCategories.add(memory.category);
+        },
+    };
+}
+
+/** Render one compact memory fact line. Importance still controls selection, but
+ * is deliberately absent from the wire so classification-only updates do not change bytes. */
 export function renderMemoryLineV2(memory: Memory, sourceName?: string): string {
-    const sourceAttr = sourceName ? ` source="${escapeXmlAttr(sourceName)}"` : "";
-    return `  <memory id="${memory.id}" category="${escapeXmlAttr(memory.category)}"${sourceAttr} importance="${memory.importance ?? 50}">${escapeXmlContent(memory.content)}</memory>`;
+    const source = sourceName ? ` [${escapeXmlContent(sourceName)}]` : "";
+    return `#${memory.id}${source}: ${escapeXmlContent(memory.content)}`;
 }
 
 export function renderMemoryBlockV2(
@@ -1385,10 +1406,18 @@ export function renderMemoryBlockV2(
     renderOptions: MemoryRenderOptions = {},
 ): string {
     if (memories.length === 0) return "";
+    const ordered = [...memories].sort(memoryRenderOrder);
     const lines = [`<${wrapper}>`];
-    for (const memory of memories) {
+    let openCategory: string | undefined;
+    for (const memory of ordered) {
+        if (memory.category !== openCategory) {
+            if (openCategory !== undefined) lines.push(`</${escapeXmlAttr(openCategory)}>`);
+            openCategory = memory.category;
+            lines.push(`<${escapeXmlAttr(openCategory)}>`);
+        }
         lines.push(renderMemoryLineV2(memory, renderOptions.sourceNameByMemoryId?.get(memory.id)));
     }
+    if (openCategory !== undefined) lines.push(`</${escapeXmlAttr(openCategory)}>`);
     lines.push(`</${wrapper}>`);
     return lines.join("\n");
 }
@@ -1590,6 +1619,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         }
         throw error;
     }
+
+    compartments = withCompartmentDates(options.sessionId, compartments, options.temporalAwareness);
 
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     const memoryRenderOptions: MemoryRenderOptions = {
@@ -1894,10 +1925,10 @@ function renderM1WithMetadata(
     });
     if (memoryUpdates.block) blocks.push(memoryUpdates.block);
 
-    const newCompartments = readNewCompartments(
-        options.db,
+    const newCompartments = withCompartmentDates(
         options.sessionId,
-        markers.maxCompartmentSeq,
+        readNewCompartments(options.db, options.sessionId, markers.maxCompartmentSeq),
+        options.temporalAwareness,
     );
     if (newCompartments.length > 0) {
         blocks.push(
@@ -2269,7 +2300,11 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     // cleared this pass), use 0 (stable: renders all memories with no expiry
     // filtering, deterministic across passes — matches Pi fallback).
     snapshotMarkers.materializedAt = options.state.cachedM0MaterializedAt ?? 0;
-    const compartments = readM0Compartments(options.db, options.sessionId);
+    const compartments = withCompartmentDates(
+        options.sessionId,
+        readM0Compartments(options.db, options.sessionId),
+        options.temporalAwareness,
+    );
     // Use the SAME frozen cutoff for the baseline memory read as m[1] does, so a
     // memory crossing expires_at between two fallback passes can't shift the m[0]
     // baseline bytes either (live Date.now() default would reintroduce drift).

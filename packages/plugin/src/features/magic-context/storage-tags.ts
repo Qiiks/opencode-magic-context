@@ -10,6 +10,7 @@ const getTagNumbersByMessageIdStatements = new WeakMap<Database, PreparedStateme
 const deleteTagsByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
 const getMaxTagNumberBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getTagNumberByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
+const hasPiFallbackMessageTagStatements = new WeakMap<Database, PreparedStatement>();
 
 function getInsertTagStatement(db: Database): PreparedStatement {
     let stmt = insertTagStatements.get(db);
@@ -415,6 +416,41 @@ export function updateTagTokenCount(
     getUpdateTagTokenCountStatement(db).run(newTokenCount, sessionId, tagNumber);
 }
 
+export interface PersistedToolTagAccounting {
+    byteSize: number;
+    tokenCount: number | null;
+    inputByteSize: number;
+    inputTokenCount: number | null;
+}
+
+/** Read the authoritative accounting after an exceptional same-pass owner adoption. */
+export function getPersistedToolTagAccounting(
+    db: Database,
+    sessionId: string,
+    tagNumber: number,
+): PersistedToolTagAccounting | null {
+    const row = db
+        .prepare(
+            `SELECT byte_size AS byteSize,
+                    token_count AS tokenCount,
+                    input_byte_size AS inputByteSize,
+                    input_token_count AS inputTokenCount
+             FROM tags
+             WHERE session_id = ? AND tag_number = ? AND type = 'tool'`,
+        )
+        .get(sessionId, tagNumber) as PersistedToolTagAccounting | null | undefined;
+    if (
+        !row ||
+        typeof row.byteSize !== "number" ||
+        (row.tokenCount !== null && typeof row.tokenCount !== "number") ||
+        typeof row.inputByteSize !== "number" ||
+        (row.inputTokenCount !== null && typeof row.inputTokenCount !== "number")
+    ) {
+        return null;
+    }
+    return row;
+}
+
 /**
  * Flat per-message ORIGINAL token map for the protected-tail boundary, keyed by
  * real message id. Sums every tag's stored token weight (output + input +
@@ -779,6 +815,23 @@ export function updateTagMessageId(
     messageId: string,
 ): void {
     getUpdateTagMessageIdStatement(db).run(messageId, sessionId, tagId);
+}
+
+/** Return whether this session has any message tag bound to a fallback Pi id. */
+export function hasPiFallbackMessageTags(db: Database, sessionId: string): boolean {
+    let statement = hasPiFallbackMessageTagStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT 1
+             FROM tags
+             WHERE session_id = ?
+               AND type = 'message'
+               AND message_id LIKE 'pi-msg-%'
+             LIMIT 1`,
+        );
+        hasPiFallbackMessageTagStatements.set(db, statement);
+    }
+    return statement.get(sessionId) != null;
 }
 
 /**

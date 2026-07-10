@@ -9,6 +9,11 @@
     "test:e2e-docker": "tests/docker/run-e2e.sh",
     "lint": "bun run --cwd packages/plugin lint && bun run --cwd packages/pi-plugin lint && bun run --cwd packages/cli lint",
     "lint:fix": "bun run --cwd packages/plugin lint:fix && bun run --cwd packages/pi-plugin lint:fix",
-    "dev:dashboard": "bun run --cwd packages/dashboard dev"
+    "dev:dashboard": "bun run --cwd packages/dashboard dev",
+    "build:rust": "cargo build --workspace",
+    "test:rust": "cargo test --workspace",
+    "lint:rust": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings",
+    "fmt:rust": "cargo fmt",
+    "check:all": "bun run test && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings"
   }
 }

@@ -32,6 +32,13 @@ export {
     storedPathBelongsToIdentity,
 } from "./project-identity";
 export {
+    type CloneCompartmentRow,
+    type CloneSessionStateFilter,
+    type CloneTagRow,
+    type CopySessionStateForCloneResult,
+    copySessionStateForClone,
+} from "./storage-clone";
+export {
     applySqliteTuningPragmas,
     type ContextDatabase,
     closeDatabase,
@@ -249,11 +256,13 @@ export {
     getMaxTagNumberBySession,
     getMinMessageTagNumberForRawId,
     getOldestActiveUnprotectedToolTags,
+    getPersistedToolTagAccounting,
     getTagById,
     getTagsByNumbers,
     getTagsBySession,
     getTopNBySize,
     getTriggerTagTokenUpperBound,
+    hasPiFallbackMessageTags,
     hasPiFallbackToolOwnerTags,
     insertTag,
     type MessageTokenTotal,

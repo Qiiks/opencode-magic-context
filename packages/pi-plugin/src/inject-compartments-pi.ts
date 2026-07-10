@@ -1049,9 +1049,9 @@ export function renderM0Pi(
 				: getMemoriesByProject(db, memPath, ["active", "permanent"])
 			: []);
 	// Use the V2 trim + render helpers (shared with OpenCode) so both harnesses
-	// emit the SAME structured <project-memory><memory id= category= importance=>
-	// shape and the same permanent-first / importance-DESC ordering. A divergent
-	// shape here would put different bytes on the wire between OpenCode and Pi.
+	// emit the same category-grouped `#id: fact` bytes and use the same
+	// permanent-first / importance-DESC selection. A divergent shape here would
+	// put different bytes on the wire between OpenCode and Pi.
 	// Always trim with the default memory-budget fallback (matching OpenCode),
 	// not gated on a truthy injectionBudgetTokens — an unset budget must NOT mean
 	// "render every memory untrimmed", which would grow m[0] without bound.

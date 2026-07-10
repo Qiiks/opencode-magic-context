@@ -159,11 +159,17 @@ function renderTable(rows: LeafRow[]): string {
     return `${header}\n${body}`;
 }
 
+// Developer-only keys excluded from the public reference. They stay in the
+// generated JSON schema (so editors validate them) but are not user-facing
+// features; documenting them would invite support questions about internal
+// tooling that requires a local daemon setup users do not have.
+const DEV_ONLY_KEYS = new Set<string>(["shadow_transform"]);
+
 export function buildConfigDocs(): string {
     const schema = buildSchema() as JsonSchema;
     const props = schema.properties ?? {};
 
-    const covered = new Set<string>(["$schema"]);
+    const covered = new Set<string>(["$schema", ...DEV_ONLY_KEYS]);
     const sections: string[] = [];
 
     for (const section of SECTION_ORDER) {

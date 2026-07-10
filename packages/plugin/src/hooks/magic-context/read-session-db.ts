@@ -177,8 +177,8 @@ interface MessageTimeRow {
  * Returns a Map keyed by message ID. Missing IDs are simply omitted.
  *
  * Used by temporal-awareness to map compartment start/end message IDs to
- * wall-clock dates for the `start="YYYY-MM-DD"` / `end="YYYY-MM-DD"` attrs
- * on the `<compartment>` elements in `<session-history>`.
+ * wall-clock dates for the `start-date="YYYY-MM-DD"` / `end-date="YYYY-MM-DD"`
+ * attributes on `<compartment>` elements in `<session-history>`.
  */
 export function getMessageTimesFromOpenCodeDb(
     sessionId: string,

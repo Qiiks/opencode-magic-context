@@ -26,7 +26,7 @@ describe("computeM0BlockTokens", () => {
         const m0Text = [
             "<project-docs>\nARCHITECTURE: lorem ipsum docs body here for tokens\n</project-docs>",
             "<user-profile>\n- user prefers concise replies\n</user-profile>",
-            '<project-memory>\n<m id="1" category="PROJECT_RULES" importance="50">use the release script</m>\n</project-memory>',
+            "<project-memory>\n<PROJECT_RULES>\n#1: use the release script\n</PROJECT_RULES>\n</project-memory>",
             '<session-history>\n<compartment start="1" end="9" title="Did a thing">\nbody text\n</compartment>\n</session-history>',
         ].join("\n");
 

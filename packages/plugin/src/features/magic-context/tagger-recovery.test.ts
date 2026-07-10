@@ -59,7 +59,7 @@ function trackAssignmentReloads(db: DatabaseType): { count: () => number; restor
     let reloads = 0;
     const originalPrepare = db.prepare.bind(db) as DatabaseType["prepare"];
     db.prepare = ((sql: string) => {
-        if (sql.includes("SELECT message_id, tag_number, type, tool_owner_message_id FROM tags")) {
+        if (sql.includes("SELECT message_id, tag_number, type, tool_owner_message_id,")) {
             reloads += 1;
         }
         return originalPrepare(sql);

@@ -102,6 +102,14 @@ export class MagicContextRpcServer {
 
     /** Start the server on a random port, write port to disk. */
     async start(): Promise<number> {
+        if (typeof Bun === "undefined") {
+            // The only RPC consumer is the terminal-TUI sidebar, which exists only
+            // under the Bun runtime (OpenCode CLI). On Node/Electron (Desktop) there
+            // is no consumer, and Bun.serve would throw — skip cleanly instead of
+            // logging a misleading boot error.
+            log("rpc server skipped: Bun runtime not available (no TUI consumer)");
+            return 0;
+        }
         this.startedAt = Date.now();
         const self = this;
         const server = Bun.serve<WsData>({

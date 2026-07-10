@@ -42,7 +42,7 @@ import {
     normalizeMaterializeReason,
     recordPendingTransformDecision,
 } from "../../features/magic-context/transform-decision-log";
-import type { ContextUsage } from "../../features/magic-context/types";
+import type { ContextUsage, SchedulerDecision } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
@@ -59,6 +59,7 @@ import {
 } from "./compartment-trigger";
 import { resolveCtxReduceAvailabilityFromMessages } from "./ctx-reduce-availability";
 import { computeTailTokenEstimate, shouldTriggerChannel2 } from "./ctx-reduce-nudge";
+import { DEFAULT_HISTORY_BUDGET_TOKENS } from "./decay-render";
 import { deriveTriggerBudget } from "./derive-budgets";
 import {
     resolveExecuteThreshold,
@@ -87,6 +88,11 @@ import { extractInMemoryMessageViews } from "./read-session-raw";
 import { sendIgnoredMessage } from "./send-session-notification";
 import { modelAcceptsEmptyContent } from "./sentinel";
 import {
+    resolveDeclaredTrimForShadow,
+    type ShadowSender,
+    type ShadowTransformDecision,
+} from "./shadow-sender";
+import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
     stripClearedReasoning,
@@ -100,6 +106,7 @@ import {
     applyFlushedStatuses,
     type MessageLike,
     stripStructuralNoise,
+    type TagNormalizationTarget,
     type TagTarget,
     tagMessages,
 } from "./transform-operations";
@@ -166,6 +173,20 @@ export function clearMessageTokensCache(sessionId: string, messageId?: string): 
 // appears (or changes) for a session in this process — not on every transform
 // pass. Bounded so crashed/abandoned sessions can't leak the guard forever.
 const recordedSessionProjectIdentity = new BoundedSessionMap<string>(MESSAGE_TOKENS_CACHE_MAX);
+
+function cloneForShadow<T>(value: T): T {
+    return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function classifyShadowDecision(args: {
+    schedulerDecision: SchedulerDecision;
+    materialized: boolean;
+    bustedThisPass: boolean;
+}): ShadowTransformDecision["class"] {
+    if (args.materialized) return "hard";
+    if (args.schedulerDecision === "execute" || args.bustedThisPass) return "soft";
+    return "defer";
+}
 
 // Tagger / trigger load-scoping floor (OpenCode only). Several hot-path reads
 // preload an in-memory map or aggregate over a session's tags; on a large/old
@@ -398,6 +419,8 @@ export interface TransformDeps {
     };
     /** Fire-and-forget active-session embed backfill after transform returns. */
     maybeAutoEmbedSession?: (sessionId: string) => void;
+    /** Dev-only sender that mirrors transform events for comparison; undefined disables that debug path. */
+    shadowSender?: ShadowSender;
 }
 
 export function createTransform(deps: TransformDeps) {
@@ -422,6 +445,25 @@ export function createTransform(deps: TransformDeps) {
         logTransformTiming(sessionId, "findSessionId", startTime, `messages=${messages.length}`);
 
         const db = deps.db;
+        const shadowSender = deps.shadowSender;
+        let shadowCapture:
+            | {
+                  nowMs: number;
+                  inputMessages: MessageLike[];
+                  declaredTrimBefore: ReturnType<typeof resolveDeclaredTrimForShadow>;
+              }
+            | undefined;
+        if (shadowSender) {
+            try {
+                shadowCapture = {
+                    nowMs: Date.now(),
+                    inputMessages: cloneForShadow(messages),
+                    declaredTrimBefore: resolveDeclaredTrimForShadow({ db, sessionId }),
+                };
+            } catch (error) {
+                sessionLog(sessionId, "shadow: capture failed (ignored):", error);
+            }
+        }
         if (deps.client !== undefined) {
             scheduleReconciliation(db, sessionId, readRawSessionMessages);
         }
@@ -1316,6 +1358,7 @@ export function createTransform(deps: TransformDeps) {
             { type: string; thinking?: string; text?: string }[]
         >();
         let messageTagNumbers = new Map<MessageLike, number>();
+        let tagNormalizationTargets: TagNormalizationTarget[] = [];
         let batch: { finalize: () => void } | null = null;
         let hasRecentReduceCall = false;
         // Inject temporal markers before tagging so the §N§ tag prefix wraps
@@ -1368,6 +1411,7 @@ export function createTransform(deps: TransformDeps) {
             targets = result.targets;
             reasoningByMessage = result.reasoningByMessage;
             messageTagNumbers = result.messageTagNumbers;
+            tagNormalizationTargets = result.normalizationTargets;
             batch = result.batch;
             hasRecentReduceCall = result.hasRecentReduceCall;
             const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;
@@ -1778,6 +1822,7 @@ export function createTransform(deps: TransformDeps) {
                 injectDocs: deps.injectDocs,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
+                temporalAwareness: deps.experimentalTemporalAwareness,
                 hardSignals: m0HardSignals,
             },
         });
@@ -2142,6 +2187,45 @@ export function createTransform(deps: TransformDeps) {
             sessionId,
             `transform completed in ${elapsed}ms (${messages.length} messages, ${targets.size} targets, watermark: ${watermark})`,
         );
+
+        if (shadowSender && shadowCapture) {
+            try {
+                const shadowDecision: ShadowTransformDecision = {
+                    class: classifyShadowDecision({
+                        schedulerDecision,
+                        materialized: postTransformResult.materialized,
+                        bustedThisPass: postTransformResult.bustedThisPass,
+                    }),
+                    marker_state: { advanced_this_pass: false },
+                    materialize_reason: postTransformResult.materializeReason,
+                    emergency: postTransformResult.emergency,
+                };
+                shadowSender.enqueue({
+                    sessionId,
+                    db,
+                    inputMessages: shadowCapture.inputMessages,
+                    outputMessages: messages,
+                    normalizationTargets: tagNormalizationTargets,
+                    projectRoot: sessionDirectory ?? deps.directory ?? process.cwd(),
+                    projectPath: sessionProjectIdentity,
+                    passInputs: {
+                        now_ms: shadowCapture.nowMs,
+                        model_key: deps.getModelKey?.(sessionId) ?? hardModelKey ?? null,
+                        usage: {
+                            input_tokens: contextUsage.inputTokens,
+                            limit: resolvedContextLimit ?? boundaryContextLimit,
+                        },
+                        effective_execute_threshold: boundaryExecuteThreshold,
+                        history_budget_tokens: historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+                        cache_ttl: sessionMeta.cacheTtl,
+                    },
+                    tsDecision: shadowDecision,
+                    declaredTrimBefore: shadowCapture.declaredTrimBefore,
+                });
+            } catch (error) {
+                sessionLog(sessionId, "shadow: capture failed (ignored):", error);
+            }
+        }
 
         deps.maybeAutoEmbedSession?.(sessionId);
     };

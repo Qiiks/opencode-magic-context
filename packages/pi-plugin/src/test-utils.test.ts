@@ -6,9 +6,9 @@ import { Database } from "@magic-context/core/shared/sqlite";
 
 export type PiMessage = ContextEvent["messages"][number];
 
-export function createTestDb(): Database {
+export function createTestDb(path = ":memory:"): Database {
 	setHarness("pi");
-	const db = new Database(":memory:");
+	const db = new Database(path);
 	initializeDatabase(db);
 	runMigrations(db);
 	return db;

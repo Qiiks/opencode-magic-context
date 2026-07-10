@@ -20,12 +20,10 @@
  * dropped tags (`[dropped §N§]`) are tiny and tokenize to ~3 tokens
  * each, which correctly reflects what's on the wire.
  *
- * Why not walk the OpenCode-style cached-by-message-id map? Pi messages
- * mutate in place via the transcript adapter's part proxies, and
- * historian/compressor publication can change tag-prefix bytes on
- * already-emitted messages. A per-pass walk is cheap (estimateTokens
- * is sub-microsecond per call for the typical part) and avoids the
- * cache-staleness cliff OpenCode accepts as a display tradeoff.
+ * Stable message ids use a guarded cache: canonical wire JSON must still match.
+ * This retains correctness when tagging, drops, or historian publication changes
+ * an old message while avoiding repeated BPE work for the unchanged prefix.
+ * Synthetic injection messages are deliberately re-counted on every pass.
  *
  * Mirrors OpenCode's switch in `transform.ts:1028-1119` adapted to
  * Pi part shapes:
@@ -46,6 +44,16 @@ import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-ses
 export interface PiMessageTokenCounts {
 	conversation: number;
 	toolCall: number;
+}
+
+export interface PiMessageTokenCacheEntry {
+	wireJson: string;
+	counts: PiMessageTokenCounts;
+}
+
+export interface TokenizePiMessagesOptions {
+	cache: Map<string, PiMessageTokenCacheEntry>;
+	stableId: (message: object) => string | undefined;
 }
 
 interface MaybePart {
@@ -69,93 +77,156 @@ interface MaybeMessage {
 /**
  * Compute conversation + tool-call token totals for a Pi message array.
  *
- * Always-walk semantics: no caching. Pi messages mutate in place
- * across pipeline phases (tag prefixes, sentinels, injection) and the
- * walk is cheap relative to the LLM call we're about to make.
+ * Stable SessionEntry ids can reuse a per-message result when canonical wire
+ * JSON matches. The equality guard is cheaper than BPE tokenization and keeps
+ * cache correctness when drops, reasoning cleanup, or another extension changes
+ * an old message. Synthetic injection messages have no stable id and always run.
  */
-export function tokenizePiMessages(messages: unknown[]): PiMessageTokenCounts {
+export function tokenizePiMessages(
+	messages: unknown[],
+	options?: TokenizePiMessagesOptions,
+): PiMessageTokenCounts {
 	let conversation = 0;
 	let toolCall = 0;
+	const liveIds = options ? new Set<string>() : undefined;
 
 	for (const raw of messages) {
 		if (!raw || typeof raw !== "object") continue;
-		const msg = raw as MaybeMessage;
-		const content = msg.content;
-
-		// User/Assistant: content is array of PiTextContent | PiImageContent
-		// | PiThinkingContent | PiToolCall (or a plain string for user
-		// messages — Pi allows that shape too).
-		if (msg.role === "user" || msg.role === "assistant") {
-			if (typeof content === "string") {
-				conversation += estimateTokens(content);
+		const resolvedStableId = options?.stableId(raw);
+		// Cache equality is only meaningful when JSON.stringify observes the same
+		// fields the tokenizer reads. Pi's JSONL messages satisfy this shape; custom
+		// prototypes and toJSON hooks must take the uncached path.
+		const stableId =
+			resolvedStableId !== undefined && isTokenCacheSafeMessage(raw)
+				? resolvedStableId
+				: undefined;
+		const wireJson = stableId === undefined ? null : safeJsonStringify(raw);
+		if (stableId !== undefined && wireJson !== null && wireJson !== "") {
+			liveIds?.add(stableId);
+			const cached = options?.cache.get(stableId);
+			if (cached?.wireJson === wireJson) {
+				conversation += cached.counts.conversation;
+				toolCall += cached.counts.toolCall;
 				continue;
 			}
-			if (!Array.isArray(content)) continue;
-			for (const part of content) {
-				if (!part || typeof part !== "object") continue;
-				const p = part as MaybePart;
-				switch (p.type) {
-					case "text":
-						if (typeof p.text === "string")
-							conversation += estimateTokens(p.text);
-						if (typeof p.textSignature === "string")
-							conversation += estimateTokens(p.textSignature);
-						break;
-					case "thinking":
-						if (typeof p.thinking === "string")
-							conversation += estimateTokens(p.thinking);
-						if (typeof p.thinkingSignature === "string")
-							conversation += estimateTokens(p.thinkingSignature);
-						break;
-					case "image":
-						// Pi image content is base64. Anthropic-style visual
-						// token estimate would need width/height, which Pi
-						// doesn't expose at this layer. Use the OpenCode
-						// fallback (1200 tokens) — over-estimates small
-						// thumbnails, under-estimates 4K screenshots, but is
-						// stable and matches the OpenCode fallback path.
-						conversation += 1200;
-						break;
-					case "toolCall":
-						// Tool invocation: name + JSON-serialized arguments.
-						// Mirrors OpenCode's `tool_use` case where input is
-						// the args payload.
-						if (typeof p.name === "string") toolCall += estimateTokens(p.name);
-						if (p.arguments !== undefined) {
-							const s =
-								typeof p.arguments === "string"
-									? p.arguments
-									: safeJsonStringify(p.arguments);
-							if (s) toolCall += estimateTokens(s);
-						}
-						break;
-				}
-			}
-			continue;
 		}
+		const beforeConversation = conversation;
+		const beforeToolCall = toolCall;
+		try {
+			const msg = raw as MaybeMessage;
+			const content = msg.content;
 
-		// ToolResult: top-level content is the bulky output body. This is
-		// the LARGER of the two halves of a tool tag (args ~58 bytes vs
-		// result ~4KB on a typical `read`), so it dominates the bucket.
-		if (msg.role === "toolResult") {
-			if (typeof content === "string") {
-				toolCall += estimateTokens(content);
+			// User/Assistant: content is array of PiTextContent | PiImageContent
+			// | PiThinkingContent | PiToolCall (or a plain string for user
+			// messages — Pi allows that shape too).
+			if (msg.role === "user" || msg.role === "assistant") {
+				if (typeof content === "string") {
+					conversation += estimateTokens(content);
+					continue;
+				}
+				if (!Array.isArray(content)) continue;
+				for (const part of content) {
+					if (!part || typeof part !== "object") continue;
+					const p = part as MaybePart;
+					switch (p.type) {
+						case "text":
+							if (typeof p.text === "string")
+								conversation += estimateTokens(p.text);
+							if (typeof p.textSignature === "string")
+								conversation += estimateTokens(p.textSignature);
+							break;
+						case "thinking":
+							if (typeof p.thinking === "string")
+								conversation += estimateTokens(p.thinking);
+							if (typeof p.thinkingSignature === "string")
+								conversation += estimateTokens(p.thinkingSignature);
+							break;
+						case "image":
+							// Pi image content is base64. Anthropic-style visual
+							// token estimate would need width/height, which Pi
+							// doesn't expose at this layer. Use the OpenCode
+							// fallback (1200 tokens) — over-estimates small
+							// thumbnails, under-estimates 4K screenshots, but is
+							// stable and matches the OpenCode fallback path.
+							conversation += 1200;
+							break;
+						case "toolCall":
+							// Tool invocation: name + JSON-serialized arguments.
+							// Mirrors OpenCode's `tool_use` case where input is
+							// the args payload.
+							if (typeof p.name === "string")
+								toolCall += estimateTokens(p.name);
+							if (p.arguments !== undefined) {
+								const s =
+									typeof p.arguments === "string"
+										? p.arguments
+										: safeJsonStringify(p.arguments);
+								if (s) toolCall += estimateTokens(s);
+							}
+							break;
+					}
+				}
 				continue;
 			}
-			if (!Array.isArray(content)) continue;
-			for (const part of content) {
-				if (!part || typeof part !== "object") continue;
-				const p = part as MaybePart;
-				if (p.type === "text" && typeof p.text === "string") {
-					toolCall += estimateTokens(p.text);
-				} else if (p.type === "image") {
-					toolCall += 1200;
+
+			// ToolResult: top-level content is the bulky output body. This is
+			// the LARGER of the two halves of a tool tag (args ~58 bytes vs
+			// result ~4KB on a typical `read`), so it dominates the bucket.
+			if (msg.role === "toolResult") {
+				if (typeof content === "string") {
+					toolCall += estimateTokens(content);
+					continue;
 				}
+				if (!Array.isArray(content)) continue;
+				for (const part of content) {
+					if (!part || typeof part !== "object") continue;
+					const p = part as MaybePart;
+					if (p.type === "text" && typeof p.text === "string") {
+						toolCall += estimateTokens(p.text);
+					} else if (p.type === "image") {
+						toolCall += 1200;
+					}
+				}
+			}
+		} finally {
+			if (stableId !== undefined && wireJson !== null && wireJson !== "") {
+				options?.cache.set(stableId, {
+					wireJson,
+					counts: {
+						conversation: conversation - beforeConversation,
+						toolCall: toolCall - beforeToolCall,
+					},
+				});
 			}
 		}
 	}
 
+	if (options && liveIds) {
+		for (const id of options.cache.keys()) {
+			if (!liveIds.has(id)) options.cache.delete(id);
+		}
+	}
 	return { conversation, toolCall };
+}
+
+function isTokenCacheSafeMessage(value: object): boolean {
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return false;
+	if ("toJSON" in value) return false;
+	return (
+		isJsonVisibleDataProperty(value, "role") &&
+		isJsonVisibleDataProperty(value, "content")
+	);
+}
+
+function isJsonVisibleDataProperty(value: object, key: string): boolean {
+	if (!(key in value)) return true;
+	const descriptor = Object.getOwnPropertyDescriptor(value, key);
+	return (
+		descriptor !== undefined &&
+		descriptor.enumerable === true &&
+		"value" in descriptor
+	);
 }
 
 function safeJsonStringify(value: unknown): string {

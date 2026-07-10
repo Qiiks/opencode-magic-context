@@ -211,6 +211,7 @@ interface RunPostTransformPhaseArgs {
         injectDocs?: boolean;
         memoryInjectionBudgetTokens?: number;
         historyBudgetTokens?: number;
+        temporalAwareness?: boolean;
         hardSignals?: M0HardSignals;
     };
 }
@@ -807,6 +808,7 @@ export async function runPostTransformPhase(
                 injectDocs: args.m0M1.injectDocs,
                 memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                 historyBudgetTokens: args.m0M1.historyBudgetTokens,
+                temporalAwareness: args.m0M1.temporalAwareness,
                 isCacheBustingPass,
                 hardSignals: args.m0M1.hardSignals,
             });

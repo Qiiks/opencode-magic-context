@@ -721,6 +721,16 @@ sidekick, a separate security concern, unaffected by this divergence.
 
 ---
 
+## 25. Pi clone/fork inherits session state; OpenCode `/fork` does not yet
+
+Pi preserves JSONL entry ids when cloning a branch, so the clone-start hook can
+copy compartments, tags, reductions, and deferred Pi marker state while filtering
+them to the copied prefix. OpenCode re-mints message ids during `/fork`, making
+entry-id-keyed migration unsafe there. OpenCode fork inheritance therefore needs
+a separate future design based on a stable cross-fork identity.
+
+---
+
 ## Maintenance
 
 Update this file whenever a deliberate Pi↔OpenCode divergence is introduced or
@@ -757,3 +767,15 @@ message for the upfront estimate and one per historian chunk, then a final
 summary. The drain loop, durable `wrapup_in_progress` marker, sequential historian
 runs, and deferred compaction semantics are shared in intent; only the progress
 surface differs.
+
+---
+
+## 9. Compartment date attributes require OpenCode message timestamps
+
+**OpenCode:** when `temporal_awareness` is enabled, fresh m[0]/m[1] renders batch-read
+compartment boundary timestamps from `opencode.db` and emit `start-date` / `end-date`.
+
+**Pi:** Pi sessions are JSONL and the Pi compartment pipeline has never had a durable
+boundary-timestamp lookup equivalent to OpenCode's message table. Pi therefore omits
+these attributes while retaining temporal gap markers derived from Pi message data.
+Cached defer passes in both harnesses continue replaying their previously rendered bytes.

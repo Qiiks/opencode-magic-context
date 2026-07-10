@@ -72,6 +72,9 @@ describe("MagicContextConfigSchema", () => {
                     overlay: false,
                 },
                 smart_drops: false,
+                shadow_transform: {
+                    enabled: false,
+                },
                 caveman_text_compression: {
                     enabled: false,
                     min_chars: 500,

@@ -76,3 +76,6 @@ packages/plugin/scripts/test-historian-prompt.ts
 # Internal SUBC-migration design docs / specs (not public)
 docs/cache-policy/
 docs/specs/
+
+# Rust workspace build output
+/target

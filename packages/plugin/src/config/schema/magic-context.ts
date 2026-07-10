@@ -434,6 +434,9 @@ export interface MagicContextConfig {
             max_commits: number;
         };
     };
+    shadow_transform: {
+        enabled: boolean;
+    };
     sidekick?: SidekickConfig;
 }
 
@@ -614,6 +617,19 @@ export const MagicContextConfigSchema = z
             .default(false)
             .describe(
                 "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
+            ),
+        shadow_transform: z
+            .object({
+                enabled: z
+                    .boolean()
+                    .default(false)
+                    .describe(
+                        "Dev flag: mirror every transform pass to the Magic Context Rust module over subc and byte-compare outputs. No behavior impact; default off.",
+                    ),
+            })
+            .default({ enabled: false })
+            .describe(
+                "Developer-only shadow transform lane. When enabled, the plugin fire-and-forgets a copy of each finalized transform to the Rust module for comparison; the live output is unchanged.",
             ),
         todowrite: z
             .object({
