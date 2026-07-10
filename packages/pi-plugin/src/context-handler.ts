@@ -203,7 +203,10 @@ import { clearPiSystemPromptSession } from "./system-prompt";
 import { injectPiTemporalMarkers } from "./temporal-awareness-pi";
 /** Force-materialization threshold — mirrors OpenCode's FORCE_MATERIALIZE_PERCENTAGE (85%). */
 import { withTimeout } from "./timeout";
-import { tokenizePiMessages } from "./tokenize-pi-messages";
+import {
+	type PiMessageTokenCacheEntry,
+	tokenizePiMessages,
+} from "./tokenize-pi-messages";
 import { createPiTranscript } from "./transcript-pi";
 
 const FORCE_MATERIALIZATION_PERCENTAGE = 85;
@@ -363,6 +366,10 @@ const lastHeuristicsTurnIdBySession = new Map<string, string>();
 const firstContextPassSeenBySession = new Set<string>();
 const liveModelBySession = new Map<string, string>();
 const taggedStableMessageIdsBySession = new Map<string, Set<string>>();
+const piMessageTokenCacheBySession = new Map<
+	string,
+	Map<string, PiMessageTokenCacheEntry>
+>();
 
 function logTransformTiming(
 	sessionId: string,
@@ -4669,7 +4676,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// never fail the pipeline on a stats write error.
 	try {
 		const tTokenAccounting = performance.now();
-		const counts = tokenizePiMessages(outputMessages as unknown[]);
+		let tokenCache = piMessageTokenCacheBySession.get(args.sessionId);
+		if (!tokenCache) {
+			tokenCache = new Map();
+			piMessageTokenCacheBySession.set(args.sessionId, tokenCache);
+		}
+		const counts = tokenizePiMessages(outputMessages as unknown[], {
+			cache: tokenCache,
+			stableId: (message) => postCommitEntryIdByRef.get(message),
+		});
 		updateSessionMeta(args.db, args.sessionId, {
 			conversationTokens: counts.conversation,
 			toolCallTokens: counts.toolCall,
@@ -5103,6 +5118,7 @@ function appendReminderToPiUserMessage(
  *   - emergency-notification cooldown
  *   - auto-search per-turn cache
  *   - compressor cooldown timer
+ *   - stable-message token totals
  *
  * NOT cleaned (intentional):
  *   - `inFlightHistorian` / `inFlightCompressor` — these promises
@@ -5135,6 +5151,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	commitSeenLastPass.delete(sessionId);
 	liveModelBySession.delete(sessionId);
 	taggedStableMessageIdsBySession.delete(sessionId);
+	piMessageTokenCacheBySession.delete(sessionId);
 	clearPiChannel1State(sessionId);
 	lastHeuristicsTurnIdBySession.delete(sessionId);
 	lastSeenProjectIdentityBySession.delete(sessionId);
