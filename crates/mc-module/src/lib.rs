@@ -133,6 +133,9 @@ pub const DEFAULT_MODULE_ID: &str = "magic-context";
 /// Consumers read these at attach via the status op and refuse to serve on mismatch
 /// with their hardcoded fallbacks, so a diverged epoch map cannot silently skip the
 /// safety fold.
+/// Bumps when the shared project-memory render changes. Epoch 1 is the compact,
+/// category-grouped `#id: fact` format and applies to every serializer profile.
+pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 1;
 /// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages.
@@ -1874,6 +1877,7 @@ impl McHandler {
                     "initialized": state.meta.initialized,
                     "row_version": state.row_version,
                     "epochs": {
+                        "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
                         "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                         "tagger_epoch": TAGGER_FEATURE_EPOCH,
                     },
@@ -1912,6 +1916,7 @@ impl McHandler {
             "publication_floor_ordinal": loaded.meta.publication_floor_ordinal,
             "pass_trace": pass_trace,
             "epochs": {
+                "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
                 "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
             },
@@ -4389,6 +4394,7 @@ mod tests {
 
     #[test]
     fn profile_render_epoch_is_profile_specific_and_zero_for_unchanged_profiles() {
+        assert_eq!(MEMORY_RENDER_FORMAT_EPOCH, 1);
         assert_eq!(
             profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic),
             PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
@@ -5340,6 +5346,7 @@ mod tests {
         assert_eq!(status["row_version"], Value::Null);
         assert_eq!(status["historian"]["last_no_fire"], Value::Null);
         assert_eq!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 1);
+        assert_eq!(status["epochs"]["memory_render_epoch"], json!(1));
         assert_eq!(status["epochs"]["profile_epoch"], json!(1));
         assert_eq!(
             status["epochs"]["tagger_epoch"],

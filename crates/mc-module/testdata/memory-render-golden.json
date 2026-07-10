@@ -13,13 +13,25 @@
           "importance": 80
         }
       ],
-      "block": "<project-memory>\n  <memory id=\"1\" category=\"ARCHITECTURE\" importance=\"80\">the spine holds the frozen set</memory>\n</project-memory>"
+      "block": "<project-memory>\n<ARCHITECTURE>\n#1: the spine holds the frozen set\n</ARCHITECTURE>\n</project-memory>"
     },
     {
       "memories": [
         {
+          "id": 3,
+          "category": "NAMING",
+          "content": "use ctx_* prefix",
+          "importance": 40
+        },
+        {
+          "id": 5,
+          "category": "Z_LEGACY",
+          "content": "last unknown",
+          "importance": 1
+        },
+        {
           "id": 1,
-          "category": "ARCHITECTURE",
+          "category": "PROJECT_RULES",
           "content": "alpha",
           "importance": 90
         },
@@ -27,16 +39,17 @@
           "id": 2,
           "category": "CONSTRAINTS",
           "content": "x < y & \"z\"",
-          "importance": null
+          "importance": null,
+          "source_name": "svc<&"
         },
         {
-          "id": 3,
-          "category": "NAMING",
-          "content": "use ctx_* prefix",
-          "importance": 40
+          "id": 4,
+          "category": "A_LEGACY",
+          "content": "first unknown",
+          "importance": 100
         }
       ],
-      "block": "<project-memory>\n  <memory id=\"1\" category=\"ARCHITECTURE\" importance=\"90\">alpha</memory>\n  <memory id=\"2\" category=\"CONSTRAINTS\" importance=\"50\">x &lt; y &amp; \"z\"</memory>\n  <memory id=\"3\" category=\"NAMING\" importance=\"40\">use ctx_* prefix</memory>\n</project-memory>"
+      "block": "<project-memory>\n<PROJECT_RULES>\n#1: alpha\n</PROJECT_RULES>\n<CONSTRAINTS>\n#2 [svc&lt;&amp;]: x &lt; y &amp; \"z\"\n</CONSTRAINTS>\n<NAMING>\n#3: use ctx_* prefix\n</NAMING>\n<A_LEGACY>\n#4: first unknown\n</A_LEGACY>\n<Z_LEGACY>\n#5: last unknown\n</Z_LEGACY>\n</project-memory>"
     }
   ],
   "memory_updates_cases": [

@@ -793,6 +793,11 @@ fn apply_once(
     // provider base, so membership or serializer-format changes drive the existing
     // render_config HARD path even if the caller's opaque base string is static.
     // upgrade_state + the external memory epoch have no mc_* source yet → empty (inert).
+    let memory_render_epoch = if crate::MEMORY_RENDER_FORMAT_EPOCH != 0 {
+        format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH)
+    } else {
+        String::new()
+    };
     let profile_render_epoch = serializer_profile
         .map(crate::profile_render_epoch)
         .filter(|epoch| *epoch != 0)
@@ -804,6 +809,7 @@ fn apply_once(
             workspace_fingerprint: store.workspace_fingerprint(ctx.project_path)?,
             upgrade_state: String::new(),
             memory_content_epoch: String::new(),
+            memory_render_epoch,
             profile_render_epoch,
         },
     );
@@ -6791,6 +6797,7 @@ mod tests {
                 workspace_fingerprint: s.workspace_fingerprint("git:proj").unwrap(),
                 upgrade_state: String::new(),
                 memory_content_epoch: String::new(),
+                memory_render_epoch: format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
                 profile_render_epoch: String::new(),
             },
         );
@@ -6899,15 +6906,30 @@ mod tests {
         )
     }
 
-    fn epoch0_effective_render_config(store: &McStore, cfg: &str) -> String {
+    fn effective_render_config_with_epochs(
+        store: &McStore,
+        cfg: &str,
+        memory_render_epoch: String,
+        profile_render_epoch: String,
+    ) -> String {
         fold_m0_content_epoch(
             cfg,
             &M0ContentEpoch {
                 workspace_fingerprint: store.workspace_fingerprint("git:proj").unwrap(),
                 upgrade_state: String::new(),
                 memory_content_epoch: String::new(),
-                profile_render_epoch: String::new(),
+                memory_render_epoch,
+                profile_render_epoch,
             },
+        )
+    }
+
+    fn global_epoch_effective_render_config(store: &McStore, cfg: &str) -> String {
+        effective_render_config_with_epochs(
+            store,
+            cfg,
+            format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+            String::new(),
         )
     }
 
@@ -7017,6 +7039,7 @@ mod tests {
                     workspace_fingerprint: String::new(),
                     upgrade_state: String::new(),
                     memory_content_epoch: String::new(),
+                    memory_render_epoch: format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
                     profile_render_epoch: String::new(),
                 },
             ),
@@ -7392,7 +7415,9 @@ mod tests {
         assert_eq!(first.action, "HARD");
 
         let mut loaded = s.load("ses").unwrap();
-        loaded.meta.last_render_config = epoch0_effective_render_config(&s, "cfg0");
+        // Keep the shared memory-render epoch current so this fixture isolates
+        // the claude-code profile epoch transition.
+        loaded.meta.last_render_config = global_epoch_effective_render_config(&s, "cfg0");
         loaded
             .core
             .frozen_units
@@ -7423,11 +7448,13 @@ mod tests {
     }
 
     #[test]
-    fn epoch_zero_profiles_keep_effective_render_config_byte_identical() {
+    fn global_memory_render_epoch_hards_all_profiles_once_then_stabilizes() {
+        assert_eq!(crate::MEMORY_RENDER_FORMAT_EPOCH, 1);
         for profile in [
             SerializerProfile::OwnedLlmRunner,
             SerializerProfile::Pi,
             SerializerProfile::OpencodeAiSdk,
+            SerializerProfile::ClaudeCodeAnthropic,
         ] {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
@@ -7443,21 +7470,52 @@ mod tests {
             let first = run(&s, &request, &spine());
             assert_eq!(first.action, "HARD");
 
-            let loaded = s.load(&session).unwrap();
-            let epoch0_cfg = epoch0_effective_render_config(&s, "cfg0");
+            let mut loaded = s.load(&session).unwrap();
+            let profile_epoch = crate::profile_render_epoch(profile);
+            let profile_epoch_component = if profile_epoch == 0 {
+                String::new()
+            } else {
+                format!("mpe{profile_epoch}")
+            };
+            let current_cfg = effective_render_config_with_epochs(
+                &s,
+                "cfg0",
+                format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+                profile_epoch_component.clone(),
+            );
+            assert_eq!(loaded.meta.last_render_config, current_cfg);
+            assert!(current_cfg.contains("mre:4:mre1"));
+
+            loaded.meta.last_render_config = effective_render_config_with_epochs(
+                &s,
+                "cfg0",
+                String::new(),
+                profile_epoch_component,
+            );
+            loaded
+                .core
+                .frozen_units
+                .iter_mut()
+                .find(|unit| unit.key == "m0")
+                .unwrap()
+                .frozen_payload = "OLD-PROJECT-MEMORY-FORMAT".to_string();
+            s.commit(&session, loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+
+            let transitioned = run(&s, &request, &spine());
             assert_eq!(
-                loaded.meta.last_render_config,
-                epoch0_cfg,
-                "{} must not render an empty profile epoch component",
+                transitioned.action,
+                "HARD",
+                "{} must fold the shared memory render epoch",
                 profile.wire_id()
             );
-            assert!(!epoch0_cfg.contains("mpe:"));
+            assert!(!m0_bytes(&transitioned).contains("OLD-PROJECT-MEMORY-FORMAT"));
 
             let steady = run(&s, &request, &spine());
             assert_eq!(
                 steady.action,
                 "SOFT+",
-                "{} must not take a deploy fold while its profile epoch is zero",
+                "{} must not loop the memory render fold",
                 profile.wire_id()
             );
             assert!(!steady.committed);

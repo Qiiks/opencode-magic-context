@@ -15,8 +15,8 @@ import { estimateTokens } from "./read-session-formatting";
  *    slice of the persisted m[0] snapshot (cached_m0_bytes), not Σp1.
  *  - `<project-docs>` and `<user-profile>` moved into m[0] (out of the system
  *    prompt) — they are their own buckets, not Conversation.
- *  - Memories render as the v2 `<project-memory>` slice (id/category/importance
- *    attributes), not the legacy v1 `memory_block_cache` "- content" shape.
+ *  - Memories render as the compact v2 `<project-memory>` slice (category groups
+ *    containing `#id: fact` lines), not the legacy `memory_block_cache` shape.
  *  - Facts are RETIRED as a render source (promoted to memories) → factTokens
  *    is always 0; the field is kept only for dashboard/back-compat shape.
  *

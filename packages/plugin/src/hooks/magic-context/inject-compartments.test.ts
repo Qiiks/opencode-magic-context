@@ -13,6 +13,7 @@ import {
     insertMemory,
     setMemoryClassification,
 } from "../../features/magic-context/memory/storage-memory";
+import type { Memory } from "../../features/magic-context/memory/types";
 import {
     bumpSessionFactsVersion,
     getOrCreateSessionMeta,
@@ -32,9 +33,12 @@ import {
     mustMaterialize,
     prepareCompartmentInjection,
     renderCompartmentInjection,
+    renderMemoryBlockV2,
+    renderMemoryLineV2,
     trimMemoriesToBudgetV2,
 } from "./inject-compartments";
 import { closeReadOnlySessionDb } from "./read-session-db";
+import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 
 const SESSION_ID = "ses_test_inject";
@@ -136,6 +140,73 @@ afterEach(() => {
     clearInjectionCache(SESSION_ID);
     for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
     tempDirs.length = 0;
+});
+
+function renderMemory(id: number, category: string, content: string, importance = 50): Memory {
+    return { id, category, content, importance } as unknown as Memory;
+}
+
+describe("compact project-memory wire", () => {
+    it("groups by canonical then alphabetical categories and escapes facts and attribution", () => {
+        const memories = [
+            renderMemory(9, "Z_LEGACY", "last"),
+            renderMemory(5, "ARCHITECTURE", "owned by service"),
+            renderMemory(4, "PROJECT_RULES", "second rule"),
+            renderMemory(3, "PROJECT_RULES", "use <fast> & safe mode"),
+            renderMemory(8, "A&LEGACY", "first unknown"),
+        ];
+
+        expect(
+            renderMemoryBlockV2(memories, "project-memory", {
+                sourceNameByMemoryId: new Map([[5, "svc<&"]]),
+            }),
+        ).toBe(`<project-memory>
+<PROJECT_RULES>
+#3: use &lt;fast&gt; &amp; safe mode
+#4: second rule
+</PROJECT_RULES>
+<ARCHITECTURE>
+#5 [svc&lt;&amp;]: owned by service
+</ARCHITECTURE>
+<A&amp;LEGACY>
+#8: first unknown
+</A&amp;LEGACY>
+<Z_LEGACY>
+#9: last
+</Z_LEGACY>
+</project-memory>`);
+        expect(renderMemoryLineV2(memories[0]!)).toBe("#9: last");
+    });
+
+    it("measures the complete grouped block so a dropped category has no tag overhead", () => {
+        const kept = renderMemory(1, "PROJECT_RULES", "always run focused tests", 100);
+        const dropped = renderMemory(2, "ARCHITECTURE", "a separate category", 1);
+        const budget = estimateTokens(renderMemoryBlockV2([kept]));
+        expect(estimateTokens(renderMemoryBlockV2([kept, dropped]))).toBeGreaterThan(budget);
+
+        const trimmed = trimMemoriesToBudgetV2(SESSION_ID, [dropped, kept], budget);
+        expect(trimmed.selected.map((memory) => memory.id)).toEqual([kept.id]);
+        const block = renderMemoryBlockV2(trimmed.renderOrder);
+        expect(estimateTokens(block)).toBeLessThanOrEqual(budget);
+        expect(block).not.toContain("<ARCHITECTURE>");
+    });
+
+    it("keeps rendered bytes identical across importance-only classification updates", () => {
+        db = makeDb();
+        const inserted = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "CONSTRAINTS",
+            content: "Never bypass the validation gate.",
+            importance: 20,
+        });
+        const before = renderMemoryBlockV2(getMemoriesByProject(db, PROJECT_PATH));
+
+        expect(setMemoryClassification(db, inserted.id, { importance: 95 })).toBe(true);
+        const after = renderMemoryBlockV2(getMemoriesByProject(db, PROJECT_PATH));
+
+        expect(after).toBe(before);
+        expect(after).not.toContain("importance");
+    });
 });
 
 describe("prepareCompartmentInjection — empty compartments fallback", () => {
@@ -1137,7 +1208,7 @@ describe("m[0]/m[1] materialization", () => {
             hardSignals: { ...hardV1, systemHash: "sys-v2" },
         });
         expect(hard.m0RematerializedThisPass).toBe(true);
-        expect(renderedText(third[0])).toContain('importance="100"');
+        expect(renderedText(third[0])).not.toContain("importance=");
         expect(renderedText(third[0])).toContain("LOW_PRIORITY_MEMORY");
         expect(renderedText(third[0])).not.toContain("HIGH_PRIORITY_MEMORY");
     });

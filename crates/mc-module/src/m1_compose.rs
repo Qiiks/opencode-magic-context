@@ -231,8 +231,9 @@ pub fn compose_m1_from_store(
 }
 
 /// Active memories with `id > after_id` for the calling project (or the workspace union
-/// when `membership` is Some), ordered by importance then id (the <new-memories> render
-/// set). Filters the active pool in memory — the new set is a small tail and this runs
+/// when `membership` is Some). This loader sorts by importance then id; the compact
+/// `<new-memories>` renderer canonicalizes the final category-grouped wire order.
+/// Filters the active pool in memory — the new set is a small tail and this runs
 /// only on a bust. `membership` is the ALREADY-RESOLVED membership for the CALLING project
 /// (so own-vs-foreign visibility keys off the right own_identity); `paths[0]` is the
 /// single project when there is no membership.

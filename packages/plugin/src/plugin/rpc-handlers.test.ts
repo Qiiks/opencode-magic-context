@@ -127,10 +127,10 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
         try {
             const sessionId = "ses-test-3";
             const directory = process.cwd();
-            // m[0] carries the real v2 render (id/category/importance attributes).
+            // m[0] carries the compact v2 category-grouped render.
             const m0 =
                 "<session-history>\n</session-history>\n\n" +
-                '<project-memory>\n  <memory id="1" category="ARCHITECTURE" importance="50">a durable architectural fact about the system</memory>\n</project-memory>';
+                "<project-memory>\n<ARCHITECTURE>\n#1: a durable architectural fact about the system\n</ARCHITECTURE>\n</project-memory>";
             // memory_block_cache holds the LEGACY v1 shape — must be IGNORED for
             // the token bucket now (it under-counts the real injected cost).
             const v1Cache = "<project-memory>\n- a durable architectural fact\n</project-memory>";
@@ -144,15 +144,13 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
 
             const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
             expect(snapshot.memoryBlockCount).toBe(1);
-            // Tokens come from the m[0] v2 slice, which is heavier than the v1
-            // cache shape (has id/category/importance attributes).
+            // Tokens come from the actual m[0] v2 slice, not the stale cache.
             const v2SliceTokens = snapshot.memoryTokens;
             expect(v2SliceTokens).toBeGreaterThan(0);
-            // The v2 slice is strictly larger than the v1 cache shape would yield.
             expect(
                 estimateTokens(m0.match(/<project-memory>[\s\S]*?<\/project-memory>/)?.[0] ?? ""),
             ).toBe(v2SliceTokens);
-            expect(v2SliceTokens).toBeGreaterThan(estimateTokens(v1Cache));
+            expect(v2SliceTokens).not.toBe(estimateTokens(v1Cache));
         } finally {
             closeQuietly(db);
         }

@@ -254,25 +254,39 @@ console.log(`wrote ${docsCases.length} project-docs cases → ${docsOut}`);
 // render is a private DB-backed function; its branch logic (update/superseded/removed)
 // is mirrored here byte-for-byte (the Rust unit tests assert the same three branches
 // directly), so the golden still pins the Rust render to the TS shape.
-const xmlAttr = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const xmlContent = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const mkMem = (id: number, category: string, content: string, importance: number | null): Memory =>
     ({ id, category, content, importance }) as unknown as Memory;
 
-const memoryBlockInputs: Array<Array<[number, string, string, number | null]>> = [
+const memoryBlockInputs: Array<
+    Array<[number, string, string, number | null, string?]>
+> = [
     [],
     [[1, "ARCHITECTURE", "the spine holds the frozen set", 80]],
     [
-        [1, "ARCHITECTURE", "alpha", 90],
-        [2, "CONSTRAINTS", "x < y & \"z\"", null], // null importance defaults to 50; content special chars escape
         [3, "NAMING", "use ctx_* prefix", 40],
+        [5, "Z_LEGACY", "last unknown", 1],
+        [1, "PROJECT_RULES", "alpha", 90],
+        [2, "CONSTRAINTS", "x < y & \"z\"", null, "svc<&"],
+        [4, "A_LEGACY", "first unknown", 100],
     ],
 ];
 const memoryBlockCases = memoryBlockInputs.map((rows) => {
-    const memories = rows.map(([id, c, content, imp]) => mkMem(id, c, content, imp));
+    const memories = rows.map(([id, category, content, importance]) =>
+        mkMem(id, category, content, importance),
+    );
+    const sourceNameByMemoryId = new Map(
+        rows.flatMap(([id, , , , sourceName]) => (sourceName ? [[id, sourceName] as const] : [])),
+    );
     return {
-        memories: rows.map(([id, category, content, importance]) => ({ id, category, content, importance })),
-        block: renderMemoryBlockV2(memories, "project-memory"),
+        memories: rows.map(([id, category, content, importance, source_name]) => ({
+            id,
+            category,
+            content,
+            importance,
+            ...(source_name ? { source_name } : {}),
+        })),
+        block: renderMemoryBlockV2(memories, "project-memory", { sourceNameByMemoryId }),
     };
 });
 
@@ -315,4 +329,3 @@ const memoryUpdatesCases = memoryUpdatesInputs.map(({ mutations, rendered_ids })
 const memOut = join(import.meta.dir, "../../mc-module/testdata/memory-render-golden.json");
 writeFileSync(memOut, `${JSON.stringify({ memory_block_cases: memoryBlockCases, memory_updates_cases: memoryUpdatesCases }, null, 2)}\n`);
 console.log(`wrote ${memoryBlockCases.length} memory-block + ${memoryUpdatesCases.length} memory-updates cases → ${memOut}`);
-void xmlAttr;

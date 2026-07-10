@@ -3,9 +3,9 @@
 //! Faithful port of the memory render in `inject-compartments.ts`
 //! (`renderMemoryLineV2` / `renderMemoryBlockV2` / `renderMemoryUpdatesBlock`). Pure
 //! over the stored rows:
-//!  - the baseline block lists each rendered memory as a `<memory>` line (the m0 source);
-//!    the SAME line shape feeds the budget accounting, so a trim measures the bytes it
-//!    actually injects.
+//!  - the baseline block groups memories by category and renders compact `#id: fact`
+//!    lines; the TypeScript trim measures the complete grouped block so category-tag
+//!    overhead matches the bytes it actually injects.
 //!  - the corrections block renders the coalesced mutation set as a forward delta the
 //!    model trusts over the (stale-but-cached) baseline: `<updated>` for a content
 //!    change, `<superseded by=>` when the replacement is itself in the baseline else
@@ -16,6 +16,7 @@
 
 use crate::decay_render::{render_decayed_compartments, DecayRenderCompartment};
 use mc_store::{StoredMemory, StoredMemoryMutation, WorkspaceMembership};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 /// The body for an empty session history. The `<session-history>` tag is always present
@@ -42,27 +43,50 @@ fn escape_xml_content(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Render ONE memory's baseline line exactly as it lands in the `<project-memory>`
-/// block — the same shape the budget accounting measures, so a trim counts the bytes it
-/// injects (a lighter shape would under-count and overflow the budget). `source_name`
-/// is the repo attribution for a workspace-union memory (None = own project).
+const MEMORY_CATEGORY_ORDER: [&str; 5] = [
+    "PROJECT_RULES",
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "CONFIG_VALUES",
+    "NAMING",
+];
+
+fn memory_render_order(left: &StoredMemory, right: &StoredMemory) -> Ordering {
+    let left_priority = MEMORY_CATEGORY_ORDER
+        .iter()
+        .position(|category| *category == left.category);
+    let right_priority = MEMORY_CATEGORY_ORDER
+        .iter()
+        .position(|category| *category == right.category);
+    match (left_priority, right_priority) {
+        (Some(left_rank), Some(right_rank)) => left_rank
+            .cmp(&right_rank)
+            .then_with(|| left.id.cmp(&right.id)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left
+            .category
+            .cmp(&right.category)
+            .then_with(|| left.id.cmp(&right.id)),
+    }
+}
+
+/// Render one compact memory fact line. Importance still controls selection, but is
+/// deliberately absent from the wire so classification-only updates do not change bytes.
 pub fn render_memory_line(memory: &StoredMemory, source_name: Option<&str>) -> String {
-    let source_attr = match source_name {
-        Some(name) => format!(" source=\"{}\"", escape_xml_attr(name)),
-        None => String::new(),
-    };
+    let source = source_name
+        .filter(|name| !name.is_empty())
+        .map(|name| format!(" [{}]", escape_xml_content(name)))
+        .unwrap_or_default();
     format!(
-        "  <memory id=\"{}\" category=\"{}\"{} importance=\"{}\">{}</memory>",
+        "#{}{source}: {}",
         memory.id,
-        escape_xml_attr(&memory.category),
-        source_attr,
-        memory.importance.unwrap_or(50),
         escape_xml_content(&memory.content)
     )
 }
 
-/// Render the `<project-memory>` (or workspace-`wrapper`) baseline block from the
-/// already-selected, already-ordered memory set. Empty set → empty string.
+/// Render the `<project-memory>` (or workspace-`wrapper`) block from an already-selected
+/// memory set. Categories are canonical-first, then non-taxonomy categories alphabetically;
 /// `source_name_by_id` supplies per-memory repo attribution for a workspace union.
 pub fn workspace_source_names(
     memories: &[StoredMemory],
@@ -89,13 +113,27 @@ pub fn render_memory_block(
     if memories.is_empty() {
         return String::new();
     }
-    let mut lines = Vec::with_capacity(memories.len() + 2);
+    let mut ordered: Vec<&StoredMemory> = memories.iter().collect();
+    ordered.sort_by(|left, right| memory_render_order(left, right));
+
+    let mut lines = Vec::with_capacity(memories.len() * 2 + 2);
     lines.push(format!("<{wrapper}>"));
-    for m in memories {
+    let mut open_category: Option<&str> = None;
+    for memory in ordered {
+        if open_category != Some(memory.category.as_str()) {
+            if let Some(category) = open_category {
+                lines.push(format!("</{}>", escape_xml_attr(category)));
+            }
+            open_category = Some(&memory.category);
+            lines.push(format!("<{}>", escape_xml_attr(&memory.category)));
+        }
         lines.push(render_memory_line(
-            m,
-            source_name_by_id.get(&m.id).map(String::as_str),
+            memory,
+            source_name_by_id.get(&memory.id).map(String::as_str),
         ));
+    }
+    if let Some(category) = open_category {
+        lines.push(format!("</{}>", escape_xml_attr(category)));
     }
     lines.push(format!("</{wrapper}>"));
     lines.join("\n")
@@ -358,33 +396,31 @@ mod tests {
     }
 
     #[test]
-    fn memory_block_lines_and_attrs() {
+    fn memory_block_groups_categories_and_omits_importance() {
         let memories = vec![
+            mem(4, "Z_LEGACY", "last", Some(1)),
+            mem(2, "CONSTRAINTS", "x < y & z", None),
             mem(1, "ARCHITECTURE", "the spine holds", Some(80)),
-            mem(2, "CONSTRAINTS", "x < y & z", None), // None importance → 50; XML escape
+            mem(3, "A&LEGACY", "first unknown", Some(100)),
         ];
         let block = render_memory_block(&memories, "project-memory", &Default::default());
-        assert!(block.starts_with("<project-memory>\n"));
-        assert!(block.ends_with("\n</project-memory>"));
-        assert!(block.contains(
-            "<memory id=\"1\" category=\"ARCHITECTURE\" importance=\"80\">the spine holds</memory>"
-        ));
-        assert!(
-            block.contains("importance=\"50\">x &lt; y &amp; z</memory>"),
-            "{block}"
+        assert_eq!(
+            block,
+            "<project-memory>\n<ARCHITECTURE>\n#1: the spine holds\n</ARCHITECTURE>\n<CONSTRAINTS>\n#2: x &lt; y &amp; z\n</CONSTRAINTS>\n<A&amp;LEGACY>\n#3: first unknown\n</A&amp;LEGACY>\n<Z_LEGACY>\n#4: last\n</Z_LEGACY>\n</project-memory>"
         );
+        assert!(!block.contains("importance"));
     }
 
     #[test]
     fn memory_block_source_attribution() {
         let mut src = std::collections::HashMap::new();
-        src.insert(1i64, "svc-auth".to_string());
+        src.insert(1i64, "svc<&".to_string());
         let block = render_memory_block(
             &[mem(1, "ARCHITECTURE", "c", Some(50))],
             "project-memory",
             &src,
         );
-        assert!(block.contains("source=\"svc-auth\""), "{block}");
+        assert!(block.contains("#1 [svc&lt;&amp;]: c"), "{block}");
     }
 
     #[test]
@@ -537,6 +573,8 @@ mod tests {
         category: String,
         content: String,
         importance: Option<i32>,
+        #[serde(default)]
+        source_name: Option<String>,
     }
     #[derive(Deserialize)]
     struct RawMut {
@@ -577,7 +615,17 @@ mod tests {
                 .iter()
                 .map(|r| mem(r.id, &r.category, &r.content, r.importance))
                 .collect();
-            let got = render_memory_block(&memories, "project-memory", &Default::default());
+            let sources = c
+                .memories
+                .iter()
+                .filter_map(|memory| {
+                    memory
+                        .source_name
+                        .as_ref()
+                        .map(|source| (memory.id, source.clone()))
+                })
+                .collect();
+            let got = render_memory_block(&memories, "project-memory", &sources);
             assert_eq!(got, c.block, "memory block mismatch case {n}");
         }
         for (n, c) in golden.memory_updates_cases.iter().enumerate() {

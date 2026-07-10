@@ -1353,6 +1353,8 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 			expect(historyClose).toBeGreaterThan(-1);
 			expect(memoryOpen).toBeGreaterThan(-1);
 			expect(memoryOpen).toBeGreaterThan(historyClose);
+			expect(m0).toContain("<ARCHITECTURE>\n#");
+			expect(m0).not.toContain("<memory id=");
 			// Compartment body lives INSIDE <session-history>; memory does NOT.
 			const historyBlock = m0.slice(
 				m0.indexOf("<session-history>"),

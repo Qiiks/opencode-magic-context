@@ -62,6 +62,10 @@ pub struct M0ContentEpoch {
     /// (the mutation log + cursor) as a SOFT. Must NOT be derived from the mutation log,
     /// or in-session edits would HARD and the m1 correction path would be dead.
     pub memory_content_epoch: String,
+    /// The module-wide project-memory render epoch. A non-zero value coordinates one HARD
+    /// fold for every serializer profile when the shared memory block format changes.
+    /// Empty means epoch zero and is omitted from the folded identity.
+    pub memory_render_epoch: String,
     /// The module's own rendered-prefix FORMAT epoch for this session's serializer
     /// profile: the "m0 in an incompatible format" composition class (same reason as
     /// `upgrade_state`). Folded module-side so a format flip self-coordinates ONE HARD
@@ -90,6 +94,9 @@ pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -
         part("upg", &epoch.upgrade_state),
         part("mem", &epoch.memory_content_epoch),
     ];
+    if !epoch.memory_render_epoch.is_empty() {
+        parts.push(part("mre", &epoch.memory_render_epoch));
+    }
     if !epoch.profile_render_epoch.is_empty() {
         parts.push(part("mpe", &epoch.profile_render_epoch));
     }
@@ -247,6 +254,7 @@ mod tests {
             workspace_fingerprint: "wf1".into(),
             upgrade_state: "u1".into(),
             memory_content_epoch: "mc1".into(),
+            memory_render_epoch: String::new(),
             profile_render_epoch: String::new(),
         };
         let folded = fold_m0_content_epoch(base, &epoch);
@@ -255,10 +263,17 @@ mod tests {
         assert!(folded.starts_with(base));
         assert!(folded.contains("ws:3:wf1"));
         assert!(folded.contains("mem:3:mc1"));
+        assert!(!folded.contains("mre:"), "global epoch zero must be inert");
         assert!(
             !folded.contains("mpe:"),
-            "epoch zero must not add a component or non-CC sessions would fold spuriously"
+            "profile epoch zero must not add a component"
         );
+        let mut memory_render_epoch = epoch.clone();
+        memory_render_epoch.memory_render_epoch = "mre1".into();
+        let memory_render_folded = fold_m0_content_epoch(base, &memory_render_epoch);
+        assert!(memory_render_folded.contains("mre:4:mre1"));
+        assert_ne!(folded, memory_render_folded);
+
         let mut profile_epoch = epoch.clone();
         profile_epoch.profile_render_epoch = "mpe1".into();
         let profile_folded = fold_m0_content_epoch(base, &profile_epoch);
