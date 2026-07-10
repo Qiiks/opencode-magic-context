@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import {
@@ -166,6 +167,32 @@ describe("applyForwardPressureFloor", () => {
 	});
 });
 
+describe("stable tag identity reuse window", () => {
+	it("contains only real ids from the latest successful pass", () => {
+		const sessionId = "ses-reuse-window";
+		try {
+			contextHandlerInternals.recordSuccessfulTaggedMessageIds(sessionId, [
+				"entry-a",
+				"entry-b",
+				undefined,
+				"pi-msg-2-10-user",
+			]);
+			contextHandlerInternals.recordSuccessfulTaggedMessageIds(sessionId, [
+				"entry-b",
+				"entry-c",
+			]);
+
+			expect(
+				Array.from(
+					contextHandlerInternals.getTaggedStableMessageIdsForTests(sessionId),
+				).sort(),
+			).toEqual(["entry-b", "entry-c"]);
+		} finally {
+			clearContextHandlerSession(sessionId);
+		}
+	});
+});
+
 describe("Pi fallback tag adoption", () => {
 	type RawTagRow = {
 		tagNumber: number;
@@ -296,6 +323,68 @@ describe("Pi fallback tag adoption", () => {
 		}
 	});
 
+	it("re-probes a stale negative after fingerprint construction before skipping adoption", () => {
+		const dir = mkdtempSync(join(tmpdir(), "mc-pi-fallback-race-"));
+		const dbPath = join(dir, "context.db");
+		const db = createTestDb(dbPath);
+		const siblingDb = createTestDb(dbPath);
+		try {
+			db.exec("PRAGMA journal_mode = WAL");
+			siblingDb.exec("PRAGMA journal_mode = WAL");
+			const sessionId = "ses-pi-fallback-negative-race";
+			const realId = "entry-real-raced";
+			const fallbackId = "pi-msg-0-10-user";
+			const messages = [userMessage("raced message", 10)];
+			const fingerprints = contextHandlerInternals.buildEntryFingerprintMap(
+				messages,
+				() => realId,
+			);
+			const fingerprint = fingerprints.get(realId);
+			if (!fingerprint) throw new Error("missing test fingerprint");
+			const tagger = createTagger();
+			tagger.initFromDb(sessionId, db);
+
+			// This commit lands after the caller's negative preflight and fingerprint
+			// construction, matching a sibling Pi process on the same session.
+			insertTag(
+				siblingDb,
+				sessionId,
+				`${fallbackId}:p0`,
+				"message",
+				13,
+				7,
+				0,
+				null,
+				0,
+				null,
+				fingerprint,
+				{ tokenCount: 3, inputTokenCount: 0, reasoningTokenCount: 0 },
+			);
+
+			contextHandlerInternals.adoptPiFallbackTags(
+				db,
+				sessionId,
+				tagger,
+				fingerprints,
+				{ hasFallbackMessageTags: false },
+			);
+			expect(readTagRow(db, sessionId, 7)?.messageId).toBe(`${realId}:p0`);
+			expect(tagger.getTag(sessionId, `${realId}:p0`, "message")).toBe(7);
+
+			const transcript = createPiTranscript(messages, sessionId, [realId]);
+			tagTranscript(sessionId, transcript, tagger, db, {
+				entryFingerprintByMessageId: fingerprints,
+			});
+			transcript.commit();
+			expect(getTagsBySession(db, sessionId)).toHaveLength(1);
+			expect(textOf(messages[0])).toBe("§7§ raced message");
+		} finally {
+			closeQuietly(siblingDb);
+			closeQuietly(db);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("migrates dropped sentinelized tool-only owners without allocating a fresh tag", () => {
 		const db = createTestDb();
 		try {
@@ -342,6 +431,7 @@ describe("Pi fallback tag adoption", () => {
 					messages: realMessages,
 					resolveStableId: (_msg: unknown, index: number) =>
 						index === 0 ? realOwner : "entry-tool-result",
+					hasFallbackToolOwnerTags: false,
 				},
 			);
 
@@ -451,6 +541,14 @@ describe("Pi fallback tag adoption", () => {
 			});
 			expect(tagger.getToolTag(sessionId, callId, piOwner)).toBeUndefined();
 			expect(tagger.getToolTag(sessionId, callId, realOwner)).toBe(10);
+			expect(tagger.getToolTagAccounting(sessionId, callId, realOwner)).toEqual(
+				{
+					byteSize: 1000,
+					tokenCount: 300,
+					inputByteSize: 200,
+					inputTokenCount: 40,
+				},
+			);
 		} finally {
 			closeQuietly(db);
 		}

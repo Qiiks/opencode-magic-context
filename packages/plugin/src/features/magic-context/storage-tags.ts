@@ -416,6 +416,41 @@ export function updateTagTokenCount(
     getUpdateTagTokenCountStatement(db).run(newTokenCount, sessionId, tagNumber);
 }
 
+export interface PersistedToolTagAccounting {
+    byteSize: number;
+    tokenCount: number | null;
+    inputByteSize: number;
+    inputTokenCount: number | null;
+}
+
+/** Read the authoritative accounting after an exceptional same-pass owner adoption. */
+export function getPersistedToolTagAccounting(
+    db: Database,
+    sessionId: string,
+    tagNumber: number,
+): PersistedToolTagAccounting | null {
+    const row = db
+        .prepare(
+            `SELECT byte_size AS byteSize,
+                    token_count AS tokenCount,
+                    input_byte_size AS inputByteSize,
+                    input_token_count AS inputTokenCount
+             FROM tags
+             WHERE session_id = ? AND tag_number = ? AND type = 'tool'`,
+        )
+        .get(sessionId, tagNumber) as PersistedToolTagAccounting | null | undefined;
+    if (
+        !row ||
+        typeof row.byteSize !== "number" ||
+        (row.tokenCount !== null && typeof row.tokenCount !== "number") ||
+        typeof row.inputByteSize !== "number" ||
+        (row.inputTokenCount !== null && typeof row.inputTokenCount !== "number")
+    ) {
+        return null;
+    }
+    return row;
+}
+
 /**
  * Flat per-message ORIGINAL token map for the protected-tail boundary, keyed by
  * real message id. Sums every tag's stored token weight (output + input +

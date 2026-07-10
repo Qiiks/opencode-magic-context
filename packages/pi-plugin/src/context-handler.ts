@@ -67,6 +67,7 @@ import {
 	getOldestActiveUnprotectedToolTags,
 	getPendingOps,
 	getPendingPiCompactionMarkerState,
+	getPersistedToolTagAccounting,
 	getTagsByNumbers,
 	hasPiFallbackMessageTags,
 	hasPiFallbackToolOwnerTags,
@@ -263,6 +264,10 @@ export const __test = {
 	applyForwardPressureFloor,
 	buildEntryFingerprintMap,
 	buildPiToolOwnerMap,
+	getTaggedStableMessageIdsForTests(sessionId: string): ReadonlySet<string> {
+		return new Set(taggedStableMessageIdsBySession.get(sessionId));
+	},
+	recordSuccessfulTaggedMessageIds,
 	setInFlightHistorianForTests(
 		sessionId: string,
 		promise: Promise<unknown>,
@@ -366,6 +371,18 @@ const lastHeuristicsTurnIdBySession = new Map<string, string>();
 const firstContextPassSeenBySession = new Set<string>();
 const liveModelBySession = new Map<string, string>();
 const taggedStableMessageIdsBySession = new Map<string, Set<string>>();
+
+function recordSuccessfulTaggedMessageIds(
+	sessionId: string,
+	entryIds: readonly (string | undefined)[],
+): void {
+	const liveRealIds = new Set<string>();
+	for (const entryId of entryIds) {
+		if (entryId && !entryId.startsWith("pi-msg-")) liveRealIds.add(entryId);
+	}
+	taggedStableMessageIdsBySession.set(sessionId, liveRealIds);
+}
+
 const piMessageTokenCacheBySession = new Map<
 	string,
 	Map<string, PiMessageTokenCacheEntry>
@@ -1452,15 +1469,22 @@ function adoptPiFallbackTags(
 	fingerprintById: ReadonlyMap<string, string>,
 	options: AdoptPiFallbackTagsOptions = {},
 ): void {
+	// A positive preflight remains a valid fast path, but a negative preflight is
+	// only advisory: a sibling connection can commit a fallback row after the
+	// fingerprint map is built. Re-probe negatives here so the decision to skip
+	// observes commits that happened before adoption starts.
+	const hasFallbackMessageTags =
+		options.hasFallbackMessageTags === true ||
+		hasPiFallbackMessageTags(db, sessionId);
+	const hasFallbackToolOwnerTags =
+		options.hasFallbackToolOwnerTags === true ||
+		hasPiFallbackToolOwnerTags(db, sessionId);
 	const shouldRunMessageMigration =
 		options.stampStableIdScheme !== undefined ||
-		((options.hasFallbackMessageTags ?? true) &&
+		(hasFallbackMessageTags &&
 			hasAdoptablePiFallbackMessageTags(db, sessionId, fingerprintById));
 	const shouldRunToolOwnerMigration = Boolean(
-		options.messages &&
-			options.resolveStableId &&
-			(options.hasFallbackToolOwnerTags ??
-				hasPiFallbackToolOwnerTags(db, sessionId)),
+		options.messages && options.resolveStableId && hasFallbackToolOwnerTags,
 	);
 	if (!shouldRunMessageMigration && !shouldRunToolOwnerMigration) return;
 
@@ -1548,6 +1572,20 @@ function adoptPiFallbackTags(
 						realOwnerId,
 						adoption.tagNumber,
 					);
+					const accounting = getPersistedToolTagAccounting(
+						db,
+						sessionId,
+						adoption.tagNumber,
+					);
+					if (accounting) {
+						// Collision folds can raise stored maxima; refresh the mirror before
+						// identity reuse uses it as the no-BPE growth baseline.
+						tagger.setToolTagAccounting(
+							sessionId,
+							adoption.tagNumber,
+							accounting,
+						);
+					}
 				}
 			}
 		}
@@ -2303,17 +2341,11 @@ export function registerPiContextHandler(
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
 				isSubagent: sessionMeta.isSubagent,
 			});
-			// SessionEntry message ids are append-only. Mark only after the pipeline
-			// succeeds so a failed first observation retries full derivation next time.
+			// Replace the reuse window only after a successful pass. An id absent from
+			// the current branch must take one full derivation pass if it later returns,
+			// and bounding the set to the live branch prevents session-long growth.
 			if (strictEntryIds) {
-				let taggedIds = taggedStableMessageIdsBySession.get(sessionId);
-				if (!taggedIds) {
-					taggedIds = new Set();
-					taggedStableMessageIdsBySession.set(sessionId, taggedIds);
-				}
-				for (const entryId of strictEntryIds) {
-					if (entryId) taggedIds.add(entryId);
-				}
+				recordSuccessfulTaggedMessageIds(sessionId, strictEntryIds);
 			}
 			const piDecisionSnapshotNewestAssistant =
 				branchEntries === null
@@ -3773,14 +3805,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// message keeps its tag_number/§N§ instead of getting a fresh tag. No-op for
 	// OpenCode (this path is Pi-only) and for messages already on a real id.
 	const tFallbackIdentity = performance.now();
-	// Two indexed existence probes replace one fallback-candidate query per
-	// message on steady-state passes. Without fallback rows, append-only messages
-	// observed on an earlier pass already have their persisted fingerprints.
+	// This indexed preflight avoids rebuilding fingerprints for every old message.
+	// A negative result is rechecked by adoption after this map is complete, while
+	// tool-owner adoption performs its only existence probe at that later point.
 	const hasFallbackMessageTags = hasPiFallbackMessageTags(
-		args.db,
-		args.sessionId,
-	);
-	const hasFallbackToolOwnerTags = hasPiFallbackToolOwnerTags(
 		args.db,
 		args.sessionId,
 	);
@@ -3804,7 +3832,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				? PI_STABLE_ID_SCHEME
 				: undefined,
 			hasFallbackMessageTags,
-			hasFallbackToolOwnerTags,
 		},
 	);
 	logTransformTiming(

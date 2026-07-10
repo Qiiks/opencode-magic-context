@@ -45,6 +45,13 @@ export function makeToolCompositeKey(ownerMsgId: string, callId: string): string
  */
 type NonToolTagType = Exclude<TagEntry["type"], "tool">;
 
+export interface ToolTagAccounting {
+    byteSize: number;
+    tokenCount: number | null;
+    inputByteSize: number;
+    inputTokenCount: number | null;
+}
+
 export interface Tagger {
     /**
      * Assign a tag for a non-tool entity (message text or file part).
@@ -114,6 +121,14 @@ export interface Tagger {
      * identity.
      */
     getToolTag(sessionId: string, callId: string, ownerMsgId: string): number | undefined;
+    /** Persisted accounting loaded in the same scan as tool-tag identities. */
+    getToolTagAccounting(
+        sessionId: string,
+        callId: string,
+        ownerMsgId: string,
+    ): ToolTagAccounting | undefined;
+    /** Keep the loaded accounting mirror synchronized with same-connection writes. */
+    setToolTagAccounting(sessionId: string, tagNumber: number, accounting: ToolTagAccounting): void;
     bindTag(sessionId: string, messageId: string, tagNumber: number): void;
     /**
      * Remove a stale in-memory assignment key. Used by Pi fallback-tag
@@ -146,13 +161,13 @@ const GET_COUNTER_SQL = `SELECT counter FROM session_meta WHERE session_id = ?`;
 // placed in the in-memory map; the lazy-adoption DB path discovers them
 // at the next lookup.
 const GET_ASSIGNMENTS_SQL =
-    "SELECT message_id, tag_number, type, tool_owner_message_id FROM tags WHERE session_id = ? ORDER BY tag_number ASC";
+    "SELECT message_id, tag_number, type, tool_owner_message_id, byte_size, token_count, input_byte_size, input_token_count FROM tags WHERE session_id = ? ORDER BY tag_number ASC";
 // Scoped variant: load only tags at/above the live-wire floor (tag_number is
 // monotonic with message order, so everything below the first wire message's
 // tag is compacted-away history not in the wire). floor=0 callers use the
 // unscoped SQL above and get today's full-session load unchanged.
 const GET_ASSIGNMENTS_SCOPED_SQL =
-    "SELECT message_id, tag_number, type, tool_owner_message_id FROM tags WHERE session_id = ? AND tag_number >= ? ORDER BY tag_number ASC";
+    "SELECT message_id, tag_number, type, tool_owner_message_id, byte_size, token_count, input_byte_size, input_token_count FROM tags WHERE session_id = ? AND tag_number >= ? ORDER BY tag_number ASC";
 
 /**
  * SQLite change-detection signal for the `initFromDb` cache.
@@ -185,6 +200,10 @@ interface AssignmentRow {
     tag_number: number;
     type: TagEntry["type"];
     tool_owner_message_id: string | null;
+    byte_size: number;
+    token_count: number | null;
+    input_byte_size: number;
+    input_token_count: number | null;
 }
 
 /**
@@ -218,6 +237,11 @@ function isAssignmentRow(row: unknown): row is AssignmentRow {
         candidate.tool_owner_message_id !== null &&
         typeof candidate.tool_owner_message_id !== "string"
     )
+        return false;
+    if (typeof candidate.byte_size !== "number") return false;
+    if (candidate.token_count !== null && typeof candidate.token_count !== "number") return false;
+    if (typeof candidate.input_byte_size !== "number") return false;
+    if (candidate.input_token_count !== null && typeof candidate.input_token_count !== "number")
         return false;
     return true;
 }
@@ -286,6 +310,9 @@ export function createTagger(): Tagger {
     const counters = new Map<string, number>();
     // per-session tag assignments: messageId → tag number
     const assignments = new Map<string, Map<string, number>>();
+    // Persisted tool accounting is loaded with assignments, avoiding a point query
+    // for every reused result while retaining an authoritative growth baseline.
+    const toolAccountingBySession = new Map<string, Map<number, ToolTagAccounting>>();
     // per-session load signatures: tracks the DB state at the last
     // successful initFromDb() reload. A subsequent initFromDb() call can
     // skip the full DB scan when (a) the signature exists for this session,
@@ -304,6 +331,15 @@ export function createTagger(): Tagger {
         if (!map) {
             map = new Map();
             assignments.set(sessionId, map);
+        }
+        return map;
+    }
+
+    function getSessionToolAccounting(sessionId: string): Map<number, ToolTagAccounting> {
+        let map = toolAccountingBySession.get(sessionId);
+        if (!map) {
+            map = new Map();
+            toolAccountingBySession.set(sessionId, map);
         }
         return map;
     }
@@ -439,6 +475,14 @@ export function createTagger(): Tagger {
 
             counters.set(sessionId, next);
             sessionAssignments.set(mapKey, next);
+            if (type === "tool") {
+                getSessionToolAccounting(sessionId).set(next, {
+                    byteSize,
+                    tokenCount: tokenCounts?.tokenCount ?? null,
+                    inputByteSize,
+                    inputTokenCount: tokenCounts?.inputTokenCount ?? null,
+                });
+            }
             return next;
         }
 
@@ -611,6 +655,25 @@ export function createTagger(): Tagger {
         return assignments.get(sessionId)?.get(makeToolCompositeKey(ownerMsgId, callId));
     }
 
+    function getToolTagAccounting(
+        sessionId: string,
+        callId: string,
+        ownerMsgId: string,
+    ): ToolTagAccounting | undefined {
+        const tagNumber = getToolTag(sessionId, callId, ownerMsgId);
+        return tagNumber === undefined
+            ? undefined
+            : toolAccountingBySession.get(sessionId)?.get(tagNumber);
+    }
+
+    function setToolTagAccounting(
+        sessionId: string,
+        tagNumber: number,
+        accounting: ToolTagAccounting,
+    ): void {
+        getSessionToolAccounting(sessionId).set(tagNumber, accounting);
+    }
+
     function bindTag(sessionId: string, messageId: string, tagNumber: number): void {
         getSessionAssignments(sessionId).set(messageId, tagNumber);
     }
@@ -642,6 +705,7 @@ export function createTagger(): Tagger {
         // monotonic upsert by using a dedicated statement.
         counters.set(sessionId, 0);
         assignments.delete(sessionId);
+        toolAccountingBySession.delete(sessionId);
         // Drop the load signature so the next initFromDb forces a full
         // reload rather than cache-hitting against pre-reset state.
         loadSignatures.delete(sessionId);
@@ -723,6 +787,8 @@ export function createTagger(): Tagger {
         ).filter(isAssignmentRow);
         const sessionAssignments = getSessionAssignments(sessionId);
         sessionAssignments.clear();
+        const sessionToolAccounting = getSessionToolAccounting(sessionId);
+        sessionToolAccounting.clear();
 
         let maxTagNumber = 0;
         for (const assignment of assignmentRows) {
@@ -744,6 +810,12 @@ export function createTagger(): Tagger {
                         ),
                         assignment.tag_number,
                     );
+                    sessionToolAccounting.set(assignment.tag_number, {
+                        byteSize: assignment.byte_size,
+                        tokenCount: assignment.token_count,
+                        inputByteSize: assignment.input_byte_size,
+                        inputTokenCount: assignment.input_token_count,
+                    });
                 }
                 // else: NULL-owner — skip the in-memory binding.
             } else {
@@ -775,6 +847,7 @@ export function createTagger(): Tagger {
     function cleanup(sessionId: string): void {
         counters.delete(sessionId);
         assignments.delete(sessionId);
+        toolAccountingBySession.delete(sessionId);
         // Drop the load signature so the next initFromDb forces a full
         // reload rather than cache-hitting against pre-cleanup state.
         loadSignatures.delete(sessionId);
@@ -785,6 +858,8 @@ export function createTagger(): Tagger {
         assignToolTag,
         getTag,
         getToolTag,
+        getToolTagAccounting,
+        setToolTagAccounting,
         bindTag,
         unbindTag,
         bindToolTag,

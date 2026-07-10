@@ -165,8 +165,8 @@ interface ToolAggregate {
     toolName: string | null;
     /** Input byte size from the invocation occurrence (for storage projection). */
     inputByteSize: number;
-    /** Whether input_token_count has been persisted (from the tool_use occurrence). */
-    inputTokenStored: boolean;
+    /** Persisted input-token count, or null for a legacy/unobserved invocation. */
+    inputTokenCount: number | null;
 }
 
 export function tagTranscript(
@@ -295,26 +295,38 @@ export function tagTranscript(
                     const canReuseIdentity = reuseIdentity && existing.identityReusable;
                     let text = "";
                     if (canReuseIdentity) {
-                        // Prefix replay still needs the visible result text. Invocation
-                        // JSON, tokenizer work, source writes, and tag updates do not.
-                        if (part.kind === "tool_result") text = part.getText() ?? "";
+                        // Prefix replay always needs result text. Byte length is also
+                        // cheap enough to guard the durable growth invariant; BPE and
+                        // DB writes remain staged behind an actual persisted-size bump.
+                        if (part.kind === "tool_result") {
+                            text = part.getText() ?? "";
+                            applyGrownToolResultAccounting({
+                                db,
+                                sessionId,
+                                tagger,
+                                aggregate: existing,
+                                byteSize: getToolPartByteSize(part, text),
+                                part,
+                                text,
+                                timing,
+                            });
+                        }
                         if (timing) timing.identity += performance.now() - identityStart;
                     } else {
                         const accounting = readAggregateToolAccounting(part, timing);
                         text = accounting.text;
-                        if (
-                            part.kind === "tool_result" &&
-                            accounting.byteSize > existing.maxByteSize
-                        ) {
-                            existing.maxByteSize = accounting.byteSize;
-                            existing.maxTokenCount = accounting.tokenCount;
-                            updateTagByteSize(db, sessionId, existing.tagId, accounting.byteSize);
-                            updateTagTokenCount(
+                        if (part.kind === "tool_result") {
+                            applyGrownToolResultAccounting({
                                 db,
                                 sessionId,
-                                existing.tagId,
-                                accounting.tokenCount,
-                            );
+                                tagger,
+                                aggregate: existing,
+                                byteSize: accounting.byteSize,
+                                part,
+                                text,
+                                timing,
+                                knownTokenCount: accounting.tokenCount,
+                            });
                         }
                         if (existing.toolName === null && accounting.toolName) {
                             existing.toolName = accounting.toolName;
@@ -333,11 +345,11 @@ export function tagTranscript(
                             );
                         }
                         if (
-                            !existing.inputTokenStored &&
+                            existing.inputTokenCount === null &&
                             part.kind === "tool_use" &&
                             accounting.inputTokenCount > 0
                         ) {
-                            existing.inputTokenStored = true;
+                            existing.inputTokenCount = accounting.inputTokenCount;
                             updateTagInputTokenCount(
                                 db,
                                 sessionId,
@@ -345,6 +357,7 @@ export function tagTranscript(
                                 accounting.inputTokenCount,
                             );
                         }
+                        syncToolAggregateAccounting(tagger, sessionId, existing);
                         if (timing) timing.identity += performance.now() - identityStart;
                     }
                     existing.identityReusable &&= reuseIdentity;
@@ -371,24 +384,39 @@ export function tagTranscript(
                 const reusableTagId = reuseIdentity
                     ? tagger.getToolTag(sessionId, callId, messageId)
                     : undefined;
+                const reusableAccounting = reuseIdentity
+                    ? tagger.getToolTagAccounting(sessionId, callId, messageId)
+                    : undefined;
                 let aggregate: ToolAggregate & { tagId: number };
                 let text = "";
-                if (reusableTagId !== undefined) {
-                    if (part.kind === "tool_result") text = part.getText() ?? "";
+                if (reusableTagId !== undefined && reusableAccounting !== undefined) {
                     aggregate = {
                         callId,
                         tagId: reusableTagId,
                         identityReusable: true,
                         occurrences: [{ message, part, kind: part.kind }],
-                        // Persisted accounting is authoritative for a stable part.
-                        // Infinity prevents another stable result block from issuing a
-                        // redundant size write during this rebuilt aggregate.
-                        maxByteSize: part.kind === "tool_result" ? Number.POSITIVE_INFINITY : 0,
-                        maxTokenCount: 0,
+                        // Stable identity does not imply stable payload size. Seed from
+                        // the persisted row so unchanged results avoid BPE while a
+                        // genuinely larger folded result can still bump accounting.
+                        maxByteSize: reusableAccounting.byteSize,
+                        maxTokenCount: reusableAccounting.tokenCount ?? 0,
                         toolName: null,
-                        inputByteSize: part.kind === "tool_use" ? Number.POSITIVE_INFINITY : 0,
-                        inputTokenStored: part.kind === "tool_use",
+                        inputByteSize: reusableAccounting.inputByteSize,
+                        inputTokenCount: reusableAccounting.inputTokenCount,
                     };
+                    if (part.kind === "tool_result") {
+                        text = part.getText() ?? "";
+                        applyGrownToolResultAccounting({
+                            db,
+                            sessionId,
+                            tagger,
+                            aggregate,
+                            byteSize: getToolPartByteSize(part, text),
+                            part,
+                            text,
+                            timing,
+                        });
+                    }
                     if (timing) timing.identity += performance.now() - identityStart;
                 } else {
                     const accounting = readAggregateToolAccounting(part, timing);
@@ -413,17 +441,40 @@ export function tagTranscript(
                             reasoningTokenCount: null,
                         }),
                     );
+                    const persistedAccounting = tagger.getToolTagAccounting(
+                        sessionId,
+                        callId,
+                        messageId,
+                    );
                     aggregate = {
                         callId,
                         tagId,
                         identityReusable: false,
                         occurrences: [{ message, part, kind: part.kind }],
-                        maxByteSize: outputByteSize,
-                        maxTokenCount: outputTokenCount,
+                        maxByteSize: persistedAccounting?.byteSize ?? outputByteSize,
+                        maxTokenCount: persistedAccounting?.tokenCount ?? outputTokenCount,
                         toolName: accounting.toolName,
-                        inputByteSize: part.kind === "tool_use" ? accounting.inputByteSize : 0,
-                        inputTokenStored: part.kind === "tool_use" && firstInputTokenCount > 0,
+                        inputByteSize:
+                            persistedAccounting?.inputByteSize ??
+                            (part.kind === "tool_use" ? accounting.inputByteSize : 0),
+                        inputTokenCount:
+                            persistedAccounting?.inputTokenCount ??
+                            (part.kind === "tool_use" ? firstInputTokenCount : null),
                     };
+                    if (part.kind === "tool_result") {
+                        applyGrownToolResultAccounting({
+                            db,
+                            sessionId,
+                            tagger,
+                            aggregate,
+                            byteSize: accounting.byteSize,
+                            part,
+                            text,
+                            timing,
+                            knownTokenCount: accounting.tokenCount,
+                        });
+                    }
+                    syncToolAggregateAccounting(tagger, sessionId, aggregate);
                     if (timing) timing.identity += performance.now() - identityStart;
                 }
 
@@ -465,6 +516,47 @@ interface AggregateToolAccounting {
     toolName: string | null;
     inputByteSize: number;
     inputTokenCount: number;
+}
+
+interface GrownToolResultAccountingArgs {
+    db: ContextDatabase;
+    sessionId: string;
+    tagger: Tagger;
+    aggregate: ToolAggregate & { tagId: number };
+    byteSize: number;
+    part: TranscriptPart;
+    text: string;
+    timing: TagTranscriptTiming | undefined;
+    knownTokenCount?: number;
+}
+
+function syncToolAggregateAccounting(
+    tagger: Tagger,
+    sessionId: string,
+    aggregate: ToolAggregate & { tagId: number },
+): void {
+    tagger.setToolTagAccounting(sessionId, aggregate.tagId, {
+        byteSize: aggregate.maxByteSize,
+        tokenCount: aggregate.maxTokenCount,
+        inputByteSize: aggregate.inputByteSize,
+        inputTokenCount: aggregate.inputTokenCount,
+    });
+}
+
+function applyGrownToolResultAccounting(args: GrownToolResultAccountingArgs): void {
+    if (args.byteSize <= args.aggregate.maxByteSize) return;
+
+    let tokenCount = args.knownTokenCount;
+    if (tokenCount === undefined) {
+        const tokenStart = args.timing ? performance.now() : 0;
+        tokenCount = getToolPartTokenCount(args.part, args.text);
+        if (args.timing) args.timing.tokenCounting += performance.now() - tokenStart;
+    }
+    args.aggregate.maxByteSize = args.byteSize;
+    args.aggregate.maxTokenCount = tokenCount;
+    updateTagByteSize(args.db, args.sessionId, args.aggregate.tagId, args.byteSize);
+    updateTagTokenCount(args.db, args.sessionId, args.aggregate.tagId, tokenCount);
+    syncToolAggregateAccounting(args.tagger, args.sessionId, args.aggregate);
 }
 
 function readAggregateToolAccounting(

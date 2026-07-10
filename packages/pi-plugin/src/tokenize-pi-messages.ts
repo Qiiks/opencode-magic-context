@@ -92,7 +92,14 @@ export function tokenizePiMessages(
 
 	for (const raw of messages) {
 		if (!raw || typeof raw !== "object") continue;
-		const stableId = options?.stableId(raw);
+		const resolvedStableId = options?.stableId(raw);
+		// Cache equality is only meaningful when JSON.stringify observes the same
+		// fields the tokenizer reads. Pi's JSONL messages satisfy this shape; custom
+		// prototypes and toJSON hooks must take the uncached path.
+		const stableId =
+			resolvedStableId !== undefined && isTokenCacheSafeMessage(raw)
+				? resolvedStableId
+				: undefined;
 		const wireJson = stableId === undefined ? null : safeJsonStringify(raw);
 		if (stableId !== undefined && wireJson !== null && wireJson !== "") {
 			liveIds?.add(stableId);
@@ -200,6 +207,26 @@ export function tokenizePiMessages(
 		}
 	}
 	return { conversation, toolCall };
+}
+
+function isTokenCacheSafeMessage(value: object): boolean {
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return false;
+	if ("toJSON" in value) return false;
+	return (
+		isJsonVisibleDataProperty(value, "role") &&
+		isJsonVisibleDataProperty(value, "content")
+	);
+}
+
+function isJsonVisibleDataProperty(value: object, key: string): boolean {
+	if (!(key in value)) return true;
+	const descriptor = Object.getOwnPropertyDescriptor(value, key);
+	return (
+		descriptor !== undefined &&
+		descriptor.enumerable === true &&
+		"value" in descriptor
+	);
 }
 
 function safeJsonStringify(value: unknown): string {

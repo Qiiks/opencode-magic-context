@@ -7,6 +7,8 @@ import type { TagEntry } from "./types";
 
 interface StoredTag extends TagEntry {
     rowId: number;
+    tokenCount: number | null;
+    inputTokenCount: number | null;
 }
 
 // Mock DB that simulates bun:sqlite interface
@@ -29,6 +31,9 @@ function createMockDb(options?: { failCounterWrite?: boolean; rollbackTransactio
                     inputByteSize?: number,
                     _harness?: string,
                     toolOwnerMessageId?: string | null,
+                    _entryFingerprint?: string | null,
+                    tokenCount?: number | null,
+                    inputTokenCount?: number | null,
                 ) => {
                     const tag: StoredTag = {
                         rowId: nextId++,
@@ -44,6 +49,8 @@ function createMockDb(options?: { failCounterWrite?: boolean; rollbackTransactio
                         tagNumber: _tagNumber,
                         cavemanDepth: 0,
                         toolOwnerMessageId: toolOwnerMessageId ?? null,
+                        tokenCount: tokenCount ?? null,
+                        inputTokenCount: inputTokenCount ?? null,
                     };
                     tags.push(tag);
                     return { lastInsertRowid: tag.rowId };
@@ -57,7 +64,7 @@ function createMockDb(options?: { failCounterWrite?: boolean; rollbackTransactio
                 run: () => {},
             };
         }
-        if (sql.includes("SELECT message_id, tag_number, type, tool_owner_message_id FROM tags")) {
+        if (sql.includes("SELECT message_id, tag_number, type, tool_owner_message_id,")) {
             return {
                 all: (sessionId: string) =>
                     tags
@@ -67,6 +74,10 @@ function createMockDb(options?: { failCounterWrite?: boolean; rollbackTransactio
                             tag_number: tag.tagNumber,
                             type: tag.type,
                             tool_owner_message_id: tag.toolOwnerMessageId,
+                            byte_size: tag.byteSize,
+                            token_count: tag.tokenCount,
+                            input_byte_size: tag.inputByteSize,
+                            input_token_count: tag.inputTokenCount,
                         })),
             };
         }
