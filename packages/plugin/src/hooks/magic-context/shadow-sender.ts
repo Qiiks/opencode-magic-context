@@ -1101,7 +1101,11 @@ class SubcShadowTransport implements ShadowTransport {
         await this.ensureConnected();
         const body: Record<string, unknown> = {
             op: "route.open",
-            target: { kind: "management_surface", module_id: this.moduleId },
+            // mc-module registers a ToolProvider role in its manifest (see
+            // crates/mc-module/src/lib.rs manifest()); it does NOT provide a
+            // management surface. Opening with the wrong kind makes the daemon
+            // reject every route with target_unavailable.
+            target: { kind: "tool_provider", module_id: this.moduleId },
             identity: {
                 project_root: projectRoot,
                 harness: getHarness(),
