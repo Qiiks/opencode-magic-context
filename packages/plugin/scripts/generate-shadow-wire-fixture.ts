@@ -261,7 +261,12 @@ export function generateShadowWireFixture(): string {
             declaredTrim,
         };
         const sync = __shadowSenderTest.buildStateSyncPayload({ state, pass, force: true });
-        if (sync === null || sync === "mismatch" || sync === "unresolved") {
+        if (
+            sync === null ||
+            sync === "m0_mutation" ||
+            sync === "mismatch" ||
+            sync === "unresolved"
+        ) {
             throw new Error(`fixture state sync failed: ${String(sync)}`);
         }
 

@@ -622,12 +622,19 @@ function buildStateSyncPayload(args: {
     state: SessionQueueState;
     pass: Pick<ShadowTransformPass, "db" | "sessionId" | "projectPath">;
     force: boolean;
-}): ShadowStateSyncPayload | null | "mismatch" | "unresolved" {
+}): ShadowStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" {
     const currentWatermarks = loadWatermarks({
         db: args.pass.db,
         sessionId: args.pass.sessionId,
         projectPath: args.pass.projectPath,
     });
+    if (
+        !args.force &&
+        args.state.lastAckedWatermarks &&
+        currentWatermarks.m0_mutation_id > args.state.lastAckedWatermarks.m0_mutation_id
+    ) {
+        return "m0_mutation";
+    }
     if (!args.force && watermarksEqual(args.state.lastAckedWatermarks, currentWatermarks)) {
         return null;
     }
@@ -1033,6 +1040,24 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
             return;
         }
 
+        if (syncPayload === "m0_mutation") {
+            await performReset({
+                sessionId: pass.sessionId,
+                state,
+                reason: "m0_mutation",
+                projectRoot: pass.projectRoot,
+            });
+            try {
+                const fullSync = buildStateSyncPayload({ state, pass: preparedPass, force: true });
+                if (fullSync === "m0_mutation") {
+                    throw new Error("forced state sync unexpectedly requested another m0 reset");
+                }
+                syncPayload = fullSync;
+            } catch (error) {
+                sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
+                return;
+            }
+        }
         if (syncPayload === "mismatch") {
             state.counters.ordinal_mismatch += 1;
             state.requireResetReason = "ordinal_mismatch";

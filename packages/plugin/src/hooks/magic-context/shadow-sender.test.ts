@@ -9,7 +9,11 @@ import {
     closeDatabase,
     openDatabase,
 } from "../../features/magic-context/storage";
-import { appendCompartments } from "../../features/magic-context/compartment-storage";
+import {
+    appendCompartments,
+    replaceAllCompartmentState,
+} from "../../features/magic-context/compartment-storage";
+import { queueM0Mutation } from "../../features/magic-context/storage-m0-mutation-log";
 import { appendAutoSearchHintDecision } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -559,6 +563,96 @@ describe("shadow sender", () => {
             "state_sync",
         ]);
         expect(methods.filter((method) => method === "shadow_reset")).toHaveLength(2);
+    });
+
+    it("resets and fully reseeds after a recomp mutation recreates acknowledged sequences", async () => {
+        useTempDataHome("shadow-recomp-");
+        const sessionId = "s-recomp";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", text: "one" },
+            { id: "m2", role: "assistant", text: "two" },
+            { id: "m3", role: "user", text: "three" },
+        ]);
+        const db = openDatabase();
+        const compartments = [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                title: "one",
+                content: "original one",
+            },
+            {
+                sequence: 1,
+                startMessage: 2,
+                endMessage: 2,
+                startMessageId: "m2",
+                endMessageId: "m2",
+                title: "two",
+                content: "original two",
+            },
+            {
+                sequence: 2,
+                startMessage: 3,
+                endMessage: 3,
+                startMessageId: "m3",
+                endMessageId: "m3",
+                title: "three",
+                content: "original three",
+            },
+        ];
+        appendCompartments(db, sessionId, compartments);
+        const transport = new FakeTransport();
+        const sender = createShadowSender({ transport });
+        const msg = message(sessionId, "m3", "three");
+
+        sender.enqueue(
+            basePass({ db, sessionId, inputMessages: [msg], outputMessages: [msg], nowMs: 1 }),
+        );
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 1,
+        );
+
+        replaceAllCompartmentState(
+            db,
+            sessionId,
+            compartments.map((compartment) =>
+                compartment.sequence === 2
+                    ? { ...compartment, content: "recreated sequence two" }
+                    : compartment,
+            ),
+            [],
+        );
+        queueM0Mutation(db, {
+            sessionId,
+            mutationType: "recomp_boundary_change",
+            targetId: 2,
+            queuedAt: 2,
+        });
+        sender.enqueue(
+            basePass({ db, sessionId, inputMessages: [msg], outputMessages: [msg], nowMs: 2 }),
+        );
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 2,
+        );
+
+        expect(transport.calls.map((call) => call.method)).toEqual([
+            "shadow_reset",
+            "state_sync",
+            "shadow_transform",
+            "shadow_reset",
+            "state_sync",
+            "shadow_transform",
+        ]);
+        const syncBodies = transport.calls
+            .filter((call) => call.method === "state_sync")
+            .map((call) => call.body as { compartments: Array<{ sequence: number; content: string }> });
+        expect(syncBodies[1].compartments).toHaveLength(3);
+        expect(syncBodies[1].compartments).toContainEqual(
+            expect.objectContaining({ sequence: 2, content: "recreated sequence two" }),
+        );
     });
 
     it("keeps sender exceptions off the transform hot path", () => {
