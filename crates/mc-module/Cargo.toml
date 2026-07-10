@@ -10,7 +10,10 @@ name = "mc_module"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mc-module"
+# Fleet convention: supervised binaries carry the ck-* prefix so they group in
+# Activity Monitor. Crate/package stays mc-module and module_id stays
+# "magic-context" — only the built executable name changes.
+name = "ck-mc"
 path = "src/main.rs"
 
 [dependencies]

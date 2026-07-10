@@ -83,7 +83,7 @@ async fn mc_transform_spine_through_real_daemon() {
     );
     let module_bin = ensure_binary(
         &workspace,
-        workspace.join("target/debug/mc-module"),
+        workspace.join("target/debug/ck-mc"),
         &["build", "-p", "mc-module"],
     );
 
