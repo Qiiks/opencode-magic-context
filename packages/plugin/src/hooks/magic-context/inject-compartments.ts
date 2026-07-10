@@ -1115,20 +1115,12 @@ export function trimMemoriesToBudgetV2(
 ): TrimMemoriesResultV2 {
     const selectionOrder = [...memories].sort(memorySelectionOrder);
     const selected: Memory[] = [];
+    const accounting = createMemoryBlockAccounting(renderOptions);
 
     for (const memory of selectionOrder) {
-        // Re-render the full candidate block on every iteration. Category tags are
-        // present exactly when at least one selected memory uses that category, so
-        // omitting the last memory in a category also removes its tag overhead from
-        // the measured bytes. This intentionally favors exact wire accounting over
-        // an additive estimate whose group-tag amortization could drift.
-        const candidate = [...selected, memory];
-        if (
-            estimateTokens(renderMemoryBlockV2(candidate, "project-memory", renderOptions)) >
-            budgetTokens
-        ) {
-            continue;
-        }
+        const cost = accounting.candidateCost(memory);
+        if (accounting.usedTokens + cost > budgetTokens) continue;
+        accounting.admit(memory, cost);
         selected.push(memory);
     }
 
@@ -1157,16 +1149,14 @@ export function trimWorkspaceMemoriesToBudgetV2(
 
     const selected: Memory[] = [];
     const selectedIds = new Set<number>();
-    let usedTokens = 0;
-    const candidateCost = (memory: Memory) =>
-        estimateTokens(renderMemoryBlockV2([...selected, memory], "project-memory", renderOptions));
+    const accounting = createMemoryBlockAccounting(renderOptions);
     const trySelect = (memory: Memory): boolean => {
         if (selectedIds.has(memory.id)) return false;
-        const nextUsedTokens = candidateCost(memory);
-        if (nextUsedTokens > budgetTokens) return false;
+        const cost = accounting.candidateCost(memory);
+        if (accounting.usedTokens + cost > budgetTokens) return false;
         selected.push(memory);
         selectedIds.add(memory.id);
-        usedTokens = nextUsedTokens;
+        accounting.admit(memory, cost);
         return true;
     };
 
@@ -1176,7 +1166,7 @@ export function trimWorkspaceMemoriesToBudgetV2(
         trySelect(memory);
     }
 
-    const remainingAfterPermanent = Math.max(0, budgetTokens - usedTokens);
+    const remainingAfterPermanent = Math.max(0, budgetTokens - accounting.usedTokens);
     const floorTokens = remainingAfterPermanent / Math.max(1, workspace.identities.length);
     const byIdentity = new Map<string, Memory[]>();
     for (const memory of memories) {
@@ -1193,14 +1183,13 @@ export function trimWorkspaceMemoriesToBudgetV2(
         const candidates = (byIdentity.get(identity) ?? []).sort(memorySelectionOrder);
         for (const memory of candidates) {
             if (selectedIds.has(memory.id)) continue;
-            const nextUsedTokens = candidateCost(memory);
-            const incrementalTokens = Math.max(0, nextUsedTokens - usedTokens);
-            if (memberTokens + incrementalTokens > floorTokens) continue;
-            if (nextUsedTokens > budgetTokens) continue;
+            const cost = accounting.candidateCost(memory);
+            if (memberTokens + cost > floorTokens) continue;
+            if (accounting.usedTokens + cost > budgetTokens) continue;
             selected.push(memory);
             selectedIds.add(memory.id);
-            usedTokens = nextUsedTokens;
-            memberTokens += incrementalTokens;
+            accounting.admit(memory, cost);
+            memberTokens += cost;
         }
     }
 
@@ -1360,6 +1349,48 @@ function readNewMemoriesForM1(
         .all(projectPath, afterId, expiryCutoff)
         .filter(isMemoryRow);
     return rows.map((row) => ({ ...row }));
+}
+
+/**
+ * Incremental token accounting for the grouped memory block. Trimming probes
+ * hundreds of candidates against the budget; re-rendering and re-tokenizing the
+ * whole block per probe is O(n²) in tokenizer passes (~250ms at a 260-memory
+ * pool — a hot-path stall on materialize and the sidebar RPC). Instead: measure
+ * the wrapper once, each candidate line once, and each category's open/close
+ * tags once when that category first appears. BPE merges across the newline
+ * joins can only shrink the whole relative to the sum of its parts, so this
+ * additive account is a slight UPPER bound on the rendered block — trims stay
+ * conservative and the injected block can only land under the budget, never
+ * over it.
+ */
+function createMemoryBlockAccounting(renderOptions: MemoryRenderOptions) {
+    const seenCategories = new Set<string>();
+    const categoryCost = new Map<string, number>();
+    return {
+        usedTokens: estimateTokens("<project-memory>\n</project-memory>"),
+        candidateCost(memory: Memory): number {
+            const line = renderMemoryLineV2(
+                memory,
+                renderOptions.sourceNameByMemoryId?.get(memory.id),
+            );
+            let cost = estimateTokens(`${line}\n`);
+            if (!seenCategories.has(memory.category)) {
+                let tags = categoryCost.get(memory.category);
+                if (tags === undefined) {
+                    tags = estimateTokens(
+                        `<${escapeXmlAttr(memory.category)}>\n</${escapeXmlAttr(memory.category)}>\n`,
+                    );
+                    categoryCost.set(memory.category, tags);
+                }
+                cost += tags;
+            }
+            return cost;
+        },
+        admit(memory: Memory, cost: number): void {
+            this.usedTokens += cost;
+            seenCategories.add(memory.category);
+        },
+    };
 }
 
 /** Render one compact memory fact line. Importance still controls selection, but
