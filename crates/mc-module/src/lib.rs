@@ -154,6 +154,7 @@ pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     match profile {
         SerializerProfile::ClaudeCodeAnthropic => PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
         SerializerProfile::OwnedLlmRunner
+        | SerializerProfile::OwnedBroca
         | SerializerProfile::OpencodeAiSdk
         | SerializerProfile::Pi => 0,
     }

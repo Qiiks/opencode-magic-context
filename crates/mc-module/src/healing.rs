@@ -12,13 +12,19 @@ use std::cell::Cell;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SerializerProfile {
     OwnedLlmRunner,
+    /// The owned leg renamed (llm-runner -> broca). Identical serializer semantics
+    /// to OwnedLlmRunner; a separate variant so the wire string keeps driving the
+    /// render_config identity (the rename is a designed one-time HARD per session).
+    /// OwnedLlmRunner is deleted once the fleet cut lands and nothing sends it.
+    OwnedBroca,
     ClaudeCodeAnthropic,
     OpencodeAiSdk,
     Pi,
 }
 
-const ALL_PROFILES: [SerializerProfile; 4] = [
+const ALL_PROFILES: [SerializerProfile; 5] = [
     SerializerProfile::OwnedLlmRunner,
+    SerializerProfile::OwnedBroca,
     SerializerProfile::ClaudeCodeAnthropic,
     SerializerProfile::OpencodeAiSdk,
     SerializerProfile::Pi,
@@ -28,6 +34,7 @@ impl SerializerProfile {
     pub const fn wire_id(self) -> &'static str {
         match self {
             Self::OwnedLlmRunner => "owned-llmrunner",
+            Self::OwnedBroca => "owned-broca",
             Self::ClaudeCodeAnthropic => "claude-code-anthropic",
             Self::OpencodeAiSdk => "opencode-aisdk",
             Self::Pi => "pi",
@@ -37,6 +44,7 @@ impl SerializerProfile {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "owned-llmrunner" => Some(Self::OwnedLlmRunner),
+            "owned-broca" => Some(Self::OwnedBroca),
             "claude-code-anthropic" => Some(Self::ClaudeCodeAnthropic),
             "opencode-aisdk" => Some(Self::OpencodeAiSdk),
             "pi" => Some(Self::Pi),
@@ -92,7 +100,9 @@ pub struct QuirkResidual {
 
 pub const fn coverage(profile: SerializerProfile) -> HealingCoverage {
     match profile {
-        SerializerProfile::OwnedLlmRunner | SerializerProfile::Pi => HealingCoverage {
+        SerializerProfile::OwnedLlmRunner
+        | SerializerProfile::OwnedBroca
+        | SerializerProfile::Pi => HealingCoverage {
             drops_empty_content: true,
             autofills_reasoning: true,
             merges_consecutive_assistants: false,
@@ -127,6 +137,7 @@ pub const fn tail_reclaim(profile: SerializerProfile) -> bool {
     match profile {
         SerializerProfile::ClaudeCodeAnthropic => false,
         SerializerProfile::OwnedLlmRunner
+        | SerializerProfile::OwnedBroca
         | SerializerProfile::Pi
         | SerializerProfile::OpencodeAiSdk => true,
     }
@@ -167,6 +178,7 @@ pub const fn quirk_residual(profile: SerializerProfile) -> QuirkResidual {
             strips_reasoning_from_merged_assistants: true,
         },
         SerializerProfile::OwnedLlmRunner
+        | SerializerProfile::OwnedBroca
         | SerializerProfile::ClaudeCodeAnthropic
         | SerializerProfile::Pi => QuirkResidual {
             requires_non_anthropic_empty_sentinels: false,
@@ -187,6 +199,29 @@ mod tests {
         }
         assert_eq!(SerializerProfile::parse(""), None);
         assert_eq!(SerializerProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn owned_broca_is_semantically_identical_to_owned_llmrunner() {
+        // The broca rename must not change ANY profile-derived behavior — only the
+        // wire string (which drives the designed one-time render_config HARD).
+        assert_eq!(
+            coverage(SerializerProfile::OwnedBroca),
+            coverage(SerializerProfile::OwnedLlmRunner)
+        );
+        assert_eq!(
+            quirk_residual(SerializerProfile::OwnedBroca),
+            quirk_residual(SerializerProfile::OwnedLlmRunner)
+        );
+        assert_eq!(
+            tail_reclaim(SerializerProfile::OwnedBroca),
+            tail_reclaim(SerializerProfile::OwnedLlmRunner)
+        );
+        assert_eq!(
+            SerializerProfile::parse("owned-broca"),
+            Some(SerializerProfile::OwnedBroca)
+        );
+        assert_eq!(SerializerProfile::OwnedBroca.wire_id(), "owned-broca");
     }
 
     #[test]
