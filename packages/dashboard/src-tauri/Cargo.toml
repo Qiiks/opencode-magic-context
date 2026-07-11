@@ -1,5 +1,8 @@
 [package]
 name = "magic-context-dashboard"
+# The profiler bin (src/bin/profile_cache_page.rs) makes `cargo run` ambiguous;
+# tauri dev runs a bare `cargo run`, so the app must stay the default target.
+default-run = "magic-context-dashboard"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
