@@ -50,6 +50,12 @@ function parseJsonRecord(value: string): Record<string, unknown> | null {
     }
 }
 
+export function isRawCompactionSummaryInfo(info: unknown): boolean {
+    if (info === null || typeof info !== "object" || Array.isArray(info)) return false;
+    const candidate = info as Record<string, unknown>;
+    return candidate.summary === true && candidate.finish === "stop";
+}
+
 function parseJsonUnknown(value: string): unknown {
     try {
         return JSON.parse(value);
@@ -99,10 +105,9 @@ export function readRawSessionMessagesFromDb(db: Database, sessionId: string): R
     // Filter out compaction summary messages injected by magic-context.
     // These exist only for OpenCode's filterCompacted boundary and must not
     // be visible to historian, trigger evaluation, FTS indexing, or ctx_expand.
-    const filtered = messageRows.filter((row) => {
-        const info = parseJsonRecord(row.data);
-        return !(info?.summary === true && info?.finish === "stop");
-    });
+    const filtered = messageRows.filter(
+        (row) => !isRawCompactionSummaryInfo(parseJsonRecord(row.data)),
+    );
 
     return filtered.flatMap((row, index) => {
         const info = parseJsonRecord(row.data);
@@ -117,6 +122,31 @@ export function readRawSessionMessagesFromDb(db: Database, sessionId: string): R
             version: row.time_updated ?? null,
         };
     });
+}
+
+/**
+ * Read the canonical raw-message ordinal space without loading or parsing part rows.
+ * Keep the ordering, summary predicate, and malformed-message behavior identical to
+ * `readRawSessionMessagesFromDb`; consumers compare these ordinals across passes.
+ */
+export function readRawSessionMessageIdOrdinalsFromDb(
+    db: Database,
+    sessionId: string,
+): Map<string, number> {
+    const messageRows = db
+        .prepare(
+            "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC",
+        )
+        .all(sessionId)
+        .filter(isRawMessageRow);
+    const filtered = messageRows.filter(
+        (row) => !isRawCompactionSummaryInfo(parseJsonRecord(row.data)),
+    );
+    const ordinalById = new Map<string, number>();
+    filtered.forEach((row, index) => {
+        if (parseJsonRecord(row.data)) ordinalById.set(row.id, index + 1);
+    });
+    return ordinalById;
 }
 
 interface AnchorRow {
@@ -380,7 +410,7 @@ export function readRawSessionMessageByIdFromDb(
     }
 
     const info = parseJsonRecord(row.data);
-    if (!info || (info.summary === true && info.finish === "stop")) {
+    if (!info || isRawCompactionSummaryInfo(info)) {
         return null;
     }
 

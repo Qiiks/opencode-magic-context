@@ -21,6 +21,7 @@ import {
 import {
     type RawMessage,
     readRawSessionMessageByIdFromDb,
+    readRawSessionMessageIdOrdinalsFromDb,
     readRawSessionMessagesFromDb,
     readRawSessionTailFromDb,
 } from "./read-session-raw";
@@ -99,6 +100,7 @@ let activeAbsoluteCountCache: Map<string, number> | null = null;
 export interface RawMessageProvider {
     readMessages(): RawMessage[];
     readMessageById?: (messageId: string) => RawMessage | null;
+    readMessageIdOrdinals?: () => Map<string, number>;
     /** Optional fast count path; falls back to readMessages().length. */
     getMessageCount?: () => number;
 }
@@ -300,6 +302,16 @@ export function primeInMemoryTailRawMessageCache(args: {
     activeRawMessageCache.set(sessionId, messages);
     activeAbsoluteCountCache?.set(sessionId, absoluteMessageCount);
     return true;
+}
+
+export function readRawSessionMessageIdOrdinals(sessionId: string): Map<string, number> {
+    const provider = sessionProviders.get(sessionId);
+    if (provider?.readMessageIdOrdinals) return provider.readMessageIdOrdinals();
+    if (provider) {
+        return new Map(provider.readMessages().map((message) => [message.id, message.ordinal]));
+    }
+    if (!openCodeDbExists()) return new Map();
+    return withReadOnlySessionDb((db) => readRawSessionMessageIdOrdinalsFromDb(db, sessionId));
 }
 
 export function readRawSessionMessageById(sessionId: string, messageId: string): RawMessage | null {

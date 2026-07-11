@@ -17,10 +17,13 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import { queueM0Mutation } from "../../features/magic-context/storage-m0-mutation-log";
-import { appendAutoSearchHintDecision } from "../../features/magic-context/storage-meta-persisted";
+import {
+    appendAutoSearchHintDecision,
+    setPersistedCompactionMarkerState,
+} from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { primeInMemoryTailRawMessageCache, withRawSessionMessageCache } from "./read-session-chunk";
+import { setRawMessageProvider } from "./read-session-chunk";
 import {
     __shadowSenderTest,
     createShadowSender,
@@ -148,6 +151,13 @@ function message(sessionId: string, id: string, text: string): MessageLike {
     return {
         info: { id, role: "user", sessionID: sessionId },
         parts: [{ type: "text", text }],
+    };
+}
+
+function summaryMessage(sessionId: string, id: string): MessageLike {
+    return {
+        info: { id, role: "assistant", sessionID: sessionId, summary: true, finish: "stop" },
+        parts: [{ type: "text", text: "internal summary" }],
     };
 }
 
@@ -327,27 +337,6 @@ describe("shadow sender", () => {
             }),
         );
 
-        const belowFloor = withRawSessionMessageCache(() => {
-            primeInMemoryTailRawMessageCache({
-                sessionId,
-                messages: [{ ordinal: 2, id: "m2", role: "assistant", parts: [] }],
-                absoluteMessageCount: 2,
-            });
-            return __shadowSenderTest.resolveOrdinalsForShadow({
-                sessionId,
-                messages: [message(sessionId, "m1", "old")],
-                generation: state.shadowGeneration,
-                memoGeneration: state.idOrdinalMemoGeneration,
-                memo: new Map(),
-            });
-        });
-        expect(belowFloor).toEqual(
-            expect.objectContaining({
-                ok: true,
-                annotatedInput: [expect.objectContaining({ absolute_ordinal: 1 })],
-            }),
-        );
-
         // m2 vanished from the DB (revert) but the memo remembers ordinal 2. The
         // trailing-suffix rule assigns it a provisional ordinal that disagrees, so
         // the drift check reports mismatch and the caller's shadow_reset re-seeds —
@@ -422,23 +411,77 @@ describe("shadow sender", () => {
         ).toEqual(expect.objectContaining({ ok: false, reason: "mismatch" }));
     });
 
-    it("runs one in-flight operation per session and drops the oldest queued pass above the cap", async () => {
+    it("sends compacted sessions after excluding summary rows from both comparison lanes", async () => {
+        useTempDataHome("shadow-compacted-");
+        const sessionId = "s-compacted";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", text: "before" },
+            { id: "summary", role: "assistant", text: "summary", summary: true },
+            { id: "m2", role: "assistant", text: "after" },
+        ]);
+        const db = openDatabase();
+        const transport = new FakeTransport();
+        const sender = createShadowSender({ transport });
+        const inputMessages = [
+            message(sessionId, "m1", "before"),
+            summaryMessage(sessionId, "summary"),
+            message(sessionId, "m2", "after"),
+        ];
+
+        sender.enqueue(
+            basePass({
+                db,
+                sessionId,
+                inputMessages,
+                outputMessages: structuredClone(inputMessages),
+            }),
+        );
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 1,
+        );
+
+        const body = transport.calls.find((call) => call.method === "shadow_transform")?.body as {
+            input: Array<{ info: { id: string }; absolute_ordinal: number }>;
+            ts_output: Array<{ info: { id: string } }>;
+            normalizations: Array<{ kind: string; message_id: string; field: string }>;
+        };
+        expect(body.input.map((entry) => [entry.info.id, entry.absolute_ordinal])).toEqual([
+            ["m1", 1],
+            ["m2", 2],
+        ]);
+        expect(body.ts_output.map((entry) => entry.info.id)).toEqual(["m1", "m2"]);
+        expect(body.normalizations).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({
+                    kind: "summary_message",
+                    message_id: "summary",
+                    field: "input",
+                }),
+                expect.objectContaining({
+                    kind: "summary_message",
+                    message_id: "summary",
+                    field: "ts_output",
+                }),
+            ]),
+        );
+        expect(sender.getStats(sessionId).ordinal_unresolved).toBe(0);
+        expect(sender.getStats(sessionId).transforms_sent).toBe(1);
+    });
+
+    it("keeps only the newest unsent pass per session", async () => {
         useTempDataHome("shadow-fifo-");
         const sessionId = "s-fifo";
         createOpenCodeDb(sessionId, [
             { id: "m1", role: "user", text: "one" },
             { id: "m2", role: "user", text: "two" },
             { id: "m3", role: "user", text: "three" },
-            { id: "m4", role: "user", text: "four" },
-            { id: "m5", role: "user", text: "five" },
-            { id: "m6", role: "user", text: "six" },
         ]);
         const db = openDatabase();
         const transport = new FakeTransport();
         transport.blockFirstReset();
         const sender = createShadowSender({ transport });
 
-        for (let index = 1; index <= 6; index += 1) {
+        for (let index = 1; index <= 3; index += 1) {
             const msg = message(sessionId, `m${index}`, String(index));
             sender.enqueue(
                 basePass({
@@ -453,7 +496,7 @@ describe("shadow sender", () => {
         expect(sender.getStats(sessionId).dropped_oldest).toBe(1);
         transport.releaseReset?.();
         await waitFor(
-            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 5,
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 2,
         );
 
         // Wire bodies are FLAT (op fields beside `method`) — the module's serde
@@ -461,7 +504,7 @@ describe("shadow sender", () => {
         const sentNowMs = transport.calls
             .filter((call) => call.method === "shadow_transform")
             .map((call) => (call.body as { pass_inputs: { now_ms: number } }).pass_inputs.now_ms);
-        expect(sentNowMs).toEqual([1, 3, 4, 5, 6]);
+        expect(sentNowMs).toEqual([1, 3]);
         const firstTransformIndex = transport.calls.findIndex(
             (call) => call.method === "shadow_transform",
         );
@@ -474,6 +517,104 @@ describe("shadow sender", () => {
             .map((call) => call.body as { seed_pass: boolean });
         expect(transformBodies[0].seed_pass).toBe(true);
         expect(transformBodies.slice(1).every((body) => body.seed_pass === false)).toBe(true);
+    });
+
+    it("uses id-only and point readers across ordinal, declared-trim, and state-sync paths", () => {
+        useTempDataHome("shadow-point-reads-");
+        const sessionId = "s-point-reads";
+        const db = openDatabase();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m1",
+                endMessageId: "m2",
+                title: "Point-read compartment",
+                content: "content",
+            },
+        ]);
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "m2",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction-part",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 2,
+            targetEndMessageId: "m2",
+        });
+        const rawById = new Map([
+            [
+                "m1",
+                {
+                    ordinal: 1,
+                    id: "m1",
+                    role: "user",
+                    parts: [{ type: "text", text: "one" }],
+                    createdAt: new Date(2025, 0, 2, 12).getTime(),
+                },
+            ],
+            [
+                "m2",
+                {
+                    ordinal: 2,
+                    id: "m2",
+                    role: "assistant",
+                    parts: [{ type: "text", text: "two" }],
+                    createdAt: new Date(2025, 0, 3, 12).getTime(),
+                },
+            ],
+        ]);
+        let fullReads = 0;
+        let pointReads = 0;
+        const unregister = setRawMessageProvider(sessionId, {
+            readMessages() {
+                fullReads += 1;
+                throw new Error("full raw-session reads are forbidden on shadow paths");
+            },
+            readMessageIdOrdinals() {
+                return new Map([
+                    ["m1", 1],
+                    ["m2", 2],
+                ]);
+            },
+            readMessageById(messageId) {
+                pointReads += 1;
+                return rawById.get(messageId) ?? null;
+            },
+        });
+        try {
+            const state = __shadowSenderTest.createSessionQueueState();
+            expect(
+                __shadowSenderTest.resolveOrdinalsForShadow({
+                    sessionId,
+                    messages: [message(sessionId, "m2", "two")],
+                    generation: state.shadowGeneration,
+                    memoGeneration: state.idOrdinalMemoGeneration,
+                    memo: state.idOrdinalMemo,
+                }),
+            ).toEqual(expect.objectContaining({ ok: true }));
+            expect(__shadowSenderTest.resolveDeclaredTrimForShadow({ db, sessionId })).toEqual(
+                expect.objectContaining({ flat_boundary_id: "m2#0" }),
+            );
+            const sync = __shadowSenderTest.buildStateSyncPayload({
+                state,
+                pass: basePass({ db, sessionId }),
+                force: true,
+            });
+            expect(sync).toEqual(
+                expect.objectContaining({
+                    params: expect.objectContaining({
+                        compartments: [
+                            expect.objectContaining({ start_message: 1, end_message: 2 }),
+                        ],
+                    }),
+                }),
+            );
+            expect(fullReads).toBe(0);
+            expect(pointReads).toBe(3);
+        } finally {
+            unregister();
+        }
     });
 
     it("performs at most one reset and reseed retry after quarantine", async () => {
@@ -746,6 +887,7 @@ describe("shadow sender", () => {
         const transport = new FakeTransport();
         transport.syncFailuresRemaining = 1;
         transport.rejectNextTransform = true;
+        transport.blockFirstReset();
         const sender = createShadowSender({ transport });
 
         const msg1 = message(sessionId, "m1", "one");
@@ -754,14 +896,17 @@ describe("shadow sender", () => {
         sender.enqueue(
             basePass({ db, sessionId, inputMessages: [msg1], outputMessages: [msg1], nowMs: 1 }),
         );
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_reset").length === 1,
+        );
         sender.enqueue(
             basePass({ db, sessionId, inputMessages: [msg2], outputMessages: [msg2], nowMs: 2 }),
         );
+        transport.releaseReset?.();
+        await waitFor(() => sender.getStats(sessionId).send_failures >= 2);
         sender.enqueue(
             basePass({ db, sessionId, inputMessages: [msg3], outputMessages: [msg3], nowMs: 3 }),
         );
-
-        await waitFor(() => sender.getStats(sessionId).send_failures >= 2);
         await waitFor(
             () => transport.calls.filter((call) => call.method === "shadow_reset").length >= 2,
         );

@@ -31,12 +31,8 @@ import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
-import {
-    readRawSessionMessageById,
-    readRawSessionMessages,
-    withRawSessionMessageCache,
-} from "./read-session-chunk";
-import type { RawMessage } from "./read-session-raw";
+import { readRawSessionMessageById, readRawSessionMessageIdOrdinals } from "./read-session-chunk";
+import { isRawCompactionSummaryInfo, type RawMessage } from "./read-session-raw";
 import type { MessageLike, TagNormalizationTarget } from "./tag-messages";
 import { formatDate } from "./temporal-awareness";
 
@@ -44,7 +40,6 @@ const DEFAULT_MODULE_ID = "magic-context";
 function getDefaultConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
-const MAX_QUEUE_PER_SESSION = 4;
 const SUBC_HEADER_LEN = 17;
 const SUBC_PROTOCOL_VERSION = 1;
 const FRAME_REQUEST = 0;
@@ -302,7 +297,7 @@ function removeExactSuffix(value: string, suffix: string): string | null {
 }
 
 export interface ShadowNormalizationRecord {
-    kind: "tag_prefix" | "ctx_search_hint";
+    kind: "tag_prefix" | "ctx_search_hint" | "summary_message";
     message_id: string | null;
     part_index: number;
     field: string;
@@ -316,7 +311,7 @@ export function denormalizeShadowOutput(args: {
     outputMessages: MessageLike[];
     normalizationTargets: readonly TagNormalizationTarget[];
 }): { ts_output: unknown[]; normalizations: ShadowNormalizationRecord[] } {
-    const tsOutput = cloneJson(args.outputMessages) as unknown[];
+    const clonedOutput = cloneJson(args.outputMessages) as unknown[];
     const normalizations: ShadowNormalizationRecord[] = [];
     const messageIndex = new Map<MessageLike, number>();
     args.outputMessages.forEach((message, index) => {
@@ -334,7 +329,7 @@ export function denormalizeShadowOutput(args: {
             }
         }
         if (partIndex < 0) continue;
-        const cloneMessage = tsOutput[msgIndex] as { parts?: unknown[] } | undefined;
+        const cloneMessage = clonedOutput[msgIndex] as { parts?: unknown[] } | undefined;
         const clonePart = cloneMessage?.parts?.[partIndex];
         const current = readStringField(clonePart, target.field);
         if (current === null) continue;
@@ -364,7 +359,7 @@ export function denormalizeShadowOutput(args: {
             if (!messageId) return;
             const hint = hintByMessage.get(messageId);
             if (!hint) return;
-            const cloneMessage = tsOutput[msgIndex] as { parts?: unknown[] } | undefined;
+            const cloneMessage = clonedOutput[msgIndex] as { parts?: unknown[] } | undefined;
             for (let partIndex = 0; partIndex < message.parts.length; partIndex += 1) {
                 const originalPart = message.parts[partIndex];
                 if (!isRecord(originalPart) || originalPart.type !== "text") continue;
@@ -386,6 +381,18 @@ export function denormalizeShadowOutput(args: {
         });
     }
 
+    const tsOutput = clonedOutput.filter((message, index) => {
+        if (!isRawCompactionSummaryInfo(args.outputMessages[index]?.info)) return true;
+        normalizations.push({
+            kind: "summary_message",
+            message_id: getMessageId(args.outputMessages[index]),
+            part_index: -1,
+            field: "ts_output",
+            removed: JSON.stringify(message),
+        });
+        return false;
+    });
+
     return { ts_output: tsOutput, normalizations };
 }
 
@@ -396,39 +403,45 @@ export function resolveOrdinalsForShadow(args: {
     memoGeneration: number;
     memo: Map<string, number>;
 }):
-    | { ok: true; annotatedInput: unknown[]; memoGeneration: number }
+    | {
+          ok: true;
+          annotatedInput: unknown[];
+          memoGeneration: number;
+          normalizations: ShadowNormalizationRecord[];
+      }
     | { ok: false; reason: "unresolved" | "mismatch"; messageId?: string } {
     const memo = args.memo;
     if (args.memoGeneration !== args.generation) {
         memo.clear();
     }
 
-    const ordinalById = withRawSessionMessageCache(() => {
-        const raw = readRawSessionMessages(args.sessionId);
-        return new Map(raw.map((message) => [message.id, message.ordinal]));
+    // Shadow enqueue runs after the transform's raw-message cache scope has ended.
+    // Read only message ids and metadata here; part rows are not needed for ordinals.
+    const ordinalById = readRawSessionMessageIdOrdinals(args.sessionId);
+    const normalizations: ShadowNormalizationRecord[] = [];
+    const visibleMessages = args.messages.filter((message) => {
+        if (!isRawCompactionSummaryInfo(message.info)) return true;
+        // Summary rows delimit OpenCode compaction but intentionally have no raw
+        // ordinal, so both comparison lanes omit them from the ordinal space.
+        normalizations.push({
+            kind: "summary_message",
+            message_id: getMessageId(message),
+            part_index: -1,
+            field: "input",
+            removed: JSON.stringify(message),
+        });
+        return false;
     });
 
     // The transform captured this array before mutating the live messages. Annotate
     // that private snapshot directly instead of cloning the full history again.
-    const annotated = args.messages as unknown as Array<Record<string, unknown>>;
+    const annotated = visibleMessages as unknown as Array<Record<string, unknown>>;
     const resolved: Array<number | undefined> = new Array(annotated.length);
     let firstUnresolvedId: string | undefined;
     for (let index = 0; index < annotated.length; index += 1) {
-        const messageId = getMessageId(args.messages[index]);
+        const messageId = getMessageId(visibleMessages[index]);
         if (!messageId) return { ok: false, reason: "unresolved" };
-        let ordinal = ordinalById.get(messageId);
-        if (ordinal === undefined) {
-            // The active raw-message cache can be primed TAIL-ONLY (post-boundary)
-            // by the transform on large sessions, so wire messages below the prime
-            // floor never appear in it and would starve the shadow lane forever.
-            // Fall back to a canonical by-id DB read — it computes the absolute
-            // ordinal with the same ORDER BY/COUNT semantics as the full read, so
-            // the memo drift check below keeps its exact meaning (a fresh value is
-            // re-derived every pass; deleted messages stay "unresolved"). Below-
-            // floor ids per pass are bounded by the marker lag (a handful), so the
-            // extra point reads stay off the hot-path cost radar.
-            ordinal = readRawSessionMessageById(args.sessionId, messageId)?.ordinal;
-        }
+        const ordinal = ordinalById.get(messageId);
         if (ordinal === undefined && firstUnresolvedId === undefined) {
             firstUnresolvedId = messageId;
         }
@@ -462,7 +475,7 @@ export function resolveOrdinalsForShadow(args: {
     }
 
     for (let index = 0; index < annotated.length; index += 1) {
-        const messageId = getMessageId(args.messages[index]) as string;
+        const messageId = getMessageId(visibleMessages[index]) as string;
         const ordinal = resolved[index] as number;
         const prior = memo.get(messageId);
         if (prior !== undefined && prior !== ordinal) {
@@ -472,11 +485,16 @@ export function resolveOrdinalsForShadow(args: {
         annotated[index].absolute_ordinal = ordinal;
     }
 
-    return { ok: true, annotatedInput: annotated, memoGeneration: args.generation };
+    return {
+        ok: true,
+        annotatedInput: annotated,
+        memoGeneration: args.generation,
+        normalizations,
+    };
 }
 
 function ordinalForMessageId(args: {
-    rawById: ReadonlyMap<string, RawMessage>;
+    raw: RawMessage | null;
     messageId: string;
     generation: number;
     state: SessionQueueState;
@@ -485,12 +503,11 @@ function ordinalForMessageId(args: {
         args.state.idOrdinalMemo.clear();
         args.state.idOrdinalMemoGeneration = args.generation;
     }
-    const found = args.rawById.get(args.messageId);
-    if (!found) return null;
+    if (!args.raw) return null;
     const prior = args.state.idOrdinalMemo.get(args.messageId);
-    if (prior !== undefined && prior !== found.ordinal) return "mismatch";
-    args.state.idOrdinalMemo.set(args.messageId, found.ordinal);
-    return found.ordinal;
+    if (prior !== undefined && prior !== args.raw.ordinal) return "mismatch";
+    args.state.idOrdinalMemo.set(args.messageId, args.raw.ordinal);
+    return args.raw.ordinal;
 }
 
 function flatBlockCountForRawMessage(message: RawMessage | undefined): number {
@@ -559,9 +576,7 @@ export function resolveDeclaredTrimForShadow(args: {
     const cached = declaredTrimBySession.get(args.sessionId);
     if (cached?.markerKey === markerKey) return cached.trim;
 
-    const raw = withRawSessionMessageCache(() => readRawSessionMessages(args.sessionId));
-    const rawById = new Map(raw.map((message) => [message.id, message]));
-    const boundaryRaw = rawById.get(targetEndMessageId);
+    const boundaryRaw = readRawSessionMessageById(args.sessionId, targetEndMessageId);
     if (!boundaryRaw) return null;
     const compartments = getCompartmentsByEndMessageId(args.db, args.sessionId, targetEndMessageId);
     const boundaryCompartment = compartments.find(
@@ -685,27 +700,28 @@ function watermarksEqual(left: ShadowWatermarks | null, right: ShadowWatermarks)
 }
 
 function serializeCompartment(args: {
-    sessionId: string;
     compartment: ReturnType<typeof getCompartments>[number];
-    rawById: Map<string, RawMessage>;
+    readRawById: (messageId: string) => RawMessage | null;
     state: SessionQueueState;
 }): unknown | null | "mismatch" {
+    const startRaw = args.readRawById(args.compartment.startMessageId);
+    const endRaw = args.readRawById(args.compartment.endMessageId);
     const startOrdinal = ordinalForMessageId({
-        rawById: args.rawById,
+        raw: startRaw,
         messageId: args.compartment.startMessageId,
         generation: args.state.shadowGeneration,
         state: args.state,
     });
     const endOrdinal = ordinalForMessageId({
-        rawById: args.rawById,
+        raw: endRaw,
         messageId: args.compartment.endMessageId,
         generation: args.state.shadowGeneration,
         state: args.state,
     });
     if (startOrdinal === "mismatch" || endOrdinal === "mismatch") return "mismatch";
     if (startOrdinal === null || endOrdinal === null) return null;
-    const startCreatedAt = args.rawById.get(args.compartment.startMessageId)?.createdAt;
-    const endCreatedAt = args.rawById.get(args.compartment.endMessageId)?.createdAt;
+    const startCreatedAt = startRaw?.createdAt;
+    const endCreatedAt = endRaw?.createdAt;
     const dateRange =
         typeof startCreatedAt === "number" && typeof endCreatedAt === "number"
             ? {
@@ -719,12 +735,12 @@ function serializeCompartment(args: {
         end_message: endOrdinal,
         start_message_id: flatBlockIdForRawMessage(
             args.compartment.startMessageId,
-            args.rawById.get(args.compartment.startMessageId),
+            startRaw ?? undefined,
             "start",
         ),
         end_message_id: flatBlockIdForRawMessage(
             args.compartment.endMessageId,
-            args.rawById.get(args.compartment.endMessageId),
+            endRaw ?? undefined,
             "end",
         ),
         ...dateRange,
@@ -779,19 +795,21 @@ function buildStateSyncPayload(args: {
               memory_mutation_id: 0,
               last_todo_state_hash: "",
           });
-    const rawById = withRawSessionMessageCache(
-        () =>
-            new Map(
-                readRawSessionMessages(args.pass.sessionId).map((message) => [message.id, message]),
-            ),
-    );
+    // State sync needs only compartment boundary messages. Cache point reads within
+    // this payload so adjacent compartments sharing a boundary read it once.
+    const rawById = new Map<string, RawMessage | null>();
+    const readRawById = (messageId: string): RawMessage | null => {
+        if (!rawById.has(messageId)) {
+            rawById.set(messageId, readRawSessionMessageById(args.pass.sessionId, messageId));
+        }
+        return rawById.get(messageId) ?? null;
+    };
     const compartments: unknown[] = [];
     for (const compartment of getCompartments(args.pass.db, args.pass.sessionId)) {
         if (compartment.sequence <= acked.compartment_sequence) continue;
         const serialized = serializeCompartment({
-            sessionId: args.pass.sessionId,
             compartment,
-            rawById,
+            readRawById,
             state: args.state,
         });
         if (serialized === "mismatch") return "mismatch";
@@ -1010,16 +1028,20 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
 
     const pushWork = (sessionId: string, work: ShadowWorkItem): void => {
         const state = getState(sessionId);
-        if (work.kind === "pass") state.counters.enqueued += 1;
-        if (
-            work.kind === "pass" &&
-            state.queue.filter((item) => item.kind === "pass").length >= MAX_QUEUE_PER_SESSION
-        ) {
-            const oldestIndex = state.queue.findIndex((item) => item.kind === "pass");
-            if (oldestIndex >= 0) {
-                state.queue.splice(oldestIndex, 1);
-                state.counters.dropped_oldest += 1;
-                sessionLog(sessionId, "shadow: dropped oldest queued pass (cap=4)");
+        if (work.kind === "pass") {
+            state.counters.enqueued += 1;
+            let dropped = 0;
+            for (let index = state.queue.length - 1; index >= 0; index -= 1) {
+                if (state.queue[index]?.kind !== "pass") continue;
+                state.queue.splice(index, 1);
+                dropped += 1;
+            }
+            if (dropped > 0) {
+                state.counters.dropped_oldest += dropped;
+                sessionLog(
+                    sessionId,
+                    `shadow: dropped ${dropped} stale queued pass${dropped === 1 ? "" : "es"}`,
+                );
             }
         }
         state.queue.push(work);
@@ -1176,7 +1198,7 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
                 ...pass,
                 annotatedInput: resolved.annotatedInput,
                 shadowTsOutput: denormalized.ts_output,
-                shadowNormalizations: denormalized.normalizations,
+                shadowNormalizations: [...resolved.normalizations, ...denormalized.normalizations],
                 declaredTrim,
                 tsDecision: {
                     ...pass.tsDecision,
