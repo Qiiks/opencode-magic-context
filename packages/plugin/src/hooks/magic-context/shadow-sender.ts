@@ -148,6 +148,8 @@ interface SessionQueueState {
     idOrdinalMemo: Map<string, number>;
     requireResetReason: string | null;
     blockedUntilReset: boolean;
+    seedPassPending: boolean;
+    quarantineRetryAttempted: boolean;
     counters: ShadowSenderCounters;
 }
 
@@ -246,6 +248,8 @@ function createSessionQueueState(): SessionQueueState {
         idOrdinalMemo: new Map(),
         requireResetReason: "cold_start",
         blockedUntilReset: false,
+        seedPassPending: false,
+        quarantineRetryAttempted: false,
         counters: emptyCounters(),
     };
 }
@@ -760,13 +764,21 @@ function buildStateSyncPayload(args: {
         return null;
     }
 
-    const acked = args.state.lastAckedWatermarks ?? {
-        compartment_sequence: -1,
-        memory_id: 0,
-        m0_mutation_id: 0,
-        memory_mutation_id: 0,
-        last_todo_state_hash: "",
-    };
+    const acked = args.force
+        ? {
+              compartment_sequence: -1,
+              memory_id: 0,
+              m0_mutation_id: 0,
+              memory_mutation_id: 0,
+              last_todo_state_hash: "",
+          }
+        : (args.state.lastAckedWatermarks ?? {
+              compartment_sequence: -1,
+              memory_id: 0,
+              m0_mutation_id: 0,
+              memory_mutation_id: 0,
+              last_todo_state_hash: "",
+          });
     const rawById = withRawSessionMessageCache(
         () =>
             new Map(
@@ -962,6 +974,7 @@ function buildShadowTransformBody(args: { pass: PreparedShadowPass; state: Sessi
         method: "shadow_transform",
         params: {
             shadow_generation: args.state.shadowGeneration,
+            seed_pass: args.state.seedPassPending,
             input: args.pass.annotatedInput,
             ts_output: denormalized.ts_output,
             normalizations: denormalized.normalizations,
@@ -1082,6 +1095,10 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
         args.state.initialized = true;
         args.state.blockedUntilReset = false;
         args.state.requireResetReason = null;
+        // Every fresh lineage must commit one normal transform before byte comparison.
+        // The complete sync makes source state available; the seed pass then establishes
+        // the shadow lane's own first-render cache and boundary state.
+        args.state.seedPassPending = true;
         args.state.counters.resets_sent += 1;
         sessionLog(
             args.sessionId,
@@ -1244,10 +1261,21 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
             body: transformBody,
         });
         const ack = extractAckValue(response);
+        state.seedPassPending = false;
+        state.counters.transforms_sent += 1;
         if (ack.divergence || ack.divergence_class || ack.hard_divergence) {
             sessionLog(pass.sessionId, "shadow: divergence report", ack);
         }
-        state.counters.transforms_sent += 1;
+        if (ack.quarantined === true && !state.quarantineRetryAttempted) {
+            state.quarantineRetryAttempted = true;
+            await performReset({
+                sessionId: pass.sessionId,
+                state,
+                reason: "quarantine_reseed",
+                projectRoot: pass.projectRoot,
+            });
+            await processPass(state, pass);
+        }
     };
 
     return {

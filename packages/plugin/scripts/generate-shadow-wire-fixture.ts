@@ -175,6 +175,21 @@ export function generateShadowWireFixture(): string {
                 importance: 87,
                 episodeType: "feature,verification",
             },
+            {
+                sequence: 2,
+                startMessage: 2,
+                endMessage: 2,
+                startMessageId: "message-2",
+                endMessageId: "message-2",
+                title: "Fixture tail compartment",
+                content: "Fixture tail compartment content",
+                p1: "Fixture tail P1",
+                p2: "Fixture tail P2",
+                p3: "Fixture tail P3",
+                p4: "Fixture tail P4",
+                importance: 66,
+                episodeType: "verification",
+            },
         ]);
 
         const memory = insertMemory(db, {
@@ -260,6 +275,7 @@ export function generateShadowWireFixture(): string {
 
         const state = __shadowSenderTest.createSessionQueueState();
         state.shadowGeneration = 7;
+        state.seedPassPending = true;
         state.lastAckedSeq = 11;
         state.lastAckedWatermarks = {
             compartment_sequence: -1,

@@ -222,6 +222,8 @@ struct ShadowTransformWire {
     session_id: Option<String>,
     shadow_generation: u64,
     #[serde(default)]
+    seed_pass: bool,
+    #[serde(default)]
     pass_seq: Option<u64>,
     #[serde(default)]
     serializer_profile: Option<String>,
@@ -2471,6 +2473,36 @@ impl McHandler {
         });
         if let Some(trim) = &result.trim_mismatch {
             rs_decision["trim_mismatch"] = serde_json::to_value(trim).unwrap_or(Value::Null);
+        }
+        if parsed.seed_pass && !loaded.meta.initialized {
+            // A fresh shadow lineage must take its own first-render path even when the
+            // source lane is already warm. Committing that pass calibrates durable cache
+            // and boundary state; initialized state makes every later pass compare even
+            // if a sender repeats the seed flag.
+            let state_hash = shadow_state_hash(&store, &binding.session).unwrap_or_default();
+            return self.record_shadow_report(
+                &store,
+                &binding.session,
+                ShadowReportInput {
+                    shadow_generation: parsed.shadow_generation,
+                    pass_seq,
+                    outcome: CompareOutcome {
+                        class: "identical".to_string(),
+                        hard: false,
+                        compared: false,
+                        first_mid: None,
+                        first_block: None,
+                        first_field: None,
+                        ts_prefix: String::new(),
+                        rs_prefix: String::new(),
+                    },
+                    normalizations: parsed.normalizations,
+                    ts_decision: parsed.ts_decision,
+                    rs_decision,
+                    state_hash,
+                    replay: None,
+                },
+            );
         }
         let ts_messages = match shadow_ts_messages(&parsed) {
             Ok(messages) => messages,
@@ -7257,6 +7289,7 @@ mod tests {
     struct StrictShadowTransform {
         method: String,
         shadow_generation: u64,
+        seed_pass: bool,
         input: Vec<Value>,
         ts_output: Vec<Value>,
         normalizations: Vec<Value>,
@@ -7391,7 +7424,7 @@ mod tests {
         assert_eq!(fixture.state_sync.method, "state_sync");
         assert_eq!(fixture.shadow_transform.method, "shadow_transform");
         assert_eq!(fixture.shadow_reset.method, "shadow_reset");
-        assert_eq!(fixture.state_sync.compartments.len(), 1);
+        assert_eq!(fixture.state_sync.compartments.len(), 2);
         assert_eq!(fixture.state_sync.memories.len(), 2);
         assert_eq!(fixture.state_sync.memory_mutations.len(), 1);
         assert_eq!(
@@ -7425,18 +7458,20 @@ mod tests {
         session: &str,
         generation: u64,
         ts_output: Vec<CkWireMessage>,
+        seed_pass: bool,
     ) -> Value {
         json!({
             "kind": "shadow_transform",
             "session_id": session,
             "shadow_generation": generation,
+            "seed_pass": seed_pass,
             "pass_seq": 0,
             "serializer_profile": "owned-llmrunner",
             "render_config": "cfg0",
             "messages": vec![ck("m0", 0, "zero ordinal is real"), ck("m1", 1, "tail")],
             "ts_ck_messages": ts_output,
             "pass_inputs": shadow_pass_inputs(),
-            "ts_decision": { "class": "hard" },
+            "ts_decision": { "class": "defer" },
             "normalizations": [],
         })
     }
@@ -7584,7 +7619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_transform_quarantines_hard_divergence_and_then_records_decision_only() {
+    async fn shadow_transform_calibrates_once_then_quarantines_without_duplicate_rows() {
         let state = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&state), default_test_config());
@@ -7596,12 +7631,27 @@ mod tests {
             )
             .await;
 
-        let report = match handler
-            .dispatch_value(8, shadow_transform_body("shadow:ses", 1, Vec::new()))
+        let seed_report = match handler
+            .dispatch_value(8, shadow_transform_body("shadow:ses", 1, Vec::new(), true))
             .await
         {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("unexpected shadow transform outcome: {other:?}"),
+            other => panic!("unexpected seed transform outcome: {other:?}"),
+        };
+        assert_eq!(seed_report["class"], "identical");
+        assert_eq!(seed_report["compared"], false);
+        assert_eq!(
+            store.load_shadow_divergences("shadow:ses").unwrap().len(),
+            0
+        );
+        assert!(store.load("shadow:ses").unwrap().meta.initialized);
+
+        let report = match handler
+            .dispatch_value(8, shadow_transform_body("shadow:ses", 1, Vec::new(), true))
+            .await
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected warm shadow transform outcome: {other:?}"),
         };
         assert_eq!(report["class"], "byte-mismatch");
         assert_eq!(report["quarantined"], true);
@@ -7624,7 +7674,7 @@ mod tests {
 
         let before = store.load("shadow:ses").unwrap().row_version;
         let decision_only = match handler
-            .dispatch_value(8, shadow_transform_body("shadow:ses", 1, Vec::new()))
+            .dispatch_value(8, shadow_transform_body("shadow:ses", 1, Vec::new(), false))
             .await
         {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -7632,10 +7682,12 @@ mod tests {
         };
         assert_eq!(decision_only["class"], "quarantined");
         assert_eq!(decision_only["compared"], false);
-        assert_eq!(store.load("shadow:ses").unwrap().row_version, before);
+        let quarantined = store.load("shadow:ses").unwrap();
+        assert!(quarantined.row_version > before);
+        assert_eq!(quarantined.meta.shadow_quarantined_pass_count, 1);
         assert_eq!(
             store.load_shadow_divergences("shadow:ses").unwrap().len(),
-            2
+            1
         );
     }
 }

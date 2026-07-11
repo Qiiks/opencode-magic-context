@@ -22,6 +22,25 @@
         "episode_type": "feature,verification",
         "legacy": 0,
         "created_at": 1735689600000
+      },
+      {
+        "sequence": 2,
+        "start_message": 2,
+        "end_message": 2,
+        "start_message_id": "message-2#0",
+        "end_message_id": "message-2#2",
+        "start_date": "2025-01-03",
+        "end_date": "2025-01-03",
+        "title": "Fixture tail compartment",
+        "content": "Fixture tail compartment content",
+        "p1": "Fixture tail P1",
+        "p2": "Fixture tail P2",
+        "p3": "Fixture tail P3",
+        "p4": "Fixture tail P4",
+        "importance": 66,
+        "episode_type": "verification",
+        "legacy": 0,
+        "created_at": 1735689600000
       }
     ],
     "memories": [
@@ -112,6 +131,7 @@
   "shadow_transform": {
     "method": "shadow_transform",
     "shadow_generation": 7,
+    "seed_pass": true,
     "input": [
       {
         "info": {
@@ -221,7 +241,7 @@
     "reason": "fixture_reset"
   },
   "local_watermarks": {
-    "compartment_sequence": 1,
+    "compartment_sequence": 2,
     "memory_id": 2,
     "m0_mutation_id": 1,
     "memory_mutation_id": 1,
