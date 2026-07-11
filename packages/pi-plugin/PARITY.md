@@ -762,11 +762,22 @@ regression.
 **OpenCode:** `/ctx-wrapup` uses the shared recomp progress channel, so the TUI
 sidebar can render a live **Wrapup** row with chunk counters.
 
-**Pi:** there is no persistent sidebar row. The command emits one status/toast
-message for the upfront estimate and one per historian chunk, then a final
-summary. The drain loop, durable `wrapup_in_progress` marker, sequential historian
+**Pi:** there is no persistent sidebar row. The command appends one `ctx-status`
+custom entry for the upfront estimate and one per historian chunk, then a final
+summary. On runtimes with `registerEntryRenderer`, one shared renderer presents
+these entries in the interactive transcript. Plain `custom` entries are excluded
+from Pi's LLM context, so status progress cannot queue a steer into a streaming
+turn. The drain loop, durable `wrapup_in_progress` marker, sequential historian
 runs, and deferred compaction semantics are shared in intent; only the progress
 surface differs.
+
+The supported and installed Pi floor is `@earendil-works/pi-coding-agent` 0.80.2.
+That version exposes `appendEntry` but not `registerEntryRenderer`; appending alone
+would make statuses invisible. The extension therefore feature-detects renderer
+registration and retains the legacy visible `sendMessage(..., { triggerTurn:
+false })` path on 0.80.2. Once both APIs are present, every user-facing status uses
+`appendEntry`; the intentionally model-visible Channel-2 ceiling nudge remains on
+`sendMessage`.
 
 ---
 

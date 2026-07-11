@@ -14,14 +14,14 @@ import { registerCtxStatusCommand } from "./ctx-status";
 
 type Handler = (args: string, ctx: MockCommandContext) => Promise<void>;
 
-interface SentMessage {
-	message: {
-		customType: string;
-		content: string;
-		display: boolean;
+interface AppendedEntry {
+	customType: string;
+	data: {
+		title: string;
+		text: string;
+		level?: "info" | "success" | "warning" | "error";
 		details?: unknown;
 	};
-	options?: { triggerTurn?: boolean };
 }
 
 interface MockCommandContext {
@@ -52,18 +52,18 @@ function createDb() {
 
 function createMockPi() {
 	const handlers = new Map<string, Handler>();
-	const sent: SentMessage[] = [];
+	const sent: AppendedEntry[] = [];
 	return {
 		pi: {
 			registerCommand(name: string, options: { handler: Handler }) {
 				handlers.set(name, options.handler);
 			},
-			registerMessageRenderer() {},
-			sendMessage(
-				message: SentMessage["message"],
-				options?: SentMessage["options"],
-			) {
-				sent.push({ message, options });
+			registerEntryRenderer() {},
+			appendEntry(customType: string, data: AppendedEntry["data"]) {
+				sent.push({ customType, data });
+			},
+			sendMessage() {
+				throw new Error("ctx-status must not use sendMessage");
 			},
 		},
 		handlers,
@@ -130,7 +130,7 @@ describe("Pi Magic Context commands", () => {
 		expect(customCalls[0]?.options).toMatchObject({ overlay: true });
 	});
 
-	it("falls back to non-turn custom status message without UI", async () => {
+	it("appends a model-invisible status entry without UI", async () => {
 		const db = createDb();
 		const { pi, handlers, sent } = createMockPi();
 
@@ -141,9 +141,8 @@ describe("Pi Magic Context commands", () => {
 		await handlers.get("ctx-status")?.("", createCtx());
 
 		expect(sent).toHaveLength(1);
-		expect(sent[0]?.message.customType).toBe("ctx-status");
-		expect(sent[0]?.message.content).toContain("## Magic Status");
-		expect(sent[0]?.options?.triggerTurn).toBe(false);
+		expect(sent[0]?.customType).toBe("ctx-status");
+		expect(sent[0]?.data.text).toContain("## Magic Status");
 	});
 
 	it("registers /ctx-flush and materializes queued pending ops", async () => {
@@ -155,9 +154,8 @@ describe("Pi Magic Context commands", () => {
 		registerCtxFlushCommand(pi as never, { db });
 		await handlers.get("ctx-flush")?.("", createCtx());
 
-		expect(sent[0]?.message.customType).toBe("ctx-status");
-		expect(sent[0]?.message.content).toContain("Flushed 1 pending ops");
-		expect(sent[0]?.options?.triggerTurn).toBe(false);
+		expect(sent[0]?.customType).toBe("ctx-status");
+		expect(sent[0]?.data.text).toContain("Flushed 1 pending ops");
 	});
 
 	it("registers /ctx-dream and starts a run (Dreamer v2 manual path)", async () => {
@@ -174,9 +172,8 @@ describe("Pi Magic Context commands", () => {
 		// assert the command is wired and emits a /ctx-dream status message.
 		await handlers.get("ctx-dream")?.("", createCtx());
 
-		expect(sent[0]?.message.customType).toBe("ctx-status");
-		expect(sent[0]?.message.content).toContain("/ctx-dream");
-		expect(sent[0]?.options?.triggerTurn).toBe(false);
+		expect(sent[0]?.customType).toBe("ctx-status");
+		expect(sent[0]?.data.text).toContain("/ctx-dream");
 	});
 
 	it("/ctx-dream accepts split memory tasks and rejects retired task names", async () => {
@@ -190,11 +187,11 @@ describe("Pi Magic Context commands", () => {
 		});
 
 		await handlers.get("ctx-dream")?.("verify", createCtx());
-		expect(sent[0]?.message.content).toContain('Running dream task "verify"');
+		expect(sent[0]?.data.text).toContain('Running dream task "verify"');
 
 		sent.length = 0;
 		await handlers.get("ctx-dream")?.("curate", createCtx());
-		expect(sent[0]?.message.content).toContain('Running dream task "curate"');
+		expect(sent[0]?.data.text).toContain('Running dream task "curate"');
 
 		for (const retired of [
 			"maintain-memory",
@@ -204,7 +201,7 @@ describe("Pi Magic Context commands", () => {
 		]) {
 			sent.length = 0;
 			await handlers.get("ctx-dream")?.(retired, createCtx());
-			expect(sent[0]?.message.content).toContain(`Unknown task "${retired}"`);
+			expect(sent[0]?.data.text).toContain(`Unknown task "${retired}"`);
 		}
 	});
 
@@ -220,7 +217,7 @@ describe("Pi Magic Context commands", () => {
 		});
 		await handlers.get("ctx-dream")?.("", createCtx());
 
-		expect(sent[0]?.message.content).toContain("Dreamer is disabled");
+		expect(sent[0]?.data.text).toContain("Dreamer is disabled");
 	});
 
 	it("/ctx-dream resolves dreamer enablement from the invocation cwd", async () => {
@@ -244,10 +241,10 @@ describe("Pi Magic Context commands", () => {
 			cwd: "/tmp/project-b",
 		});
 
-		expect(sent[0]?.message.content).toContain(
+		expect(sent[0]?.data.text).toContain(
 			"Starting dream run for /tmp/project-b",
 		);
-		expect(sent[0]?.message.content).not.toContain("Dreamer is disabled");
+		expect(sent[0]?.data.text).not.toContain("Dreamer is disabled");
 	});
 
 	it("/ctx-status resolves project identity at command time", async () => {
@@ -263,10 +260,8 @@ describe("Pi Magic Context commands", () => {
 		});
 
 		await handlers.get("ctx-status")?.("", createCtx());
-		expect(sent[0]?.message.details).toMatchObject({
-			details: {
-				projectIdentity: "/tmp/current",
-			},
+		expect(sent[0]?.data.details).toMatchObject({
+			projectIdentity: "/tmp/current",
 		});
 	});
 
@@ -280,12 +275,10 @@ describe("Pi Magic Context commands", () => {
 		});
 
 		await handlers.get("ctx-status")?.("", createCtx());
-		expect(sent[0]?.message.details).toMatchObject({
-			details: {
-				dreamer: {
-					enabled: true,
-					scheduleSummary: "verify 0 3 * * *",
-				},
+		expect(sent[0]?.data.details).toMatchObject({
+			dreamer: {
+				enabled: true,
+				scheduleSummary: "verify 0 3 * * *",
 			},
 		});
 	});
@@ -311,9 +304,8 @@ describe("Pi Magic Context commands", () => {
 		await handlers.get("ctx-recomp")?.("", createCtx());
 
 		expect(runnerCalled).toBe(false);
-		expect(sent[0]?.message.customType).toBe("ctx-status");
-		expect(sent[0]?.message.content).toContain("Confirmation Required");
-		expect(sent[0]?.options?.triggerTurn).toBe(false);
+		expect(sent[0]?.customType).toBe("ctx-status");
+		expect(sent[0]?.data.text).toContain("Confirmation Required");
 	});
 
 	it("/ctx-recomp resolves historian model from the invocation cwd", async () => {
@@ -356,8 +348,8 @@ describe("Pi Magic Context commands", () => {
 			cwd: "/tmp/project-b",
 		});
 
-		expect(sent[0]?.message.content).toContain("Confirmation Required");
-		expect(sent[0]?.message.content).not.toContain("historian.model");
+		expect(sent[0]?.data.text).toContain("Confirmation Required");
+		expect(sent[0]?.data.text).not.toContain("historian.model");
 	});
 
 	it("/ctx-recomp --upgrade returns the deprecation hint instead of usage", async () => {
@@ -398,11 +390,11 @@ describe("Pi Magic Context commands", () => {
 
 		await handlers.get("ctx-recomp")?.("--upgrade", createCtx("ses-upgrade"));
 
-		expect(sent[0]?.message.content).toContain("Magic Recomp Upgrade");
-		expect(sent[0]?.message.content).toContain(
+		expect(sent[0]?.data.text).toContain("Magic Recomp Upgrade");
+		expect(sent[0]?.data.text).toContain(
 			"The `--upgrade` flag is deprecated. Run `/ctx-session-upgrade` to upgrade this session.",
 		);
-		expect(sent[0]?.message.content).not.toContain("Invalid Arguments");
+		expect(sent[0]?.data.text).not.toContain("Invalid Arguments");
 	});
 
 	it("passes configured historian chunk budget into /ctx-recomp execution", async () => {

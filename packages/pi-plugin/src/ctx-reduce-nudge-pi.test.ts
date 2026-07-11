@@ -199,7 +199,7 @@ describe("maybeDeliverChannel2Pi", () => {
 		});
 	}
 
-	it("delivers via sendMessage(display:false, followUp) and consumes the one-shot cap", () => {
+	it("regression: keeps the model-visible ceiling nudge on sendMessage(display:false, followUp)", () => {
 		const db = createTestDb();
 		setChannel2NudgeState(db, SESSION, "pending");
 		armStrongBaseline(SESSION);

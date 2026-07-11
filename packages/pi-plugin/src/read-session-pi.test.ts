@@ -141,6 +141,36 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 		return { type: "message", id, message };
 	}
 
+	it("skips current custom entries and historical ctx-status custom messages", () => {
+		const entries = [
+			messageEntry("user-1", { role: "user", content: "before" }),
+			{
+				type: "custom",
+				id: "status-current",
+				customType: "ctx-status",
+				data: { title: "Magic Embed", text: "Embedding history…" },
+			},
+			{
+				type: "custom_message",
+				id: "status-historical",
+				customType: "ctx-status",
+				content: "Historical status",
+				display: true,
+			},
+			messageEntry("asst-1", { role: "assistant", content: "after" }),
+		];
+
+		expect(
+			convertEntriesToRawMessages(entries).map(({ id, role }) => ({
+				id,
+				role,
+			})),
+		).toEqual([
+			{ id: "user-1", role: "user" },
+			{ id: "asst-1", role: "assistant" },
+		]);
+	});
+
 	it("assigns the first folded toolResult's id to a synthetic user emitted at toolResult→assistant", () => {
 		const entries = [
 			messageEntry("user-1", { role: "user", content: "kick off" }),

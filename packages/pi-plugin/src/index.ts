@@ -96,6 +96,10 @@ import { registerCtxRecompCommand } from "./commands/ctx-recomp";
 import { registerCtxSessionUpgradeCommand } from "./commands/ctx-session-upgrade";
 import { registerCtxStatusCommand } from "./commands/ctx-status";
 import { registerCtxWrapupCommand } from "./commands/ctx-wrapup";
+import {
+	registerCtxStatusEntryRenderer,
+	sendCtxStatusMessage,
+} from "./commands/pi-command-utils";
 import { loadPiConfig } from "./config";
 import {
 	awaitInFlightHistorians,
@@ -801,14 +805,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				dir,
 				identity,
 				(text) => {
-					pi.sendMessage(
-						{
-							customType: "ctx-status",
-							content: text,
-							display: true,
-						} as never,
-						{ triggerTurn: false },
-					);
+					sendCtxStatusMessage(pi, {
+						title: "/ctx-embed",
+						text,
+						level: "info",
+					});
 				},
 			);
 		},
@@ -981,13 +982,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			: "registered /ctx-aug (sidekick disabled — set sidekick.disable=false and sidekick.model in config)",
 	);
 
-	// Step 5c: register the four diagnostic/admin slash commands so Pi
-	// reaches command-surface parity with the OpenCode plugin. All four
-	// commands emit `pi.sendMessage(..., { triggerTurn: false })` — they
-	// are never visible to the LLM and never trigger a turn. They mirror
-	// the behavior of OpenCode's command-handler.ts but use Pi-native
-	// surfaces (registerCommand + sendMessage) instead of OpenCode's
-	// command.execute.before hook.
+	// Register the shared renderer before any command can append a status entry.
+	// Plain custom entries render in interactive Pi without entering model context.
+	const statusEntryRendererAvailable = registerCtxStatusEntryRenderer(pi);
+	info(
+		statusEntryRendererAvailable
+			? "registered model-invisible ctx-status entry renderer"
+			: "ctx-status entry renderer unavailable; using legacy visible-message fallback",
+	);
+
+	// Step 5c: register the diagnostic/admin slash commands so Pi reaches
+	// command-surface parity with the OpenCode plugin. Their user-facing output
+	// uses model-invisible custom entries when the runtime can render them.
 	const recompRunner = new PiSubagentRunner();
 	const wrapupRunner = new PiSubagentRunner();
 	const upgradeRunner = new PiSubagentRunner();
