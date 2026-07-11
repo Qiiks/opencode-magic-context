@@ -294,6 +294,7 @@ export function generateShadowWireFixture(): string {
         };
         const pass: ShadowTransformPass = {
             sessionId: SESSION_ID,
+            isSubagent: false,
             db,
             projectRoot: "/fixture/root",
             projectPath: PROJECT_PATH,

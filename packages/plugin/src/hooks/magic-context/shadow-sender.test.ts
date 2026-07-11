@@ -124,10 +124,12 @@ function basePass(args: {
     normalizationTargets?: TagNormalizationTarget[];
     projectPath?: string;
     nowMs?: number;
+    isSubagent?: boolean;
 }): ShadowTransformPass {
     const inputMessages = args.inputMessages ?? [message(args.sessionId, "m1", "hello")];
     return {
         sessionId: args.sessionId,
+        isSubagent: args.isSubagent ?? false,
         db: args.db,
         inputMessages,
         outputMessages: args.outputMessages ?? structuredClone(inputMessages),
@@ -264,6 +266,22 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("shadow sender", () => {
+    it("never sends traffic for subagent sessions", async () => {
+        useTempDataHome("shadow-subagent-");
+        const sessionId = "s-subagent";
+        createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "child prompt" }]);
+        const db = openDatabase();
+        const transport = new FakeTransport();
+        const sender = createShadowSender({ transport });
+
+        sender.enqueue(basePass({ db, sessionId, isSubagent: true }));
+        sender.enqueue(basePass({ db, sessionId, isSubagent: true, nowMs: 2 }));
+        sender.resetSession(sessionId, "must_stay_disarmed");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        expect(transport.calls).toEqual([]);
+    });
+
     it("strips only tag prefixes known from tagger state and exact ctx-search hint blocks", () => {
         useTempDataHome("shadow-denorm-");
         const db = openDatabase();
@@ -710,6 +728,41 @@ describe("shadow sender", () => {
         expect(syncBodies.map((body) => body.seed_boundary_id)).toEqual(["m2#0", "m2#0"]);
         expect(sender.getStats(sessionId).resets_sent).toBe(2);
         expect(sender.getStats(sessionId).transforms_sent).toBe(1);
+    });
+
+    it("retries reseeding after cooldown and resets the allowance after success", async () => {
+        useTempDataHome("shadow-reseed-cooldown-");
+        const sessionId = "s-reseed-cooldown";
+        createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "tail" }]);
+        const db = openDatabase();
+        const transport = new FakeTransport();
+        transport.seedBoundaryFailuresRemaining = 10;
+        let now = 1_000;
+        const sender = createShadowSender({
+            transport,
+            now: () => now,
+            reseedCooldownMs: 100,
+        });
+        const pass = basePass({ db, sessionId });
+
+        sender.enqueue(pass);
+        await waitFor(() => sender.getStats(sessionId).send_failures === 1);
+        expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(2);
+
+        sender.enqueue({ ...pass, passInputs: { ...pass.passInputs, now_ms: 2 } });
+        await waitFor(() => sender.getStats(sessionId).send_failures === 2);
+        expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(2);
+
+        now += 100;
+        transport.seedBoundaryFailuresRemaining = 1;
+        sender.enqueue({ ...pass, passInputs: { ...pass.passInputs, now_ms: 3 } });
+        await waitFor(() => sender.getStats(sessionId).transforms_sent === 1);
+        expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(3);
+
+        transport.quarantinedResponsesRemaining = 1;
+        sender.enqueue({ ...pass, passInputs: { ...pass.passInputs, now_ms: 4 } });
+        await waitFor(() => sender.getStats(sessionId).transforms_sent === 3);
+        expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(4);
     });
 
     it("serializes state_sync and shadow_transform with the shadow wire field inventory", () => {

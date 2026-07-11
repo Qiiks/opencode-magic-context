@@ -429,6 +429,9 @@ struct CompareOutcome {
     first_field: Option<String>,
     ts_prefix: String,
     rs_prefix: String,
+    first_diff_offset: Option<u64>,
+    ts_window: String,
+    rs_window: String,
 }
 
 struct ShadowReportInput {
@@ -977,6 +980,9 @@ impl McHandler {
                 first_field: outcome.first_field.as_deref(),
                 ts_prefix: &outcome.ts_prefix,
                 rs_prefix: &outcome.rs_prefix,
+                first_diff_offset: outcome.first_diff_offset,
+                ts_window: &outcome.ts_window,
+                rs_window: &outcome.rs_window,
                 normalizations_json: &normalizations_json,
                 ts_decision_json: &ts_decision_json,
                 rs_decision_json: &rs_decision_json,
@@ -2384,6 +2390,9 @@ impl McHandler {
                         first_field: None,
                         ts_prefix: String::new(),
                         rs_prefix: String::new(),
+                        first_diff_offset: None,
+                        ts_window: String::new(),
+                        rs_window: String::new(),
                     },
                     normalizations: parsed.normalizations,
                     ts_decision: parsed.ts_decision,
@@ -2504,6 +2513,9 @@ impl McHandler {
                         first_field: None,
                         ts_prefix: String::new(),
                         rs_prefix: String::new(),
+                        first_diff_offset: None,
+                        ts_window: String::new(),
+                        rs_window: String::new(),
                     },
                     normalizations: parsed.normalizations,
                     ts_decision: parsed.ts_decision,
@@ -3772,6 +3784,9 @@ fn compare_shadow_outputs(
             first_field: Some(trim.predicate.to_string()),
             ts_prefix: bounded_prefix(&ts_canonical),
             rs_prefix: bounded_prefix(&rs_canonical),
+            first_diff_offset: None,
+            ts_window: String::new(),
+            rs_window: String::new(),
         };
     }
 
@@ -3785,6 +3800,9 @@ fn compare_shadow_outputs(
             first_field: None,
             ts_prefix: String::new(),
             rs_prefix: String::new(),
+            first_diff_offset: None,
+            ts_window: String::new(),
+            rs_window: String::new(),
         };
     }
 
@@ -3799,6 +3817,9 @@ fn compare_shadow_outputs(
             first_field: Some("class".to_string()),
             ts_prefix: bounded_prefix(&canonical_value(ts_decision)),
             rs_prefix: bounded_prefix(&canonical_value(rs_decision)),
+            first_diff_offset: None,
+            ts_window: String::new(),
+            rs_window: String::new(),
         };
     }
 
@@ -3812,6 +3833,9 @@ fn compare_shadow_outputs(
             first_field: Some("synthetic_todo_shape".to_string()),
             ts_prefix: bounded_prefix(&ts_canonical),
             rs_prefix: bounded_prefix(&rs_canonical),
+            first_diff_offset: None,
+            ts_window: String::new(),
+            rs_window: String::new(),
         };
     }
 
@@ -3832,10 +3856,15 @@ fn compare_shadow_outputs(
             first_field: Some("normalization".to_string()),
             ts_prefix: bounded_prefix(&ts_canonical),
             rs_prefix: bounded_prefix(&rs_canonical),
+            first_diff_offset: None,
+            ts_window: String::new(),
+            rs_window: String::new(),
         };
     }
 
     let diff = first_diff(ts_messages, rs_messages);
+    let first_diff_offset = first_diff_byte_offset(&ts_canonical, &rs_canonical)
+        .expect("non-identical canonical messages must have a differing byte");
     CompareOutcome {
         class: "byte-mismatch".to_string(),
         hard: true,
@@ -3845,6 +3874,9 @@ fn compare_shadow_outputs(
         first_field: diff.2,
         ts_prefix: bounded_prefix(&ts_canonical),
         rs_prefix: bounded_prefix(&rs_canonical),
+        first_diff_offset: Some(first_diff_offset as u64),
+        ts_window: centered_diff_window(&ts_canonical, first_diff_offset),
+        rs_window: centered_diff_window(&rs_canonical, first_diff_offset),
     }
 }
 
@@ -3932,6 +3964,28 @@ fn bounded_prefix(value: &str) -> String {
     value.chars().take(SHADOW_COMPARE_PREFIX_LIMIT).collect()
 }
 
+fn first_diff_byte_offset(left: &str, right: &str) -> Option<usize> {
+    let shared = left.len().min(right.len());
+    left.as_bytes()[..shared]
+        .iter()
+        .zip(&right.as_bytes()[..shared])
+        .position(|(left, right)| left != right)
+        .or_else(|| (left.len() != right.len()).then_some(shared))
+}
+
+fn centered_diff_window(value: &str, diff_offset: usize) -> String {
+    let center = diff_offset.min(value.len());
+    let mut start = center.saturating_sub(300);
+    while !value.is_char_boundary(start) {
+        start = start.saturating_sub(1);
+    }
+    let mut end = center.saturating_add(900).min(value.len());
+    while end < value.len() && !value.is_char_boundary(end) {
+        end += 1;
+    }
+    value[start..end].to_string()
+}
+
 fn first_message_hint(
     ts_messages: &[crate::ck_wire::CkWireMessage],
     rs_messages: &[crate::ck_wire::CkWireMessage],
@@ -3944,6 +3998,34 @@ fn first_message_hint(
         .or_else(|| rs_messages.get(index))
         .and_then(|message| message.meta.harness_id.clone());
     (mid, Some(index.to_string()))
+}
+
+fn first_differing_block_id(
+    ts: &crate::ck_wire::CkWireMessage,
+    rs: &crate::ck_wire::CkWireMessage,
+    message_index: usize,
+) -> Option<String> {
+    let block_index = (0..ts.content.len().max(rs.content.len()))
+        .find(|index| ts.content.get(*index) != rs.content.get(*index))?;
+    let mid = ts
+        .meta
+        .harness_id
+        .as_deref()
+        .or(rs.meta.harness_id.as_deref());
+    Some(match mid {
+        Some(mid) => crate::ck_wire::block_id(mid, block_index),
+        None => format!("{message_index}#{block_index}"),
+    })
+}
+
+fn first_available_block_id(
+    message: &crate::ck_wire::CkWireMessage,
+    message_index: usize,
+) -> Option<String> {
+    (!message.content.is_empty()).then(|| match message.meta.harness_id.as_deref() {
+        Some(mid) => crate::ck_wire::block_id(mid, 0),
+        None => format!("{message_index}#0"),
+    })
 }
 
 fn first_diff(
@@ -3961,7 +4043,7 @@ fn first_diff(
                             .harness_id
                             .clone()
                             .or_else(|| rs.meta.harness_id.clone()),
-                        Some(index.to_string()),
+                        first_differing_block_id(ts, rs, index),
                         first_value_diff(&ts_value, &rs_value, "message"),
                     );
                 }
@@ -3969,14 +4051,14 @@ fn first_diff(
             (Some(ts), None) => {
                 return (
                     ts.meta.harness_id.clone(),
-                    Some(index.to_string()),
+                    first_available_block_id(ts, index),
                     Some("missing_rs_message".to_string()),
                 )
             }
             (None, Some(rs)) => {
                 return (
                     rs.meta.harness_id.clone(),
-                    Some(index.to_string()),
+                    first_available_block_id(rs, index),
                     Some("missing_ts_message".to_string()),
                 )
             }
@@ -7709,5 +7791,49 @@ mod tests {
             store.load_shadow_divergences("shadow:ses").unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn byte_mismatch_diagnostics_localize_early_and_mid_array_differences() {
+        let shared_prefix = "a".repeat(5_000);
+        let ts_messages = vec![
+            ck("m1", 1, &shared_prefix).ck,
+            ck("m2", 2, "before TS_DIFFERENCE after").ck,
+            ck("m3", 3, "unchanged tail").ck,
+        ];
+        let rs_messages = vec![
+            ck("m1", 1, &shared_prefix).ck,
+            ck("m2", 2, "before RS_DIFFERENCE after").ck,
+            ck("m3", 3, "unchanged tail").ck,
+        ];
+        let decision = json!({ "class": "defer" });
+
+        let mismatch =
+            compare_shadow_outputs(&ts_messages, &rs_messages, &decision, &decision, &[], None);
+        let ts_canonical = canonical_messages(&ts_messages);
+        let expected_offset = ts_canonical.find("TS_DIFFERENCE").unwrap() as u64;
+        assert!(expected_offset > SHADOW_COMPARE_PREFIX_LIMIT as u64);
+        assert_eq!(mismatch.class, "byte-mismatch");
+        assert_eq!(mismatch.first_diff_offset, Some(expected_offset));
+        assert_eq!(mismatch.first_mid.as_deref(), Some("m2"));
+        assert_eq!(mismatch.first_block.as_deref(), Some("m2#0"));
+        assert!(mismatch.ts_window.contains("TS_DIFFERENCE"));
+        assert!(mismatch.rs_window.contains("RS_DIFFERENCE"));
+
+        let early_ts = vec![ck("early", 1, "hello").ck];
+        let early_rs = vec![ck("early", 1, "jello").ck];
+        let early = compare_shadow_outputs(&early_ts, &early_rs, &decision, &decision, &[], None);
+        let early_canonical = canonical_messages(&early_ts);
+        assert_eq!(
+            early.first_diff_offset,
+            Some(early_canonical.find("hello").unwrap() as u64)
+        );
+        assert!(early.ts_window.contains("hello"));
+        assert!(early.rs_window.contains("jello"));
+
+        let identical =
+            compare_shadow_outputs(&early_ts, &early_ts, &decision, &decision, &[], None);
+        assert_eq!(identical.class, "identical");
+        assert_eq!(identical.first_diff_offset, None);
     }
 }

@@ -705,6 +705,16 @@ const MIGRATIONS: &[Migration] = &[
         DELETE FROM shadow_divergences WHERE class = 'quarantined';
     ",
     },
+    Migration {
+        version: 14,
+        // Keep the original prefixes for readers that predate localized byte diagnostics.
+        // The offset and centered windows make late mismatches directly inspectable.
+        statements: "
+        ALTER TABLE shadow_divergences ADD COLUMN first_diff_offset INTEGER;
+        ALTER TABLE shadow_divergences ADD COLUMN ts_window TEXT NOT NULL DEFAULT '';
+        ALTER TABLE shadow_divergences ADD COLUMN rs_window TEXT NOT NULL DEFAULT '';
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1566,6 +1576,9 @@ pub struct ShadowDivergenceRecord<'a> {
     pub first_field: Option<&'a str>,
     pub ts_prefix: &'a str,
     pub rs_prefix: &'a str,
+    pub first_diff_offset: Option<u64>,
+    pub ts_window: &'a str,
+    pub rs_window: &'a str,
     pub normalizations_json: &'a str,
     pub ts_decision_json: &'a str,
     pub rs_decision_json: &'a str,
@@ -1591,6 +1604,9 @@ pub struct ShadowDivergenceRow {
     pub first_field: Option<String>,
     pub ts_prefix: String,
     pub rs_prefix: String,
+    pub first_diff_offset: Option<u64>,
+    pub ts_window: String,
+    pub rs_window: String,
     pub normalizations_json: String,
     pub ts_decision_json: String,
     pub rs_decision_json: String,
@@ -2481,9 +2497,9 @@ impl McStore {
             tx.execute(
                 "INSERT INTO shadow_divergences
                    (session_id, pass_seq, class, first_mid, first_block, first_field,
-                    ts_prefix, rs_prefix, normalizations, ts_decision, rs_decision,
-                    state_hash, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    ts_prefix, rs_prefix, first_diff_offset, ts_window, rs_window,
+                    normalizations, ts_decision, rs_decision, state_hash, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     record.session_id,
                     record.pass_seq as i64,
@@ -2493,6 +2509,9 @@ impl McStore {
                     record.first_field,
                     record.ts_prefix,
                     record.rs_prefix,
+                    record.first_diff_offset.map(|offset| offset as i64),
+                    record.ts_window,
+                    record.rs_window,
                     record.normalizations_json,
                     record.ts_decision_json,
                     record.rs_decision_json,
@@ -2543,8 +2562,8 @@ impl McStore {
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, session_id, pass_seq, class, first_mid, first_block, first_field,
-                        ts_prefix, rs_prefix, normalizations, ts_decision, rs_decision,
-                        state_hash, created_at
+                        ts_prefix, rs_prefix, first_diff_offset, ts_window, rs_window,
+                        normalizations, ts_decision, rs_decision, state_hash, created_at
                    FROM shadow_divergences
                   WHERE session_id = ?1
                   ORDER BY pass_seq ASC, id ASC",
@@ -2561,11 +2580,16 @@ impl McStore {
                         first_field: r.get(6)?,
                         ts_prefix: r.get(7)?,
                         rs_prefix: r.get(8)?,
-                        normalizations_json: r.get(9)?,
-                        ts_decision_json: r.get(10)?,
-                        rs_decision_json: r.get(11)?,
-                        state_hash: r.get(12)?,
-                        created_at_ms: r.get(13)?,
+                        first_diff_offset: r
+                            .get::<_, Option<i64>>(9)?
+                            .map(|offset| offset.max(0) as u64),
+                        ts_window: r.get(10)?,
+                        rs_window: r.get(11)?,
+                        normalizations_json: r.get(12)?,
+                        ts_decision_json: r.get(13)?,
+                        rs_decision_json: r.get(14)?,
+                        state_hash: r.get(15)?,
+                        created_at_ms: r.get(16)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -5193,6 +5217,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_date_columns, 2);
+        let divergence_diagnostic_columns = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('shadow_divergences')
+                     WHERE name IN ('first_diff_offset', 'ts_window', 'rs_window')",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(divergence_diagnostic_columns, 3);
         let remaining_classes = migrated
             .inner
             .with_conn(|conn| {
@@ -6576,6 +6612,9 @@ mod shadow_tests {
                 first_field: Some("content"),
                 ts_prefix: "ts",
                 rs_prefix: "rs",
+                first_diff_offset: Some(3),
+                ts_window: "ts-window",
+                rs_window: "rs-window",
                 normalizations_json: "[]",
                 ts_decision_json: "{}",
                 rs_decision_json: "{}",
@@ -6586,7 +6625,11 @@ mod shadow_tests {
             .unwrap();
         assert!(write.quarantined);
         assert!(store.load(session).unwrap().meta.shadow_quarantined);
-        assert_eq!(store.load_shadow_divergences(session).unwrap().len(), 1);
+        let rows = store.load_shadow_divergences(session).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].first_diff_offset, Some(3));
+        assert_eq!(rows[0].ts_window, "ts-window");
+        assert_eq!(rows[0].rs_window, "rs-window");
 
         let repeated = store
             .record_shadow_divergence(ShadowDivergenceRecord {
@@ -6599,6 +6642,9 @@ mod shadow_tests {
                 first_field: None,
                 ts_prefix: "",
                 rs_prefix: "",
+                first_diff_offset: None,
+                ts_window: "",
+                rs_window: "",
                 normalizations_json: "[]",
                 ts_decision_json: "{}",
                 rs_decision_json: "{}",

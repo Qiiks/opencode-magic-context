@@ -2202,6 +2202,7 @@ export function createTransform(deps: TransformDeps) {
                 };
                 shadowSender.enqueue({
                     sessionId,
+                    isSubagent: sessionMeta.isSubagent,
                     db,
                     inputMessages: shadowCapture.inputMessages,
                     outputMessages: messages,

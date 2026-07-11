@@ -54,6 +54,8 @@ const CONNECT_BACKOFF_INITIAL_MS = 1_000;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
+const RESEED_COOLDOWN_MS = 30 * 60 * 1_000;
+const RESEED_ATTEMPT_CAP = 5;
 
 const declaredTrimBySession = new Map<string, { markerKey: string; trim: ShadowDeclaredTrim }>();
 
@@ -91,6 +93,7 @@ export interface ShadowDeclaredTrim {
 
 export interface ShadowTransformPass {
     sessionId: string;
+    isSubagent: boolean;
     db: ContextDatabase;
     projectRoot: string;
     projectPath?: string;
@@ -144,7 +147,10 @@ interface SessionQueueState {
     requireResetReason: string | null;
     blockedUntilReset: boolean;
     seedPassPending: boolean;
-    quarantineRetryAttempted: boolean;
+    skipped: boolean;
+    reseedAttempts: number;
+    lastReseedAttemptMs: number | null;
+    reseedAwaitingSuccess: boolean;
     counters: ShadowSenderCounters;
 }
 
@@ -245,7 +251,10 @@ function createSessionQueueState(): SessionQueueState {
         requireResetReason: "cold_start",
         blockedUntilReset: false,
         seedPassPending: false,
-        quarantineRetryAttempted: false,
+        skipped: false,
+        reseedAttempts: 0,
+        lastReseedAttemptMs: null,
+        reseedAwaitingSuccess: false,
         counters: emptyCounters(),
     };
 }
@@ -1014,9 +1023,20 @@ function buildShadowTransformBody(args: { pass: PreparedShadowPass; state: Sessi
     };
 }
 
-export function createShadowSender(options: { transport?: ShadowTransport } = {}): ShadowSender {
+export function createShadowSender(
+    options: {
+        transport?: ShadowTransport;
+        now?: () => number;
+        reseedCooldownMs?: number;
+        reseedAttemptCap?: number;
+    } = {},
+): ShadowSender {
     const transport = options.transport ?? new SubcShadowTransport();
+    const now = options.now ?? Date.now;
+    const reseedCooldownMs = options.reseedCooldownMs ?? RESEED_COOLDOWN_MS;
+    const reseedAttemptCap = options.reseedAttemptCap ?? RESEED_ATTEMPT_CAP;
     const sessions = new Map<string, SessionQueueState>();
+    const subagentSessions = new Set<string>();
 
     const getState = (sessionId: string): SessionQueueState => {
         let state = sessions.get(sessionId);
@@ -1060,7 +1080,7 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
     };
 
     const runQueue = async (sessionId: string, state: SessionQueueState): Promise<void> => {
-        while (state.queue.length > 0) {
+        while (!state.skipped && state.queue.length > 0) {
             const item = state.queue.shift();
             if (!item) continue;
             if (item.kind === "reset") {
@@ -1139,10 +1159,26 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
         );
     };
 
+    const beginReseed = (state: SessionQueueState): boolean => {
+        const attemptAt = now();
+        if (state.reseedAttempts >= reseedAttemptCap) return false;
+        if (
+            state.lastReseedAttemptMs !== null &&
+            attemptAt - state.lastReseedAttemptMs < reseedCooldownMs
+        ) {
+            return false;
+        }
+        state.reseedAttempts += 1;
+        state.lastReseedAttemptMs = attemptAt;
+        state.reseedAwaitingSuccess = true;
+        return true;
+    };
+
     const processPass = async (
         state: SessionQueueState,
         pass: ShadowTransformPass,
     ): Promise<void> => {
+        if (state.skipped) return;
         if (state.blockedUntilReset && !state.requireResetReason) {
             state.requireResetReason = "unknown_block";
         }
@@ -1154,7 +1190,7 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
                 projectRoot: pass.projectRoot,
             });
         }
-        if (state.blockedUntilReset) return;
+        if (state.skipped || state.blockedUntilReset) return;
 
         let resolved: ReturnType<typeof resolveOrdinalsForShadow>;
         try {
@@ -1279,19 +1315,19 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
                     body: toFlatWireBody(syncPayload),
                 });
             } catch (error) {
-                if (isSeedBoundaryReject(error) && !state.quarantineRetryAttempted) {
-                    state.quarantineRetryAttempted = true;
+                if (isSeedBoundaryReject(error) && beginReseed(state)) {
                     await performReset({
                         sessionId: pass.sessionId,
                         state,
                         reason: "seed_boundary_reseed",
                         projectRoot: pass.projectRoot,
                     });
-                    await processPass(state, pass);
+                    if (!state.skipped) await processPass(state, pass);
                     return;
                 }
                 throw error;
             }
+            if (state.skipped) return;
             state.lastAckedSeq = numericAck(
                 response,
                 ["shadow_seq", "seq"],
@@ -1309,29 +1345,49 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
             method: "shadow_transform",
             body: transformBody,
         });
+        if (state.skipped) return;
         const ack = extractAckValue(response);
         state.seedPassPending = false;
         state.counters.transforms_sent += 1;
         if (ack.divergence || ack.divergence_class || ack.hard_divergence) {
             sessionLog(pass.sessionId, "shadow: divergence report", ack);
         }
-        if (ack.quarantined === true && !state.quarantineRetryAttempted) {
-            state.quarantineRetryAttempted = true;
+        if (ack.quarantined === true && beginReseed(state)) {
             await performReset({
                 sessionId: pass.sessionId,
                 state,
                 reason: "quarantine_reseed",
                 projectRoot: pass.projectRoot,
             });
-            await processPass(state, pass);
+            if (!state.skipped) await processPass(state, pass);
+        } else if (ack.quarantined !== true && state.reseedAwaitingSuccess) {
+            state.reseedAttempts = 0;
+            state.lastReseedAttemptMs = null;
+            state.reseedAwaitingSuccess = false;
         }
     };
 
     return {
         enqueue(pass: ShadowTransformPass): void {
+            if (pass.isSubagent) {
+                const state = sessions.get(pass.sessionId);
+                if (state) {
+                    state.skipped = true;
+                    state.queue.length = 0;
+                    sessions.delete(pass.sessionId);
+                }
+                clearDeclaredTrimForSession(pass.sessionId);
+                transport.closeSession?.(pass.sessionId);
+                if (!subagentSessions.has(pass.sessionId)) {
+                    subagentSessions.add(pass.sessionId);
+                    sessionLog(pass.sessionId, "shadow: skipped (subagent session)");
+                }
+                return;
+            }
             pushWork(pass.sessionId, { kind: "pass", pass });
         },
         resetSession(sessionId: string, reason: string): void {
+            if (subagentSessions.has(sessionId)) return;
             const state = getState(sessionId);
             state.queue.length = 0;
             state.requireResetReason = reason;
@@ -1340,7 +1396,10 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
             pushWork(sessionId, { kind: "reset", sessionId, reason });
         },
         clearSession(sessionId: string): void {
+            const state = sessions.get(sessionId);
+            if (state) state.skipped = true;
             sessions.delete(sessionId);
+            subagentSessions.delete(sessionId);
             clearDeclaredTrimForSession(sessionId);
             transport.closeSession?.(sessionId);
         },
