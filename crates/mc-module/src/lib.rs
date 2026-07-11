@@ -3418,7 +3418,7 @@ fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
         return Some(id);
     }
     let ids = memory_ids(args, action);
-    (ids.len() == 1).then_some(ids[0])
+    ids.first().copied().filter(|_| ids.len() == 1)
 }
 
 fn memory_ids(args: &Map<String, Value>, _action: &str) -> Vec<i64> {
@@ -6131,6 +6131,44 @@ mod tests {
         assert_eq!(error_code(rejected), "reduce_unavailable_for_profile");
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
         crate::healing::set_tagging_enabled_for_tests(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_never_panics_on_malformed_memory_arguments() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[(
+            "token",
+            FakeResolve::Hit("opaque-own-conversation".to_string()),
+        )]);
+        let (handler, _store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/repo", "token"));
+
+        let malformed = [
+            json!({ "action": "update", "content": "edited" }),
+            json!({ "action": "update", "ids": [], "content": "edited" }),
+            json!({ "action": "update", "ids": ["x"], "content": "edited" }),
+            json!({ "action": "update", "id": -1, "content": "edited" }),
+            json!({ "action": "update", "id": u64::MAX, "content": "edited" }),
+            json!({ "action": "archive" }),
+            json!({ "action": "archive", "ids": [] }),
+            json!({ "action": "archive", "ids": ["x"] }),
+            json!({ "action": "archive", "id": -1 }),
+            json!({ "action": "archive", "id": u64::MAX }),
+            json!({ "action": "merge", "content": "merged" }),
+            json!({ "action": "merge", "ids": [], "content": "merged" }),
+            json!({ "action": "merge", "ids": ["x"], "content": "merged" }),
+            json!({ "action": "merge", "ids": [-1, -2], "content": "merged" }),
+            json!({ "action": "merge", "ids": [u64::MAX, 1], "content": "merged" }),
+        ];
+
+        for arguments in malformed {
+            let outcome = call_facade(&handler, "ctx_memory", arguments.clone()).await;
+            assert!(
+                tool_is_error(outcome),
+                "malformed arguments must return a typed tool error: {arguments}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
