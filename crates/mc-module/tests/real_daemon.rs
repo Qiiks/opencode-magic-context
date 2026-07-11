@@ -1,5 +1,5 @@
 //! End-to-end acceptance test: the cache-stability transform driven THROUGH a live
-//! subc daemon (a real subc-core spawns mc-module as a provider, and a SubcConsumer
+//! subc daemon (a real ck-subc spawns mc-module as a provider, and a SubcConsumer
 //! calls the `transform` op over the wire).
 //!
 //! Covered here (the cases drivable through the real production path): the first-pass
@@ -78,7 +78,7 @@ async fn mc_transform_spine_through_real_daemon() {
     // Build the daemon (from the sibling subconscious workspace) and our module.
     let daemon_bin = ensure_binary(
         &subconscious,
-        subconscious.join("target/debug/subc-core"),
+        subconscious.join("target/debug/ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
     let module_bin = ensure_binary(
