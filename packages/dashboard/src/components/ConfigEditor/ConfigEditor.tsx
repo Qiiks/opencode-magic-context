@@ -9,6 +9,7 @@ import {
 } from "solid-js";
 import { getConfig, getProjectConfigs, saveConfig, saveProjectConfig } from "../../lib/api";
 import { jsoncErrorMessage, parseJsonc } from "../../lib/jsonc";
+import { getEffectiveModelIds } from "../../lib/model-ids";
 import { invoke } from "../../lib/platform";
 import type { OpencodeInstallState, ProjectConfigEntry } from "../../lib/types";
 import { configSaveBlocker } from "./config-save-guard";
@@ -2089,7 +2090,7 @@ export default function ConfigEditor(props: {
     }),
   );
 
-  const effectiveModels = () => props.models;
+  const effectiveModels = createMemo(() => getEffectiveModelIds(props.piModels, props.models));
 
   const selectConfigTarget = (next: ConfigTarget) => {
     setConfigTarget(next);
@@ -2265,7 +2266,7 @@ export default function ConfigEditor(props: {
               <ProjectConfigDetail
                 entry={proj()}
                 onBack={() => setSelectedProject(null)}
-                models={props.models}
+                models={effectiveModels()}
                 opencodeInstallState={props.opencodeInstallState}
               />
             )}

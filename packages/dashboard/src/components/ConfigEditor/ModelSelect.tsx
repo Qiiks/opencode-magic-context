@@ -7,6 +7,39 @@ interface ModelSelectProps {
   placeholder?: string;
 }
 
+const INVALID_MODEL_ID_HINT = "Enter a model id in provider/model form";
+
+export function getTypedModelSelection(
+  input: string,
+  availableModels: readonly string[],
+): { model: string | null; hint: string | null; isListed: boolean } {
+  const model = input.trim();
+  if (!model) return { model: null, hint: null, isListed: false };
+
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash === model.length - 1) {
+    return { model: null, hint: INVALID_MODEL_ID_HINT, isListed: false };
+  }
+
+  // Discovery lists are never exhaustive, so a valid provider/model ID must
+  // remain selectable even when it is not one of the discovered models.
+  return {
+    model,
+    hint: null,
+    isListed: availableModels.includes(model),
+  };
+}
+
+export function commitTypedModelValue(
+  input: string,
+  availableModels: readonly string[],
+  onChange: (model: string) => void,
+): { model: string | null; hint: string | null; isListed: boolean } {
+  const selection = getTypedModelSelection(input, availableModels);
+  if (selection.model) onChange(selection.model);
+  return selection;
+}
+
 export default function ModelSelect(props: ModelSelectProps) {
   const [open, setOpen] = createSignal(false);
   const [search, setSearch] = createSignal("");
@@ -40,12 +73,16 @@ export default function ModelSelect(props: ModelSelectProps) {
     return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b));
   });
 
-  const canUseFreeText = () => props.models.length === 0;
-  const typedModel = () => search().trim();
+  const typedSelection = createMemo(() => getTypedModelSelection(search(), props.models));
+  const typedModel = () => typedSelection().model;
+  const showTypedModelOption = () => {
+    const selection = typedSelection();
+    return selection.model !== null && !selection.isListed;
+  };
 
   const openDropdown = () => {
     setOpen(true);
-    setSearch(canUseFreeText() ? valueStr() : "");
+    setSearch("");
     startListening();
     requestAnimationFrame(() => inputRef?.focus());
   };
@@ -63,19 +100,10 @@ export default function ModelSelect(props: ModelSelectProps) {
     stopListening();
   };
 
-  const commitTypedModel = () => {
-    if (!canUseFreeText()) return;
-    const model = typedModel();
-    if (model) selectModel(model);
-  };
+  const commitTypedModel = () => commitTypedModelValue(search(), props.models, selectModel);
 
-  // Memoize a normalized string view of props.value so JSX reads can't
-  // see a stale "truthy" outer ternary while the inner .substring() call
-  // re-evaluates against a now-undefined / non-string value.
-  // Reproduces in dashboard ConfigEditor when switching Pi → OpenCode
-  // config tabs: createEffect updates formData asynchronously, so the
-  // ternary at line 80 and the inner reads at 82-83 could observe
-  // different snapshots of props.value within the same render.
+  // Normalize values at the component boundary because asynchronous form-state
+  // refreshes can briefly provide a non-string value before the next render.
   const valueStr = createMemo(() => (typeof props.value === "string" ? props.value : ""));
 
   const displayValue = () => {
@@ -134,14 +162,14 @@ export default function ModelSelect(props: ModelSelectProps) {
               ref={inputRef}
               class="model-select-search"
               type="text"
-              placeholder={canUseFreeText() ? "Type model id..." : "Search models..."}
+              placeholder="Search or type provider/model..."
               value={search()}
               onInput={(e) => setSearch(e.currentTarget.value)}
               onKeyDown={(e) => {
                 if (e.key === "Escape") {
                   setOpen(false);
                   stopListening();
-                } else if (e.key === "Enter" && canUseFreeText()) {
+                } else if (e.key === "Enter") {
                   e.preventDefault();
                   commitTypedModel();
                 }
@@ -149,46 +177,41 @@ export default function ModelSelect(props: ModelSelectProps) {
             />
           </div>
           <div class="model-select-options">
-            <Show
-              when={canUseFreeText()}
-              fallback={
-                <For
-                  each={grouped()}
-                  fallback={<div class="model-select-empty">No models found</div>}
-                >
-                  {([provider, models]) => (
-                    <div class="model-select-group">
-                      <div class="model-select-group-label">{provider}</div>
-                      <For each={models}>
-                        {(model) => (
-                          <button
-                            class={`model-select-option ${props.value === model ? "active" : ""}`}
-                            onClick={() => selectModel(model)}
-                            type="button"
-                          >
-                            {modelName(model)}
-                          </button>
-                        )}
-                      </For>
-                    </div>
-                  )}
-                </For>
-              }
-            >
-              <Show
-                when={typedModel()}
-                fallback={<div class="model-select-empty">Type a model id and press Enter</div>}
+            <For each={grouped()}>
+              {([provider, models]) => (
+                <div class="model-select-group">
+                  <div class="model-select-group-label">{provider}</div>
+                  <For each={models}>
+                    {(model) => (
+                      <button
+                        class={`model-select-option ${props.value === model ? "active" : ""}`}
+                        onClick={() => selectModel(model)}
+                        type="button"
+                      >
+                        {modelName(model)}
+                      </button>
+                    )}
+                  </For>
+                </div>
+              )}
+            </For>
+            <Show when={showTypedModelOption()}>
+              <button
+                class="model-select-option"
+                onClick={() => {
+                  const model = typedModel();
+                  if (model) selectModel(model);
+                }}
+                type="button"
               >
-                {(model) => (
-                  <button
-                    class={`model-select-option ${props.value === model() ? "active" : ""}`}
-                    onClick={() => selectModel(model())}
-                    type="button"
-                  >
-                    Use "{model()}"
-                  </button>
-                )}
-              </Show>
+                Use "{typedModel()}"
+              </button>
+            </Show>
+            <Show when={typedSelection().hint}>
+              {(hint) => <div class="model-select-empty">{hint()}</div>}
+            </Show>
+            <Show when={grouped().length === 0 && !typedModel() && !typedSelection().hint}>
+              <div class="model-select-empty">Search models or type a model id</div>
             </Show>
           </div>
         </div>
