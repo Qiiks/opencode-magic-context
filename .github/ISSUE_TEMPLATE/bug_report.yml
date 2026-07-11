@@ -64,6 +64,8 @@ body:
         - OpenCode Desktop
         - OpenCode TUI (CLI)
         - OpenCode Web
+        - Pi
+        - Magic Context Dashboard
         - Unknown
     validations:
       required: true
