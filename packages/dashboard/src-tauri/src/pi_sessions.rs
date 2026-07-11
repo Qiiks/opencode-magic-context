@@ -182,40 +182,47 @@ fn read_pi_session_meta_uncached(path: &Path, mtime: SystemTime) -> Option<PiSes
     let mut message_count = 0u32;
     let mut first_message = String::new();
     let mut session_name = None;
-    let mut last_activity = None;
+    let mut last_activity_line = None;
 
     for line in lines.map_while(Result::ok) {
-        let Some(entry) = parse_json_line(&line) else {
+        if json_string_field_is(&line, "type", "session_info") {
+            if let Some(entry) = parse_json_line(&line) {
+                session_name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(normalize_title)
+                    .filter(|name| !name.is_empty());
+            }
             continue;
-        };
-        if entry.get("type").and_then(Value::as_str) == Some("session_info") {
-            session_name = entry
-                .get("name")
-                .and_then(Value::as_str)
-                .map(normalize_title)
-                .filter(|name| !name.is_empty());
         }
-        if entry.get("type").and_then(Value::as_str) != Some("message") {
+        if !json_string_field_is(&line, "type", "message") {
             continue;
         }
         message_count = message_count.saturating_add(1);
-        let Some(message) = entry.get("message") else {
+        let is_user = json_string_field_is(&line, "role", "user");
+        let is_assistant = json_string_field_is(&line, "role", "assistant");
+        if !is_user && !is_assistant {
             continue;
-        };
-        let role = message.get("role").and_then(Value::as_str);
-        if matches!(role, Some("user" | "assistant")) {
-            if let Some(ts) = message_timestamp_ms(&entry, message) {
-                last_activity = Some(last_activity.map_or(ts, |last: i64| last.max(ts)));
+        }
+        if first_message.is_empty() && is_user {
+            if let Some(entry) = parse_json_line(&line) {
+                if let Some(message) = entry.get("message") {
+                    let text = normalize_title(&extract_text_content(message));
+                    if !text.is_empty() {
+                        first_message = text;
+                    }
+                }
             }
         }
-        if first_message.is_empty() && role == Some("user") {
-            let text = normalize_title(&extract_text_content(message));
-            if !text.is_empty() {
-                first_message = text;
-            }
-        }
+        // JSONL entries are chronological. Retaining only the final activity
+        // line avoids deserializing every large message merely to find its time.
+        last_activity_line = Some(line);
     }
 
+    let last_activity = last_activity_line.as_deref().and_then(|line| {
+        let entry = parse_json_line(line)?;
+        message_timestamp_ms(&entry, entry.get("message")?)
+    });
     let created = parse_ts_ms(header.get("timestamp")).unwrap_or_else(|| system_time_ms(mtime));
     Some(PiSessionMeta {
         session_id: header.get("id")?.as_str()?.to_string(),
@@ -478,6 +485,27 @@ fn system_time_ms(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn json_string_field_is(line: &str, key: &str, expected: &str) -> bool {
+    let quoted_key = match key {
+        "type" => "\"type\"",
+        "role" => "\"role\"",
+        _ => return false,
+    };
+    let Some(key_start) = line.find(quoted_key) else {
+        return false;
+    };
+    let after_key = line[key_start + quoted_key.len()..].trim_start();
+    let Some(after_colon) = after_key.strip_prefix(':') else {
+        return false;
+    };
+    after_colon
+        .trim_start()
+        .strip_prefix('"')
+        .is_some_and(|value| {
+            value.starts_with(expected) && value[expected.len()..].starts_with('"')
+        })
 }
 
 fn parse_json_line(line: &str) -> Option<Value> {

@@ -965,7 +965,10 @@ pub fn load_raw_db_cache_events(
 /// windowing the OpenCode SQL path does so a single noisy Pi session cannot
 /// monopolize the global view, and emits the same `RawDbCacheEvent` shape as
 /// OpenCode so downstream `build_db_cache_events` works unchanged.
-pub fn load_raw_pi_cache_events(limit: usize, since_timestamp: Option<i64>) -> Vec<RawDbCacheEvent> {
+pub fn load_raw_pi_cache_events(
+    limit: usize,
+    since_timestamp: Option<i64>,
+) -> Vec<RawDbCacheEvent> {
     let per_session_limit = limit;
     let global_cap = limit.saturating_mul(10);
     let mut all_rows: Vec<RawDbCacheEvent> = Vec::new();
@@ -1261,67 +1264,39 @@ fn build_db_cache_events_with_decisions(
             .or_insert(row.timestamp);
     }
 
-    // OC-side: check which sessions truly have their first-ever assistant
-    // message in our window by computing each session's true-first assistant
-    // message timestamp in a single GROUP BY query, then comparing to our
-    // window's earliest. Pi sessions are excluded here because Pi cache rows
-    // come from JSONL files, not OpenCode's `message` table — Pi
-    // first-message detection is handled in `pi_true_first_sessions` below.
+    // OC-side: probe each small session key through the
+    // (session_id, time_created) index and stop at its first usable assistant
+    // event. The previous GROUP BY evaluated JSON for every row in each giant
+    // session every time its chart window or incremental overlap was loaded.
+    let mut true_first_sessions: HashSet<(Harness, String)> = HashSet::new();
     let oc_session_ids: Vec<String> = earliest_ts_in_window
         .iter()
         .filter(|((h, _), _)| matches!(h, Harness::Opencode))
         .map(|((_, sid), _)| sid.clone())
         .collect();
-    let true_first_sessions: HashSet<(Harness, String)> = if !oc_session_ids.is_empty() {
+    if !oc_session_ids.is_empty() {
         if let Some(opencode_db_path) = resolve_opencode_db_path() {
             if let Ok(conn) = open_readonly(&opencode_db_path) {
-                // Build IN-clause with placeholders for each session_id we care about.
-                let placeholders = vec!["?"; oc_session_ids.len()].join(",");
-                let sql = format!(
-                        "SELECT session_id, MIN(time_created) AS first_ts
-                         FROM message
-                         WHERE session_id IN ({})
-                           AND json_extract(data, '$.role') = 'assistant'
-                           AND COALESCE(CAST(json_extract(data, '$.tokens.total') AS INTEGER), 0) > 0
-                         GROUP BY session_id",
-                        placeholders
-                    );
-                let session_id_refs: Vec<&dyn rusqlite::types::ToSql> = oc_session_ids
-                    .iter()
-                    .map(|s| s as &dyn rusqlite::types::ToSql)
-                    .collect();
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    let rows = stmt.query_map(session_id_refs.as_slice(), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    });
-                    if let Ok(rows) = rows {
-                        // A session is "truly first" in our window if its
-                        // window-earliest timestamp matches its DB-wide
-                        // earliest assistant timestamp.
-                        rows.filter_map(|r| r.ok())
-                            .filter(|(sid, db_earliest)| {
-                                earliest_ts_in_window
-                                    .get(&(Harness::Opencode, sid.clone()))
-                                    .map(|window_earliest| *window_earliest <= *db_earliest)
-                                    .unwrap_or(false)
-                            })
-                            .map(|(sid, _)| (Harness::Opencode, sid))
-                            .collect()
-                    } else {
-                        HashSet::new()
+                if let Ok(mut stmt) = conn.prepare(FIRST_OPENCODE_CACHE_EVENT_SQL) {
+                    for sid in oc_session_ids {
+                        let db_earliest = stmt
+                            .query_row(params![&sid], |row| row.get::<_, i64>(0))
+                            .optional()
+                            .ok()
+                            .flatten();
+                        let window_earliest =
+                            earliest_ts_in_window.get(&(Harness::Opencode, sid.clone()));
+                        if db_earliest
+                            .zip(window_earliest)
+                            .is_some_and(|(db, window)| *window <= db)
+                        {
+                            true_first_sessions.insert((Harness::Opencode, sid));
+                        }
                     }
-                } else {
-                    HashSet::new()
                 }
-            } else {
-                HashSet::new()
             }
-        } else {
-            HashSet::new()
         }
-    } else {
-        HashSet::new()
-    };
+    }
 
     // Pi-side: a Pi session has its true-first assistant message in our window
     // when our window-earliest timestamp for that Pi session is also the
@@ -1729,9 +1704,15 @@ fn build_db_cache_events_with_decisions(
 }
 
 pub fn get_cache_events_from_db(limit: usize, since_timestamp: Option<i64>) -> Vec<DbCacheEvent> {
-    let mut rows = load_raw_db_cache_events(limit, since_timestamp).unwrap_or_default();
-    rows.extend(load_raw_pi_cache_events(limit, since_timestamp));
-    let (claude_rows, codex_rows) = load_raw_external_cache_events_parallel(limit, since_timestamp);
+    const MERGED_TIMELINE_LOOKBACK_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+    // This one-shot merged feed has no active dashboard caller. Keep its OpenCode
+    // JSON extraction bounded so a future caller cannot accidentally scan years
+    // of message history.
+    let floor =
+        since_timestamp.unwrap_or_else(|| now_millis().saturating_sub(MERGED_TIMELINE_LOOKBACK_MS));
+    let mut rows = load_raw_db_cache_events(limit, Some(floor)).unwrap_or_default();
+    rows.extend(load_raw_pi_cache_events(limit, Some(floor)));
+    let (claude_rows, codex_rows) = load_raw_external_cache_events_parallel(limit, Some(floor));
     rows.extend(claude_rows);
     rows.extend(codex_rows);
     // Newest-first across all harnesses, then truncate to the same global cap
@@ -1741,7 +1722,82 @@ pub fn get_cache_events_from_db(limit: usize, since_timestamp: Option<i64>) -> V
     build_db_cache_events(rows, true)
 }
 
-type SessionCacheStatsAccumulator = (usize, i64, i64, i64, i64, usize);
+#[derive(Debug)]
+struct CacheSessionListEntry {
+    harness: Harness,
+    session_id: String,
+    last_activity_ms: i64,
+}
+
+const RECENT_OPENCODE_CACHE_SESSIONS_SQL: &str = "SELECT id, time_updated
+     FROM session
+     WHERE time_archived IS NULL
+     ORDER BY time_updated DESC
+     LIMIT ?1";
+
+const RECENT_OPENCODE_SESSION_MESSAGES_SQL: &str = "SELECT data
+     FROM message
+     WHERE session_id = ?1
+     ORDER BY time_created DESC
+     LIMIT ?2";
+
+const FIRST_OPENCODE_CACHE_EVENT_SQL: &str = "SELECT time_created
+     FROM message
+     WHERE session_id = ?1
+       AND json_extract(data, '$.role') = 'assistant'
+       AND COALESCE(CAST(json_extract(data, '$.tokens.total') AS INTEGER), 0) > 0
+     ORDER BY time_created ASC
+     LIMIT 1";
+
+fn load_recent_opencode_cache_sessions(limit: usize) -> Vec<CacheSessionListEntry> {
+    const CACHE_EVENT_LOOKBACK_MESSAGES: i64 = 200;
+    let Some(path) = resolve_opencode_db_path() else {
+        return Vec::new();
+    };
+    let Ok(conn) = open_readonly(&path) else {
+        return Vec::new();
+    };
+    let candidate_limit = i64::try_from(limit.saturating_mul(4)).unwrap_or(i64::MAX);
+    let mut candidates = {
+        let Ok(mut stmt) = conn.prepare(RECENT_OPENCODE_CACHE_SESSIONS_SQL) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([candidate_limit], |row| {
+            Ok(CacheSessionListEntry {
+                harness: Harness::Opencode,
+                session_id: row.get(0)?,
+                last_activity_ms: row.get(1)?,
+            })
+        }) else {
+            return Vec::new();
+        };
+        rows.flatten().collect::<Vec<_>>()
+    };
+    let Ok(mut messages_stmt) = conn.prepare(RECENT_OPENCODE_SESSION_MESSAGES_SQL) else {
+        return Vec::new();
+    };
+    candidates.retain(|candidate| {
+        let Ok(rows) = messages_stmt.query_map(
+            params![&candidate.session_id, CACHE_EVENT_LOOKBACK_MESSAGES],
+            |row| row.get::<_, String>(0),
+        ) else {
+            return false;
+        };
+        rows.flatten().any(|data| {
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(&data) else {
+                return false;
+            };
+            message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                && message
+                    .pointer("/tokens/total")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0)
+                    > 0
+        })
+    });
+    candidates.truncate(limit);
+    candidates
+}
 
 fn resolve_store_db_path() -> Option<PathBuf> {
     let data_dir = std::env::var("XDG_DATA_HOME")
@@ -1903,101 +1959,87 @@ pub fn get_session_cache_stats_from_db(
     limit: usize,
     show_unmanaged: bool,
 ) -> Vec<SessionCacheStats> {
-    // Reuse raw rows instead of re-querying + re-parsing logs.
-    let mut rows = load_raw_db_cache_events(200, None).unwrap_or_default();
-    rows.extend(load_raw_pi_cache_events(200, None));
-    let (claude_rows, codex_rows) = load_raw_external_cache_events_parallel(200, None);
-    rows.extend(claude_rows);
-    rows.extend(codex_rows);
+    // The list endpoint carries only metadata. Cache totals are derived from the
+    // same bounded per-session windows that the frontend already loads for the
+    // cards and chart, so the 1s reconcile never recomputes global aggregates.
+    let (mut sessions, pi_sessions, claude_sessions, codex_sessions) =
+        std::thread::scope(|scope| {
+            let opencode = scope.spawn(|| load_recent_opencode_cache_sessions(limit));
+            let pi = scope.spawn(pi_sessions::scan_pi_session_dir);
+            let claude = scope.spawn(external_cache_sessions::scan_claude_code_session_dir);
+            let codex = scope.spawn(external_cache_sessions::scan_codex_session_dir);
+            (
+                opencode.join().unwrap_or_default(),
+                pi.join().unwrap_or_default(),
+                claude.join().unwrap_or_default(),
+                codex.join().unwrap_or_default(),
+            )
+        });
+    sessions.extend(pi_sessions.into_iter().map(|meta| CacheSessionListEntry {
+        harness: Harness::Pi,
+        session_id: meta.session_id,
+        last_activity_ms: meta.modified,
+    }));
+    sessions.extend(
+        claude_sessions
+            .into_iter()
+            .map(|meta| CacheSessionListEntry {
+                harness: Harness::ClaudeCode,
+                session_id: meta.session_id,
+                last_activity_ms: meta.modified,
+            }),
+    );
+    sessions.extend(
+        codex_sessions
+            .into_iter()
+            .map(|meta| CacheSessionListEntry {
+                harness: Harness::Codex,
+                session_id: meta.session_id,
+                last_activity_ms: meta.modified,
+            }),
+    );
 
-    let row_keys: HashSet<(Harness, String)> = rows
+    let candidate_keys: HashSet<(Harness, String)> = sessions
         .iter()
         .map(|row| (row.harness, row.session_id.clone()))
         .collect();
-    let detected_managed = load_managed_cache_sessions(&row_keys);
+    let detected_managed = load_managed_cache_sessions(&candidate_keys);
     if !show_unmanaged {
-        rows.retain(|row| {
+        sessions.retain(|row| {
             is_managed_cache_session(row.harness, &row.session_id, &detected_managed)
         });
     }
+    sessions.sort_by_key(|row| std::cmp::Reverse(row.last_activity_ms));
+    sessions.truncate(limit);
 
-    rows.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
-    rows.truncate(2000); // 200 per-session × ~10 sessions cap
-    let events = build_db_cache_events(rows, false); // skip log enrichment for stats
-                                                     // Key by (harness, session_id) so sessions from different harnesses never
-                                                     // collide on a shared short-prefix session ID.
-    let mut map: HashMap<(Harness, String), SessionCacheStatsAccumulator> = HashMap::new();
-
-    for event in events {
-        if event.session_id.is_empty() {
-            continue;
-        }
-
-        let entry = map
-            .entry((event.harness, event.session_id.clone()))
-            .or_insert((0, 0, 0, 0, event.timestamp, 0));
-        entry.0 += 1;
-        entry.1 += event.cache_read;
-        entry.2 += event.cache_write;
-        entry.3 += event.input_tokens;
-        entry.4 = entry.4.max(event.timestamp);
-        if event.severity == "bust" || event.severity == "full_bust" {
-            entry.5 += 1;
-        }
-    }
-
-    let stat_keys: HashSet<(Harness, String)> = map.keys().cloned().collect();
+    let stat_keys: HashSet<(Harness, String)> = sessions
+        .iter()
+        .map(|row| (row.harness, row.session_id.clone()))
+        .collect();
     let titles = load_cache_session_titles(&stat_keys);
     let subagent_flags = load_cache_subagent_flags(&stat_keys);
-    let detected_managed = load_managed_cache_sessions(&stat_keys);
 
-    let mut stats: Vec<(i64, SessionCacheStats)> = map
+    sessions
         .into_iter()
-        .map(
-            |(
-                (harness, session_id),
-                (
-                    event_count,
-                    total_cache_read,
-                    total_cache_write,
-                    total_input,
-                    last_timestamp,
-                    bust_count,
-                ),
-            )| {
-                let total_prompt = total_cache_read + total_cache_write + total_input;
-                let hit_ratio = if total_prompt > 0 {
-                    total_cache_read as f64 / total_prompt as f64
-                } else {
-                    0.0
-                };
-                let key = (harness, session_id.clone());
-
-                (
-                    last_timestamp,
-                    SessionCacheStats {
-                        harness,
-                        session_id,
-                        event_count,
-                        total_cache_read,
-                        total_cache_write,
-                        total_input,
-                        hit_ratio,
-                        last_timestamp: format_timestamp_iso(last_timestamp),
-                        last_activity_ms: last_timestamp,
-                        bust_count,
-                        managed: is_managed_cache_session(harness, &key.1, &detected_managed),
-                        is_subagent: subagent_flags.get(&key).copied().unwrap_or(false),
-                        title: titles.get(&key).cloned(),
-                    },
-                )
-            },
-        )
-        .collect();
-
-    stats.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
-    stats.truncate(limit);
-    stats.into_iter().map(|(_, stat)| stat).collect()
+        .map(|row| {
+            let key = (row.harness, row.session_id.clone());
+            SessionCacheStats {
+                harness: row.harness,
+                session_id: row.session_id,
+                event_count: 0,
+                total_cache_read: 0,
+                total_cache_write: 0,
+                total_input: 0,
+                hit_ratio: 0.0,
+                last_timestamp: format_timestamp_iso(row.last_activity_ms),
+                last_activity_ms: row.last_activity_ms,
+                bust_count: 0,
+                managed: is_managed_cache_session(row.harness, &key.1, &detected_managed),
+                is_subagent: subagent_flags.get(&key).copied().unwrap_or(false),
+                title: titles.get(&key).cloned(),
+            }
+        })
+        .collect()
 }
 
 // `limit` caps the returned event count to the most recent N (newest-first
@@ -5941,6 +5983,42 @@ pub fn get_db_health(db_path: &PathBuf) -> DbHealth {
         size_bytes,
         wal_size_bytes,
         table_counts,
+    }
+}
+
+#[cfg(test)]
+mod cache_session_list_query_tests {
+    use super::{
+        FIRST_OPENCODE_CACHE_EVENT_SQL, RECENT_OPENCODE_CACHE_SESSIONS_SQL,
+        RECENT_OPENCODE_SESSION_MESSAGES_SQL,
+    };
+
+    #[test]
+    fn opencode_list_query_never_reads_message_json() {
+        let sql = RECENT_OPENCODE_CACHE_SESSIONS_SQL.to_ascii_lowercase();
+        assert!(sql.contains("from session"));
+        assert!(sql.contains("order by time_updated desc"));
+        assert!(sql.contains("limit ?1"));
+        assert!(!sql.contains("message"));
+        assert!(!sql.contains("json_extract"));
+    }
+
+    #[test]
+    fn cache_presence_probe_is_session_scoped_without_sql_json_parsing() {
+        let sql = RECENT_OPENCODE_SESSION_MESSAGES_SQL.to_ascii_lowercase();
+        assert!(sql.contains("session_id = ?1"));
+        assert!(sql.contains("order by time_created desc"));
+        assert!(sql.contains("limit ?2"));
+        assert!(!sql.contains("json_extract"));
+    }
+
+    #[test]
+    fn first_event_probe_is_session_scoped_and_bounded() {
+        let sql = FIRST_OPENCODE_CACHE_EVENT_SQL.to_ascii_lowercase();
+        assert!(sql.contains("session_id = ?1"));
+        assert!(sql.contains("order by time_created asc"));
+        assert!(sql.contains("limit 1"));
+        assert!(!sql.contains("group by"));
     }
 }
 

@@ -10,12 +10,14 @@
 //!   1. get_session_cache_stats_from_db(50, false)   — the session list
 //!   2. per recent session (top 10 + managed filter): get_session_cache_events(harness, sid, 60)
 //!   3. one reconcile tick: stats re-list + incremental event fetches (since=lastSeen)
+//!
 //! Timings print per step and per session so the dominant cost is unambiguous.
 
 use std::time::Instant;
 
 use magic_context_dashboard_lib::db;
 use magic_context_dashboard_lib::db::Harness;
+use magic_context_dashboard_lib::{external_cache_sessions, pi_sessions};
 
 const CACHE_STATS_FETCH_LIMIT: usize = 50;
 const RECENT_SESSIONS_LIMIT: usize = 10;
@@ -32,7 +34,11 @@ fn run_pass(label: &str) {
     // Step 1: session list (the page's first await).
     let t = Instant::now();
     let stats = db::get_session_cache_stats_from_db(CACHE_STATS_FETCH_LIMIT, false);
-    println!("[1] get_session_cache_stats_from_db(50, managed-only): {:8.1}ms  ({} sessions)", ms(t), stats.len());
+    println!(
+        "[1] get_session_cache_stats_from_db(50, managed-only): {:8.1}ms  ({} sessions)",
+        ms(t),
+        stats.len()
+    );
 
     // Managed filter + top-N, mirroring recentSessionRows with hideSubagents=false.
     let recent: Vec<_> = stats
@@ -84,24 +90,51 @@ fn run_pass(label: &str) {
     println!("=== {label} wall: {:8.1}ms ===\n", ms(total));
 }
 
-/// Times each loader inside get_session_cache_stats_from_db separately, twice,
-/// so the slow component and its cold-vs-warm behavior are unambiguous.
+/// Times each metadata source used by the cache session list, twice, so cold
+/// filesystem discovery and warm in-process cache costs stay visible.
 fn profile_stats_components() {
     for round in ["cold", "warm"] {
-        println!("=== stats components ({round}) ===");
+        println!("=== stats list components ({round}) ===");
         let t = Instant::now();
-        let oc = db::load_raw_db_cache_events(200, None).unwrap_or_default();
-        println!("[c] opencode raw (200,None): {:8.1}ms ({} rows)", ms(t), oc.len());
-        let t = Instant::now();
-        let pi = db::load_raw_pi_cache_events(200, None);
-        println!("[c] pi raw (200,None):       {:8.1}ms ({} rows)", ms(t), pi.len());
-        let t = Instant::now();
-        let (cc, cx) = db::load_raw_external_cache_events_parallel(200, None);
+        let mut oc = db::list_opencode_sessions(&db::SessionFilter::default());
+        oc.sort_by_key(|row| std::cmp::Reverse(row.last_activity_ms));
+        oc.truncate(CACHE_STATS_FETCH_LIMIT);
         println!(
-            "[c] cc+codex raw (200,None): {:8.1}ms ({} + {} rows)",
+            "[c] opencode session table: {:8.1}ms ({} rows)",
             ms(t),
-            cc.len(),
-            cx.len()
+            oc.len()
+        );
+
+        let t = Instant::now();
+        let pi = pi_sessions::scan_pi_session_dir();
+        println!(
+            "[c] pi metadata:            {:8.1}ms ({} rows)",
+            ms(t),
+            pi.len()
+        );
+
+        let t = Instant::now();
+        let cc = external_cache_sessions::scan_claude_code_session_dir();
+        println!(
+            "[c] claude metadata:        {:8.1}ms ({} rows)",
+            ms(t),
+            cc.len()
+        );
+
+        let t = Instant::now();
+        let codex = external_cache_sessions::scan_codex_session_dir();
+        println!(
+            "[c] codex metadata:         {:8.1}ms ({} rows)",
+            ms(t),
+            codex.len()
+        );
+
+        let t = Instant::now();
+        let stats = db::get_session_cache_stats_from_db(CACHE_STATS_FETCH_LIMIT, false);
+        println!(
+            "[c] assembled list:         {:8.1}ms ({} rows)",
+            ms(t),
+            stats.len()
         );
     }
 }
