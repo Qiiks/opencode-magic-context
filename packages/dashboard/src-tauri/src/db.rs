@@ -636,7 +636,7 @@ pub struct SessionCacheStats {
 }
 
 #[derive(Debug, Clone)]
-struct RawDbCacheEvent {
+pub struct RawDbCacheEvent {
     harness: Harness,
     message_id: String,
     session_id: String,
@@ -860,7 +860,7 @@ fn transform_decision_cause(decision: Option<&TransformDecisionCause>) -> Option
     None
 }
 
-fn load_raw_db_cache_events(
+pub fn load_raw_db_cache_events(
     limit: usize,
     since_timestamp: Option<i64>,
 ) -> Result<Vec<RawDbCacheEvent>, rusqlite::Error> {
@@ -965,7 +965,7 @@ fn load_raw_db_cache_events(
 /// windowing the OpenCode SQL path does so a single noisy Pi session cannot
 /// monopolize the global view, and emits the same `RawDbCacheEvent` shape as
 /// OpenCode so downstream `build_db_cache_events` works unchanged.
-fn load_raw_pi_cache_events(limit: usize, since_timestamp: Option<i64>) -> Vec<RawDbCacheEvent> {
+pub fn load_raw_pi_cache_events(limit: usize, since_timestamp: Option<i64>) -> Vec<RawDbCacheEvent> {
     let per_session_limit = limit;
     let global_cap = limit.saturating_mul(10);
     let mut all_rows: Vec<RawDbCacheEvent> = Vec::new();
@@ -1042,7 +1042,7 @@ fn load_raw_codex_cache_events(limit: usize, since_timestamp: Option<i64>) -> Ve
 
 /// Claude Code and Codex store independent trees, so loading them concurrently
 /// keeps the first diagnostics request from waiting for both JSONL parses in turn.
-fn load_raw_external_cache_events_parallel(
+pub fn load_raw_external_cache_events_parallel(
     limit: usize,
     since_timestamp: Option<i64>,
 ) -> (Vec<RawDbCacheEvent>, Vec<RawDbCacheEvent>) {
@@ -1829,7 +1829,7 @@ fn is_managed_cache_session(
         || detected.contains(&(harness, session_id.to_string()))
 }
 
-fn load_cache_session_titles(
+pub fn load_cache_session_titles(
     keys: &HashSet<(Harness, String)>,
 ) -> HashMap<(Harness, String), String> {
     let mut titles = HashMap::new();
@@ -1882,7 +1882,7 @@ fn load_cache_session_titles(
     titles
 }
 
-fn load_cache_subagent_flags(
+pub fn load_cache_subagent_flags(
     keys: &HashSet<(Harness, String)>,
 ) -> HashMap<(Harness, String), bool> {
     let mut out = HashMap::new();
