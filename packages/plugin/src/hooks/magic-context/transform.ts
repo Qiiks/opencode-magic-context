@@ -371,7 +371,7 @@ export interface TransformDeps {
     experimentalUserMemories?: boolean;
 
     /** When true, inject wall-clock gap markers (<!-- +Xm -->) on user messages and
-     *  add start/end date attributes to <compartment> elements in <session-history>.
+     *  add compact date ranges to compartment headings in <session-history>.
      *  Controlled by `experimental.temporal_awareness` config. */
     experimentalTemporalAwareness?: boolean;
     /** When true, run a second editor pass after historian to clean U: lines.

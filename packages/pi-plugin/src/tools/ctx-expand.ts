@@ -2,9 +2,9 @@
  * Pi-side wrapper for the `ctx_expand` tool.
  *
  * Mirrors OpenCode's `packages/plugin/src/tools/ctx-expand/tools.ts`:
- * given a `<compartment start="N" end="M">` range, return the original
- * compacted U:/A: transcript so the agent can see the raw discussion
- * behind a summarized region.
+ * given the N-M range from a rendered `## N-M · date · title` heading, return
+ * the original compacted U:/A: transcript so the agent can see the raw
+ * discussion behind a summarized region.
  *
  * Implementation: shared `readSessionChunk` reads via the per-session
  * `RawMessageProvider` registry. We register Pi's `readPiSessionMessages`

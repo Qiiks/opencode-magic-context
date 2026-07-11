@@ -80,8 +80,8 @@ console.log(`wrote ${tierCases.length} tier cases + ${pressureCases.length} pres
 // same output driven purely by the decay curve. Legacy/flat bodies are ASCII-only so
 // the TS UTF-16 string slice and the Rust char slice truncate identically. The cases
 // exercise: the P1..P4 paraphrase bodies across a set old enough to demote and archive
-// some rows, XML escaping in titles/bodies, the empty-P4 self-close, legacy-row
-// truncation, and the malformed-pseudo-v2 (empty p1) flat-content fallback.
+// some rows, plain-text headings with escaped bodies, empty-P4 title-only headings,
+// legacy-row truncation, and the malformed-pseudo-v2 (empty p1) flat-content fallback.
 const LOOSE = 10_000_000;
 const v2 = (
     start: number,
@@ -119,9 +119,11 @@ pushRender(
         ]),
     ),
 );
-// XML escaping in title + body
+// Heading titles are plain text; body XML escaping remains stable.
 pushRender([v2(1, 2, 'a<b>&"c"', 50, ["x < y & z", "d", "e", "f"])]);
-// Complete temporal range: attributes render after end and before title.
+// Body lines that resemble compartment headings are deterministically indented.
+pushRender([v2(3, 4, "Heading guard", 50, ["first\n## nested\nlast", "d", "e", "f"])]);
+// Complete temporal range: same-month dates use the compact heading form.
 pushRender([
     {
         ...v2(1, 2, "Dated", 50, ["dated body", "dense", "brief", "anchor"]),

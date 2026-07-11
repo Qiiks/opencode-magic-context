@@ -677,6 +677,11 @@ fn apply_once(
     } else {
         String::new()
     };
+    let compartment_render_epoch = if crate::COMPARTMENT_RENDER_FORMAT_EPOCH != 0 {
+        format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH)
+    } else {
+        String::new()
+    };
     let profile_render_epoch = serializer_profile
         .map(crate::profile_render_epoch)
         .filter(|epoch| *epoch != 0)
@@ -694,6 +699,7 @@ fn apply_once(
             upgrade_state: String::new(),
             memory_content_epoch: String::new(),
             memory_render_epoch,
+            compartment_render_epoch,
             profile_render_epoch,
             tagger_feature_epoch: tagger_feature_epoch.clone(),
         },
@@ -7045,6 +7051,7 @@ mod tests {
                 upgrade_state: String::new(),
                 memory_content_epoch: String::new(),
                 memory_render_epoch: format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+                compartment_render_epoch: format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
                 profile_render_epoch: String::new(),
                 tagger_feature_epoch: String::new(),
             },
@@ -7158,6 +7165,7 @@ mod tests {
         store: &McStore,
         cfg: &str,
         memory_render_epoch: String,
+        compartment_render_epoch: String,
         profile_render_epoch: String,
         tagger_feature_epoch: String,
     ) -> String {
@@ -7168,6 +7176,7 @@ mod tests {
                 upgrade_state: String::new(),
                 memory_content_epoch: String::new(),
                 memory_render_epoch,
+                compartment_render_epoch,
                 profile_render_epoch,
                 tagger_feature_epoch,
             },
@@ -7179,6 +7188,7 @@ mod tests {
             store,
             cfg,
             format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+            format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
             String::new(),
             String::new(),
         )
@@ -7291,6 +7301,10 @@ mod tests {
                     upgrade_state: String::new(),
                     memory_content_epoch: String::new(),
                     memory_render_epoch: format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+                    compartment_render_epoch: format!(
+                        "cre{}",
+                        crate::COMPARTMENT_RENDER_FORMAT_EPOCH
+                    ),
                     profile_render_epoch: String::new(),
                     tagger_feature_epoch: String::new(),
                 },
@@ -7789,6 +7803,7 @@ mod tests {
                 &s,
                 "cfg0",
                 format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+                format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
                 profile_epoch_component.clone(),
                 String::new(),
             );
@@ -7799,6 +7814,7 @@ mod tests {
                 &s,
                 "cfg0",
                 String::new(),
+                format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
                 profile_epoch_component,
                 String::new(),
             );
@@ -7826,6 +7842,76 @@ mod tests {
                 steady.action,
                 "SOFT+",
                 "{} must not loop the memory render fold",
+                profile.wire_id()
+            );
+            assert!(!steady.committed);
+        }
+    }
+
+    #[test]
+    fn compartment_render_epoch_hards_all_profiles_once_then_stabilizes() {
+        assert_eq!(crate::COMPARTMENT_RENDER_FORMAT_EPOCH, 1);
+        for profile in [
+            SerializerProfile::OwnedLlmRunner,
+            SerializerProfile::Pi,
+            SerializerProfile::OpencodeAiSdk,
+            SerializerProfile::ClaudeCodeAnthropic,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let session = format!("cre-session-{}", profile.wire_id());
+            s.replace_compartments(&session, &[comp(1, 1, 1, "m1", "SUMMARY")])
+                .unwrap();
+            let request = profile_req(
+                profile,
+                &session,
+                "cfg0",
+                vec![item("m1", 1, "covered"), item("t2", 2, "tail")],
+            );
+            assert_eq!(run(&s, &request, &spine()).action, "HARD");
+
+            let mut loaded = s.load(&session).unwrap();
+            let profile_epoch = crate::profile_render_epoch(profile);
+            let profile_epoch_component = if profile_epoch == 0 {
+                String::new()
+            } else {
+                format!("mpe{profile_epoch}")
+            };
+            assert!(loaded.meta.last_render_config.contains("cre:4:cre1"));
+            loaded.meta.last_render_config = effective_render_config_with_epochs(
+                &s,
+                "cfg0",
+                format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+                String::new(),
+                profile_epoch_component,
+                String::new(),
+            );
+            loaded
+                .core
+                .frozen_units
+                .iter_mut()
+                .find(|unit| unit.key == "m0")
+                .unwrap()
+                .frozen_payload =
+                "<session-history><compartment title=\"old\" /></session-history>".to_string();
+            s.commit(&session, loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+
+            let transitioned = run(&s, &request, &spine());
+            assert_eq!(
+                transitioned.action,
+                "HARD",
+                "{} must fold the shared compartment render epoch",
+                profile.wire_id()
+            );
+            assert!(m0_bytes(&transitioned).contains("## 1-1 · C1"));
+            assert!(!m0_bytes(&transitioned).contains("<compartment"));
+
+            let steady = run(&s, &request, &spine());
+            assert_eq!(
+                steady.action,
+                "SOFT+",
+                "{} must not loop the compartment render fold",
                 profile.wire_id()
             );
             assert!(!steady.committed);

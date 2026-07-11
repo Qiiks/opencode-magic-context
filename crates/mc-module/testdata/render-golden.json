@@ -363,7 +363,7 @@
           "legacy": 0
         }
       ],
-      "body": "<compartment start=\"1\" end=\"9\" title=\"arc 0\">\nP2 dense 0\n</compartment>\n\n<compartment start=\"11\" end=\"19\" title=\"arc 1\">\nP1 verbose body for compartment number 1 with enough text to be distinct\n</compartment>\n\n<compartment start=\"21\" end=\"29\" title=\"arc 2\">\nP1 verbose body for compartment number 2 with enough text to be distinct\n</compartment>\n\n<compartment start=\"31\" end=\"39\" title=\"arc 3\">\nP2 dense 3\n</compartment>\n\n<compartment start=\"41\" end=\"49\" title=\"arc 4\">\nP1 verbose body for compartment number 4 with enough text to be distinct\n</compartment>\n\n<compartment start=\"51\" end=\"59\" title=\"arc 5\">\nP1 verbose body for compartment number 5 with enough text to be distinct\n</compartment>\n\n<compartment start=\"61\" end=\"69\" title=\"arc 6\">\nP2 dense 6\n</compartment>\n\n<compartment start=\"71\" end=\"79\" title=\"arc 7\">\nP1 verbose body for compartment number 7 with enough text to be distinct\n</compartment>\n\n<compartment start=\"81\" end=\"89\" title=\"arc 8\">\nP1 verbose body for compartment number 8 with enough text to be distinct\n</compartment>\n\n<compartment start=\"91\" end=\"99\" title=\"arc 9\">\nP2 dense 9\n</compartment>\n\n<compartment start=\"101\" end=\"109\" title=\"arc 10\">\nP1 verbose body for compartment number 10 with enough text to be distinct\n</compartment>\n\n<compartment start=\"111\" end=\"119\" title=\"arc 11\">\nP1 verbose body for compartment number 11 with enough text to be distinct\n</compartment>\n\n<compartment start=\"121\" end=\"129\" title=\"arc 12\">\nP2 dense 12\n</compartment>\n\n<compartment start=\"131\" end=\"139\" title=\"arc 13\">\nP1 verbose body for compartment number 13 with enough text to be distinct\n</compartment>\n\n<compartment start=\"141\" end=\"149\" title=\"arc 14\">\nP1 verbose body for compartment number 14 with enough text to be distinct\n</compartment>\n\n<compartment start=\"151\" end=\"159\" title=\"arc 15\">\nP1 verbose body for compartment number 15 with enough text to be distinct\n</compartment>\n\n<compartment start=\"161\" end=\"169\" title=\"arc 16\">\nP1 verbose body for compartment number 16 with enough text to be distinct\n</compartment>\n\n<compartment start=\"171\" end=\"179\" title=\"arc 17\">\nP1 verbose body for compartment number 17 with enough text to be distinct\n</compartment>\n\n<compartment start=\"181\" end=\"189\" title=\"arc 18\">\nP1 verbose body for compartment number 18 with enough text to be distinct\n</compartment>\n\n<compartment start=\"191\" end=\"199\" title=\"arc 19\">\nP1 verbose body for compartment number 19 with enough text to be distinct\n</compartment>\n\n<compartment start=\"201\" end=\"209\" title=\"arc 20\">\nP1 verbose body for compartment number 20 with enough text to be distinct\n</compartment>\n\n<compartment start=\"211\" end=\"219\" title=\"arc 21\">\nP1 verbose body for compartment number 21 with enough text to be distinct\n</compartment>\n\n<compartment start=\"221\" end=\"229\" title=\"arc 22\">\nP1 verbose body for compartment number 22 with enough text to be distinct\n</compartment>\n\n<compartment start=\"231\" end=\"239\" title=\"arc 23\">\nP1 verbose body for compartment number 23 with enough text to be distinct\n</compartment>\n\n<compartment start=\"241\" end=\"249\" title=\"arc 24\">\nP1 verbose body for compartment number 24 with enough text to be distinct\n</compartment>\n\n<compartment start=\"251\" end=\"259\" title=\"arc 25\">\nP1 verbose body for compartment number 25 with enough text to be distinct\n</compartment>\n\n<compartment start=\"261\" end=\"269\" title=\"arc 26\">\nP1 verbose body for compartment number 26 with enough text to be distinct\n</compartment>\n\n<compartment start=\"271\" end=\"279\" title=\"arc 27\">\nP1 verbose body for compartment number 27 with enough text to be distinct\n</compartment>\n\n<compartment start=\"281\" end=\"289\" title=\"arc 28\">\nP1 verbose body for compartment number 28 with enough text to be distinct\n</compartment>\n\n<compartment start=\"291\" end=\"299\" title=\"arc 29\">\nP1 verbose body for compartment number 29 with enough text to be distinct\n</compartment>",
+      "body": "## 1-9 · arc 0\nP2 dense 0\n\n## 11-19 · arc 1\nP1 verbose body for compartment number 1 with enough text to be distinct\n\n## 21-29 · arc 2\nP1 verbose body for compartment number 2 with enough text to be distinct\n\n## 31-39 · arc 3\nP2 dense 3\n\n## 41-49 · arc 4\nP1 verbose body for compartment number 4 with enough text to be distinct\n\n## 51-59 · arc 5\nP1 verbose body for compartment number 5 with enough text to be distinct\n\n## 61-69 · arc 6\nP2 dense 6\n\n## 71-79 · arc 7\nP1 verbose body for compartment number 7 with enough text to be distinct\n\n## 81-89 · arc 8\nP1 verbose body for compartment number 8 with enough text to be distinct\n\n## 91-99 · arc 9\nP2 dense 9\n\n## 101-109 · arc 10\nP1 verbose body for compartment number 10 with enough text to be distinct\n\n## 111-119 · arc 11\nP1 verbose body for compartment number 11 with enough text to be distinct\n\n## 121-129 · arc 12\nP2 dense 12\n\n## 131-139 · arc 13\nP1 verbose body for compartment number 13 with enough text to be distinct\n\n## 141-149 · arc 14\nP1 verbose body for compartment number 14 with enough text to be distinct\n\n## 151-159 · arc 15\nP1 verbose body for compartment number 15 with enough text to be distinct\n\n## 161-169 · arc 16\nP1 verbose body for compartment number 16 with enough text to be distinct\n\n## 171-179 · arc 17\nP1 verbose body for compartment number 17 with enough text to be distinct\n\n## 181-189 · arc 18\nP1 verbose body for compartment number 18 with enough text to be distinct\n\n## 191-199 · arc 19\nP1 verbose body for compartment number 19 with enough text to be distinct\n\n## 201-209 · arc 20\nP1 verbose body for compartment number 20 with enough text to be distinct\n\n## 211-219 · arc 21\nP1 verbose body for compartment number 21 with enough text to be distinct\n\n## 221-229 · arc 22\nP1 verbose body for compartment number 22 with enough text to be distinct\n\n## 231-239 · arc 23\nP1 verbose body for compartment number 23 with enough text to be distinct\n\n## 241-249 · arc 24\nP1 verbose body for compartment number 24 with enough text to be distinct\n\n## 251-259 · arc 25\nP1 verbose body for compartment number 25 with enough text to be distinct\n\n## 261-269 · arc 26\nP1 verbose body for compartment number 26 with enough text to be distinct\n\n## 271-279 · arc 27\nP1 verbose body for compartment number 27 with enough text to be distinct\n\n## 281-289 · arc 28\nP1 verbose body for compartment number 28 with enough text to be distinct\n\n## 291-299 · arc 29\nP1 verbose body for compartment number 29 with enough text to be distinct",
       "budget": 10000000
     },
     {
@@ -381,7 +381,25 @@
           "legacy": 0
         }
       ],
-      "body": "<compartment start=\"1\" end=\"2\" title=\"a&lt;b&gt;&amp;&quot;c&quot;\">\nx &lt; y &amp; z\n</compartment>",
+      "body": "## 1-2 · a<b>&\"c\"\nx &lt; y &amp; z",
+      "budget": 10000000
+    },
+    {
+      "compartments": [
+        {
+          "startMessage": 3,
+          "endMessage": 4,
+          "title": "Heading guard",
+          "content": "",
+          "p1": "first\n## nested\nlast",
+          "p2": "d",
+          "p3": "e",
+          "p4": "f",
+          "importance": 50,
+          "legacy": 0
+        }
+      ],
+      "body": "## 3-4 · Heading guard\nfirst\n ## nested\nlast",
       "budget": 10000000
     },
     {
@@ -401,7 +419,7 @@
           "endDate": "2026-01-03"
         }
       ],
-      "body": "<compartment start=\"1\" end=\"2\" start-date=\"2026-01-02\" end-date=\"2026-01-03\" title=\"Dated\">\ndated body\n</compartment>",
+      "body": "## 1-2 · 2026-01-02→03 · Dated\ndated body",
       "budget": 10000000
     },
     {
@@ -423,7 +441,7 @@
           "importance": 50
         }
       ],
-      "body": "<compartment start=\"1\" end=\"5\" title=\"LegU\">\nU: question\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa…\n</compartment>\n\n<compartment start=\"6\" end=\"9\" title=\"LegNoU\" />",
+      "body": "## 1-5 · LegU\nU: question\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa…\n\n## 6-9 · LegNoU",
       "budget": 10000000
     },
     {
@@ -438,7 +456,7 @@
           "importance": 50
         }
       ],
-      "body": "<compartment start=\"1\" end=\"2\" title=\"Pseudo\">\nflat body here\n</compartment>",
+      "body": "## 1-2 · Pseudo\nflat body here",
       "budget": 10000000
     },
     {
@@ -476,7 +494,7 @@
           "legacy": 0
         }
       ],
-      "body": "<compartment start=\"1\" end=\"9\" title=\"v2a\">\nP1 first\n</compartment>\n\n<compartment start=\"10\" end=\"14\" title=\"leg\">\nU: x\nccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc…\n</compartment>\n\n<compartment start=\"15\" end=\"20\" title=\"v2b\">\nP1 second\n</compartment>",
+      "body": "## 1-9 · v2a\nP1 first\n\n## 10-14 · leg\nU: x\nccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc…\n\n## 15-20 · v2b\nP1 second",
       "budget": 10000000
     }
   ]

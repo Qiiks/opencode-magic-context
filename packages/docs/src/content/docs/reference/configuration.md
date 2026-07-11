@@ -233,7 +233,7 @@ Behavior tuning most installs never need to touch.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `temporal_awareness` | boolean | `true` | Inject wall-clock gap markers (<!-- +Xm -->) between user messages where > 5 min elapsed since the previous message, and add start/end date attributes on compartments. Gives the agent a sense of session pacing and "how long ago" across multi-day sessions. Graduated from experimental.temporal_awareness; default: true (set false to opt out). |
+| `temporal_awareness` | boolean | `true` | Inject wall-clock gap markers (<!-- +Xm -->) between user messages where > 5 min elapsed since the previous message, and add compact date ranges to compartment headings. Gives the agent a sense of session pacing and "how long ago" across multi-day sessions. Graduated from experimental.temporal_awareness; default: true (set false to opt out). |
 | `caveman_text_compression` | object | — | Age-tier caveman compression for long user/assistant text parts. Active for primary sessions when enabled; never for subagents. Oldest 20% of eligible tags (outside protected tail) go to ultra, next 20% to full, next 20% to lite, newest 40% untouched. Graduated from experimental.caveman_text_compression; opt-in, default off (lossy). |
 | `caveman_text_compression.enabled` | boolean | `false` | Apply deterministic caveman-style text compression to old conversation text. Active for primary sessions when enabled; never for subagents. Compresses user/assistant text in oldest-first tiers: ultra (oldest 20%), full, lite, untouched (newest 40%). |
 | `caveman_text_compression.min_chars` | number (100–10000) | `500` | Text parts shorter than this (characters) stay untouched. Min 100, max 10000. Default: 500. |

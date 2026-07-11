@@ -42,16 +42,27 @@ export interface DecayRenderCompartment {
     legacy?: number | null;
 }
 
-function escapeXmlAttr(s: string): string {
-    return s
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-}
-
 function escapeXmlContent(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function formatDateRange(startDate?: string | null, endDate?: string | null): string {
+    if (!startDate || !endDate) return "";
+    if (startDate === endDate) return startDate;
+    if (startDate.slice(0, 7) === endDate.slice(0, 7)) return `${startDate}→${endDate.slice(8)}`;
+    return `${startDate}→${endDate}`;
+}
+
+function compartmentHeading(c: DecayRenderCompartment): string {
+    const dateRange = formatDateRange(c.startDate, c.endDate);
+    const dateSegment = dateRange ? ` · ${dateRange}` : "";
+    return `## ${c.startMessage}-${c.endMessage}${dateSegment} · ${c.title}`;
+}
+
+function guardCompartmentBody(body: string): string {
+    // A rendered body cannot open a new compartment; indent heading-like lines so
+    // the next unindented `## ` line remains an unambiguous compartment boundary.
+    return body.replace(/^## /gm, " ## ");
 }
 
 /**
@@ -61,8 +72,8 @@ function escapeXmlContent(s: string): string {
  * p1=''`). Rows with empty/null `p1` — legacy rows, or the malformed pseudo-v2
  * state left by an interrupted upgrade (`legacy=0` but tiers never populated) —
  * must render via flat `content`, never as an empty tier body. Note a VALID v2
- * row can still have an empty `p4` (a legitimate self-close); that's handled by
- * the tier-body path, not here, because such a row has a non-empty `p1`.
+ * row can still have an empty `p4` (a legitimate title-only heading); that's
+ * handled by the tier-body path, not here, because such a row has a non-empty `p1`.
  */
 function isTieredRow(c: DecayRenderCompartment): boolean {
     return typeof c.p1 === "string" && c.p1.length > 0;
@@ -103,30 +114,23 @@ export function renderCompartmentAtTier(c: DecayRenderCompartment, tier: number)
 }
 
 function renderOneCompartment(c: DecayRenderCompartment, tier: number): string {
-    const dateAttrs =
-        c.startDate && c.endDate
-            ? ` start-date="${escapeXmlAttr(c.startDate)}" end-date="${escapeXmlAttr(c.endDate)}"`
-            : "";
-    const baseAttrs = `start="${c.startMessage}" end="${c.endMessage}"${dateAttrs} title="${escapeXmlAttr(c.title)}"`;
     if (tier >= 5) return ""; // archived
+    const heading = compartmentHeading(c);
 
     // Legacy rows AND malformed pseudo-v2 rows (legacy=0 but no usable p1, e.g.
     // an interrupted upgrade) render via flat `content` — never as an empty
-    // tier. Without this, a `legacy=0, p1=''` row produced an empty self-close
-    // here, silently dropping the compartment body from m[0]/m[1].
+    // title-only heading. Without this, a `legacy=0, p1=''` row silently drops
+    // the compartment body from m[0]/m[1].
     if (c.legacy === 1 || !isTieredRow(c)) {
         const flat = (c.content ?? "").trim();
-        if (tier >= 4 || flat.length === 0) return `<compartment ${baseAttrs} />`;
-        return [
-            `<compartment ${baseAttrs}>`,
-            escapeXmlContent(legacyBodyForTier(flat, tier)),
-            "</compartment>",
-        ].join("\n");
+        if (tier >= 4 || flat.length === 0) return heading;
+        const body = guardCompartmentBody(escapeXmlContent(legacyBodyForTier(flat, tier)));
+        return `${heading}\n${body}`;
     }
 
     const body = tierBody(c, tier);
-    if (body.length === 0) return `<compartment ${baseAttrs} />`;
-    return [`<compartment ${baseAttrs}>`, escapeXmlContent(body), "</compartment>"].join("\n");
+    if (body.length === 0) return heading;
+    return `${heading}\n${guardCompartmentBody(escapeXmlContent(body))}`;
 }
 
 /**

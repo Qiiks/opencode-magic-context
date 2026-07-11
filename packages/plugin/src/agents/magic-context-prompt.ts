@@ -74,7 +74,7 @@ Use \`ctx_reduce\` to mark spent tagged content as discardable and reclaim space
 Do not announce or narrate \`ctx_reduce\` drops — just call the tool silently. Saying "I'll drop these outputs" wastes tokens the user does not care about.
 ${CTX_NOTE_GUIDANCE}
 ${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
-Use \`ctx_expand\` to recover the raw conversation behind a \`<compartment>\` summary in \`<session-history>\` — pass its \`start\`/\`end\` attributes when the summary is not enough (exact wording, values, error text).
+Use \`ctx_expand\` to recover the raw conversation behind a summary under a \`## start-end · date · title\` heading inside \`<session-history>\` — pass the heading's start/end range when the summary is not enough (exact wording, values, error text).
 **Search before asking the user**: If you can't remember or don't know something that might have been discussed before or stored in project memory, use \`ctx_search\` before asking the user. Examples:
 - Can't remember where a related codebase or dependency lives → \`ctx_search(query="opencode source code path")\`
 - Forgot a prior architectural decision or constraint → \`ctx_search(query="why did we choose SQLite over postgres")\`
@@ -96,7 +96,7 @@ Before your turn finishes, consider using \`ctx_reduce\` to drop large tool outp
  *  tokens at the start of their own text. */
 const BASE_INTRO_NO_REDUCE = (memoryEnabled: boolean): string => `${CTX_NOTE_GUIDANCE}
 ${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
-Use \`ctx_expand\` to recover the raw conversation behind a \`<compartment>\` summary in \`<session-history>\` — pass its \`start\`/\`end\` attributes when the summary is not enough (exact wording, values, error text).
+Use \`ctx_expand\` to recover the raw conversation behind a summary under a \`## start-end · date · title\` heading inside \`<session-history>\` — pass the heading's start/end range when the summary is not enough (exact wording, values, error text).
 **Search before asking the user**: If you can't remember or don't know something that might have been discussed before or stored in project memory, use \`ctx_search\` before asking the user. Examples:
 - Can't remember where a related codebase or dependency lives → \`ctx_search(query="opencode source code path")\`
 - Forgot a prior architectural decision or constraint → \`ctx_search(query="why did we choose SQLite over postgres")\`

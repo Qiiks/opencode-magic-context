@@ -14,13 +14,11 @@ const TAG_PREFIX_REGEX = /^(?:§\d+§\s*)+/;
 //   §15298">§ hello...        ← partial, no closing digits
 //   §15298">§ §15298§ hello   ← partial stub followed by a normal tag
 //
-// The root cause is token-level confusion between our `§N§` tag format and
-// the many quoted `"N"` / `"N">` substrings the model sees in rendered
-// `<compartment start="N" end="M" start-date="..." end-date="..." title="...">`
-// lines inside <session-history>. After temporal awareness added `start-date`
-// and `end-date` attributes, quoted-number density near tag references
-// roughly doubled — reports of this pattern are timestamped to immediately
-// after that flag was turned on.
+// The root cause was token-level confusion between our `§N§` tag format and
+// quoted ordinal/date attributes in the former rendered compartment tags.
+// Current <session-history> bytes use `## N-M · date · title` headings, but a
+// cached m0 stays byte-identical until its next natural fold, so this repair
+// must continue accepting malformed prefixes learned from the former format.
 //
 // This regex recognizes the malformed shapes so stripTagPrefix removes them
 // BEFORE the next prependTag runs. Without this, the regex above

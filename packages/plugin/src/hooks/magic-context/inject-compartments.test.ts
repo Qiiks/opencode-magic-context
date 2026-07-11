@@ -607,9 +607,7 @@ describe("m[0]/m[1] materialization", () => {
             temporalAwareness: true,
         });
 
-        expect(rendered.m0Text).toContain(
-            'start="1" end="2" start-date="2026-01-02" end-date="2026-01-03" title="dated compartment"',
-        );
+        expect(rendered.m0Text).toContain("## 1-2 · 2026-01-02→03 · dated compartment");
     });
 
     it("omits compartment date ranges from m[0] when temporal awareness is disabled", () => {
@@ -627,8 +625,8 @@ describe("m[0]/m[1] materialization", () => {
             temporalAwareness: false,
         });
 
-        expect(rendered.m0Text).not.toContain("start-date=");
-        expect(rendered.m0Text).not.toContain("end-date=");
+        expect(rendered.m0Text).toContain("## 1-2 · dated compartment");
+        expect(rendered.m0Text).not.toContain("2026-01-02");
     });
 
     it("replays date-bearing m[0]/m[1] bytes unchanged on consecutive defer passes", () => {
@@ -662,7 +660,9 @@ describe("m[0]/m[1] materialization", () => {
             isCacheBustingPass: false,
         });
 
-        expect(first.m0Bytes?.toString("utf8")).toContain('start-date="2026-01-02"');
+        expect(first.m0Bytes?.toString("utf8")).toContain(
+            "## 1-2 · 2026-01-02→03 · dated compartment",
+        );
         expect(second.m0Bytes).toEqual(first.m0Bytes);
         expect(second.m1Text).toBe(first.m1Text);
         expect(third.m0Bytes).toEqual(second.m0Bytes);
@@ -847,9 +847,7 @@ describe("m[0]/m[1] materialization", () => {
             isCacheBustingPass: true,
         });
         expect(refreshed.m0RematerializedThisPass).toBe(false);
-        expect(refreshed.m1Text).toContain(
-            'start="1" end="1" start-date="2026-01-04" end-date="2026-01-04" title="New"',
-        );
+        expect(refreshed.m1Text).toContain("## 1-1 · 2026-01-04 · New");
     });
 
     it("mustMaterialize does NOT materialize m[0] on a retrospective memory write", () => {

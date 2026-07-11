@@ -5,8 +5,8 @@
  *   1. Prepends <!-- +Xm --> / <!-- +2h 15m --> / <!-- +3d 4h --> HTML comments
  *      to user messages where the gap since the previous message exceeds
  *      TEMPORAL_AWARENESS_THRESHOLD_SECONDS.
- *   2. Adds start="YYYY-MM-DD" end="YYYY-MM-DD" date attributes to <compartment>
- *      elements in the injected <session-history> block.
+ *   2. Adds a compact date range to each `## start-end · date · title` heading
+ *      in the injected <session-history> block.
  *
  * The gap is measured from the previous message's effective end time:
  *   - Assistant (completed): prev.time.completed
@@ -80,7 +80,7 @@ export function effectiveEndMs(time: { created: number; completed?: number }): n
 
 /**
  * Format a Unix ms timestamp as YYYY-MM-DD in the process local timezone.
- * Used for compartment start/end date attributes.
+ * Used for compartment heading date ranges.
  */
 export function formatDate(ms: number): string {
     const d = new Date(ms);

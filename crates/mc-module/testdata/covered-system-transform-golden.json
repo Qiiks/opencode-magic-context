@@ -5,7 +5,7 @@
       {
         "kind": {
           "type": "text",
-          "text": "<covered-system-messages>\n<covered-system-message>identity alpha</covered-system-message>\n<covered-system-message>identity beta</covered-system-message>\n</covered-system-messages>\n\n<session-history>\n<compartment start=\"0\" end=\"3\" title=\"C1\">\nSUMMARY\n</compartment>\n</session-history>"
+          "text": "<covered-system-messages>\n<covered-system-message>identity alpha</covered-system-message>\n<covered-system-message>identity beta</covered-system-message>\n</covered-system-messages>\n\n<session-history>\n## 0-3 · C1\nSUMMARY\n</session-history>"
         }
       }
     ],

@@ -10,8 +10,9 @@ import { estimateTokens } from "./read-session-formatting";
  * diverge on what the categories are or how they're measured.
  *
  * v2 reality this encodes:
- *  - Compartments are DECAY-RENDERED — the real on-wire `<session-history>`
- *    slice is far smaller than Σ(full p1 content), so we measure the ACTUAL
+ *  - Compartments are DECAY-RENDERED under `## start-end · date · title`
+ *    headings — the real on-wire `<session-history>` slice is far smaller than
+ *    Σ(full p1 content), so we measure the ACTUAL
  *    slice of the persisted m[0] snapshot (cached_m0_bytes), not Σp1.
  *  - `<project-docs>` and `<user-profile>` moved into m[0] (out of the system
  *    prompt) — they are their own buckets, not Conversation.
@@ -83,7 +84,7 @@ export function computeM0BlockTokens(
                 .all(sessionId);
             for (const c of compRows) {
                 compartmentTokens += estimateTokens(
-                    `<compartment start="${c.start_message}" end="${c.end_message}" title="${c.title}">\n${c.content}\n</compartment>\n`,
+                    `## ${c.start_message}-${c.end_message} · ${c.title}\n${c.content}\n`,
                 );
             }
         } catch {
