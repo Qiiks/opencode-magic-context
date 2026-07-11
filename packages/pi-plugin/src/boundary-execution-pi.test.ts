@@ -77,15 +77,12 @@ describe("boundary execution Pi integration", () => {
 		const db = createDb();
 		ensureSessionMetaRow(db, "s1");
 		setDeferredExecutePendingIfAbsent(db, "s1", flag());
-		const midTurn = isMidTurnPi(
-			{
-				messages: [
-					{ role: "assistant", stopReason: "toolUse", content: [] },
-					{ role: "user", content: "new turn" },
-				],
-			},
-			"s1",
-		);
+		const assistant = { role: "assistant", stopReason: "toolUse", content: [] };
+		const user = { role: "user", content: "new turn" };
+		const midTurn = isMidTurnPi({ messages: [assistant, user] }, "s1", [
+			{ type: "message", id: "assistant-1", message: assistant },
+			{ type: "message", id: "user-1", message: user },
+		]);
 		const result = applyMidTurnDeferral({
 			base: "execute",
 			bypassReason: "none",

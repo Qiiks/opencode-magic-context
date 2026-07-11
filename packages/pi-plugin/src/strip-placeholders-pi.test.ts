@@ -76,6 +76,37 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 		}
 	});
 
+	it("leaves newly discovered placeholders in place when durable CAS persistence fails", () => {
+		const db = createTestDb();
+		try {
+			const runPass = () => {
+				const placeholder = assistantMessage("[dropped §2§]", 2);
+				const messages = [userMessage("keep", 1), placeholder];
+				const stableIdByRef = new Map<object, string>([
+					[messages[0] as object, "entry-keep"],
+					[placeholder as object, "entry-placeholder"],
+				]);
+				const result = stripPiDroppedPlaceholderMessages({
+					db,
+					sessionId: "ses-cas-failure",
+					messages,
+					isCacheBusting: true,
+					stableIdByRef,
+					applyDelta: () => false,
+				});
+				return { result, wire: JSON.stringify(messages) };
+			};
+
+			const first = runPass();
+			const second = runPass();
+			expect(first.result).toEqual({ removed: 0, discovered: 0 });
+			expect(second.wire).toBe(first.wire);
+			expect(getStrippedPlaceholderIds(db, "ses-cas-failure").size).toBe(0);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("prunes below-boundary ids from the persisted set on cache-busting passes", () => {
 		const db = createTestDb();
 		try {

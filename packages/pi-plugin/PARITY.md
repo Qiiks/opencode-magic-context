@@ -557,16 +557,14 @@ channel) — it reflects `task_schedule_state` read-only.
 
 ---
 
-## 19b. Processed-image stripping is OpenCode-only
+## 19b. Processed-image stripping uses harness-specific image shapes
 
-OpenCode replaces large base64 image payloads in user `file` parts with
-sentinels once the assistant has processed them (`stripProcessedImages`,
-frozen-id replay). Pi's image part shape differs (`kind: "image"` with a URL)
-and large base64 images are rare in Pi sessions — the equivalent strip would
-only fire for the pasted-screenshot case, which Pi does not currently
-optimize. A Pi-specific image-content stripper can be added later if that
-case becomes common. Intentional divergence (see the cleanup-stage notes in
-`context-handler.ts`).
+Both harnesses freeze ids for aged, assistant-processed image messages on
+cache-busting passes and replay the frozen set on every pass. OpenCode replaces
+large base64 data-URL `file` parts; Pi replaces its native `{ type: "image",
+data, mimeType }` user and tool-result parts with the same empty-text sentinel.
+Both persist the frozen id before changing bytes, and clone inheritance copies
+`processed_image_stripped_ids`.
 
 ---
 
@@ -772,12 +770,11 @@ runs, and deferred compaction semantics are shared in intent; only the progress
 surface differs.
 
 The supported and installed Pi floor is `@earendil-works/pi-coding-agent` 0.80.2.
-That version exposes `appendEntry` but not `registerEntryRenderer`; appending alone
-would make statuses invisible. The extension therefore feature-detects renderer
-registration and retains the legacy visible `sendMessage(..., { triggerTurn:
-false })` path on 0.80.2. Once both APIs are present, every user-facing status uses
-`appendEntry`; the intentionally model-visible Channel-2 ceiling nudge remains on
-`sendMessage`.
+That version exposes `appendEntry` but not `registerEntryRenderer`, so status entries
+are persisted and session-logged but invisible in its TUI. Statuses never fall back
+to `sendMessage`, because that would leak progress text into model context. Newer
+runtimes render the same entries through the optional renderer. The intentionally
+model-visible Channel-2 ceiling nudge remains on `sendMessage`.
 
 ---
 

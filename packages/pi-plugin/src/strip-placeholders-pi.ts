@@ -91,54 +91,66 @@ export function stripPiDroppedPlaceholderMessages(args: {
 	 * re-keyed under the new scheme (discovery is otherwise history-refresh-gated).
 	 */
 	forceDiscovery?: boolean;
+	/** Test seam for exhausting the durable CAS write. */
+	applyDelta?: typeof applyStrippedPlaceholderDelta;
 }): StripPiDroppedPlaceholderResult {
 	const { db, sessionId, messages, isCacheBusting, stableIdByRef } = args;
 	const persistedIds = getStrippedPlaceholderIds(db, sessionId);
 	const idsToStrip = new Set(persistedIds);
-	let discovered = 0;
 
-	// Resolve a message's stable id: carried map (object-ref, survives splice)
-	// first; fall back to the index-based id only when the message isn't in the
-	// map (legacy callers that pass no map, or the rare unmapped message).
 	const idOf = (msg: unknown, index: number): string | undefined => {
 		const m = msg && typeof msg === "object" ? (msg as object) : undefined;
 		const carried = m ? stableIdByRef?.get(m) : undefined;
 		if (typeof carried === "string" && carried.length > 0) return carried;
-		// Skip-on-miss when a map was provided: the only unmapped messages
-		// post-injection are synthetic m[0]/m[1] prepends, never placeholders.
 		if (stableIdByRef) return undefined;
-		// No carried map (legacy/test callers): resolve via the unified resolver
-		// (index-only inputs → the pi-msg-* fallback). Production always passes the
-		// map, so this branch is the legacy path only.
 		return resolvePiStableId(msg, index);
 	};
 
-	// Ids of every message present in the CURRENT (trimmed+injected) window,
-	// captured BEFORE the removal splice. Used to prune below-boundary ids from
-	// the persisted set. Captured pre-removal so placeholders stripped THIS pass
-	// stay in the set — Pi rebuilds AgentMessage[] from JSONL every pass, so a
-	// still-in-window placeholder must keep its id to be re-stripped next pass.
-	// Only populated when discovering (cache-busting/cutover) AND a carried map
-	// is present (production path); the index-fallback path can't safely prune.
 	const canPrune =
 		(isCacheBusting || args.forceDiscovery === true) && !!stableIdByRef;
 	const presentIds = canPrune ? new Set<string>() : null;
-
-	// Track the exact ids discovered THIS pass so we can persist an add-delta
-	// (CAS) instead of overwriting the whole set — a sibling process's concurrent
-	// discovery/prune must not be clobbered.
 	const discoveredIds: string[] = [];
 	if (isCacheBusting || args.forceDiscovery) {
 		for (let i = 0; i < messages.length; i++) {
 			const id = idOf(messages[i], i);
 			if (!id) continue;
 			presentIds?.add(id);
-			if (!messageIsPlaceholderOnly(messages[i])) continue;
-			if (!idsToStrip.has(id)) {
-				idsToStrip.add(id);
+			if (messageIsPlaceholderOnly(messages[i]) && !persistedIds.has(id)) {
 				discoveredIds.push(id);
-				discovered++;
 			}
+		}
+	}
+
+	const removedIds: string[] = [];
+	if (presentIds) {
+		for (const id of persistedIds) {
+			if (!presentIds.has(id)) removedIds.push(id);
+		}
+	}
+
+	let discovered = 0;
+	let pruned = 0;
+	if (discoveredIds.length > 0 || removedIds.length > 0) {
+		const persisted = (args.applyDelta ?? applyStrippedPlaceholderDelta)(
+			db,
+			sessionId,
+			{
+				add: discoveredIds,
+				remove: removedIds,
+			},
+		);
+		if (persisted) {
+			// Bytes ship only after their replay state is durable. If the CAS fails,
+			// replay the old frozen set and retry discovery on the next busting pass.
+			for (const id of discoveredIds) idsToStrip.add(id);
+			for (const id of removedIds) idsToStrip.delete(id);
+			discovered = discoveredIds.length;
+			pruned = removedIds.length;
+		} else {
+			sessionLog(
+				sessionId,
+				"placeholder strip: persistence failed; leaving newly discovered messages intact",
+			);
 		}
 	}
 
@@ -148,39 +160,6 @@ export function stripPiDroppedPlaceholderMessages(args: {
 		if (!id || !idsToStrip.has(id)) continue;
 		messages.splice(i, 1);
 		removed++;
-	}
-
-	// Persist on cache-busting/cutover passes. When pruning is possible (carried
-	// map present) also drop below-boundary ids (in the persisted set but no
-	// longer in the window) so the set doesn't grow unbounded over a long session
-	// — Pi's compaction boundary only advances, so an id absent from the current
-	// window is gone for good and safe to drop. Pruning is storage-only and gated
-	// to cache-busting passes (parity with note-nudge/sticky GC): the bytes
-	// already change on these passes, and a defer pass must never mutate persisted
-	// replay state.
-	let pruned = 0;
-	if (presentIds) {
-		// Below-boundary ids: in the persisted set (pre-discovery) but no longer
-		// in the window. Compute against `persistedIds` (the original set), not
-		// the in-memory idsToStrip, so we emit a precise remove-delta.
-		const removedIds: string[] = [];
-		for (const id of persistedIds) {
-			if (!presentIds.has(id)) removedIds.push(id);
-		}
-		pruned = removedIds.length;
-		if (discoveredIds.length > 0 || removedIds.length > 0) {
-			// CAS delta merge (parity with OpenCode): add discovered, remove
-			// below-boundary, applied atomically against a fresh read so a sibling
-			// process's concurrent change is preserved.
-			applyStrippedPlaceholderDelta(db, sessionId, {
-				add: discoveredIds,
-				remove: removedIds,
-			});
-		}
-	} else if (discoveredIds.length > 0) {
-		// No carried map (legacy/test path): can't safely prune, but still persist
-		// newly discovered ids as an add-delta.
-		applyStrippedPlaceholderDelta(db, sessionId, { add: discoveredIds });
 	}
 
 	if (removed > 0 || discovered > 0 || pruned > 0) {

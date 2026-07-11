@@ -144,7 +144,11 @@ export function resolvePiStableId(
 		: `pi-msg-${index}-${role}`;
 }
 
-export function isMidTurnPi(event: unknown, _sessionId: string): boolean {
+export function isMidTurnPi(
+	event: unknown,
+	_sessionId: string,
+	branchEntries?: readonly unknown[] | null,
+): boolean {
 	const messages = (event as { messages?: unknown })?.messages;
 	if (!Array.isArray(messages)) return false;
 
@@ -163,7 +167,8 @@ export function isMidTurnPi(event: unknown, _sessionId: string): boolean {
 	}
 
 	if (latestAssistant === null) return false;
-	if (hasRealUserAfter(messages, latestAssistantIndex)) return false;
+	if (hasRealUserAfter(messages, latestAssistantIndex, branchEntries))
+		return false;
 	if (latestAssistant.stopReason === "toolUse") return true;
 
 	const toolCallIds = getToolCallIds(latestAssistant.content);
@@ -188,14 +193,31 @@ export function isMidTurnPi(event: unknown, _sessionId: string): boolean {
 function hasRealUserAfter(
 	messages: readonly unknown[],
 	latestAssistantIndex: number,
+	branchEntries?: readonly unknown[] | null,
 ): boolean {
-	// If an interrupted assistant tool-use sequence is followed by a real user
-	// message, treat that user message as the turn boundary so the next pass can
-	// finish any work held back during tool-use. Custom-role nudge messages are
-	// not real user turns, so they should not trigger the boundary.
+	if (!branchEntries) return false;
+	const genuineUserMessages = new Set<object>();
+	for (const entry of branchEntries) {
+		if (entry === null || typeof entry !== "object") continue;
+		const record = entry as Record<string, unknown>;
+		if (record.type !== "message") continue;
+		const message = record.message;
+		if (message === null || typeof message !== "object") continue;
+		if ((message as Record<string, unknown>).role === "user") {
+			genuineUserMessages.add(message);
+		}
+	}
+
+	// A wire-shaped user role is not enough: steer/custom entries can be converted
+	// to user messages for the model. Only a genuine branch message ends the lock.
 	for (const msg of messages.slice(latestAssistantIndex + 1)) {
-		if (msg === null || typeof msg !== "object") continue;
-		if ((msg as Record<string, unknown>).role === "user") return true;
+		if (
+			msg !== null &&
+			typeof msg === "object" &&
+			genuineUserMessages.has(msg)
+		) {
+			return true;
+		}
 	}
 	return false;
 }

@@ -20,18 +20,31 @@ describe("isMidTurnPi", () => {
 		).toBe(true);
 	});
 
-	it("is not mid-turn when a newer real user message ends a stale toolUse tail", () => {
+	it("is not mid-turn when a newer branch-backed user message ends a stale toolUse tail", () => {
+		const assistant = { role: "assistant", stopReason: "toolUse", content: [] };
+		const user = { role: "user", content: "new turn" };
 		expect(
-			isMidTurnPi(
-				{
-					messages: [
-						{ role: "assistant", stopReason: "toolUse", content: [] },
-						{ role: "user", content: "new turn" },
-					],
-				},
-				"session-1",
-			),
+			isMidTurnPi({ messages: [assistant, user] }, "session-1", [
+				{ type: "message", id: "assistant-1", message: assistant },
+				{ type: "message", id: "user-1", message: user },
+			]),
 		).toBe(false);
+	});
+
+	it("does not release mid-turn for synthetic user-shaped model messages", () => {
+		const assistant = { role: "assistant", stopReason: "toolUse", content: [] };
+		const syntheticUser = { role: "user", content: "steer content" };
+		expect(
+			isMidTurnPi({ messages: [assistant, syntheticUser] }, "session-1", [
+				{ type: "message", id: "assistant-1", message: assistant },
+				{
+					type: "custom_message",
+					id: "steer-1",
+					customType: "ctx-nudge",
+					message: syntheticUser,
+				},
+			]),
+		).toBe(true);
 	});
 
 	it("does not release mid-turn for custom-role nudges after a stale toolUse tail", () => {
@@ -64,20 +77,17 @@ describe("isMidTurnPi", () => {
 		).toBe(true);
 	});
 
-	it("is not mid-turn when a newer real user message ends an unpaired toolCall tail", () => {
+	it("is not mid-turn when a newer branch-backed user ends an unpaired toolCall tail", () => {
+		const assistant = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-1", name: "bash" }],
+		};
+		const user = { role: "user", content: "new turn" };
 		expect(
-			isMidTurnPi(
-				{
-					messages: [
-						{
-							role: "assistant",
-							content: [{ type: "toolCall", id: "call-1", name: "bash" }],
-						},
-						{ role: "user", content: "new turn" },
-					],
-				},
-				"session-1",
-			),
+			isMidTurnPi({ messages: [assistant, user] }, "session-1", [
+				{ type: "message", id: "assistant-1", message: assistant },
+				{ type: "message", id: "user-1", message: user },
+			]),
 		).toBe(false);
 	});
 

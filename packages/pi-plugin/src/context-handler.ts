@@ -64,6 +64,7 @@ import {
 	getActiveTagsBySession,
 	getActiveTagTokenAggregate,
 	getHistorianFailureState,
+	getMaxDroppedTagNumber,
 	getOldestActiveUnprotectedToolTags,
 	getPendingOps,
 	getPendingPiCompactionMarkerState,
@@ -200,6 +201,7 @@ import {
 	stripInlineThinkingPi,
 } from "./reasoning-replay-pi";
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
+import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import { clearPiSystemPromptSession } from "./system-prompt";
 import { injectPiTemporalMarkers } from "./temporal-awareness-pi";
 /** Force-materialization threshold — mirrors OpenCode's FORCE_MATERIALIZE_PERCENTAGE (85%). */
@@ -257,6 +259,11 @@ function applyForwardPressureFloor(
 }
 
 let injectM0M1PiForRun = injectM0M1Pi;
+let persistReasoningWatermarkForRun = updateSessionMeta;
+let persistStableIdSchemeForRun = updateSessionMeta;
+let afterFallbackAdoptionForTests:
+	| ((stableIdSchemeCutover: boolean) => void)
+	| undefined;
 
 export const __test = {
 	FORWARD_PRESSURE_LIMIT_FACTOR,
@@ -283,6 +290,30 @@ export const __test = {
 		injectM0M1PiForRun = fn;
 		return () => {
 			injectM0M1PiForRun = injectM0M1Pi;
+		};
+	},
+	setReasoningWatermarkPersistenceForTests(
+		fn: typeof updateSessionMeta,
+	): () => void {
+		persistReasoningWatermarkForRun = fn;
+		return () => {
+			persistReasoningWatermarkForRun = updateSessionMeta;
+		};
+	},
+	setStableIdSchemePersistenceForTests(
+		fn: typeof updateSessionMeta,
+	): () => void {
+		persistStableIdSchemeForRun = fn;
+		return () => {
+			persistStableIdSchemeForRun = updateSessionMeta;
+		};
+	},
+	setAfterFallbackAdoptionForTests(
+		fn: ((stableIdSchemeCutover: boolean) => void) | undefined,
+	): () => void {
+		afterFallbackAdoptionForTests = fn;
+		return () => {
+			afterFallbackAdoptionForTests = undefined;
 		};
 	},
 };
@@ -1435,7 +1466,6 @@ function runImmediateTransaction<T>(db: ContextDatabase, fn: () => T): T {
 interface AdoptPiFallbackTagsOptions {
 	messages?: readonly PiAgentMessage[];
 	resolveStableId?: (msg: unknown, index: number) => string | undefined;
-	stampStableIdScheme?: number;
 	hasFallbackMessageTags?: boolean;
 	hasFallbackToolOwnerTags?: boolean;
 }
@@ -1480,9 +1510,8 @@ function adoptPiFallbackTags(
 		options.hasFallbackToolOwnerTags === true ||
 		hasPiFallbackToolOwnerTags(db, sessionId);
 	const shouldRunMessageMigration =
-		options.stampStableIdScheme !== undefined ||
-		(hasFallbackMessageTags &&
-			hasAdoptablePiFallbackMessageTags(db, sessionId, fingerprintById));
+		hasFallbackMessageTags &&
+		hasAdoptablePiFallbackMessageTags(db, sessionId, fingerprintById);
 	const shouldRunToolOwnerMigration = Boolean(
 		options.messages && options.resolveStableId && hasFallbackToolOwnerTags,
 	);
@@ -1588,12 +1617,6 @@ function adoptPiFallbackTags(
 					}
 				}
 			}
-		}
-
-		if (options.stampStableIdScheme !== undefined) {
-			updateSessionMeta(db, sessionId, {
-				piStableIdScheme: options.stampStableIdScheme,
-			});
 		}
 	});
 }
@@ -2049,9 +2072,9 @@ export function registerPiContextHandler(
 			// (rather than an uncontrolled defer-pass bust that could leak
 			// full-size content). Also clear stripped_placeholder_ids so the
 			// forced pass rediscovers placeholders under the new scheme. The new
-			// scheme is stamped atomically with fallback tag adoption immediately
-			// before tagging, so a session can keep resolving any remaining pi-msg-*
-			// tool owners on later post-stamp passes via the cheap stale-owner gate.
+			// scheme stamp is staged until every transform phase succeeds. A failed
+			// cutover therefore retries placeholder discovery and fallback adoption on
+			// the next pass instead of hiding legacy pi-msg-* replay state.
 			const storedStableIdScheme = sessionMeta.piStableIdScheme ?? 0;
 			// Only activate the cutover when REAL SessionEntry ids are available this
 			// pass. The cutover re-keys persisted state from pi-msg-* index ids to
@@ -2093,7 +2116,7 @@ export function registerPiContextHandler(
 
 			const tBoundaryChecks = performance.now();
 			const schedulerDecisionEarly = schedulerDecision;
-			const midTurn = isMidTurnPi(event, sessionId);
+			const midTurn = isMidTurnPi(event, sessionId, branchEntries);
 			const bypassReason = detectMidTurnBypassReason({
 				contextUsage: { percentage: usagePercentage },
 				sessionMeta,
@@ -2393,12 +2416,6 @@ export function registerPiContextHandler(
 				});
 			}
 
-			// Stable-id scheme stamping now happens inside `adoptPiFallbackTags`, in
-			// the same BEGIN IMMEDIATE transaction as fallback tag rekeys/folds. Keep
-			// this post-transform slot free of DB writes so post-stamp passes can still
-			// run the cheap stale-owner gate and late-resolve any surviving pi-msg-* tool
-			// owners on future passes.
-
 			// Step 4b.4: nudge + note-nudge + auto-search hint. All three
 			// run AFTER tagging/drops finish so they see the post-mutation
 			// message shape. Each is independently optional and fail-open —
@@ -2663,6 +2680,23 @@ export function registerPiContextHandler(
 				sessionLog(
 					sessionId,
 					`work-metrics update failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+
+			if (stableIdSchemeCutover) {
+				// Scheme stamps only after the cutover pass completed. If this write
+				// fails, the outer fail-open path ships the original messages and the
+				// next pass repeats forced placeholder discovery.
+				persistStableIdSchemeForRun(options.db, sessionId, {
+					piStableIdScheme: PI_STABLE_ID_SCHEME,
+				});
+				invalidateTrueRawTokenCache({
+					sessionId,
+					reason: "pi.stable-id-scheme.changed",
+				});
+				sessionLog(
+					sessionId,
+					`stable-id scheme cutover complete — stamped scheme=${PI_STABLE_ID_SCHEME}`,
 				);
 			}
 
@@ -3602,6 +3636,51 @@ function pendingPiMarkerCoveredByRenderedBoundary(
 	return boundary.ordinal !== null && pending.ordinal <= boundary.ordinal;
 }
 
+function captureReasoningMutationRollback(
+	messages: readonly unknown[],
+): () => void {
+	const snapshots: Array<{
+		part: Record<string, unknown>;
+		field: "thinking" | "text";
+		value: unknown;
+		hadSignature?: boolean;
+		signature?: unknown;
+	}> = [];
+	for (const raw of messages) {
+		if (!raw || typeof raw !== "object") continue;
+		const message = raw as { role?: unknown; content?: unknown };
+		if (message.role !== "assistant" || !Array.isArray(message.content))
+			continue;
+		for (const rawPart of message.content) {
+			if (!rawPart || typeof rawPart !== "object") continue;
+			const part = rawPart as Record<string, unknown>;
+			if (part.type === "thinking") {
+				snapshots.push({
+					part,
+					field: "thinking",
+					value: part.thinking,
+					hadSignature: Object.hasOwn(part, "thinkingSignature"),
+					signature: part.thinkingSignature,
+				});
+			} else if (part.type === "text") {
+				snapshots.push({ part, field: "text", value: part.text });
+			}
+		}
+	}
+	return () => {
+		for (const snapshot of snapshots) {
+			snapshot.part[snapshot.field] = snapshot.value;
+			if (snapshot.field === "thinking") {
+				if (snapshot.hadSignature) {
+					snapshot.part.thinkingSignature = snapshot.signature;
+				} else {
+					delete snapshot.part.thinkingSignature;
+				}
+			}
+		}
+	};
+}
+
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let executedWorkThisPass = false;
 	let historyWasConsumedThisPass = false;
@@ -3828,9 +3907,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		{
 			messages: args.messages as PiAgentMessage[],
 			resolveStableId: stableIdResolver,
-			stampStableIdScheme: args.stableIdSchemeCutover
-				? PI_STABLE_ID_SCHEME
-				: undefined,
 			hasFallbackMessageTags,
 		},
 	);
@@ -3839,16 +3915,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		"fallbackIdentityAndAdoption",
 		tFallbackIdentity,
 	);
-	if (args.stableIdSchemeCutover === true) {
-		invalidateTrueRawTokenCache({
-			sessionId: args.sessionId,
-			reason: "pi.stable-id-scheme.changed",
-		});
-		sessionLog(
-			args.sessionId,
-			`stable-id scheme cutover complete — stamped scheme=${PI_STABLE_ID_SCHEME}`,
-		);
-	}
+	afterFallbackAdoptionForTests?.(args.stableIdSchemeCutover === true);
 	const tTag = performance.now();
 	const { targets } = tagTranscript(
 		args.sessionId,
@@ -4154,13 +4221,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	//   reasoning parts get merged before send. Pi's send path doesn't
 	//   merge messages this way, so the workaround isn't needed.
 	//
-	// - stripProcessedImages: replaces large base64 image payloads in
-	//   user `file` parts with sentinels after the assistant has
-	//   processed them. Pi's image part shape is different (kind:
-	//   "image" with a URL) and large base64 images are rare in Pi
-	//   sessions — the equivalent path here would only fire for the
-	//   pasted-screenshot case, which we don't currently optimize.
-	//   Can be added later with a Pi-specific image-content stripper.
 
 	// 4. Heuristic cleanup — drops aged tools, dedups, strips system
 	// injections, age-tier caveman compression. Gated on scheduler
@@ -4297,6 +4357,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// wire on a pass that already dropped tools (inconsistent + a missed
 	// same-pass mutation). shouldRunHeuristics is the broader, correct set.
 	if (args.reasoningClearing && shouldRunHeuristics) {
+		const rollbackReasoning = captureReasoningMutationRollback(workingMessages);
 		try {
 			const tClearReasoning = performance.now();
 			const meta = getOrCreateSessionMeta(args.db, args.sessionId);
@@ -4318,7 +4379,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				stripOutcome.newWatermark,
 			);
 			if (combinedWatermark > prevWatermark) {
-				updateSessionMeta(args.db, args.sessionId, {
+				persistReasoningWatermarkForRun(args.db, args.sessionId, {
 					clearedReasoningThroughTag: combinedWatermark,
 				});
 				sessionLog(
@@ -4340,9 +4401,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				executedWorkThisPass = true;
 			}
 		} catch (err) {
+			// Never ship cleared reasoning unless replay state persisted. Restoring the
+			// pre-cleanup parts keeps this pass byte-stable and lets the next execute
+			// pass retry the watermark write.
+			rollbackReasoning();
 			sessionLog(
 				args.sessionId,
-				`reasoning clearing failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
+				`reasoning clearing failed; restored original reasoning: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
 	}
@@ -4420,6 +4485,35 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				droppedCount += syntheticPendingOps.length;
 				autoReclaimDidMutateThisPass = true;
 			}
+		}
+	}
+
+	// 4c. Processed-image replay/detection. Pi carries base64 image data in
+	// user and tool-result parts. Frozen ids replay on every Anthropic pass;
+	// newly aged ids are detected only while this pass is already busting and
+	// are persisted before their bytes are replaced with empty text sentinels.
+	if (args.canUseEmptySentinels) {
+		try {
+			const imageResult = stripPiProcessedImages({
+				db: args.db,
+				sessionId: args.sessionId,
+				messages: workingMessages,
+				detect:
+					args.isCacheBusting || shouldApplyPendingOps || shouldRunHeuristics,
+				watermark: getMaxDroppedTagNumber(args.db, args.sessionId),
+				messageIdToMaxTag,
+				stableId: stableIdResolver,
+			});
+			if (imageResult.newlyStrippedIds.length > 0) {
+				heuristicOrReasoningDidMutate = true;
+				executedWorkThisPass = true;
+				droppedCount += imageResult.stripped;
+			}
+		} catch (err) {
+			sessionLog(
+				args.sessionId,
+				`processed-image strip failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
+			);
 		}
 	}
 

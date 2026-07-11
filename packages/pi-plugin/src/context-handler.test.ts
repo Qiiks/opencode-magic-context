@@ -458,7 +458,7 @@ describe("Pi fallback tag adoption", () => {
 		}
 	});
 
-	it("folds tool-owner collisions into the synthetic survivor with max accounting and alias rebinding", () => {
+	it("folds tool-owner collisions into the real-id survivor with max accounting and alias rebinding", () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-pi-tool-owner-fold-max";
@@ -527,9 +527,9 @@ describe("Pi fallback tag adoption", () => {
 				},
 			);
 
-			expect(readTagRow(db, sessionId, 20)).toBeUndefined();
-			expect(sourceContent(db, sessionId, 20)).toBeUndefined();
-			expect(readTagRow(db, sessionId, 10)).toMatchObject({
+			expect(readTagRow(db, sessionId, 10)).toBeUndefined();
+			expect(sourceContent(db, sessionId, 20)).toBe("duplicate source");
+			expect(readTagRow(db, sessionId, 20)).toMatchObject({
 				status: "dropped",
 				byteSize: 1000,
 				reasoningByteSize: 7,
@@ -540,7 +540,7 @@ describe("Pi fallback tag adoption", () => {
 				toolOwnerMessageId: realOwner,
 			});
 			expect(tagger.getToolTag(sessionId, callId, piOwner)).toBeUndefined();
-			expect(tagger.getToolTag(sessionId, callId, realOwner)).toBe(10);
+			expect(tagger.getToolTag(sessionId, callId, realOwner)).toBe(20);
 			expect(tagger.getToolTagAccounting(sessionId, callId, realOwner)).toEqual(
 				{
 					byteSize: 1000,
@@ -580,12 +580,12 @@ describe("Pi fallback tag adoption", () => {
 				},
 			);
 
-			expect(readTagRow(db, sessionId, 31)).toBeUndefined();
-			expect(readTagRow(db, sessionId, 30)).toMatchObject({
+			expect(readTagRow(db, sessionId, 30)).toBeUndefined();
+			expect(readTagRow(db, sessionId, 31)).toMatchObject({
 				status: "active",
 				toolOwnerMessageId: realOwner,
 			});
-			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([30]);
+			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([31]);
 		} finally {
 			closeQuietly(db);
 		}
@@ -668,17 +668,7 @@ describe("Pi fallback tag adoption", () => {
 			insertTag(db, sessionId, callId, "tool", 10, 60, 0, "Read", 0, piOwner);
 			tagger.bindToolTag(sessionId, callId, piOwner, 60);
 
-			contextHandlerInternals.adoptPiFallbackTags(
-				db,
-				sessionId,
-				tagger,
-				new Map(),
-				{
-					messages: [],
-					resolveStableId: () => undefined,
-					stampStableIdScheme: 1,
-				},
-			);
+			updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
 			expect(getOrCreateSessionMeta(db, sessionId).piStableIdScheme).toBe(1);
 			expect(readTagRow(db, sessionId, 60)?.toolOwnerMessageId).toBe(piOwner);
 
@@ -712,7 +702,7 @@ describe("Pi fallback tag adoption", () => {
 		}
 	});
 
-	it("folds colliding message-tag adoption into the synthetic survivor", () => {
+	it("keeps a racing real-id §N§ stable when later adoption folds the fallback row", () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-pi-message-fold";
@@ -767,19 +757,27 @@ describe("Pi fallback tag adoption", () => {
 				new Map([[realId, fingerprint]]),
 			);
 
-			expect(readTagRow(db, sessionId, 71)).toBeUndefined();
-			expect(sourceContent(db, sessionId, 71)).toBeUndefined();
-			expect(readTagRow(db, sessionId, 70)).toMatchObject({
+			expect(readTagRow(db, sessionId, 70)).toBeUndefined();
+			expect(sourceContent(db, sessionId, 71)).toBe("duplicate message source");
+			expect(readTagRow(db, sessionId, 71)).toMatchObject({
 				messageId: `${realId}:p0`,
 				status: "dropped",
 				byteSize: 100,
 				tokenCount: 9,
 			});
-			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([70]);
+			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([71]);
 			expect(
 				tagger.getTag(sessionId, `${fallbackId}:p0`, "message"),
 			).toBeUndefined();
-			expect(tagger.getTag(sessionId, `${realId}:p0`, "message")).toBe(70);
+			expect(tagger.getTag(sessionId, `${realId}:p0`, "message")).toBe(71);
+
+			const nextPass = [userMessage("hello", 70)];
+			const transcript = createPiTranscript(nextPass, sessionId, [realId]);
+			tagTranscript(sessionId, transcript, tagger, db, {
+				entryFingerprintByMessageId: new Map([[realId, fingerprint]]),
+			});
+			transcript.commit();
+			expect(textOf(nextPass[0])).toBe("§71§ hello");
 		} finally {
 			closeQuietly(db);
 		}
@@ -829,7 +827,7 @@ describe("Pi fallback tag adoption", () => {
 			const callId = "call-pending-only";
 			const piOwner = "pi-msg-0-90-assistant";
 			const realOwner = "entry-tool-pending-only";
-			// Survivor (synthetic) has NO pending op; the duplicate (real re-read) does.
+			// The fallback has no pending op; the real-id row already has one.
 			insertTag(db, sessionId, callId, "tool", 10, 90, 0, "Read", 0, piOwner);
 			insertTag(db, sessionId, callId, "tool", 20, 91, 0, "Read", 0, realOwner);
 			queuePendingOp(db, sessionId, 91, "drop", 110);
@@ -847,11 +845,11 @@ describe("Pi fallback tag adoption", () => {
 				},
 			);
 
-			// The duplicate is gone and its pending op moved onto the survivor (90),
-			// which had none — proving retarget, not silent loss.
-			expect(readTagRow(db, sessionId, 91)).toBeUndefined();
-			expect(readTagRow(db, sessionId, 90)?.status).toBe("active");
-			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([90]);
+			// The real-id survivor and its pending op keep the tag identity already
+			// emitted by the racing pass.
+			expect(readTagRow(db, sessionId, 90)).toBeUndefined();
+			expect(readTagRow(db, sessionId, 91)?.status).toBe("active");
+			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([91]);
 		} finally {
 			closeQuietly(db);
 		}
@@ -2712,6 +2710,129 @@ describe("registerPiContextHandler", () => {
 			expect(getBranchCalls).toBe(1);
 		} finally {
 			clearContextHandlerSession("ses-pi-branch-once");
+			closeQuietly(db);
+		}
+	});
+
+	it("restores reasoning bytes when the durable watermark write fails", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-reasoning-watermark-failure";
+		const restorePersistence =
+			contextHandlerInternals.setReasoningWatermarkPersistenceForTests(() => {
+				throw new Error("faulted reasoning watermark write");
+			});
+		try {
+			updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				heuristics: { clearReasoningAge: 1 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] } | undefined>;
+			const buildPass = () => [
+				userMessage("first", 1),
+				{
+					role: "assistant",
+					timestamp: 2,
+					content: [
+						{
+							type: "thinking",
+							thinking: "durable secret",
+							thinkingSignature: "sig",
+						},
+						{ type: "text", text: "first answer" },
+					],
+				},
+				userMessage("second", 3),
+				assistantMessage("second answer", 4),
+			];
+			const runPass = async () => {
+				const messages = buildPass();
+				const result = await handler({ messages: messages as never[] }, {
+					...fakeContext(
+						sessionId,
+						process.cwd(),
+						["entry-u1", "entry-a1", "entry-u2", "entry-a2"],
+						messages as never,
+					),
+					getContextUsage: () => ({
+						tokens: 70_000,
+						percent: 70,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				if (!result) throw new Error("expected transformed messages");
+				return result.messages;
+			};
+
+			const first = await runPass();
+			const second = await runPass();
+			const firstThinking = (first[1] as { content: Record<string, unknown>[] })
+				.content[0];
+			expect(firstThinking).toMatchObject({
+				thinking: "durable secret",
+				thinkingSignature: "sig",
+			});
+			expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+			expect(
+				getOrCreateSessionMeta(db, sessionId).clearedReasoningThroughTag,
+			).toBe(0);
+		} finally {
+			restorePersistence();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("stamps the stable-id scheme only after a successful cutover pass", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-cutover-staged-stamp";
+		const cutoverAttempts: boolean[] = [];
+		const restoreHook =
+			contextHandlerInternals.setAfterFallbackAdoptionForTests((isCutover) => {
+				cutoverAttempts.push(isCutover);
+				if (cutoverAttempts.length === 1) {
+					throw new Error("fault after fallback adoption");
+				}
+			});
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] } | undefined>;
+			const buildPass = () => [
+				userMessage("hello", 1),
+				assistantMessage("answer", 2),
+			];
+			const runPass = async () => {
+				const messages = buildPass() as never[];
+				return handler(
+					{ messages },
+					fakeContext(
+						sessionId,
+						process.cwd(),
+						["entry-user", "entry-assistant"],
+						messages,
+					) as never,
+				);
+			};
+
+			expect(await runPass()).toBeUndefined();
+			expect(getOrCreateSessionMeta(db, sessionId).piStableIdScheme ?? 0).toBe(
+				0,
+			);
+
+			expect(await runPass()).toBeDefined();
+			expect(cutoverAttempts).toEqual([true, true]);
+			expect(getOrCreateSessionMeta(db, sessionId).piStableIdScheme).toBe(1);
+		} finally {
+			restoreHook();
+			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 		}
 	});

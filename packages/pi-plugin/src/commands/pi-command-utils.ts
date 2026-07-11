@@ -5,6 +5,7 @@ import type {
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, Text } from "@earendil-works/pi-tui";
+import { sessionLog } from "@magic-context/core/shared/logger";
 
 export const CTX_STATUS_CUSTOM_TYPE = "ctx-status";
 
@@ -37,10 +38,7 @@ type PiEntryRendererRegistration = {
 };
 
 export type PiMessageSender = Pick<ExtensionAPI, "appendEntry"> &
-	Partial<Pick<ExtensionAPI, "sendMessage">> &
 	PiEntryRendererRegistration;
-
-const failedRendererRegistrations = new WeakSet<object>();
 
 export function resolveSessionId(
 	ctx: ExtensionCommandContext,
@@ -96,8 +94,8 @@ export const renderCtxStatusEntry: CtxStatusEntryRenderer = (
 
 /**
  * Register the model-invisible status-entry renderer when the Pi runtime supports it.
- * Pi 0.80.2 exposes appendEntry but not registerEntryRenderer, so callers retain the
- * legacy visible-message fallback until both halves of the API are available.
+ * Older Pi versions still persist status entries through appendEntry; they simply do
+ * not render those entries in the TUI.
  */
 export function registerCtxStatusEntryRenderer(pi: PiMessageSender): boolean {
 	if (typeof pi.registerEntryRenderer !== "function") return false;
@@ -106,10 +104,8 @@ export function registerCtxStatusEntryRenderer(pi: PiMessageSender): boolean {
 			CTX_STATUS_CUSTOM_TYPE,
 			renderCtxStatusEntry,
 		);
-		failedRendererRegistrations.delete(pi);
 		return true;
 	} catch {
-		failedRendererRegistrations.add(pi);
 		return false;
 	}
 }
@@ -124,32 +120,12 @@ export function sendCtxStatusMessage(
 		details: details ?? content.details,
 	};
 
-	if (
-		typeof pi.registerEntryRenderer === "function" &&
-		!failedRendererRegistrations.has(pi)
-	) {
-		// Plain custom entries are persisted and rendered without entering Pi's
-		// model context, so they cannot steer an in-flight agent turn.
+	// Custom entries are persisted without entering model context. On older Pi
+	// versions they may be invisible in the TUI, but model safety takes priority.
+	if (typeof pi.appendEntry === "function") {
 		pi.appendEntry<CtxStatusEntryData>(CTX_STATUS_CUSTOM_TYPE, data);
-		return;
 	}
-
-	if (typeof pi.sendMessage === "function") {
-		// Compatibility for Pi versions that cannot render custom entries. This is
-		// model-visible and may steer a stream, but keeps user status output visible.
-		pi.sendMessage(
-			{
-				customType: CTX_STATUS_CUSTOM_TYPE,
-				content: content.text,
-				display: true,
-				details: data,
-			},
-			{ triggerTurn: false },
-		);
-		return;
-	}
-
-	// Append-only test doubles and future non-interactive APIs can still persist the
-	// status safely even when they do not expose renderer registration or sendMessage.
-	pi.appendEntry<CtxStatusEntryData>(CTX_STATUS_CUSTOM_TYPE, data);
+	// Minimal non-interactive API shims may omit appendEntry; logging remains the
+	// safe fallback and status text must never be routed through sendMessage.
+	sessionLog("pi-status", `${content.title}: ${content.text}`);
 }

@@ -1245,21 +1245,15 @@ export function adoptPiFallbackToolOwnerTag(
         return { action: "skipped" };
     }
 
-    foldDuplicateIntoSurvivor(db, sessionId, survivor, existing);
-    const result = db
-        .prepare(
-            `UPDATE tags
-             SET tool_owner_message_id = ?
-             WHERE session_id = ?
-               AND tag_number = ?
-               AND type = 'tool'
-               AND message_id = ?
-               AND tool_owner_message_id = ?`,
-        )
-        .run(newOwnerMessageId, sessionId, tagNumber, callId, oldOwnerMessageId);
-    return (result.changes ?? 0) === 1
-        ? { action: "folded", tagNumber, deletedTagNumbers: [existing.tagNumber] }
-        : { action: "skipped" };
+    // The real-id row may have been allocated by a racing pass after adoption's
+    // probe. Preserve that row's tag number so the §N§ already sent on the wire
+    // remains stable, and fold the stale fallback row into it.
+    foldDuplicateIntoSurvivor(db, sessionId, existing, survivor);
+    return {
+        action: "folded",
+        tagNumber: existing.tagNumber,
+        deletedTagNumbers: [tagNumber],
+    };
 }
 
 export function adoptPiFallbackMessageTag(
@@ -1299,24 +1293,22 @@ export function adoptPiFallbackMessageTag(
             : { action: "skipped" };
     }
 
-    const deletedTagNumbers: number[] = [];
-    for (const duplicate of duplicates) {
-        foldDuplicateIntoSurvivor(db, sessionId, survivor, duplicate);
+    // A real-id row can appear after the adoption probe but before allocation.
+    // Keep its already-visible tag identity and merge every fallback/duplicate
+    // row into it, rather than replacing the §N§ emitted by the racing pass.
+    const realSurvivor = duplicates[0];
+    if (!realSurvivor) return { action: "skipped" };
+    const deletedTagNumbers = [tagNumber];
+    foldDuplicateIntoSurvivor(db, sessionId, realSurvivor, survivor);
+    for (const duplicate of duplicates.slice(1)) {
+        foldDuplicateIntoSurvivor(db, sessionId, realSurvivor, duplicate);
         deletedTagNumbers.push(duplicate.tagNumber);
     }
-    const result = db
-        .prepare(
-            `UPDATE tags
-             SET message_id = ?
-             WHERE session_id = ?
-               AND tag_number = ?
-               AND type = 'message'
-               AND message_id = ?`,
-        )
-        .run(newRealMessageId, sessionId, tagNumber, oldFallbackMessageId);
-    return (result.changes ?? 0) === 1
-        ? { action: "folded", tagNumber, deletedTagNumbers }
-        : { action: "skipped" };
+    return {
+        action: "folded",
+        tagNumber: realSurvivor.tagNumber,
+        deletedTagNumbers,
+    };
 }
 
 /**

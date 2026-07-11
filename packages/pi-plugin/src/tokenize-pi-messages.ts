@@ -213,10 +213,13 @@ function isTokenCacheSafeMessage(value: object): boolean {
 	const prototype = Object.getPrototypeOf(value);
 	if (prototype !== Object.prototype && prototype !== null) return false;
 	if ("toJSON" in value) return false;
-	return (
-		isJsonVisibleDataProperty(value, "role") &&
-		isJsonVisibleDataProperty(value, "content")
-	);
+	if (
+		!isJsonVisibleDataProperty(value, "role") ||
+		!isJsonVisibleDataProperty(value, "content")
+	) {
+		return false;
+	}
+	return isPlainJsonData((value as { content?: unknown }).content, new Set());
 }
 
 function isJsonVisibleDataProperty(value: object, key: string): boolean {
@@ -227,6 +230,43 @@ function isJsonVisibleDataProperty(value: object, key: string): boolean {
 		descriptor.enumerable === true &&
 		"value" in descriptor
 	);
+}
+
+function isPlainJsonData(value: unknown, seen: Set<object>): boolean {
+	if (
+		value === null ||
+		typeof value === "string" ||
+		typeof value === "number" ||
+		typeof value === "boolean" ||
+		typeof value === "undefined"
+	) {
+		return true;
+	}
+	if (typeof value !== "object" || seen.has(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	if (
+		!Array.isArray(value) &&
+		prototype !== Object.prototype &&
+		prototype !== null
+	) {
+		return false;
+	}
+	if ("toJSON" in value) return false;
+	seen.add(value);
+	try {
+		for (const key of Reflect.ownKeys(value)) {
+			if (Array.isArray(value) && key === "length") continue;
+			if (typeof key !== "string") return false;
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor?.enumerable || !("value" in descriptor)) {
+				return false;
+			}
+			if (!isPlainJsonData(descriptor.value, seen)) return false;
+		}
+		return true;
+	} finally {
+		seen.delete(value);
+	}
 }
 
 function safeJsonStringify(value: unknown): string {

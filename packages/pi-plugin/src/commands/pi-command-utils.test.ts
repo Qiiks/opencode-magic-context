@@ -68,25 +68,27 @@ describe("ctx-status entries", () => {
 		).toBeUndefined();
 	});
 
-	it("keeps statuses visible on the Pi 0.80.2 API without entry renderers", () => {
-		let appended = 0;
-		let sentMessage: { customType?: string; content?: string } | undefined;
+	it("keeps statuses model-invisible on Pi 0.80.2 without entry renderers", () => {
+		const appended: Array<{ customType: string; data: unknown }> = [];
+		let sent = 0;
 		const pi = {
-			appendEntry() {
-				appended += 1;
+			appendEntry(customType: string, data?: unknown) {
+				appended.push({ customType, data });
 			},
-			sendMessage(message: { customType?: string; content?: string }) {
-				sentMessage = message;
+			sendMessage() {
+				sent += 1;
 			},
 		} as unknown as PiMessageSender;
 
 		expect(registerCtxStatusEntryRenderer(pi)).toBe(false);
 		sendCtxStatusMessage(pi, { title: "Magic Status", text: "Ready" });
 
-		expect(appended).toBe(0);
-		expect(sentMessage).toMatchObject({
-			customType: CTX_STATUS_CUSTOM_TYPE,
-			content: "Ready",
-		});
+		expect(appended).toEqual([
+			{
+				customType: CTX_STATUS_CUSTOM_TYPE,
+				data: { title: "Magic Status", text: "Ready" },
+			},
+		]);
+		expect(sent).toBe(0);
 	});
 });

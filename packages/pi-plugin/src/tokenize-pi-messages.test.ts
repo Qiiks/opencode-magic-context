@@ -249,6 +249,30 @@ describe("tokenizePiMessages", () => {
 		expect(cache.has("entry-to-json")).toBe(false);
 	});
 
+	test("nested toJSON-bearing parts bypass stable-id cache equality", () => {
+		const cache = new Map();
+		const stableId = () => "entry-nested-to-json";
+		const shortText = "short cached text";
+		const first = tokenizePiMessages(
+			[{ role: "user", content: [{ type: "text", text: shortText }] }],
+			{ cache, stableId },
+		);
+		const customPart = {
+			type: "text",
+			text: "a much larger actual token payload ".repeat(80),
+			toJSON() {
+				return { type: "text", text: shortText };
+			},
+		};
+
+		const recounted = tokenizePiMessages(
+			[{ role: "user", content: [customPart] }],
+			{ cache, stableId },
+		);
+		expect(recounted.conversation).toBeGreaterThan(first.conversation);
+		expect(cache.has("entry-nested-to-json")).toBe(false);
+	});
+
 	test("non-enumerable tokenizer fields bypass stable-id cache equality", () => {
 		const cache = new Map();
 		const stableId = () => "entry-hidden-fields";
