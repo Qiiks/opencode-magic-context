@@ -50,6 +50,7 @@ import {
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
+    stripReasoningFromMergedAssistants,
     stripSystemInjectedMessages,
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
@@ -225,6 +226,17 @@ export interface PostTransformPhaseResult {
     droppedCount: number;
     emergency: boolean;
     bustedThisPass: boolean;
+}
+
+export function finalizeMessageRepresentation(
+    messages: MessageLike[],
+    resolvedProviderID?: string,
+): { clearedParts: number; mergedReasoningParts: number } {
+    const clearedParts = modelAcceptsEmptyContent(resolvedProviderID)
+        ? stripClearedReasoning(messages)
+        : 0;
+    const mergedReasoningParts = stripReasoningFromMergedAssistants(messages, resolvedProviderID);
+    return { clearedParts, mergedReasoningParts };
 }
 
 export async function runPostTransformPhase(
@@ -1360,6 +1372,25 @@ export async function runPostTransformPhase(
         m0RematerializedThisPass ||
         (m0M1InjectedThisPass && historyWasConsumedThisPass) ||
         historyWasConsumedThisPass;
+
+    // Final representation strips run once, after all topology mutations; execute
+    // and defer must serialize identical prefixes. Do not add message, tool-target,
+    // or role-topology mutations below this phase.
+    const tFinalRepresentation = performance.now();
+    const finalRepresentation = finalizeMessageRepresentation(
+        args.messages,
+        args.resolvedProviderID,
+    );
+    sessionLog(
+        args.sessionId,
+        `final representation: clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts}`,
+    );
+    logTransformTiming(
+        args.sessionId,
+        "finalizeMessageRepresentation",
+        tFinalRepresentation,
+        `clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts}`,
+    );
 
     return {
         explicitMaterializedSuccessfully,

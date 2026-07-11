@@ -22,10 +22,18 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { registerActiveCompartmentRun } from "./compartment-runner";
 import { injectM0M1, type M0HardSignals } from "./inject-compartments";
-import type { MessageLike, TagTarget } from "./tag-messages";
+import type { MessageLike, TagTarget, ThinkingLikePart } from "./tag-messages";
+import {
+    createToolDropTarget,
+    extractToolCallObservation,
+    type ToolCallIndex,
+    ToolMutationBatch,
+} from "./tool-drop-target";
+import { applyFlushedStatuses } from "./transform-operations";
 import {
     checkM0MutationDriftAndSignal,
     clearPendingCompactionMarkerAfterSuccessfulDrain,
+    finalizeMessageRepresentation,
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
 
@@ -187,6 +195,100 @@ function basePostTransformArgs(
         hasRecentReduceCall: false,
         ...overrides,
     };
+}
+
+function cloneMessages(messages: MessageLike[]): MessageLike[] {
+    return structuredClone(messages);
+}
+
+function buildToolCallIndex(messages: MessageLike[]): ToolCallIndex {
+    const index: ToolCallIndex = new Map();
+    for (const message of messages) {
+        for (const part of message.parts) {
+            const observation = extractToolCallObservation(part);
+            if (!observation) continue;
+            const entry = index.get(observation.callId) ?? {
+                occurrences: [],
+                hasResult: false,
+            };
+            entry.occurrences.push({ message, part, kind: observation.kind });
+            if (observation.kind === "result") entry.hasResult = true;
+            index.set(observation.callId, entry);
+        }
+    }
+    return index;
+}
+
+function findMessage(messages: MessageLike[], id: string): MessageLike {
+    const message = messages.find((candidate) => candidate.info.id === id);
+    if (!message) throw new Error(`missing fixture message ${id}`);
+    return message;
+}
+
+function thinkingParts(message: MessageLike): ThinkingLikePart[] {
+    return message.parts.filter((part): part is ThinkingLikePart => {
+        if (part === null || typeof part !== "object") return false;
+        const type = (part as { type?: unknown }).type;
+        return type === "thinking" || type === "reasoning";
+    });
+}
+
+function makeMessageTarget(message: MessageLike): TagTarget {
+    return {
+        message,
+        setContent: (content: string) => {
+            const part = message.parts[0] as { text?: string } | undefined;
+            if (part?.text === content) return false;
+            message.parts[0] = { type: "text", text: content } as MessageLike["parts"][number];
+            return true;
+        },
+    };
+}
+
+function addToolTarget(args: {
+    targets: Map<number, TagTarget>;
+    index: ToolCallIndex;
+    batch: ToolMutationBatch;
+    callId: string;
+    tagNumber: number;
+    thinking?: ThinkingLikePart[];
+}): void {
+    args.targets.set(
+        args.tagNumber,
+        createToolDropTarget(
+            args.callId,
+            args.thinking ?? [],
+            args.index,
+            args.batch,
+            args.tagNumber,
+        ),
+    );
+}
+
+function padRecentToolSkeletonWindow(sessionId: string, afterTagNumber: number): void {
+    for (let offset = 1; offset <= 20; offset += 1) {
+        insertTag(
+            db,
+            sessionId,
+            `pad-call-${afterTagNumber + offset}`,
+            "tool",
+            10,
+            afterTagNumber + offset,
+        );
+    }
+}
+
+function serializeAnthropicWirePrefix(messages: MessageLike[]): string {
+    return JSON.stringify(
+        messages.map((message) => ({
+            role: message.info.role,
+            content: message.parts.filter((part) => {
+                if (part === null || typeof part !== "object") return true;
+                const candidate = part as { type?: unknown; text?: unknown };
+                return candidate.type !== "text" || candidate.text !== "";
+            }),
+        })),
+    );
 }
 
 describe("deferred compaction marker CAS drain", () => {
@@ -1090,5 +1192,387 @@ describe("postprocess empty-sentinel provider gate", () => {
         );
 
         expect(messages[0].parts[0]).toMatchObject({ type: "tool", tool: "ctx_reduce" });
+    });
+});
+
+describe("final message representation", () => {
+    it("serializes a late auto-reclaim clear identically on execute and defer", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-final-representation-late-clear";
+        const template = [
+            {
+                info: { id: "trigger", role: "user" },
+                parts: [{ type: "text", text: "drop trigger" }],
+            },
+            {
+                info: { id: "target", role: "assistant" },
+                parts: [
+                    { type: "text", text: "" },
+                    {
+                        type: "reasoning",
+                        text: "reasoning cleared with the old tool",
+                        metadata: { anthropic: { signature: "signature-cleared-with-old-tool" } },
+                    },
+                    {
+                        type: "tool",
+                        callID: "call-old",
+                        tool: "read",
+                        state: { output: "old output", status: "completed" },
+                    },
+                    {
+                        type: "tool",
+                        callID: "call-survivor",
+                        tool: "read",
+                        state: { output: "surviving output", status: "completed" },
+                    },
+                    { type: "text", text: "" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+
+        insertTag(db, sessionId, "trigger", "message", 100, 1);
+        insertTag(db, sessionId, "call-old", "tool", 100, 2, 0, "read");
+        insertTag(db, sessionId, "call-survivor", "tool", 100, 3, 0, "read");
+        padRecentToolSkeletonWindow(sessionId, 3);
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        advanceToolReclaimWatermark(db, sessionId, 2);
+
+        const foldMessages = cloneMessages(template);
+        const foldBatch = new ToolMutationBatch(foldMessages);
+        const foldTargets = new Map<number, TagTarget>([
+            [1, makeMessageTarget(findMessage(foldMessages, "trigger"))],
+        ]);
+        const foldIndex = buildToolCallIndex(foldMessages);
+        addToolTarget({
+            targets: foldTargets,
+            index: foldIndex,
+            batch: foldBatch,
+            callId: "call-old",
+            tagNumber: 2,
+            thinking: thinkingParts(findMessage(foldMessages, "target")),
+        });
+        addToolTarget({
+            targets: foldTargets,
+            index: foldIndex,
+            batch: foldBatch,
+            callId: "call-survivor",
+            tagNumber: 3,
+        });
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, foldMessages, {
+                schedulerDecision: "execute",
+                contextUsage: { percentage: 60, inputTokens: 6000 },
+                currentTurnId: "turn-late-clear",
+                resolvedProviderID: "anthropic",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: foldTargets,
+                batch: foldBatch,
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        const statuses = new Map(
+            getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]),
+        );
+        expect(statuses.get(1)).toBe("dropped");
+        expect(statuses.get(2)).toBe("dropped");
+        expect(statuses.get(3)).toBe("active");
+        const foldTarget = findMessage(foldMessages, "target");
+        expect(
+            foldTarget.parts.some(
+                (part) =>
+                    typeof part === "object" &&
+                    part !== null &&
+                    (part as { callID?: unknown }).callID === "call-old",
+            ),
+        ).toBe(false);
+        expect(foldTarget.parts).toContainEqual({
+            type: "tool",
+            callID: "call-survivor",
+            tool: "read",
+            state: { output: "surviving output", status: "completed" },
+        });
+
+        const deferMessages = cloneMessages(template);
+        const deferBatch = new ToolMutationBatch(deferMessages);
+        const deferTargets = new Map<number, TagTarget>([
+            [1, makeMessageTarget(findMessage(deferMessages, "trigger"))],
+        ]);
+        const deferIndex = buildToolCallIndex(deferMessages);
+        addToolTarget({
+            targets: deferTargets,
+            index: deferIndex,
+            batch: deferBatch,
+            callId: "call-old",
+            tagNumber: 2,
+            thinking: thinkingParts(findMessage(deferMessages, "target")),
+        });
+        addToolTarget({
+            targets: deferTargets,
+            index: deferIndex,
+            batch: deferBatch,
+            callId: "call-survivor",
+            tagNumber: 3,
+        });
+        expect(
+            applyFlushedStatuses(sessionId, db, deferTargets, getTagsBySession(db, sessionId)),
+        ).toBe(true);
+        deferBatch.finalize();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: deferTargets,
+                batch: deferBatch,
+                didMutateFromFlushedStatuses: true,
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        const foldWire = serializeAnthropicWirePrefix(foldMessages);
+        const deferWire = serializeAnthropicWirePrefix(deferMessages);
+        expect(deferWire).toBe(foldWire);
+        expect(foldWire).not.toContain("[cleared]");
+        expect(foldWire).not.toContain("reasoning cleared with the old tool");
+        expect(foldWire).not.toContain("signature-cleared-with-old-tool");
+    });
+
+    it("preserves leading signed reasoning after a predecessor is reclaimed and pruned", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-final-representation-preserve-reasoning";
+        const preservedReasoning = {
+            type: "reasoning",
+            text: "real reasoning that must survive",
+            metadata: { anthropic: { signature: "signature-that-must-survive" } },
+        };
+        const template = [
+            {
+                info: { id: "user", role: "user" },
+                parts: [{ type: "text", text: "drop trigger" }],
+            },
+            {
+                info: { id: "drop-only", role: "assistant" },
+                parts: [
+                    {
+                        type: "tool",
+                        callID: "call-predecessor",
+                        tool: "read",
+                        state: { output: "spent output", status: "completed" },
+                    },
+                ],
+            },
+            {
+                info: { id: "target", role: "assistant" },
+                parts: [
+                    { type: "text", text: "" },
+                    preservedReasoning,
+                    { type: "tool_use", id: "call-live", name: "read", input: { path: "x" } },
+                    { type: "text", text: "" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+
+        insertTag(db, sessionId, "user", "message", 100, 1);
+        insertTag(db, sessionId, "call-predecessor", "tool", 100, 2, 0, "read");
+        padRecentToolSkeletonWindow(sessionId, 2);
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        advanceToolReclaimWatermark(db, sessionId, 2);
+
+        const foldMessages = cloneMessages(template);
+        const foldBatch = new ToolMutationBatch(foldMessages);
+        const foldTargets = new Map<number, TagTarget>([
+            [1, makeMessageTarget(findMessage(foldMessages, "user"))],
+        ]);
+        addToolTarget({
+            targets: foldTargets,
+            index: buildToolCallIndex(foldMessages),
+            batch: foldBatch,
+            callId: "call-predecessor",
+            tagNumber: 2,
+        });
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, foldMessages, {
+                schedulerDecision: "execute",
+                contextUsage: { percentage: 60, inputTokens: 6000 },
+                currentTurnId: "turn-preserve-reasoning",
+                resolvedProviderID: "anthropic",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: foldTargets,
+                batch: foldBatch,
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        expect(foldMessages.some((message) => message.info.id === "drop-only")).toBe(false);
+        expect(getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 2)?.status).toBe(
+            "dropped",
+        );
+        expect(findMessage(foldMessages, "target").parts).toContainEqual(preservedReasoning);
+
+        const deferMessages = cloneMessages(template);
+        const deferBatch = new ToolMutationBatch(deferMessages);
+        const deferTargets = new Map<number, TagTarget>([
+            [1, makeMessageTarget(findMessage(deferMessages, "user"))],
+        ]);
+        addToolTarget({
+            targets: deferTargets,
+            index: buildToolCallIndex(deferMessages),
+            batch: deferBatch,
+            callId: "call-predecessor",
+            tagNumber: 2,
+        });
+        expect(
+            applyFlushedStatuses(sessionId, db, deferTargets, getTagsBySession(db, sessionId)),
+        ).toBe(true);
+        deferBatch.finalize();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: deferTargets,
+                batch: deferBatch,
+                didMutateFromFlushedStatuses: true,
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        const foldWire = serializeAnthropicWirePrefix(foldMessages);
+        const deferWire = serializeAnthropicWirePrefix(deferMessages);
+        expect(deferWire).toBe(foldWire);
+        expect(foldWire).toContain("real reasoning that must survive");
+        expect(foldWire).toContain("signature-that-must-survive");
+        expect(findMessage(deferMessages, "target").parts).toContainEqual(preservedReasoning);
+    });
+
+    it("strips reasoning created by final adjacency, stays idempotent, and gates non-Anthropic providers", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-final-representation-adjacency";
+        const template = [
+            {
+                info: { id: "assistant-first", role: "assistant" },
+                parts: [{ type: "text", text: "first assistant content" }],
+            },
+            {
+                info: { id: "drop-only", role: "tool" },
+                parts: [
+                    {
+                        type: "tool",
+                        callID: "call-between",
+                        tool: "read",
+                        state: { output: "spent output", status: "completed" },
+                    },
+                ],
+            },
+            {
+                info: { id: "assistant-second", role: "assistant" },
+                parts: [
+                    {
+                        type: "reasoning",
+                        text: "reasoning invalid after merge",
+                        metadata: { anthropic: { signature: "signature-invalid-after-merge" } },
+                    },
+                    { type: "tool_use", id: "call-live", name: "read", input: {} },
+                ],
+            },
+        ] as unknown as MessageLike[];
+
+        insertTag(db, sessionId, "call-between", "tool", 100, 1, 0, "read");
+        padRecentToolSkeletonWindow(sessionId, 1);
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+
+        const foldMessages = cloneMessages(template);
+        const foldBatch = new ToolMutationBatch(foldMessages);
+        const foldTargets = new Map<number, TagTarget>();
+        addToolTarget({
+            targets: foldTargets,
+            index: buildToolCallIndex(foldMessages),
+            batch: foldBatch,
+            callId: "call-between",
+            tagNumber: 1,
+        });
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, foldMessages, {
+                schedulerDecision: "execute",
+                contextUsage: { percentage: 60, inputTokens: 6000 },
+                currentTurnId: "turn-final-adjacency",
+                resolvedProviderID: "anthropic",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: foldTargets,
+                batch: foldBatch,
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+        expect(foldMessages.some((message) => message.info.id === "drop-only")).toBe(false);
+        expect(getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 1)?.status).toBe(
+            "dropped",
+        );
+
+        const deferMessages = cloneMessages(template);
+        const deferBatch = new ToolMutationBatch(deferMessages);
+        const deferTargets = new Map<number, TagTarget>();
+        addToolTarget({
+            targets: deferTargets,
+            index: buildToolCallIndex(deferMessages),
+            batch: deferBatch,
+            callId: "call-between",
+            tagNumber: 1,
+        });
+        expect(
+            applyFlushedStatuses(sessionId, db, deferTargets, getTagsBySession(db, sessionId)),
+        ).toBe(true);
+        deferBatch.finalize();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: deferTargets,
+                batch: deferBatch,
+                didMutateFromFlushedStatuses: true,
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        const foldWire = serializeAnthropicWirePrefix(foldMessages);
+        expect(serializeAnthropicWirePrefix(deferMessages)).toBe(foldWire);
+        expect(foldWire).not.toContain("reasoning invalid after merge");
+        expect(foldWire).not.toContain("signature-invalid-after-merge");
+
+        const beforeSecondFinalization = JSON.stringify(foldMessages);
+        expect(finalizeMessageRepresentation(foldMessages, "anthropic")).toEqual({
+            clearedParts: 0,
+            mergedReasoningParts: 0,
+        });
+        expect(JSON.stringify(foldMessages)).toBe(beforeSecondFinalization);
+
+        const nonAnthropicMessages = cloneMessages([
+            {
+                info: { id: "first", role: "assistant" },
+                parts: [{ type: "text", text: "first" }],
+            },
+            {
+                info: { id: "second", role: "assistant" },
+                parts: [
+                    { type: "thinking", thinking: "[cleared]", signature: "keep-cleared-shell" },
+                    {
+                        type: "reasoning",
+                        text: "provider-specific reasoning",
+                        metadata: { anthropic: { signature: "keep-provider-signature" } },
+                    },
+                ],
+            },
+        ] as unknown as MessageLike[]);
+        const nonAnthropicBefore = JSON.stringify(nonAnthropicMessages);
+        expect(finalizeMessageRepresentation(nonAnthropicMessages, "github-copilot")).toEqual({
+            clearedParts: 0,
+            mergedReasoningParts: 0,
+        });
+        expect(JSON.stringify(nonAnthropicMessages)).toBe(nonAnthropicBefore);
     });
 });

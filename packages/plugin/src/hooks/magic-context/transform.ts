@@ -96,7 +96,6 @@ import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
     stripClearedReasoning,
-    stripReasoningFromMergedAssistants,
 } from "./strip-content";
 import { injectTemporalMarkers } from "./temporal-awareness";
 import { runCompartmentPhase } from "./transform-compartment-phase";
@@ -1594,40 +1593,6 @@ export function createTransform(deps: TransformDeps) {
             "stripClearedReasoning",
             t4,
             `strippedParts=${strippedClearedReasoning}`,
-        );
-
-        // Anthropic groupIntoBlocks workaround. @ai-sdk/anthropic requires
-        // thinking blocks at index 0 of an assistant message; when Magic
-        // Context drops a tool call and `pruneEmptyMessages` removes the
-        // now-empty message, two assistant messages can become adjacent and
-        // the second one's `thinking` part triggers an index-0 rejection.
-        //
-        // Gated to canonical Anthropic only. openai-compatible providers
-        // like Kimi/Moonshot enforce the OPPOSITE rule (every assistant
-        // tool-call message must have non-empty `reasoning_content`), so
-        // stripping there triggers "thinking is enabled but reasoning_content
-        // is missing in assistant tool call message". Bedrock-Claude and
-        // Google-Vertex-Anthropic may need the workaround if they hit
-        // merged-assistant scenarios; broaden the gate then.
-        const tMergeStrip = performance.now();
-        // Uses the same resolved provider as the empty-sentinel gates above so a
-        // cold DB-recovered pass and a hot map pass make the same Anthropic-only
-        // merged-reasoning decision.
-        const strippedMergedReasoning = stripReasoningFromMergedAssistants(
-            messages,
-            resolvedProviderID,
-        );
-        if (strippedMergedReasoning > 0) {
-            sessionLog(
-                sessionId,
-                `stripped ${strippedMergedReasoning} reasoning parts from merged assistants (anthropic groupIntoBlocks workaround)`,
-            );
-        }
-        logTransformTiming(
-            sessionId,
-            "stripReasoningFromMergedAssistants",
-            tMergeStrip,
-            `strippedParts=${strippedMergedReasoning}`,
         );
 
         // Watermark = highest dropped tag_number for this session. Backed by
