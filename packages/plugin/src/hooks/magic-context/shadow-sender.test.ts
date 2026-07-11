@@ -155,6 +155,7 @@ class FakeTransport implements ShadowTransport {
     calls: Array<{ method: string; body: unknown }> = [];
     syncFailuresRemaining = 0;
     rejectNextTransform = false;
+    quarantinedResponsesRemaining = 0;
     resetFailuresRemaining = 0;
     seq = 0;
     releaseReset: (() => void) | null = null;
@@ -198,7 +199,11 @@ class FakeTransport implements ShadowTransport {
         }
         if (req.method === "shadow_transform") {
             this.seq += 1;
-            return { result: { shadow_seq: this.seq } };
+            if (this.quarantinedResponsesRemaining > 0) {
+                this.quarantinedResponsesRemaining -= 1;
+                return { result: { shadow_seq: this.seq, quarantined: true } };
+            }
+            return { result: { shadow_seq: this.seq, quarantined: false } };
         }
         return { result: {} };
     }
@@ -457,6 +462,51 @@ describe("shadow sender", () => {
             .filter((call) => call.method === "shadow_transform")
             .map((call) => (call.body as { pass_inputs: { now_ms: number } }).pass_inputs.now_ms);
         expect(sentNowMs).toEqual([1, 3, 4, 5, 6]);
+        const firstTransformIndex = transport.calls.findIndex(
+            (call) => call.method === "shadow_transform",
+        );
+        expect(transport.calls.slice(0, firstTransformIndex).map((call) => call.method)).toEqual([
+            "shadow_reset",
+            "state_sync",
+        ]);
+        const transformBodies = transport.calls
+            .filter((call) => call.method === "shadow_transform")
+            .map((call) => call.body as { seed_pass: boolean });
+        expect(transformBodies[0].seed_pass).toBe(true);
+        expect(transformBodies.slice(1).every((body) => body.seed_pass === false)).toBe(true);
+    });
+
+    it("performs at most one reset and reseed retry after quarantine", async () => {
+        useTempDataHome("shadow-quarantine-retry-");
+        const sessionId = "s-quarantine-retry";
+        createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "one" }]);
+        const db = openDatabase();
+        const transport = new FakeTransport();
+        transport.quarantinedResponsesRemaining = 2;
+        const sender = createShadowSender({ transport });
+        const msg = message(sessionId, "m1", "one");
+
+        sender.enqueue(
+            basePass({ db, sessionId, inputMessages: [msg], outputMessages: [msg], nowMs: 1 }),
+        );
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 2,
+        );
+
+        expect(transport.calls.map((call) => call.method)).toEqual([
+            "shadow_reset",
+            "state_sync",
+            "shadow_transform",
+            "shadow_reset",
+            "state_sync",
+            "shadow_transform",
+        ]);
+        expect(
+            transport.calls
+                .filter((call) => call.method === "shadow_transform")
+                .map((call) => (call.body as { seed_pass: boolean }).seed_pass),
+        ).toEqual([true, true]);
+        expect(sender.getStats(sessionId).resets_sent).toBe(2);
     });
 
     it("serializes state_sync and shadow_transform with the shadow wire field inventory", () => {
@@ -486,11 +536,11 @@ describe("shadow sender", () => {
         ]);
         const state = __shadowSenderTest.createSessionQueueState();
         state.lastAckedWatermarks = {
-            compartment_sequence: -1,
-            memory_id: 0,
+            compartment_sequence: 99,
+            memory_id: 99,
             m0_mutation_id: 0,
-            memory_mutation_id: 0,
-            last_todo_state_hash: "",
+            memory_mutation_id: 99,
+            last_todo_state_hash: "already-acked",
         };
         const pass = basePass({ db, sessionId });
 
@@ -526,6 +576,7 @@ describe("shadow sender", () => {
                 method: "shadow_transform",
                 params: expect.objectContaining({
                     shadow_generation: expect.any(Number),
+                    seed_pass: false,
                     input: expect.any(Array),
                     ts_output: expect.any(Array),
                     normalizations: expect.any(Array),
@@ -600,6 +651,7 @@ describe("shadow sender", () => {
         expect(flatTransform.method).toBe("shadow_transform");
         expect(flatTransform.params).toBeUndefined();
         expect(flatTransform.shadow_generation).toEqual(expect.any(Number));
+        expect(flatTransform.seed_pass).toBe(false);
         expect(flatTransform.pass_inputs).toEqual(
             expect.objectContaining({ now_ms: expect.any(Number) }),
         );

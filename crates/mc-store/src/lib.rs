@@ -697,6 +697,14 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE mc_compartments ADD COLUMN end_date TEXT;
     ",
     },
+    Migration {
+        version: 13,
+        // Quarantine is represented by the divergence that caused it plus durable meta.
+        // Older decision-only rows duplicate that terminal finding and carry no replay.
+        statements: "
+        DELETE FROM shadow_divergences WHERE class = 'quarantined';
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1242,11 +1250,13 @@ pub struct ModuleMeta {
     /// missing.
     #[serde(default)]
     pub shadow_seq: u64,
-    /// Set when the shadow session first diverges from the source state. While
-    /// quarantined, the system still records lightweight decisions, but it stops
-    /// byte-for-byte comparison until a reset clears the flag.
+    /// Set when the shadow session first diverges from the source state. Quarantine is
+    /// terminal for that generation: later passes increment the counter without adding
+    /// duplicate divergence rows until a reset clears both fields.
     #[serde(default)]
     pub shadow_quarantined: bool,
+    #[serde(default)]
+    pub shadow_quarantined_pass_count: u64,
     /// Stores the last watermarks acknowledged from the sender, using the same
     /// compare-and-swap update as the mirror rows so restarts and retries see one
     /// consistent state.
@@ -2275,11 +2285,6 @@ impl McStore {
                   )",
                 params![shadow_project_path],
             )?;
-            tx.execute(
-                "DELETE FROM shadow_divergences WHERE session_id = ?1",
-                params![session_id],
-            )?;
-
             let next = current.max(0) as u64 + 1;
             let meta_json = serde_json::to_string(&meta)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -2302,8 +2307,10 @@ impl McStore {
     }
 
     /// Stores one shadow divergence report and optionally marks the session quarantined in
-    /// a single compare-and-swap update. If the generation no longer matches, the write
-    /// fails so an older report cannot quarantine a newer shadow lineage.
+    /// a single compare-and-swap update. Once quarantined, later reports only increment the
+    /// durable pass counter so the first terminal row remains the sole finding. If the
+    /// generation no longer matches, the write fails so an older report cannot affect a
+    /// newer shadow lineage.
     pub fn record_shadow_divergence(
         &self,
         record: ShadowDivergenceRecord<'_>,
@@ -2333,6 +2340,27 @@ impl McStore {
                 return Ok(ShadowDivergenceTxnOutcome::GenerationMismatch {
                     found: meta.shadow_generation,
                 });
+            }
+
+            if meta.shadow_quarantined {
+                meta.shadow_quarantined_pass_count =
+                    meta.shadow_quarantined_pass_count.saturating_add(1);
+                let next = current.max(0) as u64 + 1;
+                let meta_json = match serde_json::to_string(&meta) {
+                    Ok(json) => json,
+                    Err(e) => return Ok(ShadowDivergenceTxnOutcome::Serde(e.to_string())),
+                };
+                tx.execute(
+                    "UPDATE mc_cache_state SET row_version = ?2, core_state = ?3, meta = ?4
+                     WHERE session_id = ?1 AND row_version = ?5",
+                    params![record.session_id, next as i64, core_json, meta_json, current],
+                )?;
+                return Ok(ShadowDivergenceTxnOutcome::Committed(
+                    ShadowDivergenceWriteResult {
+                        quarantined: true,
+                        row_version: next,
+                    },
+                ));
             }
 
             tx.execute(
@@ -5014,6 +5042,15 @@ mod tests {
             )
             .unwrap();
         }
+        conn.execute_batch(
+            "INSERT INTO shadow_divergences
+                 (session_id, pass_seq, class, ts_prefix, rs_prefix, normalizations,
+                  ts_decision, rs_decision, state_hash, created_at)
+             VALUES
+                 ('shadow:test', 1, 'byte-mismatch', 'ts', 'rs', '[]', '{}', '{}', 'a', 1),
+                 ('shadow:test', 1, 'quarantined', '', '', '[]', '{}', '{}', 'b', 2);",
+        )
+        .unwrap();
         drop(conn);
 
         let migrated = McStore::open(&descriptor(migrated_dir.path())).unwrap();
@@ -5041,6 +5078,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_date_columns, 2);
+        let remaining_classes = migrated
+            .inner
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT class FROM shadow_divergences ORDER BY id")?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(remaining_classes, vec!["byte-mismatch"]);
     }
 
     #[test]
@@ -6389,9 +6437,41 @@ mod shadow_tests {
         assert!(store.load(session).unwrap().meta.shadow_quarantined);
         assert_eq!(store.load_shadow_divergences(session).unwrap().len(), 1);
 
+        let repeated = store
+            .record_shadow_divergence(ShadowDivergenceRecord {
+                session_id: session,
+                shadow_generation: reset.shadow_generation,
+                pass_seq: 1,
+                class: "quarantined",
+                first_mid: None,
+                first_block: None,
+                first_field: None,
+                ts_prefix: "",
+                rs_prefix: "",
+                normalizations_json: "[]",
+                ts_decision_json: "{}",
+                rs_decision_json: "{}",
+                state_hash: "hash",
+                created_at_ms: 8,
+                quarantine: false,
+            })
+            .unwrap();
+        assert!(repeated.quarantined);
+        assert_eq!(store.load_shadow_divergences(session).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .load(session)
+                .unwrap()
+                .meta
+                .shadow_quarantined_pass_count,
+            1
+        );
+
         let reset = store.reset_shadow_session(session, project).unwrap();
         assert_eq!(reset.shadow_generation, 2);
-        assert!(!store.load(session).unwrap().meta.shadow_quarantined);
-        assert!(store.load_shadow_divergences(session).unwrap().is_empty());
+        let loaded = store.load(session).unwrap();
+        assert!(!loaded.meta.shadow_quarantined);
+        assert_eq!(loaded.meta.shadow_quarantined_pass_count, 0);
+        assert_eq!(store.load_shadow_divergences(session).unwrap().len(), 1);
     }
 }
