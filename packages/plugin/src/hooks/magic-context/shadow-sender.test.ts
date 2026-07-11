@@ -164,6 +164,7 @@ function summaryMessage(sessionId: string, id: string): MessageLike {
 class FakeTransport implements ShadowTransport {
     calls: Array<{ method: string; body: unknown }> = [];
     syncFailuresRemaining = 0;
+    seedBoundaryFailuresRemaining = 0;
     rejectNextTransform = false;
     quarantinedResponsesRemaining = 0;
     resetFailuresRemaining = 0;
@@ -190,6 +191,12 @@ class FakeTransport implements ShadowTransport {
         if (req.method === "state_sync" && this.syncFailuresRemaining > 0) {
             this.syncFailuresRemaining -= 1;
             throw new Error("dropped sync");
+        }
+        if (req.method === "state_sync" && this.seedBoundaryFailuresRemaining > 0) {
+            this.seedBoundaryFailuresRemaining -= 1;
+            const error = new Error("stale seed boundary") as Error & { code?: string };
+            error.code = "shadow_seed_boundary_mismatch";
+            throw error;
         }
         if (req.method === "shadow_transform" && this.rejectNextTransform) {
             this.rejectNextTransform = false;
@@ -648,6 +655,61 @@ describe("shadow sender", () => {
                 .map((call) => (call.body as { seed_pass: boolean }).seed_pass),
         ).toEqual([true, true]);
         expect(sender.getStats(sessionId).resets_sent).toBe(2);
+    });
+
+    it("resets and reseeds once when the peer rejects a stale seed boundary", async () => {
+        useTempDataHome("shadow-seed-boundary-retry-");
+        const sessionId = "s-seed-boundary-retry";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", text: "covered" },
+            { id: "m2", role: "assistant", text: "boundary" },
+            { id: "m3", role: "user", text: "tail" },
+        ]);
+        const db = openDatabase();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 1,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m1",
+                endMessageId: "m2",
+                title: "Seeded compartment",
+                content: "covered summary",
+            },
+        ]);
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "m2",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction-part",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 2,
+            targetEndMessageId: "m2",
+        });
+        const transport = new FakeTransport();
+        transport.seedBoundaryFailuresRemaining = 1;
+        const sender = createShadowSender({ transport });
+        const tail = message(sessionId, "m3", "tail");
+
+        sender.enqueue(
+            basePass({ db, sessionId, inputMessages: [tail], outputMessages: [tail], nowMs: 3 }),
+        );
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 1,
+        );
+
+        expect(transport.calls.map((call) => call.method)).toEqual([
+            "shadow_reset",
+            "state_sync",
+            "shadow_reset",
+            "state_sync",
+            "shadow_transform",
+        ]);
+        const syncBodies = transport.calls
+            .filter((call) => call.method === "state_sync")
+            .map((call) => call.body as { seed_boundary_id: string | null });
+        expect(syncBodies.map((body) => body.seed_boundary_id)).toEqual(["m2#0", "m2#0"]);
+        expect(sender.getStats(sessionId).resets_sent).toBe(2);
+        expect(sender.getStats(sessionId).transforms_sent).toBe(1);
     });
 
     it("serializes state_sync and shadow_transform with the shadow wire field inventory", () => {

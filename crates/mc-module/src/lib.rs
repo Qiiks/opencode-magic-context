@@ -193,6 +193,8 @@ struct ShadowStateSyncWire {
     shadow_generation: u64,
     expected_shadow_seq: u64,
     #[serde(default)]
+    seed_boundary_id: Option<String>,
+    #[serde(default)]
     compartments: Vec<ShadowCompartmentWire>,
     #[serde(default)]
     memories: Vec<ShadowMemoryWire>,
@@ -2262,6 +2264,7 @@ impl McHandler {
             shadow_project_path: &root_path,
             shadow_generation: parsed.shadow_generation,
             expected_shadow_seq: parsed.expected_shadow_seq,
+            seed_boundary_id: parsed.seed_boundary_id.as_deref(),
             compartments: &compartments,
             memories: &memories,
             memory_mutations: &memory_mutations,
@@ -2289,6 +2292,12 @@ impl McHandler {
                     "expected_shadow_seq {expected} did not match current shadow_seq {found}"
                 ),
             },
+            Err(ShadowStateSyncError::InvalidSeedBoundary { declared, detail }) => {
+                HandlerOutcome::Error {
+                    code: "shadow_seed_boundary_mismatch".to_string(),
+                    message: format!("seed boundary {declared:?} rejected: {detail}"),
+                }
+            }
             Err(e) => HandlerOutcome::Error {
                 code: "shadow_state_sync_failed".to_string(),
                 message: e.to_string(),
@@ -7193,6 +7202,7 @@ mod tests {
         method: String,
         shadow_generation: u64,
         expected_shadow_seq: u64,
+        seed_boundary_id: Option<String>,
         compartments: Vec<StrictShadowCompartment>,
         memories: Vec<StrictShadowMemory>,
         memory_mutations: Vec<StrictShadowMemoryMutation>,
@@ -7422,6 +7432,10 @@ mod tests {
             .expect("shadow_reset fixture must parse through the production wire struct");
 
         assert_eq!(fixture.state_sync.method, "state_sync");
+        assert_eq!(
+            fixture.state_sync.seed_boundary_id.as_deref(),
+            Some("message-2#2")
+        );
         assert_eq!(fixture.shadow_transform.method, "shadow_transform");
         assert_eq!(fixture.shadow_reset.method, "shadow_reset");
         assert_eq!(fixture.state_sync.compartments.len(), 2);
@@ -7543,6 +7557,7 @@ mod tests {
                     "session_id": "shadow:ses",
                     "shadow_generation": 1,
                     "expected_shadow_seq": 0,
+                    "seed_boundary_id": "m0#0",
                     "compartments": [{
                         "sequence": 0,
                         "start_message": 0,
@@ -7573,6 +7588,11 @@ mod tests {
         assert_eq!(synced["shadow_seq"], 1);
         let loaded = store.load("shadow:ses").unwrap();
         assert_eq!(loaded.meta.shadow_seq, 1);
+        assert_eq!(loaded.core.boundary_id, "m0#0");
+        assert_eq!(loaded.meta.coverage_ordinal, Some(0));
+        assert_eq!(loaded.meta.coverage_start_ordinal, Some(0));
+        assert_eq!(loaded.meta.coverage_compartment_seq, Some(0));
+        assert_eq!(loaded.meta.folded_compartment_seq, 0);
         assert_eq!(loaded.meta.last_todo_state.as_deref(), Some("[]"));
         let stored_compartments = store.load_compartments("shadow:ses").unwrap();
         assert_eq!(

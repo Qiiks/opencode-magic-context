@@ -684,9 +684,24 @@ fn text_parts(message: &FlatMessage<'_>) -> Vec<String> {
                 let normalized = normalize_text(&cleaned);
                 (!normalized.is_empty()).then_some(normalized)
             }
+            CkKind::Media(media) => Some(media_placeholder(media)),
             _ => None,
         })
         .collect()
+}
+
+fn media_placeholder(media: &crate::ck_wire::MediaBlock) -> String {
+    let kind = match media.kind {
+        crate::ck_wire::MediaKind::Image => "image",
+        crate::ck_wire::MediaKind::Audio => "audio",
+        crate::ck_wire::MediaKind::Video => "video",
+        crate::ck_wire::MediaKind::File => "file",
+        crate::ck_wire::MediaKind::Document => "document",
+    };
+    match media.filename.as_deref() {
+        Some(filename) => format!("[media:{kind} {} {filename}]", media.media_type),
+        None => format!("[media:{kind} {}]", media.media_type),
+    }
 }
 
 fn has_text_parts(message: &FlatMessage<'_>) -> bool {
@@ -948,7 +963,7 @@ mod tests {
     use crate::ck_wire::{
         project_messages, CkIngressMessage, CkWireBlock, CkWireMessage, HarnessMeta,
     };
-    use mc_store::{CkKind, ProviderExtras, StoredCompartment};
+    use mc_store::{CkKind, MediaBlock, MediaKind, ProviderExtras, StoredCompartment};
     use serde::Deserialize;
     use serde_json::json;
 
@@ -1104,6 +1119,39 @@ mod tests {
         assert!(
             crate::historian_validate::validate_chunk_coverage(&built.chunk).is_none(),
             "a mid-span system message must not open a coverage gap"
+        );
+    }
+
+    #[test]
+    fn media_in_compactable_head_uses_a_deterministic_placeholder() {
+        let media = CkKind::Media(MediaBlock {
+            kind: MediaKind::Image,
+            media_type: "image/png".to_string(),
+            filename: Some("screen.png".to_string()),
+            source: json!({"type": "data_base64", "data": "stable-bytes"}),
+        });
+        let messages = vec![
+            msg("u1", 1, "user", vec![media]),
+            msg(
+                "a2",
+                2,
+                "assistant",
+                vec![text("I inspected the screenshot")],
+            ),
+        ];
+        let first = project_and_build(&messages, 1, 1_000, 3);
+        let second = project_and_build(&messages, 1, 1_000, 3);
+        assert_eq!(first.text, second.text);
+        assert!(first.text.contains("[media:image image/png screen.png]"));
+        assert_eq!(first.chunk.end_index, 2);
+        assert_eq!(
+            first
+                .chunk
+                .lines
+                .iter()
+                .map(|line| line.ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
         );
     }
 

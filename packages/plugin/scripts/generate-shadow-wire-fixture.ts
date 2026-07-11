@@ -163,9 +163,9 @@ export function generateShadowWireFixture(): string {
             {
                 sequence: 1,
                 startMessage: 1,
-                endMessage: 2,
+                endMessage: 1,
                 startMessageId: "message-1",
-                endMessageId: "message-2",
+                endMessageId: "message-1",
                 title: "Fixture compartment",
                 content: "Fixture full compartment content",
                 p1: "Fixture P1",
@@ -287,10 +287,10 @@ export function generateShadowWireFixture(): string {
         const messages = fixtureMessages();
         const inputMessages = structuredClone(messages);
         const declaredTrim = {
-            flat_boundary_id: "message-1#0",
-            boundary_bare_message_id: "message-1",
-            boundary_absolute_ordinal: 1,
-            next_absolute_ordinal: 2,
+            flat_boundary_id: "message-2#2",
+            boundary_bare_message_id: "message-2",
+            boundary_absolute_ordinal: 2,
+            next_absolute_ordinal: 3,
         };
         const pass: ShadowTransformPass = {
             sessionId: SESSION_ID,
@@ -312,7 +312,7 @@ export function generateShadowWireFixture(): string {
             tsDecision: {
                 class: "hard",
                 marker_state: {
-                    marker_message_id: "message-1",
+                    marker_message_id: "message-2",
                     advanced_this_pass: true,
                 },
                 materialize_reason: "fixture",
@@ -333,7 +333,11 @@ export function generateShadowWireFixture(): string {
             annotatedInput: resolved.annotatedInput,
             declaredTrim,
         };
-        const sync = __shadowSenderTest.buildStateSyncPayload({ state, pass, force: true });
+        const sync = __shadowSenderTest.buildStateSyncPayload({
+            state,
+            pass: preparedPass,
+            force: true,
+        });
         if (
             sync === null ||
             sync === "m0_mutation" ||

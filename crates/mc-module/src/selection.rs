@@ -683,7 +683,11 @@ pub fn select_reductions(
         return Vec::new();
     }
 
-    let live_ids: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+    let live_ids: HashSet<String> = items
+        .iter()
+        .filter(|item| !matches!(item.kind, SelKind::Media | SelKind::Opaque))
+        .map(|item| item.id.clone())
+        .collect();
     let arcs = group_arcs(items, frozen_keys);
 
     // The COMPOSED candidate pool: active (non-reduced), client-executed arcs only.
@@ -775,7 +779,8 @@ pub fn select_reductions(
         expand_arc(arc, resolved, frozen_keys, &mut out);
     }
 
-    // ctx_reduce agent drops (block-granular; independent of the arc selectors).
+    // ctx_reduce agent drops stay block-granular, but pass-through carriers are absent
+    // from live_ids so Media and Opaque can never become reduction targets.
     select_agent_drops(&ctx.agent_drop_ids, &live_ids, frozen_keys, &mut out);
 
     // Deterministic merge: exactly one decision per target (drop > edit_marker >
@@ -1438,6 +1443,26 @@ mod tests {
         assert!(out
             .iter()
             .any(|d| d.target_id == result_block_id("c1") && d.kind == "drop"));
+    }
+
+    #[test]
+    fn pass_through_carriers_are_never_reduction_targets() {
+        let items = [SelKind::Media, SelKind::Opaque]
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| SelItem {
+                id: format!("carrier#{index}"),
+                ordinal: 1,
+                kind,
+                provider_executed: false,
+                byte_size: 100,
+                arc_id: None,
+            })
+            .collect::<Vec<_>>();
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.agent_drop_ids = items.iter().map(|item| item.id.clone()).collect();
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(out.is_empty());
     }
 
     #[test]

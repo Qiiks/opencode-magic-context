@@ -3009,7 +3009,7 @@ mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
-    use mc_store::{InsertMemoryInput, ModuleUsage, StoredCompartment};
+    use mc_store::{InsertMemoryInput, ModuleUsage, ShadowStateSyncRequest, StoredCompartment};
 
     #[test]
     fn effective_context_limit_falls_back_below_plausible_floor() {
@@ -3505,11 +3505,9 @@ mod tests {
     }
 
     #[test]
-    fn opaque_projects_verbatim_and_media_fails_loud_at_ingress() {
-        // Opaque is a first-class carrier: it must project (verbatim bytes,
-        // "opaque" kind_tag), never reject — a rejected Opaque would fail every
-        // conversation containing a provider-native block (e.g. Responses
-        // reasoning items) at ingress.
+    fn opaque_and_media_project_verbatim_across_passes() {
+        // Opaque is a first-class carrier: it must project with verbatim bytes and
+        // an "opaque" kind tag rather than rejecting provider-native blocks.
         let opaque = CkIngressMessage {
             mid: "opaque".to_string(),
             ordinal: 1,
@@ -3556,10 +3554,27 @@ mod tests {
                 ck_wire::HarnessMeta::default(),
             ),
         };
-        assert!(matches!(
-            project_messages(&[media]),
-            Err(CkWireError::UnsupportedBlock { .. })
-        ));
+        let media_wire = serde_json::to_value(&media.ck).unwrap();
+        let media_projection = project_messages(std::slice::from_ref(&media)).unwrap();
+        assert_eq!(media_projection.blocks[0].kind_tag, "media");
+        assert!(media_projection.blocks[0].bytes.contains("file://x"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let first = run(
+            &store,
+            &req("media-pass", "cfg", vec![media.clone()]),
+            &spine(),
+        );
+        let second = run(&store, &req("media-pass", "cfg", vec![media]), &spine());
+        for response in [&first, &second] {
+            let replayed = response
+                .messages()
+                .iter()
+                .find(|message| !message.meta.synthetic)
+                .expect("live media message must pass through");
+            assert_eq!(serde_json::to_value(replayed).unwrap(), media_wire);
+        }
     }
 
     #[test]
@@ -7065,6 +7080,62 @@ mod tests {
             request,
             pctx("git:proj", "/nonexistent-docs", 0),
         )
+    }
+
+    #[test]
+    fn seeded_boundary_validates_declared_trim_before_the_first_shadow_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let compartments = vec![StoredCompartment {
+            sequence: 4,
+            start_message: 1,
+            end_message: 2,
+            start_message_id: "a#0".to_string(),
+            end_message_id: "b#0".to_string(),
+            title: "seeded".to_string(),
+            content: "seeded summary".to_string(),
+            p1: Some("seeded summary".to_string()),
+            importance: 50,
+            ..Default::default()
+        }];
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: "seeded-trim",
+                shadow_project_path: "git:proj",
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: Some("b#0"),
+                compartments: &compartments,
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: Value::Null,
+            })
+            .unwrap();
+        let seeded = store.load("seeded-trim").unwrap();
+        assert_eq!(seeded.core.boundary_id, "b#0");
+        assert_eq!(seeded.meta.coverage_ordinal, Some(2));
+        assert_eq!(seeded.meta.coverage_start_ordinal, Some(1));
+        assert_eq!(seeded.meta.coverage_compartment_seq, Some(4));
+        assert_eq!(seeded.meta.folded_compartment_seq, 4);
+
+        let mut request = req("seeded-trim", "cfg", vec![item("c", 3, "live tail")]);
+        request.declared_trim = Some(DeclaredTrim {
+            flat_boundary_id: "b#0".to_string(),
+            boundary_bare_message_id: "b".to_string(),
+            boundary_absolute_ordinal: 2,
+            next_absolute_ordinal: 3,
+        });
+        let ctx = pctx("git:proj", dir.path().to_str().unwrap(), 1);
+        let first = transform_with_projection(&store, &request, &ctx).unwrap();
+        assert_eq!(first.boundary_state, BoundaryState::DeclaredTrimValidated);
+        assert_eq!(first.trim_mismatch, None);
+        assert!(!store.load("seeded-trim").unwrap().meta.shadow_quarantined);
+
+        let second = transform_with_projection(&store, &request, &ctx).unwrap();
+        assert_eq!(second.boundary_state, BoundaryState::DeclaredTrimValidated);
+        assert_eq!(first.response.ck_messages, second.response.ck_messages);
     }
 
     #[test]

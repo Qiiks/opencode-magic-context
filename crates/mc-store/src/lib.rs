@@ -1523,6 +1523,8 @@ pub struct ShadowStateSyncRequest<'a> {
     pub shadow_project_path: &'a str,
     pub shadow_generation: u64,
     pub expected_shadow_seq: u64,
+    /// The producer's current flat compaction boundary. Present only on a full seed.
+    pub seed_boundary_id: Option<&'a str>,
     pub compartments: &'a [StoredCompartment],
     pub memories: &'a [ShadowMemoryRow],
     pub memory_mutations: &'a [ShadowMemoryMutationRow],
@@ -1543,6 +1545,7 @@ pub enum ShadowStateSyncError {
     Store(McStoreError),
     GenerationMismatch { expected: u64, found: u64 },
     SeqMismatch { expected: u64, found: u64 },
+    InvalidSeedBoundary { declared: String, detail: String },
     Serde(String),
 }
 
@@ -1637,6 +1640,9 @@ impl std::fmt::Display for ShadowStateSyncError {
             ShadowStateSyncError::SeqMismatch { expected, found } => {
                 write!(f, "shadow seq mismatch: expected {expected}, found {found}")
             }
+            ShadowStateSyncError::InvalidSeedBoundary { declared, detail } => {
+                write!(f, "invalid seed boundary {declared:?}: {detail}")
+            }
             ShadowStateSyncError::Serde(e) => write!(f, "serde: {e}"),
         }
     }
@@ -1678,10 +1684,83 @@ enum TruncateTxnOutcome {
     Serde(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedSeedBoundary {
+    boundary_id: String,
+    coverage_start_ordinal: u64,
+    coverage_end_ordinal: u64,
+    max_sequence: i64,
+}
+
+fn split_flat_block_id(id: &str) -> Option<(&str, u64)> {
+    let (mid, index) = id.rsplit_once('#')?;
+    if mid.is_empty() || mid.contains('#') {
+        return None;
+    }
+    Some((mid, index.parse().ok()?))
+}
+
+fn validated_seed_boundary(
+    declared: &str,
+    compartments: &[StoredCompartment],
+) -> Result<ValidatedSeedBoundary, String> {
+    let (declared_mid, declared_index) = split_flat_block_id(declared)
+        .ok_or_else(|| "declared identity must be a parseable <mid>#<index> flat id".to_string())?;
+    let mut ordered = compartments.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|compartment| compartment.sequence);
+    let tail = ordered
+        .last()
+        .copied()
+        .ok_or_else(|| "a boundary cannot be adopted without seeded compartments".to_string())?;
+
+    if ordered.iter().any(|compartment| {
+        compartment.start_message < 0 || compartment.end_message < compartment.start_message
+    }) {
+        return Err(
+            "seeded compartment ordinal ranges must be non-negative and ordered".to_string(),
+        );
+    }
+    for pair in ordered.windows(2) {
+        if pair[0].sequence == pair[1].sequence {
+            return Err("seeded compartment sequences must be unique".to_string());
+        }
+        if pair[1].start_message <= pair[0].end_message {
+            return Err(format!(
+                "seeded compartment ranges overlap at ordinals {} and {}",
+                pair[0].end_message, pair[1].start_message
+            ));
+        }
+    }
+
+    let (tail_mid, tail_index) = split_flat_block_id(&tail.end_message_id).ok_or_else(|| {
+        "the highest-sequence compartment must carry a parseable flat end_message_id".to_string()
+    })?;
+    if declared_mid != tail_mid {
+        return Err(format!(
+            "declared message {declared_mid:?} did not match tail compartment message {tail_mid:?}"
+        ));
+    }
+    if declared_index != tail_index {
+        return Err(format!(
+            "declared block index {declared_index} did not match tail compartment end-block index {tail_index}"
+        ));
+    }
+
+    Ok(ValidatedSeedBoundary {
+        // The compartment publisher's end-block form is canonical even if a future
+        // sender derives the same identity through a different marker representation.
+        boundary_id: tail.end_message_id.clone(),
+        coverage_start_ordinal: ordered[0].start_message as u64,
+        coverage_end_ordinal: tail.end_message as u64,
+        max_sequence: tail.sequence,
+    })
+}
+
 enum ShadowSyncTxnOutcome {
     Committed(ShadowStateSyncResult),
     GenerationMismatch { found: u64 },
     SeqMismatch { found: u64 },
+    InvalidSeedBoundary { declared: String, detail: String },
     Serde(String),
 }
 
@@ -2125,7 +2204,7 @@ impl McStore {
         &self,
         request: ShadowStateSyncRequest<'_>,
     ) -> Result<ShadowStateSyncResult, ShadowStateSyncError> {
-        let core_json = serde_json::to_string(&CoreState::default())
+        let default_core_json = serde_json::to_string(&CoreState::default())
             .map_err(|e| ShadowStateSyncError::Serde(e.to_string()))?;
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
@@ -2142,15 +2221,25 @@ impl McStore {
                 )
                 .optional()?;
 
-            let (current, core_state_json, mut meta) = match row {
+            let (current, mut core, mut meta) = match row {
                 Some((row_version, core_state_json, meta_json)) => {
+                    let core = match serde_json::from_str::<CoreState>(&core_state_json) {
+                        Ok(core) => core,
+                        Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+                    };
                     let meta = match serde_json::from_str::<ModuleMeta>(&meta_json) {
                         Ok(meta) => meta,
                         Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
                     };
-                    (row_version, core_state_json, meta)
+                    (row_version, core, meta)
                 }
-                None => (NO_ROW, core_json.clone(), ModuleMeta::default()),
+                None => {
+                    let core = match serde_json::from_str::<CoreState>(&default_core_json) {
+                        Ok(core) => core,
+                        Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+                    };
+                    (NO_ROW, core, ModuleMeta::default())
+                }
             };
 
             if meta.shadow_generation != request.shadow_generation {
@@ -2162,6 +2251,25 @@ impl McStore {
                 return Ok(ShadowSyncTxnOutcome::SeqMismatch {
                     found: meta.shadow_seq,
                 });
+            }
+
+            if let Some(declared) = request.seed_boundary_id {
+                let adoption = match validated_seed_boundary(declared, request.compartments) {
+                    Ok(adoption) => adoption,
+                    Err(detail) => {
+                        return Ok(ShadowSyncTxnOutcome::InvalidSeedBoundary {
+                            declared: declared.to_string(),
+                            detail,
+                        })
+                    }
+                };
+                core.boundary_id = adoption.boundary_id;
+                core.reconcile_pending = false;
+                meta.coverage_ordinal = Some(adoption.coverage_end_ordinal);
+                meta.coverage_start_ordinal = Some(adoption.coverage_start_ordinal);
+                meta.coverage_compartment_seq = Some(adoption.max_sequence);
+                meta.folded_compartment_seq = adoption.max_sequence;
+                meta.pending_rewrite = None;
             }
 
             for compartment in request.compartments {
@@ -2176,6 +2284,10 @@ impl McStore {
             meta.shadow_acked_watermarks = request.acked_watermarks.clone();
 
             let next = current.max(0) as u64 + 1;
+            let core_json = match serde_json::to_string(&core) {
+                Ok(json) => json,
+                Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+            };
             let meta_json = match serde_json::to_string(&meta) {
                 Ok(json) => json,
                 Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
@@ -2187,7 +2299,7 @@ impl McStore {
                      row_version = excluded.row_version,
                      core_state  = excluded.core_state,
                      meta        = excluded.meta",
-                params![request.session_id, next as i64, core_state_json, meta_json],
+                params![request.session_id, next as i64, core_json, meta_json],
             )?;
 
             Ok(ShadowSyncTxnOutcome::Committed(ShadowStateSyncResult {
@@ -2209,6 +2321,9 @@ impl McStore {
                 expected: request.expected_shadow_seq,
                 found,
             }),
+            ShadowSyncTxnOutcome::InvalidSeedBoundary { declared, detail } => {
+                Err(ShadowStateSyncError::InvalidSeedBoundary { declared, detail })
+            }
             ShadowSyncTxnOutcome::Serde(e) => Err(ShadowStateSyncError::Serde(e)),
         }
     }
@@ -6269,6 +6384,7 @@ mod shadow_tests {
                 shadow_project_path: session,
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
+                seed_boundary_id: None,
                 compartments: &[],
                 memories: &[own, shared, private],
                 memory_mutations: &[],
@@ -6333,6 +6449,7 @@ mod shadow_tests {
                 shadow_project_path: project,
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
+                seed_boundary_id: None,
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &mutations,
@@ -6361,6 +6478,7 @@ mod shadow_tests {
                 shadow_project_path: project,
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
+                seed_boundary_id: None,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -6389,6 +6507,7 @@ mod shadow_tests {
                 shadow_project_path: project,
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
+                seed_boundary_id: None,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -6404,6 +6523,38 @@ mod shadow_tests {
                 found: 1
             }
         ));
+    }
+
+    #[test]
+    fn shadow_seed_boundary_mismatch_rejects_without_partial_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "shadow:stale-boundary";
+        let compartments = vec![comp(7, 12, "tail#2")];
+
+        let error = store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: Some("tail#1"),
+                compartments: &compartments,
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ShadowStateSyncError::InvalidSeedBoundary { .. }
+        ));
+        let loaded = store.load(session).unwrap();
+        assert_eq!(loaded.meta.shadow_seq, 0);
+        assert!(loaded.core.boundary_id.is_empty());
+        assert!(store.load_compartments(session).unwrap().is_empty());
     }
 
     #[test]

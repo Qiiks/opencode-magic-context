@@ -148,7 +148,6 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
 
         let mut identities = Vec::new();
         for (index, block) in msg.ck.content.iter().enumerate() {
-            ensure_supported(&msg.mid, index, block)?;
             let id = block_id(&msg.mid, index);
             let arc_id = arc_for_block(&msg.mid, index, &msg.ck, &mut pending_calls)?;
             let flat = flatten_block(msg, index, block, id, arc_id)?;
@@ -308,51 +307,6 @@ fn flatten_block(
         output_kind,
         wire: block.clone(),
     })
-}
-
-fn ensure_supported(mid: &str, block_index: usize, block: &CkWireBlock) -> Result<(), CkWireError> {
-    match &block.kind {
-        // Opaque is a first-class carrier (provider-native blocks the module must
-        // never interpret): it projects like any block — verbatim bytes, arc data
-        // internal to the block — and selection classifies it as never-reducible.
-        // Media stays rejected until a canonical vector exists for it.
-        CkKind::Opaque(_) => Ok(()),
-        CkKind::Media(_) => Err(CkWireError::UnsupportedBlock {
-            mid: mid.to_string(),
-            block_index,
-            kind: block.kind.tag().to_string(),
-        }),
-        CkKind::ToolResult { output, .. } => ensure_output_supported(mid, block_index, output),
-        _ => Ok(()),
-    }
-}
-
-fn ensure_output_supported(
-    mid: &str,
-    block_index: usize,
-    output: &CkToolOutput,
-) -> Result<(), CkWireError> {
-    if let CkOutputKind::Content { blocks } = &output.kind {
-        for block in blocks {
-            match block.kind {
-                ResultBlockKind::Media { .. } => {
-                    return Err(CkWireError::UnsupportedBlock {
-                        mid: mid.to_string(),
-                        block_index,
-                        kind: "tool_result.content.media".to_string(),
-                    })
-                }
-                // Result-embedded Opaque carriers (e.g. screenshots inside MCP tool
-                // results) get the same treatment as top-level Opaque blocks: verbatim
-                // source-tagged bytes, never interpreted, projected back unchanged.
-                // Rejecting them here wedged real Claude Code sessions, since any
-                // image-returning tool poisons the history for every later pass.
-                ResultBlockKind::Opaque { .. } => {}
-                ResultBlockKind::Text { .. } => {}
-            }
-        }
-    }
-    Ok(())
 }
 
 fn arc_for_block(
@@ -561,11 +515,10 @@ mod tests {
         assert!(matches!(err, CkWireError::UnpairedToolResult { .. }));
     }
 
-    // Opaque carriers inside tool_result content blocks (e.g. screenshots returned by
-    // MCP tools) are first-class verbatim carriers, same as top-level Opaque blocks.
-    // Media inside results stays rejected.
+    // Opaque and Media carriers inside tool_result content blocks are first-class
+    // pass-through values, matching their top-level treatment.
     #[test]
-    fn opaque_inside_tool_result_content_is_accepted_and_projected() {
+    fn opaque_and_media_inside_tool_result_content_are_accepted_and_projected() {
         let result_with_opaque = CkIngressMessage {
             mid: "m2".to_string(),
             ordinal: 2,
@@ -611,7 +564,6 @@ mod tests {
             project_messages(&messages).expect("result-embedded opaque must be accepted");
         assert!(projection.blocks.iter().any(|b| b.id == "m2#0"));
 
-        // Media inside a result is still rejected.
         let mut with_media = messages;
         if let CkKind::ToolResult { output, .. } = &mut with_media[2].ck.content[0].kind {
             if let CkOutputKind::Content { blocks } = &mut output.kind {
@@ -619,13 +571,20 @@ mod tests {
                     media: MediaBlock {
                         kind: MediaKind::Image,
                         media_type: "image/png".to_string(),
-                        filename: None,
-                        source: serde_json::json!({}),
+                        filename: Some("capture.png".to_string()),
+                        source: serde_json::json!({"type": "url", "url": "file://capture.png"}),
                     },
                 };
             }
         }
-        let err = project_messages(&with_media).expect_err("media in result stays rejected");
-        assert!(matches!(err, CkWireError::UnsupportedBlock { .. }));
+        let media_projection =
+            project_messages(&with_media).expect("result-embedded media must be accepted");
+        assert!(media_projection
+            .blocks
+            .iter()
+            .find(|block| block.id == "m2#0")
+            .expect("media result block")
+            .bytes
+            .contains("file://capture.png"));
     }
 }

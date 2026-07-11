@@ -3,15 +3,16 @@
     "method": "state_sync",
     "shadow_generation": 7,
     "expected_shadow_seq": 11,
+    "seed_boundary_id": "message-2#2",
     "compartments": [
       {
         "sequence": 1,
         "start_message": 1,
-        "end_message": 2,
+        "end_message": 1,
         "start_message_id": "message-1#0",
-        "end_message_id": "message-2#2",
+        "end_message_id": "message-1#0",
         "start_date": "2025-01-02",
-        "end_date": "2025-01-03",
+        "end_date": "2025-01-02",
         "title": "Fixture compartment",
         "content": "Fixture full compartment content",
         "p1": "Fixture P1",
@@ -222,17 +223,17 @@
     "ts_decision": {
       "class": "hard",
       "marker_state": {
-        "marker_message_id": "message-1",
+        "marker_message_id": "message-2",
         "advanced_this_pass": true
       },
       "materialize_reason": "fixture",
       "emergency": false
     },
     "declared_trim": {
-      "flat_boundary_id": "message-1#0",
-      "boundary_bare_message_id": "message-1",
-      "boundary_absolute_ordinal": 1,
-      "next_absolute_ordinal": 2
+      "flat_boundary_id": "message-2#2",
+      "boundary_bare_message_id": "message-2",
+      "boundary_absolute_ordinal": 2,
+      "next_absolute_ordinal": 3
     }
   },
   "shadow_reset": {

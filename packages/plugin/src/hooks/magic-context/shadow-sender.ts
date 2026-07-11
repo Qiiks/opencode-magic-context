@@ -191,6 +191,7 @@ interface ShadowStateSyncPayload {
     params: {
         shadow_generation: number;
         expected_shadow_seq: number;
+        seed_boundary_id: string | null;
         compartments: unknown[];
         memories: unknown[];
         memory_mutations: unknown[];
@@ -759,7 +760,9 @@ function serializeCompartment(args: {
 
 function buildStateSyncPayload(args: {
     state: SessionQueueState;
-    pass: Pick<ShadowTransformPass, "db" | "sessionId" | "projectPath" | "passInputs">;
+    pass: Pick<ShadowTransformPass, "db" | "sessionId" | "projectPath" | "passInputs"> & {
+        declaredTrim?: ShadowDeclaredTrim | null;
+    };
     force: boolean;
 }): ShadowStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" {
     const workspace = resolveShadowWorkspaceContext(args.pass.db, args.pass.projectPath);
@@ -888,6 +891,10 @@ function buildStateSyncPayload(args: {
         params: {
             shadow_generation: args.state.shadowGeneration,
             expected_shadow_seq: args.state.lastAckedSeq,
+            seed_boundary_id:
+                args.state.seedPassPending && compartments.length > 0
+                    ? (args.pass.declaredTrim?.flat_boundary_id ?? null)
+                    : null,
             compartments,
             memories,
             memory_mutations: memoryMutations,
@@ -937,6 +944,10 @@ function isPeerReject(error: unknown): boolean {
         text.includes("seq mismatch") ||
         text.includes("CAS")
     );
+}
+
+function isSeedBoundaryReject(error: unknown): boolean {
+    return errorCode(error) === "shadow_seed_boundary_mismatch";
 }
 
 function isConnectionFailure(error: unknown): boolean {
@@ -1259,12 +1270,28 @@ export function createShadowSender(options: { transport?: ShadowTransport } = {}
             return;
         }
         if (syncPayload !== null) {
-            const response = await transport.call({
-                sessionId: pass.sessionId,
-                projectRoot: pass.projectRoot,
-                method: "state_sync",
-                body: toFlatWireBody(syncPayload),
-            });
+            let response: unknown;
+            try {
+                response = await transport.call({
+                    sessionId: pass.sessionId,
+                    projectRoot: pass.projectRoot,
+                    method: "state_sync",
+                    body: toFlatWireBody(syncPayload),
+                });
+            } catch (error) {
+                if (isSeedBoundaryReject(error) && !state.quarantineRetryAttempted) {
+                    state.quarantineRetryAttempted = true;
+                    await performReset({
+                        sessionId: pass.sessionId,
+                        state,
+                        reason: "seed_boundary_reseed",
+                        projectRoot: pass.projectRoot,
+                    });
+                    await processPass(state, pass);
+                    return;
+                }
+                throw error;
+            }
             state.lastAckedSeq = numericAck(
                 response,
                 ["shadow_seq", "seq"],
