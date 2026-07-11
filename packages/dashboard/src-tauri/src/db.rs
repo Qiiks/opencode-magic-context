@@ -4,6 +4,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::external_cache_sessions;
 use crate::pi_sessions;
@@ -1039,10 +1040,31 @@ fn load_raw_codex_cache_events(limit: usize, since_timestamp: Option<i64>) -> Ve
     )
 }
 
+/// Claude Code and Codex store independent trees, so loading them concurrently
+/// keeps the first diagnostics request from waiting for both JSONL parses in turn.
+fn load_raw_external_cache_events_parallel(
+    limit: usize,
+    since_timestamp: Option<i64>,
+) -> (Vec<RawDbCacheEvent>, Vec<RawDbCacheEvent>) {
+    std::thread::scope(|scope| {
+        let claude = scope.spawn(|| load_raw_claude_code_cache_events(limit, since_timestamp));
+        let codex = scope.spawn(|| load_raw_codex_cache_events(limit, since_timestamp));
+        let claude = match claude.join() {
+            Ok(rows) => rows,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        let codex = match codex.join() {
+            Ok(rows) => rows,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        (claude, codex)
+    })
+}
+
 fn load_raw_external_cache_events(
     harness: Harness,
     scan: fn() -> Vec<external_cache_sessions::JsonlSessionMeta>,
-    read_detail: fn(&std::path::Path) -> Option<external_cache_sessions::JsonlSessionDetail>,
+    read_detail: fn(&std::path::Path) -> Option<Arc<external_cache_sessions::JsonlSessionDetail>>,
     limit: usize,
     since_timestamp: Option<i64>,
 ) -> Vec<RawDbCacheEvent> {
@@ -1051,6 +1073,11 @@ fn load_raw_external_cache_events(
     let mut all_rows: Vec<RawDbCacheEvent> = Vec::new();
 
     for meta in scan() {
+        if since_timestamp.is_some_and(|since| {
+            external_cache_sessions::source_file_mtime_is_not_newer_than(&meta, since)
+        }) {
+            continue;
+        }
         let Some(detail) = read_detail(&meta.jsonl_path) else {
             continue;
         };
@@ -1704,8 +1731,9 @@ fn build_db_cache_events_with_decisions(
 pub fn get_cache_events_from_db(limit: usize, since_timestamp: Option<i64>) -> Vec<DbCacheEvent> {
     let mut rows = load_raw_db_cache_events(limit, since_timestamp).unwrap_or_default();
     rows.extend(load_raw_pi_cache_events(limit, since_timestamp));
-    rows.extend(load_raw_claude_code_cache_events(limit, since_timestamp));
-    rows.extend(load_raw_codex_cache_events(limit, since_timestamp));
+    let (claude_rows, codex_rows) = load_raw_external_cache_events_parallel(limit, since_timestamp);
+    rows.extend(claude_rows);
+    rows.extend(codex_rows);
     // Newest-first across all harnesses, then truncate to the same global cap
     // the OpenCode-only path used so the merged feed never balloons unbounded.
     rows.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
@@ -1878,8 +1906,9 @@ pub fn get_session_cache_stats_from_db(
     // Reuse raw rows instead of re-querying + re-parsing logs.
     let mut rows = load_raw_db_cache_events(200, None).unwrap_or_default();
     rows.extend(load_raw_pi_cache_events(200, None));
-    rows.extend(load_raw_claude_code_cache_events(200, None));
-    rows.extend(load_raw_codex_cache_events(200, None));
+    let (claude_rows, codex_rows) = load_raw_external_cache_events_parallel(200, None);
+    rows.extend(claude_rows);
+    rows.extend(codex_rows);
 
     let row_keys: HashSet<(Harness, String)> = rows
         .iter()
@@ -2175,13 +2204,13 @@ fn get_claude_code_session_cache_events(
     limit: Option<usize>,
     since_timestamp: Option<i64>,
 ) -> Vec<DbCacheEvent> {
-    let Some(path) = external_cache_sessions::find_claude_code_session_path(session_id) else {
+    let Some(meta) = external_cache_sessions::find_claude_code_session_meta(session_id) else {
         return Vec::new();
     };
     get_external_session_cache_events(
         Harness::ClaudeCode,
         session_id,
-        &path,
+        &meta,
         external_cache_sessions::read_claude_code_session_detail,
         limit,
         since_timestamp,
@@ -2193,13 +2222,13 @@ fn get_codex_session_cache_events(
     limit: Option<usize>,
     since_timestamp: Option<i64>,
 ) -> Vec<DbCacheEvent> {
-    let Some(path) = external_cache_sessions::find_codex_session_path(session_id) else {
+    let Some(meta) = external_cache_sessions::find_codex_session_meta(session_id) else {
         return Vec::new();
     };
     get_external_session_cache_events(
         Harness::Codex,
         session_id,
-        &path,
+        &meta,
         external_cache_sessions::read_codex_session_detail,
         limit,
         since_timestamp,
@@ -2209,28 +2238,33 @@ fn get_codex_session_cache_events(
 fn get_external_session_cache_events(
     harness: Harness,
     session_id: &str,
-    path: &Path,
-    read_detail: fn(&Path) -> Option<external_cache_sessions::JsonlSessionDetail>,
+    meta: &external_cache_sessions::JsonlSessionMeta,
+    read_detail: fn(&Path) -> Option<Arc<external_cache_sessions::JsonlSessionDetail>>,
     limit: Option<usize>,
     since_timestamp: Option<i64>,
 ) -> Vec<DbCacheEvent> {
-    let Some(detail) = read_detail(path) else {
+    if since_timestamp.is_some_and(|since| {
+        external_cache_sessions::source_file_mtime_is_not_newer_than(meta, since)
+    }) {
+        return Vec::new();
+    }
+    let Some(detail) = read_detail(&meta.jsonl_path) else {
         return Vec::new();
     };
     let mut rows: Vec<RawDbCacheEvent> = detail
         .events
-        .into_iter()
+        .iter()
         .map(|event| RawDbCacheEvent {
             harness,
-            message_id: event.message_id,
+            message_id: event.message_id.clone(),
             session_id: session_id.to_string(),
             timestamp: event.timestamp_ms,
             input_tokens: event.input_tokens,
             cache_read: event.cache_read,
             cache_write: event.cache_write,
             total_tokens: event.total_tokens,
-            agent: event.model,
-            finish: event.finish,
+            agent: event.model.clone(),
+            finish: event.finish.clone(),
             context_limit: event.context_limit,
         })
         .collect();
@@ -8089,5 +8123,51 @@ mod dream_run_memory_changes_tests {
         assert!(detail.written.is_empty());
         assert!(detail.archived.is_empty());
         assert!(detail.merged.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod external_cache_incremental_tests {
+    use super::*;
+    use crate::external_cache_sessions;
+    use std::fs::{self, File};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn set_modified_time(path: &Path, modified: SystemTime) {
+        File::open(path)
+            .expect("open fixture")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("set fixture mtime");
+    }
+
+    #[test]
+    fn incremental_external_load_skips_unchanged_files_and_reads_touched_files() {
+        external_cache_sessions::clear_caches_for_tests();
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("project/session.jsonl");
+        fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
+        fs::write(
+            &path,
+            r#"{"type":"assistant","uuid":"cc-main-1","sessionId":"cc-session","timestamp":"2030-01-01T00:00:05.000Z","cwd":"/tmp/proj","isSidechain":false,"message":{"usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":25,"output_tokens":5}}}
+"#,
+        )
+        .expect("write fixture");
+
+        let since_timestamp = 1_893_456_000_000;
+        set_modified_time(&path, UNIX_EPOCH + Duration::from_secs(1));
+        external_cache_sessions::set_claude_code_test_root_for_tests(dir.path().to_path_buf());
+        assert!(load_raw_claude_code_cache_events(200, Some(since_timestamp)).is_empty());
+
+        set_modified_time(
+            &path,
+            UNIX_EPOCH + Duration::from_millis((since_timestamp + 10_000) as u64),
+        );
+        external_cache_sessions::clear_caches_for_tests();
+        external_cache_sessions::set_claude_code_test_root_for_tests(dir.path().to_path_buf());
+        let rows = load_raw_claude_code_cache_events(200, Some(since_timestamp));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "cc-main-1");
+        external_cache_sessions::clear_caches_for_tests();
     }
 }
