@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct JsonlSessionMeta {
@@ -14,6 +14,7 @@ pub struct JsonlSessionMeta {
     pub created: i64,
     pub modified: i64,
     pub event_count: u32,
+    pub(crate) source_mtime: SystemTime,
 }
 
 #[derive(Debug, Clone)]
@@ -36,14 +37,34 @@ pub struct JsonlSessionDetail {
     pub events: Vec<JsonlCacheEvent>,
 }
 
-type MetaCache = HashMap<PathBuf, (SystemTime, Arc<JsonlSessionMeta>)>;
-type DetailCache = HashMap<PathBuf, (SystemTime, Arc<JsonlSessionDetail>)>;
+// Remember files with no usable cache events too, so an unchanged JSONL file
+// is not reparsed on every dashboard refresh.
+type MetaCache = HashMap<PathBuf, (SystemTime, Option<Arc<JsonlSessionMeta>>)>;
+type DetailCache = HashMap<PathBuf, (SystemTime, Option<Arc<JsonlSessionDetail>>)>;
+type DirectoryListingCache = HashMap<PathBuf, CachedDirectoryListing>;
+
+#[derive(Debug)]
+struct CachedDirectoryListing {
+    scanned_at: Instant,
+    files: Arc<Vec<ScannedJsonlFile>>,
+}
+
+#[derive(Debug, Clone)]
+struct ScannedJsonlFile {
+    path: PathBuf,
+    mtime: SystemTime,
+}
+
+const DIRECTORY_LISTING_TTL: Duration = Duration::from_secs(5);
+const SOURCE_MTIME_CLOCK_SKEW_MS: i64 = 2_000;
 
 static CLAUDE_META_CACHE: OnceLock<RwLock<MetaCache>> = OnceLock::new();
 static CLAUDE_DETAIL_CACHE: OnceLock<RwLock<DetailCache>> = OnceLock::new();
+static CLAUDE_DIRECTORY_LISTING_CACHE: OnceLock<RwLock<DirectoryListingCache>> = OnceLock::new();
 static CLAUDE_TEST_ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 static CODEX_META_CACHE: OnceLock<RwLock<MetaCache>> = OnceLock::new();
 static CODEX_DETAIL_CACHE: OnceLock<RwLock<DetailCache>> = OnceLock::new();
+static CODEX_DIRECTORY_LISTING_CACHE: OnceLock<RwLock<DirectoryListingCache>> = OnceLock::new();
 static CODEX_TEST_ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
 fn claude_meta_cache() -> &'static RwLock<MetaCache> {
@@ -52,6 +73,10 @@ fn claude_meta_cache() -> &'static RwLock<MetaCache> {
 
 fn claude_detail_cache() -> &'static RwLock<DetailCache> {
     CLAUDE_DETAIL_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn claude_directory_listing_cache() -> &'static RwLock<DirectoryListingCache> {
+    CLAUDE_DIRECTORY_LISTING_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn claude_test_root() -> &'static RwLock<Option<PathBuf>> {
@@ -64,6 +89,10 @@ fn codex_meta_cache() -> &'static RwLock<MetaCache> {
 
 fn codex_detail_cache() -> &'static RwLock<DetailCache> {
     CODEX_DETAIL_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn codex_directory_listing_cache() -> &'static RwLock<DirectoryListingCache> {
+    CODEX_DIRECTORY_LISTING_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn codex_test_root() -> &'static RwLock<Option<PathBuf>> {
@@ -96,9 +125,17 @@ pub fn scan_claude_code_session_dir() -> Vec<JsonlSessionMeta> {
 }
 
 pub fn scan_claude_code_session_dir_at(root: &Path) -> Vec<JsonlSessionMeta> {
-    scan_jsonl_files(root)
-        .into_iter()
-        .filter_map(|path| read_claude_code_session_meta(&path))
+    let files = cached_jsonl_files(root, claude_directory_listing_cache());
+    files
+        .iter()
+        .filter_map(|file| {
+            read_cached_meta_at_mtime(
+                &file.path,
+                file.mtime,
+                claude_meta_cache(),
+                read_claude_code_session_meta_uncached,
+            )
+        })
         .collect::<Vec<_>>()
         .tap_sort_newest_first()
 }
@@ -111,7 +148,7 @@ pub fn read_claude_code_session_meta(path: &Path) -> Option<JsonlSessionMeta> {
     )
 }
 
-pub fn read_claude_code_session_detail(path: &Path) -> Option<JsonlSessionDetail> {
+pub fn read_claude_code_session_detail(path: &Path) -> Option<Arc<JsonlSessionDetail>> {
     read_cached_detail(
         path,
         claude_detail_cache(),
@@ -119,11 +156,14 @@ pub fn read_claude_code_session_detail(path: &Path) -> Option<JsonlSessionDetail
     )
 }
 
-pub fn find_claude_code_session_path(session_id: &str) -> Option<PathBuf> {
+pub fn find_claude_code_session_meta(session_id: &str) -> Option<JsonlSessionMeta> {
     scan_claude_code_session_dir()
         .into_iter()
         .find(|meta| meta.session_id == session_id)
-        .map(|meta| meta.jsonl_path)
+}
+
+pub fn find_claude_code_session_path(session_id: &str) -> Option<PathBuf> {
+    find_claude_code_session_meta(session_id).map(|meta| meta.jsonl_path)
 }
 
 pub fn claude_code_first_event_timestamp(session_id: &str) -> Option<i64> {
@@ -143,9 +183,17 @@ pub fn scan_codex_session_dir() -> Vec<JsonlSessionMeta> {
 }
 
 pub fn scan_codex_session_dir_at(root: &Path) -> Vec<JsonlSessionMeta> {
-    scan_jsonl_files(root)
-        .into_iter()
-        .filter_map(|path| read_codex_session_meta(&path))
+    let files = cached_jsonl_files(root, codex_directory_listing_cache());
+    files
+        .iter()
+        .filter_map(|file| {
+            read_cached_meta_at_mtime(
+                &file.path,
+                file.mtime,
+                codex_meta_cache(),
+                read_codex_session_meta_uncached,
+            )
+        })
         .collect::<Vec<_>>()
         .tap_sort_newest_first()
 }
@@ -154,7 +202,7 @@ pub fn read_codex_session_meta(path: &Path) -> Option<JsonlSessionMeta> {
     read_cached_meta(path, codex_meta_cache(), read_codex_session_meta_uncached)
 }
 
-pub fn read_codex_session_detail(path: &Path) -> Option<JsonlSessionDetail> {
+pub fn read_codex_session_detail(path: &Path) -> Option<Arc<JsonlSessionDetail>> {
     read_cached_detail(
         path,
         codex_detail_cache(),
@@ -162,11 +210,14 @@ pub fn read_codex_session_detail(path: &Path) -> Option<JsonlSessionDetail> {
     )
 }
 
-pub fn find_codex_session_path(session_id: &str) -> Option<PathBuf> {
+pub fn find_codex_session_meta(session_id: &str) -> Option<JsonlSessionMeta> {
     scan_codex_session_dir()
         .into_iter()
         .find(|meta| meta.session_id == session_id)
-        .map(|meta| meta.jsonl_path)
+}
+
+pub fn find_codex_session_path(session_id: &str) -> Option<PathBuf> {
+    find_codex_session_meta(session_id).map(|meta| meta.jsonl_path)
 }
 
 pub fn codex_first_event_timestamp(session_id: &str) -> Option<i64> {
@@ -178,53 +229,86 @@ pub fn codex_first_event_timestamp(session_id: &str) -> Option<i64> {
         .min()
 }
 
+/// A file's mtime can lag a provider timestamp by a small amount, so leave a
+/// margin before treating an incremental anchor as newer than the file.
+pub(crate) fn source_file_mtime_is_not_newer_than(
+    meta: &JsonlSessionMeta,
+    since_timestamp: i64,
+) -> bool {
+    system_time_ms(meta.source_mtime).saturating_add(SOURCE_MTIME_CLOCK_SKEW_MS) <= since_timestamp
+}
+
 fn read_cached_meta(
     path: &Path,
     cache: &'static RwLock<MetaCache>,
     reader: fn(&Path, SystemTime) -> Option<JsonlSessionMeta>,
 ) -> Option<JsonlSessionMeta> {
     let mtime = file_mtime(path)?;
+    read_cached_meta_at_mtime(path, mtime, cache, reader)
+}
+
+fn read_cached_meta_at_mtime(
+    path: &Path,
+    mtime: SystemTime,
+    cache: &'static RwLock<MetaCache>,
+    reader: fn(&Path, SystemTime) -> Option<JsonlSessionMeta>,
+) -> Option<JsonlSessionMeta> {
     if let Ok(cache) = cache.read() {
         if let Some((cached_mtime, cached)) = cache.get(path) {
             if *cached_mtime == mtime {
-                return Some((**cached).clone());
+                return cached.as_deref().cloned();
             }
         }
     }
 
-    let meta = Arc::new(reader(path, mtime)?);
+    let meta = reader(path, mtime).map(Arc::new);
     if let Ok(mut cache) = cache.write() {
-        cache.insert(path.to_path_buf(), (mtime, Arc::clone(&meta)));
+        cache.insert(path.to_path_buf(), (mtime, meta.clone()));
     }
-    Some((*meta).clone())
+    meta.as_deref().cloned()
 }
 
 fn read_cached_detail(
     path: &Path,
     cache: &'static RwLock<DetailCache>,
     reader: fn(&Path, SystemTime) -> Option<JsonlSessionDetail>,
-) -> Option<JsonlSessionDetail> {
+) -> Option<Arc<JsonlSessionDetail>> {
     let mtime = file_mtime(path)?;
+    read_cached_detail_at_mtime(path, mtime, cache, reader)
+}
+
+fn read_cached_detail_at_mtime(
+    path: &Path,
+    mtime: SystemTime,
+    cache: &'static RwLock<DetailCache>,
+    reader: fn(&Path, SystemTime) -> Option<JsonlSessionDetail>,
+) -> Option<Arc<JsonlSessionDetail>> {
     if let Ok(cache) = cache.read() {
         if let Some((cached_mtime, cached)) = cache.get(path) {
             if *cached_mtime == mtime {
-                return Some((**cached).clone());
+                return cached.clone();
             }
         }
     }
 
-    let detail = Arc::new(reader(path, mtime)?);
+    let detail = reader(path, mtime).map(Arc::new);
     if let Ok(mut cache) = cache.write() {
-        cache.insert(path.to_path_buf(), (mtime, Arc::clone(&detail)));
+        cache.insert(path.to_path_buf(), (mtime, detail.clone()));
     }
-    Some((*detail).clone())
+    detail
 }
 
 fn read_claude_code_session_meta_uncached(
     path: &Path,
     mtime: SystemTime,
 ) -> Option<JsonlSessionMeta> {
-    read_claude_code_session_detail_uncached(path, mtime).map(|detail| detail.meta)
+    read_cached_detail_at_mtime(
+        path,
+        mtime,
+        claude_detail_cache(),
+        read_claude_code_session_detail_uncached,
+    )
+    .map(|detail| detail.meta.clone())
 }
 
 fn read_claude_code_session_detail_uncached(
@@ -281,6 +365,7 @@ fn read_claude_code_session_detail_uncached(
         created,
         modified,
         event_count: events.len() as u32,
+        source_mtime: mtime,
     };
     Some(JsonlSessionDetail { meta, events })
 }
@@ -323,7 +408,13 @@ fn claude_code_event_from_entry(entry: &Value) -> Option<JsonlCacheEvent> {
 }
 
 fn read_codex_session_meta_uncached(path: &Path, mtime: SystemTime) -> Option<JsonlSessionMeta> {
-    read_codex_session_detail_uncached(path, mtime).map(|detail| detail.meta)
+    read_cached_detail_at_mtime(
+        path,
+        mtime,
+        codex_detail_cache(),
+        read_codex_session_detail_uncached,
+    )
+    .map(|detail| detail.meta.clone())
 }
 
 fn read_codex_session_detail_uncached(
@@ -386,6 +477,7 @@ fn read_codex_session_detail_uncached(
         created,
         modified,
         event_count: events.len() as u32,
+        source_mtime: mtime,
     };
     Some(JsonlSessionDetail { meta, events })
 }
@@ -453,7 +545,33 @@ fn session_id_from_codex_filename(path: &Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn scan_jsonl_files(root: &Path) -> Vec<PathBuf> {
+fn cached_jsonl_files(
+    root: &Path,
+    cache: &'static RwLock<DirectoryListingCache>,
+) -> Arc<Vec<ScannedJsonlFile>> {
+    let now = Instant::now();
+    if let Ok(cache) = cache.read() {
+        if let Some(cached) = cache.get(root) {
+            if now.duration_since(cached.scanned_at) < DIRECTORY_LISTING_TTL {
+                return Arc::clone(&cached.files);
+            }
+        }
+    }
+
+    let files = Arc::new(scan_jsonl_files(root));
+    if let Ok(mut cache) = cache.write() {
+        cache.insert(
+            root.to_path_buf(),
+            CachedDirectoryListing {
+                scanned_at: now,
+                files: Arc::clone(&files),
+            },
+        );
+    }
+    files
+}
+
+fn scan_jsonl_files(root: &Path) -> Vec<ScannedJsonlFile> {
     if !root.exists() {
         return Vec::new();
     }
@@ -463,7 +581,11 @@ fn scan_jsonl_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn visit_jsonl_files(root: &Path, visited: &mut HashSet<PathBuf>, files: &mut Vec<PathBuf>) {
+fn visit_jsonl_files(
+    root: &Path,
+    visited: &mut HashSet<PathBuf>,
+    files: &mut Vec<ScannedJsonlFile>,
+) {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     if !visited.insert(canonical) {
         return;
@@ -479,7 +601,14 @@ fn visit_jsonl_files(root: &Path, visited: &mut HashSet<PathBuf>, files: &mut Ve
         if file_type.is_dir() {
             visit_jsonl_files(&path, visited, files);
         } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-            files.push(path);
+            let Some(mtime) = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+            else {
+                continue;
+            };
+            files.push(ScannedJsonlFile { path, mtime });
         }
     }
 }
@@ -552,6 +681,14 @@ pub fn clear_caches_for_tests() {
         }
     }
     for cache in [claude_detail_cache(), codex_detail_cache()] {
+        if let Ok(mut cache) = cache.write() {
+            cache.clear();
+        }
+    }
+    for cache in [
+        claude_directory_listing_cache(),
+        codex_directory_listing_cache(),
+    ] {
         if let Ok(mut cache) = cache.write() {
             cache.clear();
         }
@@ -636,5 +773,22 @@ mod tests {
         assert_eq!(event.cache_write, 0);
         assert_eq!(event.total_tokens, 1550);
         assert_eq!(event.context_limit, Some(200000));
+    }
+
+    #[test]
+    fn warm_detail_reads_share_the_cached_arc() {
+        clear_caches_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project/session.jsonl");
+        write_fixture(
+            &path,
+            r#"{"type":"assistant","uuid":"cc-main-1","sessionId":"cc-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/proj","isSidechain":false,"message":{"usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":25,"output_tokens":5}}}
+"#,
+        );
+
+        let first = read_claude_code_session_detail(&path).unwrap();
+        let second = read_claude_code_session_detail(&path).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
