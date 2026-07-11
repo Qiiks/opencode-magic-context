@@ -33,6 +33,7 @@ interface RunnerOptions {
 	messages: number;
 	step: number;
 	points?: number[];
+	repeatFinal: number;
 	output?: string;
 	lane: PerfLane;
 }
@@ -77,6 +78,15 @@ async function main(): Promise<void> {
 	const passes = buildAccumulationPasses(fixture, points);
 	if (passes.length === 0)
 		throw new Error(`No message passes found in ${fixture.name}`);
+	const finalPass = passes.at(-1);
+	if (finalPass) {
+		for (let repeat = 0; repeat < options.repeatFinal; repeat += 1) {
+			passes.push({
+				...finalPass,
+				messages: structuredClone(finalPass.messages),
+			});
+		}
+	}
 
 	const dataDir = mkdtempSync(join(tmpdir(), "mc-pi-perf-data-"));
 	process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dataDir;
@@ -275,6 +285,7 @@ function fakeContext(
 		},
 		sessionManager: {
 			getSessionId: () => sessionId,
+			getLeafId: () => branchEntries.at(-1)?.id ?? null,
 			getBranch: () => branchEntries as SessionEntry[],
 			getEntry: (id: string) => byId.get(id),
 		},
@@ -332,6 +343,7 @@ function parseOptions(args: readonly string[]): RunnerOptions {
 	const options: RunnerOptions = {
 		messages: 1_000,
 		step: 500,
+		repeatFinal: 0,
 		lane: "default",
 	};
 	for (let index = 0; index < args.length; index += 1) {
@@ -350,6 +362,9 @@ function parseOptions(args: readonly string[]): RunnerOptions {
 			options.points = value
 				.split(",")
 				.map((item) => positiveInteger(item, arg));
+			index += 1;
+		} else if (arg === "--repeat-final" && value) {
+			options.repeatFinal = positiveInteger(value, arg);
 			index += 1;
 		} else if (arg === "--output" && value) {
 			options.output = value;

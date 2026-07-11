@@ -38,8 +38,13 @@ export function printLargestPhaseTable(
 			ms: round(elapsedMs),
 		})),
 	);
+	const coverage =
+		largest.phases.total > 0
+			? (largest.phases.accounted / largest.phases.total) * 100
+			: 100;
 	console.log(
-		`DB I/O is cross-cutting: ${largest.db.operations} operations ` +
+		`Top-level stages account for ${round(coverage)}% of transform wall time. ` +
+			`DB I/O is cross-cutting: ${largest.db.operations} operations ` +
 			`(${largest.db.reads} reads, ${largest.db.writes} writes). ` +
 			`Serialization took ${round(largest.serializationMs ?? 0)}ms; the 150ms drain observed ` +
 			`${largest.deferredDb?.operations ?? 0} deferred DB operations.`,

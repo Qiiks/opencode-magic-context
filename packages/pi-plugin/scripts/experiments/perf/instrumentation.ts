@@ -7,15 +7,39 @@ export interface TimingSample {
 }
 
 export interface PhaseTotals {
+	prePipeline: number;
+	pipeline: number;
+	postPipeline: number;
+	accounted: number;
+	unaccounted: number;
 	entryBranch: number;
+	fallbackIdentity: number;
+	tagIdentityCore: number;
 	tagIdentity: number;
 	tagPrefix: number;
 	targets: number;
 	tokenCountingBackfill: number;
+	tagTokenCounting: number;
+	tokenAccounting: number;
+	tokenCacheValidation: number;
+	tokenBpe: number;
 	stripsReplay: number;
+	processedImages: number;
+	droppedPlaceholders: number;
+	cavemanReplay: number;
+	transcriptCommit: number;
+	postCommitMaps: number;
 	drops: number;
 	boundaryTriggers: number;
 	injection: number;
+	decisionState: number;
+	historianScheduling: number;
+	noteIndexMaps: number;
+	stickyReplay: number;
+	autoSearch: number;
+	todoCapture: number;
+	channelAccounting: number;
+	workMetrics: number;
 	dbIo: number;
 	postTransform: number;
 	total: number;
@@ -130,23 +154,52 @@ export function summarizePhases(
 		samples
 			.filter((sample) => sample.stage === name)
 			.reduce((sum, sample) => sum + sample.elapsedMs, 0);
+	const total = stage("total");
+	const prePipeline = stage("prePipelineTotal");
+	const pipeline = stage("runPipeline");
+	const postPipeline = stage("postPipelineTotal");
+	const accounted = prePipeline + pipeline + postPipeline;
 	return {
+		prePipeline,
+		pipeline,
+		postPipeline,
+		accounted,
+		unaccounted: Math.max(0, total - accounted),
 		entryBranch: stage("entryParseAndBranchResolution"),
+		fallbackIdentity: stage("fallbackIdentityAndAdoption"),
+		tagIdentityCore: stage("tag:identity"),
 		tagIdentity: stage("fallbackIdentityAndAdoption") + stage("tag:identity"),
 		tagPrefix: stage("tag:prefix"),
 		targets: stage("tag:targets"),
 		tokenCountingBackfill:
 			stage("tag:tokenCounting") + stage("tokenAccounting"),
+		tagTokenCounting: stage("tag:tokenCounting"),
+		tokenAccounting: stage("tokenAccounting"),
+		tokenCacheValidation: stage("token:cacheValidation"),
+		tokenBpe: stage("token:bpe"),
 		stripsReplay:
 			stage("applyFlushedStatuses") +
 			stage("replayReasoningClearing") +
 			stage("stripClearedReasoning"),
+		processedImages: stage("stripProcessedImages"),
+		droppedPlaceholders: stage("stripDroppedPlaceholders"),
+		cavemanReplay: stage("cavemanReplay"),
+		transcriptCommit: stage("transcriptCommit"),
+		postCommitMaps: stage("postCommitStableIdMaps"),
 		drops: stage("applyPendingOperations") + stage("applyHeuristicCleanup"),
 		boundaryTriggers: stage("boundaryTriggerChecks"),
 		injection: stage("prepareCompartmentInjection"),
+		decisionState: stage("transformDecisionAndReuseState"),
+		historianScheduling: stage("historianScheduling"),
+		noteIndexMaps: stage("noteIndexMaps"),
+		stickyReplay: stage("stickyReplayDecisions"),
+		autoSearch: stage("autoSearch"),
+		todoCapture: stage("todoCapture"),
+		channelAccounting: stage("channelNudgeAccounting"),
+		workMetrics: stage("workMetrics"),
 		dbIo: database.elapsedMs,
 		postTransform: stage("postTransformPhase"),
-		total: stage("total"),
+		total,
 	};
 }
 

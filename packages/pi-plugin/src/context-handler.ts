@@ -276,6 +276,7 @@ export const __test = {
 	applyForwardPressureFloor,
 	buildEntryFingerprintMap,
 	buildPiToolOwnerMap,
+	readPiBranchEntriesForContext,
 	getTaggedStableMessageIdsForTests(sessionId: string): ReadonlySet<string> {
 		return new Set(taggedStableMessageIdsBySession.get(sessionId));
 	},
@@ -423,6 +424,33 @@ function recordSuccessfulTaggedMessageIds(
 const piMessageTokenCacheBySession = new Map<
 	string,
 	Map<string, PiMessageTokenCacheEntry>
+>();
+const piTagTextTokenCacheBySession = new Map<
+	string,
+	Map<string, { text: string; tokenCount: number }>
+>();
+const piTagToolTokenCacheBySession = new Map<
+	string,
+	Map<string, { text: string; tokenCount: number }>
+>();
+
+interface PiBranchEntryLookup {
+	entryIdByMessageRef: Map<object, string>;
+	entryIdsByFingerprint: Map<string, string[]>;
+	alignedEntryIds: (string | undefined)[];
+}
+
+interface PiBranchProjectionCache {
+	leafId: string;
+	entries: readonly unknown[];
+	indexById: Map<string, number>;
+	lookup: PiBranchEntryLookup;
+}
+
+const piBranchProjectionBySession = new Map<string, PiBranchProjectionCache>();
+const piBranchLookupByProjection = new WeakMap<
+	readonly unknown[],
+	PiBranchEntryLookup
 >();
 
 function logTransformTiming(
@@ -1154,53 +1182,16 @@ export function collectMessageEntryIdsStrict(
 }
 
 /**
- * Resolve the SessionEntry id for each `event.messages[i]` by reference
- * identity against `sessionManager.getBranch()` entries.
+ * Resolve each context message to a real SessionEntry id without assuming the
+ * context and branch arrays have identical positions. Pi clones context messages
+ * before extension handlers run, so production alignment uses stable content
+ * fingerprints cached with the session's branch projection. Reference matching
+ * remains as a compatibility path for test doubles and older runtimes.
  *
- * Why this exists alongside `collectMessageEntryIds`: the position-based
- * walk in `collectMessageEntryIds` assumes that filtering `getBranch()`
- * to message/custom_message/branch_summary entries produces an array
- * 1:1 with `event.messages` in length. That assumption breaks when Pi's
- * runtime `agent.state.messages` and SessionManager's branch desync by
- * even one entry — and we've observed off-by-one (around the agent_end
- * boundary, likely a bash flush race) and much larger (288-entry) gaps
- * in production. When that happens, every index past the divergence
- * gets the wrong entry id, breaking compartment boundary lookup.
- *
- * Reference-based mapping is immune to count divergence. Pi's
- * `appendMessage` (session-manager.js:580) stores `entry.message =
- * sourceAgentMessage` by reference, and `buildSessionContext` emits
- * those same references back as the message array. So `event.messages[i]
- * === branchEntries[j].message` holds for every emit-eligible entry.
- *
- * Algorithm:
- *   1. Walk `getBranch()` once, building `entryByMsgRef: Map<object, string>`
- *      keyed by `entry.message` reference (for `type === "message"`),
- *      `entry` itself for `custom_message` (Pi calls `createCustomMessage`
- *      which returns a fresh object, so we key by the message we emit
- *      using a synthesized reference table — see below), and similar for
- *      `branch_summary`.
- *   2. For each `event.messages[i]`, look up by reference. Hit → real
- *      SessionEntry id. Miss → undefined (caller falls back to
- *      synthesized id via `buildPiMessageIdByIndex`).
- *
- * For `custom_message` and `branch_summary` entries, Pi's
- * `buildSessionContext` calls `createCustomMessage(...)` /
- * `createBranchSummaryMessage(...)` which return NEW objects per
- * `context` event. Reference matching cannot work for those — Pi makes
- * fresh wrappers every call. Those entries fall through to undefined
- * here, and the caller's `buildPiMessageIdByIndex` falls back to a
- * synthesized `pi-msg-${index}-${ts}-${role}` id. That synthesized id
- * has zero cross-pass stability, but compartment boundaries never
- * target custom-message / branch-summary entries (historian only writes
- * boundaries on plain `message` entries via `read-session-pi.ts`), so
- * the fallback is harmless.
- *
- * Returns `null` only when the SessionManager API is unavailable. When
- * we successfully traverse the branch, we always return an array of
- * the same length as `messages` (with `undefined` slots for unmapped
- * positions). Length mismatch is NEVER returned — that's the whole
- * point of switching to reference-based matching.
+ * Ambiguous fingerprints intentionally remain unresolved rather than risking a
+ * wrong durable boundary. Custom and branch-summary wrappers also remain
+ * unresolved because Pi synthesizes them for each context event and historian
+ * boundaries only target ordinary message entries.
  */
 export function collectMessageEntryIdsByRef(
 	ctx: ExtensionContext,
@@ -1232,32 +1223,11 @@ export function collectMessageEntryIdsByRef(
 		}
 	}
 
-	// Build lookup tables keyed first by AgentMessage reference and then by
-	// a content fingerprint. Reference identity is the fast, lossless path for
-	// native Pi messages. The fingerprint fallback covers full message-clone
-	// paths introduced by other Pi extensions that re-wrap ordinary messages
-	// while preserving stable fields and first text content.
-	const entryIdByMsgRef = new Map<object, string>();
-	const entryIdsByFingerprint = new Map<string, string[]>();
-	for (const entry of entries) {
-		if (!entry || typeof entry !== "object") continue;
-		const e = entry as {
-			type?: unknown;
-			id?: unknown;
-			message?: unknown;
-		};
-		if (e.type !== "message") continue;
-		if (typeof e.id !== "string") continue;
-		if (!e.message || typeof e.message !== "object") continue;
-		const message = e.message as object;
-		entryIdByMsgRef.set(message, e.id);
-		const fingerprint = piMessageEntryFingerprint(e.message);
-		if (fingerprint) {
-			const bucket = entryIdsByFingerprint.get(fingerprint);
-			if (bucket) bucket.push(e.id);
-			else entryIdsByFingerprint.set(fingerprint, [e.id]);
-		}
-	}
+	// SessionManager clones context messages before this handler runs, so the
+	// fingerprint index is the production alignment path. The reference index is
+	// retained for test doubles and older Pi runtimes that do not clone.
+	const { entryIdByMessageRef, entryIdsByFingerprint } =
+		getPiBranchEntryLookup(entries);
 
 	const result: (string | undefined)[] = new Array(messages.length);
 	let resolved = 0;
@@ -1269,7 +1239,7 @@ export function collectMessageEntryIdsByRef(
 			result[i] = undefined;
 			continue;
 		}
-		const id = entryIdByMsgRef.get(msg as object);
+		const id = entryIdByMessageRef.get(msg as object);
 		if (typeof id === "string") {
 			result[i] = id;
 			resolved += 1;
@@ -1307,13 +1277,102 @@ export function collectMessageEntryIdsByRef(
 		log(
 			`[magic-context][pi]${sessionId ? `[${sessionId}]` : ""} ` +
 				`collectMessageEntryIdsByRef: resolved=${resolved}/${messages.length} ` +
-				`(fingerprint=${fingerprintResolved}, branchEntries=${entries.length}, messageEntries=${entryIdByMsgRef.size}) — ` +
+				`(fingerprint=${fingerprintResolved}, branchEntries=${entries.length}, messageEntries=${entryIdByMessageRef.size}) — ` +
 				`unmapped slots fall through to synthesized ids; boundary lookup still works ` +
 				`for any compartment whose start/end message is among the resolved set`,
 		);
 	}
 
 	return result;
+}
+
+function addPiBranchEntryToLookup(
+	lookup: PiBranchEntryLookup,
+	entry: unknown,
+): void {
+	if (!entry || typeof entry !== "object") return;
+	const row = entry as { type?: unknown; id?: unknown; message?: unknown };
+	if (
+		row.type !== "message" ||
+		typeof row.id !== "string" ||
+		!row.message ||
+		typeof row.message !== "object"
+	) {
+		return;
+	}
+	lookup.entryIdByMessageRef.set(row.message as object, row.id);
+	const fingerprint = piMessageEntryFingerprint(row.message);
+	if (!fingerprint) return;
+	const bucket = lookup.entryIdsByFingerprint.get(fingerprint);
+	if (bucket) bucket.push(row.id);
+	else lookup.entryIdsByFingerprint.set(fingerprint, [row.id]);
+}
+
+function isPiContextEmitEligible(entry: unknown): entry is { id: string } {
+	if (!entry || typeof entry !== "object") return false;
+	const row = entry as { type?: unknown; id?: unknown; summary?: unknown };
+	if (typeof row.id !== "string") return false;
+	return (
+		row.type === "message" ||
+		row.type === "custom_message" ||
+		(row.type === "branch_summary" &&
+			typeof row.summary === "string" &&
+			row.summary.length > 0)
+	);
+}
+
+function buildPiAlignedEntryIds(
+	entries: readonly unknown[],
+): (string | undefined)[] {
+	let compactionIndex = -1;
+	let firstKeptEntryId: string | undefined;
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const row = entries[index] as
+			| { type?: unknown; firstKeptEntryId?: unknown }
+			| undefined;
+		if (row?.type !== "compaction") continue;
+		compactionIndex = index;
+		firstKeptEntryId =
+			typeof row.firstKeptEntryId === "string"
+				? row.firstKeptEntryId
+				: undefined;
+		break;
+	}
+	if (compactionIndex < 0) {
+		return entries.filter(isPiContextEmitEligible).map((entry) => entry.id);
+	}
+
+	const ids: (string | undefined)[] = [undefined];
+	if (firstKeptEntryId !== undefined) {
+		let foundFirstKept = false;
+		for (let index = 0; index < compactionIndex; index += 1) {
+			const entry = entries[index];
+			if ((entry as { id?: unknown } | undefined)?.id === firstKeptEntryId) {
+				foundFirstKept = true;
+			}
+			if (foundFirstKept && isPiContextEmitEligible(entry)) ids.push(entry.id);
+		}
+	}
+	for (let index = compactionIndex + 1; index < entries.length; index += 1) {
+		const entry = entries[index];
+		if (isPiContextEmitEligible(entry)) ids.push(entry.id);
+	}
+	return ids;
+}
+
+function getPiBranchEntryLookup(
+	entries: readonly unknown[],
+): PiBranchEntryLookup {
+	const cached = piBranchLookupByProjection.get(entries);
+	if (cached) return cached;
+	const lookup: PiBranchEntryLookup = {
+		entryIdByMessageRef: new Map(),
+		entryIdsByFingerprint: new Map(),
+		alignedEntryIds: buildPiAlignedEntryIds(entries),
+	};
+	for (const entry of entries) addPiBranchEntryToLookup(lookup, entry);
+	piBranchLookupByProjection.set(entries, lookup);
+	return lookup;
 }
 
 /**
@@ -1331,17 +1390,9 @@ export function collectMessageEntryIdsByRef(
 function buildEntryIdByRefMap(
 	branchEntries: readonly unknown[] | null,
 ): Map<object, string> {
-	const map = new Map<object, string>();
-	if (!branchEntries) return map;
-	for (const entry of branchEntries) {
-		if (!entry || typeof entry !== "object") continue;
-		const e = entry as { type?: unknown; id?: unknown; message?: unknown };
-		if (e.type !== "message") continue;
-		if (typeof e.id !== "string") continue;
-		if (!e.message || typeof e.message !== "object") continue;
-		map.set(e.message as object, e.id);
-	}
-	return map;
+	return branchEntries
+		? getPiBranchEntryLookup(branchEntries).entryIdByMessageRef
+		: new Map();
 }
 
 function readPiBranchEntriesForContext(
@@ -1349,18 +1400,134 @@ function readPiBranchEntriesForContext(
 	sessionId: string,
 ): readonly unknown[] | null {
 	const sm = ctx.sessionManager as
-		| { getBranch?: (fromId?: string) => unknown[] }
+		| {
+				getLeafId?: () => string | null;
+				getEntry?: (id: string) => unknown;
+				getBranch?: (fromId?: string) => unknown[];
+		  }
 		| undefined;
-	if (typeof sm?.getBranch !== "function") return null;
-	try {
+
+	const installProjection = (
+		leafId: string,
+		entries: readonly unknown[],
+	): readonly unknown[] => {
+		const indexById = new Map<string, number>();
+		const lookup = getPiBranchEntryLookup(entries);
+		for (let index = 0; index < entries.length; index += 1) {
+			const entry = entries[index];
+			if (entry && typeof entry === "object") {
+				const id = (entry as { id?: unknown }).id;
+				if (typeof id === "string") indexById.set(id, index);
+			}
+		}
+		const projection = { leafId, entries, indexById, lookup };
+		piBranchProjectionBySession.set(sessionId, projection);
+		piBranchLookupByProjection.set(entries, lookup);
+		return entries;
+	};
+
+	const fallbackToBranch = (): readonly unknown[] | null => {
+		if (typeof sm?.getBranch !== "function") return null;
 		const entries = sm.getBranch.call(sm);
-		return Array.isArray(entries) ? entries : null;
+		if (!Array.isArray(entries)) return null;
+		const leafId =
+			typeof (entries.at(-1) as { id?: unknown } | undefined)?.id === "string"
+				? ((entries.at(-1) as { id: string }).id ?? "")
+				: "";
+		return leafId ? installProjection(leafId, entries) : entries;
+	};
+
+	try {
+		if (
+			typeof sm?.getLeafId !== "function" ||
+			typeof sm.getEntry !== "function"
+		) {
+			return fallbackToBranch();
+		}
+		const leafId = sm.getLeafId.call(sm);
+		if (leafId === null) return [];
+		if (typeof leafId !== "string" || leafId.length === 0) {
+			return fallbackToBranch();
+		}
+
+		const cached = piBranchProjectionBySession.get(sessionId);
+		if (cached?.leafId === leafId) return cached.entries;
+
+		const suffix: unknown[] = [];
+		const seen = new Set<string>();
+		let cursor: string | null = leafId;
+		let cachedAncestorIndex: number | undefined;
+		while (cursor !== null) {
+			const priorIndex = cached?.indexById.get(cursor);
+			if (priorIndex !== undefined) {
+				cachedAncestorIndex = priorIndex;
+				break;
+			}
+			if (seen.has(cursor)) return fallbackToBranch();
+			seen.add(cursor);
+			const entry = sm.getEntry.call(sm, cursor);
+			if (!entry || typeof entry !== "object") return fallbackToBranch();
+			const row = entry as { id?: unknown; parentId?: unknown };
+			if (
+				row.id !== cursor ||
+				(row.parentId !== null && typeof row.parentId !== "string")
+			) {
+				return fallbackToBranch();
+			}
+			suffix.push(entry);
+			cursor = row.parentId as string | null;
+		}
+		suffix.reverse();
+
+		if (cached && cachedAncestorIndex === cached.entries.length - 1) {
+			const entries = [...cached.entries, ...suffix];
+			if (
+				suffix.some(
+					(entry) =>
+						(entry as { type?: unknown } | undefined)?.type === "compaction",
+				)
+			) {
+				return installProjection(leafId, entries);
+			}
+			for (let index = 0; index < suffix.length; index += 1) {
+				const entry = suffix[index];
+				const id = (entry as { id: string }).id;
+				cached.indexById.set(id, cached.entries.length + index);
+				addPiBranchEntryToLookup(cached.lookup, entry);
+				if (isPiContextEmitEligible(entry)) {
+					cached.lookup.alignedEntryIds.push(entry.id);
+				}
+			}
+			const projection = {
+				leafId,
+				entries,
+				indexById: cached.indexById,
+				lookup: cached.lookup,
+			};
+			piBranchProjectionBySession.set(sessionId, projection);
+			piBranchLookupByProjection.set(entries, cached.lookup);
+			return entries;
+		}
+
+		const entries =
+			cached && cachedAncestorIndex !== undefined
+				? [...cached.entries.slice(0, cachedAncestorIndex + 1), ...suffix]
+				: suffix;
+		return installProjection(leafId, entries);
 	} catch (error) {
 		sessionLog(
 			sessionId,
-			`Pi branch pre-read failed: ${error instanceof Error ? error.message : String(error)}`,
+			`Pi branch projection failed: ${error instanceof Error ? error.message : String(error)}`,
 		);
-		return null;
+		try {
+			return fallbackToBranch();
+		} catch (fallbackError) {
+			sessionLog(
+				sessionId,
+				`Pi branch pre-read failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+			);
+			return null;
+		}
 	}
 }
 
@@ -1755,26 +1922,25 @@ export function registerPiContextHandler(
 			);
 			rawMessageProviderUnregistersBySession.set(sessionId, unregisterRaw);
 			scheduleReconciliation(options.db, sessionId, readRawSessionMessages);
-			// Reference-based entry-id resolution. Immune to the
-			// position-based count divergence that broke
-			// `collectMessageEntryIdsStrict` when Pi's `agent.state.messages`
-			// and `sessionManager.getBranch()` were out of sync (off-by-one
-			// near agent_end, or much larger gaps when condensed-milk-pi
-			// is active). Returns `null` only when getBranch is unavailable;
-			// otherwise returns an array indexed 1:1 with event.messages
-			// (with undefined for any message whose AgentMessage reference
-			// doesn't match a branch entry — typically synthetic compaction
-			// summaries and custom_message wrappers, which never carry
-			// compartment boundaries).
+			// Pi builds the context from this exact branch projection before cloning
+			// messages for extension handlers. A compaction-aware projection with the
+			// same length is therefore the lossless O(1) alignment lane. If another
+			// extension changed the message count, fall back to conservative fingerprint
+			// matching and leave ambiguous messages unresolved.
+			const branchLookup =
+				branchEntries === null ? null : getPiBranchEntryLookup(branchEntries);
+			const alignedEntryIds = branchLookup?.alignedEntryIds ?? null;
 			const resolvedEntryIds =
-				branchEntries === null
-					? null
-					: collectMessageEntryIdsByRef(
-							ctx,
-							event.messages as readonly PiAgentMessage[],
-							sessionId,
-							branchEntries,
-						);
+				alignedEntryIds?.length === event.messages.length
+					? alignedEntryIds
+					: branchEntries === null
+						? null
+						: collectMessageEntryIdsByRef(
+								ctx,
+								event.messages as readonly PiAgentMessage[],
+								sessionId,
+								branchEntries,
+							);
 			const strictEntryIds = resolvedEntryIds ? [...resolvedEntryIds] : null;
 			if (strictEntryIds && options.injection) {
 				const removed = trimPiMessagesToCachedBoundary(
@@ -1825,6 +1991,7 @@ export function registerPiContextHandler(
 				),
 			);
 			logTransformTiming(sessionId, "findLastUserMessageId", tLastUser);
+			const tMessageIndexScheduling = performance.now();
 			if (latestUser) {
 				const located = branchEntries
 					? convertLocatedPiUserEntry(branchEntries, latestUser.messageId)
@@ -1838,6 +2005,11 @@ export function registerPiContextHandler(
 							readPiSessionMessageById(ctx, messageId)),
 				);
 			}
+			logTransformTiming(
+				sessionId,
+				"messageIndexScheduling",
+				tMessageIndexScheduling,
+			);
 
 			// Lazy-initialize tagger state from DB. Idempotent: re-init
 			// during the same session is a no-op because the in-memory
@@ -2377,6 +2549,8 @@ export function registerPiContextHandler(
 						)
 					: undefined;
 
+			logTransformTiming(sessionId, "prePipelineTotal", transformStartTime);
+			const tRunPipeline = performance.now();
 			const result = await runPipeline({
 				db: options.db,
 				tagger,
@@ -2435,20 +2609,19 @@ export function registerPiContextHandler(
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
 				isSubagent: sessionMeta.isSubagent,
 			});
+			logTransformTiming(sessionId, "runPipeline", tRunPipeline);
+			const postPipelineStart = performance.now();
+			const tTransformDecision = performance.now();
 			// Replace the reuse window only after a successful pass. An id absent from
 			// the current branch must take one full derivation pass if it later returns,
 			// and bounding the set to the live branch prevents session-long growth.
 			if (strictEntryIds) {
 				recordSuccessfulTaggedMessageIds(sessionId, strictEntryIds);
 			}
-			const piDecisionSnapshotNewestAssistant =
-				branchEntries === null
-					? undefined
-					: findNewestPiAssistantEntryId(branchEntries);
-			if (
-				result.bustedThisPass &&
-				piDecisionSnapshotNewestAssistant !== undefined
-			) {
+			const piDecisionSnapshotNewestAssistant = result.bustedThisPass
+				? findNewestPiAssistantEntryId(branchEntries)
+				: undefined;
+			if (piDecisionSnapshotNewestAssistant !== undefined) {
 				recordPendingPiTransformDecision(
 					sessionId,
 					{
@@ -2469,11 +2642,17 @@ export function registerPiContextHandler(
 					piDecisionSnapshotNewestAssistant,
 				);
 			}
+			logTransformTiming(
+				sessionId,
+				"transformDecisionAndReuseState",
+				tTransformDecision,
+			);
 
 			// After tagging+drops have committed, check whether historian
 			// should fire. Historian config is optional — tagging-only
 			// behavior is the Step 4b.2 contract, and historian is
 			// fire-and-forget so we never block the LLM call on it.
+			const tHistorianScheduling = performance.now();
 			if (options.historian) {
 				maybeFireHistorian({
 					pi,
@@ -2487,6 +2666,11 @@ export function registerPiContextHandler(
 					taggerFloor,
 				});
 			}
+			logTransformTiming(
+				sessionId,
+				"historianScheduling",
+				tHistorianScheduling,
+			);
 
 			// Step 4b.4: nudge + note-nudge + auto-search hint. All three
 			// run AFTER tagging/drops finish so they see the post-mutation
@@ -2496,6 +2680,7 @@ export function registerPiContextHandler(
 			const tPostTransform = performance.now();
 			let outputMessages = result.messages as PiAgentMessage[];
 
+			const tNoteNudges = performance.now();
 			try {
 				outputMessages = applyNoteNudges({
 					sessionId,
@@ -2520,7 +2705,9 @@ export function registerPiContextHandler(
 					`note nudges failed: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			logTransformTiming(sessionId, "noteNudges", tNoteNudges);
 
+			const tAutoSearch = performance.now();
 			if (options.autoSearch?.enabled) {
 				try {
 					outputMessages = await runAutoSearchHintForPi({
@@ -2551,6 +2738,7 @@ export function registerPiContextHandler(
 					);
 				}
 			}
+			logTransformTiming(sessionId, "autoSearch", tAutoSearch);
 
 			// Synthetic todowrite injection — Pi parity with OpenCode's
 			// transform-postprocess-phase.ts B7. On cache-busting passes,
@@ -2572,6 +2760,7 @@ export function registerPiContextHandler(
 			//
 			// Subagents skip — they don't get synthetic injection in
 			// OpenCode either (see B7 `args.fullFeatureMode` gate).
+			const tTodoCapture = performance.now();
 			try {
 				const sessionMetaForTodo = getOrCreateSessionMeta(
 					options.db,
@@ -2600,6 +2789,7 @@ export function registerPiContextHandler(
 					`synthetic todowrite injection failed: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			logTransformTiming(sessionId, "todoCapture", tTodoCapture);
 
 			// Channel 1 baseline snapshot + Channel 2 ceiling trigger. Mirrors
 			// OpenCode's transform.ts end-of-pass block. Computed from the final
@@ -2607,6 +2797,7 @@ export function registerPiContextHandler(
 			// (a proven transform boundary) zeroes the per-turn accumulator. The
 			// `tool_result` handler in index.ts reads this baseline. Primary-only:
 			// a missing baseline is how Channel 1 stays off for subagents.
+			const tChannelAccounting = performance.now();
 			try {
 				const sessionMetaForCh1 = getOrCreateSessionMeta(options.db, sessionId);
 				// Gate on ctx_reduce being callable. Primary Pi sessions register the
@@ -2733,6 +2924,11 @@ export function registerPiContextHandler(
 					`channel1 baseline / channel2 trigger failed: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			logTransformTiming(
+				sessionId,
+				"channelNudgeAccounting",
+				tChannelAccounting,
+			);
 
 			// Work-metrics update runs on EVERY transform pass (not just
 			// execute passes). The Pi compute helper is pure-read on
@@ -2741,6 +2937,7 @@ export function registerPiContextHandler(
 			// cache-busting). Gating on executedWorkThisPass would mean
 			// sessions sitting below execute threshold never see populated
 			// values, making Pi's status surface permanently zero.
+			const tWorkMetrics = performance.now();
 			try {
 				const metrics = computePiWorkMetrics(outputMessages as unknown[]);
 				setSessionWorkMetrics(
@@ -2755,7 +2952,9 @@ export function registerPiContextHandler(
 					`work-metrics update failed: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			logTransformTiming(sessionId, "workMetrics", tWorkMetrics);
 
+			const tStableIdSchemePersist = performance.now();
 			if (stableIdSchemeCutover) {
 				// Scheme stamps only after the cutover pass completed. If this write
 				// fails, the outer fail-open path ships the original messages and the
@@ -2772,19 +2971,13 @@ export function registerPiContextHandler(
 					`stable-id scheme cutover complete — stamped scheme=${PI_STABLE_ID_SCHEME}`,
 				);
 			}
+			logTransformTiming(
+				sessionId,
+				"stableIdSchemePersist",
+				tStableIdSchemePersist,
+			);
 
 			logTransformTiming(sessionId, "postTransformPhase", tPostTransform);
-			const transformElapsedMs = performance.now() - transformStartTime;
-			recordPiTransformTiming({
-				sessionId,
-				stage: "total",
-				elapsedMs: transformElapsedMs,
-				extra: `messages=${outputMessages.length} targets=${result.targetCount}`,
-			});
-			sessionLog(
-				sessionId,
-				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
-			);
 
 			// Cast the rebuilt array back to the AgentMessage[] shape Pi's
 			// ContextEventResult expects. The nudge/note/auto-search paths
@@ -2795,6 +2988,18 @@ export function registerPiContextHandler(
 				sessionId,
 				projectDirectory,
 				projectIdentity,
+			);
+			logTransformTiming(sessionId, "postPipelineTotal", postPipelineStart);
+			const transformElapsedMs = performance.now() - transformStartTime;
+			recordPiTransformTiming({
+				sessionId,
+				stage: "total",
+				elapsedMs: transformElapsedMs,
+				extra: `messages=${outputMessages.length} targets=${result.targetCount}`,
+			});
+			sessionLog(
+				sessionId,
+				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
@@ -4008,6 +4213,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	);
 	afterFallbackAdoptionForTests?.(args.stableIdSchemeCutover === true);
 	const tTag = performance.now();
+	let tagTextTokenCache = piTagTextTokenCacheBySession.get(args.sessionId);
+	if (!tagTextTokenCache) {
+		tagTextTokenCache = new Map();
+		piTagTextTokenCacheBySession.set(args.sessionId, tagTextTokenCache);
+	}
+	let tagToolTokenCache = piTagToolTokenCacheBySession.get(args.sessionId);
+	if (!tagToolTokenCache) {
+		tagToolTokenCache = new Map();
+		piTagToolTokenCacheBySession.set(args.sessionId, tagToolTokenCache);
+	}
 	const { targets } = tagTranscript(
 		args.sessionId,
 		transcript,
@@ -4017,6 +4232,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			skipPrefixInjection: !ctxReduceCallable,
 			entryFingerprintByMessageId,
 			reuseMessageIds: args.reusableMessageIds,
+			textTokenCache: tagTextTokenCache,
+			toolTokenCache: tagToolTokenCache,
 			onTiming: hasPiTransformTimingObserver()
 				? (phase, elapsedMs) => {
 						recordPiTransformTiming({
@@ -4281,6 +4498,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// is deterministic, so replay produces the exact text the original
 	// execute pass produced, regardless of how many times it runs.
 	if (args.heuristics?.caveman?.enabled && !args.isSubagent) {
+		const tCavemanReplay = performance.now();
 		try {
 			// P0 perf: caveman replay only acts on tags whose tag_number is in
 			// `targets`, so fetch just that slice instead of the whole session
@@ -4304,6 +4522,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				`caveman replay failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
+		logTransformTiming(args.sessionId, "cavemanReplay", tCavemanReplay);
 	}
 
 	// 3d. Cleanup stages NOT applicable to Pi (intentionally omitted):
@@ -4590,6 +4809,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// newly aged ids are detected only while this pass is already busting and
 	// are persisted before their bytes are replaced with empty text sentinels.
 	if (args.canUseEmptySentinels) {
+		const tProcessedImages = performance.now();
 		try {
 			const imageResult = stripPiProcessedImages({
 				db: args.db,
@@ -4612,6 +4832,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				`processed-image strip failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
+		logTransformTiming(
+			args.sessionId,
+			"stripProcessedImages",
+			tProcessedImages,
+		);
 	}
 
 	// 5. Commit tagging mutations back to Pi messages BEFORE injecting
@@ -4619,7 +4844,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// pre-tagged content. Pi's transcript adapter writes mutations
 	// back to the underlying AgentMessage[] via the part proxies, so
 	// commit() just locks the result in.
+	const tTranscriptCommit = performance.now();
 	transcript.commit();
+	logTransformTiming(args.sessionId, "transcriptCommit", tTranscriptCommit);
 	if (toolReclaimExecutePass) {
 		advanceToolReclaimWatermarkToCurrentMax(args.db, args.sessionId);
 	}
@@ -4651,6 +4878,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	//      a pi-msg-* fallback id would defeat that and anchor to an unstable id.
 	// The only legitimate misses are injection's synthetic m[0]/m[1] prepends,
 	// which carry no SessionEntry id and must not be anchored.
+	const tPostCommitStableIdMaps = performance.now();
 	const postCommitStableIdByRef = new Map<object, string>();
 	const postCommitEntryIdByRef = new Map<object, string>();
 	for (let i = 0; i < args.messages.length; i++) {
@@ -4670,6 +4898,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			postCommitEntryIdByRef.set(m as object, realId);
 		}
 	}
+	logTransformTiming(
+		args.sessionId,
+		"postCommitStableIdMaps",
+		tPostCommitStableIdMaps,
+	);
 
 	// 6. <session-history> injection — writes compartments, facts, and
 	// project memories into message[0]. This is the second-biggest
@@ -4740,6 +4973,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		}
 	}
 
+	const tDroppedPlaceholders = performance.now();
 	stripPiDroppedPlaceholderMessages({
 		db: args.db,
 		sessionId: args.sessionId,
@@ -4763,6 +4997,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// pass (discovery is otherwise gated on isCacheBusting = history-refresh).
 		forceDiscovery: args.stableIdSchemeCutover === true,
 	});
+	logTransformTiming(
+		args.sessionId,
+		"stripDroppedPlaceholders",
+		tDroppedPlaceholders,
+	);
 
 	// Drain predicate intentionally has two Pi-specific terms beyond OpenCode's
 	// `historyWasConsumedThisPass && deferredHistoryWasPendingAtPassStart &&
@@ -4902,6 +5141,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		const counts = tokenizePiMessages(outputMessages as unknown[], {
 			cache: tokenCache,
 			stableId: (message) => postCommitEntryIdByRef.get(message),
+			onTiming: hasPiTransformTimingObserver()
+				? (phase, elapsedMs) => {
+						recordPiTransformTiming({
+							sessionId: args.sessionId,
+							stage: `token:${phase}`,
+							elapsedMs,
+						});
+					}
+				: undefined,
 		});
 		updateSessionMeta(args.db, args.sessionId, {
 			conversationTokens: counts.conversation,
@@ -5009,6 +5257,7 @@ function applyNoteNudges(args: {
 	const { sessionId, db, messages, projectIdentity, entryIds, entryIdByRef } =
 		args;
 
+	const tNoteIndexMaps = performance.now();
 	const messageIdByIndex = buildPiMessageIdByIndex(
 		messages,
 		entryIds,
@@ -5021,7 +5270,9 @@ function applyNoteNudges(args: {
 		true,
 		entryIdByRef,
 	);
+	logTransformTiming(sessionId, "noteIndexMaps", tNoteIndexMaps);
 
+	const tStickyReplay = performance.now();
 	for (const anchor of getNoteNudgeAnchors(db, sessionId)) {
 		appendReminderToUserMessageByIdPi(
 			messages,
@@ -5040,6 +5291,7 @@ function applyNoteNudges(args: {
 			);
 		}
 	}
+	logTransformTiming(sessionId, "stickyReplayDecisions", tStickyReplay);
 
 	// Path 2: fresh delivery. Use the latest user message id (or null if
 	// no user messages yet) as the trigger-message hint to peekNoteNudgeText.
@@ -5373,6 +5625,9 @@ export function clearContextHandlerSession(sessionId: string): void {
 		taggersBySession.delete(sessionId);
 	}
 	piMessageTokenCacheBySession.delete(sessionId);
+	piTagTextTokenCacheBySession.delete(sessionId);
+	piTagToolTokenCacheBySession.delete(sessionId);
+	piBranchProjectionBySession.delete(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
 	clearPiChannel1State(sessionId);
 	lastHeuristicsTurnIdBySession.delete(sessionId);

@@ -13,6 +13,7 @@ interface Options {
 	messages: number;
 	step: number;
 	points?: string;
+	repeatFinal: number;
 	lane: string;
 }
 
@@ -61,6 +62,9 @@ async function runHarness(
 	];
 	if (fixture) args.push("--fixture", fixture);
 	if (options.points) args.push("--points", options.points);
+	if (options.repeatFinal > 0) {
+		args.push("--repeat-final", String(options.repeatFinal));
+	}
 	try {
 		const child = Bun.spawn(args, {
 			cwd: resolve(import.meta.dir, "../../.."),
@@ -108,6 +112,7 @@ function parseOptions(args: readonly string[]): Options {
 		synthetic: false,
 		messages: 1_000,
 		step: 500,
+		repeatFinal: 0,
 		lane: "default",
 	};
 	for (let index = 0; index < args.length; index += 1) {
@@ -127,6 +132,9 @@ function parseOptions(args: readonly string[]): Options {
 			index += 1;
 		} else if (arg === "--points" && value) {
 			options.points = value;
+			index += 1;
+		} else if (arg === "--repeat-final" && value) {
+			options.repeatFinal = positiveInteger(value, arg);
 			index += 1;
 		} else if (arg === "--lane" && value) {
 			options.lane = value;

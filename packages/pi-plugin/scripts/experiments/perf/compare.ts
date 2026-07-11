@@ -18,6 +18,7 @@ interface Options {
 	messages: number;
 	step: number;
 	points?: string;
+	repeatFinal: number;
 }
 
 async function main(): Promise<void> {
@@ -100,6 +101,9 @@ async function main(): Promise<void> {
 			"--step",
 			String(options.step),
 		];
+		if (options.repeatFinal > 0) {
+			commonArgs.push("--repeat-final", String(options.repeatFinal));
+		}
 		if (options.fixture) commonArgs.push("--fixture", resolve(options.fixture));
 		if (options.points) commonArgs.push("--points", options.points);
 
@@ -241,7 +245,12 @@ async function run(
 }
 
 function parseOptions(args: readonly string[]): Options {
-	const options: Options = { baseline: "AUTO", messages: 1_000, step: 500 };
+	const options: Options = {
+		baseline: "AUTO",
+		messages: 1_000,
+		step: 500,
+		repeatFinal: 0,
+	};
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		const value = args[index + 1];
@@ -259,6 +268,9 @@ function parseOptions(args: readonly string[]): Options {
 			index += 1;
 		} else if (arg === "--points" && value) {
 			options.points = value;
+			index += 1;
+		} else if (arg === "--repeat-final" && value) {
+			options.repeatFinal = positiveInteger(value, arg);
 			index += 1;
 		} else {
 			throw new Error(`Unknown or incomplete argument: ${arg ?? "<missing>"}`);
