@@ -16,6 +16,8 @@ export function printGrowthTable(label: string, report: PerfRunReport): void {
 			),
 			token_ms: round(pass.phases.tokenCountingBackfill),
 			db_ms: round(pass.phases.dbIo),
+			serialize_ms: round(pass.serializationMs ?? 0),
+			deferred_db_ops: pass.deferredDb?.operations ?? 0,
 			tags: pass.tagRows,
 		})),
 	);
@@ -38,7 +40,9 @@ export function printLargestPhaseTable(
 	);
 	console.log(
 		`DB I/O is cross-cutting: ${largest.db.operations} operations ` +
-			`(${largest.db.reads} reads, ${largest.db.writes} writes).`,
+			`(${largest.db.reads} reads, ${largest.db.writes} writes). ` +
+			`Serialization took ${round(largest.serializationMs ?? 0)}ms; the 150ms drain observed ` +
+			`${largest.deferredDb?.operations ?? 0} deferred DB operations.`,
 	);
 }
 

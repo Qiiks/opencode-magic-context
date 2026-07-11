@@ -260,6 +260,7 @@ export {
     getTagById,
     getTagsByNumbers,
     getTagsBySession,
+    getTagsForPendingOperations,
     getTopNBySize,
     getTriggerTagTokenUpperBound,
     hasPiFallbackMessageTags,

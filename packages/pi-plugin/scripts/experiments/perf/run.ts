@@ -21,12 +21,20 @@ import {
 	summarizePhases,
 } from "./instrumentation";
 
+type PerfLane =
+	| "default"
+	| "historian-low"
+	| "historian-high"
+	| "execute-compacted"
+	| "auto-search-sticky";
+
 interface RunnerOptions {
 	fixture?: string;
 	messages: number;
 	step: number;
 	points?: number[];
 	output?: string;
+	lane: PerfLane;
 }
 
 export interface PerfPassReport {
@@ -40,14 +48,18 @@ export interface PerfPassReport {
 	tagRowsHash: string;
 	phases: PhaseTotals;
 	db: DatabaseTiming;
+	serializationMs: number;
+	deferredDrainMs: number;
+	deferredDb: DatabaseTiming;
 }
 
 export interface PerfRunReport {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	fixture: string;
 	fixtureBytes: number;
 	sessionId: string;
 	requestedStep: number;
+	lane: PerfLane;
 	passes: PerfPassReport[];
 }
 
@@ -83,7 +95,11 @@ async function main(): Promise<void> {
 		import("@magic-context/core/shared/harness"),
 	]);
 	const [
-		{ registerPiContextHandler, clearContextHandlerSession },
+		{
+			registerPiContextHandler,
+			clearContextHandlerSession,
+			awaitInFlightHistorians,
+		},
 		{ setPiTransformTimingObserver },
 	] = await Promise.all([
 		import("../../../src/context-handler"),
@@ -107,10 +123,15 @@ async function main(): Promise<void> {
 			handlers.set(event, handler);
 		},
 	};
+	const historianEnabled =
+		options.lane === "historian-low" || options.lane === "historian-high";
 	registerPiContextHandler(pi as never, {
 		db: dbTimer.database as never,
 		protectedTags: 20,
-		scheduler: { executeThresholdPercentage: 95 },
+		scheduler: {
+			executeThresholdPercentage:
+				options.lane === "execute-compacted" ? 10 : 95,
+		},
 		heuristics: { caveman: { enabled: false, minChars: 2_000 } },
 		injection: {
 			memoryEnabled: false,
@@ -118,6 +139,21 @@ async function main(): Promise<void> {
 			injectionBudgetTokens: 4_000,
 			temporalAwareness: false,
 		},
+		historian: historianEnabled
+			? {
+					runner: {
+						harness: "pi-perf",
+						run: async () => ({ ok: false, reason: "model_error" }),
+					} as never,
+					model: "perf/mock-historian",
+					historianChunkTokens: 8_000,
+					executeThresholdPercentage: 65,
+				}
+			: undefined,
+		autoSearch:
+			options.lane === "auto-search-sticky"
+				? { enabled: true, minPromptChars: Number.MAX_SAFE_INTEGER }
+				: undefined,
 	});
 	const handler = handlers.get("context");
 	if (!handler)
@@ -132,10 +168,29 @@ async function main(): Promise<void> {
 			if (!pass) continue;
 			timings.reset();
 			dbTimer.reset();
+			if (options.lane === "execute-compacted" && index > 0) {
+				rawDb
+					.prepare(
+						`UPDATE tags SET status = 'compacted'
+						 WHERE session_id = ? AND tag_number < COALESCE(
+						   (SELECT MAX(tag_number) - 20 FROM tags WHERE session_id = ?), 0
+						 )`,
+					)
+					.run(fixture.sessionId, fixture.sessionId);
+			}
+			const usagePercentage =
+				options.lane === "historian-high"
+					? 85
+					: options.lane === "historian-low"
+						? 25
+						: options.lane === "execute-compacted"
+							? 70
+							: 0.25;
 			const context = fakeContext(
 				fixture.sessionId,
 				fixture.cwd,
 				pass.branchEntries,
+				usagePercentage,
 			);
 			const event = { messages: pass.messages };
 			const inputMessageCount = event.messages.length;
@@ -154,8 +209,16 @@ async function main(): Promise<void> {
 				);
 			}
 			const dbSnapshot = dbTimer.snapshot();
-			const tagRows = readTagRows(rawDb, fixture.sessionId);
+			const serializationStart = performance.now();
 			const outputCanonical = canonicalJson(output);
+			const serializationMs = performance.now() - serializationStart;
+			const drainStart = performance.now();
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			await awaitInFlightHistorians();
+			const deferredDrainMs = performance.now() - drainStart;
+			const afterDrainDb = dbTimer.snapshot();
+			const deferredDb = subtractDatabaseTiming(afterDrainDb, dbSnapshot);
+			const tagRows = readTagRows(rawDb, fixture.sessionId);
 			reports.push({
 				pass: index + 1,
 				requestedMessages: pass.requestedMessages,
@@ -167,6 +230,9 @@ async function main(): Promise<void> {
 				tagRowsHash: canonicalHash(tagRows),
 				phases: summarizePhases(timings.samples(), dbSnapshot),
 				db: dbSnapshot,
+				serializationMs,
+				deferredDrainMs,
+				deferredDb,
 			});
 		}
 	} finally {
@@ -177,11 +243,12 @@ async function main(): Promise<void> {
 	}
 
 	const report: PerfRunReport = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		fixture: fixture.name,
 		fixtureBytes: fixture.sourceBytes,
 		sessionId: fixture.sessionId,
 		requestedStep: options.step,
+		lane: options.lane,
 		passes: reports,
 	};
 	const serialized = `${JSON.stringify(report, null, 2)}\n`;
@@ -193,6 +260,7 @@ function fakeContext(
 	sessionId: string,
 	cwd: string,
 	branchEntries: readonly SessionEntry[],
+	usagePercentage: number,
 ): ExtensionContext {
 	const byId = new Map(branchEntries.map((entry) => [entry.id, entry]));
 	return {
@@ -211,8 +279,8 @@ function fakeContext(
 			getEntry: (id: string) => byId.get(id),
 		},
 		getContextUsage: () => ({
-			tokens: 1_000,
-			percent: 0.25,
+			tokens: Math.round((400_000 * usagePercentage) / 100),
+			percent: usagePercentage,
 			contextWindow: 400_000,
 		}),
 	} as unknown as ExtensionContext;
@@ -235,6 +303,18 @@ function readTagRows(
 		.all(sessionId);
 }
 
+function subtractDatabaseTiming(
+	after: DatabaseTiming,
+	before: DatabaseTiming,
+): DatabaseTiming {
+	return {
+		elapsedMs: after.elapsedMs - before.elapsedMs,
+		operations: after.operations - before.operations,
+		reads: after.reads - before.reads,
+		writes: after.writes - before.writes,
+	};
+}
+
 function buildPoints(messageCount: number, step: number): number[] {
 	const points: number[] = [];
 	for (
@@ -249,7 +329,11 @@ function buildPoints(messageCount: number, step: number): number[] {
 }
 
 function parseOptions(args: readonly string[]): RunnerOptions {
-	const options: RunnerOptions = { messages: 1_000, step: 500 };
+	const options: RunnerOptions = {
+		messages: 1_000,
+		step: 500,
+		lane: "default",
+	};
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		const value = args[index + 1];
@@ -270,11 +354,25 @@ function parseOptions(args: readonly string[]): RunnerOptions {
 		} else if (arg === "--output" && value) {
 			options.output = value;
 			index += 1;
+		} else if (arg === "--lane" && value) {
+			if (!isPerfLane(value)) throw new Error(`Unknown perf lane: ${value}`);
+			options.lane = value;
+			index += 1;
 		} else {
 			throw new Error(`Unknown or incomplete argument: ${arg ?? "<missing>"}`);
 		}
 	}
 	return options;
+}
+
+function isPerfLane(value: string): value is PerfLane {
+	return [
+		"default",
+		"historian-low",
+		"historian-high",
+		"execute-compacted",
+		"auto-search-sticky",
+	].includes(value);
 }
 
 function positiveInteger(value: string, option: string): number {

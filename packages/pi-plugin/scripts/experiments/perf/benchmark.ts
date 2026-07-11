@@ -13,6 +13,7 @@ interface Options {
 	messages: number;
 	step: number;
 	points?: string;
+	lane: string;
 }
 
 async function main(): Promise<void> {
@@ -20,8 +21,8 @@ async function main(): Promise<void> {
 	const fixtures = selectFixtures(options);
 	for (const fixture of fixtures) {
 		const report = await runHarness(options, fixture);
-		printGrowthTable("transform", report);
-		printLargestPhaseTable("transform", report);
+		printGrowthTable(`transform:${report.lane}`, report);
+		printLargestPhaseTable(`transform:${report.lane}`, report);
 	}
 }
 
@@ -55,6 +56,8 @@ async function runHarness(
 		String(options.step),
 		"--output",
 		output,
+		"--lane",
+		options.lane,
 	];
 	if (fixture) args.push("--fixture", fixture);
 	if (options.points) args.push("--points", options.points);
@@ -105,6 +108,7 @@ function parseOptions(args: readonly string[]): Options {
 		synthetic: false,
 		messages: 1_000,
 		step: 500,
+		lane: "default",
 	};
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
@@ -123,6 +127,9 @@ function parseOptions(args: readonly string[]): Options {
 			index += 1;
 		} else if (arg === "--points" && value) {
 			options.points = value;
+			index += 1;
+		} else if (arg === "--lane" && value) {
+			options.lane = value;
 			index += 1;
 		} else if (arg === "--all") {
 			options.all = true;

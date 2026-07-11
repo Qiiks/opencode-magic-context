@@ -77,6 +77,13 @@ export interface InMemoryTailSource {
     absoluteMessageCount: number;
 }
 
+/**
+ * Deferred tail conversion for callers that have already tagged the live wire.
+ * The trigger's cheap gate can use the caller-provided tag floor without building
+ * RawMessages; the factory runs only when authoritative tail inspection is needed.
+ */
+export type LazyInMemoryTailSource = () => InMemoryTailSource | undefined;
+
 function tagOwnerMessageId(row: {
     type: string;
     message_id: string;
@@ -409,7 +416,7 @@ export function checkCompartmentTrigger(
     commitClusterTrigger?: { enabled: boolean; min_clusters: number },
     preloadedActiveTags?: readonly TagEntry[],
     contextLimit?: number,
-    inMemoryTail?: InMemoryTailSource,
+    inMemoryTail?: InMemoryTailSource | LazyInMemoryTailSource,
     taggerFloorOverride?: number,
 ): CompartmentTriggerResult {
     if (sessionMeta.compartmentInProgress) {
@@ -420,19 +427,17 @@ export function checkCompartmentTrigger(
         return { shouldFire: false };
     }
 
-    // The in-memory tail is only usable AFTER the one-time v3 protected-tail
-    // policy seed: the legacy seed (getLegacyProtectedTailStartOrdinal) must
-    // scan ALL user messages of the session, which a tail slice cannot provide.
-    // Mirror the DB tail-prime's gate — before the seed, fall through to the
-    // full DB read (which runs the seed once); afterwards (policyVersion >= 3,
-    // the steady state) the in-memory path applies. Live-capture verified: the
-    // only migrationFloor divergences were on un-seeded sessions.
-    if (inMemoryTail) {
+    const lazyInMemoryTail = typeof inMemoryTail === "function" ? inMemoryTail : undefined;
+    let resolvedInMemoryTail = typeof inMemoryTail === "function" ? undefined : inMemoryTail;
+
+    // An in-memory tail is usable only after the one-time v3 seed, which needs
+    // the complete session. Before then, retain the provider-backed fallback.
+    if (resolvedInMemoryTail) {
         try {
             const policyVersion = loadProtectedTailMeta(db, sessionId).protectedTailPolicyVersion;
-            if (policyVersion < 3) inMemoryTail = undefined;
+            if (policyVersion < 3) resolvedInMemoryTail = undefined;
         } catch {
-            inMemoryTail = undefined;
+            resolvedInMemoryTail = undefined;
         }
     }
 
@@ -453,11 +458,11 @@ export function checkCompartmentTrigger(
     const taggerFloor =
         taggerFloorOverride !== undefined && taggerFloorOverride > 0
             ? taggerFloorOverride
-            : inMemoryTail
+            : resolvedInMemoryTail
               ? deriveTagLoadFloor(
                     db,
                     sessionId,
-                    inMemoryTail.messages.map((m) => m.id),
+                    resolvedInMemoryTail.messages.map((m) => m.id),
                 )
               : 0;
 
@@ -499,18 +504,20 @@ export function checkCompartmentTrigger(
             // could falsely cheap-skip a needed historian fire (context overflow).
             // So fall back to floor 0 here — the full active+dropped sum is still a
             // valid UPPER bound (pre-boundary tags only inflate it), just looser.
-            const boundFloor = inMemoryTail ? taggerFloor : 0;
+            // A lazy source is supplied only after the caller has tagged the live
+            // wire, so its scoped persisted sum already covers the retained tail.
+            const boundFloor = resolvedInMemoryTail || lazyInMemoryTail ? taggerFloor : 0;
             const { bound: persistedBound, nullCount } = getTriggerTagTokenUpperBound(
                 db,
                 sessionId,
                 boundFloor,
             );
             if (nullCount === 0) {
-                const untaggedUpperBound = inMemoryTail
+                const untaggedUpperBound = resolvedInMemoryTail
                     ? estimateUntaggedInMemoryTailUpperBound(
                           db,
                           sessionId,
-                          inMemoryTail,
+                          resolvedInMemoryTail,
                           taggerFloor,
                       )
                     : 0;
@@ -519,7 +526,7 @@ export function checkCompartmentTrigger(
                 // (commit_clusters). tail_size needs even more. Equality falls
                 // through to preserve the existing conservative < semantics.
                 if (eligibleUpperBound < triggerBudget) {
-                    const memorySuffix = inMemoryTail
+                    const memorySuffix = resolvedInMemoryTail
                         ? ` (persisted=${persistedBound}, untagged-memory≤${untaggedUpperBound})`
                         : "";
                     sessionLog(
@@ -539,6 +546,15 @@ export function checkCompartmentTrigger(
         }
     }
 
+    if (lazyInMemoryTail) {
+        try {
+            const policyVersion = loadProtectedTailMeta(db, sessionId).protectedTailPolicyVersion;
+            if (policyVersion >= 3) resolvedInMemoryTail = lazyInMemoryTail();
+        } catch {
+            resolvedInMemoryTail = undefined;
+        }
+    }
+
     const tailInfo = getUnsummarizedTailInfo(
         db,
         sessionId,
@@ -546,7 +562,7 @@ export function checkCompartmentTrigger(
         usage,
         executeThresholdPercentage,
         contextLimit,
-        inMemoryTail,
+        resolvedInMemoryTail,
         taggerFloor,
     );
     if (!tailInfo.hasNewRawHistory) {
@@ -611,11 +627,11 @@ export function checkCompartmentTrigger(
         // inspection: prime from the in-memory tail when supplied (zero DB
         // reads), otherwise this rare ≥80% path does its own full read as before.
         const scaledBoundary = withRawSessionMessageCache(() => {
-            if (inMemoryTail) {
+            if (resolvedInMemoryTail) {
                 primeInMemoryTailRawMessageCache({
                     sessionId,
-                    messages: inMemoryTail.messages,
-                    absoluteMessageCount: inMemoryTail.absoluteMessageCount,
+                    messages: resolvedInMemoryTail.messages,
+                    absoluteMessageCount: resolvedInMemoryTail.absoluteMessageCount,
                 });
             }
             return resolveOpenCodeProtectedTailBoundary({

@@ -16,6 +16,17 @@ Use `--points 500,1000,2000,4000,5725` for fixed checkpoints. The synthetic gene
 
 The phase table reports transform phases plus DB I/O. DB time is cross-cutting and therefore overlaps the phase that issued each query. Per-part timing is activated only while the harness observer is installed; production does not pay those timers.
 
+Use `--lane` to exercise hot paths that the default cache-stable pass does not reach:
+
+```bash
+bun scripts/experiments/perf/benchmark.ts --synthetic --points 1000,3000,5725 --lane historian-low
+bun scripts/experiments/perf/benchmark.ts --synthetic --points 1000,3000,5725 --lane historian-high
+bun scripts/experiments/perf/benchmark.ts --synthetic --points 1000,3000,5725 --lane execute-compacted
+bun scripts/experiments/perf/benchmark.ts --synthetic --points 1000,3000,5725 --lane auto-search-sticky
+```
+
+Each pass measures output serialization and then waits 150 ms before sampling deferred DB work. Historian lanes use a fail-soft local runner so trigger and scheduling costs are measured without making a model request. The execute lane marks all but the newest tag window compacted between accumulation passes; the auto-search lane persists a no-hint decision on the first pass and measures sticky replay afterward.
+
 ## Byte-identity comparison
 
 Commit the harness before the optimization so the baseline revision contains `run.ts`, then run:

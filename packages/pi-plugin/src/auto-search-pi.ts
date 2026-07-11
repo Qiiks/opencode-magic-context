@@ -283,6 +283,7 @@ export async function runAutoSearchHintForPi(args: {
 	 */
 	entryIdByRef?: ReadonlyMap<object, string> | null;
 	options: PiAutoSearchOptions;
+	ensureProjectRegistered?: () => Promise<void>;
 }): Promise<AgentMessage[]> {
 	const { sessionId, db, messages, options, entryIdByRef } = args;
 	const entryIds =
@@ -326,6 +327,8 @@ export async function runAutoSearchHintForPi(args: {
 		);
 		return messages;
 	}
+
+	await args.ensureProjectRegistered?.();
 
 	const writeNoHintAndReconcile = (
 		reason: AutoSearchHintNoHintReason,

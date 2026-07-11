@@ -36,7 +36,7 @@ import type { TagTarget } from "./tag-messages";
  * reclaim on an already-busting pass, and dedup keeps the newest duplicate's
  * full content as the nearby anchor.
  */
-const RECENT_TOOL_SKELETON_WINDOW = 20;
+export const RECENT_TOOL_SKELETON_WINDOW = 20;
 
 // ONE canonical placeholder for every non-tool (message) drop, on every path,
 // every pass. It is a PURE function of tagId — it reads NO message content, role,

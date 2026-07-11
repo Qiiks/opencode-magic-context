@@ -205,6 +205,7 @@ function trimPiMessagesToBoundary(
 	piMessages: PiAgentMessage[],
 	entryIds: readonly (string | undefined)[] | undefined,
 	cutoffMessageId: string,
+	trimMutableEntryIds = false,
 ): number {
 	if (cutoffMessageId.length === 0) return 0;
 	// Resolve a synthetic-user (folded toolResult) cutoff to the real entry id
@@ -295,6 +296,10 @@ function trimPiMessagesToBoundary(
 	const kept = piMessages.filter((_, index) => !remove.has(index));
 	const removed = piMessages.length - kept.length;
 	piMessages.splice(0, piMessages.length, ...kept);
+	if (trimMutableEntryIds && Array.isArray(entryIds)) {
+		const keptIds = entryIds.filter((_, index) => !remove.has(index));
+		entryIds.splice(0, entryIds.length, ...keptIds);
+	}
 	return removed;
 }
 
@@ -652,6 +657,39 @@ export interface PiMaterializeDecision {
 	reason: string | null;
 }
 
+interface PiInjectionTokenCountCache {
+	m0: string;
+	m0Tokens: number;
+	m1: string;
+	m1Tokens: number;
+}
+
+const injectionTokenCountsBySession = new Map<
+	string,
+	PiInjectionTokenCountCache
+>();
+
+function cachedInjectionTokenCounts(
+	sessionId: string,
+	m0: string,
+	m1: string,
+): { m0Tokens: number; m1Tokens: number } {
+	const cached = injectionTokenCountsBySession.get(sessionId);
+	if (cached?.m0 === m0 && cached.m1 === m1) return cached;
+	const counts = {
+		m0,
+		m0Tokens: estimateTokens(m0),
+		m1,
+		m1Tokens: m1 === PI_M1_PLACEHOLDER ? 0 : estimateTokens(m1),
+	};
+	injectionTokenCountsBySession.set(sessionId, counts);
+	return counts;
+}
+
+export function clearPiInjectionTokenCountCache(sessionId: string): void {
+	injectionTokenCountsBySession.delete(sessionId);
+}
+
 export interface PiRenderedCompartmentBoundary {
 	endMessageId: string | null;
 	ordinal: number | null;
@@ -725,6 +763,31 @@ function getCachedBoundary(
 	return typeof row?.boundary === "string" && row.boundary.length > 0
 		? row.boundary
 		: null;
+}
+
+export function trimPiMessagesToCachedBoundary(
+	db: ContextDatabase,
+	sessionId: string,
+	piMessages: PiAgentMessage[],
+	entryIds: (string | undefined)[] | undefined,
+): number {
+	const row = db
+		.prepare(
+			`SELECT cached_m0_bytes AS m0, cached_m1_bytes AS m1,
+			        cached_m0_last_baseline_end_message_id AS boundary
+			 FROM session_meta WHERE session_id = ?`,
+		)
+		.get(sessionId) as
+		| { m0?: unknown; m1?: unknown; boundary?: unknown }
+		| undefined;
+	if (!row?.m0 || !row.m1 || typeof row.boundary !== "string") return 0;
+	const boundary = row.boundary;
+	if (boundary.length === 0) return 0;
+	const boundaryIsLive = getCompartments(db, sessionId).some(
+		(compartment) => compartment.endMessageId === boundary,
+	);
+	if (!boundaryIsLive) return 0;
+	return trimPiMessagesToBoundary(piMessages, entryIds, boundary, true);
 }
 
 function setCachedBoundary(
@@ -909,6 +972,10 @@ export function mustMaterializePi(
 		db,
 		state,
 		currentCompartments,
+		// Project-doc edits are deliberately soft: they ride the next natural HARD
+		// fold. Reuse the persisted hash for the cache decision so defer passes do
+		// not synchronously read and fingerprint docs they cannot materialize.
+		meta.cachedM0ProjectDocsHash ?? undefined,
 	);
 	if (!meta.cachedM0Bytes) return { value: true, reason: "first_render" };
 	if (!meta.cachedM1Bytes) return { value: true, reason: "cached_m1_missing" };
@@ -2259,8 +2326,11 @@ export function injectM0M1Pi(
 		(state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS) *
 		M1_ABSOLUTE_CAP_RATIO;
 	const m1HasContent = m1 !== PI_M1_PLACEHOLDER;
-	const m1Tokens = m1HasContent ? estimateTokens(m1) : 0;
-	const m0Tokens = estimateTokens(m0);
+	const { m0Tokens, m1Tokens } = cachedInjectionTokenCounts(
+		state.sessionId,
+		m0,
+		m1,
+	);
 	const m1OverAbsoluteCap = m1HasContent && m1Tokens > m1AbsoluteBudget;
 	if (
 		!materialized &&

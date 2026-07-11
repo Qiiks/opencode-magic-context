@@ -102,6 +102,22 @@ describe("message-index-async", () => {
         expect(countMessageRows(db, "ses-overlap", "m-1")).toBe(1);
     });
 
+    it("does not reschedule a completed message and accepts an already-converted entry", async () => {
+        const converted = message("m-direct", 7, "direct source");
+        let fallbackReads = 0;
+        scheduleIncrementalIndex(db, "ses-watermark", converted.id, converted);
+        await wait(140);
+
+        scheduleIncrementalIndex(db, "ses-watermark", converted.id, () => {
+            fallbackReads++;
+            return converted;
+        });
+        await wait(140);
+
+        expect(fallbackReads).toBe(0);
+        expect(countMessageRows(db, "ses-watermark", converted.id)).toBe(1);
+    });
+
     it("reconciles a failed incremental hole even after a later incremental success advanced the watermark", async () => {
         const originalPrepare = db.prepare.bind(db);
         let failMessageId: string | null = "m-2";

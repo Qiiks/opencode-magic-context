@@ -1615,6 +1615,40 @@ export function getActiveTagsBySession(db: Database, sessionId: string): TagEntr
  * Returns an empty array when `tagNumbers` is empty (avoids generating
  * `IN ()` which is an SQL syntax error).
  */
+export function getTagsForPendingOperations(
+    db: Database,
+    sessionId: string,
+    pendingTagNumbers: readonly number[],
+    protectedTags: number,
+    recentToolWindow: number,
+): TagEntry[] {
+    const byNumber = new Map<number, TagEntry>();
+    for (const tag of getTagsByNumbers(db, sessionId, pendingTagNumbers)) {
+        byNumber.set(tag.tagNumber, tag);
+    }
+    const addRows = (sql: string, limit: number): void => {
+        if (limit <= 0) return;
+        const rows = db.prepare(sql).all(sessionId, limit).filter(isTagRow);
+        for (const row of rows) {
+            const tag = toTagEntry(row);
+            byNumber.set(tag.tagNumber, tag);
+        }
+    };
+    addRows(
+        `SELECT ${TAG_SELECT_COLUMNS} FROM tags
+         WHERE session_id = ? AND status = 'active'
+         ORDER BY tag_number DESC, id DESC LIMIT ?`,
+        protectedTags,
+    );
+    addRows(
+        `SELECT ${TAG_SELECT_COLUMNS} FROM tags
+         WHERE session_id = ? AND type = 'tool'
+         ORDER BY tag_number DESC, id DESC LIMIT ?`,
+        recentToolWindow,
+    );
+    return [...byNumber.values()].sort((left, right) => left.tagNumber - right.tagNumber);
+}
+
 export function getTagsByNumbers(
     db: Database,
     sessionId: string,

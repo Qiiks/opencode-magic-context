@@ -71,9 +71,11 @@ const reconciliationScheduledSessions = new Set<string>();
 const sessionLocks = new Map<string, Promise<void>>();
 const incrementalTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const pendingIncrementalKeys = new Set<string>();
+const completedIncrementalKeys = new Set<string>();
 
 type ReadMessages = (sessionId: string) => RawMessage[];
 type ReadSingleMessage = (sessionId: string, messageId: string) => RawMessage | null;
+type IncrementalMessageSource = ReadSingleMessage | RawMessage;
 
 function defer(fn: () => void): void {
     const immediate = (globalThis as { setImmediate?: (callback: () => void) => unknown })
@@ -176,10 +178,14 @@ export function scheduleIncrementalIndex(
     db: Database,
     sessionId: string,
     messageId: string,
-    readSingleMessage: ReadSingleMessage,
+    messageSource: IncrementalMessageSource,
 ): void {
     const key = `${sessionId}\u0000${messageId}`;
-    if (incrementalTimers.has(key) || pendingIncrementalKeys.has(key)) {
+    if (
+        completedIncrementalKeys.has(key) ||
+        incrementalTimers.has(key) ||
+        pendingIncrementalKeys.has(key)
+    ) {
         return;
     }
 
@@ -188,12 +194,14 @@ export function scheduleIncrementalIndex(
         pendingIncrementalKeys.add(key);
         let attemptedOrdinal: number | null = null;
         void runWithSessionLock(sessionId, () => {
-            const message = readSingleMessage(sessionId, messageId);
-            if (!message) {
-                return;
-            }
+            const message =
+                typeof messageSource === "function"
+                    ? messageSource(sessionId, messageId)
+                    : messageSource;
+            if (!message) return;
             attemptedOrdinal = message.ordinal;
             indexSingleMessage(db, sessionId, message);
+            completedIncrementalKeys.add(key);
         })
             .catch((error) => {
                 markMessageIndexDirty(
@@ -219,6 +227,10 @@ export function scheduleClearAndReindex(
 ): void {
     reconciledSessions.delete(sessionId);
     reconciliationScheduledSessions.delete(sessionId);
+    const prefix = `${sessionId}\u0000`;
+    for (const key of completedIncrementalKeys) {
+        if (key.startsWith(prefix)) completedIncrementalKeys.delete(key);
+    }
 
     defer(() => {
         void runWithSessionLock(sessionId, () => {
@@ -254,6 +266,9 @@ export function clearSessionTracking(sessionId: string): void {
             pendingIncrementalKeys.delete(key);
         }
     }
+    for (const key of completedIncrementalKeys) {
+        if (key.startsWith(prefix)) completedIncrementalKeys.delete(key);
+    }
 }
 
 export function __resetMessageIndexAsyncForTests(): void {
@@ -265,4 +280,5 @@ export function __resetMessageIndexAsyncForTests(): void {
     sessionLocks.clear();
     incrementalTimers.clear();
     pendingIncrementalKeys.clear();
+    completedIncrementalKeys.clear();
 }
