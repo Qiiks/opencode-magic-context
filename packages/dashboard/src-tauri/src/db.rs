@@ -661,8 +661,8 @@ fn estimate_tokens(chars: i64) -> i64 {
     (chars + 3) / 4 // Round up
 }
 
-/// XML overhead for compartments (approximate: <compartment title="...">...</compartment>)
-const COMPARTMENT_XML_OVERHEAD: i64 = 50;
+/// Markdown heading overhead for compartments (approximate: `## start-end · title`).
+const COMPARTMENT_HEADING_OVERHEAD: i64 = 24;
 
 /// Extract the `<session-history>…</session-history>` block (inclusive of the
 /// tags) from a rendered m[0] snapshot. Returns `None` if the block is absent
@@ -729,7 +729,7 @@ pub fn get_context_token_breakdown(
             conn.query_row(
                 "SELECT COALESCE(SUM(LENGTH(title) + LENGTH(content) + ?2), 0)
                  FROM compartments WHERE session_id = ?1",
-                rusqlite::params![session_id, COMPARTMENT_XML_OVERHEAD],
+                rusqlite::params![session_id, COMPARTMENT_HEADING_OVERHEAD],
                 |r| r.get(0),
             )
             .unwrap_or(0)
@@ -5916,11 +5916,11 @@ mod session_history_slice_tests {
 
     #[test]
     fn extracts_inclusive_block() {
-        let m0 = "<project-docs>x</project-docs>\n<session-history>\n<compartment>hi</compartment>\n</session-history>\n<user-profile>y</user-profile>";
+        let m0 = "<project-docs>x</project-docs>\n<session-history>\n## 1-2 · Example\nhi\n</session-history>\n<user-profile>y</user-profile>";
         let slice = extract_session_history_slice(m0).expect("slice present");
         assert!(slice.starts_with("<session-history>"));
         assert!(slice.ends_with("</session-history>"));
-        assert!(slice.contains("<compartment>hi</compartment>"));
+        assert!(slice.contains("## 1-2 · Example\nhi"));
         // Must NOT bleed into neighboring blocks.
         assert!(!slice.contains("project-docs"));
         assert!(!slice.contains("user-profile"));

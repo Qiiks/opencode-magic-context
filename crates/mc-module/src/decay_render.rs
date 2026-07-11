@@ -1,5 +1,5 @@
 //! Deterministic decay renderer: turns a chronological compartment set into the
-//! `<compartment>` history bytes that fill m0/m1.
+//! markdown-heading history bytes that fill m0/m1.
 //!
 //! Faithful port of the shared `decay-render.ts`. It picks a tier per compartment
 //! from age + importance + budget pressure (via [`mc_core::decay`], pressure computed
@@ -44,7 +44,7 @@ pub struct DecayRenderCompartment {
 impl From<&StoredCompartment> for DecayRenderCompartment {
     /// Project a stored compartment into the renderer's input shape. Empty tier
     /// strings stay empty (the `is_tiered_row`/`tier_body` logic distinguishes an
-    /// empty p1 = not-tiered from a non-empty p1 with an empty p4 = self-close).
+    /// empty p1 = not-tiered from a non-empty p1 with an empty p4 = title-only).
     fn from(c: &StoredCompartment) -> Self {
         DecayRenderCompartment {
             start_message: c.start_message,
@@ -77,24 +77,59 @@ pub fn render_stored_compartments(
     render_decayed_compartments(&mapped, history_budget_tokens, estimate_tokens)
 }
 
-fn escape_xml_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 fn escape_xml_content(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
+fn format_date_range(start_date: Option<&str>, end_date: Option<&str>) -> String {
+    let (Some(start_date), Some(end_date)) = (start_date, end_date) else {
+        return String::new();
+    };
+    if start_date.is_empty() || end_date.is_empty() {
+        return String::new();
+    }
+    if start_date == end_date {
+        return start_date.to_string();
+    }
+    if start_date.get(..7) == end_date.get(..7) {
+        if let Some(end_day) = end_date.get(8..) {
+            return format!("{start_date}→{end_day}");
+        }
+    }
+    format!("{start_date}→{end_date}")
+}
+
+fn compartment_heading(c: &DecayRenderCompartment) -> String {
+    let date_range = format_date_range(c.start_date.as_deref(), c.end_date.as_deref());
+    let date_segment = if date_range.is_empty() {
+        String::new()
+    } else {
+        format!(" · {date_range}")
+    };
+    format!(
+        "## {}-{}{date_segment} · {}",
+        c.start_message, c.end_message, c.title
+    )
+}
+
+fn guard_compartment_body(body: &str) -> String {
+    // A rendered body cannot open a new compartment; indent heading-like lines so
+    // the next unindented `## ` line remains an unambiguous compartment boundary.
+    let guarded = body.replace("\n## ", "\n ## ");
+    if guarded.starts_with("## ") {
+        format!(" {guarded}")
+    } else {
+        guarded
+    }
+}
+
 /// A row is v2-tiered ONLY when `p1` is a non-empty string. Rows with empty/null `p1`
 /// (legacy rows, or the malformed pseudo-v2 state left by an interrupted upgrade —
 /// `legacy=0` but tiers never populated) render via flat `content`, never as an empty
-/// tier body. A VALID v2 row can still have an empty `p4` (a legitimate self-close);
-/// that is handled by the tier-body path, since such a row has a non-empty `p1`.
+/// tier body. A VALID v2 row can still have an empty `p4` (a legitimate title-only
+/// heading); that is handled by the tier-body path, since such a row has a non-empty `p1`.
 fn is_tiered_row(c: &DecayRenderCompartment) -> bool {
     c.p1.as_deref().is_some_and(|p| !p.is_empty())
 }
@@ -163,47 +198,30 @@ pub fn render_compartment_at_tier(c: &DecayRenderCompartment, tier: u8) -> Strin
 }
 
 fn render_one_compartment(c: &DecayRenderCompartment, tier: u8) -> String {
-    let date_attrs = match (&c.start_date, &c.end_date) {
-        (Some(start_date), Some(end_date)) if !start_date.is_empty() && !end_date.is_empty() => {
-            format!(
-                " start-date=\"{}\" end-date=\"{}\"",
-                escape_xml_attr(start_date),
-                escape_xml_attr(end_date)
-            )
-        }
-        _ => String::new(),
-    };
-    let base_attrs = format!(
-        "start=\"{}\" end=\"{}\"{date_attrs} title=\"{}\"",
-        c.start_message,
-        c.end_message,
-        escape_xml_attr(&c.title)
-    );
     if tier >= 5 {
         return String::new(); // archived
     }
+    let heading = compartment_heading(c);
 
     // Legacy rows AND malformed pseudo-v2 rows (legacy=0 but no usable p1) render via
-    // flat `content`, never as an empty tier — otherwise a `legacy=0, p1=''` row would
-    // self-close empty here and silently drop the compartment body from m0/m1.
+    // flat `content`, never as an empty title-only heading — otherwise a
+    // `legacy=0, p1=''` row would silently drop the compartment body from m0/m1.
     if c.legacy == Some(1) || !is_tiered_row(c) {
         let flat = c.content.trim();
         if tier >= 4 || flat.is_empty() {
-            return format!("<compartment {base_attrs} />");
+            return heading;
         }
-        return format!(
-            "<compartment {base_attrs}>\n{}\n</compartment>",
-            escape_xml_content(&legacy_body_for_tier(flat, tier))
-        );
+        let body = guard_compartment_body(&escape_xml_content(&legacy_body_for_tier(flat, tier)));
+        return format!("{heading}\n{body}");
     }
 
     let body = tier_body(c, tier);
     if body.is_empty() {
-        return format!("<compartment {base_attrs} />");
+        return heading;
     }
     format!(
-        "<compartment {base_attrs}>\n{}\n</compartment>",
-        escape_xml_content(&body)
+        "{heading}\n{}",
+        guard_compartment_body(&escape_xml_content(&body))
     )
 }
 
@@ -364,8 +382,7 @@ mod tests {
         };
         // index 1 (newest) → tier 1 → p1 body
         let out = render_decayed_compartments(std::slice::from_ref(&c), 60_000.0, no_guard);
-        assert!(out.contains(">\nVERBOSE\n<"), "newest renders p1: {out}");
-        assert!(out.contains("start=\"1\" end=\"9\" title=\"T\""));
+        assert_eq!(out, "## 1-9 · T\nVERBOSE");
     }
 
     #[test]
@@ -377,18 +394,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_tier_body_self_closes() {
+    fn empty_tier_body_renders_title_only_heading() {
         let mut c = comp(3, 4, "Title", "p1body", 50);
         c.p4 = Some(String::new());
-        // explicit P4 with empty body → self-close (valid v2 self-close)
-        assert_eq!(
-            render_compartment_at_tier(&c, 4),
-            "<compartment start=\"3\" end=\"4\" title=\"Title\" />"
-        );
+        assert_eq!(render_compartment_at_tier(&c, 4), "## 3-4 · Title");
     }
 
     #[test]
-    fn xml_escaping_in_attr_and_body() {
+    fn heading_is_plain_text_while_body_keeps_xml_escaping() {
         let c = DecayRenderCompartment {
             start_message: 1,
             end_message: 2,
@@ -398,11 +411,38 @@ mod tests {
             ..Default::default()
         };
         let out = render_compartment_at_tier(&c, 1);
-        assert!(
-            out.contains("title=\"a&lt;b&gt;&amp;&quot;c&quot;\""),
-            "{out}"
+        assert_eq!(out, "## 1-2 · a<b>&\"c\"\nx &lt; y &amp; z");
+    }
+
+    #[test]
+    fn date_ranges_compress_and_heading_like_body_lines_are_indented() {
+        let base = DecayRenderCompartment {
+            start_message: 1,
+            end_message: 2,
+            title: "Dated".into(),
+            p1: Some("first\n## nested\nlast".into()),
+            ..Default::default()
+        };
+        let render_dates = |start: &str, end: &str| {
+            render_compartment_at_tier(
+                &DecayRenderCompartment {
+                    start_date: Some(start.into()),
+                    end_date: Some(end.into()),
+                    ..base.clone()
+                },
+                1,
+            )
+        };
+
+        assert_eq!(
+            render_dates("2026-06-08", "2026-06-08"),
+            "## 1-2 · 2026-06-08 · Dated\nfirst\n ## nested\nlast"
         );
-        assert!(out.contains("x &lt; y &amp; z"), "{out}");
+        assert!(
+            render_dates("2026-06-08", "2026-06-09").starts_with("## 1-2 · 2026-06-08→09 · Dated")
+        );
+        assert!(render_dates("2026-06-08", "2026-07-02")
+            .starts_with("## 1-2 · 2026-06-08→2026-07-02 · Dated"));
     }
 
     #[test]
@@ -417,7 +457,7 @@ mod tests {
         };
         // has a U: line → legacy starts at P3 → ≤420 chars + ellipsis
         let out = render_decayed_compartments(std::slice::from_ref(&c), 60_000.0, no_guard);
-        assert!(out.ends_with("…\n</compartment>"), "P3 truncates: {out}");
+        assert!(out.ends_with('…'), "P3 truncates: {out}");
     }
 
     #[test]
@@ -433,7 +473,7 @@ mod tests {
             ..Default::default()
         };
         let out = render_compartment_at_tier(&c, 1);
-        assert!(out.contains(">\nflat body\n<"), "renders flat: {out}");
+        assert_eq!(out, "## 1-2 · M\nflat body");
     }
 
     #[test]
@@ -454,7 +494,7 @@ mod tests {
             chars(&out)
         );
         // the newest should retain more fidelity than the oldest after demotion
-        assert!(out.contains("title=\"NEW\""), "newest survives: {out}");
+        assert!(out.contains(" · NEW"), "newest survives: {out}");
     }
 
     #[test]
@@ -476,16 +516,7 @@ mod tests {
             ..Default::default()
         };
         let out = render_stored_compartments(std::slice::from_ref(&stored), 60_000.0, no_guard);
-        assert!(
-            out.contains(
-                "start=\"1\" end=\"9\" start-date=\"2026-01-02\" end-date=\"2026-01-03\" title=\"Stored\""
-            ),
-            "{out}"
-        );
-        assert!(
-            out.contains(">\nP1 full\n<"),
-            "newest stored row at p1: {out}"
-        );
+        assert_eq!(out, "## 1-9 · 2026-01-02→03 · Stored\nP1 full");
         // an empty-p1 stored row is treated as not-tiered → flat content
         let legacy_ish = StoredCompartment {
             sequence: 1,
@@ -497,7 +528,7 @@ mod tests {
         };
         let out2 =
             render_stored_compartments(std::slice::from_ref(&legacy_ish), 60_000.0, no_guard);
-        assert!(out2.contains(">\nflat\n<"), "empty p1 → flat: {out2}");
+        assert_eq!(out2, "## 0-0 · Flat\nflat");
 
         let partial = DecayRenderCompartment {
             start_message: 1,
@@ -509,8 +540,7 @@ mod tests {
             ..Default::default()
         };
         let partial_out = render_compartment_at_tier(&partial, 1);
-        assert!(!partial_out.contains("start-date="), "{partial_out}");
-        assert!(!partial_out.contains("end-date="), "{partial_out}");
+        assert_eq!(partial_out, "## 1-2 · Partial\nflat");
     }
 
     #[test]

@@ -534,9 +534,9 @@ describe("injectM0M1Pi", () => {
 			const second = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, second as never, ["entry-1"]);
 
-			// m[0] re-materialized and now carries the compartment (title always
-			// renders; body present because the U: line keeps it at P3).
-			expect(textOf(second[0] as never)).toContain('title="Setup"');
+			// m[0] re-materialized and now carries the compartment heading; the
+			// body is present because the U: line keeps the legacy row at P3.
+			expect(textOf(second[0] as never)).toContain("## 1-1 · Setup");
 			expect(textOf(second[0] as never)).toContain("Compacted setup");
 			expect(textOf(second[1] as never)).toContain(
 				"no new content since last materialization",

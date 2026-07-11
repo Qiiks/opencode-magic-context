@@ -364,7 +364,7 @@ mod tests {
 
         // C2 rides m1 at P1, and coverage extends 10 → 20 (the SOFT advances the anchor)
         assert!(m1.body.contains("<new-compartments>"), "{}", m1.body);
-        assert!(m1.body.contains("title=\"C2\"") && !m1.body.contains("title=\"C1\""));
+        assert!(m1.body.contains("## 11-20 · C2") && !m1.body.contains("## 1-10 · C1"));
         assert!(m1.body.contains("P1-2"), "rides at P1: {}", m1.body);
         assert_eq!(m1.new_coverage, Some(("m20".to_string(), 20)));
     }

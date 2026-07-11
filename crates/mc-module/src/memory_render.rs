@@ -464,7 +464,7 @@ mod tests {
             i_docs < i_prof && i_prof < i_hist && i_hist < i_mem,
             "sub-block order: {m0}"
         );
-        assert!(m0.contains(">\nHIST\n<"), "history rendered: {m0}");
+        assert!(m0.contains("## 1-9 · T\nHIST"), "history rendered: {m0}");
     }
 
     #[test]
@@ -539,7 +539,7 @@ mod tests {
         assert!(block.starts_with("<new-compartments>\n"));
         assert!(block.ends_with("\n</new-compartments>"));
         // P1 (full), never a decayed tier, for a brand-new compartment
-        assert!(block.contains(">\nFULL P1\n<"), "{block}");
+        assert!(block.contains("## 1-9 · New\nFULL P1"), "{block}");
     }
 
     #[test]

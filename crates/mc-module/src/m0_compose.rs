@@ -239,9 +239,11 @@ mod tests {
         assert_eq!(m0.boundary_id, "m20");
         assert_eq!(m0.coverage_ordinal, Some(20));
         assert_eq!(m0.folded_compartment_seq, 2);
-        // both compartments render into the session-history block
+        // Both compartments render as headings inside the stable session-history block.
         assert!(m0.m0_bytes.contains("<session-history>"), "{}", m0.m0_bytes);
-        assert!(m0.m0_bytes.contains("title=\"C1\"") && m0.m0_bytes.contains("title=\"C2\""));
+        assert!(m0.m0_bytes.contains("## 1-10 · C1\nP1 of 1"));
+        assert!(m0.m0_bytes.contains("## 11-20 · C2\nP1 of 2"));
+        assert!(!m0.m0_bytes.contains("<compartment"));
     }
 
     #[test]

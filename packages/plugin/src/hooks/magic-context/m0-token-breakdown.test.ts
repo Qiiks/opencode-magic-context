@@ -3,6 +3,7 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { Database } from "../../shared/sqlite";
 import { computeM0BlockTokens } from "./m0-token-breakdown";
+import { estimateTokens } from "./read-session-formatting";
 
 /**
  * The shared m[0] breakdown is the single source of truth for BOTH the OpenCode
@@ -27,7 +28,7 @@ describe("computeM0BlockTokens", () => {
             "<project-docs>\nARCHITECTURE: lorem ipsum docs body here for tokens\n</project-docs>",
             "<user-profile>\n- user prefers concise replies\n</user-profile>",
             "<project-memory>\n<PROJECT_RULES>\n#1: use the release script\n</PROJECT_RULES>\n</project-memory>",
-            '<session-history>\n<compartment start="1" end="9" title="Did a thing">\nbody text\n</compartment>\n</session-history>',
+            "<session-history>\n## 1-9 · Did a thing\nbody text\n</session-history>",
         ].join("\n");
 
         const b = computeM0BlockTokens(db, SESSION_ID, {
@@ -40,7 +41,11 @@ describe("computeM0BlockTokens", () => {
         expect(b.docsTokens).toBeGreaterThan(0);
         expect(b.profileTokens).toBeGreaterThan(0);
         expect(b.memoryTokens).toBeGreaterThan(0);
-        expect(b.compartmentTokens).toBeGreaterThan(0);
+        expect(b.compartmentTokens).toBe(
+            estimateTokens(
+                "<session-history>\n## 1-9 · Did a thing\nbody text\n</session-history>",
+            ),
+        );
         // v2: facts retired (promoted to memories) → always 0.
         expect(b.factTokens).toBe(0);
         db.close();
@@ -48,8 +53,7 @@ describe("computeM0BlockTokens", () => {
 
     test("missing slices read as 0 (no docs/profile/memory present)", () => {
         const db = makeDb();
-        const m0Text =
-            '<session-history>\n<compartment start="1" end="2" title="x">\ny\n</compartment>\n</session-history>';
+        const m0Text = "<session-history>\n## 1-2 · x\ny\n</session-history>";
         const b = computeM0BlockTokens(db, SESSION_ID, {
             m0Text,
             projectIdentity: undefined,
@@ -74,8 +78,9 @@ describe("computeM0BlockTokens", () => {
             injectionBudgetTokens: undefined,
             memoryBlockCount: 0,
         });
-        // Falls back to the Σp1 estimate so the bucket isn't blank cold.
-        expect(b.compartmentTokens).toBeGreaterThan(0);
+        expect(b.compartmentTokens).toBe(
+            estimateTokens("## 1-9 · Cold compartment\nsome content body\n"),
+        );
         db.close();
     });
 });

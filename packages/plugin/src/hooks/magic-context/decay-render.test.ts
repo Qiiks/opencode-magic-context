@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { type DecayRenderCompartment, renderDecayedCompartments } from "./decay-render";
+import {
+    type DecayRenderCompartment,
+    renderCompartmentAtTier,
+    renderDecayedCompartments,
+} from "./decay-render";
 
 function legacyCompartment(i: number): DecayRenderCompartment {
     return {
@@ -40,11 +44,26 @@ describe("decay-render", () => {
         expect(rendered).not.toContain("P4_LOWER");
     });
 
-    it("renders a malformed pseudo-v2 row (legacy=0, p1='') via flat content, not empty", () => {
-        // Interrupted-upgrade state: legacy=0 but tiers never populated (p1='').
-        // The parser treats p1='' as NOT tiered; the renderer must fall back to
-        // `content` instead of emitting an empty self-closing compartment that
-        // silently drops the body. Render at P1 (newest) to exercise the body path.
+    it("renders tiered, legacy, and title-only compartments as markdown headings", () => {
+        const base: DecayRenderCompartment = {
+            startMessage: 1,
+            endMessage: 5,
+            title: "Rendered arc",
+            content: "legacy body",
+        };
+
+        expect(renderCompartmentAtTier({ ...base, p1: "tiered body", legacy: 0 }, 1)).toBe(
+            "## 1-5 · Rendered arc\ntiered body",
+        );
+        expect(renderCompartmentAtTier({ ...base, legacy: 1 }, 1)).toBe(
+            "## 1-5 · Rendered arc\nlegacy body",
+        );
+        expect(renderCompartmentAtTier({ ...base, p1: "tiered body", p4: "", legacy: 0 }, 4)).toBe(
+            "## 1-5 · Rendered arc",
+        );
+    });
+
+    it("renders a malformed pseudo-v2 row via flat content, not a title-only heading", () => {
         const pseudoV2: DecayRenderCompartment = {
             startMessage: 1,
             endMessage: 5,
@@ -61,42 +80,31 @@ describe("decay-render", () => {
             compartments: [pseudoV2],
             historyBudgetTokens: 100_000,
         });
-        expect(rendered).toContain("PSEUDO_BODY_KEEP");
-        // Must NOT be a bare self-close — the body has to be present.
-        expect(rendered).not.toMatch(/<compartment[^>]*\/>/);
+        expect(rendered).toBe("## 1-5 · pseudo v2\nPSEUDO_BODY_KEEP");
     });
 
-    it("renders complete date ranges in canonical order across tiered, legacy, and self-close arms", () => {
-        const attrs =
-            'start="1" end="2" start-date="2026-01-02" end-date="2026-01-03" title="dated"';
+    it("compresses same-day, same-month, and full date ranges", () => {
         const base: DecayRenderCompartment = {
             startMessage: 1,
             endMessage: 2,
-            startDate: "2026-01-02",
-            endDate: "2026-01-03",
             title: "dated",
-            content: "U: prompt\nflat body",
+            content: "body",
+            p1: "body",
+            legacy: 0,
         };
 
-        const tiered = renderDecayedCompartments({
-            compartments: [{ ...base, p1: "tiered body", legacy: 0 }],
-            historyBudgetTokens: 100_000,
-        });
-        const legacy = renderDecayedCompartments({
-            compartments: [{ ...base, legacy: 1 }],
-            historyBudgetTokens: 100_000,
-        });
-        const selfClosing = renderDecayedCompartments({
-            compartments: [{ ...base, content: "", legacy: 1 }],
-            historyBudgetTokens: 100_000,
-        });
-
-        expect(tiered).toContain(`<compartment ${attrs}>`);
-        expect(legacy).toContain(`<compartment ${attrs}>`);
-        expect(selfClosing).toBe(`<compartment ${attrs} />`);
+        expect(
+            renderCompartmentAtTier({ ...base, startDate: "2026-06-08", endDate: "2026-06-08" }, 1),
+        ).toStartWith("## 1-2 · 2026-06-08 · dated");
+        expect(
+            renderCompartmentAtTier({ ...base, startDate: "2026-06-08", endDate: "2026-06-09" }, 1),
+        ).toStartWith("## 1-2 · 2026-06-08→09 · dated");
+        expect(
+            renderCompartmentAtTier({ ...base, startDate: "2026-06-08", endDate: "2026-07-02" }, 1),
+        ).toStartWith("## 1-2 · 2026-06-08→2026-07-02 · dated");
     });
 
-    it("omits date attributes when a range is absent or partial", () => {
+    it("omits the date segment when a range is absent or partial", () => {
         const base: DecayRenderCompartment = {
             startMessage: 1,
             endMessage: 2,
@@ -104,25 +112,65 @@ describe("decay-render", () => {
             content: "body",
             legacy: 1,
         };
-        const withoutDates = renderDecayedCompartments({
-            compartments: [base],
-            historyBudgetTokens: 100_000,
-        });
-        const partial = renderDecayedCompartments({
-            compartments: [{ ...base, startDate: "2026-01-02" }],
-            historyBudgetTokens: 100_000,
-        });
 
-        expect(withoutDates).not.toContain("start-date=");
-        expect(withoutDates).not.toContain("end-date=");
-        expect(partial).not.toContain("start-date=");
-        expect(partial).not.toContain("end-date=");
+        expect(renderCompartmentAtTier(base, 1)).toStartWith("## 1-2 · undated");
+        expect(renderCompartmentAtTier({ ...base, startDate: "2026-01-02" }, 1)).toStartWith(
+            "## 1-2 · undated",
+        );
     });
 
-    it("keeps a VALID v2 row with empty p4 self-closing when demoted to P4", () => {
-        // A genuine v2 row (non-empty p1) with an empty p4 must still self-close
-        // at tier 4 — the isTieredRow fix must NOT regress this. Force P4 via a
-        // tiny budget across many rows so the oldest demotes to archive/P4.
+    it("indents body lines that could be mistaken for compartment headings", () => {
+        const rendered = renderCompartmentAtTier(
+            {
+                startMessage: 4,
+                endMessage: 8,
+                title: "Heading guard",
+                content: "",
+                p1: "first\n## nested heading\nlast",
+                legacy: 0,
+            },
+            1,
+        );
+
+        expect(rendered).toBe("## 4-8 · Heading guard\nfirst\n ## nested heading\nlast");
+    });
+
+    it("keeps body XML escaping while headings no longer require XML attributes", () => {
+        const rendered = renderCompartmentAtTier(
+            {
+                startMessage: 1,
+                endMessage: 2,
+                title: 'a<b>&"c"',
+                content: "",
+                p1: "x < y & z",
+                legacy: 0,
+            },
+            1,
+        );
+
+        expect(rendered).toBe('## 1-2 · a<b>&"c"\nx &lt; y &amp; z');
+    });
+
+    it("is byte-stable for identical inputs across calls", () => {
+        const args = {
+            compartments: [
+                {
+                    startMessage: 10,
+                    endMessage: 20,
+                    title: "Stable",
+                    content: "",
+                    p1: "stable body",
+                    importance: 70,
+                    legacy: 0,
+                },
+            ],
+            historyBudgetTokens: 100_000,
+        };
+
+        expect(renderDecayedCompartments(args)).toBe(renderDecayedCompartments(args));
+    });
+
+    it("keeps a valid v2 row with empty p4 as a title-only heading when demoted", () => {
         const rows: DecayRenderCompartment[] = Array.from({ length: 30 }, (_, i) => ({
             startMessage: i + 1,
             endMessage: i + 1,
@@ -139,7 +187,7 @@ describe("decay-render", () => {
             compartments: rows,
             historyBudgetTokens: 200,
         });
-        // At least one row should have demoted to a self-closing form (valid P4).
-        expect(rendered).toMatch(/<compartment[^>]*\/>/);
+
+        expect(rendered.split("\n")).toContain("## 29-29 · v2 28");
     });
 });

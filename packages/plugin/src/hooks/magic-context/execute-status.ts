@@ -149,7 +149,7 @@ export function executeStatus(
         let historyBlockTokens = 0;
         for (const c of compartments) {
             historyBlockTokens += estimateTokens(
-                `<compartment start="${c.startMessage}" end="${c.endMessage}" title="${c.title}">\n${c.content}\n</compartment>\n`,
+                `## ${c.startMessage}-${c.endMessage} · ${c.title}\n${c.content}\n`,
             );
         }
 

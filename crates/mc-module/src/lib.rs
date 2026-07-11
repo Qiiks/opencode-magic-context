@@ -136,6 +136,9 @@ pub const DEFAULT_MODULE_ID: &str = "magic-context";
 /// Bumps when the shared project-memory render changes. Epoch 1 is the compact,
 /// category-grouped `#id: fact` format and applies to every serializer profile.
 pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 1;
+/// Bumps when the shared compartment render changes. Epoch 1 replaces rendered
+/// `<compartment>` elements with markdown headings in m0 and m1.
+pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 1;
 /// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages.
@@ -1908,6 +1911,7 @@ impl McHandler {
                     "row_version": state.row_version,
                     "epochs": {
                         "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
+                        "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
                         "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                         "tagger_epoch": TAGGER_FEATURE_EPOCH,
                     },
@@ -1947,6 +1951,7 @@ impl McHandler {
             "pass_trace": pass_trace,
             "epochs": {
                 "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
+                "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
                 "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
             },
@@ -5502,6 +5507,7 @@ mod tests {
         assert_eq!(status["historian"]["last_no_fire"], Value::Null);
         assert_eq!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 1);
         assert_eq!(status["epochs"]["memory_render_epoch"], json!(1));
+        assert_eq!(status["epochs"]["compartment_render_epoch"], json!(1));
         assert_eq!(status["epochs"]["profile_epoch"], json!(1));
         assert_eq!(
             status["epochs"]["tagger_epoch"],
@@ -7757,9 +7763,7 @@ mod tests {
             |_| 0,
         )
         .unwrap();
-        assert!(composed.m0_bytes.contains(
-            "start=\"0\" end=\"0\" start-date=\"2026-01-02\" end-date=\"2026-01-03\" title=\"c0\""
-        ));
+        assert!(composed.m0_bytes.contains("## 0-0 · 2026-01-02→03 · c0"));
         assert_eq!(
             store.load_active_memories("shadow:ses", 0).unwrap()[0].id,
             0
