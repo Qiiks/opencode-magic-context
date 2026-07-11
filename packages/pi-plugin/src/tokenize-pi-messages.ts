@@ -54,6 +54,10 @@ export interface PiMessageTokenCacheEntry {
 export interface TokenizePiMessagesOptions {
 	cache: Map<string, PiMessageTokenCacheEntry>;
 	stableId: (message: object) => string | undefined;
+	onTiming?: (
+		phase: "cacheValidation" | "bpe" | "cachePrune",
+		elapsedMs: number,
+	) => void;
 }
 
 interface MaybePart {
@@ -88,10 +92,13 @@ export function tokenizePiMessages(
 ): PiMessageTokenCounts {
 	let conversation = 0;
 	let toolCall = 0;
+	let cacheValidationMs = 0;
+	let bpeMs = 0;
 	const liveIds = options ? new Set<string>() : undefined;
 
 	for (const raw of messages) {
 		if (!raw || typeof raw !== "object") continue;
+		const cacheValidationStart = options?.onTiming ? performance.now() : 0;
 		const resolvedStableId = options?.stableId(raw);
 		// Cache equality is only meaningful when JSON.stringify observes the same
 		// fields the tokenizer reads. Pi's JSONL messages satisfy this shape; custom
@@ -107,9 +114,12 @@ export function tokenizePiMessages(
 			if (cached?.wireJson === wireJson) {
 				conversation += cached.counts.conversation;
 				toolCall += cached.counts.toolCall;
+				cacheValidationMs += performance.now() - cacheValidationStart;
 				continue;
 			}
 		}
+		cacheValidationMs += performance.now() - cacheValidationStart;
+		const bpeStart = options?.onTiming ? performance.now() : 0;
 		const beforeConversation = conversation;
 		const beforeToolCall = toolCall;
 		try {
@@ -189,6 +199,7 @@ export function tokenizePiMessages(
 				}
 			}
 		} finally {
+			bpeMs += performance.now() - bpeStart;
 			if (stableId !== undefined && wireJson !== null && wireJson !== "") {
 				options?.cache.set(stableId, {
 					wireJson,
@@ -202,10 +213,14 @@ export function tokenizePiMessages(
 	}
 
 	if (options && liveIds) {
+		const cachePruneStart = options.onTiming ? performance.now() : 0;
 		for (const id of options.cache.keys()) {
 			if (!liveIds.has(id)) options.cache.delete(id);
 		}
+		options.onTiming?.("cachePrune", performance.now() - cachePruneStart);
 	}
+	options?.onTiming?.("cacheValidation", cacheValidationMs);
+	options?.onTiming?.("bpe", bpeMs);
 	return { conversation, toolCall };
 }
 

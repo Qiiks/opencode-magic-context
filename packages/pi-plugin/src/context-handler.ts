@@ -1825,6 +1825,7 @@ export function registerPiContextHandler(
 				),
 			);
 			logTransformTiming(sessionId, "findLastUserMessageId", tLastUser);
+			const tMessageIndexScheduling = performance.now();
 			if (latestUser) {
 				const located = branchEntries
 					? convertLocatedPiUserEntry(branchEntries, latestUser.messageId)
@@ -1838,6 +1839,11 @@ export function registerPiContextHandler(
 							readPiSessionMessageById(ctx, messageId)),
 				);
 			}
+			logTransformTiming(
+				sessionId,
+				"messageIndexScheduling",
+				tMessageIndexScheduling,
+			);
 
 			// Lazy-initialize tagger state from DB. Idempotent: re-init
 			// during the same session is a no-op because the in-memory
@@ -2377,6 +2383,8 @@ export function registerPiContextHandler(
 						)
 					: undefined;
 
+			logTransformTiming(sessionId, "prePipelineTotal", transformStartTime);
+			const tRunPipeline = performance.now();
 			const result = await runPipeline({
 				db: options.db,
 				tagger,
@@ -2435,6 +2443,9 @@ export function registerPiContextHandler(
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
 				isSubagent: sessionMeta.isSubagent,
 			});
+			logTransformTiming(sessionId, "runPipeline", tRunPipeline);
+			const postPipelineStart = performance.now();
+			const tTransformDecision = performance.now();
 			// Replace the reuse window only after a successful pass. An id absent from
 			// the current branch must take one full derivation pass if it later returns,
 			// and bounding the set to the live branch prevents session-long growth.
@@ -2469,11 +2480,17 @@ export function registerPiContextHandler(
 					piDecisionSnapshotNewestAssistant,
 				);
 			}
+			logTransformTiming(
+				sessionId,
+				"transformDecisionAndReuseState",
+				tTransformDecision,
+			);
 
 			// After tagging+drops have committed, check whether historian
 			// should fire. Historian config is optional — tagging-only
 			// behavior is the Step 4b.2 contract, and historian is
 			// fire-and-forget so we never block the LLM call on it.
+			const tHistorianScheduling = performance.now();
 			if (options.historian) {
 				maybeFireHistorian({
 					pi,
@@ -2487,6 +2504,11 @@ export function registerPiContextHandler(
 					taggerFloor,
 				});
 			}
+			logTransformTiming(
+				sessionId,
+				"historianScheduling",
+				tHistorianScheduling,
+			);
 
 			// Step 4b.4: nudge + note-nudge + auto-search hint. All three
 			// run AFTER tagging/drops finish so they see the post-mutation
@@ -2496,6 +2518,7 @@ export function registerPiContextHandler(
 			const tPostTransform = performance.now();
 			let outputMessages = result.messages as PiAgentMessage[];
 
+			const tNoteNudges = performance.now();
 			try {
 				outputMessages = applyNoteNudges({
 					sessionId,
@@ -2520,7 +2543,9 @@ export function registerPiContextHandler(
 					`note nudges failed: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			logTransformTiming(sessionId, "noteNudges", tNoteNudges);
 
+			const tAutoSearch = performance.now();
 			if (options.autoSearch?.enabled) {
 				try {
 					outputMessages = await runAutoSearchHintForPi({
@@ -2551,6 +2576,7 @@ export function registerPiContextHandler(
 					);
 				}
 			}
+			logTransformTiming(sessionId, "autoSearch", tAutoSearch);
 
 			// Synthetic todowrite injection — Pi parity with OpenCode's
 			// transform-postprocess-phase.ts B7. On cache-busting passes,
@@ -2572,6 +2598,7 @@ export function registerPiContextHandler(
 			//
 			// Subagents skip — they don't get synthetic injection in
 			// OpenCode either (see B7 `args.fullFeatureMode` gate).
+			const tTodoCapture = performance.now();
 			try {
 				const sessionMetaForTodo = getOrCreateSessionMeta(
 					options.db,
@@ -2600,6 +2627,7 @@ export function registerPiContextHandler(
 					`synthetic todowrite injection failed: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			logTransformTiming(sessionId, "todoCapture", tTodoCapture);
 
 			// Channel 1 baseline snapshot + Channel 2 ceiling trigger. Mirrors
 			// OpenCode's transform.ts end-of-pass block. Computed from the final
@@ -2607,6 +2635,7 @@ export function registerPiContextHandler(
 			// (a proven transform boundary) zeroes the per-turn accumulator. The
 			// `tool_result` handler in index.ts reads this baseline. Primary-only:
 			// a missing baseline is how Channel 1 stays off for subagents.
+			const tChannelAccounting = performance.now();
 			try {
 				const sessionMetaForCh1 = getOrCreateSessionMeta(options.db, sessionId);
 				// Gate on ctx_reduce being callable. Primary Pi sessions register the
@@ -2733,6 +2762,11 @@ export function registerPiContextHandler(
 					`channel1 baseline / channel2 trigger failed: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			logTransformTiming(
+				sessionId,
+				"channelNudgeAccounting",
+				tChannelAccounting,
+			);
 
 			// Work-metrics update runs on EVERY transform pass (not just
 			// execute passes). The Pi compute helper is pure-read on
@@ -2741,6 +2775,7 @@ export function registerPiContextHandler(
 			// cache-busting). Gating on executedWorkThisPass would mean
 			// sessions sitting below execute threshold never see populated
 			// values, making Pi's status surface permanently zero.
+			const tWorkMetrics = performance.now();
 			try {
 				const metrics = computePiWorkMetrics(outputMessages as unknown[]);
 				setSessionWorkMetrics(
@@ -2755,7 +2790,9 @@ export function registerPiContextHandler(
 					`work-metrics update failed: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
+			logTransformTiming(sessionId, "workMetrics", tWorkMetrics);
 
+			const tStableIdSchemePersist = performance.now();
 			if (stableIdSchemeCutover) {
 				// Scheme stamps only after the cutover pass completed. If this write
 				// fails, the outer fail-open path ships the original messages and the
@@ -2772,19 +2809,13 @@ export function registerPiContextHandler(
 					`stable-id scheme cutover complete — stamped scheme=${PI_STABLE_ID_SCHEME}`,
 				);
 			}
+			logTransformTiming(
+				sessionId,
+				"stableIdSchemePersist",
+				tStableIdSchemePersist,
+			);
 
 			logTransformTiming(sessionId, "postTransformPhase", tPostTransform);
-			const transformElapsedMs = performance.now() - transformStartTime;
-			recordPiTransformTiming({
-				sessionId,
-				stage: "total",
-				elapsedMs: transformElapsedMs,
-				extra: `messages=${outputMessages.length} targets=${result.targetCount}`,
-			});
-			sessionLog(
-				sessionId,
-				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
-			);
 
 			// Cast the rebuilt array back to the AgentMessage[] shape Pi's
 			// ContextEventResult expects. The nudge/note/auto-search paths
@@ -2795,6 +2826,18 @@ export function registerPiContextHandler(
 				sessionId,
 				projectDirectory,
 				projectIdentity,
+			);
+			logTransformTiming(sessionId, "postPipelineTotal", postPipelineStart);
+			const transformElapsedMs = performance.now() - transformStartTime;
+			recordPiTransformTiming({
+				sessionId,
+				stage: "total",
+				elapsedMs: transformElapsedMs,
+				extra: `messages=${outputMessages.length} targets=${result.targetCount}`,
+			});
+			sessionLog(
+				sessionId,
+				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
@@ -4281,6 +4324,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// is deterministic, so replay produces the exact text the original
 	// execute pass produced, regardless of how many times it runs.
 	if (args.heuristics?.caveman?.enabled && !args.isSubagent) {
+		const tCavemanReplay = performance.now();
 		try {
 			// P0 perf: caveman replay only acts on tags whose tag_number is in
 			// `targets`, so fetch just that slice instead of the whole session
@@ -4304,6 +4348,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				`caveman replay failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
+		logTransformTiming(args.sessionId, "cavemanReplay", tCavemanReplay);
 	}
 
 	// 3d. Cleanup stages NOT applicable to Pi (intentionally omitted):
@@ -4590,6 +4635,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// newly aged ids are detected only while this pass is already busting and
 	// are persisted before their bytes are replaced with empty text sentinels.
 	if (args.canUseEmptySentinels) {
+		const tProcessedImages = performance.now();
 		try {
 			const imageResult = stripPiProcessedImages({
 				db: args.db,
@@ -4612,6 +4658,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				`processed-image strip failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
+		logTransformTiming(
+			args.sessionId,
+			"stripProcessedImages",
+			tProcessedImages,
+		);
 	}
 
 	// 5. Commit tagging mutations back to Pi messages BEFORE injecting
@@ -4619,7 +4670,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// pre-tagged content. Pi's transcript adapter writes mutations
 	// back to the underlying AgentMessage[] via the part proxies, so
 	// commit() just locks the result in.
+	const tTranscriptCommit = performance.now();
 	transcript.commit();
+	logTransformTiming(args.sessionId, "transcriptCommit", tTranscriptCommit);
 	if (toolReclaimExecutePass) {
 		advanceToolReclaimWatermarkToCurrentMax(args.db, args.sessionId);
 	}
@@ -4651,6 +4704,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	//      a pi-msg-* fallback id would defeat that and anchor to an unstable id.
 	// The only legitimate misses are injection's synthetic m[0]/m[1] prepends,
 	// which carry no SessionEntry id and must not be anchored.
+	const tPostCommitStableIdMaps = performance.now();
 	const postCommitStableIdByRef = new Map<object, string>();
 	const postCommitEntryIdByRef = new Map<object, string>();
 	for (let i = 0; i < args.messages.length; i++) {
@@ -4670,6 +4724,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			postCommitEntryIdByRef.set(m as object, realId);
 		}
 	}
+	logTransformTiming(
+		args.sessionId,
+		"postCommitStableIdMaps",
+		tPostCommitStableIdMaps,
+	);
 
 	// 6. <session-history> injection — writes compartments, facts, and
 	// project memories into message[0]. This is the second-biggest
@@ -4740,6 +4799,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		}
 	}
 
+	const tDroppedPlaceholders = performance.now();
 	stripPiDroppedPlaceholderMessages({
 		db: args.db,
 		sessionId: args.sessionId,
@@ -4763,6 +4823,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// pass (discovery is otherwise gated on isCacheBusting = history-refresh).
 		forceDiscovery: args.stableIdSchemeCutover === true,
 	});
+	logTransformTiming(
+		args.sessionId,
+		"stripDroppedPlaceholders",
+		tDroppedPlaceholders,
+	);
 
 	// Drain predicate intentionally has two Pi-specific terms beyond OpenCode's
 	// `historyWasConsumedThisPass && deferredHistoryWasPendingAtPassStart &&
@@ -4902,6 +4967,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		const counts = tokenizePiMessages(outputMessages as unknown[], {
 			cache: tokenCache,
 			stableId: (message) => postCommitEntryIdByRef.get(message),
+			onTiming: hasPiTransformTimingObserver()
+				? (phase, elapsedMs) => {
+						recordPiTransformTiming({
+							sessionId: args.sessionId,
+							stage: `token:${phase}`,
+							elapsedMs,
+						});
+					}
+				: undefined,
 		});
 		updateSessionMeta(args.db, args.sessionId, {
 			conversationTokens: counts.conversation,
@@ -5009,6 +5083,7 @@ function applyNoteNudges(args: {
 	const { sessionId, db, messages, projectIdentity, entryIds, entryIdByRef } =
 		args;
 
+	const tNoteIndexMaps = performance.now();
 	const messageIdByIndex = buildPiMessageIdByIndex(
 		messages,
 		entryIds,
@@ -5021,7 +5096,9 @@ function applyNoteNudges(args: {
 		true,
 		entryIdByRef,
 	);
+	logTransformTiming(sessionId, "noteIndexMaps", tNoteIndexMaps);
 
+	const tStickyReplay = performance.now();
 	for (const anchor of getNoteNudgeAnchors(db, sessionId)) {
 		appendReminderToUserMessageByIdPi(
 			messages,
@@ -5040,6 +5117,7 @@ function applyNoteNudges(args: {
 			);
 		}
 	}
+	logTransformTiming(sessionId, "stickyReplayDecisions", tStickyReplay);
 
 	// Path 2: fresh delivery. Use the latest user message id (or null if
 	// no user messages yet) as the trigger-message hint to peekNoteNudgeText.

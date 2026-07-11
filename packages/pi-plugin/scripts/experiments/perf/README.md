@@ -12,7 +12,7 @@ bun scripts/experiments/perf/benchmark.ts --fixture ~/.pi/agent/sessions/<projec
 
 Without `--fixture` or `--synthetic`, `benchmark.ts` selects the largest JSONL file under `MC_PI_PERF_FIXTURES`. The default directory is `~/.pi/agent/sessions`. Pass `--all` to benchmark every JSONL fixture. Private session data is only read at runtime and is never copied into the repository.
 
-Use `--points 500,1000,2000,4000,5725` for fixed checkpoints. The synthetic generator includes text, thinking, images, tool-call/result arcs, and call IDs deliberately reused across turns.
+Use `--points 500,1000,2000,4000,5725` for fixed checkpoints. Add `--repeat-final 1` to measure a steady-state pass over a fresh clone of the final message projection after all caches are warm. The synthetic generator includes text, thinking, images, tool-call/result arcs, and call IDs deliberately reused across turns.
 
 The phase table reports transform phases plus DB I/O. DB time is cross-cutting and therefore overlaps the phase that issued each query. Per-part timing is activated only while the harness observer is installed; production does not pay those timers.
 
