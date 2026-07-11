@@ -285,6 +285,7 @@ function fakeContext(
 		},
 		sessionManager: {
 			getSessionId: () => sessionId,
+			getLeafId: () => branchEntries.at(-1)?.id ?? null,
 			getBranch: () => branchEntries as SessionEntry[],
 			getEntry: (id: string) => byId.get(id),
 		},

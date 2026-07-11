@@ -3749,6 +3749,84 @@ describe("collectMessageEntryIdsByRef", () => {
 	});
 });
 
+describe("Pi branch projection cache", () => {
+	it("rebuilds from a cached ancestor after a branch switch and matches a cold projection", () => {
+		const entries = [
+			{
+				type: "message",
+				id: "root",
+				parentId: null,
+				message: userMessage("root", 1),
+			},
+			{
+				type: "message",
+				id: "a",
+				parentId: "root",
+				message: userMessage("a", 2),
+			},
+			{ type: "message", id: "b", parentId: "a", message: userMessage("b", 3) },
+			{ type: "message", id: "c", parentId: "b", message: userMessage("c", 4) },
+			{ type: "message", id: "x", parentId: "a", message: userMessage("x", 5) },
+			{ type: "message", id: "y", parentId: "x", message: userMessage("y", 6) },
+		];
+		const byId = new Map(entries.map((entry) => [entry.id, entry]));
+		let leafId = "c";
+		let getEntryCalls = 0;
+		const context = {
+			sessionManager: {
+				getLeafId: () => leafId,
+				getEntry: (id: string) => {
+					getEntryCalls += 1;
+					return byId.get(id);
+				},
+			},
+		} as never;
+
+		const initial = contextHandlerInternals.readPiBranchEntriesForContext(
+			context,
+			"ses-projection",
+		);
+		expect(initial?.map((entry) => (entry as { id: string }).id)).toEqual([
+			"root",
+			"a",
+			"b",
+			"c",
+		]);
+		expect(getEntryCalls).toBe(4);
+		contextHandlerInternals.readPiBranchEntriesForContext(
+			context,
+			"ses-projection",
+		);
+		expect(getEntryCalls).toBe(4);
+
+		leafId = "y";
+		const switched = contextHandlerInternals.readPiBranchEntriesForContext(
+			context,
+			"ses-projection",
+		);
+		expect(getEntryCalls).toBe(6);
+		const switchedMessages = (switched ?? []).map((entry) =>
+			structuredClone((entry as { message: unknown }).message),
+		);
+		expect(
+			collectMessageEntryIdsByRef(
+				{} as never,
+				switchedMessages as never[],
+				"ses-projection",
+				switched ?? undefined,
+			),
+		).toEqual(["root", "a", "x", "y"]);
+
+		const cold = contextHandlerInternals.readPiBranchEntriesForContext(
+			context,
+			"ses-projection-cold",
+		);
+		expect(JSON.stringify(switched)).toBe(JSON.stringify(cold));
+		clearContextHandlerSession("ses-projection");
+		clearContextHandlerSession("ses-projection-cold");
+	});
+});
+
 describe("maybeFireHistorian raw provider cleanup", () => {
 	it("unregisters the raw-message provider in finally when no historian is spawned", () => {
 		const src = readFileSync(

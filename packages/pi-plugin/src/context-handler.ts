@@ -276,6 +276,7 @@ export const __test = {
 	applyForwardPressureFloor,
 	buildEntryFingerprintMap,
 	buildPiToolOwnerMap,
+	readPiBranchEntriesForContext,
 	getTaggedStableMessageIdsForTests(sessionId: string): ReadonlySet<string> {
 		return new Set(taggedStableMessageIdsBySession.get(sessionId));
 	},
@@ -423,6 +424,24 @@ function recordSuccessfulTaggedMessageIds(
 const piMessageTokenCacheBySession = new Map<
 	string,
 	Map<string, PiMessageTokenCacheEntry>
+>();
+
+interface PiBranchEntryLookup {
+	entryIdByMessageRef: Map<object, string>;
+	entryIdsByFingerprint: Map<string, string[]>;
+}
+
+interface PiBranchProjectionCache {
+	leafId: string;
+	entries: readonly unknown[];
+	indexById: Map<string, number>;
+	lookup: PiBranchEntryLookup;
+}
+
+const piBranchProjectionBySession = new Map<string, PiBranchProjectionCache>();
+const piBranchLookupByProjection = new WeakMap<
+	readonly unknown[],
+	PiBranchEntryLookup
 >();
 
 function logTransformTiming(
@@ -1154,53 +1173,16 @@ export function collectMessageEntryIdsStrict(
 }
 
 /**
- * Resolve the SessionEntry id for each `event.messages[i]` by reference
- * identity against `sessionManager.getBranch()` entries.
+ * Resolve each context message to a real SessionEntry id without assuming the
+ * context and branch arrays have identical positions. Pi clones context messages
+ * before extension handlers run, so production alignment uses stable content
+ * fingerprints cached with the session's branch projection. Reference matching
+ * remains as a compatibility path for test doubles and older runtimes.
  *
- * Why this exists alongside `collectMessageEntryIds`: the position-based
- * walk in `collectMessageEntryIds` assumes that filtering `getBranch()`
- * to message/custom_message/branch_summary entries produces an array
- * 1:1 with `event.messages` in length. That assumption breaks when Pi's
- * runtime `agent.state.messages` and SessionManager's branch desync by
- * even one entry — and we've observed off-by-one (around the agent_end
- * boundary, likely a bash flush race) and much larger (288-entry) gaps
- * in production. When that happens, every index past the divergence
- * gets the wrong entry id, breaking compartment boundary lookup.
- *
- * Reference-based mapping is immune to count divergence. Pi's
- * `appendMessage` (session-manager.js:580) stores `entry.message =
- * sourceAgentMessage` by reference, and `buildSessionContext` emits
- * those same references back as the message array. So `event.messages[i]
- * === branchEntries[j].message` holds for every emit-eligible entry.
- *
- * Algorithm:
- *   1. Walk `getBranch()` once, building `entryByMsgRef: Map<object, string>`
- *      keyed by `entry.message` reference (for `type === "message"`),
- *      `entry` itself for `custom_message` (Pi calls `createCustomMessage`
- *      which returns a fresh object, so we key by the message we emit
- *      using a synthesized reference table — see below), and similar for
- *      `branch_summary`.
- *   2. For each `event.messages[i]`, look up by reference. Hit → real
- *      SessionEntry id. Miss → undefined (caller falls back to
- *      synthesized id via `buildPiMessageIdByIndex`).
- *
- * For `custom_message` and `branch_summary` entries, Pi's
- * `buildSessionContext` calls `createCustomMessage(...)` /
- * `createBranchSummaryMessage(...)` which return NEW objects per
- * `context` event. Reference matching cannot work for those — Pi makes
- * fresh wrappers every call. Those entries fall through to undefined
- * here, and the caller's `buildPiMessageIdByIndex` falls back to a
- * synthesized `pi-msg-${index}-${ts}-${role}` id. That synthesized id
- * has zero cross-pass stability, but compartment boundaries never
- * target custom-message / branch-summary entries (historian only writes
- * boundaries on plain `message` entries via `read-session-pi.ts`), so
- * the fallback is harmless.
- *
- * Returns `null` only when the SessionManager API is unavailable. When
- * we successfully traverse the branch, we always return an array of
- * the same length as `messages` (with `undefined` slots for unmapped
- * positions). Length mismatch is NEVER returned — that's the whole
- * point of switching to reference-based matching.
+ * Ambiguous fingerprints intentionally remain unresolved rather than risking a
+ * wrong durable boundary. Custom and branch-summary wrappers also remain
+ * unresolved because Pi synthesizes them for each context event and historian
+ * boundaries only target ordinary message entries.
  */
 export function collectMessageEntryIdsByRef(
 	ctx: ExtensionContext,
@@ -1232,32 +1214,11 @@ export function collectMessageEntryIdsByRef(
 		}
 	}
 
-	// Build lookup tables keyed first by AgentMessage reference and then by
-	// a content fingerprint. Reference identity is the fast, lossless path for
-	// native Pi messages. The fingerprint fallback covers full message-clone
-	// paths introduced by other Pi extensions that re-wrap ordinary messages
-	// while preserving stable fields and first text content.
-	const entryIdByMsgRef = new Map<object, string>();
-	const entryIdsByFingerprint = new Map<string, string[]>();
-	for (const entry of entries) {
-		if (!entry || typeof entry !== "object") continue;
-		const e = entry as {
-			type?: unknown;
-			id?: unknown;
-			message?: unknown;
-		};
-		if (e.type !== "message") continue;
-		if (typeof e.id !== "string") continue;
-		if (!e.message || typeof e.message !== "object") continue;
-		const message = e.message as object;
-		entryIdByMsgRef.set(message, e.id);
-		const fingerprint = piMessageEntryFingerprint(e.message);
-		if (fingerprint) {
-			const bucket = entryIdsByFingerprint.get(fingerprint);
-			if (bucket) bucket.push(e.id);
-			else entryIdsByFingerprint.set(fingerprint, [e.id]);
-		}
-	}
+	// SessionManager clones context messages before this handler runs, so the
+	// fingerprint index is the production alignment path. The reference index is
+	// retained for test doubles and older Pi runtimes that do not clone.
+	const { entryIdByMessageRef, entryIdsByFingerprint } =
+		getPiBranchEntryLookup(entries);
 
 	const result: (string | undefined)[] = new Array(messages.length);
 	let resolved = 0;
@@ -1269,7 +1230,7 @@ export function collectMessageEntryIdsByRef(
 			result[i] = undefined;
 			continue;
 		}
-		const id = entryIdByMsgRef.get(msg as object);
+		const id = entryIdByMessageRef.get(msg as object);
 		if (typeof id === "string") {
 			result[i] = id;
 			resolved += 1;
@@ -1307,13 +1268,49 @@ export function collectMessageEntryIdsByRef(
 		log(
 			`[magic-context][pi]${sessionId ? `[${sessionId}]` : ""} ` +
 				`collectMessageEntryIdsByRef: resolved=${resolved}/${messages.length} ` +
-				`(fingerprint=${fingerprintResolved}, branchEntries=${entries.length}, messageEntries=${entryIdByMsgRef.size}) — ` +
+				`(fingerprint=${fingerprintResolved}, branchEntries=${entries.length}, messageEntries=${entryIdByMessageRef.size}) — ` +
 				`unmapped slots fall through to synthesized ids; boundary lookup still works ` +
 				`for any compartment whose start/end message is among the resolved set`,
 		);
 	}
 
 	return result;
+}
+
+function addPiBranchEntryToLookup(
+	lookup: PiBranchEntryLookup,
+	entry: unknown,
+): void {
+	if (!entry || typeof entry !== "object") return;
+	const row = entry as { type?: unknown; id?: unknown; message?: unknown };
+	if (
+		row.type !== "message" ||
+		typeof row.id !== "string" ||
+		!row.message ||
+		typeof row.message !== "object"
+	) {
+		return;
+	}
+	lookup.entryIdByMessageRef.set(row.message as object, row.id);
+	const fingerprint = piMessageEntryFingerprint(row.message);
+	if (!fingerprint) return;
+	const bucket = lookup.entryIdsByFingerprint.get(fingerprint);
+	if (bucket) bucket.push(row.id);
+	else lookup.entryIdsByFingerprint.set(fingerprint, [row.id]);
+}
+
+function getPiBranchEntryLookup(
+	entries: readonly unknown[],
+): PiBranchEntryLookup {
+	const cached = piBranchLookupByProjection.get(entries);
+	if (cached) return cached;
+	const lookup: PiBranchEntryLookup = {
+		entryIdByMessageRef: new Map(),
+		entryIdsByFingerprint: new Map(),
+	};
+	for (const entry of entries) addPiBranchEntryToLookup(lookup, entry);
+	piBranchLookupByProjection.set(entries, lookup);
+	return lookup;
 }
 
 /**
@@ -1331,17 +1328,9 @@ export function collectMessageEntryIdsByRef(
 function buildEntryIdByRefMap(
 	branchEntries: readonly unknown[] | null,
 ): Map<object, string> {
-	const map = new Map<object, string>();
-	if (!branchEntries) return map;
-	for (const entry of branchEntries) {
-		if (!entry || typeof entry !== "object") continue;
-		const e = entry as { type?: unknown; id?: unknown; message?: unknown };
-		if (e.type !== "message") continue;
-		if (typeof e.id !== "string") continue;
-		if (!e.message || typeof e.message !== "object") continue;
-		map.set(e.message as object, e.id);
-	}
-	return map;
+	return branchEntries
+		? getPiBranchEntryLookup(branchEntries).entryIdByMessageRef
+		: new Map();
 }
 
 function readPiBranchEntriesForContext(
@@ -1349,18 +1338,127 @@ function readPiBranchEntriesForContext(
 	sessionId: string,
 ): readonly unknown[] | null {
 	const sm = ctx.sessionManager as
-		| { getBranch?: (fromId?: string) => unknown[] }
+		| {
+				getLeafId?: () => string | null;
+				getEntry?: (id: string) => unknown;
+				getBranch?: (fromId?: string) => unknown[];
+		  }
 		| undefined;
-	if (typeof sm?.getBranch !== "function") return null;
-	try {
+
+	const installProjection = (
+		leafId: string,
+		entries: readonly unknown[],
+	): readonly unknown[] => {
+		const indexById = new Map<string, number>();
+		const lookup: PiBranchEntryLookup = {
+			entryIdByMessageRef: new Map(),
+			entryIdsByFingerprint: new Map(),
+		};
+		for (let index = 0; index < entries.length; index += 1) {
+			const entry = entries[index];
+			if (entry && typeof entry === "object") {
+				const id = (entry as { id?: unknown }).id;
+				if (typeof id === "string") indexById.set(id, index);
+			}
+			addPiBranchEntryToLookup(lookup, entry);
+		}
+		const projection = { leafId, entries, indexById, lookup };
+		piBranchProjectionBySession.set(sessionId, projection);
+		piBranchLookupByProjection.set(entries, lookup);
+		return entries;
+	};
+
+	const fallbackToBranch = (): readonly unknown[] | null => {
+		if (typeof sm?.getBranch !== "function") return null;
 		const entries = sm.getBranch.call(sm);
-		return Array.isArray(entries) ? entries : null;
+		if (!Array.isArray(entries)) return null;
+		const leafId =
+			typeof (entries.at(-1) as { id?: unknown } | undefined)?.id === "string"
+				? ((entries.at(-1) as { id: string }).id ?? "")
+				: "";
+		return leafId ? installProjection(leafId, entries) : entries;
+	};
+
+	try {
+		if (
+			typeof sm?.getLeafId !== "function" ||
+			typeof sm.getEntry !== "function"
+		) {
+			return fallbackToBranch();
+		}
+		const leafId = sm.getLeafId.call(sm);
+		if (leafId === null) return [];
+		if (typeof leafId !== "string" || leafId.length === 0) {
+			return fallbackToBranch();
+		}
+
+		const cached = piBranchProjectionBySession.get(sessionId);
+		if (cached?.leafId === leafId) return cached.entries;
+
+		const suffix: unknown[] = [];
+		const seen = new Set<string>();
+		let cursor: string | null = leafId;
+		let cachedAncestorIndex: number | undefined;
+		while (cursor !== null) {
+			const priorIndex = cached?.indexById.get(cursor);
+			if (priorIndex !== undefined) {
+				cachedAncestorIndex = priorIndex;
+				break;
+			}
+			if (seen.has(cursor)) return fallbackToBranch();
+			seen.add(cursor);
+			const entry = sm.getEntry.call(sm, cursor);
+			if (!entry || typeof entry !== "object") return fallbackToBranch();
+			const row = entry as { id?: unknown; parentId?: unknown };
+			if (
+				row.id !== cursor ||
+				(row.parentId !== null && typeof row.parentId !== "string")
+			) {
+				return fallbackToBranch();
+			}
+			suffix.push(entry);
+			cursor = row.parentId as string | null;
+		}
+		suffix.reverse();
+
+		if (cached && cachedAncestorIndex === cached.entries.length - 1) {
+			const entries = [...cached.entries, ...suffix];
+			for (let index = 0; index < suffix.length; index += 1) {
+				const entry = suffix[index];
+				const id = (entry as { id: string }).id;
+				cached.indexById.set(id, cached.entries.length + index);
+				addPiBranchEntryToLookup(cached.lookup, entry);
+			}
+			const projection = {
+				leafId,
+				entries,
+				indexById: cached.indexById,
+				lookup: cached.lookup,
+			};
+			piBranchProjectionBySession.set(sessionId, projection);
+			piBranchLookupByProjection.set(entries, cached.lookup);
+			return entries;
+		}
+
+		const entries =
+			cached && cachedAncestorIndex !== undefined
+				? [...cached.entries.slice(0, cachedAncestorIndex + 1), ...suffix]
+				: suffix;
+		return installProjection(leafId, entries);
 	} catch (error) {
 		sessionLog(
 			sessionId,
-			`Pi branch pre-read failed: ${error instanceof Error ? error.message : String(error)}`,
+			`Pi branch projection failed: ${error instanceof Error ? error.message : String(error)}`,
 		);
-		return null;
+		try {
+			return fallbackToBranch();
+		} catch (fallbackError) {
+			sessionLog(
+				sessionId,
+				`Pi branch pre-read failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+			);
+			return null;
+		}
 	}
 }
 
@@ -2452,14 +2550,10 @@ export function registerPiContextHandler(
 			if (strictEntryIds) {
 				recordSuccessfulTaggedMessageIds(sessionId, strictEntryIds);
 			}
-			const piDecisionSnapshotNewestAssistant =
-				branchEntries === null
-					? undefined
-					: findNewestPiAssistantEntryId(branchEntries);
-			if (
-				result.bustedThisPass &&
-				piDecisionSnapshotNewestAssistant !== undefined
-			) {
+			const piDecisionSnapshotNewestAssistant = result.bustedThisPass
+				? findNewestPiAssistantEntryId(branchEntries)
+				: undefined;
+			if (piDecisionSnapshotNewestAssistant !== undefined) {
 				recordPendingPiTransformDecision(
 					sessionId,
 					{
@@ -5451,6 +5545,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 		taggersBySession.delete(sessionId);
 	}
 	piMessageTokenCacheBySession.delete(sessionId);
+	piBranchProjectionBySession.delete(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
 	clearPiChannel1State(sessionId);
 	lastHeuristicsTurnIdBySession.delete(sessionId);
