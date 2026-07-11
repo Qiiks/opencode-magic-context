@@ -198,7 +198,7 @@ describe("tokenizePiMessages", () => {
 		expect(counts.toolCall).toBe(1200);
 	});
 
-	test("stable-id cache reuses equal wire bytes and invalidates changed content", () => {
+	test("stable-id cache reuses equal token fields and invalidates changed content", () => {
 		const cache = new Map();
 		const stableId = () => "entry-1";
 		const first = tokenizePiMessages(
@@ -295,7 +295,7 @@ describe("tokenizePiMessages", () => {
 		const cache = new Map([
 			[
 				"old-entry",
-				{ wireJson: "{}", counts: { conversation: 0, toolCall: 0 } },
+				{ fingerprint: [], counts: { conversation: 0, toolCall: 0 } },
 			],
 		]);
 		const message = { role: "user", content: "live" };
@@ -305,6 +305,40 @@ describe("tokenizePiMessages", () => {
 		});
 		expect(cache.has("old-entry")).toBe(false);
 		expect(cache.has("live-entry")).toBe(true);
+	});
+
+	test("image payload changes reuse the fixed visual token count", () => {
+		const cache = new Map();
+		const stableId = () => "entry-image";
+		const first = tokenizePiMessages(
+			[
+				{
+					role: "user",
+					content: [
+						{ type: "image", data: "first-payload", mimeType: "image/png" },
+					],
+				},
+			],
+			{ cache, stableId },
+		);
+		const cachedEntry = cache.get("entry-image");
+		const changedPayload = tokenizePiMessages(
+			[
+				{
+					role: "user",
+					content: [
+						{
+							type: "image",
+							data: "different-payload",
+							mimeType: "image/jpeg",
+						},
+					],
+				},
+			],
+			{ cache, stableId },
+		);
+		expect(changedPayload).toEqual(first);
+		expect(cache.get("entry-image")).toBe(cachedEntry);
 	});
 
 	test("toolCall args as pre-stringified JSON → toolCall bucket", () => {
