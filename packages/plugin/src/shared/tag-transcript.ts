@@ -89,6 +89,10 @@ export interface TagTranscriptOptions {
      * rebuilds the complete set of messages affected by each tag.
      */
     reuseMessageIds?: ReadonlySet<string>;
+    /** Exact text/count pairs retained by Pi for safe lazy-token backfill reuse. */
+    textTokenCache?: Map<string, { text: string; tokenCount: number }>;
+    /** Exact tool-result text/count pairs retained under composite tag identity. */
+    toolTokenCache?: Map<string, { text: string; tokenCount: number }>;
     /** Optional process-local benchmark callback; production callers omit it. */
     onTiming?: (
         phase: "identity" | "prefix" | "targets" | "tokenCounting",
@@ -240,6 +244,7 @@ export function tagTranscript(
                     entryFingerprint: options.entryFingerprintByMessageId?.get(messageId) ?? null,
                     reuseIdentity,
                     timing,
+                    textTokenCache: options.textTokenCache,
                 });
                 textOrdinal += 1;
                 continue;
@@ -309,11 +314,18 @@ export function tagTranscript(
                                 part,
                                 text,
                                 timing,
+                                tokenCache: options.toolTokenCache,
+                                tokenCacheKey: aggregateKey,
                             });
                         }
                         if (timing) timing.identity += performance.now() - identityStart;
                     } else {
-                        const accounting = readAggregateToolAccounting(part, timing);
+                        const accounting = readAggregateToolAccounting(
+                            part,
+                            timing,
+                            options.toolTokenCache,
+                            aggregateKey,
+                        );
                         text = accounting.text;
                         if (part.kind === "tool_result") {
                             applyGrownToolResultAccounting({
@@ -415,11 +427,18 @@ export function tagTranscript(
                             part,
                             text,
                             timing,
+                            tokenCache: options.toolTokenCache,
+                            tokenCacheKey: aggregateKey,
                         });
                     }
                     if (timing) timing.identity += performance.now() - identityStart;
                 } else {
-                    const accounting = readAggregateToolAccounting(part, timing);
+                    const accounting = readAggregateToolAccounting(
+                        part,
+                        timing,
+                        options.toolTokenCache,
+                        aggregateKey,
+                    );
                     text = accounting.text;
                     const outputByteSize = part.kind === "tool_result" ? accounting.byteSize : 0;
                     const outputTokenCount =
@@ -527,6 +546,8 @@ interface GrownToolResultAccountingArgs {
     part: TranscriptPart;
     text: string;
     timing: TagTranscriptTiming | undefined;
+    tokenCache?: Map<string, { text: string; tokenCount: number }>;
+    tokenCacheKey?: string;
     knownTokenCount?: number;
 }
 
@@ -547,9 +568,17 @@ function applyGrownToolResultAccounting(args: GrownToolResultAccountingArgs): vo
     if (args.byteSize <= args.aggregate.maxByteSize) return;
 
     let tokenCount = args.knownTokenCount;
+    if (tokenCount !== undefined && args.tokenCacheKey) {
+        args.tokenCache?.set(args.tokenCacheKey, { text: args.text, tokenCount });
+    }
     if (tokenCount === undefined) {
         const tokenStart = args.timing ? performance.now() : 0;
-        tokenCount = getToolPartTokenCount(args.part, args.text);
+        tokenCount = getCachedToolPartTokenCount(
+            args.part,
+            args.text,
+            args.tokenCache,
+            args.tokenCacheKey,
+        );
         if (args.timing) args.timing.tokenCounting += performance.now() - tokenStart;
     }
     args.aggregate.maxByteSize = args.byteSize;
@@ -562,6 +591,8 @@ function applyGrownToolResultAccounting(args: GrownToolResultAccountingArgs): vo
 function readAggregateToolAccounting(
     part: TranscriptPart,
     timing: TagTranscriptTiming | undefined,
+    tokenCache?: Map<string, { text: string; tokenCount: number }>,
+    tokenCacheKey?: string,
 ): AggregateToolAccounting {
     const text = part.getText() ?? "";
     const byteSize = getToolPartByteSize(part, text);
@@ -569,7 +600,7 @@ function readAggregateToolAccounting(
     let tokenCount = 0;
     if (part.kind === "tool_result") {
         const tokenStart = timing ? performance.now() : 0;
-        tokenCount = getToolPartTokenCount(part, text);
+        tokenCount = getCachedToolPartTokenCount(part, text, tokenCache, tokenCacheKey);
         if (timing) timing.tokenCounting += performance.now() - tokenStart;
     }
     return {
@@ -671,6 +702,19 @@ function getToolPartTokenCount(part: TranscriptPart, text: string): number {
     return 0;
 }
 
+function getCachedToolPartTokenCount(
+    part: TranscriptPart,
+    text: string,
+    cache?: Map<string, { text: string; tokenCount: number }>,
+    cacheKey?: string,
+): number {
+    const cached = cacheKey ? cache?.get(cacheKey) : undefined;
+    if (cached?.text === text) return cached.tokenCount;
+    const tokenCount = getToolPartTokenCount(part, text);
+    if (cacheKey) cache?.set(cacheKey, { text, tokenCount });
+    return tokenCount;
+}
+
 function getNonTextToolResultByteSize(part: TranscriptPart): number {
     // Prefer the adapter's exact raw-payload size when available (Pi's
     // tool_result proxy can serialize the real content array, incl. images).
@@ -715,6 +759,7 @@ interface TagTextPartArgs {
     entryFingerprint: string | null;
     reuseIdentity: boolean;
     timing?: TagTranscriptTiming;
+    textTokenCache?: Map<string, { text: string; tokenCount: number }>;
 }
 
 function tagTextPart(args: TagTextPartArgs): void {
@@ -743,8 +788,16 @@ function tagTextPart(args: TagTextPartArgs): void {
         // from already-prefixed text still tokenizes the pristine content.
         () => {
             const tokenStart = args.timing ? performance.now() : 0;
+            const cached = args.textTokenCache?.get(contentId);
+            const tokenCount =
+                cached?.text === text
+                    ? cached.tokenCount
+                    : estimateTagTextTokens(stripTagPrefix(text));
+            if (cached?.text !== text) {
+                args.textTokenCache?.set(contentId, { text, tokenCount });
+            }
             const counts = {
-                tokenCount: estimateTagTextTokens(stripTagPrefix(text)),
+                tokenCount,
                 inputTokenCount: null,
                 reasoningTokenCount: null,
             };

@@ -13,10 +13,14 @@ export interface PhaseTotals {
 	accounted: number;
 	unaccounted: number;
 	entryBranch: number;
+	fallbackIdentity: number;
+	tagIdentityCore: number;
 	tagIdentity: number;
 	tagPrefix: number;
 	targets: number;
 	tokenCountingBackfill: number;
+	tagTokenCounting: number;
+	tokenAccounting: number;
 	tokenCacheValidation: number;
 	tokenBpe: number;
 	stripsReplay: number;
@@ -162,11 +166,15 @@ export function summarizePhases(
 		accounted,
 		unaccounted: Math.max(0, total - accounted),
 		entryBranch: stage("entryParseAndBranchResolution"),
+		fallbackIdentity: stage("fallbackIdentityAndAdoption"),
+		tagIdentityCore: stage("tag:identity"),
 		tagIdentity: stage("fallbackIdentityAndAdoption") + stage("tag:identity"),
 		tagPrefix: stage("tag:prefix"),
 		targets: stage("tag:targets"),
 		tokenCountingBackfill:
 			stage("tag:tokenCounting") + stage("tokenAccounting"),
+		tagTokenCounting: stage("tag:tokenCounting"),
+		tokenAccounting: stage("tokenAccounting"),
 		tokenCacheValidation: stage("token:cacheValidation"),
 		tokenBpe: stage("token:bpe"),
 		stripsReplay:

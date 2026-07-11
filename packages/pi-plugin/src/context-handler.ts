@@ -425,10 +425,19 @@ const piMessageTokenCacheBySession = new Map<
 	string,
 	Map<string, PiMessageTokenCacheEntry>
 >();
+const piTagTextTokenCacheBySession = new Map<
+	string,
+	Map<string, { text: string; tokenCount: number }>
+>();
+const piTagToolTokenCacheBySession = new Map<
+	string,
+	Map<string, { text: string; tokenCount: number }>
+>();
 
 interface PiBranchEntryLookup {
 	entryIdByMessageRef: Map<object, string>;
 	entryIdsByFingerprint: Map<string, string[]>;
+	alignedEntryIds: (string | undefined)[];
 }
 
 interface PiBranchProjectionCache {
@@ -1299,6 +1308,58 @@ function addPiBranchEntryToLookup(
 	else lookup.entryIdsByFingerprint.set(fingerprint, [row.id]);
 }
 
+function isPiContextEmitEligible(entry: unknown): entry is { id: string } {
+	if (!entry || typeof entry !== "object") return false;
+	const row = entry as { type?: unknown; id?: unknown; summary?: unknown };
+	if (typeof row.id !== "string") return false;
+	return (
+		row.type === "message" ||
+		row.type === "custom_message" ||
+		(row.type === "branch_summary" &&
+			typeof row.summary === "string" &&
+			row.summary.length > 0)
+	);
+}
+
+function buildPiAlignedEntryIds(
+	entries: readonly unknown[],
+): (string | undefined)[] {
+	let compactionIndex = -1;
+	let firstKeptEntryId: string | undefined;
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const row = entries[index] as
+			| { type?: unknown; firstKeptEntryId?: unknown }
+			| undefined;
+		if (row?.type !== "compaction") continue;
+		compactionIndex = index;
+		firstKeptEntryId =
+			typeof row.firstKeptEntryId === "string"
+				? row.firstKeptEntryId
+				: undefined;
+		break;
+	}
+	if (compactionIndex < 0) {
+		return entries.filter(isPiContextEmitEligible).map((entry) => entry.id);
+	}
+
+	const ids: (string | undefined)[] = [undefined];
+	if (firstKeptEntryId !== undefined) {
+		let foundFirstKept = false;
+		for (let index = 0; index < compactionIndex; index += 1) {
+			const entry = entries[index];
+			if ((entry as { id?: unknown } | undefined)?.id === firstKeptEntryId) {
+				foundFirstKept = true;
+			}
+			if (foundFirstKept && isPiContextEmitEligible(entry)) ids.push(entry.id);
+		}
+	}
+	for (let index = compactionIndex + 1; index < entries.length; index += 1) {
+		const entry = entries[index];
+		if (isPiContextEmitEligible(entry)) ids.push(entry.id);
+	}
+	return ids;
+}
+
 function getPiBranchEntryLookup(
 	entries: readonly unknown[],
 ): PiBranchEntryLookup {
@@ -1307,6 +1368,7 @@ function getPiBranchEntryLookup(
 	const lookup: PiBranchEntryLookup = {
 		entryIdByMessageRef: new Map(),
 		entryIdsByFingerprint: new Map(),
+		alignedEntryIds: buildPiAlignedEntryIds(entries),
 	};
 	for (const entry of entries) addPiBranchEntryToLookup(lookup, entry);
 	piBranchLookupByProjection.set(entries, lookup);
@@ -1350,17 +1412,13 @@ function readPiBranchEntriesForContext(
 		entries: readonly unknown[],
 	): readonly unknown[] => {
 		const indexById = new Map<string, number>();
-		const lookup: PiBranchEntryLookup = {
-			entryIdByMessageRef: new Map(),
-			entryIdsByFingerprint: new Map(),
-		};
+		const lookup = getPiBranchEntryLookup(entries);
 		for (let index = 0; index < entries.length; index += 1) {
 			const entry = entries[index];
 			if (entry && typeof entry === "object") {
 				const id = (entry as { id?: unknown }).id;
 				if (typeof id === "string") indexById.set(id, index);
 			}
-			addPiBranchEntryToLookup(lookup, entry);
 		}
 		const projection = { leafId, entries, indexById, lookup };
 		piBranchProjectionBySession.set(sessionId, projection);
@@ -1423,11 +1481,22 @@ function readPiBranchEntriesForContext(
 
 		if (cached && cachedAncestorIndex === cached.entries.length - 1) {
 			const entries = [...cached.entries, ...suffix];
+			if (
+				suffix.some(
+					(entry) =>
+						(entry as { type?: unknown } | undefined)?.type === "compaction",
+				)
+			) {
+				return installProjection(leafId, entries);
+			}
 			for (let index = 0; index < suffix.length; index += 1) {
 				const entry = suffix[index];
 				const id = (entry as { id: string }).id;
 				cached.indexById.set(id, cached.entries.length + index);
 				addPiBranchEntryToLookup(cached.lookup, entry);
+				if (isPiContextEmitEligible(entry)) {
+					cached.lookup.alignedEntryIds.push(entry.id);
+				}
 			}
 			const projection = {
 				leafId,
@@ -1853,26 +1922,25 @@ export function registerPiContextHandler(
 			);
 			rawMessageProviderUnregistersBySession.set(sessionId, unregisterRaw);
 			scheduleReconciliation(options.db, sessionId, readRawSessionMessages);
-			// Reference-based entry-id resolution. Immune to the
-			// position-based count divergence that broke
-			// `collectMessageEntryIdsStrict` when Pi's `agent.state.messages`
-			// and `sessionManager.getBranch()` were out of sync (off-by-one
-			// near agent_end, or much larger gaps when condensed-milk-pi
-			// is active). Returns `null` only when getBranch is unavailable;
-			// otherwise returns an array indexed 1:1 with event.messages
-			// (with undefined for any message whose AgentMessage reference
-			// doesn't match a branch entry — typically synthetic compaction
-			// summaries and custom_message wrappers, which never carry
-			// compartment boundaries).
+			// Pi builds the context from this exact branch projection before cloning
+			// messages for extension handlers. A compaction-aware projection with the
+			// same length is therefore the lossless O(1) alignment lane. If another
+			// extension changed the message count, fall back to conservative fingerprint
+			// matching and leave ambiguous messages unresolved.
+			const branchLookup =
+				branchEntries === null ? null : getPiBranchEntryLookup(branchEntries);
+			const alignedEntryIds = branchLookup?.alignedEntryIds ?? null;
 			const resolvedEntryIds =
-				branchEntries === null
-					? null
-					: collectMessageEntryIdsByRef(
-							ctx,
-							event.messages as readonly PiAgentMessage[],
-							sessionId,
-							branchEntries,
-						);
+				alignedEntryIds?.length === event.messages.length
+					? alignedEntryIds
+					: branchEntries === null
+						? null
+						: collectMessageEntryIdsByRef(
+								ctx,
+								event.messages as readonly PiAgentMessage[],
+								sessionId,
+								branchEntries,
+							);
 			const strictEntryIds = resolvedEntryIds ? [...resolvedEntryIds] : null;
 			if (strictEntryIds && options.injection) {
 				const removed = trimPiMessagesToCachedBoundary(
@@ -4145,6 +4213,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	);
 	afterFallbackAdoptionForTests?.(args.stableIdSchemeCutover === true);
 	const tTag = performance.now();
+	let tagTextTokenCache = piTagTextTokenCacheBySession.get(args.sessionId);
+	if (!tagTextTokenCache) {
+		tagTextTokenCache = new Map();
+		piTagTextTokenCacheBySession.set(args.sessionId, tagTextTokenCache);
+	}
+	let tagToolTokenCache = piTagToolTokenCacheBySession.get(args.sessionId);
+	if (!tagToolTokenCache) {
+		tagToolTokenCache = new Map();
+		piTagToolTokenCacheBySession.set(args.sessionId, tagToolTokenCache);
+	}
 	const { targets } = tagTranscript(
 		args.sessionId,
 		transcript,
@@ -4154,6 +4232,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			skipPrefixInjection: !ctxReduceCallable,
 			entryFingerprintByMessageId,
 			reuseMessageIds: args.reusableMessageIds,
+			textTokenCache: tagTextTokenCache,
+			toolTokenCache: tagToolTokenCache,
 			onTiming: hasPiTransformTimingObserver()
 				? (phase, elapsedMs) => {
 						recordPiTransformTiming({
@@ -5545,6 +5625,8 @@ export function clearContextHandlerSession(sessionId: string): void {
 		taggersBySession.delete(sessionId);
 	}
 	piMessageTokenCacheBySession.delete(sessionId);
+	piTagTextTokenCacheBySession.delete(sessionId);
+	piTagToolTokenCacheBySession.delete(sessionId);
 	piBranchProjectionBySession.delete(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
 	clearPiChannel1State(sessionId);
