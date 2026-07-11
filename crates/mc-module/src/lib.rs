@@ -147,9 +147,6 @@ pub const TAGGER_FEATURE_EPOCH: u32 = 0;
 ///
 /// Future profile-specific m0 format epochs slot in here so the module folds them into
 /// its effective render_config even when a consumer sends a static base render_config.
-/// `TAGGER_FEATURE_EPOCH` needs the same module-side folding treatment when the U1
-/// tagger surface flips, but it intentionally remains out of the fold while the feature
-/// epoch is zero.
 pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     match profile {
         SerializerProfile::ClaudeCodeAnthropic => PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
@@ -157,6 +154,28 @@ pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
         | SerializerProfile::OwnedBroca
         | SerializerProfile::OpencodeAiSdk
         | SerializerProfile::Pi => 0,
+    }
+}
+
+/// The tagger epoch folded for this profile. The gate and epoch must both be enabled:
+/// this makes a partial deploy inert rather than allowing tag bytes without a new render
+/// identity.
+#[cfg(not(test))]
+pub const fn tagger_feature_epoch(profile: SerializerProfile) -> u32 {
+    if healing::tagging_enabled(profile) {
+        TAGGER_FEATURE_EPOCH
+    } else {
+        0
+    }
+}
+
+/// Tests exercise the future non-zero fold while the production epoch remains zero.
+#[cfg(test)]
+pub fn tagger_feature_epoch(profile: SerializerProfile) -> u32 {
+    if healing::tagging_enabled(profile) {
+        1
+    } else {
+        0
     }
 }
 
@@ -2638,6 +2657,9 @@ impl McHandler {
         if !healing::tagging_enabled(profile) {
             return tagging_inactive_error();
         }
+        if !healing::tail_reclaim(profile) {
+            return reduce_unavailable_for_profile_error();
+        }
 
         let requested = match parse_tag_range_string(drop_arg) {
             Ok(ids) => ids,
@@ -3452,6 +3474,15 @@ fn tagging_inactive_error() -> HandlerOutcome {
     HandlerOutcome::Error {
         code: "tagging_inactive".to_string(),
         message: "tagging not active for this session's profile".to_string(),
+    }
+}
+
+fn reduce_unavailable_for_profile_error() -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "reduce_unavailable_for_profile".to_string(),
+        message:
+            "ctx_reduce is unavailable because this session's profile cannot apply tail mutations"
+                .to_string(),
     }
 }
 
@@ -6037,8 +6068,11 @@ mod tests {
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         handler.bind_route(8, binding(project.to_str().unwrap(), "token"));
 
-        let transformed =
-            call_transform(&handler, vec![ck("m1", 1, "one"), ck("m2", 2, "two")]).await;
+        let messages = vec![ck("m1", 1, "one"), ck("m2", 2, "two")];
+        let transition = call_transform(&handler, messages.clone()).await;
+        assert_eq!(transition["status"], "ok");
+        assert!(store.load_tags_for_session("ses").unwrap().is_empty());
+        let transformed = call_transform(&handler, messages).await;
         assert_eq!(transformed["status"], "ok");
         assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 2);
 
@@ -6065,6 +6099,31 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Invalid range syntax"));
+        crate::healing::set_tagging_enabled_for_tests(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_ctx_reduce_rejects_profiles_that_cannot_drain_tail_mutations() {
+        crate::healing::set_tagging_enabled_for_tests(Some(true));
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(8, binding(project.to_str().unwrap(), "token"));
+
+        let messages = vec![ck("m1", 1, "one")];
+        let mut cc_request = request(messages.clone());
+        cc_request["serializer_profile"] = json!("claude-code-anthropic");
+        let first = call_transform_request(&handler, cc_request.clone()).await;
+        assert_eq!(first["status"], "ok");
+        let second = call_transform_request(&handler, cc_request).await;
+        assert_eq!(second["status"], "ok");
+        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 1);
+
+        let rejected =
+            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "1" })).await;
+        assert_eq!(error_code(rejected), "reduce_unavailable_for_profile");
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
         crate::healing::set_tagging_enabled_for_tests(None);
     }
 

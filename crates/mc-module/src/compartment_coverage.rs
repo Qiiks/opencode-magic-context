@@ -74,6 +74,10 @@ pub struct M0ContentEpoch {
     /// identity, preserving byte-identical effective render_config strings for profiles
     /// whose serializer epoch is still zero.
     pub profile_render_epoch: String,
+    /// The visible tagger surface epoch. A non-zero value coordinates the cache-breaking
+    /// HARD fold that introduces tag bytes; empty epoch zero is omitted so the current
+    /// disabled surface leaves every existing effective render identity byte-identical.
+    pub tagger_feature_epoch: String,
 }
 
 /// Combine the base render_config (the provider-eviction triggers: system/model/
@@ -99,6 +103,9 @@ pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -
     }
     if !epoch.profile_render_epoch.is_empty() {
         parts.push(part("mpe", &epoch.profile_render_epoch));
+    }
+    if !epoch.tagger_feature_epoch.is_empty() {
+        parts.push(part("tfe", &epoch.tagger_feature_epoch));
     }
     format!("{base_render_config}|m0epoch[{}]", parts.join(";"))
 }
@@ -256,10 +263,15 @@ mod tests {
             memory_content_epoch: "mc1".into(),
             memory_render_epoch: String::new(),
             profile_render_epoch: String::new(),
+            tagger_feature_epoch: String::new(),
         };
         let folded = fold_m0_content_epoch(base, &epoch);
         // the base is kept as a prefix (a provider change still alters the string) and
         // each epoch field appears by name so a diff shows the cause
+        assert_eq!(
+            folded, "sys0|tools0|model0|prof0|m0epoch[ws:3:wf1;upg:2:u1;mem:3:mc1]",
+            "omitted epoch-zero fields must not change existing render identities"
+        );
         assert!(folded.starts_with(base));
         assert!(folded.contains("ws:3:wf1"));
         assert!(folded.contains("mem:3:mc1"));
@@ -267,6 +279,10 @@ mod tests {
         assert!(
             !folded.contains("mpe:"),
             "profile epoch zero must not add a component"
+        );
+        assert!(
+            !folded.contains("tfe:"),
+            "tagger epoch zero must leave the identity byte-identical"
         );
         let mut memory_render_epoch = epoch.clone();
         memory_render_epoch.memory_render_epoch = "mre1".into();
@@ -279,6 +295,12 @@ mod tests {
         let profile_folded = fold_m0_content_epoch(base, &profile_epoch);
         assert!(profile_folded.contains("mpe:4:mpe1"));
         assert_ne!(folded, profile_folded);
+
+        let mut tagger_epoch = epoch.clone();
+        tagger_epoch.tagger_feature_epoch = "tfe1".into();
+        let tagger_folded = fold_m0_content_epoch(base, &tagger_epoch);
+        assert!(tagger_folded.contains("tfe:4:tfe1"));
+        assert_ne!(folded, tagger_folded);
         // docs hash is deliberately excluded from the fold (a docs-only edit must not
         // force a full m0 re-render)
         assert!(!folded.contains("docs"));

@@ -294,11 +294,9 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
 
 // --- payload builders (PURE functions of the block's immutable bytes) ---
 
-/// The canonical reduced-content placeholder for a fully-dropped block. Numberless
-/// by design: in the CK model tool pairing is STRUCTURAL (ToolCall/ToolResult share
-/// the canonical id), so the placeholder needs no per-item number for pairing. The
-/// per-provider on-wire shaping (e.g. an Anthropic tag number, or omitting an empty
-/// block) is a downstream codec-render concern, not selection's.
+/// The provider-neutral reduced-content placeholder for a fully-dropped block. Selection
+/// stays pure over immutable block bytes; the transform freeze path adds a durable tag
+/// reference when the target already has a minted visible tag number.
 const DROPPED_PLACEHOLDER: &str = "[dropped]";
 
 /// Slice without splitting a UTF-8 char boundary (mirrors the TS safeSlice, which

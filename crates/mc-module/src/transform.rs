@@ -36,7 +36,7 @@ use mc_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::ck_wire::{
@@ -61,7 +61,6 @@ const RED_KEY_PREFIX: &str = "red:";
 /// separated upstream session keys. Five edges corresponds to three arm/clear cycles
 /// when the initial arm is not counted as evidence of multiplexing by itself.
 const PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD: u32 = 5;
-const TAG_PREFIX_OPEN: char = '§';
 const CHANNEL1_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_PRESSURE_FLOOR: f64 = 0.8;
@@ -401,7 +400,6 @@ pub struct TransformWithProjection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaggableKind {
     Message,
-    ToolCall,
     ToolResult,
 }
 
@@ -409,7 +407,6 @@ impl TaggableKind {
     fn as_store_kind(self) -> &'static str {
         match self {
             Self::Message => "message",
-            Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
         }
     }
@@ -669,7 +666,41 @@ fn apply_once(
     }
 
     let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
-    let tagging_active = serializer_profile.is_some_and(healing::tagging_enabled);
+    let loaded = store.load(&req.session_id)?;
+
+    // Every module-owned byte-affecting epoch is folded before activation decisions. The
+    // tagger is active only after its non-zero epoch is present in the session's committed
+    // render identity, so an established pre-flip session cannot acquire tags before the
+    // coordinating cache-breaking HARD fold has committed.
+    let memory_render_epoch = if crate::MEMORY_RENDER_FORMAT_EPOCH != 0 {
+        format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH)
+    } else {
+        String::new()
+    };
+    let profile_render_epoch = serializer_profile
+        .map(crate::profile_render_epoch)
+        .filter(|epoch| *epoch != 0)
+        .map(|epoch| format!("mpe{epoch}"))
+        .unwrap_or_default();
+    let tagger_feature_epoch = serializer_profile
+        .map(crate::tagger_feature_epoch)
+        .filter(|epoch| *epoch != 0)
+        .map(|epoch| format!("tfe{epoch}"))
+        .unwrap_or_default();
+    let effective_render_config = fold_m0_content_epoch(
+        &req.render_config,
+        &M0ContentEpoch {
+            workspace_fingerprint: store.workspace_fingerprint(ctx.project_path)?,
+            upgrade_state: String::new(),
+            memory_content_epoch: String::new(),
+            memory_render_epoch,
+            profile_render_epoch,
+            tagger_feature_epoch: tagger_feature_epoch.clone(),
+        },
+    );
+    let tagging_active = !tagger_feature_epoch.is_empty()
+        && loaded.meta.initialized
+        && loaded.meta.last_render_config == effective_render_config;
     let tag_rows = if tagging_active {
         mint_tags_for_projection(store, &req.session_id, &projection, ctx.now_ms)?;
         store.load_tags_for_session(&req.session_id)?
@@ -681,8 +712,6 @@ fn apply_once(
     } else {
         Vec::new()
     };
-
-    let loaded = store.load(&req.session_id)?;
 
     // Check whether the boundary is present in the live messages, or through a shadow
     // trim record that matches durable coverage and the first untrimmed message. A failed
@@ -789,30 +818,6 @@ fn apply_once(
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
 
     // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
-    // The effective render_config folds live module-owned m0 composition epochs into the
-    // provider base, so membership or serializer-format changes drive the existing
-    // render_config HARD path even if the caller's opaque base string is static.
-    // upgrade_state + the external memory epoch have no mc_* source yet → empty (inert).
-    let memory_render_epoch = if crate::MEMORY_RENDER_FORMAT_EPOCH != 0 {
-        format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH)
-    } else {
-        String::new()
-    };
-    let profile_render_epoch = serializer_profile
-        .map(crate::profile_render_epoch)
-        .filter(|epoch| *epoch != 0)
-        .map(|epoch| format!("mpe{epoch}"))
-        .unwrap_or_default();
-    let effective_render_config = fold_m0_content_epoch(
-        &req.render_config,
-        &M0ContentEpoch {
-            workspace_fingerprint: store.workspace_fingerprint(ctx.project_path)?,
-            upgrade_state: String::new(),
-            memory_content_epoch: String::new(),
-            memory_render_epoch,
-            profile_render_epoch,
-        },
-    );
     // The cheap m1-change digest (watermark triple). Computed every pass to gate SOFT vs
     // defer WITHOUT composing the body; the body composes only on the bust arm below.
     let m1_signal = m1_revision_signal_parts(store, ctx.project_path, &req.session_id)?;
@@ -953,6 +958,8 @@ fn apply_once(
     } else {
         ctx.injected_reductions.clone()
     };
+    let selected_reductions =
+        numbered_drop_placeholders_for_new_freezes(&loaded.core, &selected_reductions, &tag_rows);
 
     // Fail-loud monotonicity guard, BEFORE classify and on EVERY pass: a frozen
     // reduction target re-supplied with different bytes breaks the immutable contract,
@@ -1000,7 +1007,7 @@ fn apply_once(
         }
     }
     apply_ingress_meta(&mut meta, req, &projection);
-    if tagging_active {
+    if !tagger_feature_epoch.is_empty() {
         meta.last_serializer_profile = req.serializer_profile.clone();
     }
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
@@ -1720,6 +1727,35 @@ fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Add a durable tag reference only while a new drop payload is being frozen. Existing
+/// frozen units remain authoritative and replay byte-identically.
+fn numbered_drop_placeholders_for_new_freezes(
+    core: &CoreState,
+    reductions: &[ReductionDecision],
+    tag_rows: &[McTagRow],
+) -> Vec<ReductionDecision> {
+    let frozen = frozen_red_targets(core);
+    let tag_by_block = tag_rows
+        .iter()
+        .map(|row| (row.block_id.as_str(), row.tag_number))
+        .collect::<HashMap<_, _>>();
+    reductions
+        .iter()
+        .map(|reduction| {
+            let mut reduction = reduction.clone();
+            if reduction.kind == "drop"
+                && reduction.payload == "[dropped]"
+                && !frozen.contains(&reduction.target_id)
+            {
+                if let Some(tag_number) = tag_by_block.get(reduction.target_id.as_str()) {
+                    reduction.payload = format!("[dropped §{tag_number}§]");
+                }
+            }
+            reduction
+        })
+        .collect()
+}
+
 /// Build a `red:<target>` frozen unit (Lineage — it persists + replays byte-identical).
 fn red_unit(target: &str, kind: &str, payload: &str) -> FrozenUnit {
     FrozenUnit {
@@ -2265,12 +2301,12 @@ fn mint_tags_for_projection(
         .blocks
         .iter()
         .filter_map(|block| {
-            let kind = taggable_kind(block)?;
-            let text = tag_token_text(block);
+            let (kind, source) = taggable_source(block)?;
             Some(TagMintInput {
                 block_id: block.id.clone(),
                 kind: kind.as_store_kind().to_string(),
-                token_count: mc_tokenizer::estimate_tokens(&text) as i64,
+                token_count: mc_tokenizer::estimate_tokens(source) as i64,
+                source_bytes: source.as_bytes().to_vec(),
             })
         })
         .collect::<Vec<_>>();
@@ -2280,52 +2316,37 @@ fn mint_tags_for_projection(
     Ok(())
 }
 
-fn taggable_kind(block: &FlatBlock) -> Option<TaggableKind> {
+/// Return exactly the span the overlay can prefix. Mint scope and overlay scope share
+/// this predicate so every visible tag number has a renderable §N§ carrier.
+fn taggable_source(block: &FlatBlock) -> Option<(TaggableKind, &str)> {
     if block.synthetic || block.role == "system" {
         return None;
     }
-    match block.kind_tag.as_str() {
-        "text" if block.role == "user" || block.role == "assistant" => Some(TaggableKind::Message),
-        "tool_call" => Some(TaggableKind::ToolCall),
-        "tool_result" => Some(TaggableKind::ToolResult),
+    match &block.wire.kind {
+        ck_wire::CkKind::Text { text } if block.role == "user" || block.role == "assistant" => {
+            Some((TaggableKind::Message, text))
+        }
+        ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
+            ck_wire::CkOutputKind::Text { text } | ck_wire::CkOutputKind::ErrorText { text } => {
+                Some((TaggableKind::ToolResult, text))
+            }
+            ck_wire::CkOutputKind::Content { blocks } => blocks.iter().find_map(|block| {
+                if let ck_wire::ResultBlockKind::Text { text } = &block.kind {
+                    Some((TaggableKind::ToolResult, text.as_str()))
+                } else {
+                    None
+                }
+            }),
+            ck_wire::CkOutputKind::Json { .. }
+            | ck_wire::CkOutputKind::ErrorJson { .. }
+            | ck_wire::CkOutputKind::ExecutionDenied { .. } => None,
+        },
         _ => None,
     }
 }
 
-fn tag_token_text(block: &FlatBlock) -> String {
-    match &block.wire.kind {
-        ck_wire::CkKind::Text { text } => text.clone(),
-        ck_wire::CkKind::ToolCall { name, input, .. } => {
-            serde_json::to_string(&serde_json::json!({
-                "name": name,
-                "input": input,
-            }))
-            .unwrap_or_default()
-        }
-        ck_wire::CkKind::ToolResult { output, .. } => tool_output_text(output),
-        _ => block.bytes.clone(),
-    }
-}
-
-fn tool_output_text(output: &ck_wire::CkToolOutput) -> String {
-    match &output.kind {
-        ck_wire::CkOutputKind::Text { text } | ck_wire::CkOutputKind::ErrorText { text } => {
-            text.clone()
-        }
-        ck_wire::CkOutputKind::Json { value } | ck_wire::CkOutputKind::ErrorJson { value } => {
-            value.to_string()
-        }
-        ck_wire::CkOutputKind::ExecutionDenied { reason } => reason.clone().unwrap_or_default(),
-        ck_wire::CkOutputKind::Content { blocks } => blocks
-            .iter()
-            .filter_map(|block| match &block.kind {
-                ck_wire::ResultBlockKind::Text { text } => Some(text.as_str()),
-                ck_wire::ResultBlockKind::Media { .. }
-                | ck_wire::ResultBlockKind::Opaque { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
+fn taggable_kind(block: &FlatBlock) -> Option<TaggableKind> {
+    taggable_source(block).map(|(kind, _)| kind)
 }
 
 fn tag_overlay_state(tag_rows: &[McTagRow], appends: &[Channel1AppendRow]) -> TagOverlayState {
@@ -2472,30 +2493,21 @@ fn append_channel1_to_output(output: &mut ck_wire::CkToolOutput, reminder: &str)
     false
 }
 
-fn prepend_tag(tag_number: i64, value: &str) -> String {
-    format!("§{tag_number}§ {}", strip_tag_prefix(value))
+fn tag_prefix(tag_number: i64) -> String {
+    format!("§{tag_number}§ ")
 }
 
-fn strip_tag_prefix(value: &str) -> &str {
-    let mut rest = value;
-    loop {
-        let Some(after_open) = rest.strip_prefix(TAG_PREFIX_OPEN) else {
-            return rest;
-        };
-        let digit_len = after_open
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .map(char::len_utf8)
-            .sum::<usize>();
-        if digit_len == 0 {
-            return rest;
-        }
-        let after_digits = &after_open[digit_len..];
-        let Some(after_close) = after_digits.strip_prefix(TAG_PREFIX_OPEN) else {
-            return rest;
-        };
-        rest = after_close.trim_start();
-    }
+fn prepend_tag(tag_number: i64, value: &str) -> String {
+    let tagged = format!("{}{value}", tag_prefix(tag_number));
+    debug_assert_eq!(strip_tag_prefix(&tagged, tag_number), value);
+    tagged
+}
+
+/// Remove exactly the prefix added for this block's registered number. This is the
+/// inverse of [`prepend_tag`]; it never trims source whitespace or interprets another
+/// block's tag-like user content.
+fn strip_tag_prefix(value: &str, tag_number: i64) -> &str {
+    value.strip_prefix(&tag_prefix(tag_number)).unwrap_or(value)
 }
 
 fn maybe_append_channel1_nudge(
@@ -3334,6 +3346,22 @@ mod tests {
     }
 
     fn tool_result(mid: &str, ordinal: u64, call_id: &str, text: &str) -> CkIngressMessage {
+        tool_result_with_output(
+            mid,
+            ordinal,
+            call_id,
+            ck_wire::CkOutputKind::Text {
+                text: text.to_string(),
+            },
+        )
+    }
+
+    fn tool_result_with_output(
+        mid: &str,
+        ordinal: u64,
+        call_id: &str,
+        output: ck_wire::CkOutputKind,
+    ) -> CkIngressMessage {
         CkIngressMessage {
             mid: mid.to_string(),
             ordinal,
@@ -3342,9 +3370,7 @@ mod tests {
                 vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolResult {
                     id: call_id.to_string(),
                     tool_name: "read".to_string(),
-                    output: ck_wire::CkToolOutput::bare(ck_wire::CkOutputKind::Text {
-                        text: text.to_string(),
-                    }),
+                    output: ck_wire::CkToolOutput::bare(output),
                     provider_executed: false,
                 })],
                 None,
@@ -6287,7 +6313,15 @@ mod tests {
         match &block.kind {
             ck_wire::CkKind::Text { text } => Some(text.as_str()),
             ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
-                ck_wire::CkOutputKind::Text { text } => Some(text.as_str()),
+                ck_wire::CkOutputKind::Text { text }
+                | ck_wire::CkOutputKind::ErrorText { text } => Some(text.as_str()),
+                ck_wire::CkOutputKind::Content { blocks } => blocks.iter().find_map(|block| {
+                    if let ck_wire::ResultBlockKind::Text { text } = &block.kind {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                }),
                 _ => None,
             },
             _ => None,
@@ -6325,6 +6359,196 @@ mod tests {
     }
 
     #[test]
+    fn tagger_flip_hards_before_committed_identity_can_render_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = req("flip", "cfg0", vec![item("m1", 1, "hello")]);
+
+        let before_flip = run(&s, &request, &spine());
+        assert_eq!(before_flip.action, "HARD");
+        assert_eq!(tail_bytes(&before_flip, "m1"), "hello");
+        assert!(!s
+            .load("flip")
+            .unwrap()
+            .meta
+            .last_render_config
+            .contains("tfe:"));
+
+        crate::healing::set_tagging_enabled_for_tests(Some(true));
+        let transition = run(&s, &request, &spine());
+        assert_eq!(transition.action, "HARD");
+        assert_eq!(tail_bytes(&transition, "m1"), "hello");
+        assert!(s.load_tags_for_session("flip").unwrap().is_empty());
+        assert!(s
+            .load("flip")
+            .unwrap()
+            .meta
+            .last_render_config
+            .contains("tfe:4:tfe1"));
+
+        let after_commit = run(&s, &request, &spine());
+        assert_eq!(after_commit.action, "SOFT+");
+        assert_eq!(tail_bytes(&after_commit, "m1"), "§1§ hello");
+        assert_eq!(s.load_tags_for_session("flip").unwrap().len(), 1);
+        crate::healing::set_tagging_enabled_for_tests(None);
+    }
+
+    #[test]
+    fn drop_placeholder_uses_tag_number_only_for_new_tagged_freezes() {
+        let tagged = reduce("tagged#0", "drop", "[dropped]");
+        let untagged = reduce("untagged#0", "drop", "[dropped]");
+        let rows = vec![McTagRow {
+            tag_number: 7,
+            block_id: "tagged#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 1,
+            created_at_ms: 10,
+            source_bytes: b"source".to_vec(),
+        }];
+
+        let numbered = numbered_drop_placeholders_for_new_freezes(
+            &CoreState::default(),
+            &[tagged.clone(), untagged],
+            &rows,
+        );
+        assert_eq!(numbered[0].payload, "[dropped §7§]");
+        assert_eq!(numbered[1].payload, "[dropped]");
+
+        let frozen = CoreState {
+            frozen_units: vec![red_unit("tagged#0", "drop", "[dropped]")],
+            ..Default::default()
+        };
+        let replay = numbered_drop_placeholders_for_new_freezes(&frozen, &[tagged], &rows);
+        assert_eq!(replay[0].payload, "[dropped]");
+        assert_eq!(frozen_red_payload(&frozen, "tagged#0"), Some("[dropped]"));
+    }
+
+    #[test]
+    fn tag_prefix_strip_is_a_byte_exact_inverse() {
+        let corpus = [
+            "",
+            "plain",
+            "  leading whitespace",
+            "\t\nline",
+            "§7§ forged other tag",
+            "§42§ genuine same-looking content",
+            "é日🙂",
+            "§not-a-tag§ x",
+        ];
+        for content in corpus {
+            let tagged = prepend_tag(42, content);
+            assert_eq!(strip_tag_prefix(&tagged, 42).as_bytes(), content.as_bytes());
+            if !content.starts_with("§42§ ") {
+                assert_eq!(strip_tag_prefix(content, 42).as_bytes(), content.as_bytes());
+            }
+        }
+        assert_eq!(
+            strip_tag_prefix("§7§ forged other tag", 42),
+            "§7§ forged other tag"
+        );
+        assert_eq!(
+            strip_tag_prefix("§42§ §42§ user content", 42),
+            "§42§ user content",
+            "only one registered prefix occurrence is removed"
+        );
+    }
+
+    #[test]
+    fn mint_scope_matches_overlay_scope_and_captures_exact_source() {
+        with_tagging_enabled(|| {
+            let content_text = ck_wire::ResultBlock {
+                kind: ck_wire::ResultBlockKind::Text {
+                    text: "  content §9§".to_string(),
+                },
+                provider_extras: ck_wire::ProviderExtras::new(),
+            };
+            let messages = vec![
+                item("m1", 1, "  user §7§"),
+                assistant_tool_call("call1", 2, "c1"),
+                tool_result("text", 3, "c1", "  text output"),
+                assistant_tool_call("call2", 4, "c2"),
+                tool_result_with_output(
+                    "error-text",
+                    5,
+                    "c2",
+                    ck_wire::CkOutputKind::ErrorText {
+                        text: "error output".to_string(),
+                    },
+                ),
+                assistant_tool_call("call3", 6, "c3"),
+                tool_result_with_output(
+                    "json",
+                    7,
+                    "c3",
+                    ck_wire::CkOutputKind::Json {
+                        value: json!({"x": 1}),
+                    },
+                ),
+                assistant_tool_call("call4", 8, "c4"),
+                tool_result_with_output(
+                    "error-json",
+                    9,
+                    "c4",
+                    ck_wire::CkOutputKind::ErrorJson {
+                        value: json!({"x": 2}),
+                    },
+                ),
+                assistant_tool_call("call5", 10, "c5"),
+                tool_result_with_output(
+                    "denied",
+                    11,
+                    "c5",
+                    ck_wire::CkOutputKind::ExecutionDenied {
+                        reason: Some("no".to_string()),
+                    },
+                ),
+                assistant_tool_call("call6", 12, "c6"),
+                tool_result_with_output(
+                    "content",
+                    13,
+                    "c6",
+                    ck_wire::CkOutputKind::Content {
+                        blocks: vec![content_text],
+                    },
+                ),
+                assistant_tool_call("call7", 14, "c7"),
+                tool_result_with_output(
+                    "empty-content",
+                    15,
+                    "c7",
+                    ck_wire::CkOutputKind::Content { blocks: Vec::new() },
+                ),
+            ];
+            let request = req("scope", "cfg0", messages.clone());
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            run(&s, &request, &spine());
+            let response = run(&s, &request, &spine());
+            let rows = s.load_tags_for_session("scope").unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.block_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["m1#0", "text#0", "error-text#0", "content#0"]
+            );
+            let projection = project_messages(&messages).unwrap();
+            for row in &rows {
+                let block = projection
+                    .blocks
+                    .iter()
+                    .find(|block| block.id == row.block_id)
+                    .unwrap();
+                let (_, source) = taggable_source(block).expect("minted tags must be overlayable");
+                assert_eq!(row.source_bytes, source.as_bytes());
+            }
+            assert_eq!(tail_bytes(&response, "m1"), "§1§   user §7§");
+            assert_eq!(tail_bytes(&response, "text"), "§2§   text output");
+            assert_eq!(tail_bytes(&response, "error-text"), "§3§ error output");
+            assert_eq!(tail_bytes(&response, "content"), "§4§   content §9§");
+        });
+    }
+
+    #[test]
     fn tag_minting_is_deterministic_monotonic_and_survives_rejected_pass() {
         with_tagging_enabled(|| {
             let messages = vec![
@@ -6335,33 +6559,30 @@ mod tests {
             let dir_a = tempfile::tempdir().unwrap();
             let store_a = store(dir_a.path());
             run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
+            assert!(store_a.load_tags_for_session("mint").unwrap().is_empty());
+            run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
             let first = store_a.load_tags_for_session("mint").unwrap();
             assert_eq!(
                 first
                     .iter()
                     .map(|row| (row.tag_number, row.block_id.as_str(), row.kind.as_str()))
                     .collect::<Vec<_>>(),
-                vec![
-                    (1, "m1#0", "message"),
-                    (2, "call#0", "tool_call"),
-                    (3, "result#0", "tool_result")
-                ]
+                vec![(1, "m1#0", "message"), (2, "result#0", "tool_result")]
             );
             run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
             assert_eq!(store_a.load_tags_for_session("mint").unwrap(), first);
 
             let dir_b = tempfile::tempdir().unwrap();
             let store_b = store(dir_b.path());
+            run(&store_b, &req("mint", "cfg0", messages.clone()), &spine());
             run(&store_b, &req("mint", "cfg0", messages), &spine());
             assert_eq!(store_b.load_tags_for_session("mint").unwrap(), first);
 
             let dir_c = tempfile::tempdir().unwrap();
             let store_c = store(dir_c.path());
-            run(
-                &store_c,
-                &req("reject", "cfg0", vec![item("m1", 1, "old")]),
-                &spine(),
-            );
+            let stable = req("reject", "cfg0", vec![item("m1", 1, "old")]);
+            run(&store_c, &stable, &spine());
+            run(&store_c, &stable, &spine());
             let err = transform(
                 &store_c,
                 &req(
@@ -6389,6 +6610,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
             let first_req = req("stable", "cfg0", vec![item("m1", 1, "alpha")]);
+            let transition = run(&s, &first_req, &spine());
+            assert_eq!(tail_bytes(&transition, "m1"), "alpha");
             let first = run(&s, &first_req, &spine());
             let replay = run(&s, &first_req, &spine());
             assert_eq!(tail_bytes(&first, "m1"), "§1§ alpha");
@@ -6413,17 +6636,25 @@ mod tests {
         with_tagging_enabled(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
-            let response = run(
-                &s,
-                &req(
-                    "drop-tag",
-                    "cfg0",
-                    vec![item("m1", 1, "drop me"), item("m2", 2, "keep me")],
-                ),
-                &with_reductions(vec![reduce("m1#0", "drop", "[dropped]")]),
+            s.replace_compartments("drop-tag", &[comp(1, 1, 1, "a", "SUMMARY")])
+                .unwrap();
+            let request = req(
+                "drop-tag",
+                "cfg0",
+                vec![
+                    item("a", 1, "covered"),
+                    item("m1", 2, "drop me"),
+                    item("m2", 3, "keep me"),
+                ],
             );
-            assert_eq!(tail_bytes(&response, "m1"), "[dropped]");
-            assert_eq!(tail_bytes(&response, "m2"), "§2§ keep me");
+            run(&s, &request, &spine());
+            let active = run(&s, &request, &spine());
+            assert_eq!(tail_bytes(&active, "m1"), "§2§ drop me");
+            let reductions = with_reductions(vec![reduce("m1#0", "drop", "[dropped]")]);
+            let response = run(&s, &request, &reductions);
+            assert_eq!(response.action, "SOFT");
+            assert_eq!(tail_bytes(&response, "m1"), "[dropped §2§]");
+            assert_eq!(tail_bytes(&response, "m2"), "§3§ keep me");
         });
     }
 
@@ -6440,6 +6671,7 @@ mod tests {
                 tool_result("result2", 4, "c2", &huge),
             ];
             let request = with_usage(req("nudge", "cfg0", messages.clone()), 900, 1024);
+            run(&s, &request, &spine());
             let first = run(&s, &request, &spine());
             let first_result = tail_bytes(&first, "result2").to_string();
             assert!(first_result.contains("<system-reminder>"));
@@ -6814,6 +7046,7 @@ mod tests {
                 memory_content_epoch: String::new(),
                 memory_render_epoch: format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
                 profile_render_epoch: String::new(),
+                tagger_feature_epoch: String::new(),
             },
         );
         let good_meta = ModuleMeta {
@@ -6926,6 +7159,7 @@ mod tests {
         cfg: &str,
         memory_render_epoch: String,
         profile_render_epoch: String,
+        tagger_feature_epoch: String,
     ) -> String {
         fold_m0_content_epoch(
             cfg,
@@ -6935,6 +7169,7 @@ mod tests {
                 memory_content_epoch: String::new(),
                 memory_render_epoch,
                 profile_render_epoch,
+                tagger_feature_epoch,
             },
         )
     }
@@ -6944,6 +7179,7 @@ mod tests {
             store,
             cfg,
             format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+            String::new(),
             String::new(),
         )
     }
@@ -7056,6 +7292,7 @@ mod tests {
                     memory_content_epoch: String::new(),
                     memory_render_epoch: format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
                     profile_render_epoch: String::new(),
+                    tagger_feature_epoch: String::new(),
                 },
             ),
             coverage_ordinal: Some(0),
@@ -7553,6 +7790,7 @@ mod tests {
                 "cfg0",
                 format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
                 profile_epoch_component.clone(),
+                String::new(),
             );
             assert_eq!(loaded.meta.last_render_config, current_cfg);
             assert!(current_cfg.contains("mre:4:mre1"));
@@ -7562,6 +7800,7 @@ mod tests {
                 "cfg0",
                 String::new(),
                 profile_epoch_component,
+                String::new(),
             );
             loaded
                 .core

@@ -715,6 +715,15 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE shadow_divergences ADD COLUMN rs_window TEXT NOT NULL DEFAULT '';
     ",
     },
+    Migration {
+        version: 15,
+        // Preserve the exact pre-overlay span at mint time. Existing rows predate this
+        // provenance and remain explicitly empty; new rows never reconstruct source bytes
+        // from forgeable tag syntax.
+        statements: "
+        ALTER TABLE mc_tags ADD COLUMN source_bytes BLOB NOT NULL DEFAULT X'';
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1286,6 +1295,7 @@ pub struct TagMintInput {
     pub block_id: String,
     pub kind: String,
     pub token_count: i64,
+    pub source_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1295,6 +1305,7 @@ pub struct McTagRow {
     pub kind: String,
     pub token_count: i64,
     pub created_at_ms: i64,
+    pub source_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2018,7 +2029,7 @@ impl McStore {
                 }
                 if let Some(row) = tx
                     .query_row(
-                        "SELECT tag_number, block_id, kind, token_count, created_at_ms
+                        "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
                          FROM mc_tags
                          WHERE session_id = ?1 AND block_id = ?2",
                         params![session_id, block_id],
@@ -2035,8 +2046,9 @@ impl McStore {
                     |r| r.get::<_, i64>(0),
                 )?;
                 tx.execute(
-                    "INSERT INTO mc_tags (session_id, tag_number, block_id, kind, token_count, created_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO mc_tags
+                         (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         session_id,
                         next,
@@ -2044,6 +2056,7 @@ impl McStore {
                         input.kind.as_str(),
                         input.token_count.max(0),
                         created_at_ms,
+                        input.source_bytes.as_slice(),
                     ],
                 )?;
                 out.push(McTagRow {
@@ -2052,6 +2065,7 @@ impl McStore {
                     kind: input.kind.clone(),
                     token_count: input.token_count.max(0),
                     created_at_ms,
+                    source_bytes: input.source_bytes.clone(),
                 });
             }
             Ok(out)
@@ -2062,7 +2076,7 @@ impl McStore {
     pub fn load_tags_for_session(&self, session_id: &str) -> Result<Vec<McTagRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT tag_number, block_id, kind, token_count, created_at_ms
+                "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
                  FROM mc_tags
                  WHERE session_id = ?1
                  ORDER BY tag_number ASC",
@@ -4548,6 +4562,7 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
         kind: r.get(2)?,
         token_count: r.get(3)?,
         created_at_ms: r.get(4)?,
+        source_bytes: r.get(5)?,
     })
 }
 
@@ -5044,11 +5059,13 @@ mod tests {
                 block_id: "m1#0".to_string(),
                 kind: "message".to_string(),
                 token_count: 11,
+                source_bytes: b"message source".to_vec(),
             },
             TagMintInput {
                 block_id: "m2#0".to_string(),
                 kind: "tool_result".to_string(),
                 token_count: 22,
+                source_bytes: b"tool source".to_vec(),
             },
         ];
         let rows = store.mint_or_get_tags("ses", &first, 100).unwrap();
@@ -5062,11 +5079,13 @@ mod tests {
                 block_id: "m1#0".to_string(),
                 kind: "message".to_string(),
                 token_count: 999,
+                source_bytes: b"changed source must not overwrite".to_vec(),
             },
             TagMintInput {
                 block_id: "m3#0".to_string(),
                 kind: "tool_call".to_string(),
                 token_count: 33,
+                source_bytes: b"new source".to_vec(),
             },
         ];
         let rows = store.mint_or_get_tags("ses", &second, 200).unwrap();
@@ -5080,6 +5099,10 @@ mod tests {
         assert_eq!(
             all[0].token_count, 11,
             "token count is computed once at mint"
+        );
+        assert_eq!(
+            all[0].source_bytes, b"message source",
+            "pre-overlay provenance is immutable after the first mint"
         );
         let token_sum_ids = ["m1#0".to_string(), "m3#0".to_string()]
             .into_iter()
@@ -5190,6 +5213,25 @@ mod tests {
                  ('shadow:test', 1, 'quarantined', '', '', '[]', '{}', '{}', 'b', 2);",
         )
         .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| (9..=14).contains(&migration.version))
+        {
+            conn.execute_batch(migration.statements).unwrap();
+            conn.execute(
+                "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                 VALUES (?1, ?2, 0)",
+                params![NS, migration.version],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO mc_tags
+                 (session_id, tag_number, block_id, kind, token_count, created_at_ms)
+             VALUES ('legacy', 1, 'm1#0', 'message', 1, 1)",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
         let migrated = McStore::open(&descriptor(migrated_dir.path())).unwrap();
@@ -5229,6 +5271,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(divergence_diagnostic_columns, 3);
+        let tag_source_columns = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('mc_tags') WHERE name = 'source_bytes'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(tag_source_columns, 1);
+        assert_eq!(
+            migrated.load_tags_for_session("legacy").unwrap()[0].source_bytes,
+            Vec::<u8>::new(),
+            "migration preserves old tag rows with explicit unknown provenance"
+        );
         let remaining_classes = migrated
             .inner
             .with_conn(|conn| {
