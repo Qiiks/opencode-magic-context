@@ -8,7 +8,9 @@ import {
 } from "../../../scripts/generate-shadow-wire-fixture";
 
 describe("shadow wire fixture", () => {
-    it("matches the deterministic output of the real shadow payload builders", () => {
-        expect(readFileSync(SHADOW_WIRE_FIXTURE_PATH, "utf8")).toBe(generateShadowWireFixture());
+    it("matches the deterministic output of the real shadow payload builders", async () => {
+        expect(readFileSync(SHADOW_WIRE_FIXTURE_PATH, "utf8")).toBe(
+            await generateShadowWireFixture(),
+        );
     });
 });

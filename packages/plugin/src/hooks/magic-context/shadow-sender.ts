@@ -31,8 +31,16 @@ import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
-import { readRawSessionMessageById, readRawSessionMessageIdOrdinals } from "./read-session-chunk";
-import { isRawCompactionSummaryInfo, type RawMessage } from "./read-session-raw";
+import {
+    getRawSessionStoredMessageCount,
+    readRawSessionMessageOrdinalPage,
+    readRawSessionMessagePartsById,
+} from "./read-session-chunk";
+import {
+    isRawCompactionSummaryInfo,
+    type RawMessageOrdinalAnchor,
+    type RawMessageParts,
+} from "./read-session-raw";
 import type { MessageLike, TagNormalizationTarget } from "./tag-messages";
 import { formatDate } from "./temporal-awareness";
 
@@ -58,6 +66,9 @@ const SHADOW_SEND_TIMEOUT_MS = 15_000;
 const SHADOW_QUEUE_MAX_DEPTH = 2;
 const RESEED_COOLDOWN_MS = 30 * 60 * 1_000;
 const RESEED_ATTEMPT_CAP = 5;
+const SHADOW_ORDINAL_PAGE_SIZE = 500;
+const SHADOW_SEED_YIELD_EVERY_COMPARTMENTS = 10;
+const SHADOW_SEED_BUDGET_MS = 30_000;
 
 const declaredTrimBySession = new Map<string, { markerKey: string; trim: ShadowDeclaredTrim }>();
 
@@ -138,6 +149,7 @@ interface ShadowSenderCounters {
     generation_rejects: number;
     resets_sent: number;
     transforms_sent: number;
+    seed_budget_exceeded: number;
 }
 
 interface SessionQueueState {
@@ -149,6 +161,9 @@ interface SessionQueueState {
     lastAckedWatermarks: ShadowWatermarks | null;
     idOrdinalMemoGeneration: number;
     idOrdinalMemo: Map<string, number>;
+    idOrdinalMemoAnchor: RawMessageOrdinalAnchor | null;
+    idOrdinalMemoStoredCount: number | null;
+    idOrdinalMemoCanonicalCount: number;
     requireResetReason: string | null;
     blockedUntilReset: boolean;
     seedPassPending: boolean;
@@ -156,6 +171,8 @@ interface SessionQueueState {
     reseedAttempts: number;
     lastReseedAttemptMs: number | null;
     reseedAwaitingSuccess: boolean;
+    seedStartedAtMs: number | null;
+    seedBudgetSpentMs: number;
     counters: ShadowSenderCounters;
 }
 
@@ -241,6 +258,7 @@ function emptyCounters(): ShadowSenderCounters {
         generation_rejects: 0,
         resets_sent: 0,
         transforms_sent: 0,
+        seed_budget_exceeded: 0,
     };
 }
 
@@ -254,6 +272,9 @@ function createSessionQueueState(): SessionQueueState {
         lastAckedWatermarks: null,
         idOrdinalMemoGeneration: 0,
         idOrdinalMemo: new Map(),
+        idOrdinalMemoAnchor: null,
+        idOrdinalMemoStoredCount: null,
+        idOrdinalMemoCanonicalCount: 0,
         requireResetReason: "cold_start",
         blockedUntilReset: false,
         seedPassPending: false,
@@ -261,12 +282,18 @@ function createSessionQueueState(): SessionQueueState {
         reseedAttempts: 0,
         lastReseedAttemptMs: null,
         reseedAwaitingSuccess: false,
+        seedStartedAtMs: null,
+        seedBudgetSpentMs: 0,
         counters: emptyCounters(),
     };
 }
 
 function cloneJson<T>(value: T): T {
     return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function yieldToEventLoop(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function stableHash(value: string): string {
@@ -412,33 +439,81 @@ export function denormalizeShadowOutput(args: {
     return { ts_output: tsOutput, normalizations };
 }
 
-export function resolveOrdinalsForShadow(args: {
+export async function resolveOrdinalsForShadow(args: {
     sessionId: string;
     messages: MessageLike[];
     generation: number;
     memoGeneration: number;
     memo: Map<string, number>;
-}):
+    memoAnchor?: RawMessageOrdinalAnchor | null;
+    memoStoredCount?: number | null;
+    memoCanonicalCount?: number;
+}): Promise<
     | {
           ok: true;
           annotatedInput: unknown[];
           memoGeneration: number;
+          memoAnchor: RawMessageOrdinalAnchor | null;
+          memoStoredCount: number;
+          memoCanonicalCount: number;
           normalizations: ShadowNormalizationRecord[];
       }
-    | { ok: false; reason: "unresolved" | "mismatch"; messageId?: string } {
+    | { ok: false; reason: "unresolved" | "mismatch"; messageId?: string }
+> {
     const memo = args.memo;
-    if (args.memoGeneration !== args.generation) {
+    const generationChanged = args.memoGeneration !== args.generation;
+    if (generationChanged) memo.clear();
+
+    let anchor = generationChanged ? null : (args.memoAnchor ?? null);
+    let storedCount = generationChanged ? null : (args.memoStoredCount ?? null);
+    let canonicalCount = generationChanged ? 0 : (args.memoCanonicalCount ?? 0);
+    const priming = storedCount === null;
+    if (priming) {
         memo.clear();
+        anchor = null;
+        canonicalCount = 0;
     }
 
-    // Shadow enqueue runs after the transform's raw-message cache scope has ended.
-    // Read only message ids and metadata here; part rows are not needed for ordinals.
-    const ordinalById = readRawSessionMessageIdOrdinals(args.sessionId);
+    const newEntries: Array<ReturnType<typeof readRawSessionMessageOrdinalPage>[number]> = [];
+    let pageAnchor = anchor;
+    while (true) {
+        const page = readRawSessionMessageOrdinalPage(
+            args.sessionId,
+            pageAnchor,
+            SHADOW_ORDINAL_PAGE_SIZE,
+        );
+        if (page.length === 0) break;
+        newEntries.push(...page);
+        const last = page[page.length - 1];
+        pageAnchor = { timeCreated: last.timeCreated, id: last.id };
+        if (page.length < SHADOW_ORDINAL_PAGE_SIZE) break;
+        await yieldToEventLoop();
+    }
+
+    const currentStoredCount = getRawSessionStoredMessageCount(args.sessionId);
+    const expectedStoredCount = (storedCount ?? 0) + newEntries.length;
+    if (currentStoredCount !== expectedStoredCount) {
+        memo.clear();
+        return { ok: false, reason: "mismatch" };
+    }
+
+    for (const entry of newEntries) {
+        if (!entry.contributesOrdinal) continue;
+        canonicalCount += 1;
+        if (!entry.hasValidInfo) continue;
+        const prior = memo.get(entry.id);
+        if (prior !== undefined && prior !== canonicalCount) {
+            memo.clear();
+            return { ok: false, reason: "mismatch", messageId: entry.id };
+        }
+        memo.set(entry.id, canonicalCount);
+    }
+    anchor = pageAnchor;
+    storedCount = currentStoredCount;
+
     const normalizations: ShadowNormalizationRecord[] = [];
     const visibleMessages = args.messages.filter((message) => {
         if (!isRawCompactionSummaryInfo(message.info)) return true;
-        // Summary rows delimit OpenCode compaction but intentionally have no raw
-        // ordinal, so both comparison lanes omit them from the ordinal space.
         normalizations.push({
             kind: "summary_message",
             message_id: getMessageId(message),
@@ -457,29 +532,18 @@ export function resolveOrdinalsForShadow(args: {
     for (let index = 0; index < annotated.length; index += 1) {
         const messageId = getMessageId(visibleMessages[index]);
         if (!messageId) return { ok: false, reason: "unresolved" };
-        const ordinal = ordinalById.get(messageId);
-        if (ordinal === undefined && firstUnresolvedId === undefined) {
-            firstUnresolvedId = messageId;
-        }
+        const ordinal = memo.get(messageId);
+        if (ordinal === undefined && firstUnresolvedId === undefined) firstUnresolvedId = messageId;
         resolved[index] = ordinal;
     }
 
-    // OpenCode persists assistant rows at step/turn completion while the transform
-    // runs mid-turn, so the newest wire message(s) routinely have no DB row yet.
-    // Those live-tail messages are always a contiguous SUFFIX of the wire array in
-    // canonical order, so their eventual ordinals are exactly "last persisted + n".
-    // Assign those provisionally instead of skipping the pass — otherwise every
-    // ACTIVE pass (the ones the byte-compare exists for) starves. If interleaved
-    // persistence ever lands a different real ordinal, the memo drift check below
-    // reports "mismatch" on the next pass and the caller's shadow_reset self-heals.
+    // OpenCode can persist the live assistant suffix after this snapshot is captured.
+    // Provisional suffix ordinals keep active passes flowing; when those rows appear,
+    // the incremental reader verifies that their persisted ordinals agree.
     let suffixStart = annotated.length;
-    while (suffixStart > 0 && resolved[suffixStart - 1] === undefined) {
-        suffixStart -= 1;
-    }
+    while (suffixStart > 0 && resolved[suffixStart - 1] === undefined) suffixStart -= 1;
     for (let index = 0; index < suffixStart; index += 1) {
         if (resolved[index] === undefined) {
-            // A hole BEFORE a resolved message is not the live tail (deleted or
-            // foreign id) — keep the fail-skip so we never fabricate history.
             return { ok: false, reason: "unresolved", messageId: firstUnresolvedId };
         }
     }
@@ -505,13 +569,17 @@ export function resolveOrdinalsForShadow(args: {
         ok: true,
         annotatedInput: annotated,
         memoGeneration: args.generation,
+        memoAnchor: anchor,
+        memoStoredCount: storedCount,
+        memoCanonicalCount: canonicalCount,
         normalizations,
     };
 }
 
 function ordinalForMessageId(args: {
-    raw: RawMessage | null;
+    raw: RawMessageParts | null;
     messageId: string;
+    declaredOrdinal: number;
     generation: number;
     state: SessionQueueState;
 }): number | null | "mismatch" {
@@ -519,14 +587,14 @@ function ordinalForMessageId(args: {
         args.state.idOrdinalMemo.clear();
         args.state.idOrdinalMemoGeneration = args.generation;
     }
-    if (!args.raw) return null;
+    if (!args.raw || args.raw.id !== args.messageId || args.declaredOrdinal < 1) return null;
     const prior = args.state.idOrdinalMemo.get(args.messageId);
-    if (prior !== undefined && prior !== args.raw.ordinal) return "mismatch";
-    args.state.idOrdinalMemo.set(args.messageId, args.raw.ordinal);
-    return args.raw.ordinal;
+    if (prior !== undefined && prior !== args.declaredOrdinal) return "mismatch";
+    args.state.idOrdinalMemo.set(args.messageId, args.declaredOrdinal);
+    return args.declaredOrdinal;
 }
 
-function flatBlockCountForRawMessage(message: RawMessage | undefined): number {
+function flatBlockCountForRawMessage(message: RawMessageParts | undefined): number {
     if (!message) return 1;
     let count = 0;
     for (const part of message.parts) {
@@ -573,7 +641,7 @@ function flatBlockCountForRawMessage(message: RawMessage | undefined): number {
 
 export function flatBlockIdForRawMessage(
     messageId: string,
-    raw: RawMessage | undefined,
+    raw: RawMessageParts | undefined,
     edge: "start" | "end",
 ): string {
     const blockIndex = edge === "start" ? 0 : flatBlockCountForRawMessage(raw) - 1;
@@ -592,7 +660,7 @@ export function resolveDeclaredTrimForShadow(args: {
     const cached = declaredTrimBySession.get(args.sessionId);
     if (cached?.markerKey === markerKey) return cached.trim;
 
-    const boundaryRaw = readRawSessionMessageById(args.sessionId, targetEndMessageId);
+    const boundaryRaw = readRawSessionMessagePartsById(args.sessionId, targetEndMessageId);
     if (!boundaryRaw) return null;
     const compartments = getCompartmentsByEndMessageId(args.db, args.sessionId, targetEndMessageId);
     const boundaryCompartment = compartments.find(
@@ -717,7 +785,7 @@ function watermarksEqual(left: ShadowWatermarks | null, right: ShadowWatermarks)
 
 function serializeCompartment(args: {
     compartment: ReturnType<typeof getCompartments>[number];
-    readRawById: (messageId: string) => RawMessage | null;
+    readRawById: (messageId: string) => RawMessageParts | null;
     state: SessionQueueState;
 }): unknown | null | "mismatch" {
     const startRaw = args.readRawById(args.compartment.startMessageId);
@@ -725,12 +793,14 @@ function serializeCompartment(args: {
     const startOrdinal = ordinalForMessageId({
         raw: startRaw,
         messageId: args.compartment.startMessageId,
+        declaredOrdinal: args.compartment.startMessage,
         generation: args.state.shadowGeneration,
         state: args.state,
     });
     const endOrdinal = ordinalForMessageId({
         raw: endRaw,
         messageId: args.compartment.endMessageId,
+        declaredOrdinal: args.compartment.endMessage,
         generation: args.state.shadowGeneration,
         state: args.state,
     });
@@ -773,13 +843,18 @@ function serializeCompartment(args: {
     };
 }
 
-function buildStateSyncPayload(args: {
+async function buildStateSyncPayload(args: {
     state: SessionQueueState;
     pass: Pick<ShadowTransformPass, "db" | "sessionId" | "projectPath" | "passInputs"> & {
         declaredTrim?: ShadowDeclaredTrim | null;
     };
     force: boolean;
-}): ShadowStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" {
+    shouldAbortSeed?: () => boolean;
+    beforeSerializeCompartment?: () => void;
+    yieldEveryCompartments?: number;
+}): Promise<
+    ShadowStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" | "seed_budget"
+> {
     const workspace = resolveShadowWorkspaceContext(args.pass.db, args.pass.projectPath);
     const currentWatermarks = loadWatermarks({
         db: args.pass.db,
@@ -815,16 +890,23 @@ function buildStateSyncPayload(args: {
           });
     // State sync needs only compartment boundary messages. Cache point reads within
     // this payload so adjacent compartments sharing a boundary read it once.
-    const rawById = new Map<string, RawMessage | null>();
-    const readRawById = (messageId: string): RawMessage | null => {
+    const rawById = new Map<string, RawMessageParts | null>();
+    const readRawById = (messageId: string): RawMessageParts | null => {
         if (!rawById.has(messageId)) {
-            rawById.set(messageId, readRawSessionMessageById(args.pass.sessionId, messageId));
+            rawById.set(messageId, readRawSessionMessagePartsById(args.pass.sessionId, messageId));
         }
         return rawById.get(messageId) ?? null;
     };
     const compartments: unknown[] = [];
+    const yieldEvery = Math.max(
+        1,
+        args.yieldEveryCompartments ?? SHADOW_SEED_YIELD_EVERY_COMPARTMENTS,
+    );
+    let serializedCount = 0;
     for (const compartment of getCompartments(args.pass.db, args.pass.sessionId)) {
         if (compartment.sequence <= acked.compartment_sequence) continue;
+        args.beforeSerializeCompartment?.();
+        if (args.shouldAbortSeed?.()) return "seed_budget";
         const serialized = serializeCompartment({
             compartment,
             readRawById,
@@ -833,6 +915,11 @@ function buildStateSyncPayload(args: {
         if (serialized === "mismatch") return "mismatch";
         if (serialized === null) return "unresolved";
         compartments.push(serialized);
+        serializedCount += 1;
+        if (serializedCount % yieldEvery === 0) {
+            await yieldToEventLoop();
+            if (args.shouldAbortSeed?.()) return "seed_budget";
+        }
     }
 
     const allMemories = args.pass.projectPath
@@ -1050,6 +1137,11 @@ export function createShadowSender(
         reseedAttemptCap?: number;
         sendTimeoutMs?: number;
         queueMaxDepth?: number;
+        seedBudgetMs?: number;
+        seedClock?: () => number;
+        beforeSerializeCompartment?: () => void;
+        seedYieldEveryCompartments?: number;
+        onSeedBudgetExceeded?: (message: string) => void;
     } = {},
 ): ShadowSender {
     const transport = options.transport ?? new SubcShadowTransport();
@@ -1058,6 +1150,8 @@ export function createShadowSender(
     const reseedAttemptCap = options.reseedAttemptCap ?? RESEED_ATTEMPT_CAP;
     const sendTimeoutMs = Math.max(1, options.sendTimeoutMs ?? SHADOW_SEND_TIMEOUT_MS);
     const queueMaxDepth = Math.max(1, options.queueMaxDepth ?? SHADOW_QUEUE_MAX_DEPTH);
+    const seedBudgetMs = Math.max(1, options.seedBudgetMs ?? SHADOW_SEED_BUDGET_MS);
+    const seedClock = options.seedClock ?? (() => performance.now());
     const sessions = new Map<string, SessionQueueState>();
     const subagentSessions = new Set<string>();
 
@@ -1070,18 +1164,40 @@ export function createShadowSender(
         return state;
     };
 
+    const disableIfSeedBudgetExceeded = (sessionId: string, state: SessionQueueState): boolean => {
+        const activeElapsed =
+            state.seedStartedAtMs === null ? 0 : Math.max(0, seedClock() - state.seedStartedAtMs);
+        if (state.seedBudgetSpentMs + activeElapsed <= seedBudgetMs) return false;
+        if (!state.skipped) {
+            state.skipped = true;
+            state.queue.length = 0;
+            state.counters.seed_budget_exceeded += 1;
+            const message = "shadow: seed budget exceeded, lane disabled for session";
+            sessionLog(sessionId, message);
+            options.onSeedBudgetExceeded?.(message);
+        }
+        return true;
+    };
+
+    const pauseSeedBudget = (state: SessionQueueState): void => {
+        if (state.seedStartedAtMs === null) return;
+        state.seedBudgetSpentMs += Math.max(0, seedClock() - state.seedStartedAtMs);
+        state.seedStartedAtMs = null;
+    };
+
     const schedule = (sessionId: string): void => {
         const state = getState(sessionId);
         if (state.running) return;
         state.running = true;
         void runQueue(sessionId, state).finally(() => {
             state.running = false;
-            if (state.queue.length > 0) schedule(sessionId);
+            if (!state.skipped && state.queue.length > 0) schedule(sessionId);
         });
     };
 
     const pushWork = (sessionId: string, work: ShadowWorkItem): void => {
         const state = getState(sessionId);
+        if (state.skipped) return;
         let dropped = 0;
         if (work.kind === "pass") {
             state.counters.enqueued += 1;
@@ -1147,6 +1263,8 @@ export function createShadowSender(
                         reason: item.reason,
                         projectRoot: item.projectRoot,
                     });
+                    pauseSeedBudget(state);
+                    disableIfSeedBudgetExceeded(sessionId, state);
                 } catch (error) {
                     state.counters.send_failures += 1;
                     state.initialized = false;
@@ -1181,6 +1299,8 @@ export function createShadowSender(
                 }
                 sessionLog(sessionId, "shadow: send failed (ignored):", error);
             }
+            pauseSeedBudget(state);
+            disableIfSeedBudgetExceeded(sessionId, state);
         }
     };
 
@@ -1190,6 +1310,8 @@ export function createShadowSender(
         reason: string;
         projectRoot?: string;
     }): Promise<void> => {
+        args.state.seedBudgetSpentMs = 0;
+        args.state.seedStartedAtMs = seedClock();
         const projectRoot = args.projectRoot ?? process.cwd();
         const body = toFlatWireBody(buildShadowResetBody(args));
         const response = await callTransport(args.state, {
@@ -1207,6 +1329,9 @@ export function createShadowSender(
         args.state.lastAckedWatermarks = null;
         args.state.idOrdinalMemo.clear();
         args.state.idOrdinalMemoGeneration = args.state.shadowGeneration;
+        args.state.idOrdinalMemoAnchor = null;
+        args.state.idOrdinalMemoStoredCount = null;
+        args.state.idOrdinalMemoCanonicalCount = 0;
         clearDeclaredTrimForSession(args.sessionId);
         args.state.initialized = true;
         args.state.blockedUntilReset = false;
@@ -1242,6 +1367,9 @@ export function createShadowSender(
         pass: ShadowTransformPass,
     ): Promise<void> => {
         if (state.skipped) return;
+        if (state.seedPassPending && state.seedStartedAtMs === null) {
+            state.seedStartedAtMs = seedClock();
+        }
         if (state.blockedUntilReset && !state.requireResetReason) {
             state.requireResetReason = "unknown_block";
         }
@@ -1254,15 +1382,19 @@ export function createShadowSender(
             });
         }
         if (state.skipped || state.blockedUntilReset) return;
+        if (disableIfSeedBudgetExceeded(pass.sessionId, state)) return;
 
-        let resolved: ReturnType<typeof resolveOrdinalsForShadow>;
+        let resolved: Awaited<ReturnType<typeof resolveOrdinalsForShadow>>;
         try {
-            resolved = resolveOrdinalsForShadow({
+            resolved = await resolveOrdinalsForShadow({
                 sessionId: pass.sessionId,
                 messages: pass.inputMessages,
                 generation: state.shadowGeneration,
                 memoGeneration: state.idOrdinalMemoGeneration,
                 memo: state.idOrdinalMemo,
+                memoAnchor: state.idOrdinalMemoAnchor,
+                memoStoredCount: state.idOrdinalMemoStoredCount,
+                memoCanonicalCount: state.idOrdinalMemoCanonicalCount,
             });
         } catch (error) {
             sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
@@ -1290,9 +1422,13 @@ export function createShadowSender(
             return;
         }
         state.idOrdinalMemoGeneration = resolved.memoGeneration;
+        state.idOrdinalMemoAnchor = resolved.memoAnchor;
+        state.idOrdinalMemoStoredCount = resolved.memoStoredCount;
+        state.idOrdinalMemoCanonicalCount = resolved.memoCanonicalCount;
+        if (disableIfSeedBudgetExceeded(pass.sessionId, state)) return;
 
         let preparedPass: PreparedShadowPass;
-        let syncPayload: ReturnType<typeof buildStateSyncPayload>;
+        let syncPayload: Awaited<ReturnType<typeof buildStateSyncPayload>>;
         try {
             const declaredTrim = resolveDeclaredTrimForShadow({
                 db: pass.db,
@@ -1321,10 +1457,20 @@ export function createShadowSender(
                     },
                 },
             };
-            syncPayload = buildStateSyncPayload({
+            syncPayload = await buildStateSyncPayload({
                 state,
                 pass: preparedPass,
                 force: state.lastAckedWatermarks === null,
+                shouldAbortSeed: state.seedPassPending
+                    ? () =>
+                          state.seedBudgetSpentMs +
+                              (state.seedStartedAtMs === null
+                                  ? 0
+                                  : Math.max(0, seedClock() - state.seedStartedAtMs)) >
+                          seedBudgetMs
+                    : undefined,
+                beforeSerializeCompartment: options.beforeSerializeCompartment,
+                yieldEveryCompartments: options.seedYieldEveryCompartments,
             });
         } catch (error) {
             sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
@@ -1339,7 +1485,19 @@ export function createShadowSender(
                 projectRoot: pass.projectRoot,
             });
             try {
-                const fullSync = buildStateSyncPayload({ state, pass: preparedPass, force: true });
+                const fullSync = await buildStateSyncPayload({
+                    state,
+                    pass: preparedPass,
+                    force: true,
+                    shouldAbortSeed: () =>
+                        state.seedBudgetSpentMs +
+                            (state.seedStartedAtMs === null
+                                ? 0
+                                : Math.max(0, seedClock() - state.seedStartedAtMs)) >
+                        seedBudgetMs,
+                    beforeSerializeCompartment: options.beforeSerializeCompartment,
+                    yieldEveryCompartments: options.seedYieldEveryCompartments,
+                });
                 if (fullSync === "m0_mutation") {
                     throw new Error("forced state sync unexpectedly requested another m0 reset");
                 }
@@ -1348,6 +1506,15 @@ export function createShadowSender(
                 sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
                 return;
             }
+        }
+        if (syncPayload === "seed_budget") {
+            disableIfSeedBudgetExceeded(pass.sessionId, state);
+            return;
+        }
+        if (state.seedPassPending) {
+            if (disableIfSeedBudgetExceeded(pass.sessionId, state)) return;
+            state.seedStartedAtMs = null;
+            state.seedBudgetSpentMs = 0;
         }
         if (syncPayload === "mismatch") {
             state.counters.ordinal_mismatch += 1;

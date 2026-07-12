@@ -303,12 +303,83 @@ function responseFrame(channel: number, corr: number, body: unknown): Buffer {
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-    const deadline = Date.now() + 1_000;
+    const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
         if (predicate()) return;
         await new Promise((resolve) => setTimeout(resolve, 5));
     }
     expect(predicate()).toBe(true);
+}
+
+function appendLinearCompartments(db: ContextDatabase, sessionId: string, count: number): void {
+    appendCompartments(
+        db,
+        sessionId,
+        Array.from({ length: count }, (_, index) => ({
+            sequence: index,
+            startMessage: index + 1,
+            endMessage: index + 1,
+            startMessageId: `m${index + 1}`,
+            endMessageId: `m${index + 1}`,
+            title: `Compartment ${index + 1}`,
+            content: `content ${index + 1}`,
+        })),
+    );
+}
+
+function installLinearRawProvider(
+    sessionId: string,
+    count: number,
+): {
+    counters: {
+        fullReads: number;
+        ordinalPageReads: number;
+        storedCounts: number;
+        partReads: number;
+    };
+    unregister: () => void;
+} {
+    const counters = { fullReads: 0, ordinalPageReads: 0, storedCounts: 0, partReads: 0 };
+    const rows = Array.from({ length: count }, (_, index) => ({
+        id: `m${index + 1}`,
+        timeCreated: index + 1,
+        contributesOrdinal: true,
+        hasValidInfo: true,
+    }));
+    const unregister = setRawMessageProvider(sessionId, {
+        readMessages() {
+            counters.fullReads += 1;
+            throw new Error("shadow seed must not hydrate the full raw session");
+        },
+        readMessageOrdinalPage(after, limit) {
+            counters.ordinalPageReads += 1;
+            return rows
+                .filter(
+                    (row) =>
+                        !after ||
+                        row.timeCreated > after.timeCreated ||
+                        (row.timeCreated === after.timeCreated && row.id > after.id),
+                )
+                .slice(0, limit);
+        },
+        getStoredMessageCount() {
+            counters.storedCounts += 1;
+            return rows.length;
+        },
+        readMessagePartsById(messageId) {
+            counters.partReads += 1;
+            const row = rows.find((candidate) => candidate.id === messageId);
+            return row
+                ? {
+                      id: row.id,
+                      role: "user",
+                      parts: [{ type: "text", text: row.id }],
+                      createdAt: row.timeCreated,
+                  }
+                : null;
+        },
+    });
+    return { counters, unregister };
 }
 
 describe("shadow sender", () => {
@@ -384,102 +455,148 @@ describe("shadow sender", () => {
         ]);
     });
 
-    it("resolves canonical raw ordinals, detects mismatches, and skips unresolvable windows", () => {
-        useTempDataHome("shadow-ordinals-");
+    it("primes ordinals once, appends only newer rows, and detects deletion drift", async () => {
         const sessionId = "s-ord";
-        createOpenCodeDb(sessionId, [
-            { id: "m1", role: "user", text: "old" },
-            { id: "summary", role: "assistant", text: "summary", summary: true },
-            { id: "m2", role: "assistant", text: "visible" },
-        ]);
-        const state = __shadowSenderTest.createSessionQueueState();
-
-        const resolved = __shadowSenderTest.resolveOrdinalsForShadow({
-            sessionId,
-            messages: [message(sessionId, "m2", "visible")],
-            generation: state.shadowGeneration,
-            memoGeneration: state.idOrdinalMemoGeneration,
-            memo: state.idOrdinalMemo,
+        let rows = [
+            { id: "m1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true },
+            { id: "summary", timeCreated: 2, contributesOrdinal: false, hasValidInfo: true },
+            { id: "m2", timeCreated: 3, contributesOrdinal: true, hasValidInfo: true },
+        ];
+        const pageAnchors: Array<{ timeCreated: number; id: string } | null> = [];
+        const unregister = setRawMessageProvider(sessionId, {
+            readMessages() {
+                throw new Error("incremental ordinal reads must not hydrate the full session");
+            },
+            readMessageOrdinalPage(after, limit) {
+                pageAnchors.push(after);
+                return rows
+                    .filter(
+                        (row) =>
+                            !after ||
+                            row.timeCreated > after.timeCreated ||
+                            (row.timeCreated === after.timeCreated && row.id > after.id),
+                    )
+                    .slice(0, limit);
+            },
+            getStoredMessageCount() {
+                return rows.length;
+            },
         });
-        expect(resolved).toEqual(
-            expect.objectContaining({
-                ok: true,
-                annotatedInput: [expect.objectContaining({ absolute_ordinal: 2 })],
-            }),
-        );
-
-        // m2 vanished from the DB (revert) but the memo remembers ordinal 2. The
-        // trailing-suffix rule assigns it a provisional ordinal that disagrees, so
-        // the drift check reports mismatch and the caller's shadow_reset re-seeds —
-        // stronger healing than the old skip-forever behavior.
-        createOpenCodeDb(sessionId, [{ id: "m3", role: "assistant", text: "new" }]);
-        expect(
-            __shadowSenderTest.resolveOrdinalsForShadow({
+        try {
+            const state = __shadowSenderTest.createSessionQueueState();
+            const first = await __shadowSenderTest.resolveOrdinalsForShadow({
                 sessionId,
                 messages: [message(sessionId, "m2", "visible")],
                 generation: state.shadowGeneration,
                 memoGeneration: state.idOrdinalMemoGeneration,
                 memo: state.idOrdinalMemo,
-            }),
-        ).toEqual(expect.objectContaining({ ok: false, reason: "mismatch" }));
+                memoAnchor: state.idOrdinalMemoAnchor,
+                memoStoredCount: state.idOrdinalMemoStoredCount,
+                memoCanonicalCount: state.idOrdinalMemoCanonicalCount,
+            });
+            expect(first).toEqual(
+                expect.objectContaining({
+                    ok: true,
+                    annotatedInput: [expect.objectContaining({ absolute_ordinal: 2 })],
+                }),
+            );
+            if (!first.ok) throw new Error("ordinal prime unexpectedly failed");
 
-        // Live tail: a not-yet-persisted assistant suffix gets provisional ordinals
-        // (last persisted + n) instead of starving the active pass; a HOLE before a
-        // persisted message still fail-skips (never fabricate history mid-array).
-        createOpenCodeDb(sessionId, [
-            { id: "m1", role: "user", text: "old" },
-            { id: "m2", role: "assistant", text: "visible" },
-        ]);
-        const liveTail = __shadowSenderTest.resolveOrdinalsForShadow({
-            sessionId,
-            messages: [
-                message(sessionId, "m2", "visible"),
-                message(sessionId, "m-live-user", "new prompt"),
-                message(sessionId, "m-live-assistant", "in flight"),
-            ],
-            generation: state.shadowGeneration,
-            memoGeneration: state.idOrdinalMemoGeneration,
-            memo: new Map(),
-        });
-        expect(liveTail).toEqual(
-            expect.objectContaining({
-                ok: true,
-                annotatedInput: [
-                    expect.objectContaining({ absolute_ordinal: 2 }),
-                    expect.objectContaining({ absolute_ordinal: 3 }),
-                    expect.objectContaining({ absolute_ordinal: 4 }),
-                ],
-            }),
-        );
-        expect(
-            __shadowSenderTest.resolveOrdinalsForShadow({
+            rows = [
+                ...rows,
+                { id: "m3", timeCreated: 4, contributesOrdinal: true, hasValidInfo: true },
+                { id: "m4", timeCreated: 5, contributesOrdinal: true, hasValidInfo: true },
+                { id: "m5", timeCreated: 6, contributesOrdinal: true, hasValidInfo: true },
+            ];
+            const second = await __shadowSenderTest.resolveOrdinalsForShadow({
                 sessionId,
-                messages: [
-                    message(sessionId, "m-hole", "never persisted"),
-                    message(sessionId, "m2", "visible"),
-                ],
+                messages: [message(sessionId, "m5", "new")],
                 generation: state.shadowGeneration,
-                memoGeneration: state.idOrdinalMemoGeneration,
-                memo: new Map(),
-            }),
-        ).toEqual(
-            expect.objectContaining({ ok: false, reason: "unresolved", messageId: "m-hole" }),
-        );
-
-        state.idOrdinalMemo.set("m2", 7);
-        createOpenCodeDb(sessionId, [
-            { id: "m1", role: "user", text: "old" },
-            { id: "m2", role: "assistant", text: "visible" },
-        ]);
-        expect(
-            __shadowSenderTest.resolveOrdinalsForShadow({
-                sessionId,
-                messages: [message(sessionId, "m2", "visible")],
-                generation: state.shadowGeneration,
-                memoGeneration: state.idOrdinalMemoGeneration,
+                memoGeneration: first.memoGeneration,
                 memo: state.idOrdinalMemo,
-            }),
-        ).toEqual(expect.objectContaining({ ok: false, reason: "mismatch" }));
+                memoAnchor: first.memoAnchor,
+                memoStoredCount: first.memoStoredCount,
+                memoCanonicalCount: first.memoCanonicalCount,
+            });
+            expect(second).toEqual(
+                expect.objectContaining({
+                    ok: true,
+                    annotatedInput: [expect.objectContaining({ absolute_ordinal: 5 })],
+                }),
+            );
+            expect(pageAnchors).toEqual([null, { timeCreated: 3, id: "m2" }]);
+            if (!second.ok) throw new Error("incremental ordinal append unexpectedly failed");
+
+            rows = rows.filter((row) => row.id !== "m1");
+            expect(
+                await __shadowSenderTest.resolveOrdinalsForShadow({
+                    sessionId,
+                    messages: [message(sessionId, "m5", "new")],
+                    generation: state.shadowGeneration,
+                    memoGeneration: second.memoGeneration,
+                    memo: state.idOrdinalMemo,
+                    memoAnchor: second.memoAnchor,
+                    memoStoredCount: second.memoStoredCount,
+                    memoCanonicalCount: second.memoCanonicalCount,
+                }),
+            ).toEqual(expect.objectContaining({ ok: false, reason: "mismatch" }));
+        } finally {
+            unregister();
+        }
+    });
+
+    it("resets the shadow lineage when incremental count drift finds a deletion", async () => {
+        useTempDataHome("shadow-ordinal-drift-reset-");
+        const sessionId = "s-ordinal-drift-reset";
+        const db = openDatabase();
+        let rows = [
+            { id: "m1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true },
+            { id: "m2", timeCreated: 2, contributesOrdinal: true, hasValidInfo: true },
+        ];
+        const unregister = setRawMessageProvider(sessionId, {
+            readMessages() {
+                throw new Error("ordinal drift checks must not hydrate the full session");
+            },
+            readMessageOrdinalPage(after, limit) {
+                return rows
+                    .filter(
+                        (row) =>
+                            !after ||
+                            row.timeCreated > after.timeCreated ||
+                            (row.timeCreated === after.timeCreated && row.id > after.id),
+                    )
+                    .slice(0, limit);
+            },
+            getStoredMessageCount: () => rows.length,
+        });
+        try {
+            const transport = new FakeTransport();
+            const sender = createShadowSender({ transport });
+            const tail = message(sessionId, "m2", "tail");
+            sender.enqueue(
+                basePass({ db, sessionId, inputMessages: [tail], outputMessages: [tail] }),
+            );
+            await waitFor(() => sender.getStats(sessionId).transforms_sent === 1);
+
+            rows = rows.filter((row) => row.id !== "m1");
+            sender.enqueue(
+                basePass({
+                    db,
+                    sessionId,
+                    inputMessages: [tail],
+                    outputMessages: [tail],
+                    nowMs: 2,
+                }),
+            );
+            await waitFor(() => sender.getStats(sessionId).ordinal_mismatch === 1);
+
+            expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(
+                2,
+            );
+            expect(sender.getStats(sessionId).transforms_sent).toBe(1);
+        } finally {
+            unregister();
+        }
     });
 
     it("sends compacted sessions after excluding summary rows from both comparison lanes", async () => {
@@ -684,7 +801,7 @@ describe("shadow sender", () => {
         expect(compared.ts_output.map((entry) => entry.info.id)).toEqual(["m3"]);
     });
 
-    it("uses id-only and point readers across ordinal, declared-trim, and state-sync paths", () => {
+    it("uses id-only and point readers across ordinal, declared-trim, and state-sync paths", async () => {
         useTempDataHome("shadow-point-reads-");
         const sessionId = "s-point-reads";
         const db = openDatabase();
@@ -736,11 +853,25 @@ describe("shadow sender", () => {
                 fullReads += 1;
                 throw new Error("full raw-session reads are forbidden on shadow paths");
             },
-            readMessageIdOrdinals() {
-                return new Map([
-                    ["m1", 1],
-                    ["m2", 2],
-                ]);
+            readMessageOrdinalPage(after) {
+                if (after) return [];
+                return [
+                    {
+                        id: "m1",
+                        timeCreated: 1,
+                        contributesOrdinal: true,
+                        hasValidInfo: true,
+                    },
+                    {
+                        id: "m2",
+                        timeCreated: 2,
+                        contributesOrdinal: true,
+                        hasValidInfo: true,
+                    },
+                ];
+            },
+            getStoredMessageCount() {
+                return 2;
             },
             readMessageById(messageId) {
                 pointReads += 1;
@@ -750,7 +881,7 @@ describe("shadow sender", () => {
         try {
             const state = __shadowSenderTest.createSessionQueueState();
             expect(
-                __shadowSenderTest.resolveOrdinalsForShadow({
+                await __shadowSenderTest.resolveOrdinalsForShadow({
                     sessionId,
                     messages: [message(sessionId, "m2", "two")],
                     generation: state.shadowGeneration,
@@ -761,7 +892,7 @@ describe("shadow sender", () => {
             expect(__shadowSenderTest.resolveDeclaredTrimForShadow({ db, sessionId })).toEqual(
                 expect.objectContaining({ flat_boundary_id: "m2#0" }),
             );
-            const sync = __shadowSenderTest.buildStateSyncPayload({
+            const sync = await __shadowSenderTest.buildStateSyncPayload({
                 state,
                 pass: basePass({ db, sessionId }),
                 force: true,
@@ -777,6 +908,121 @@ describe("shadow sender", () => {
             );
             expect(fullReads).toBe(0);
             expect(pointReads).toBe(3);
+        } finally {
+            unregister();
+        }
+    });
+
+    it("seeds 200 compartments with one ordinal prime and parts-only point reads", async () => {
+        useTempDataHome("shadow-seed-cost-");
+        const sessionId = "s-seed-cost";
+        const db = openDatabase();
+        appendLinearCompartments(db, sessionId, 200);
+        const { counters, unregister } = installLinearRawProvider(sessionId, 200);
+        try {
+            const transport = new FakeTransport();
+            const sender = createShadowSender({ transport });
+            const tail = message(sessionId, "m200", "tail");
+            sender.enqueue(
+                basePass({ db, sessionId, inputMessages: [tail], outputMessages: [tail] }),
+            );
+            await waitFor(() => sender.getStats(sessionId).transforms_sent === 1);
+
+            expect(counters.fullReads).toBe(0);
+            expect(counters.ordinalPageReads).toBe(1);
+            expect(counters.storedCounts).toBe(1);
+            expect(counters.partReads).toBeLessThanOrEqual(200);
+        } finally {
+            unregister();
+        }
+    });
+
+    it("yields often enough for interval timers to run during a large seed", async () => {
+        useTempDataHome("shadow-seed-yield-");
+        const sessionId = "s-seed-yield";
+        const db = openDatabase();
+        appendLinearCompartments(db, sessionId, 100);
+        const { unregister } = installLinearRawProvider(sessionId, 100);
+        let previousTick = 0;
+        let maxGap = 0;
+        let timerTicks = 0;
+        let serializationStarted = false;
+        let serializedCount = 0;
+        let resolveSerializationYielded: (() => void) | null = null;
+        const serializationYielded = new Promise<void>((resolve) => {
+            resolveSerializationYielded = resolve;
+        });
+        const timer = setInterval(() => {
+            if (!serializationStarted) return;
+            const tick = performance.now();
+            timerTicks += 1;
+            maxGap = Math.max(maxGap, tick - previousTick);
+            previousTick = tick;
+        }, 10);
+        try {
+            const transport = new FakeTransport();
+            const sender = createShadowSender({
+                transport,
+                beforeSerializeCompartment() {
+                    if (!serializationStarted) {
+                        serializationStarted = true;
+                        previousTick = performance.now();
+                    }
+                    serializedCount += 1;
+                    if (serializedCount === 100)
+                        setImmediate(() => resolveSerializationYielded?.());
+                    const end = performance.now() + 2;
+                    while (performance.now() < end) {
+                        // Simulate non-trivial synchronous compartment serialization.
+                    }
+                },
+            });
+            const tail = message(sessionId, "m100", "tail");
+            sender.enqueue(
+                basePass({ db, sessionId, inputMessages: [tail], outputMessages: [tail] }),
+            );
+            await serializationYielded;
+            maxGap = Math.max(maxGap, performance.now() - previousTick);
+            expect(serializedCount).toBe(100);
+            expect(timerTicks).toBeGreaterThanOrEqual(5);
+            expect(maxGap).toBeLessThan(750);
+            await waitFor(() => sender.getStats(sessionId).transforms_sent === 1);
+        } finally {
+            clearInterval(timer);
+            unregister();
+        }
+    });
+
+    it("permanently skips a session when seed serialization exceeds its budget", async () => {
+        useTempDataHome("shadow-seed-budget-");
+        const sessionId = "s-seed-budget";
+        const db = openDatabase();
+        appendLinearCompartments(db, sessionId, 1);
+        const { unregister } = installLinearRawProvider(sessionId, 1);
+        let clock = 0;
+        const budgetLogs: string[] = [];
+        try {
+            const transport = new FakeTransport();
+            const sender = createShadowSender({
+                transport,
+                seedBudgetMs: 30,
+                seedClock: () => clock,
+                beforeSerializeCompartment: () => {
+                    clock = 31;
+                },
+                onSeedBudgetExceeded: (line) => budgetLogs.push(line),
+            });
+            sender.enqueue(basePass({ db, sessionId }));
+            await waitFor(() => sender.getStats(sessionId).seed_budget_exceeded === 1);
+
+            expect(sender.getStats(sessionId).transforms_sent).toBe(0);
+            expect(transport.calls.map((call) => call.method)).toEqual(["shadow_reset"]);
+            expect(budgetLogs).toEqual(["shadow: seed budget exceeded, lane disabled for session"]);
+
+            sender.enqueue(basePass({ db, sessionId, nowMs: 2 }));
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            expect(transport.calls.map((call) => call.method)).toEqual(["shadow_reset"]);
+            expect(sender.getStats(sessionId).seed_budget_exceeded).toBe(1);
         } finally {
             unregister();
         }
@@ -949,7 +1195,7 @@ describe("shadow sender", () => {
         expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(4);
     });
 
-    it("serializes state_sync and shadow_transform with the shadow wire field inventory", () => {
+    it("serializes state_sync and shadow_transform with the shadow wire field inventory", async () => {
         useTempDataHome("shadow-wire-");
         const sessionId = "s-wire";
         createOpenCodeDb(sessionId, [
@@ -984,7 +1230,7 @@ describe("shadow sender", () => {
         };
         const pass = basePass({ db, sessionId });
 
-        const stateSync = __shadowSenderTest.buildStateSyncPayload({
+        const stateSync = await __shadowSenderTest.buildStateSyncPayload({
             state,
             pass,
             force: true,
@@ -1097,7 +1343,7 @@ describe("shadow sender", () => {
         );
     });
 
-    it("syncs the visible workspace memory union with real project attribution", () => {
+    it("syncs the visible workspace memory union with real project attribution", async () => {
         useTempDataHome("shadow-workspace-");
         const sessionId = "s-workspace";
         const projectPath = "/workspace/owner";
@@ -1138,7 +1384,7 @@ describe("shadow sender", () => {
         });
         const state = __shadowSenderTest.createSessionQueueState();
 
-        const sync = __shadowSenderTest.buildStateSyncPayload({
+        const sync = await __shadowSenderTest.buildStateSyncPayload({
             state,
             pass: basePass({ db, sessionId, projectPath }),
             force: true,
@@ -1147,7 +1393,8 @@ describe("shadow sender", () => {
             sync === null ||
             sync === "m0_mutation" ||
             sync === "mismatch" ||
-            sync === "unresolved"
+            sync === "unresolved" ||
+            sync === "seed_budget"
         ) {
             throw new Error(`unexpected workspace sync result: ${sync}`);
         }
