@@ -51,10 +51,9 @@ export function ensureColumn(
  * execute pass mutated message content — a sustained cache-bust cascade.
  *
  * The validator now tolerates NULL, but we normalize the data too so every
- * code path sees well-formed values. Each UPDATE is best-effort: if a column
- * doesn't exist yet (migration ran on a DB older than the ensureColumn call),
- * the UPDATE throws and we move on — the next schema upgrade runs ensureColumn
- * first, then this heal again.
+ * code path sees well-formed values. Healers tolerate only absent columns,
+ * detected before each UPDATE; lock, I/O, and other execution errors must
+ * propagate so the surrounding migration rolls back and can retry.
  *
  * Exported so migration v5 can call it. Not exported from any barrel.
  */
@@ -64,15 +63,23 @@ export function healAllNullColumns(db: Database): void {
     healMissingMemoryBlockIds(db);
 }
 
+function getSessionMetaColumns(db: Database): Set<string> {
+    const rows = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name?: string }>;
+    return new Set(rows.flatMap((row) => (typeof row.name === "string" ? [row.name] : [])));
+}
+
 function healMissingMemoryBlockIds(db: Database): void {
-    try {
-        db.prepare(
-            "UPDATE session_meta SET memory_block_cache = '' WHERE memory_block_cache != '' AND (memory_block_ids IS NULL OR memory_block_ids = '') AND memory_block_count > 0",
-        ).run();
-    } catch {
-        // Column missing on very fresh DBs — next startup reruns this after
-        // ensureColumn adds the column.
+    const columns = getSessionMetaColumns(db);
+    if (
+        !columns.has("memory_block_cache") ||
+        !columns.has("memory_block_ids") ||
+        !columns.has("memory_block_count")
+    ) {
+        return;
     }
+    db.prepare(
+        "UPDATE session_meta SET memory_block_cache = '' WHERE memory_block_cache != '' AND (memory_block_ids IS NULL OR memory_block_ids = '') AND memory_block_count > 0",
+    ).run();
 }
 
 function healNullTextColumns(db: Database): void {
@@ -102,16 +109,10 @@ function healNullTextColumns(db: Database): void {
         ["compaction_marker_state", ""],
         ["key_files", ""],
     ];
+    const existingColumns = getSessionMetaColumns(db);
     for (const [column, fallback] of columns) {
-        try {
-            db.prepare(`UPDATE session_meta SET ${column} = ? WHERE ${column} IS NULL`).run(
-                fallback,
-            );
-        } catch (_error) {
-            // Ignore — the column may not exist yet on a brand-new DB that
-            // hasn't gone through all ensureColumn calls yet. The heal runs
-            // again on next startup.
-        }
+        if (!existingColumns.has(column)) continue;
+        db.prepare(`UPDATE session_meta SET ${column} = ? WHERE ${column} IS NULL`).run(fallback);
     }
 }
 
@@ -148,14 +149,9 @@ function healNullIntegerColumns(db: Database): void {
         ["emergency_drain_active", 0],
         ["historian_drain_failure_at", 0],
     ];
+    const existingColumns = getSessionMetaColumns(db);
     for (const [column, fallback] of columns) {
-        try {
-            db.prepare(`UPDATE session_meta SET ${column} = ? WHERE ${column} IS NULL`).run(
-                fallback,
-            );
-        } catch (_error) {
-            // Same rationale as the text heal — swallow missing-column errors
-            // on brand-new DBs; next startup reruns this.
-        }
+        if (!existingColumns.has(column)) continue;
+        db.prepare(`UPDATE session_meta SET ${column} = ? WHERE ${column} IS NULL`).run(fallback);
     }
 }

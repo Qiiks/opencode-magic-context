@@ -1,6 +1,10 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { $ } from "bun";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { isSiblingMigrationConflict, runMigrations } from "./migrations";
@@ -9,20 +13,68 @@ import { initializeDatabase } from "./storage-db";
 /**
  * Multi-instance migration race tolerance.
  *
- * Two plugin processes starting concurrently against the shared
- * `~/.local/share/cortexkit/magic-context/context.db` can both observe
- * `MAX(version) = N` before either commits. The first commits v(N+1);
- * the second's transaction body runs `migration.up()` (now a no-op since
- * the schema change has already landed), then hits PRIMARY KEY conflict
- * on the `INSERT INTO schema_migrations` row.
- *
- * The race tolerance fix detects that specific conflict shape and
- * resumes from the next pending migration instead of fail-closing the
- * plugin. Any other migration failure (CREATE TABLE, ALTER TABLE, data
- * heal) still fail-closes per the existing contract.
+ * Each migration takes BEGIN IMMEDIATE and re-reads MAX(version) under
+ * that lock. Concurrent starters therefore cannot both take stale read
+ * snapshots before upgrading to writers; the waiter observes the winner's
+ * committed version and skips it. The narrow PK-conflict guard remains as
+ * a secondary compatibility backstop.
  */
 
 describe("migration race tolerance", () => {
+    test("two connections safely race a genuinely pending v51 migration", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "mc-migration-race-"));
+        const path = join(dir, "context.db");
+        try {
+            const setup = new Database(path);
+            initializeDatabase(setup);
+            runMigrations(setup);
+            setup.exec(`
+                DELETE FROM schema_migrations WHERE version = 51;
+                DROP TABLE tool_owner_backfill_state;
+            `);
+            closeQuietly(setup);
+
+            const pluginRoot = process.cwd().endsWith("/packages/plugin")
+                ? process.cwd()
+                : join(process.cwd(), "packages", "plugin");
+            const script = `
+                const sqlite = await import(${JSON.stringify(`file://${pluginRoot}/src/shared/sqlite.ts`)});
+                const migrations = await import(${JSON.stringify(`file://${pluginRoot}/src/features/magic-context/migrations.ts`)});
+                const db = new sqlite.Database(${JSON.stringify(path)});
+                db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL");
+                migrations.runMigrations(db);
+                const version = db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version;
+                const table = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_owner_backfill_state'").get());
+                db.close();
+                console.log(JSON.stringify({ version, table }));
+            `;
+
+            const [first, second] = await Promise.all([
+                $`bun -e ${script}`.json() as Promise<{ version: number; table: boolean }>,
+                $`bun -e ${script}`.json() as Promise<{ version: number; table: boolean }>,
+            ]);
+
+            expect(first).toEqual({ version: 51, table: true });
+            expect(second).toEqual({ version: 51, table: true });
+
+            const verify = new Database(path);
+            expect(
+                verify
+                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 51")
+                    .get(),
+            ).toEqual({ count: 1 });
+            expect(
+                verify
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='tool_owner_backfill_state'",
+                    )
+                    .get(),
+            ).toEqual({ count: 1 });
+            closeQuietly(verify);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
     test("runMigrations is idempotent when the row was inserted by a sibling", () => {
         const db = new Database(":memory:");
         initializeDatabase(db);

@@ -7,11 +7,7 @@ import { describeError, getErrorMessage } from "../../../shared/error-message";
 import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
-import {
-    DREAMING_LEASE_KEY,
-    peekLeaseHolderAndExpiry,
-    startLeaseHeartbeat,
-} from "../dreamer/lease";
+import { DREAMING_LEASE_KEY, runLeaseGuardedWrite, startLeaseHeartbeat } from "../dreamer/lease";
 import { REVIEW_USER_MEMORIES_SYSTEM_PROMPT } from "../dreamer/task-prompts";
 import { bumpProjectUserProfileVersion } from "../storage";
 import { recordChildInvocation } from "../subagent-token-capture";
@@ -271,21 +267,10 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
         const dismissals = (parsed.dismiss_existing ?? []).filter((d) => Boolean(d.memory_id));
         const consumeCandidateIds = parsed.consume_candidate_ids ?? [];
 
-        // Lease-held-before-commit: if our lease expired mid-run (slow model) and
-        // another process took the global user-memories lease, we must NOT commit
-        // over its work on this shared cross-project pool. Throwing (not silently
-        // returning) is essential: a silent return would let the executor record
-        // "completed" and advance next_due_at, skipping the work until next cron.
-        // The thrown "lease" error is classified transient → hot-retry.
-        let leaseLostAtCommit = false;
-        args.db.transaction(() => {
-            if (!peekLeaseHolderAndExpiry(args.db, args.holderId, leaseKey)) {
-                log(
-                    `[dreamer] user-memories: commit aborted — lease lost (holder ${args.holderId})`,
-                );
-                leaseLostAtCommit = true;
-                return;
-            }
+        // Re-check the lease only after BEGIN IMMEDIATE has serialized writers.
+        // A lost lease throws so the executor hot-retries instead of recording
+        // completion and advancing next_due_at past unprocessed work.
+        runLeaseGuardedWrite(args.db, args.holderId, leaseKey, () => {
             for (const promotion of promotions) {
                 insertUserMemory(args.db, promotion.content, promotion.candidateIds);
             }
@@ -305,11 +290,7 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
             if (promotions.length > 0 || updates.length > 0 || dismissals.length > 0) {
                 bumpProjectUserProfileVersion(args.db);
             }
-        })();
-
-        if (leaseLostAtCommit) {
-            throw new Error("Dream lease lost during user-memory review commit");
-        }
+        });
 
         result.promoted = promotions.length;
         result.merged = updates.length;
