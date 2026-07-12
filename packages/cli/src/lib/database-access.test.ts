@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { openExistingContextDatabase, UnsupportedSchemaVersionError } from "./database-access";
 
@@ -27,13 +28,15 @@ afterEach(() => {
 describe("CLI context database access", () => {
     it("rejects a database newer than the shared supported schema", () => {
         const path = join(tempDir(), "context.db");
-        createVersionedDatabase(path, 52);
+        // Derive from the live fence so a routine schema bump cannot stale this fixture.
+        const newerVersion = LATEST_SUPPORTED_VERSION + 1;
+        createVersionedDatabase(path, newerVersion);
 
         expect(() => openExistingContextDatabase(path, { readonly: false })).toThrow(
             UnsupportedSchemaVersionError,
         );
         expect(() => openExistingContextDatabase(path, { readonly: true })).toThrow(
-            "database schema v52 is newer than this CLI supports (max v51)",
+            `database schema v${newerVersion} is newer than this CLI supports (max v${LATEST_SUPPORTED_VERSION})`,
         );
     });
 
@@ -44,9 +47,9 @@ describe("CLI context database access", () => {
         expect(existsSync(path)).toBe(false);
     });
 
-    it("opens schema v51 normally for reads and migration writes", () => {
+    it("opens the current supported schema normally for reads and migration writes", () => {
         const path = join(tempDir(), "context.db");
-        createVersionedDatabase(path, 51);
+        createVersionedDatabase(path, LATEST_SUPPORTED_VERSION);
 
         const db = openExistingContextDatabase(path, { readonly: false });
         expect(db).not.toBeNull();

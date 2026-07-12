@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
 import {
     migrateOpenCodeSessionToPi,
@@ -421,8 +422,9 @@ describe("migrateOpenCodeSessionToPi", () => {
         const root = tempDir();
         const contextDbPath = join(root, "context.db");
         const contextDb = new Database(contextDbPath);
+        // Derive from the live fence so a routine schema bump cannot stale this fixture.
         contextDb.exec(
-            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations (version) VALUES (52)",
+            `CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations (version) VALUES (${LATEST_SUPPORTED_VERSION + 1})`,
         );
         contextDb.close();
         const writes: string[] = [];
@@ -438,7 +440,9 @@ describe("migrateOpenCodeSessionToPi", () => {
                     unlinkSync: () => {},
                 },
             }),
-        ).toThrow("database schema v52 is newer than this CLI supports (max v51)");
+        ).toThrow(
+            `database schema v${LATEST_SUPPORTED_VERSION + 1} is newer than this CLI supports (max v${LATEST_SUPPORTED_VERSION})`,
+        );
         expect(writes).toEqual([]);
     });
 });
