@@ -120,6 +120,12 @@ describe("createCtxSearchTools", () => {
             db,
             "ses-message",
             [
+                ...Array.from({ length: 4 }, (_, index) => ({
+                    ordinal: index + 1,
+                    id: `covered-${index + 1}`,
+                    role: "system",
+                    parts: [],
+                })),
                 {
                     ordinal: 5,
                     id: "m5",

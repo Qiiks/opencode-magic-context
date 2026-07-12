@@ -19,9 +19,11 @@ import {
     type SessionChunkLine,
 } from "./read-session-formatting";
 import {
+    countRawSessionMessageOrdinalsFromDb,
     type RawMessage,
     readRawSessionMessageByIdFromDb,
     readRawSessionMessageIdOrdinalsFromDb,
+    readRawSessionMessagePageFromDb,
     readRawSessionMessagesFromDb,
     readRawSessionTailFromDb,
 } from "./read-session-raw";
@@ -99,6 +101,7 @@ let activeAbsoluteCountCache: Map<string, number> | null = null;
  */
 export interface RawMessageProvider {
     readMessages(): RawMessage[];
+    readMessagePage?: (afterOrdinal: number, limit: number, finalWatermark: number) => RawMessage[];
     readMessageById?: (messageId: string) => RawMessage | null;
     readMessageIdOrdinals?: () => Map<string, number>;
     /** Optional fast count path; falls back to readMessages().length. */
@@ -217,6 +220,43 @@ export function readRawSessionMessages(sessionId: string): RawMessage[] {
 
     return readRawSessionMessagesFromSource(sessionId);
 }
+
+export function readRawSessionMessagePage(
+    sessionId: string,
+    afterOrdinal: number,
+    limit: number,
+    finalWatermark: number,
+): RawMessage[] {
+    const provider = sessionProviders.get(sessionId);
+    if (provider?.readMessagePage) {
+        return provider.readMessagePage(afterOrdinal, limit, finalWatermark);
+    }
+    if (provider) {
+        return provider
+            .readMessages()
+            .filter(
+                (message) => message.ordinal > afterOrdinal && message.ordinal <= finalWatermark,
+            )
+            .slice(0, limit);
+    }
+    if (!openCodeDbExists()) return [];
+    return withReadOnlySessionDb((db) =>
+        readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, finalWatermark),
+    );
+}
+
+export function getRawSessionMessageOrdinalCount(sessionId: string): number {
+    const provider = sessionProviders.get(sessionId);
+    if (provider) {
+        if (provider.getMessageCount) return provider.getMessageCount();
+        return provider.readMessages().length;
+    }
+    if (!openCodeDbExists()) return 0;
+    return withReadOnlySessionDb((db) => countRawSessionMessageOrdinalsFromDb(db, sessionId));
+}
+
+readRawSessionMessages.readPage = readRawSessionMessagePage;
+readRawSessionMessages.getCount = getRawSessionMessageOrdinalCount;
 
 /**
  * Prime the active raw-message cache with a TAIL-ONLY read (only messages

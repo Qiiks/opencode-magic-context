@@ -10,7 +10,6 @@ import {
     type CompartmentChunkBackfillCandidate,
     chunkCanonicalText,
     chunkEmbeddingWindowsAreCurrent,
-    clearChunkEmbeddingsForProject,
     countSessionCompartmentEmbedCoverage,
     countUnembeddedSessionCompartments,
     loadUnembeddedCompartmentChunkCandidates,
@@ -20,7 +19,6 @@ import {
     type SaveCompartmentChunkEmbeddingInput,
 } from "./compartment-chunk-embedding";
 import {
-    clearProjectCommitEmbeddings,
     countEmbeddedCommits,
     loadUnembeddedCommits,
     saveCommitEmbedding,
@@ -37,7 +35,6 @@ import { LocalEmbeddingProvider } from "./memory/embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./memory/embedding-openai";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import {
-    clearEmbeddingsForProject,
     getMemoryEmbedCoverage,
     saveEmbeddingIfHashMatches,
 } from "./memory/storage-memory-embeddings";
@@ -59,6 +56,7 @@ const COMMIT_DRAIN_MAX_PER_SWEEP = 500;
 const CHUNK_DRAIN_BATCH_SIZE = 8;
 const CHUNK_DRAIN_MAX_PER_SWEEP = 200;
 const EMBEDDING_IDENTITY_GC_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
+const STALE_EMBEDDING_GC_BATCH_SIZE = 250;
 // Hard cap on embedding-window texts sent in ONE provider call. Deliberately
 // SMALL: a local embedding endpoint (LMStudio/Ollama) runs one forward pass per
 // input, so batching many max_input_tokens-sized windows into a single request
@@ -490,6 +488,98 @@ export interface StaleEmbeddingSweepResult {
     trackingRowsDeleted: number;
 }
 
+function deleteStaleEmbeddingBatch(
+    db: Database,
+    scope: EmbeddingIdentityScope,
+    projectIdentity: string,
+    modelId: string,
+    limit: number,
+): number {
+    if (scope === "memory") {
+        return db
+            .prepare(
+                `DELETE FROM memory_embeddings
+                 WHERE rowid IN (
+                     SELECT me.rowid
+                     FROM memory_embeddings me
+                     JOIN memories m ON m.id = me.memory_id
+                     WHERE m.project_path = ? AND me.model_id = ?
+                     LIMIT ?
+                 )`,
+            )
+            .run(projectIdentity, modelId, limit).changes;
+    }
+    if (scope === "commit") {
+        return db
+            .prepare(
+                `DELETE FROM git_commit_embeddings
+                 WHERE rowid IN (
+                     SELECT gce.rowid
+                     FROM git_commit_embeddings gce
+                     JOIN git_commits gc ON gc.sha = gce.sha
+                     WHERE gc.project_path = ? AND gce.model_id = ?
+                     LIMIT ?
+                 )`,
+            )
+            .run(projectIdentity, modelId, limit).changes;
+    }
+    return db
+        .prepare(
+            `DELETE FROM compartment_chunk_embeddings
+             WHERE id IN (
+                 SELECT id
+                 FROM compartment_chunk_embeddings
+                 WHERE project_path = ? AND model_id = ?
+                 LIMIT ?
+             )`,
+        )
+        .run(projectIdentity, modelId, limit).changes;
+}
+
+function hasStaleEmbeddingRows(
+    db: Database,
+    scope: EmbeddingIdentityScope,
+    projectIdentity: string,
+    modelId: string,
+): boolean {
+    if (scope === "memory") {
+        return Boolean(
+            db
+                .prepare(
+                    `SELECT 1
+                     FROM memory_embeddings me
+                     JOIN memories m ON m.id = me.memory_id
+                     WHERE m.project_path = ? AND me.model_id = ?
+                     LIMIT 1`,
+                )
+                .get(projectIdentity, modelId),
+        );
+    }
+    if (scope === "commit") {
+        return Boolean(
+            db
+                .prepare(
+                    `SELECT 1
+                     FROM git_commit_embeddings gce
+                     JOIN git_commits gc ON gc.sha = gce.sha
+                     WHERE gc.project_path = ? AND gce.model_id = ?
+                     LIMIT 1`,
+                )
+                .get(projectIdentity, modelId),
+        );
+    }
+    return Boolean(
+        db
+            .prepare(
+                `SELECT 1
+                 FROM compartment_chunk_embeddings
+                 WHERE project_path = ? AND model_id = ?
+                 LIMIT 1`,
+            )
+            .get(projectIdentity, modelId),
+    );
+}
+
 export function sweepStaleEmbeddingIdentitiesForProject(
     db: Database,
     projectIdentity: string,
@@ -512,70 +602,66 @@ export function sweepStaleEmbeddingIdentitiesForProject(
 
     const cutoff = now - EMBEDDING_IDENTITY_GC_GRACE_MS;
     const deleteTracking = getDeleteActiveIdentityStatement(db);
-    // Atomic select+delete under one write lock: registration commits the
-    // current model's last_active_at inside BEGIN IMMEDIATE, so GC must hold the
-    // same lock across its stale-select → delete window. A deferred transaction
-    // could select a stale id, lose the lock to a concurrent re-registration of
-    // that exact model (which refreshes last_active_at), then delete the
-    // freshly-reactivated rows anyway.
+    const scopes: Array<{
+        scope: EmbeddingIdentityScope;
+        enabled: boolean;
+        currentModelId: string;
+    }> = [
+        {
+            scope: "memory",
+            enabled: snapshot.enabled && snapshot.modelId !== "off",
+            currentModelId: snapshot.modelId,
+        },
+        {
+            scope: "commit",
+            enabled: snapshot.gitCommitEnabled && snapshot.modelId !== "off",
+            currentModelId: snapshot.modelId,
+        },
+        {
+            scope: "chunk",
+            enabled: snapshot.enabled && snapshot.chunkModelId !== "off",
+            currentModelId: snapshot.chunkModelId,
+        },
+    ];
+
+    // One invocation removes at most one bounded batch. Keeping the stale
+    // identity marker until its final vector is gone makes later timer ticks
+    // resume safely without holding a writer lock across the whole backlog.
+    let remainingBudget = STALE_EMBEDDING_GC_BATCH_SIZE;
     db.exec("BEGIN IMMEDIATE");
     try {
-        if (snapshot.enabled && snapshot.modelId !== "off") {
+        for (const { scope, enabled, currentModelId } of scopes) {
+            if (!enabled || remainingBudget === 0) continue;
             for (const modelId of staleModelsForScope(
                 db,
                 projectIdentity,
-                "memory",
-                snapshot.modelId,
+                scope,
+                currentModelId,
                 cutoff,
             )) {
-                result.memoryRowsDeleted += clearEmbeddingsForProject(db, projectIdentity, modelId);
-                result.trackingRowsDeleted += deleteTracking.run(
-                    projectIdentity,
-                    "memory",
-                    modelId,
-                ).changes;
-            }
-        }
-
-        if (snapshot.gitCommitEnabled && snapshot.modelId !== "off") {
-            for (const modelId of staleModelsForScope(
-                db,
-                projectIdentity,
-                "commit",
-                snapshot.modelId,
-                cutoff,
-            )) {
-                result.commitRowsDeleted += clearProjectCommitEmbeddings(
+                if (remainingBudget === 0) break;
+                const deleted = deleteStaleEmbeddingBatch(
                     db,
+                    scope,
                     projectIdentity,
                     modelId,
+                    remainingBudget,
                 );
-                result.trackingRowsDeleted += deleteTracking.run(
-                    projectIdentity,
-                    "commit",
-                    modelId,
-                ).changes;
-            }
-        }
+                remainingBudget -= deleted;
+                if (scope === "memory") result.memoryRowsDeleted += deleted;
+                else if (scope === "commit") result.commitRowsDeleted += deleted;
+                else result.chunkRowsDeleted += deleted;
 
-        if (snapshot.enabled && snapshot.chunkModelId !== "off") {
-            for (const modelId of staleModelsForScope(
-                db,
-                projectIdentity,
-                "chunk",
-                snapshot.chunkModelId,
-                cutoff,
-            )) {
-                result.chunkRowsDeleted += clearChunkEmbeddingsForProject(
-                    db,
-                    projectIdentity,
-                    modelId,
-                );
-                result.trackingRowsDeleted += deleteTracking.run(
-                    projectIdentity,
-                    "chunk",
-                    modelId,
-                ).changes;
+                if (!hasStaleEmbeddingRows(db, scope, projectIdentity, modelId)) {
+                    result.trackingRowsDeleted += deleteTracking.run(
+                        projectIdentity,
+                        scope,
+                        modelId,
+                    ).changes;
+                } else if (deleted === 0) {
+                    // Avoid spinning through an unexpectedly undeletable backlog.
+                    remainingBudget = 0;
+                }
             }
         }
         db.exec("COMMIT");
@@ -588,9 +674,7 @@ export function sweepStaleEmbeddingIdentitiesForProject(
         throw error;
     }
 
-    if (result.memoryRowsDeleted > 0) {
-        invalidateProject(projectIdentity);
-    }
+    if (result.memoryRowsDeleted > 0) invalidateProject(projectIdentity);
     return result;
 }
 
@@ -956,14 +1040,25 @@ export async function drainCommitBacklogForProject(
     }
 
     let total = 0;
+    let leaseLost = false;
+    const renewal = setInterval(() => {
+        try {
+            if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
+        } catch {
+            // A transient database error leaves the current TTL in force.
+        }
+    }, SESSION_EMBED_LEASE_RENEWAL_MS);
+    (renewal as { unref?: () => void }).unref?.();
     try {
-        while (Date.now() < deadline && total < COMMIT_DRAIN_MAX_PER_SWEEP) {
+        while (!leaseLost && Date.now() < deadline && total < COMMIT_DRAIN_MAX_PER_SWEEP) {
             const embedded = await embedCommitBatch(db, projectIdentity, COMMIT_DRAIN_BATCH_SIZE);
-            if (embedded === 0) break;
+            if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
+            if (leaseLost || embedded === 0) break;
             total += embedded;
             if (embedded < COMMIT_DRAIN_BATCH_SIZE) break; // partial batch = drained
         }
     } finally {
+        clearInterval(renewal);
         releaseGitSweepLease(db, projectIdentity, holderId);
     }
     return total;
@@ -1192,18 +1287,29 @@ async function drainCompartmentChunkBacklogForProject(
     }
 
     let total = 0;
+    let leaseLost = false;
+    const renewal = setInterval(() => {
+        try {
+            if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
+        } catch {
+            // A transient database error leaves the current TTL in force.
+        }
+    }, SESSION_EMBED_LEASE_RENEWAL_MS);
+    (renewal as { unref?: () => void }).unref?.();
     try {
-        while (Date.now() < deadline && total < CHUNK_DRAIN_MAX_PER_SWEEP) {
+        while (!leaseLost && Date.now() < deadline && total < CHUNK_DRAIN_MAX_PER_SWEEP) {
             const embedded = await embedCompartmentChunkBatch(
                 db,
                 projectIdentity,
                 CHUNK_DRAIN_BATCH_SIZE,
             );
-            if (embedded === 0) break;
+            if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
+            if (leaseLost || embedded === 0) break;
             total += embedded;
             if (embedded < CHUNK_DRAIN_BATCH_SIZE) break;
         }
     } finally {
+        clearInterval(renewal);
         releaseGitSweepLease(db, projectIdentity, holderId);
     }
     return total;
@@ -1282,11 +1388,19 @@ export async function embedSessionCompartmentChunks(
     // Unbounded run → renew the lease before the TTL lapses so a sibling process
     // or the passive sweep can't acquire the "expired" lease mid-run (mirrors the
     // git sweep's renewal loop). Cleared in finally.
+    let leaseLost = false;
+    const drainAbort = new AbortController();
+    const forwardCallerAbort = (): void => drainAbort.abort();
+    if (options?.signal?.aborted) drainAbort.abort();
+    else options?.signal?.addEventListener("abort", forwardCallerAbort, { once: true });
     const renewal = setInterval(() => {
         try {
-            renewGitSweepLease(db, projectIdentity, holderId);
+            if (!renewGitSweepLease(db, projectIdentity, holderId)) {
+                leaseLost = true;
+                drainAbort.abort();
+            }
         } catch {
-            /* best-effort; a failed renewal just risks the busy-window above */
+            /* best-effort; the current lease remains valid until its TTL */
         }
     }, SESSION_EMBED_LEASE_RENEWAL_MS);
     (renewal as { unref?: () => void }).unref?.();
@@ -1313,7 +1427,7 @@ export async function embedSessionCompartmentChunks(
         // denominator; `embedded` is clamped to it in the callback in case the
         // historian published mid-run.
         for (;;) {
-            if (options?.signal?.aborted) {
+            if (leaseLost || drainAbort.signal.aborted) {
                 aborted = true;
                 break;
             }
@@ -1335,8 +1449,14 @@ export async function embedSessionCompartmentChunks(
                 projectIdentity,
                 snapshot.chunkModelId,
                 candidates,
-                options?.signal,
+                drainAbort.signal,
             );
+            if (leaseLost || !renewGitSweepLease(db, projectIdentity, holderId)) {
+                leaseLost = true;
+                drainAbort.abort();
+                aborted = true;
+                break;
+            }
             // Record no-work candidates so the next query advances past them.
             for (const id of noWork) skipIds.push(id);
             // Record this-run failures so the cursor advances; retried next run.
@@ -1364,6 +1484,7 @@ export async function embedSessionCompartmentChunks(
         }
     } finally {
         clearInterval(renewal);
+        options?.signal?.removeEventListener("abort", forwardCallerAbort);
         try {
             releaseGitSweepLease(db, projectIdentity, holderId);
         } catch (error) {

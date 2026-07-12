@@ -1,9 +1,11 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { getDirtyIndexFloor } from "./message-index";
 import {
     __resetMessageIndexAsyncForTests,
     clearSessionTracking,
@@ -29,8 +31,44 @@ function message(id: string, ordinal: number, text: string): RawMessage {
     };
 }
 
+function pagedReader(
+    messages: RawMessage[],
+    onPage?: (afterOrdinal: number) => void,
+): ((sessionId: string) => RawMessage[]) & {
+    getCount: (sessionId: string) => number;
+    readPage: (
+        sessionId: string,
+        afterOrdinal: number,
+        limit: number,
+        finalWatermark: number,
+    ) => RawMessage[];
+} {
+    return Object.assign((_sessionId: string) => messages, {
+        getCount: (_sessionId: string) => messages.length,
+        readPage: (
+            _sessionId: string,
+            afterOrdinal: number,
+            limit: number,
+            finalWatermark: number,
+        ) => {
+            onPage?.(afterOrdinal);
+            return messages
+                .filter((entry) => entry.ordinal > afterOrdinal && entry.ordinal <= finalWatermark)
+                .slice(0, limit);
+        },
+    });
+}
+
 function wait(ms = 0): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+        if (Date.now() >= deadline) throw new Error("timed out waiting for async message indexing");
+        await wait(10);
+    }
 }
 
 function countRows(db: Database, sessionId: string): number {
@@ -103,7 +141,7 @@ describe("message-index-async", () => {
     });
 
     it("does not reschedule a completed message and accepts an already-converted entry", async () => {
-        const converted = message("m-direct", 7, "direct source");
+        const converted = message("m-direct", 1, "direct source");
         let fallbackReads = 0;
         scheduleIncrementalIndex(db, "ses-watermark", converted.id, converted);
         await wait(140);
@@ -147,12 +185,13 @@ describe("message-index-async", () => {
         scheduleIncrementalIndex(db, "ses-hole", "m-2", () => fullHistory[1] ?? null);
         await wait(140);
         expect(countMessageRows(db, "ses-hole", "m-2")).toBe(0);
+        expect(getDirtyIndexFloor(db, "ses-hole")).toBe(2);
         expect(isSessionReconciled("ses-hole")).toBe(false);
 
         failMessageId = null;
         scheduleIncrementalIndex(db, "ses-hole", "m-3", () => fullHistory[2] ?? null);
         await wait(140);
-        expect(countMessageRows(db, "ses-hole", "m-3")).toBe(1);
+        expect(countMessageRows(db, "ses-hole", "m-3")).toBe(0);
 
         scheduleReconciliation(db, "ses-hole", () => fullHistory);
         await wait(20);
@@ -160,6 +199,77 @@ describe("message-index-async", () => {
         expect(searchMessageIds(db, "ses-hole", "beta")).toEqual(["m-2"]);
         expect(countMessageRows(db, "ses-hole", "m-3")).toBe(1);
         expect(isSessionReconciled("ses-hole")).toBe(true);
+    });
+
+    it("yields to a timer between bounded reconciliation pages", async () => {
+        const messages = Array.from({ length: 201 }, (_, index) =>
+            message(`m-${index + 1}`, index + 1, `message ${index + 1}`),
+        );
+        let timerRan = false;
+        let pageCount = 0;
+        const reader = pagedReader(messages, () => {
+            pageCount += 1;
+            if (pageCount === 1) setTimeout(() => (timerRan = true), 0);
+            if (pageCount === 2) expect(timerRan).toBe(true);
+        });
+
+        scheduleReconciliation(db, "ses-pages", reader);
+        await waitUntil(() => isSessionReconciled("ses-pages"));
+
+        expect(pageCount).toBe(3);
+        expect(countRows(db, "ses-pages")).toBe(201);
+        expect(isSessionReconciled("ses-pages")).toBe(true);
+    });
+
+    it("clears the reconciliation latch when the pre-write dirty marker fails", async () => {
+        const history = [
+            message("m-1", 1, "first"),
+            message("m-2", 2, "recovered after marker failure"),
+        ];
+        scheduleReconciliation(db, "ses-marker-failure", () => [history[0]!]);
+        await wait(20);
+        expect(isSessionReconciled("ses-marker-failure")).toBe(true);
+
+        const originalPrepare = db.prepare.bind(db);
+        (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+            if (
+                sql.includes("dirty_floor_ordinal") &&
+                sql.includes("CASE WHEN message_history_index.dirty_floor_ordinal")
+            ) {
+                throw new Error("synthetic dirty marker failure");
+            }
+            return originalPrepare(sql);
+        }) as typeof db.prepare;
+
+        scheduleIncrementalIndex(db, "ses-marker-failure", "m-2", () => history[1] ?? null);
+        await wait(140);
+        expect(isSessionReconciled("ses-marker-failure")).toBe(false);
+        expect(countMessageRows(db, "ses-marker-failure", "m-2")).toBe(0);
+
+        (db as unknown as { prepare: typeof db.prepare }).prepare = originalPrepare;
+        scheduleReconciliation(db, "ses-marker-failure", () => history);
+        await wait(20);
+        expect(countMessageRows(db, "ses-marker-failure", "m-2")).toBe(1);
+    });
+
+    it("does not advance past out-of-order live events", async () => {
+        const history = [
+            message("m-1", 1, "first ordinal"),
+            message("m-2", 2, "second ordinal"),
+            message("m-3", 3, "third ordinal"),
+        ];
+
+        scheduleIncrementalIndex(db, "ses-out-of-order", "m-3", history[2]!);
+        scheduleIncrementalIndex(db, "ses-out-of-order", "m-1", history[0]!);
+        scheduleIncrementalIndex(db, "ses-out-of-order", "m-2", history[1]!);
+        await wait(140);
+
+        expect(countMessageRows(db, "ses-out-of-order", "m-3")).toBe(0);
+        scheduleReconciliation(db, "ses-out-of-order", () => history);
+        await wait(20);
+
+        expect(countRows(db, "ses-out-of-order")).toBe(3);
+        expect(isSessionReconciled("ses-out-of-order")).toBe(true);
     });
 
     it("clears and rebuilds after a removed message", async () => {

@@ -180,32 +180,47 @@ const server: Plugin = async (ctx) => {
     // the disabled-path invariant that no state is written).
     if (pluginConfig.enabled && hooks.magicContext) {
         setTimeout(() => {
-            try {
+            void (async () => {
                 const db = openDatabase();
                 if (!db || !isDatabasePersisted(db)) return;
                 const ocDb = openOpenCodeDb();
                 if (!ocDb) return;
                 try {
-                    const sessions = ocDb
-                        .prepare(
-                            "SELECT id, COALESCE(directory, '') AS directory FROM session ORDER BY id ASC",
-                        )
-                        .all() as Array<{ id: string; directory: string }>;
-                    void runSessionProjectBackfill(
-                        db,
-                        sessions.map((session) => ({
+                    await runSessionProjectBackfill(db, (afterSessionId, limit) => {
+                        const rows = (
+                            afterSessionId === null
+                                ? ocDb
+                                      .prepare(
+                                          `SELECT id, COALESCE(directory, '') AS directory
+                                       FROM session
+                                       ORDER BY id ASC
+                                       LIMIT ?`,
+                                      )
+                                      .all(limit)
+                                : ocDb
+                                      .prepare(
+                                          `SELECT id, COALESCE(directory, '') AS directory
+                                       FROM session
+                                       WHERE id > ?
+                                       ORDER BY id ASC
+                                       LIMIT ?`,
+                                      )
+                                      .all(afterSessionId, limit)
+                        ) as Array<{
+                            id: string;
+                            directory: string;
+                        }>;
+                        return rows.map((session) => ({
                             sessionId: session.id,
                             directory: session.directory,
-                        })),
-                    ).catch((err) => {
-                        log(`[session-projects] background runner failed: ${err}`);
+                        }));
                     });
                 } finally {
                     closeQuietly(ocDb);
                 }
-            } catch (err) {
-                log(`[session-projects] failed to start background runner: ${err}`);
-            }
+            })().catch((err) => {
+                log(`[session-projects] background runner failed: ${err}`);
+            });
         }, 0);
     }
 

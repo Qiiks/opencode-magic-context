@@ -688,6 +688,77 @@ describe("project embedding registry", () => {
         expect(loadAllEmbeddings(db, projectIdentity, first.modelId).size).toBe(1);
     });
 
+    it("deletes stale embedding rows in bounded batches and resumes on the next sweep", () => {
+        const db = useTempDb();
+        const projectIdentity = "git:gc-batched";
+        const compartmentId = seedCompartmentWithFts(db, "ses-gc-batched");
+        const windows = chunkCanonicalText("[1] U: hello", 1, 1, 10_000);
+        const now = Date.now();
+        const first = registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/gc-batched",
+        );
+        replaceCompartmentChunkEmbeddings(
+            db,
+            windows.map((window) => ({
+                compartmentId,
+                sessionId: "ses-gc-batched",
+                projectPath: projectIdentity,
+                window,
+                modelId: first.chunkModelId,
+                vector: new Float32Array([1, 0]),
+            })),
+        );
+        db.prepare(
+            `WITH RECURSIVE seq(n) AS (
+                 SELECT 1
+                 UNION ALL
+                 SELECT n + 1 FROM seq WHERE n < 299
+             )
+             INSERT INTO compartment_chunk_embeddings(
+                 compartment_id, session_id, project_path, harness, window_index,
+                 start_ordinal, end_ordinal, chunk_hash, model_id, dims, vector, created_at
+             )
+             SELECT base.compartment_id, base.session_id, base.project_path, base.harness, seq.n,
+                    base.start_ordinal, base.end_ordinal, base.chunk_hash || '-' || seq.n,
+                    base.model_id, base.dims, base.vector, base.created_at
+             FROM compartment_chunk_embeddings base
+             CROSS JOIN seq
+             WHERE base.compartment_id = ? AND base.model_id = ? AND base.window_index = 0`,
+        ).run(compartmentId, first.chunkModelId);
+
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-b"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/gc-batched",
+        );
+        db.prepare(
+            `UPDATE embedding_identity_active
+             SET last_active_at = ?
+             WHERE project_path = ? AND scope = 'chunk' AND model_id = ?`,
+        ).run(now - 15 * 24 * 60 * 60 * 1000, projectIdentity, first.chunkModelId);
+
+        const firstSweep = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
+        expect(firstSweep.chunkRowsDeleted).toBe(250);
+        expect(firstSweep.trackingRowsDeleted).toBe(0);
+        expect(
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE project_path = ? AND model_id = ?",
+                )
+                .get(projectIdentity, first.chunkModelId),
+        ).toEqual({ count: 50 });
+
+        const secondSweep = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
+        expect(secondSweep.chunkRowsDeleted).toBe(50);
+        expect(secondSweep.trackingRowsDeleted).toBe(1);
+    });
+
     it("suppresses GC while a project's last config load was untrusted", () => {
         const db = useTempDb();
         const projectIdentity = "git:untrusted-gc";
@@ -937,6 +1008,58 @@ describe("project embedding registry", () => {
         expect(
             loadCompartmentChunkEmbeddingsForSearch(db, "ses-repair", "git:right", "chunk:model"),
         ).toHaveLength(1);
+    });
+
+    it("caps session-scoped chunk repair work per observation", () => {
+        const db = useTempDb();
+        const compartmentId = seedCompartmentWithFts(db, "ses-repair-batched");
+        const windows = chunkCanonicalText("[1] U: hello", 1, 1, 10_000);
+        replaceCompartmentChunkEmbeddings(
+            db,
+            windows.map((window) => ({
+                compartmentId,
+                sessionId: "ses-repair-batched",
+                projectPath: "git:wrong",
+                window,
+                modelId: "chunk:model",
+                vector: new Float32Array([1, 0]),
+            })),
+        );
+        db.prepare(
+            `WITH RECURSIVE seq(n) AS (
+                 SELECT 1
+                 UNION ALL
+                 SELECT n + 1 FROM seq WHERE n < 149
+             )
+             INSERT INTO compartment_chunk_embeddings(
+                 compartment_id, session_id, project_path, harness, window_index,
+                 start_ordinal, end_ordinal, chunk_hash, model_id, dims, vector, created_at
+             )
+             SELECT base.compartment_id, base.session_id, base.project_path, base.harness, seq.n,
+                    base.start_ordinal, base.end_ordinal, base.chunk_hash || '-' || seq.n,
+                    base.model_id, base.dims, base.vector, base.created_at
+             FROM compartment_chunk_embeddings base
+             CROSS JOIN seq
+             WHERE base.compartment_id = ? AND base.model_id = ? AND base.window_index = 0`,
+        ).run(compartmentId, "chunk:model");
+
+        recordSessionProjectIdentity(db, "ses-repair-batched", "git:right");
+        expect(
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE session_id = ? AND project_path = ?",
+                )
+                .get("ses-repair-batched", "git:right"),
+        ).toEqual({ count: 100 });
+
+        recordSessionProjectIdentity(db, "ses-repair-batched", "git:right");
+        expect(
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE session_id = ? AND project_path = ?",
+                )
+                .get("ses-repair-batched", "git:right"),
+        ).toEqual({ count: 150 });
     });
 
     it("does not backfill compartment chunks when memory is disabled", async () => {

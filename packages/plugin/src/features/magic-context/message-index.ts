@@ -16,11 +16,10 @@ interface MessageHistoryIndexRow {
 
 const lastIndexedStatements = new WeakMap<Database, PreparedStatement>();
 const insertMessageStatements = new WeakMap<Database, PreparedStatement>();
-const upsertIndexStatements = new WeakMap<Database, PreparedStatement>();
-const upsertCleanIndexStatements = new WeakMap<Database, PreparedStatement>();
+const upsertProgressStatements = new WeakMap<Database, PreparedStatement>();
 const upsertDirtyFloorStatements = new WeakMap<Database, PreparedStatement>();
 const deleteFtsStatements = new WeakMap<Database, PreparedStatement>();
-const deleteFtsFromOrdinalStatements = new WeakMap<Database, PreparedStatement>();
+const deleteFtsRangeStatements = new WeakMap<Database, PreparedStatement>();
 const deleteIndexStatements = new WeakMap<Database, PreparedStatement>();
 const countIndexedMessageStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -50,24 +49,13 @@ function getInsertMessageStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
-function getUpsertIndexStatement(db: Database): PreparedStatement {
-    let stmt = upsertIndexStatements.get(db);
+function getUpsertProgressStatement(db: Database): PreparedStatement {
+    let stmt = upsertProgressStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "INSERT INTO message_history_index (session_id, last_indexed_ordinal, updated_at, harness) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET last_indexed_ordinal = excluded.last_indexed_ordinal, updated_at = excluded.updated_at",
+            "INSERT INTO message_history_index (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET last_indexed_ordinal = excluded.last_indexed_ordinal, dirty_floor_ordinal = excluded.dirty_floor_ordinal, updated_at = excluded.updated_at",
         );
-        upsertIndexStatements.set(db, stmt);
-    }
-    return stmt;
-}
-
-function getUpsertCleanIndexStatement(db: Database): PreparedStatement {
-    let stmt = upsertCleanIndexStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            "INSERT INTO message_history_index (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness) VALUES (?, ?, 0, ?, ?) ON CONFLICT(session_id) DO UPDATE SET last_indexed_ordinal = excluded.last_indexed_ordinal, dirty_floor_ordinal = 0, updated_at = excluded.updated_at",
-        );
-        upsertCleanIndexStatements.set(db, stmt);
+        upsertProgressStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -92,13 +80,13 @@ function getDeleteFtsStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
-function getDeleteFtsFromOrdinalStatement(db: Database): PreparedStatement {
-    let stmt = deleteFtsFromOrdinalStatements.get(db);
+function getDeleteFtsRangeStatement(db: Database): PreparedStatement {
+    let stmt = deleteFtsRangeStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "DELETE FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) >= ?",
+            "DELETE FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) BETWEEN ? AND ?",
         );
-        deleteFtsFromOrdinalStatements.set(db, stmt);
+        deleteFtsRangeStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -132,7 +120,7 @@ export function getLastIndexedOrdinal(db: Database, sessionId: string): number {
     return typeof row?.last_indexed_ordinal === "number" ? row.last_indexed_ordinal : 0;
 }
 
-function getDirtyIndexFloor(db: Database, sessionId: string): number | null {
+export function getDirtyIndexFloor(db: Database, sessionId: string): number | null {
     const row = getLastIndexedStatement(db).get(sessionId) as MessageHistoryIndexRow | null;
     return typeof row?.dirty_floor_ordinal === "number" && row.dirty_floor_ordinal > 0
         ? row.dirty_floor_ordinal
@@ -140,9 +128,9 @@ function getDirtyIndexFloor(db: Database, sessionId: string): number | null {
 }
 
 /**
- * Remember the earliest ordinal that a failed incremental write left missing. A
- * later incremental success may advance the watermark past that hole, so the
- * reconciler must rewind from this floor instead of trusting the watermark.
+ * Persist the earliest ordinal that an incremental write could leave missing.
+ * Callers set this before the FTS transaction so a crash or write failure leaves
+ * a durable reconciliation floor instead of an uncovered watermark.
  */
 export function markMessageIndexDirty(db: Database, sessionId: string, floorOrdinal: number): void {
     const dirtyFloor = Math.max(1, Math.floor(floorOrdinal));
@@ -160,14 +148,35 @@ function isMessageAlreadyIndexed(db: Database, sessionId: string, messageId: str
     return (typeof row?.count === "number" ? row.count : 0) > 0;
 }
 
-function advanceIndexWatermark(
+function setIndexProgress(
     db: Database,
     sessionId: string,
-    ordinal: number,
+    watermark: number,
+    dirtyFloor: number | null,
     now: number,
 ): void {
-    const current = getLastIndexedOrdinal(db, sessionId);
-    getUpsertIndexStatement(db).run(sessionId, Math.max(current, ordinal), now, getHarness());
+    getUpsertProgressStatement(db).run(
+        sessionId,
+        Math.max(0, Math.floor(watermark)),
+        dirtyFloor ?? 0,
+        now,
+        getHarness(),
+    );
+}
+
+export function getMessageIndexReconciliationStartOrdinal(db: Database, sessionId: string): number {
+    const watermark = getLastIndexedOrdinal(db, sessionId);
+    const dirtyFloor = getDirtyIndexFloor(db, sessionId);
+    return dirtyFloor === null ? watermark : Math.min(watermark, dirtyFloor - 1);
+}
+
+export function isMessageIndexReconciledThrough(
+    db: Database,
+    sessionId: string,
+    finalWatermark: number,
+): boolean {
+    const dirtyFloor = getDirtyIndexFloor(db, sessionId);
+    return getLastIndexedOrdinal(db, sessionId) >= finalWatermark && dirtyFloor === null;
 }
 
 export function deleteIndexedMessage(db: Database, sessionId: string, messageId: string): number {
@@ -220,31 +229,36 @@ function indexSingleMessageInTransaction(
     message: RawMessage,
     now: number,
 ): boolean {
-    if (message.role !== "user" && message.role !== "assistant") {
-        advanceIndexWatermark(db, sessionId, message.ordinal, now);
+    const currentWatermark = getLastIndexedOrdinal(db, sessionId);
+    const dirtyFloor = getDirtyIndexFloor(db, sessionId);
+
+    // A live event may only extend the already-covered prefix by one ordinal.
+    // Out-of-order events leave their earliest missing ordinal dirty for the
+    // paged reconciler instead of moving the watermark across a hole.
+    if (
+        message.ordinal !== currentWatermark + 1 ||
+        (dirtyFloor !== null && dirtyFloor !== message.ordinal)
+    ) {
         return false;
     }
 
-    const content = getIndexableContent(message.role, message.parts);
-    if (content.length === 0) {
-        advanceIndexWatermark(db, sessionId, message.ordinal, now);
-        return false;
+    let inserted = false;
+    if (message.role === "user" || message.role === "assistant") {
+        const content = getIndexableContent(message.role, message.parts);
+        if (content.length > 0 && !isMessageAlreadyIndexed(db, sessionId, message.id)) {
+            getInsertMessageStatement(db).run(
+                sessionId,
+                message.ordinal,
+                message.id,
+                message.role,
+                content,
+            );
+            inserted = true;
+        }
     }
 
-    if (isMessageAlreadyIndexed(db, sessionId, message.id)) {
-        advanceIndexWatermark(db, sessionId, message.ordinal, now);
-        return false;
-    }
-
-    getInsertMessageStatement(db).run(
-        sessionId,
-        message.ordinal,
-        message.id,
-        message.role,
-        content,
-    );
-    advanceIndexWatermark(db, sessionId, message.ordinal, now);
-    return true;
+    setIndexProgress(db, sessionId, message.ordinal, null, now);
+    return inserted;
 }
 
 export function indexSingleMessage(db: Database, sessionId: string, message: RawMessage): boolean {
@@ -277,59 +291,75 @@ export function indexMessagesAfterOrdinal(
     db: Database,
     sessionId: string,
     messages: RawMessage[],
-    lastIndexedOrdinal: number,
+    _lastIndexedOrdinal: number,
     finalWatermark: number = messages.length,
 ): number {
     const now = Date.now();
     let inserted = 0;
 
-    // Cross-process dedup is the WATERMARK, re-read INSIDE a BEGIN IMMEDIATE
-    // transaction — NOT a UNIQUE constraint. message_history_fts is a plain
-    // FTS5 virtual table; FTS5 cannot enforce UNIQUE(session_id, message_id)
-    // (the columns are UNINDEXED), so a duplicate insert is silently accepted,
-    // never raised — the old try/catch on SQLITE_CONSTRAINT_UNIQUE could never
-    // fire. The caller reads `lastIndexedOrdinal` OUTSIDE any transaction, so
-    // under WAL two processes reconciling the same session could both read
-    // watermark=0 and double-insert every row (and bloat the FTS table).
-    //
-    // BEGIN IMMEDIATE takes the writer lock up front, so the second process
-    // serializes behind the first (busy_timeout makes it wait). We then re-read
-    // the watermark inside the lock: whatever the first process already indexed
-    // is reflected, so the second skips those ordinals and inserts nothing
-    // duplicate. The bulk SELECT of existing message-ids is still avoided (it
-    // held the writer lock too long on ~30k-row sessions).
+    // The writer lock protects both duplicate checks and the progress row. Each
+    // caller supplies only one bounded source page, so lock hold time is bounded
+    // by that page rather than the full session history.
     db.exec("BEGIN IMMEDIATE");
     let committed = false;
     try {
-        // Re-read under the lock: another process may have advanced the
-        // watermark between the caller's out-of-transaction read and now.
-        let effectiveWatermark = Math.max(lastIndexedOrdinal, getLastIndexedOrdinal(db, sessionId));
+        const currentWatermark = getLastIndexedOrdinal(db, sessionId);
         const dirtyFloor = getDirtyIndexFloor(db, sessionId);
-        if (dirtyFloor !== null) {
-            const rewindOrdinal = Math.max(1, Math.min(dirtyFloor, finalWatermark + 1));
-            if (rewindOrdinal <= finalWatermark) {
-                getDeleteFtsFromOrdinalStatement(db).run(sessionId, rewindOrdinal);
-            }
-            effectiveWatermark = Math.min(effectiveWatermark, rewindOrdinal - 1);
+        const effectiveWatermark =
+            dirtyFloor === null
+                ? currentWatermark
+                : Math.min(currentWatermark, Math.max(0, dirtyFloor - 1));
+
+        if (dirtyFloor !== null && dirtyFloor <= finalWatermark) {
+            // Rebuild only the portion represented by this source snapshot. A
+            // stale snapshot must never delete newer live rows beyond its end.
+            getDeleteFtsRangeStatement(db).run(sessionId, dirtyFloor, finalWatermark);
         }
-        const insertMessage = getInsertMessageStatement(db);
+
+        const messagesByOrdinal = new Map<number, RawMessage>();
         for (const message of messages) {
-            if (message.ordinal <= effectiveWatermark) {
-                continue;
+            if (message.ordinal > effectiveWatermark && message.ordinal <= finalWatermark) {
+                messagesByOrdinal.set(message.ordinal, message);
             }
-            if (message.role !== "user" && message.role !== "assistant") {
+        }
+
+        let coveredWatermark = effectiveWatermark;
+        while (coveredWatermark < finalWatermark && messagesByOrdinal.has(coveredWatermark + 1)) {
+            coveredWatermark += 1;
+        }
+
+        for (let ordinal = effectiveWatermark + 1; ordinal <= coveredWatermark; ordinal++) {
+            const message = messagesByOrdinal.get(ordinal);
+            if (!message || (message.role !== "user" && message.role !== "assistant")) {
                 continue;
             }
             const content = getIndexableContent(message.role, message.parts);
-            if (content.length === 0) {
+            if (content.length === 0 || isMessageAlreadyIndexed(db, sessionId, message.id)) {
                 continue;
             }
-            insertMessage.run(sessionId, message.ordinal, message.id, message.role, content);
-            inserted++;
+            getInsertMessageStatement(db).run(
+                sessionId,
+                message.ordinal,
+                message.id,
+                message.role,
+                content,
+            );
+            inserted += 1;
         }
-        // Never regress a higher watermark a concurrent writer may have set.
-        const newWatermark = Math.max(effectiveWatermark, finalWatermark);
-        getUpsertCleanIndexStatement(db).run(sessionId, newWatermark, now, getHarness());
+
+        const missingFloor = coveredWatermark < finalWatermark ? coveredWatermark + 1 : null;
+        const preservedFloor =
+            dirtyFloor !== null && dirtyFloor > finalWatermark ? dirtyFloor : null;
+        const nextDirtyFloor =
+            missingFloor === null
+                ? preservedFloor
+                : preservedFloor === null
+                  ? missingFloor
+                  : Math.min(missingFloor, preservedFloor);
+
+        // The FTS watermark advances only over contiguous source ordinals. A
+        // dirty floor remains recorded until a source page actually covers it.
+        setIndexProgress(db, sessionId, coveredWatermark, nextDirtyFloor, now);
         db.exec("COMMIT");
         committed = true;
     } finally {

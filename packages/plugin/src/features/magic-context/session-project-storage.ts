@@ -1,6 +1,8 @@
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 
+const SESSION_CHUNK_REPAIR_BATCH_SIZE = 100;
+
 const upsertSessionProjectStatements = new WeakMap<Database, PreparedStatement>();
 const repairSessionChunkProjectStatements = new WeakMap<Database, PreparedStatement>();
 const repairProjectChunkProjectStatements = new WeakMap<Database, PreparedStatement>();
@@ -27,9 +29,14 @@ function getRepairSessionChunkProjectStatement(db: Database): PreparedStatement 
         stmt = db.prepare(
             `UPDATE compartment_chunk_embeddings
              SET project_path = ?
-             WHERE session_id = ?
-               AND harness = ?
-               AND project_path <> ?`,
+             WHERE id IN (
+                 SELECT id
+                 FROM compartment_chunk_embeddings
+                 WHERE session_id = ?
+                   AND harness = ?
+                   AND project_path <> ?
+                 LIMIT ?
+             )`,
         );
         repairSessionChunkProjectStatements.set(db, stmt);
     }
@@ -81,10 +88,16 @@ export function recordSessionProjectIdentity(
     const now = Date.now();
     db.transaction(() => {
         getUpsertSessionProjectStatement(db).run(sessionId, harness, projectPath, now);
-        // Repair rows from the pre-scope bug (or an interrupted rekey) as soon as
-        // the owning session is observed. Search filters by project_path, so a
-        // stale stamp hides otherwise valid vectors from their real project.
-        getRepairSessionChunkProjectStatement(db).run(projectPath, sessionId, harness, projectPath);
+        // Repair a bounded slice of chunks stamped with a project other than the
+        // session's recorded owner. Repeated observations resume the repair
+        // without making transform wait on an unbounded update.
+        getRepairSessionChunkProjectStatement(db).run(
+            projectPath,
+            sessionId,
+            harness,
+            projectPath,
+            SESSION_CHUNK_REPAIR_BATCH_SIZE,
+        );
     })();
 }
 

@@ -124,6 +124,102 @@ export function readRawSessionMessagesFromDb(db: Database, sessionId: string): R
     });
 }
 
+interface PagedRawMessageRow extends RawMessageRow {
+    ordinal: number;
+}
+
+/**
+ * Read one bounded page from the canonical raw-message ordinal space. Message
+ * and part JSON parsing is limited to the requested page so background FTS work
+ * cannot monopolize the event loop by hydrating an entire long session.
+ */
+export function readRawSessionMessagePageFromDb(
+    db: Database,
+    sessionId: string,
+    afterOrdinal: number,
+    limit: number,
+    finalWatermark = Number.MAX_SAFE_INTEGER,
+): RawMessage[] {
+    const remaining = Math.max(0, Math.floor(finalWatermark) - Math.floor(afterOrdinal));
+    const pageSize = Math.min(Math.max(1, Math.floor(limit)), remaining);
+    if (pageSize === 0) return [];
+
+    const messageRows = db
+        .prepare(
+            `SELECT id, data, time_created, time_updated
+             FROM message
+             WHERE session_id = ?
+               AND NOT (
+                   CASE WHEN json_valid(data) = 1
+                        THEN COALESCE(json_extract(data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(data) = 1
+                            THEN COALESCE(json_extract(data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )
+             ORDER BY time_created ASC, id ASC
+             LIMIT ? OFFSET ?`,
+        )
+        .all(sessionId, pageSize, Math.max(0, Math.floor(afterOrdinal)))
+        .filter(isRawMessageRow)
+        .map(
+            (row, index): PagedRawMessageRow => ({
+                ...row,
+                ordinal: Math.floor(afterOrdinal) + index + 1,
+            }),
+        );
+
+    if (messageRows.length === 0) return [];
+
+    const placeholders = messageRows.map(() => "?").join(", ");
+    const partRows = db
+        .prepare(
+            `SELECT message_id, data, time_updated
+             FROM part
+             WHERE session_id = ? AND message_id IN (${placeholders})
+             ORDER BY time_created ASC, id ASC`,
+        )
+        .all(sessionId, ...messageRows.map((row) => row.id))
+        .filter(isRawPartRow);
+    const partsByMessageId = new Map<string, unknown[]>();
+    for (const part of partRows) {
+        const list = partsByMessageId.get(part.message_id) ?? [];
+        list.push(attachRawPartVersion(parseJsonUnknown(part.data), part.time_updated));
+        partsByMessageId.set(part.message_id, list);
+    }
+
+    return messageRows.map((row) => {
+        const info = parseJsonRecord(row.data);
+        return {
+            ordinal: row.ordinal,
+            id: row.id,
+            role: typeof info?.role === "string" ? info.role : "unknown",
+            parts: partsByMessageId.get(row.id) ?? [],
+            createdAt: row.time_created ?? null,
+            version: row.time_updated ?? null,
+        };
+    });
+}
+
+export function countRawSessionMessageOrdinalsFromDb(db: Database, sessionId: string): number {
+    const row = db
+        .prepare(
+            `SELECT COUNT(*) AS count
+             FROM message
+             WHERE session_id = ?
+               AND NOT (
+                   CASE WHEN json_valid(data) = 1
+                        THEN COALESCE(json_extract(data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(data) = 1
+                            THEN COALESCE(json_extract(data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )`,
+        )
+        .get(sessionId) as { count?: number } | null;
+    return typeof row?.count === "number" ? row.count : 0;
+}
+
 /**
  * Read the canonical raw-message ordinal space without loading or parsing part rows.
  * Keep the ordering, summary predicate, and malformed-message behavior identical to
