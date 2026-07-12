@@ -74,7 +74,21 @@ describe("smart-note SSRF guard", () => {
         }
     });
 
-    test("rejects DNS answers with any private address", async () => {
+    test("allows a dual-stack host and pins only its public IPv4 answer", async () => {
+        const validated = await validateSmartNoteHttpUrl("https://dual-stack.example.test/", {
+            signal,
+            resolver: resolver([
+                { address: "93.184.216.34", family: 4 },
+                { address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 },
+            ]),
+        });
+
+        expect(validated.addresses).toEqual([
+            { address: "93.184.216.34", family: 4, classification: "global" },
+        ]);
+    });
+
+    test("rejects DNS answers with any private IPv4 address", async () => {
         await expect(
             validateSmartNoteHttpUrl("https://example.test/", {
                 signal,

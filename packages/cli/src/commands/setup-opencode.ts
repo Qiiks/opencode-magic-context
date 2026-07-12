@@ -39,21 +39,14 @@ function ensureDir(dir: string): void {
 
 export function addPluginToOpenCodeConfig(
     configPath: string,
-    format: "json" | "jsonc" | "none",
+    _format: "json" | "jsonc" | "none",
     removeDcp = false,
 ): void {
-    if (format === "none") {
-        ensureDir(dirname(configPath));
-        const config = {
-            plugin: [PLUGIN_ENTRY],
-            compaction: { auto: false, prune: false },
-        };
-        writeFileAtomic(configPath, `${stringifyJsonc(config, null, 2)}\n`);
-        return;
-    }
-
-    // Read existing config, merge our changes, preserve everything else
-    const existing = readJsoncConfigForUpdate(configPath);
+    // The detection result predates interactive prompts. Re-read at commit time so
+    // a config created while the wizard was open is merged instead of overwritten.
+    const existsAtCommit = existsSync(configPath);
+    const existing = existsAtCommit ? readJsoncConfigForUpdate(configPath) : {};
+    if (!existsAtCommit) ensureDir(dirname(configPath));
 
     // Operate on the raw plugin array — entries can be:
     //   • a string:  "@cortexkit/opencode-magic-context@latest"
@@ -97,14 +90,11 @@ export function addPluginToOpenCodeConfig(
     writeFileAtomic(configPath, `${stringifyJsonc(existing, null, 2)}\n`);
 }
 
-export function addPluginToTuiConfig(configPath: string, format: "json" | "jsonc" | "none"): void {
-    if (format === "none") {
-        ensureDir(dirname(configPath));
-        writeFileAtomic(configPath, `${stringifyJsonc({ plugin: [PLUGIN_ENTRY] }, null, 2)}\n`);
-        return;
-    }
-
-    const existing = readJsoncConfigForUpdate(configPath);
+export function addPluginToTuiConfig(configPath: string, _format: "json" | "jsonc" | "none"): void {
+    // Config discovery may be stale after prompts; merge the commit-time contents.
+    const existsAtCommit = existsSync(configPath);
+    const existing = existsAtCommit ? readJsoncConfigForUpdate(configPath) : {};
+    if (!existsAtCommit) ensureDir(dirname(configPath));
 
     // Same rules as the main opencode config — preserve tuple entries and
     // never replace dev-path entries.

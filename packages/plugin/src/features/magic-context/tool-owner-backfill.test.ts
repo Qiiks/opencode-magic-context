@@ -8,9 +8,11 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
+import { clearSession } from "./storage-meta-session";
 import { getTagsBySession, insertTag } from "./storage-tags";
 import {
     _getBackfillState,
+    _markSessionSkippedForTests,
     isToolOwnerBackfillNeeded,
     runToolOwnerBackfill,
 } from "./tool-owner-backfill";
@@ -356,6 +358,23 @@ describe("runToolOwnerBackfill", () => {
         expect(_getBackfillState(mc, "ses-1")?.status).toBe("skipped");
         expect(_getBackfillState(mc, "ses-1")?.last_error).toBe("no_oc_matches");
 
+        closeQuietly(mc);
+    });
+
+    test("does not recreate state cleared after lease acquisition", () => {
+        const dataHome = createTempDir("mc-backfill-clear-race-");
+        process.env.XDG_DATA_HOME = dataHome;
+        const mc = createMcDb();
+        mc.prepare(
+            `INSERT INTO tool_owner_backfill_state(session_id, status) VALUES (?, 'running')`,
+        ).run("ses-1");
+
+        // clearSession removes the leased state before the worker reaches its
+        // no-match terminal transition.
+        clearSession(mc, "ses-1");
+        _markSessionSkippedForTests(mc, "ses-1");
+
+        expect(_getBackfillState(mc, "ses-1")).toBeNull();
         closeQuietly(mc);
     });
 

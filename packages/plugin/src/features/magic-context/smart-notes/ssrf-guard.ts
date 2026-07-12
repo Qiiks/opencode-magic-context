@@ -158,25 +158,27 @@ async function resolveHostToValidatedGlobalAddresses(
         throw new SmartNoteSecurityError("DNS resolution returned no addresses");
     }
 
-    const classified = candidates.map((candidate) => {
-        // Prefix classification cannot safely distinguish global IPv6 from NAT64/Pref64
-        // synthesis of internal IPv4 targets. IPv6-only hosts are not worth that bypass risk.
-        if (candidate.family === 6 || candidate.address.includes(":")) {
-            throw new SmartNoteNetworkError(
-                "SMART_NOTE_NETWORK: IPv6 destinations are not permitted",
-            );
-        }
+    // Requests are pinned to one validated IPv4 address, so discard IPv6 DNS
+    // answers rather than rejecting an otherwise reachable dual-stack host.
+    // IPv6-only destinations remain blocked because no request candidate survives.
+    const ipv4Candidates = candidates.filter(
+        (candidate) => candidate.family !== 6 && !candidate.address.includes(":"),
+    );
+    if (ipv4Candidates.length === 0) {
+        throw new SmartNoteNetworkError("SMART_NOTE_NETWORK: IPv6 destinations are not permitted");
+    }
+
+    const classified = ipv4Candidates.map((candidate) => {
         const parsed = parseIpLiteral(candidate.address);
-        if (!parsed) {
+        if (parsed?.family !== 4) {
             throw new SmartNoteSecurityError(
-                `DNS returned an unparsable address: ${candidate.address}`,
+                `DNS returned an unparsable IPv4 address: ${candidate.address}`,
             );
         }
-        const global = isGlobalAddress(parsed);
         return {
             address: parsed.address,
             family: parsed.family,
-            global,
+            global: isGlobalAddress(parsed),
         };
     });
 

@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { extname, join } from "node:path";
 import { findOnPath, isExecutableFile } from "./find-on-path";
 
 export interface PiBinaryInfo {
@@ -9,6 +9,24 @@ export interface PiBinaryInfo {
 }
 
 export const PI_PACKAGE_SOURCE = "npm:@cortexkit/pi-magic-context";
+
+export interface PiCommandInvocation {
+    command: string;
+    args: string[];
+}
+
+export function getPiCommandInvocation(piPath: string, args: string[]): PiCommandInvocation {
+    const extension = extname(piPath).toLowerCase();
+    if (extension !== ".cmd" && extension !== ".bat") {
+        return { command: piPath, args };
+    }
+
+    // Windows command shims are scripts, not native executables. Route them
+    // through ComSpec with an explicit argv so model names and paths never enter
+    // an interpolated shell command.
+    const command = process.env.ComSpec?.trim() || process.env.COMSPEC?.trim() || "cmd.exe";
+    return { command, args: ["/d", "/s", "/c", piPath, ...args] };
+}
 
 export function detectPiBinary(): PiBinaryInfo | null {
     // Node-only PATH walker, not which/where: shelling out fails in
@@ -34,7 +52,8 @@ export function getPiVersion(piPath: string): string | null {
     // a clean exit. Prefer stdout when present so future Pi versions
     // that switch back to stdout still work.
     try {
-        const result = spawnSync(piPath, ["--version"], {
+        const invocation = getPiCommandInvocation(piPath, ["--version"]);
+        const result = spawnSync(invocation.command, invocation.args, {
             encoding: "utf-8",
             timeout: 10_000,
         });
@@ -48,12 +67,13 @@ export function getPiVersion(piPath: string): string | null {
     }
 }
 
-function runPi(piPath: string, args: string[]): string | null {
+export function runPiCommand(piPath: string, args: string[], timeout = 20_000): string | null {
     try {
-        return execFileSync(piPath, args, {
+        const invocation = getPiCommandInvocation(piPath, args);
+        return execFileSync(invocation.command, invocation.args, {
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "ignore"],
-            timeout: 20_000,
+            timeout,
         }).trim();
     } catch {
         return null;
@@ -125,7 +145,10 @@ export function getAvailableModels(piPath: string): string[] {
     // `pi --list-models` is the canonical command (prints the provider/model
     // table). Try it first, then the older `models list` subcommand for
     // forward/backward compat.
-    const outputs = [runPi(piPath, ["--list-models"]), runPi(piPath, ["models", "list"])];
+    const outputs = [
+        runPiCommand(piPath, ["--list-models"]),
+        runPiCommand(piPath, ["models", "list"]),
+    ];
     for (const output of outputs) {
         if (!output) continue;
         const models = parseModelListOutput(output);

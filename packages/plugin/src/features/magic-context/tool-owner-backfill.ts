@@ -289,15 +289,18 @@ function markSessionPendingRetry(db: Database, sessionId: string): void {
 }
 
 function markSessionSkipped(db: Database, sessionId: string, now: number, reason: string): void {
+    // Lease acquisition creates the row. An update-only terminal transition keeps
+    // clearSession authoritative if it removes that row while backfill is in flight.
     db.prepare(
-        `INSERT INTO tool_owner_backfill_state(session_id, status, completed_at, last_error)
-         VALUES (?, 'skipped', ?, ?)
-         ON CONFLICT(session_id) DO UPDATE SET
-             status = 'skipped',
-             completed_at = excluded.completed_at,
-             last_error = excluded.last_error,
-             lease_expires_at = NULL`,
-    ).run(sessionId, now, reason);
+        `UPDATE tool_owner_backfill_state
+         SET status = 'skipped', completed_at = ?, last_error = ?, lease_expires_at = NULL
+         WHERE session_id = ? AND status = 'running'`,
+    ).run(now, reason, sessionId);
+}
+
+/** Test-only hook for the clear-versus-terminal-transition race. */
+export function _markSessionSkippedForTests(db: Database, sessionId: string): void {
+    markSessionSkipped(db, sessionId, Date.now(), "test_no_matches");
 }
 
 function markSessionErrored(db: Database, sessionId: string, error: unknown): void {

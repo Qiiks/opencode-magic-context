@@ -3626,7 +3626,12 @@ fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
                     "Invalid range \"{part}\": start ({start}) must be <= end ({end})"
                 ));
             }
-            let range_size = end - start + 1;
+            // Endpoints are positive and i64-bounded, but keep the size calculation
+            // checked so malformed facade input can never wrap before the allocation guard.
+            let range_size = end
+                .checked_sub(start)
+                .and_then(|difference| difference.checked_add(1))
+                .ok_or_else(|| format!("Invalid range \"{part}\": size overflow"))?;
             if range_size > MAX_RANGE_ELEMENTS {
                 return Err(format!(
                     "Range \"{part}\" exceeds maximum size of {MAX_RANGE_ELEMENTS} elements (got {range_size})"
@@ -3652,8 +3657,16 @@ fn parse_tag_integer(raw: &str) -> Result<u64, String> {
     if raw.is_empty() || !raw.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(format!("Invalid integer: \"{raw}\""));
     }
-    raw.parse::<u64>()
-        .map_err(|_| format!("Invalid integer: \"{raw}\""))
+    let value = raw
+        .parse::<u64>()
+        .map_err(|_| format!("Invalid integer: \"{raw}\""))?;
+    if value == 0 || value > i64::MAX as u64 {
+        return Err(format!(
+            "Invalid integer: \"{raw}\" (tag numbers must be between 1 and {})",
+            i64::MAX
+        ));
+    }
+    Ok(value)
 }
 
 fn format_tag_numbers(ids: &[i64]) -> String {
@@ -6200,6 +6213,14 @@ mod tests {
         assert_eq!(error_code(reduce), "tagging_inactive");
     }
 
+    #[test]
+    fn ctx_reduce_range_parser_rejects_unbounded_and_oversized_ranges() {
+        assert!(parse_tag_range_string("0-18446744073709551615").is_err());
+        assert!(parse_tag_range_string("5-3").is_err());
+        assert_eq!(parse_tag_range_string("3-5,8").unwrap(), vec![3, 4, 5, 8]);
+        assert!(parse_tag_range_string("1-1001").is_err());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn facade_ctx_reduce_parses_ranges_resolves_tags_and_dedups_queue() {
         crate::healing::set_tagging_enabled_for_tests(Some(true));
@@ -6237,6 +6258,21 @@ mod tests {
         );
         assert_eq!(malformed["isError"], json!(true));
         assert!(malformed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid range syntax"));
+
+        let unbounded = tool_body(
+            call_facade_on_channel(
+                &handler,
+                8,
+                "ctx_reduce",
+                json!({ "drop": "0-18446744073709551615" }),
+            )
+            .await,
+        );
+        assert_eq!(unbounded["isError"], json!(true));
+        assert!(unbounded["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("Invalid range syntax"));
