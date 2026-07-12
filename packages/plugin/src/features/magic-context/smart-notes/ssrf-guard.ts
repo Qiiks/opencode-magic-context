@@ -159,6 +159,13 @@ async function resolveHostToValidatedGlobalAddresses(
     }
 
     const classified = candidates.map((candidate) => {
+        // Prefix classification cannot safely distinguish global IPv6 from NAT64/Pref64
+        // synthesis of internal IPv4 targets. IPv6-only hosts are not worth that bypass risk.
+        if (candidate.family === 6 || candidate.address.includes(":")) {
+            throw new SmartNoteNetworkError(
+                "SMART_NOTE_NETWORK: IPv6 destinations are not permitted",
+            );
+        }
         const parsed = parseIpLiteral(candidate.address);
         if (!parsed) {
             throw new SmartNoteSecurityError(

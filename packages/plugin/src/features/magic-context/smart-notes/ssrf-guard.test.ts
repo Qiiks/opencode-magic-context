@@ -52,19 +52,25 @@ describe("smart-note SSRF guard", () => {
         }
     });
 
-    test("blocks IPv4-mapped and private IPv6 ranges", async () => {
-        for (const host of [
-            "[::1]",
-            "[::ffff:127.0.0.1]",
-            "[fe80::1]",
-            "[fc00::1]",
-            "[fd00:ec2::254]",
-            "[ff02::1]",
-            "[2001:db8::1]",
+    test("rejects every IPv6 DNS answer before address classification", async () => {
+        for (const address of [
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "64:ff9b::a00:5",
+            "2001:4860:abcd::a00:5",
+            "3fff::1",
+            "::ffff:127.0.0.1",
+            "fe80::1",
+            "fc00::1",
+            "fd00:ec2::254",
+            "ff02::1",
+            "2001:db8::1",
         ]) {
-            await expect(validateSmartNoteHttpUrl(`https://${host}/`, { signal })).rejects.toThrow(
-                /non-global|internal/i,
-            );
+            await expect(
+                validateSmartNoteHttpUrl("https://ipv6-only.example.test/", {
+                    signal,
+                    resolver: resolver([{ address, family: 6 }]),
+                }),
+            ).rejects.toBeInstanceOf(SmartNoteNetworkError);
         }
     });
 
@@ -80,18 +86,15 @@ describe("smart-note SSRF guard", () => {
         ).rejects.toThrow(/non-global|internal/i);
     });
 
-    test("allows public DNS answers and preserves all validated candidates", async () => {
+    test("allows public IPv4 DNS answers and preserves all validated candidates", async () => {
         const validated = await validateSmartNoteHttpUrl("https://example.test/path", {
             signal,
             resolver: resolver([
                 { address: "93.184.216.34", family: 4 },
-                { address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 },
+                { address: "1.1.1.1", family: 4 },
             ]),
         });
-        expect(validated.addresses.map((a) => a.address)).toEqual([
-            "93.184.216.34",
-            "2606:2800:220:1:248:1893:25c8:1946",
-        ]);
+        expect(validated.addresses.map((a) => a.address)).toEqual(["93.184.216.34", "1.1.1.1"]);
     });
 
     test("stops after a terminal per-target failure", async () => {
@@ -186,7 +189,7 @@ describe("createPinnedLookup", () => {
     });
 
     test("returns the legacy 3-arg form when all is not requested", () => {
-        const hook = createPinnedLookup({ address: "2606:2800:220:1::1", family: 6 });
+        const hook = createPinnedLookup({ address: "1.1.1.1", family: 4 });
         let addr: unknown;
         let fam: unknown;
         hook("example.test", {}, (err, address, family) => {
@@ -194,8 +197,8 @@ describe("createPinnedLookup", () => {
             addr = address;
             fam = family;
         });
-        expect(addr).toBe("2606:2800:220:1::1");
-        expect(fam).toBe(6);
+        expect(addr).toBe("1.1.1.1");
+        expect(fam).toBe(4);
     });
 
     test("pins to the validated IP without re-querying DNS", () => {
