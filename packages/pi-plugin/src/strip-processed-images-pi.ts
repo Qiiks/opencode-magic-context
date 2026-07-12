@@ -16,6 +16,10 @@ export interface StripPiProcessedImagesResult {
 	newlyStrippedIds: string[];
 }
 
+// A non-empty marker preserves user/tool-result boundaries and keeps Anthropic
+// tool_result content valid after Pi removes the image bytes.
+const STRIPPED_IMAGE_MARKER = "[image stripped]";
+
 function isLargeImagePart(value: unknown): value is PiImagePart {
 	if (!value || typeof value !== "object") return false;
 	const part = value as Record<string, unknown>;
@@ -98,7 +102,10 @@ export function stripPiProcessedImages(args: {
 		if (!Array.isArray(message.content)) continue;
 		for (let partIndex = 0; partIndex < message.content.length; partIndex++) {
 			if (!isLargeImagePart(message.content[partIndex])) continue;
-			message.content[partIndex] = { type: "text", text: "" };
+			message.content[partIndex] = {
+				type: "text",
+				text: STRIPPED_IMAGE_MARKER,
+			};
 			stripped++;
 		}
 	}

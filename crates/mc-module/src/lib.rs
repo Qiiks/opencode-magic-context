@@ -137,8 +137,9 @@ pub const DEFAULT_MODULE_ID: &str = "magic-context";
 /// category-grouped `#id: fact` format and applies to every serializer profile.
 pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 2;
 /// Bumps when the shared compartment render changes. Epoch 1 replaces rendered
-/// `<compartment>` elements with markdown headings in m0 and m1.
-pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 1;
+/// `<compartment>` elements with markdown headings in m0 and m1; epoch 2 sanitizes
+/// historian-authored titles before placing them inside the session-history wrapper.
+pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
 /// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages.
@@ -5629,7 +5630,10 @@ mod tests {
             status["epochs"]["memory_render_epoch"],
             json!(MEMORY_RENDER_FORMAT_EPOCH)
         );
-        assert_eq!(status["epochs"]["compartment_render_epoch"], json!(1));
+        assert_eq!(
+            status["epochs"]["compartment_render_epoch"],
+            json!(COMPARTMENT_RENDER_FORMAT_EPOCH)
+        );
         assert_eq!(status["epochs"]["profile_epoch"], json!(1));
         assert_eq!(
             status["epochs"]["tagger_epoch"],

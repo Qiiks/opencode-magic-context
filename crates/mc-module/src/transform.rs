@@ -7872,7 +7872,7 @@ mod tests {
 
     #[test]
     fn compartment_render_epoch_hards_all_profiles_once_then_stabilizes() {
-        assert_eq!(crate::COMPARTMENT_RENDER_FORMAT_EPOCH, 1);
+        assert_eq!(crate::COMPARTMENT_RENDER_FORMAT_EPOCH, 2);
         for profile in [
             SerializerProfile::OwnedLlmRunner,
             SerializerProfile::Pi,
@@ -7899,7 +7899,7 @@ mod tests {
             } else {
                 format!("mpe{profile_epoch}")
             };
-            assert!(loaded.meta.last_render_config.contains("cre:4:cre1"));
+            assert!(loaded.meta.last_render_config.contains("cre:4:cre2"));
             loaded.meta.last_render_config = effective_render_config_with_epochs(
                 &s,
                 "cfg0",

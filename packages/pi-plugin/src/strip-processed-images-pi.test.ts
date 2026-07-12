@@ -78,6 +78,77 @@ describe("stripPiProcessedImages", () => {
 		}
 	});
 
+	it("keeps an image-only tool result non-empty and byte-stable on defer replay", () => {
+		const db = createTestDb();
+		try {
+			const buildMessages = () => {
+				const toolResult = {
+					...imageMessage("toolResult", 3),
+					content: [{ type: "image", data: IMAGE_DATA, mimeType: "image/png" }],
+				};
+				return [toolResult, assistantMessage("processed tool image", 4)];
+			};
+
+			const first = buildMessages();
+			const detected = stripPiProcessedImages({
+				db,
+				sessionId: "ses-image-only-tool-result",
+				messages: first,
+				detect: true,
+				watermark: 5,
+				messageIdToMaxTag: new Map([["entry-3", 3]]),
+				stableId: idByTimestamp,
+			});
+			const firstWire = JSON.stringify(first);
+
+			const replay = buildMessages();
+			const replayed = stripPiProcessedImages({
+				db,
+				sessionId: "ses-image-only-tool-result",
+				messages: replay,
+				detect: false,
+				watermark: 99,
+				messageIdToMaxTag: new Map(),
+				stableId: idByTimestamp,
+			});
+
+			expect(detected).toEqual({
+				stripped: 1,
+				newlyStrippedIds: ["entry-3"],
+			});
+			expect(replayed.stripped).toBe(1);
+			expect((first[0] as { content: unknown[] }).content).toEqual([
+				{ type: "text", text: "[image stripped]" },
+			]);
+			expect(JSON.stringify(replay)).toBe(firstWire);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("uses the same non-empty marker for user-message images", () => {
+		const db = createTestDb();
+		try {
+			const image = imageMessage("user", 1);
+			stripPiProcessedImages({
+				db,
+				sessionId: "ses-user-image-marker",
+				messages: [image, assistantMessage("processed", 2)],
+				detect: true,
+				watermark: 5,
+				messageIdToMaxTag: new Map([["entry-1", 1]]),
+				stableId: idByTimestamp,
+			});
+
+			expect(image.content[1]).toEqual({
+				type: "text",
+				text: "[image stripped]",
+			});
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("leaves images newer than the dropped-tag watermark untouched", () => {
 		const db = createTestDb();
 		try {
