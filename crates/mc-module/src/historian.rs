@@ -2718,6 +2718,76 @@ mod tests {
         assert_eq!(state.state, HistorianPhase::Idle);
     }
 
+    #[tokio::test]
+    async fn narrative_gap_rejection_preserves_boundary_for_next_run() {
+        use crate::historian_validate::ChunkLine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = HistorianChunk {
+            start_index: 2,
+            end_index: 9,
+            lines: (2..=9)
+                .map(|ordinal| ChunkLine {
+                    ordinal,
+                    message_id: format!("m{ordinal}#0"),
+                    anchorable: true,
+                })
+                .collect(),
+            present_ordinals: (1..=9).collect(),
+            tool_only_ranges: vec![],
+        };
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let rejected_output = r#"<output><compartments>
+<compartment start="2" end="2" title="first" episode_type="feature" importance="50"><p1>first</p1><p2>first</p2><p3>first</p3><p4 /></compartment>
+<compartment start="8" end="9" title="second" episode_type="feature" importance="50"><p1>second</p1><p2>second</p2><p3>second</p3><p4 /></compartment>
+</compartments><meta><unprocessed_from>10</unprocessed_from></meta></output>"#;
+        let mut rejected_request = fire_request(&store, "messages 2-9", &models, &chunk, &prior);
+        rejected_request.to_ordinal = 9;
+        let mut rejecting_producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-gap")))
+            .with_output(Ok(producer_output(rejected_output.to_string())));
+
+        let error = run_historian_firing(&mut rejecting_producer, rejected_request)
+            .await
+            .expect_err("a five-message narrative gap must reject");
+        assert!(matches!(error, HistorianDriveError::Validation(_)));
+        let after_rejection = store.load_historian_assembly_snapshot("ses").unwrap();
+        assert_eq!(after_rejection.compartments.len(), 1);
+        assert_eq!(after_rejection.compartments[0].end_message, 1);
+        assert_eq!(
+            store.load("ses").unwrap().meta.publication_floor_ordinal,
+            None
+        );
+
+        // A later firing starts from the unchanged compartment boundary and can cover
+        // every rejected ordinal, including the former gap at 3..=7.
+        let accepted_output = r#"<output><compartments>
+<compartment start="2" end="9" title="re-read" episode_type="feature" importance="50"><p1>all messages re-read</p1><p2>re-read</p2><p3>re-read</p3><p4 /></compartment>
+</compartments><meta><unprocessed_from>10</unprocessed_from></meta></output>"#;
+        let mut retry_request = fire_request(&store, "messages 2-9", &models, &chunk, &prior);
+        retry_request.to_ordinal = 9;
+        retry_request.now_ms = 1_000;
+        let mut accepting_producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-reread")))
+            .with_output(Ok(producer_output(accepted_output.to_string())));
+        let outcome = run_historian_firing(&mut accepting_producer, retry_request)
+            .await
+            .expect("the same ordinals remain publishable on the next run");
+
+        assert!(matches!(outcome, HistorianDriveOutcome::Completed(_)));
+        let after_retry = store.load_historian_assembly_snapshot("ses").unwrap();
+        assert_eq!(after_retry.compartments.len(), 2);
+        assert_eq!(after_retry.compartments[1].start_message, 2);
+        assert_eq!(after_retry.compartments[1].end_message, 9);
+        assert_eq!(
+            store.load("ses").unwrap().meta.publication_floor_ordinal,
+            Some(10)
+        );
+    }
+
     /// The seam-close proof: a real historian output is parsed + validated by the
     /// validation module, and the resulting `ValidatedChunk` drives the publish
     /// path end to end. This is the capstone that both parallel units are correct

@@ -402,12 +402,12 @@
     }
   },
   {
-    "label": "tool-only gap heals beyond safety window",
+    "label": "twenty-message tool-only gap heals",
     "input": {
-      "text": "<output>\n<compartments>\n<compartment start=\"1\" end=\"2\" title=\"alpha\" episode_type=\"feature\" importance=\"50\">\n<p1>alpha full &amp; exact</p1>\n<p2>alpha short</p2>\n<p3>alpha</p3>\n<p4 />\n</compartment>\n<compartment start=\"19\" end=\"20\" title=\"beta\" episode_type=\"feature\" importance=\"50\">\n<p1>beta full &amp; exact</p1>\n<p2>beta short</p2>\n<p3>beta</p3>\n<p4 />\n</compartment>\n</compartments>\n\n<meta><messages_processed>1-20</messages_processed><unprocessed_from>21</unprocessed_from></meta>\n</output>",
+      "text": "<output>\n<compartments>\n<compartment start=\"1\" end=\"2\" title=\"alpha\" episode_type=\"feature\" importance=\"50\">\n<p1>alpha full &amp; exact</p1>\n<p2>alpha short</p2>\n<p3>alpha</p3>\n<p4 />\n</compartment>\n<compartment start=\"23\" end=\"24\" title=\"beta\" episode_type=\"feature\" importance=\"50\">\n<p1>beta full &amp; exact</p1>\n<p2>beta short</p2>\n<p3>beta</p3>\n<p4 />\n</compartment>\n</compartments>\n\n<meta><messages_processed>1-24</messages_processed><unprocessed_from>25</unprocessed_from></meta>\n</output>",
       "chunk": {
         "start_index": 1,
-        "end_index": 20,
+        "end_index": 24,
         "lines": [
           {
             "ordinal": 1,
@@ -488,12 +488,28 @@
           {
             "ordinal": 20,
             "message_id": "msg-20"
+          },
+          {
+            "ordinal": 21,
+            "message_id": "msg-21"
+          },
+          {
+            "ordinal": 22,
+            "message_id": "msg-22"
+          },
+          {
+            "ordinal": 23,
+            "message_id": "msg-23"
+          },
+          {
+            "ordinal": 24,
+            "message_id": "msg-24"
           }
         ],
         "tool_only_ranges": [
           {
             "start": 3,
-            "end": 18
+            "end": 22
           }
         ]
       },
@@ -518,8 +534,8 @@
           "episode_type": "feature"
         },
         {
-          "start_message": 19,
-          "end_message": 20,
+          "start_message": 23,
+          "end_message": 24,
           "title": "beta",
           "content": "beta full & exact",
           "p1": "beta full & exact",
@@ -532,7 +548,7 @@
       ],
       "facts": [],
       "events": [],
-      "unprocessed_from": 21,
+      "unprocessed_from": 25,
       "user_observations": [],
       "primer_candidates": []
     },
@@ -543,9 +559,9 @@
           {
             "sequence": 0,
             "start_message_id": "msg-1",
-            "end_message_id": "msg-18",
+            "end_message_id": "msg-22",
             "start_message": 1,
-            "end_message": 18,
+            "end_message": 22,
             "title": "alpha",
             "content": "alpha full & exact",
             "p1": "alpha full & exact",
@@ -560,18 +576,18 @@
         "events": [],
         "primer_candidates": [],
         "user_observations": [],
-        "unprocessed_from": 19,
+        "unprocessed_from": 23,
         "discarded_last": true
       }
     }
   },
   {
-    "label": "small non-tool gap heals at safety boundary",
+    "label": "five-message non-tool gap rejects",
     "input": {
-      "text": "<output>\n<compartments>\n<compartment start=\"1\" end=\"2\" title=\"alpha\" episode_type=\"feature\" importance=\"50\">\n<p1>alpha full &amp; exact</p1>\n<p2>alpha short</p2>\n<p3>alpha</p3>\n<p4 />\n</compartment>\n<compartment start=\"18\" end=\"20\" title=\"beta\" episode_type=\"feature\" importance=\"50\">\n<p1>beta full &amp; exact</p1>\n<p2>beta short</p2>\n<p3>beta</p3>\n<p4 />\n</compartment>\n</compartments>\n\n<meta><messages_processed>1-20</messages_processed><unprocessed_from>21</unprocessed_from></meta>\n</output>",
+      "text": "<output>\n<compartments>\n<compartment start=\"1\" end=\"2\" title=\"alpha\" episode_type=\"feature\" importance=\"50\">\n<p1>alpha full &amp; exact</p1>\n<p2>alpha short</p2>\n<p3>alpha</p3>\n<p4 />\n</compartment>\n<compartment start=\"8\" end=\"10\" title=\"beta\" episode_type=\"feature\" importance=\"50\">\n<p1>beta full &amp; exact</p1>\n<p2>beta short</p2>\n<p3>beta</p3>\n<p4 />\n</compartment>\n</compartments>\n\n<meta><messages_processed>1-10</messages_processed><unprocessed_from>11</unprocessed_from></meta>\n</output>",
       "chunk": {
         "start_index": 1,
-        "end_index": 20,
+        "end_index": 10,
         "lines": [
           {
             "ordinal": 1,
@@ -612,46 +628,6 @@
           {
             "ordinal": 10,
             "message_id": "msg-10"
-          },
-          {
-            "ordinal": 11,
-            "message_id": "msg-11"
-          },
-          {
-            "ordinal": 12,
-            "message_id": "msg-12"
-          },
-          {
-            "ordinal": 13,
-            "message_id": "msg-13"
-          },
-          {
-            "ordinal": 14,
-            "message_id": "msg-14"
-          },
-          {
-            "ordinal": 15,
-            "message_id": "msg-15"
-          },
-          {
-            "ordinal": 16,
-            "message_id": "msg-16"
-          },
-          {
-            "ordinal": 17,
-            "message_id": "msg-17"
-          },
-          {
-            "ordinal": 18,
-            "message_id": "msg-18"
-          },
-          {
-            "ordinal": 19,
-            "message_id": "msg-19"
-          },
-          {
-            "ordinal": 20,
-            "message_id": "msg-20"
           }
         ],
         "tool_only_ranges": []
@@ -677,8 +653,8 @@
           "episode_type": "feature"
         },
         {
-          "start_message": 18,
-          "end_message": 20,
+          "start_message": 8,
+          "end_message": 10,
           "title": "beta",
           "content": "beta full & exact",
           "p1": "beta full & exact",
@@ -691,37 +667,13 @@
       ],
       "facts": [],
       "events": [],
-      "unprocessed_from": 21,
+      "unprocessed_from": 11,
       "user_observations": [],
       "primer_candidates": []
     },
     "validation": {
-      "ok": true,
-      "result": {
-        "compartments": [
-          {
-            "sequence": 0,
-            "start_message_id": "msg-1",
-            "end_message_id": "msg-17",
-            "start_message": 1,
-            "end_message": 17,
-            "title": "alpha",
-            "content": "alpha full & exact",
-            "p1": "alpha full & exact",
-            "p2": "alpha short",
-            "p3": "alpha",
-            "p4": "",
-            "importance": 50,
-            "episode_type": "feature"
-          }
-        ],
-        "facts": [],
-        "events": [],
-        "primer_candidates": [],
-        "user_observations": [],
-        "unprocessed_from": 18,
-        "discarded_last": true
-      }
+      "ok": false,
+      "error": "Historian returned invalid compartment output: gap before present message 8 (expected 3)"
     }
   },
   {

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { validateHistorianOutput } from "./compartment-runner-validation";
 import {
     getProtectedTailStartOrdinal,
     getRawSessionMessageIdsThrough,
@@ -420,6 +421,33 @@ describe("readSessionChunk", () => {
             //#then
             expect(chunk.messageCount).toBe(1);
             expect(chunk.hasMore).toBe(false);
+        });
+
+        it("absorbs filtered noise into adjacent metadata without creating a validation gap", () => {
+            useTempDataHome("read-session-noise-boundary-");
+            createOpenCodeDbWithMessages("ses-noise-boundary", [
+                { id: "m-1", role: "user", part: { type: "text", text: "first arc" } },
+                {
+                    id: "m-2",
+                    role: "user",
+                    part: { type: "text", text: "## Magic Status", ignored: true },
+                },
+                { id: "m-3", role: "assistant", part: { type: "text", text: "" } },
+                { id: "m-4", role: "assistant", part: { type: "text", text: "second arc" } },
+            ]);
+
+            const chunk = readSessionChunk("ses-noise-boundary", 100_000, 1);
+            expect(chunk.lines.map((line) => line.ordinal)).toEqual([1, 2, 3, 4]);
+            expect(chunk.text).toContain("[2-4] A: second arc");
+
+            const result = validateHistorianOutput(
+                '<output><compartment start="1" end="1" title="first">First</compartment><compartment start="2" end="4" title="second">Second</compartment></output>',
+                "ses-noise-boundary",
+                chunk,
+                [],
+                0,
+            );
+            expect(result.ok).toBe(true);
         });
 
         it("reports hasMore false when the remaining eligible tail is only filtered noise", () => {

@@ -476,30 +476,29 @@ const cases: CaseSpec[] = [
         expect: "reject",
     },
     {
-        label: "tool-only gap heals beyond safety window",
+        label: "twenty-message tool-only gap heals",
         text: output(
             [
                 [1, 2, "alpha"],
-                [19, 20, "beta"],
+                [23, 24, "beta"],
             ],
-            21,
+            25,
         ),
-        chunk: chunk(1, 20, [{ start: 3, end: 18 }]),
+        chunk: chunk(1, 24, [{ start: 3, end: 22 }]),
         expect: "heal",
-        healed: { compartment_index: 0, end_message: 18 },
+        healed: { compartment_index: 0, end_message: 22 },
     },
     {
-        label: "small non-tool gap heals at safety boundary",
+        label: "five-message non-tool gap rejects",
         text: output(
             [
                 [1, 2, "alpha"],
-                [18, 20, "beta"],
+                [8, 10, "beta"],
             ],
-            21,
+            11,
         ),
-        chunk: chunk(1, 20),
-        expect: "heal",
-        healed: { compartment_index: 0, end_message: 17 },
+        chunk: chunk(1, 10),
+        expect: "reject",
     },
     {
         label: "wrong unprocessed_from rejects",
