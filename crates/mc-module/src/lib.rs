@@ -3341,13 +3341,9 @@ const MAX_SHORT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_QUERY_BYTES: usize = 1024;
 const MAX_MEMORY_IDS: usize = 100;
 const CTX_EXPAND_BYTE_BUDGET: usize = 15_000 * 4;
-const MEMORY_CATEGORIES: [&str; 5] = [
-    "ARCHITECTURE",
-    "CONSTRAINTS",
-    "DECISIONS",
-    "PREFERENCES",
-    "WORKFLOW",
-];
+/// Accepted write categories — the canonical V2 taxonomy, single-sourced from the
+/// renderer's category order so the facade and the render path never disagree.
+use crate::memory_render::MEMORY_CATEGORY_ORDER as MEMORY_CATEGORIES;
 
 fn validate_string_cap(
     args: &Map<String, Value>,
@@ -4469,7 +4465,7 @@ fn ctx_memory_schema() -> Value {
             },
             "category": {
                 "type": "string",
-                "description": "Memory category for a new memory, such as ARCHITECTURE, CONSTRAINTS, DECISIONS, PREFERENCES, or WORKFLOW. Required for write."
+                "description": "Memory category for a new memory: one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, or NAMING. Required for write."
             },
             "content": {
                 "type": "string",

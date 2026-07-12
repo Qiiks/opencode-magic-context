@@ -43,7 +43,9 @@ fn escape_xml_content(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-const MEMORY_CATEGORY_ORDER: [&str; 5] = [
+/// The five canonical V2 memory categories, in render order. This is the single
+/// source of truth for the accepted write categories (see crate::MEMORY_CATEGORIES).
+pub(crate) const MEMORY_CATEGORY_ORDER: [&str; 5] = [
     "PROJECT_RULES",
     "ARCHITECTURE",
     "CONSTRAINTS",
