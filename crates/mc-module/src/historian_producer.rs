@@ -988,6 +988,9 @@ fn unit_run_id(unit: &Value) -> Option<&str> {
 /// template/seed prose. Flat `text`/`content` fields are kept as a fallback for
 /// simpler unit shapes.
 fn unit_text(unit: &Value) -> Option<String> {
+    if !unit_type(unit).is_some_and(|ty| ty.eq_ignore_ascii_case("assistant_message")) {
+        return None;
+    }
     if let Some(blocks) = unit
         .get("message")
         .and_then(|m| m.get("content"))
@@ -1494,6 +1497,22 @@ mod tests {
             log.sends[0].get("system").is_none(),
             "empty system must be omitted, not sent as \"\""
         );
+    }
+
+    #[test]
+    fn unit_text_collects_only_assistant_message_units() {
+        let leaked = json!({
+            "type": "example_replay",
+            "message": {"content": [{"type": "text", "text": "seed output"}]},
+            "text": "flat seed output"
+        });
+        let assistant = json!({
+            "type": "assistant_message",
+            "message": {"content": [{"type": "text", "text": "real output"}]}
+        });
+
+        assert_eq!(unit_text(&leaked), None);
+        assert_eq!(unit_text(&assistant).as_deref(), Some("real output"));
     }
 
     #[tokio::test]
