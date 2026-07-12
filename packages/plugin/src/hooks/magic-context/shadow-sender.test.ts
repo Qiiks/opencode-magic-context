@@ -170,6 +170,9 @@ class FakeTransport implements ShadowTransport {
     rejectNextTransform = false;
     quarantinedResponsesRemaining = 0;
     resetFailuresRemaining = 0;
+    resetTimeoutAtCall = 0;
+    resetTimeoutError: Error | null = null;
+    resetCalls = 0;
     seq = 0;
     releaseReset: (() => void) | null = null;
     private resetGate: Promise<void> | null = null;
@@ -182,6 +185,12 @@ class FakeTransport implements ShadowTransport {
 
     async call(req: { method: string; body: unknown }): Promise<unknown> {
         this.calls.push({ method: req.method, body: req.body });
+        if (req.method === "shadow_reset") {
+            this.resetCalls += 1;
+            if (this.resetCalls === this.resetTimeoutAtCall) {
+                throw this.resetTimeoutError ?? new Error("read timeout");
+            }
+        }
         if (req.method === "shadow_reset" && this.resetGate) {
             await this.resetGate;
             this.resetGate = null;
@@ -771,6 +780,50 @@ describe("shadow sender", () => {
         } finally {
             unregister();
         }
+    });
+
+    it("classifies the inner read timeout and reopens the route without burning reseed allowance", async () => {
+        useTempDataHome("shadow-reseed-read-timeout-");
+        const sessionId = "s-reseed-read-timeout";
+        createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "one" }]);
+        const db = openDatabase();
+
+        const reader = new __shadowSenderTest.SocketReader(new FakeSocket() as unknown as Socket);
+        const readError = await reader.readExact(1, 5).catch((error: unknown) => error);
+        expect(readError).toEqual(expect.objectContaining({ code: "ETIMEDOUT" }));
+
+        const transport = new FakeTransport();
+        transport.resetTimeoutError = readError as Error;
+        transport.quarantinedResponsesRemaining = 2;
+        transport.resetTimeoutAtCall = 2;
+        const sender = createShadowSender({
+            transport,
+            reseedAttemptCap: 1,
+            reseedCooldownMs: 60_000,
+        });
+        const msg = message(sessionId, "m1", "one");
+        sender.enqueue(
+            basePass({ db, sessionId, inputMessages: [msg], outputMessages: [msg], nowMs: 1 }),
+        );
+        await waitFor(() => sender.getStats(sessionId).connection_skips === 1);
+
+        sender.enqueue(
+            basePass({ db, sessionId, inputMessages: [msg], outputMessages: [msg], nowMs: 2 }),
+        );
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 3,
+        );
+
+        const resetReasons = transport.calls
+            .filter((call) => call.method === "shadow_reset")
+            .map((call) => (call.body as { reason?: string }).reason);
+        expect(resetReasons).toEqual([
+            "cold_start",
+            "quarantine_reseed",
+            "route_reopen",
+            "quarantine_reseed",
+        ]);
+        expect(sender.getStats(sessionId).connection_skips).toBe(1);
     });
 
     it("performs at most one reset and reseed retry after quarantine", async () => {

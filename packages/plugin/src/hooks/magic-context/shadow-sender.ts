@@ -940,6 +940,12 @@ function errorCode(error: unknown): string | null {
     return null;
 }
 
+function timeoutError(message: string): Error & { code: string } {
+    const error = new Error(message) as Error & { code: string };
+    error.code = "ETIMEDOUT";
+    return error;
+}
+
 function isPeerReject(error: unknown): boolean {
     const code = errorCode(error);
     if (
@@ -1165,6 +1171,13 @@ export function createShadowSender(
                     state.counters.connection_skips += 1;
                     state.initialized = false;
                     state.requireResetReason = "route_reopen";
+                    if (state.reseedAwaitingSuccess) {
+                        // A transport failure did not establish a fresh lineage, so it
+                        // must not consume the reseed cooldown or attempt allowance.
+                        state.reseedAttempts = Math.max(0, state.reseedAttempts - 1);
+                        state.lastReseedAttemptMs = null;
+                        state.reseedAwaitingSuccess = false;
+                    }
                 }
                 sessionLog(sessionId, "shadow: send failed (ignored):", error);
             }
@@ -1687,11 +1700,11 @@ class SocketReader {
         while (this.buffered < length) {
             if (this.closed) throw new Error("connection closed");
             const remaining = deadline - Date.now();
-            if (remaining <= 0) throw new Error("read timeout");
+            if (remaining <= 0) throw timeoutError("read timeout");
             await new Promise<void>((resolve, reject) => {
                 const timer = setTimeout(() => {
                     this.waiters = this.waiters.filter((waiter) => waiter !== onReady);
-                    reject(new Error("read timeout"));
+                    reject(timeoutError("read timeout"));
                 }, remaining);
                 const onReady = () => {
                     clearTimeout(timer);
@@ -1808,7 +1821,7 @@ async function readTerminalFor(
     const deadline = Date.now() + timeoutMs;
     for (;;) {
         const remaining = deadline - Date.now();
-        if (remaining <= 0) throw new Error("subc request timeout");
+        if (remaining <= 0) throw timeoutError("subc request timeout");
         const frame = await readFrame(reader, remaining);
         if (frame.channel === channel && frame.corr === corr) return frame;
     }

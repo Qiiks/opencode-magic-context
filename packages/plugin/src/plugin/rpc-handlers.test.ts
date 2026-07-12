@@ -11,7 +11,11 @@ import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
 import { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
-import { buildSidebarSnapshot, buildStatusDetail } from "./rpc-handlers";
+import {
+    buildSidebarSnapshot,
+    buildSidebarSnapshotRpcResponse,
+    buildStatusDetail,
+} from "./rpc-handlers";
 import { resetSidebarSnapshotCache } from "./sidebar-snapshot-cache";
 
 function createTestDb(): Database {
@@ -24,6 +28,22 @@ function createTestDb(): Database {
 afterEach(() => {
     resetSidebarSnapshotCache();
     clearModelsDevCache();
+});
+
+describe("sidebar snapshot RPC failures", () => {
+    test("returns an error envelope when snapshot construction hits SQLITE_BUSY", () => {
+        const busyDb = {
+            prepare() {
+                const error = new Error("database is locked") as Error & { code?: string };
+                error.code = "SQLITE_BUSY";
+                throw error;
+            },
+        } as unknown as Database;
+
+        expect(buildSidebarSnapshotRpcResponse(busyDb, "ses_busy", process.cwd())).toEqual({
+            error: "sidebar snapshot unavailable",
+        });
+    });
 });
 
 describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {

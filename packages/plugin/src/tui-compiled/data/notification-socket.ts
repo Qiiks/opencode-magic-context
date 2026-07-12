@@ -60,6 +60,7 @@ const GLOBAL_CURSOR_KEY = "global";
 const SESSION_CURSOR_PREFIX = "session:";
 const MAX_DEDUPED_NOTIFICATION_IDS = 500;
 const LEGACY_INSTANCE_ID = "legacy";
+type NotificationProtocolMode = "legacy" | "v2";
 
 /**
  * Notification ids restart with every server instance. Epoch-prefixing cursor keys
@@ -67,9 +68,13 @@ const LEGACY_INSTANCE_ID = "legacy";
  * high watermark or remembered ids to the replacement's fresh queue.
  */
 let activeInstanceId: string | null = null;
+let notificationProtocolMode: NotificationProtocolMode | null = null;
+const bufferedNotifications: SocketNotification[] = [];
 const lastHandledIdByCursor = new Map<string, number>();
 const handledNotificationIds = new Set<string>();
 const handledNotificationIdOrder: string[] = [];
+const legacyUnconsumedIdsByCursor = new Map<string, Set<number>>();
+const legacyConsumedIdsByCursor = new Map<string, Set<number>>();
 /** Dialog actions share UI state, so notification handlers must never overlap. */
 let notificationHandlingChain: Promise<void> = Promise.resolve();
 
@@ -107,9 +112,13 @@ export function stopNotificationSocket(): void {
     helloedSession = null;
     reconnectAttempt = 0;
     activeInstanceId = null;
+    notificationProtocolMode = null;
+    bufferedNotifications.length = 0;
     lastHandledIdByCursor.clear();
     handledNotificationIds.clear();
     handledNotificationIdOrder.length = 0;
+    legacyUnconsumedIdsByCursor.clear();
+    legacyConsumedIdsByCursor.clear();
     notificationHandlingChain = Promise.resolve();
 }
 
@@ -163,6 +172,8 @@ async function connect(): Promise<void> {
     }
     connectGeneration = rpcGeneration;
     activeToken = endpoint.token;
+    notificationProtocolMode = null;
+    bufferedNotifications.length = 0;
     switchNotificationEpoch(endpoint.instanceId ?? LEGACY_INSTANCE_ID);
     socket = ws;
 
@@ -186,6 +197,8 @@ async function connect(): Promise<void> {
         socket = null;
         activeToken = null;
         helloedSession = null;
+        notificationProtocolMode = null;
+        bufferedNotifications.length = 0;
         scheduleReconnect();
     };
     ws.addEventListener("close", onDown);
@@ -223,24 +236,31 @@ function handleSocketMessage(ws: WebSocket, raw: string, token: string | null): 
         return;
     }
 
-    if (msg.type === "hello-ack" && typeof msg.instanceId === "string") {
-        if (msg.instanceId !== activeInstanceId) {
-            switchNotificationEpoch(msg.instanceId);
-            // The server does not prune protocol 2 backlog from hello cursors, so a
-            // corrected hello safely establishes fresh epoch-scoped state.
-            sendHello(ws, token);
+    if (msg.type === "hello-ack") {
+        if (typeof msg.instanceId === "string") {
+            notificationProtocolMode = "v2";
+            if (msg.instanceId !== activeInstanceId) {
+                switchNotificationEpoch(msg.instanceId);
+                // The server does not prune protocol 2 backlog from hello cursors, so a
+                // corrected hello safely establishes fresh epoch-scoped state.
+                sendHello(ws, token);
+            }
+        } else {
+            // A hello-ack without an instance id is the frozen v0.32 shape. Its
+            // server ignores exact-id acks, so cursors must remain gap-safe.
+            notificationProtocolMode = "legacy";
+            switchNotificationEpoch(LEGACY_INSTANCE_ID);
         }
+        flushBufferedNotifications(ws);
         return;
     }
 
     if (msg.type === "notification" && msg.notification) {
-        const notification = msg.notification;
-        const deliveryInstanceId = activeInstanceId ?? LEGACY_INSTANCE_ID;
-        // A single promise chain prevents two dialog actions from replacing each
-        // other's UI while either handler is still awaiting user input.
-        notificationHandlingChain = notificationHandlingChain
-            .then(() => handleNotification(ws, notification, deliveryInstanceId))
-            .catch(() => {});
+        if (notificationProtocolMode === null) {
+            bufferedNotifications.push(msg.notification);
+        } else {
+            queueNotification(ws, msg.notification);
+        }
         return;
     }
 
@@ -255,15 +275,33 @@ function handleSocketMessage(ws: WebSocket, raw: string, token: string | null): 
     }
 }
 
+function flushBufferedNotifications(ws: WebSocket): void {
+    const pending = bufferedNotifications.splice(0);
+    for (const notification of pending) queueNotification(ws, notification);
+}
+
+function queueNotification(ws: WebSocket, notification: SocketNotification): void {
+    const deliveryInstanceId = activeInstanceId ?? LEGACY_INSTANCE_ID;
+    const deliveryMode = notificationProtocolMode;
+    if (deliveryMode === null) return;
+    // A single promise chain prevents two dialog actions from replacing each
+    // other's UI while either handler is still awaiting user input.
+    notificationHandlingChain = notificationHandlingChain
+        .then(() => handleNotification(ws, notification, deliveryInstanceId, deliveryMode))
+        .catch(() => {});
+}
+
 async function handleNotification(
     ws: WebSocket,
     notification: SocketNotification,
     deliveryInstanceId: string,
+    deliveryMode: NotificationProtocolMode,
 ): Promise<void> {
     if (
         socket !== ws ||
         getRpcGeneration() !== connectGeneration ||
-        activeInstanceId !== deliveryInstanceId
+        activeInstanceId !== deliveryInstanceId ||
+        notificationProtocolMode !== deliveryMode
     ) {
         return;
     }
@@ -272,8 +310,10 @@ async function handleNotification(
     const active = opts?.getSessionId() ?? null;
     if (notification.sessionId !== undefined && notification.sessionId !== active) return;
 
+    if (deliveryMode === "legacy") markLegacyUnconsumed(notification);
     if (handledNotificationIds.has(notificationDedupKey(notification.id, deliveryInstanceId))) {
-        sendAck(ws, notification.id);
+        if (deliveryMode === "legacy") markLegacyConsumed(notification);
+        sendAck(ws, notification, deliveryMode);
         return;
     }
 
@@ -288,14 +328,19 @@ async function handleNotification(
     if (
         socket !== ws ||
         getRpcGeneration() !== connectGeneration ||
-        activeInstanceId !== deliveryInstanceId
+        activeInstanceId !== deliveryInstanceId ||
+        notificationProtocolMode !== deliveryMode
     ) {
         return;
     }
     if (consumed) {
         rememberHandledId(notification.id, deliveryInstanceId);
-        advanceCursor(notificationCursorKey(notification), notification.id);
-        sendAck(ws, notification.id);
+        if (deliveryMode === "legacy") {
+            markLegacyConsumed(notification);
+        } else {
+            advanceCursor(notificationCursorKey(notification), notification.id);
+        }
+        sendAck(ws, notification, deliveryMode);
     }
 }
 
@@ -314,6 +359,38 @@ function cursorForKey(key: string): number {
 
 function advanceCursor(key: string, id: number): void {
     if (id > cursorForKey(key)) lastHandledIdByCursor.set(key, id);
+}
+
+function idsForCursor(map: Map<string, Set<number>>, key: string): Set<number> {
+    let ids = map.get(key);
+    if (!ids) {
+        ids = new Set<number>();
+        map.set(key, ids);
+    }
+    return ids;
+}
+
+function markLegacyUnconsumed(notification: SocketNotification): void {
+    const key = notificationCursorKey(notification);
+    if (idsForCursor(legacyConsumedIdsByCursor, key).has(notification.id)) return;
+    idsForCursor(legacyUnconsumedIdsByCursor, key).add(notification.id);
+}
+
+function markLegacyConsumed(notification: SocketNotification): void {
+    const key = notificationCursorKey(notification);
+    idsForCursor(legacyUnconsumedIdsByCursor, key).delete(notification.id);
+    const consumedIds = idsForCursor(legacyConsumedIdsByCursor, key);
+    consumedIds.add(notification.id);
+
+    let safeCursor = Math.max(cursorForKey(key), ...consumedIds);
+    const unconsumedIds = legacyUnconsumedIdsByCursor.get(key);
+    if (unconsumedIds && unconsumedIds.size > 0) {
+        safeCursor = Math.min(safeCursor, Math.min(...unconsumedIds) - 1);
+    }
+    advanceCursor(key, safeCursor);
+    for (const id of consumedIds) {
+        if (id <= cursorForKey(key)) consumedIds.delete(id);
+    }
 }
 
 function notificationDedupKey(
@@ -340,13 +417,32 @@ function switchNotificationEpoch(instanceId: string): void {
     lastHandledIdByCursor.clear();
     handledNotificationIds.clear();
     handledNotificationIdOrder.length = 0;
+    legacyUnconsumedIdsByCursor.clear();
+    legacyConsumedIdsByCursor.clear();
 }
 
-function sendAck(ws: WebSocket, id: number): void {
+function sendAck(
+    ws: WebSocket,
+    notification: SocketNotification,
+    mode: NotificationProtocolMode,
+): void {
     try {
+        if (mode === "legacy") {
+            const cursor = cursorForKey(notificationCursorKey(notification));
+            ws.send(
+                JSON.stringify({
+                    type: "ack",
+                    cursor,
+                    ...(notification.sessionId
+                        ? { sessionId: notification.sessionId }
+                        : { ackScope: "global" }),
+                }),
+            );
+            return;
+        }
         // Exact ids avoid deleting an earlier notification whose handler failed
         // while a later notification was consumed successfully.
-        ws.send(JSON.stringify({ type: "ack", ids: [id] }));
+        ws.send(JSON.stringify({ type: "ack", ids: [notification.id] }));
     } catch {
         // Best-effort: an unacknowledged row is safely deduplicated and re-acked
         // when the server delivers it again after reconnecting.

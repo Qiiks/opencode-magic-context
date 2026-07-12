@@ -181,7 +181,13 @@ export class MagicContextRpcClient {
             if (!response.ok) return false;
             const body = (await response.json()) as { pid?: unknown; instance_id?: unknown };
             if (body.pid !== record.pid) return false;
-            return record.instance_id === undefined || body.instance_id === record.instance_id;
+            // v0.32 health responses predate instance ids. A missing id is the
+            // one-release discovery bridge; an id that is present must still match.
+            return (
+                body.instance_id === undefined ||
+                record.instance_id === undefined ||
+                body.instance_id === record.instance_id
+            );
         } catch {
             return false;
         }
