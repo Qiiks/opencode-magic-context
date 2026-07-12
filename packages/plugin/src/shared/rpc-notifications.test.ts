@@ -70,10 +70,25 @@ describe("rpc notifications", () => {
         expect(isTuiConnected()).toBe(false);
     });
 
-    test("a session-less sink counts as connected for any session query", () => {
+    test("a modern session-less sink is global-only", () => {
+        const received: string[] = [];
+        const unregister = registerNotificationSink({
+            sessionId: undefined,
+            protocol: 2,
+            send: (notification) => received.push(notification.type),
+        });
+        expect(isTuiConnected("ses_whatever")).toBe(false);
+        expect(isTuiConnected()).toBe(true);
+
+        pushNotification("scoped", { ok: true }, "ses_whatever");
+        pushNotification("global", { ok: true });
+        expect(received).toEqual(["global"]);
+        unregister();
+    });
+
+    test("a legacy session-less sink retains broad compatibility", () => {
         const unregister = registerNotificationSink({ sessionId: undefined, send: () => {} });
         expect(isTuiConnected("ses_whatever")).toBe(true);
-        expect(isTuiConnected()).toBe(true);
         unregister();
     });
 
@@ -117,14 +132,20 @@ describe("rpc notifications", () => {
 
     test("queue-cap eviction is session-fair: a noisy session cannot evict another session's newest unseen item", () => {
         drainNotifications(Number.MAX_SAFE_INTEGER);
-        // One quiet session with a single pending dialog.
         pushNotification("quiet-dialog", { action: "show-upgrade-dialog" }, "ses_quiet");
-        // A noisy session floods well past the 100 cap.
         for (let i = 0; i < 200; i += 1) {
             pushNotification("noise", { i }, "ses_noisy");
         }
-        // The quiet session's newest item must survive the eviction.
         const quietPoll = drainNotifications(0, "ses_quiet");
         expect(quietPoll.some((m) => m.type === "quiet-dialog")).toBe(true);
+        expect(drainNotifications(0)).toHaveLength(100);
+    });
+
+    test("queue cap remains global across more than one hundred sessions", () => {
+        drainNotifications(Number.MAX_SAFE_INTEGER);
+        for (let i = 0; i < 250; i += 1) {
+            pushNotification("one-per-session", { i }, `ses_${i}`);
+        }
+        expect(drainNotifications(0)).toHaveLength(100);
     });
 });

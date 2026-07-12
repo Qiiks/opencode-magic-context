@@ -48,9 +48,13 @@ let reconnectAttempt = 0;
 let closed = false;
 let helloedSession: string | null = null;
 let opts: NotificationSocketOptions | null = null;
-/** Generation of the rpc client at connect time; a dispose/reinit bumps it and
- *  invalidates an in-flight socket so its late callbacks are ignored. */
+let activeToken: string | null = null;
+/** Generation of the rpc client used by the active socket. */
 let connectGeneration = 0;
+/** Exactly one endpoint lookup may be active. A monotonically increasing id lets
+ * stop/restart invalidate a late lookup before it can publish a socket. */
+let nextAttemptId = 0;
+let inFlightAttemptId: number | null = null;
 
 const GLOBAL_CURSOR_KEY = "global";
 const SESSION_CURSOR_PREFIX = "session:";
@@ -69,21 +73,21 @@ const handledNotificationIdOrder: string[] = [];
 /** Dialog actions share UI state, so notification handlers must never overlap. */
 let notificationHandlingChain: Promise<void> = Promise.resolve();
 
-/** Open the persistent notification socket. Idempotent: a second call while open
- *  is a no-op. Reconnects on its own after any drop. */
+/** Open the persistent notification socket. Reconnects on its own after a drop. */
 export function startNotificationSocket(options: NotificationSocketOptions): void {
     opts = options;
     closed = false;
-    connectGeneration = getRpcGeneration();
-    connect();
+    if (!socket && inFlightAttemptId === null) void connect();
     if (!sessionWatchTimer) {
         sessionWatchTimer = setInterval(watchSession, SESSION_WATCH_MS);
     }
 }
 
-/** Close the socket and stop reconnecting. Call on TUI dispose. */
+/** Close the socket and release all state owned by this TUI initialization. */
 export function stopNotificationSocket(): void {
     closed = true;
+    nextAttemptId += 1;
+    inFlightAttemptId = null;
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = undefined;
@@ -98,8 +102,15 @@ export function stopNotificationSocket(): void {
         // best-effort
     }
     socket = null;
+    opts = null;
+    activeToken = null;
     helloedSession = null;
     reconnectAttempt = 0;
+    activeInstanceId = null;
+    lastHandledIdByCursor.clear();
+    handledNotificationIds.clear();
+    handledNotificationIdOrder.length = 0;
+    notificationHandlingChain = Promise.resolve();
 }
 
 function scheduleReconnect(): void {
@@ -114,17 +125,22 @@ function scheduleReconnect(): void {
 }
 
 async function connect(): Promise<void> {
-    if (closed) return;
-    if (socket) return; // already connected/connecting
+    if (closed || socket || inFlightAttemptId !== null) return;
 
     const client = getRpcClient();
     if (!client) {
         scheduleReconnect();
         return;
     }
+
+    const attemptId = ++nextAttemptId;
+    const rpcGeneration = getRpcGeneration();
+    inFlightAttemptId = attemptId;
     const endpoint = await client.resolveEndpoint();
-    // The generation may have bumped (dispose/reinit) while resolving — abandon.
-    if (closed || getRpcGeneration() !== connectGeneration) return;
+    if (closed || inFlightAttemptId !== attemptId || getRpcGeneration() !== rpcGeneration) {
+        return;
+    }
+    inFlightAttemptId = null;
     if (!endpoint) {
         scheduleReconnect();
         return;
@@ -132,18 +148,29 @@ async function connect(): Promise<void> {
 
     let ws: WebSocket;
     try {
-        const tokenQuery = `?token=${encodeURIComponent(endpoint.token ?? "")}`;
-        ws = new WebSocket(`ws://127.0.0.1:${endpoint.port}/ws${tokenQuery}`);
+        ws = new WebSocket(`ws://127.0.0.1:${endpoint.port}/ws`, {
+            headers: endpoint.token ? { Authorization: `Bearer ${endpoint.token}` } : {},
+        });
     } catch {
         client.reset();
         scheduleReconnect();
         return;
     }
+
+    if (closed || getRpcGeneration() !== rpcGeneration || socket) {
+        ws.close();
+        return;
+    }
+    connectGeneration = rpcGeneration;
+    activeToken = endpoint.token;
     switchNotificationEpoch(endpoint.instanceId ?? LEGACY_INSTANCE_ID);
     socket = ws;
 
     ws.addEventListener("open", () => {
-        if (socket !== ws) return;
+        if (socket !== ws || getRpcGeneration() !== connectGeneration) {
+            ws.close();
+            return;
+        }
         reconnectAttempt = 0;
         sendHello(ws, endpoint.token);
     });
@@ -154,11 +181,11 @@ async function connect(): Promise<void> {
     });
 
     const onDown = () => {
+        if (socket !== ws) return;
         client.reset();
-        if (socket === ws) {
-            socket = null;
-            helloedSession = null;
-        }
+        socket = null;
+        activeToken = null;
+        helloedSession = null;
         scheduleReconnect();
     };
     ws.addEventListener("close", onDown);
@@ -243,7 +270,7 @@ async function handleNotification(
     // Client-side session filtering follows session switches that happen between
     // queueing and delivery. Global notifications always apply.
     const active = opts?.getSessionId() ?? null;
-    if (notification.sessionId && active && notification.sessionId !== active) return;
+    if (notification.sessionId !== undefined && notification.sessionId !== active) return;
 
     if (handledNotificationIds.has(notificationDedupKey(notification.id, deliveryInstanceId))) {
         sendAck(ws, notification.id);
@@ -328,12 +355,6 @@ function sendAck(ws: WebSocket, id: number): void {
 
 export function _resetNotificationSocketStateForTesting(): void {
     stopNotificationSocket();
-    opts = null;
-    lastHandledIdByCursor.clear();
-    handledNotificationIds.clear();
-    handledNotificationIdOrder.length = 0;
-    activeInstanceId = null;
-    notificationHandlingChain = Promise.resolve();
 }
 
 /** Cheap session-change watcher: re-scope the socket only when the active session
@@ -342,10 +363,7 @@ function watchSession(): void {
     if (closed || !socket || socket.readyState !== WebSocket.OPEN) return;
     const current = opts?.getSessionId() ?? null;
     if (current === helloedSession) return;
-    // Re-hello with the new session; the server replaces this socket's sink scope.
-    const client = getRpcClient();
-    void client?.resolveEndpoint().then((endpoint) => {
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        sendHello(socket, endpoint?.token ?? null);
-    });
+    // Re-hello with the token authenticated by this socket; no rediscovery or
+    // network request is needed for a local route change.
+    sendHello(socket, activeToken);
 }

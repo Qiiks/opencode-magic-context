@@ -58,8 +58,8 @@ function bearerToken(req: Request): string {
     return typeof auth === "string" ? auth.replace(/^Bearer\s+/i, "") : "";
 }
 
-function websocketToken(req: Request, url: URL): string {
-    return bearerToken(req) || url.searchParams.get("token") || "";
+function websocketToken(req: Request): string {
+    return bearerToken(req);
 }
 
 /**
@@ -243,7 +243,7 @@ export class MagicContextRpcServer {
         // WebSocket upgrade — the persistent push channel. Authenticate before
         // `srv.upgrade` so an unauthorized request never becomes a live socket.
         if (url.pathname === "/ws") {
-            if (!tokensMatch(websocketToken(req, url), this.token)) {
+            if (!tokensMatch(websocketToken(req), this.token)) {
                 return new Response("Unauthorized", { status: 401 });
             }
             const ok = srv.upgrade(req, { data: { authed: false } });
@@ -254,7 +254,7 @@ export class MagicContextRpcServer {
         // No wildcard CORS: the only legitimate client is the in-process TUI
         // client, not a browser origin.
         if (req.method === "GET" && url.pathname === "/health") {
-            return json({ ok: true, pid: process.pid });
+            return json({ ok: true, pid: process.pid, instance_id: this.instanceId });
         }
 
         if (req.method !== "POST" || !url.pathname.startsWith("/rpc/")) {
@@ -341,6 +341,7 @@ export class MagicContextRpcServer {
             // Register a live sink so future pushes reach this socket immediately.
             const sink: NotificationSink = {
                 sessionId: ws.data.sessionId,
+                protocol: msg.protocol,
                 send: (notification) => {
                     ws.send(JSON.stringify({ type: "notification", notification }));
                 },

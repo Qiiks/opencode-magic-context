@@ -57,10 +57,23 @@ function writePortFileForPid(
     port: number,
     pid: number,
     startedAt: number,
-): void {
-    const portFile = rpcPortFilePath(storageDir, directory, pid);
+    instanceId?: string,
+    token?: string,
+): string {
+    const portFile = rpcPortFilePath(storageDir, directory, pid, instanceId);
     mkdirSync(dirname(portFile), { recursive: true });
-    writeFileSync(portFile, JSON.stringify({ port, pid, started_at: startedAt }), "utf-8");
+    writeFileSync(
+        portFile,
+        JSON.stringify({
+            port,
+            pid,
+            started_at: startedAt,
+            instance_id: instanceId,
+            token,
+        }),
+        "utf-8",
+    );
+    return portFile;
 }
 
 function readNewestPortRecord(storageDir: string, directory: string): RpcPortFileRecord | null {
@@ -86,7 +99,9 @@ async function waitFor(condition: () => boolean, label: string, timeoutMs = 2_00
 }
 
 async function openSocket(port: number, token: string): Promise<WebSocket> {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, {
+        headers: { Authorization: `Bearer ${token}` },
+    });
     await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("socket open timed out")), 2_000);
         ws.addEventListener(
@@ -135,11 +150,14 @@ function waitForJsonMessage<T extends { type?: string }>(
     });
 }
 
-async function startRpcServer(handler: (method: string) => Response | object): Promise<TestServer> {
+async function startRpcServer(
+    handler: (method: string) => Response | object,
+    health: { pid: number; instanceId?: string } = { pid: process.pid },
+): Promise<TestServer> {
     const server = createServer(async (req, res) => {
         if (req.method === "GET" && req.url === "/health") {
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ok: true }));
+            res.end(JSON.stringify({ ok: true, pid: health.pid, instance_id: health.instanceId }));
             return;
         }
 
@@ -421,5 +439,87 @@ describe("MagicContextRpcClient", () => {
 
         const client = new MagicContextRpcClient(storageDir, directory);
         expect(await client.call<{ value: string }>("value")).toEqual({ value: "live" });
+    });
+
+    test("prefers this process and validates every discovery candidate identity", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-affinity";
+        const foreign = await startRpcServer(() => ({ value: "foreign" }), {
+            pid: process.ppid,
+            instanceId: "foreign",
+        });
+        const unrelated = await startRpcServer(() => ({ value: "unrelated" }), {
+            pid: process.pid,
+            instanceId: "different-service",
+        });
+        const local = await startRpcServer(() => ({ value: "local" }), {
+            pid: process.pid,
+            instanceId: "local-healthy",
+        });
+
+        writePortFileForPid(
+            storageDir,
+            directory,
+            foreign.port,
+            process.ppid,
+            Date.now() + 20_000,
+            "foreign",
+        );
+        writePortFileForPid(
+            storageDir,
+            directory,
+            unrelated.port,
+            process.pid,
+            Date.now() + 10_000,
+            "local-stale",
+        );
+        writePortFileForPid(
+            storageDir,
+            directory,
+            local.port,
+            process.pid,
+            Date.now(),
+            "local-healthy",
+        );
+
+        const client = new MagicContextRpcClient(storageDir, directory);
+        expect(await client.call<{ value: string }>("value")).toEqual({ value: "local" });
+    });
+
+    test("resets discovery after a 401 response", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-reauth";
+        let unauthorizedRecord = "";
+        const unauthorized = await startRpcServer(
+            () => {
+                rmSync(unauthorizedRecord, { force: true });
+                return new Response("stale token", { status: 401 });
+            },
+            { pid: process.pid, instanceId: "unauthorized" },
+        );
+        const healthy = await startRpcServer(() => ({ value: "healthy" }), {
+            pid: process.pid,
+            instanceId: "healthy",
+        });
+        unauthorizedRecord = writePortFileForPid(
+            storageDir,
+            directory,
+            unauthorized.port,
+            process.pid,
+            Date.now() + 10_000,
+            "unauthorized",
+            "stale",
+        );
+        writePortFileForPid(
+            storageDir,
+            directory,
+            healthy.port,
+            process.pid,
+            Date.now(),
+            "healthy",
+        );
+
+        const client = new MagicContextRpcClient(storageDir, directory);
+        expect(await client.call<{ value: string }>("value")).toEqual({ value: "healthy" });
     });
 });
