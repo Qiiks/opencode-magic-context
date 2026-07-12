@@ -1182,6 +1182,47 @@ mod tests {
     }
 
     #[test]
+    fn filtered_noise_adjacent_to_boundary_does_not_create_validation_gap() {
+        let messages = vec![
+            msg("u1", 1, "user", vec![text("first arc")]),
+            msg(
+                "noise2",
+                2,
+                "user",
+                vec![text("<!-- OMO_INTERNAL_INITIATOR -->")],
+            ),
+            msg("empty3", 3, "assistant", vec![]),
+            msg("a4", 4, "assistant", vec![text("second arc")]),
+        ];
+        let built = project_and_build(&messages, 1, 1_000, 5);
+        assert_eq!(
+            built
+                .chunk
+                .lines
+                .iter()
+                .map(|line| line.ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(built.text.contains("[2-4] A: second arc"));
+
+        let output = r#"<output><compartments>
+<compartment start="1" end="1" title="first" episode_type="feature" importance="50"><p1>first</p1><p2>first</p2><p3>first</p3><p4 /></compartment>
+<compartment start="2" end="4" title="second" episode_type="feature" importance="50"><p1>second</p1><p2>second</p2><p3>second</p3><p4 /></compartment>
+</compartments><meta><unprocessed_from>5</unprocessed_from></meta></output>"#;
+        crate::historian_validate::validate_historian_output(
+            output,
+            &built.chunk,
+            &[],
+            ValidateOptions {
+                in_emergency: true,
+                ..ValidateOptions::default()
+            },
+        )
+        .expect("filtered ordinals ride adjacent metadata and cannot open a gap");
+    }
+
+    #[test]
     fn duplicate_tool_call_ids_resolve_results_by_arc_id() {
         let messages = vec![
             msg(

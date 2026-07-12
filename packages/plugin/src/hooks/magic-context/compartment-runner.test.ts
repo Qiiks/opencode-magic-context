@@ -420,22 +420,24 @@ describe("executeContextRecomp", () => {
             directory: "/tmp",
         });
 
-        // Gap healing absorbs the 1-message gap (1→3), so the first attempt succeeds
-        // without a repair retry. Both compartments are kept with the gap healed.
-        expect(result).toContain("Rebuilt 2 compartments across 1 historian pass");
-        // Exactly one HISTORIAN output fetch (directory-scoped). The completion
-        // notice also reads messages (prompt-context model-pinning, no directory)
-        // — counted separately so this assertion stays about historian passes.
-        expect(historianFetches).toBe(1);
-        expect(getHistorianPromptCount(prompt)).toBe(1);
+        // The narrative gap rejects, and the repair attempt covers the same raw chunk.
+        expect(result).toContain("Rebuilt 1 compartment across 1 historian pass");
+        expect(historianFetches).toBe(2);
+        expect(getHistorianPromptCount(prompt)).toBe(2);
         expect(getIgnoredNotificationTexts(prompt)).toEqual(
             expect.arrayContaining([
                 "## Magic Recomp\n\nHistorian pass 1, attempt 1 started for messages 1-4.",
+                expect.stringContaining(
+                    "Historian pass 1, attempt 1 is continuing with a repair retry for messages 1-4.",
+                ),
             ]),
         );
         expect(getCompartments(db, "ses-recomp-retry")).toEqual([
-            expect.objectContaining({ startMessage: 1, endMessage: 2, title: "Part one" }),
-            expect.objectContaining({ startMessage: 3, endMessage: 4, title: "Part two" }),
+            expect.objectContaining({
+                startMessage: 1,
+                endMessage: 4,
+                title: "Recovered history",
+            }),
         ]);
     });
 
@@ -670,8 +672,8 @@ describe("executeContextRecomp", () => {
             directory: "/tmp",
         });
 
-        // Gap healing absorbs the 1-message gap, so the first attempt succeeds
-        // without a repair retry or chunk shrinking.
+        // Both full-size attempts omit narrative ordinal 2, so recomp must shrink
+        // the chunk rather than absorbing the gap.
         expect(result).toContain("## Magic Recomp");
         expect(result).toContain("Covered raw history 1-6");
         expect(getIgnoredNotificationTexts(prompt)).toEqual(
@@ -680,8 +682,8 @@ describe("executeContextRecomp", () => {
             ]),
         );
         expect(getCompartments(db, "ses-recomp-smaller")).toEqual([
-            expect.objectContaining({ startMessage: 1, endMessage: 2 }),
-            expect.objectContaining({ startMessage: 3, endMessage: 6 }),
+            expect.objectContaining({ startMessage: 1, endMessage: 3 }),
+            expect.objectContaining({ startMessage: 4, endMessage: 6 }),
         ]);
     });
 
@@ -860,13 +862,13 @@ describe("executeContextRecomp", () => {
             directory: "/tmp",
         });
 
-        // Gap healing absorbs the 1-message gap, so the first attempt succeeds
-        // without a repair retry. Second pass covers remaining messages.
+        // Invalid full-size attempts force a smaller chunk; a successful smaller
+        // pass must not permanently reduce the budget for the following pass.
         expect(result).toContain("Covered raw history 1-7");
         expect(getIgnoredNotificationTexts(prompt)).toEqual(
             expect.arrayContaining([
                 "## Magic Recomp\n\nHistorian pass 1, attempt 1 started for messages 1-6.",
-                "## Magic Recomp\n\nHistorian pass 2, attempt 1 started for messages 7-7.",
+                "## Magic Recomp\n\nHistorian pass 2, attempt 1 started for messages 5-7.",
             ]),
         );
     });
@@ -2104,6 +2106,93 @@ describe("runCompartmentAgent", () => {
         expect(notice).toContain("magic-context.jsonc");
         // The escalated notice surfaces the real error for diagnosis.
         expect(notice).toContain("historian model unavailable");
+    });
+
+    it("re-reads narrative-gap ordinals after validation rejection", async () => {
+        useTempDataHome("compartment-runner-gap-reread-");
+        const sessionId = "ses-gap-reread";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "narrative 1" },
+            { id: "m-2", role: "assistant", text: "narrative 2" },
+            { id: "m-3", role: "user", text: "narrative 3" },
+            { id: "m-4", role: "assistant", text: "narrative 4" },
+            { id: "m-5", role: "user", text: "narrative 5" },
+            { id: "m-6", role: "assistant", text: "narrative 6" },
+            { id: "m-7", role: "assistant", text: "narrative 7" },
+            { id: "m-8", role: "user", text: "protected 1" },
+            { id: "m-9", role: "user", text: "protected 2" },
+            { id: "m-10", role: "user", text: "protected 3" },
+            { id: "m-11", role: "user", text: "protected 4" },
+            { id: "m-12", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        const prompt = mock(async () => ({}));
+        let historianFetches = 0;
+        const messages = mock(async (input: { query?: { directory?: string } }) => {
+            if (!input.query?.directory) return { data: [] };
+            historianFetches += 1;
+            const text =
+                historianFetches <= 2
+                    ? '<output><compartment start="1" end="1" title="first">First</compartment><compartment start="7" end="7" title="second">Second</compartment></output>'
+                    : '<output><compartment start="1" end="7" title="re-read">All narrative preserved</compartment></output>';
+            return {
+                data: [
+                    {
+                        info: { role: "assistant", time: { created: historianFetches } },
+                        parts: [{ type: "text", text }],
+                    },
+                ],
+            };
+        });
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/gap-reread" } })),
+                create: mock(async () => ({ data: { id: `ses-agent-${historianFetches}` } })),
+                prompt,
+                messages,
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+            forceDrainQuota: true,
+        });
+
+        expect(historianFetches).toBe(2);
+        expect(getCompartments(db, sessionId)).toHaveLength(0);
+        expect(loadProtectedTailMeta(db, sessionId).priorBoundaryOrdinal).toBe(1);
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+            forceDrainQuota: true,
+        });
+
+        const historianPrompts = prompt.mock.calls
+            .map(
+                (call) =>
+                    call[0] as {
+                        body?: { noReply?: boolean; parts?: Array<{ text?: string }> };
+                    },
+            )
+            .filter((input) => input.body?.noReply !== true)
+            .map((input) => input.body?.parts?.[0]?.text ?? "");
+        expect(historianFetches).toBe(3);
+        expect(historianPrompts[2]).toContain("Messages 1-7");
+        expect(historianPrompts[2]).toContain("narrative 2");
+        expect(historianPrompts[2]).toContain("narrative 6");
+        expect(getCompartments(db, sessionId)).toEqual([
+            expect.objectContaining({ startMessage: 1, endMessage: 7, title: "re-read" }),
+        ]);
+        expect(loadProtectedTailMeta(db, sessionId).priorBoundaryOrdinal).toBe(8);
     });
 
     // Regression: production livelock (ses_157f877e2ffepme9doYf3RTnRx). In an

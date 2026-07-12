@@ -44,18 +44,9 @@ describe("buildHistorianRepairPrompt", () => {
 });
 
 /**
- * Regression tests for the "gap before message X (expected Y)" failure mode
- * caused by historian skipping tool-only blocks.
- *
- * Root cause: `read-session-chunk.ts` compacts consecutive tool-only assistant turns
- * into one visible block (e.g., `[12223-12238] A: TC: bash / TC: read / ...`).
- * Historian often classifies such blocks as pure noise and skips them entirely,
- * creating a gap between compartments. The old heal window of 15 messages was
- * undersized — real debug/build-test tool chains commonly span 16–30+ messages.
- *
- * Fix: chunk exposes `toolOnlyRanges` and validator heals gaps of any size that
- * fall fully within one of those ranges. Gaps outside tool-only ranges still heal
- * only up to the 15-message safety net.
+ * Gap healing is intentionally proof-based: only a range classified as tool-only by
+ * the chunk reader can be absorbed. An unclassified gap may contain narrative and must
+ * reject so the runner can re-read it without advancing the durable boundary.
  */
 
 /** Build a minimal valid historian XML output from compartment specs. */
@@ -93,20 +84,17 @@ function buildChunk(
 
 describe("healCompartmentGaps via validateHistorianOutput", () => {
     describe("tool-only gap healing (any size)", () => {
-        test("heals 16-message tool-only gap (the original bug — one over old 15-msg limit)", () => {
-            // Historian skipped messages 12223-12238 because they were all tool calls.
-            // Chunk marks that range as tool-only. Heal should absorb it even though > 15.
+        test("heals a 20-message tool-only gap", () => {
             const xml = buildXml([
-                { start: 11323, end: 12222, title: "work A" },
-                { start: 12239, end: 12498, title: "work B" },
+                { start: 1, end: 10, title: "work A" },
+                { start: 31, end: 40, title: "work B" },
             ]);
-            const chunk = buildChunk(11323, 12498, [{ start: 12223, end: 12238 }]);
+            const chunk = buildChunk(1, 40, [{ start: 11, end: 30 }]);
             const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
             expect(result.ok).toBe(true);
             if (result.ok) {
-                // Previous compartment extended to absorb the gap
-                expect(result.compartments[0].endMessage).toBe(12238);
-                expect(result.compartments[1].startMessage).toBe(12239);
+                expect(result.compartments[0].endMessage).toBe(30);
+                expect(result.compartments[1].startMessage).toBe(31);
             }
         });
 
@@ -137,14 +125,13 @@ describe("healCompartmentGaps via validateHistorianOutput", () => {
         });
     });
 
-    describe("non-tool-only gaps still fail when larger than safety net", () => {
-        test("rejects 16-msg narrative gap (historian dropped real content)", () => {
-            // No tool-only range covers the gap — historian skipped user/assistant text.
+    describe("non-tool-only gaps reject at every size", () => {
+        test("rejects a 5-message narrative gap", () => {
             const xml = buildXml([
-                { start: 1, end: 100, title: "work A" },
-                { start: 117, end: 200, title: "work B" },
+                { start: 1, end: 10, title: "work A" },
+                { start: 16, end: 20, title: "work B" },
             ]);
-            const chunk = buildChunk(1, 200, []);
+            const chunk = buildChunk(1, 20, []);
             const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
             expect(result.ok).toBe(false);
             if (!result.ok) {
@@ -152,9 +139,8 @@ describe("healCompartmentGaps via validateHistorianOutput", () => {
             }
         });
 
-        test("rejects 16-msg gap partially covered by tool-only range", () => {
-            // Gap spans 101-116 (16 msgs); tool-only covers only 101-108. Partial overlap means
-            // real narrative content (109-116) was dropped too.
+        test("rejects a gap only partially covered by a tool-only range", () => {
+            // Partial overlap cannot prove that the remaining messages are safe to absorb.
             const xml = buildXml([
                 { start: 1, end: 100, title: "work A" },
                 { start: 117, end: 200, title: "work B" },
@@ -175,31 +161,6 @@ describe("healCompartmentGaps via validateHistorianOutput", () => {
             const chunk = buildChunk(1, 200, []);
             const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
             expect(result.ok).toBe(false);
-        });
-    });
-
-    describe("safety net still heals small non-tool-only gaps", () => {
-        test("heals 5-msg gap outside any tool-only range (boundary noise)", () => {
-            const xml = buildXml([
-                { start: 1, end: 100, title: "work A" },
-                { start: 106, end: 200, title: "work B" },
-            ]);
-            const chunk = buildChunk(1, 200, []);
-            const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
-            expect(result.ok).toBe(true);
-            if (result.ok) {
-                expect(result.compartments[0].endMessage).toBe(105);
-            }
-        });
-
-        test("heals exactly 15-msg gap outside any tool-only range (safety net boundary)", () => {
-            const xml = buildXml([
-                { start: 1, end: 100, title: "work A" },
-                { start: 116, end: 200, title: "work B" },
-            ]);
-            const chunk = buildChunk(1, 200, []);
-            const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
-            expect(result.ok).toBe(true);
         });
     });
 

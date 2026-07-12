@@ -14,7 +14,6 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-const SAFETY_HEAL_GAP: u64 = 15;
 const BOUNDARY_HEALING_SLACK: u64 = 2;
 
 /// A raw ordinal range, inclusive on both ends.
@@ -813,7 +812,10 @@ fn heal_compartment_gaps(
                 .iter()
                 .any(|range| range.start <= *ordinal && range.end >= *ordinal)
         });
-        if fully_inside_tool_only || omitted_present.len() as u64 <= SAFETY_HEAL_GAP {
+        // Production replay showed contiguous narrative coverage. Tool-only noise is
+        // therefore the sole safe gap to absorb; any narrative gap rejects before the
+        // publish path can advance its durable boundary.
+        if fully_inside_tool_only {
             compartments[i - 1].end_message = *omitted_present
                 .last()
                 .expect("non-empty omitted present ordinals checked above");
@@ -1260,6 +1262,43 @@ mod tests {
         let first = validate_historian_output(&text, &chunk, &[], ValidateOptions::default());
         let second = validate_historian_output(&text, &chunk, &[], ValidateOptions::default());
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn five_message_narrative_gap_rejects_like_typescript_validator() {
+        let text = xml(&[(1, 10, "first"), (16, 20, "second")], 21, "");
+        let error = validate_historian_output(
+            &text,
+            &chunk(1, 20),
+            &[],
+            ValidateOptions {
+                in_emergency: true,
+                ..ValidateOptions::default()
+            },
+        )
+        .expect_err("unclassified gaps may contain narrative and must reject");
+
+        assert!(error.message.contains("gap"));
+    }
+
+    #[test]
+    fn twenty_message_tool_only_gap_heals_like_typescript_validator() {
+        let text = xml(&[(1, 10, "first"), (31, 40, "second")], 41, "");
+        let mut input = chunk(1, 40);
+        input.tool_only_ranges = vec![MessageRange { start: 11, end: 30 }];
+        let validated = validate_historian_output(
+            &text,
+            &input,
+            &[],
+            ValidateOptions {
+                in_emergency: true,
+                ..ValidateOptions::default()
+            },
+        )
+        .expect("a proven tool-only gap remains safe to absorb");
+
+        assert_eq!(validated.compartments[0].end_message, 30);
+        assert_eq!(validated.compartments[1].start_message, 31);
     }
 
     #[test]
