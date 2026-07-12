@@ -1305,6 +1305,7 @@ impl McHandler {
                                 publication_floor_ordinal: range.to_ordinal,
                                 now_ms: now,
                                 failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
+                                completion_now_ms: now_ms,
                             },
                         )
                         .await
@@ -1672,7 +1673,8 @@ impl McHandler {
             live_guard,
         } = task;
         let _guard = live_guard;
-        let failure_backoff_at_ms = firing.failure_backoff_at_ms;
+        let failure_started_at_ms = firing.now_ms;
+        let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
         match factory.connect(&project_root).await {
             Ok(mut producer) => {
                 let request =
@@ -1680,6 +1682,11 @@ impl McHandler {
                 run_historian_firing(&mut *producer, request).await
             }
             Err(err) => {
+                let failure_backoff_at_ms = historian::completion_failure_backoff_at_ms(
+                    failure_started_at_ms,
+                    configured_failure_backoff_at_ms,
+                    now_ms(),
+                );
                 record_historian_connect_failure(
                     &store,
                     &session_id,

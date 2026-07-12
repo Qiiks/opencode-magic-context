@@ -50,6 +50,11 @@ import {
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { sessionLog } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import {
+    COMPARTMENT_RENDER_EPOCH,
+    decodeCachedM0UpgradeIdentity,
+    encodeCachedM0UpgradeIdentity,
+} from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
 
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
@@ -560,6 +565,7 @@ export interface M0SnapshotMarkers {
     materializedAt: number;
     sessionFactsVersion: number;
     upgradeState: string | null;
+    compartmentRenderEpoch: string | null;
     // HARD-bust markers: provider-side cache-eviction signals. A change in any
     // of these means the Anthropic prompt cache was already dead (tools/system
     // block changed, or model switched), so folding m[1] into m[0] is "free".
@@ -946,6 +952,7 @@ export function readCurrentM0SnapshotMarkers(args: {
         materializedAt: Date.now(),
         sessionFactsVersion: getSessionFactsVersion(args.db, args.sessionId),
         upgradeState: getUpgradeState(args.db, args.sessionId),
+        compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
         systemHash: hard.systemHash,
         modelKey: hard.modelKey,
         projectIdentity: args.projectPath ?? null,
@@ -954,6 +961,7 @@ export function readCurrentM0SnapshotMarkers(args: {
 
 function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null {
     if (!state.cachedM0Bytes) return null;
+    const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(state.cachedM0UpgradeState);
     if (state.cachedM0ProjectMemoryEpoch === null) return null;
     if (state.cachedM0ProjectUserProfileVersion === null) return null;
     if (state.cachedM0MaxCompartmentSeq === null) return null;
@@ -972,7 +980,8 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         projectDocsHash: state.cachedM0ProjectDocsHash ?? "",
         materializedAt: state.cachedM0MaterializedAt ?? 0,
         sessionFactsVersion: state.cachedM0SessionFactsVersion,
-        upgradeState: state.cachedM0UpgradeState,
+        upgradeState: cachedUpgradeIdentity.upgradeState,
+        compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
         systemHash: state.cachedM0SystemHash ?? "",
         modelKey: state.cachedM0ModelKey ?? "",
         projectIdentity: state.cachedM0ProjectIdentity ?? null,
@@ -1012,6 +1021,13 @@ export function mustMaterialize(args: {
     // (it resolves its own workspace context); the HARD memory gate below keys on
     // that vs the cached fingerprint, so no local workspace context is needed here.
     const current = readCurrentM0SnapshotMarkers(args);
+    const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(args.state.cachedM0UpgradeState);
+
+    // Renderer-format changes must fold cached m[0] once before sanitized bytes can
+    // mix with a stale baseline. Persisting the new component consumes this trigger.
+    if (cachedUpgradeIdentity.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
+        return { value: true, reason: "compartment_render_epoch" };
+    }
 
     // ── HARD: provider-side cache eviction (the cache was already dead) ──
     // Folding m[1] into m[0] here is "free" — the prefix is being re-cached
@@ -1096,7 +1112,7 @@ export function mustMaterialize(args: {
     if (args.state.cachedM0MaxMutationId !== current.maxMutationId) {
         return { value: true, reason: "max_mutation_id" };
     }
-    if ((args.state.cachedM0UpgradeState ?? null) !== current.upgradeState) {
+    if (cachedUpgradeIdentity.upgradeState !== current.upgradeState) {
         return { value: true, reason: "upgrade_state" };
     }
     return { value: false, reason: null };
@@ -1513,7 +1529,10 @@ function applyMarkersToState(
     state.cachedM0ProjectDocsHash = markers.projectDocsHash;
     state.cachedM0MaterializedAt = markers.materializedAt;
     state.cachedM0SessionFactsVersion = markers.sessionFactsVersion;
-    state.cachedM0UpgradeState = markers.upgradeState;
+    state.cachedM0UpgradeState = encodeCachedM0UpgradeIdentity(
+        markers.upgradeState,
+        markers.compartmentRenderEpoch,
+    );
     // HARD-bust markers must be mirrored into the flat state fields too: the next
     // pass's mustMaterialize reads state.cachedM0SystemHash/ModelKey
     // directly (not snapshotMarkers). Omitting them here leaves the flat fields at
@@ -1718,6 +1737,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             materializedAt: foldMaterializedAt,
             sessionFactsVersion: getSessionFactsVersion(options.db, options.sessionId),
             upgradeState: getUpgradeState(options.db, options.sessionId),
+            compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
             // HARD-bust markers are flight-constant (system/tool/model identity of
             // THIS request) — they cannot change mid-materialization-transaction,
             // so carry the captured values and exclude them from the stale check.
@@ -1775,7 +1795,10 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             projectDocsHash: snapshotMarkers.projectDocsHash,
             materializedAt: snapshotMarkers.materializedAt,
             sessionFactsVersion: snapshotMarkers.sessionFactsVersion,
-            upgradeState: snapshotMarkers.upgradeState,
+            upgradeState: encodeCachedM0UpgradeIdentity(
+                snapshotMarkers.upgradeState,
+                snapshotMarkers.compartmentRenderEpoch,
+            ),
             systemHash: snapshotMarkers.systemHash,
             modelKey: snapshotMarkers.modelKey,
             projectIdentity: snapshotMarkers.projectIdentity,
@@ -2096,6 +2119,7 @@ function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | nul
 
 function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
     if (!row.cached_m0_bytes) return null;
+    const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(row.cached_m0_upgrade_state);
     if (row.cached_m0_project_memory_epoch === null) return null;
     if (row.cached_m0_project_user_profile_version === null) return null;
     if (row.cached_m0_max_compartment_seq === null) return null;
@@ -2114,7 +2138,8 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         projectDocsHash: row.cached_m0_project_docs_hash ?? "",
         materializedAt: row.cached_m0_materialized_at ?? 0,
         sessionFactsVersion: row.cached_m0_session_facts_version,
-        upgradeState: row.cached_m0_upgrade_state,
+        upgradeState: cachedUpgradeIdentity.upgradeState,
+        compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
         systemHash: row.cached_m0_system_hash ?? "",
         modelKey: row.cached_m0_model_key ?? "",
         projectIdentity: row.cached_m0_project_identity ?? null,
@@ -2161,7 +2186,10 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
     state.cachedM0ProjectDocsHash = markers.projectDocsHash;
     state.cachedM0MaterializedAt = markers.materializedAt;
     state.cachedM0SessionFactsVersion = markers.sessionFactsVersion;
-    state.cachedM0UpgradeState = markers.upgradeState;
+    state.cachedM0UpgradeState = encodeCachedM0UpgradeIdentity(
+        markers.upgradeState,
+        markers.compartmentRenderEpoch,
+    );
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ModelKey = markers.modelKey;
     state.cachedM0ProjectIdentity = markers.projectIdentity;

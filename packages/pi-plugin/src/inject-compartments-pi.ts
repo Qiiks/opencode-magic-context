@@ -60,6 +60,11 @@ import {
 	sourceNameForMemory,
 } from "@magic-context/core/features/magic-context/workspaces";
 import {
+	COMPARTMENT_RENDER_EPOCH,
+	decodeCachedM0UpgradeIdentity,
+	encodeCachedM0UpgradeIdentity,
+} from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
+import {
 	DEFAULT_HISTORY_BUDGET_TOKENS,
 	extractM0Block,
 	renderCompartmentAtTier,
@@ -621,6 +626,7 @@ export interface PiM0SnapshotMarkers {
 	sessionFactsVersion: number;
 	materializedAt: number;
 	upgradeState: string;
+	compartmentRenderEpoch: string | null;
 	lastBaselineEndMessageId: string | null;
 	// HARD-bust markers (parity with OpenCode M0SnapshotMarkers): provider-side
 	// cache-eviction signals. systemHash/modelKey come from runtime; Pi has no
@@ -823,6 +829,9 @@ function getCachedMarkers(
 	}
 	const compartments =
 		compartmentsForNormalization ?? getCompartments(db, state.sessionId);
+	const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(
+		meta.cachedM0UpgradeState,
+	);
 	const maxCompartmentSeq = normalizeCachedMaxCompartmentSeq(
 		meta.cachedM0MaxCompartmentSeq,
 		compartments,
@@ -856,7 +865,8 @@ function getCachedMarkers(
 		projectDocsHash: meta.cachedM0ProjectDocsHash,
 		sessionFactsVersion: meta.cachedM0SessionFactsVersion,
 		materializedAt: meta.cachedM0MaterializedAt,
-		upgradeState: meta.cachedM0UpgradeState,
+		upgradeState: cachedUpgradeIdentity.upgradeState ?? "",
+		compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
 		// The boundary that was persisted WITH these cached m[0] bytes (may be
 		// null for a legitimately-boundaryless baseline — see the guard above).
 		lastBaselineEndMessageId: cachedBoundary,
@@ -948,6 +958,7 @@ function readCurrentMarkersFromCompartments(
 		upgradeState: `${PI_M0_UPGRADE_STATE}:${
 			compartments.some((c) => c.legacy === 1) ? "legacy" : "ready"
 		}`,
+		compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
 		lastBaselineEndMessageId: lastBaselineEndMessageId(compartments),
 		systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
 		modelKey: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
@@ -986,8 +997,14 @@ export function mustMaterializePi(
 	if (!decodeCachedM0(meta.cachedM0Bytes)) {
 		return { value: true, reason: "cache_invalid" };
 	}
-	if (getCachedMarkers(db, state, currentCompartments) === null) {
+	const cached = getCachedMarkers(db, state, currentCompartments);
+	if (cached === null) {
 		return { value: true, reason: "cache_invalid" };
+	}
+	// A renderer-format change must fold cached m[0] exactly once. The fold
+	// persists this component with the rendered bytes, consuming the trigger.
+	if (cached.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
+		return { value: true, reason: "compartment_render_epoch" };
 	}
 	// ── HARD: provider-side cache eviction (the cache was already dead) ──
 	// Parity with OpenCode mustMaterialize. An empty current signal means
@@ -1027,7 +1044,7 @@ export function mustMaterializePi(
 	}
 
 	// ── HARD: genuine m[0] CONTENT change ──
-	if (meta.cachedM0UpgradeState !== current.upgradeState) {
+	if (cached.upgradeState !== current.upgradeState) {
 		return { value: true, reason: "renderer_upgrade" };
 	}
 	if (
@@ -1330,6 +1347,7 @@ function readFrozenM0InputsPi(
 			upgradeState: `${PI_M0_UPGRADE_STATE}:${
 				compartments.some((c) => c.legacy === 1) ? "legacy" : "ready"
 			}`,
+			compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
 			lastBaselineEndMessageId: lastBaselineEndMessageId(compartments),
 			systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
 			modelKey: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
@@ -1529,7 +1547,10 @@ export function materializeM0Pi(
 			projectDocsHash: snapshotMarkers.projectDocsHash,
 			materializedAt: snapshotMarkers.materializedAt,
 			sessionFactsVersion: snapshotMarkers.sessionFactsVersion,
-			upgradeState: snapshotMarkers.upgradeState,
+			upgradeState: encodeCachedM0UpgradeIdentity(
+				snapshotMarkers.upgradeState,
+				snapshotMarkers.compartmentRenderEpoch,
+			),
 			systemHash: snapshotMarkers.systemHash,
 			modelKey: snapshotMarkers.modelKey,
 			projectIdentity: snapshotMarkers.projectIdentity,
@@ -1882,6 +1903,9 @@ function markersFromCachedPiRow(
 	compartmentsForNormalization: readonly PiCompartment[],
 ): PiM0SnapshotMarkers | null {
 	if (!row.cached_m0_bytes) return null;
+	const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(
+		row.cached_m0_upgrade_state,
+	);
 	if (row.cached_m0_project_memory_epoch === null) return null;
 	if (row.cached_m0_project_user_profile_version === null) return null;
 	if (row.cached_m0_max_compartment_seq === null) return null;
@@ -1905,7 +1929,8 @@ function markersFromCachedPiRow(
 		projectDocsHash: row.cached_m0_project_docs_hash ?? "",
 		materializedAt: row.cached_m0_materialized_at,
 		sessionFactsVersion: row.cached_m0_session_facts_version,
-		upgradeState: row.cached_m0_upgrade_state,
+		upgradeState: cachedUpgradeIdentity.upgradeState ?? "",
+		compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
 		lastBaselineEndMessageId:
 			typeof row.cached_m0_last_baseline_end_message_id === "string" &&
 			row.cached_m0_last_baseline_end_message_id.length > 0
@@ -1943,6 +1968,7 @@ function cachedPiRowMatchesSnapshot(args: {
 		rowMarkers.materializedAt === args.markers.materializedAt &&
 		rowMarkers.sessionFactsVersion === args.markers.sessionFactsVersion &&
 		(rowMarkers.upgradeState ?? null) === (args.markers.upgradeState ?? null) &&
+		rowMarkers.compartmentRenderEpoch === args.markers.compartmentRenderEpoch &&
 		// HARD-bust markers (parity with OpenCode cachedRowMatchesState): a sibling
 		// that re-materialized under a new system/tool/model identity must invalidate
 		// this process's cached row so the soft-refresh CAS adopts the sibling's m[0].

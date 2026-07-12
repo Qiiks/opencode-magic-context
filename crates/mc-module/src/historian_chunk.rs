@@ -464,6 +464,7 @@ impl AssembledHistorianFiring {
             validate_options: self.validate_options,
             now_ms: self.now_ms,
             failure_backoff_at_ms: self.failure_backoff_at_ms,
+            completion_now_ms: crate::now_ms,
         }
     }
 }
