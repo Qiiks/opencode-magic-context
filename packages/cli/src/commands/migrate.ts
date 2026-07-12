@@ -4,8 +4,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
-import { Database } from "@magic-context/core/shared/sqlite";
 import { writeFileAtomic } from "../lib/atomic-write";
+import { openExistingContextDatabase, openExistingDatabase } from "../lib/database-access";
 import { getPiSessionsRoot } from "../lib/paths";
 
 export interface MigrateOpenCodeSessionToPiOptions {
@@ -32,6 +32,7 @@ export interface MigrateOpenCodeSessionToPiOptions {
     maxMessages?: number;
     dryRun?: boolean;
     opencodeDbPath?: string;
+    cortexkitDbPath?: string;
     piSessionsRoot?: string;
     provider?: string;
     modelId?: string;
@@ -899,7 +900,10 @@ export function migrateOpenCodeSessionToPi(
     const opencodeDbPath = opts.opencodeDbPath ?? defaultOpenCodeDbPath();
     const piSessionsRoot = opts.piSessionsRoot ?? defaultPiSessionsRoot();
     const ownsDb = !opts.db;
-    const db = opts.db ?? new Database(opencodeDbPath, { readonly: true });
+    const db = opts.db ?? openExistingDatabase(opencodeDbPath, { readonly: true });
+    if (db === null) {
+        throw new Error(`OpenCode database not found at ${opencodeDbPath}; nothing to migrate.`);
+    }
 
     // Cortexkit DB: when not provided explicitly, open the canonical
     // shared DB read-write (we'll INSERT into compartments + session_facts).
@@ -911,15 +915,13 @@ export function migrateOpenCodeSessionToPi(
     } else if (opts.cortexkitDb !== undefined) {
         cortexkitDb = opts.cortexkitDb;
     } else {
-        try {
-            cortexkitDb = new Database(defaultCortexkitDbPath());
-            ownsCortexkitDb = true;
-        } catch {
-            // If the cortexkit DB doesn't exist yet (Magic Context never
-            // loaded on this machine), skip the copy gracefully — the
-            // migration still produces a usable Pi JSONL.
-            cortexkitDb = null;
-        }
+        const cortexkitDbPath = opts.cortexkitDbPath ?? defaultCortexkitDbPath();
+        cortexkitDb = openExistingContextDatabase(cortexkitDbPath, {
+            readonly: Boolean(opts.dryRun),
+        });
+        ownsCortexkitDb = cortexkitDb !== null;
+        // If Magic Context has never created context.db, skip the state copy;
+        // opening a missing path must not fabricate an empty database.
     }
 
     try {

@@ -32,7 +32,7 @@ import {
 import { bumpProjectMemoryEpoch } from "@magic-context/core/features/magic-context/storage-project-state";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
-import { Database } from "@magic-context/core/shared/sqlite";
+import { openExistingContextDatabase, openExistingDatabase } from "../lib/database-access";
 import { promptIO } from "../lib/prompts";
 
 type DatabaseLike = Pick<DatabaseType, "prepare" | "close" | "exec">;
@@ -505,22 +505,30 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
 
     const opencodeDbPath = defaultOpenCodeDbPath();
     const contextDbPath = defaultContextDbPath();
-    const dbReadonly = dryRun ? { readonly: true } : undefined;
-    const opencodeDb = new Database(opencodeDbPath, dbReadonly);
-    const contextDb = new Database(contextDbPath, dbReadonly);
-    // This CLI opens context.db directly (bypassing initializeDatabase), so the
-    // pragmas the plugin normally sets are absent. foreign_keys=ON is REQUIRED:
-    // the collision-merge path (rekeyMemoryRowWithCollisionMerge) relies on
-    // memory_embeddings FK-cascading when a source memory row is deleted — without
-    // it, deletes leave ORPHANED embedding rows. busy_timeout avoids instant-fail
-    // if a plugin process touches the shared DB during the move.
+    let opencodeDb: DatabaseLike | null = null;
+    let contextDb: DatabaseLike | null = null;
     try {
-        contextDb.exec("PRAGMA foreign_keys=ON");
-        contextDb.exec("PRAGMA busy_timeout=5000");
-    } catch {
-        // best-effort; the move's own transactions are the real safety net
-    }
-    try {
+        opencodeDb = openExistingDatabase(opencodeDbPath, { readonly: dryRun });
+        if (opencodeDb === null) {
+            throw new Error(
+                `OpenCode database not found at ${opencodeDbPath}; nothing to migrate.`,
+            );
+        }
+        contextDb = openExistingContextDatabase(contextDbPath, { readonly: dryRun });
+        if (contextDb === null) {
+            throw new Error(
+                `Magic Context database not found at ${contextDbPath}; nothing to migrate.`,
+            );
+        }
+
+        // The collision-merge path relies on foreign-key cascades when source
+        // memories are deleted. These pragmas must be enabled before planning or writing.
+        try {
+            contextDb.exec("PRAGMA foreign_keys=ON");
+            contextDb.exec("PRAGMA busy_timeout=5000");
+        } catch {
+            // Best-effort; the move's own transactions remain the final safety net.
+        }
         const deps = realDeps(opencodeDb, contextDb);
         const plan = planMigrateSession(sessionId, expandedTo, deps);
 
@@ -632,7 +640,7 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
         console.error(error instanceof Error ? error.message : String(error));
         return 1;
     } finally {
-        opencodeDb.close();
-        contextDb.close();
+        opencodeDb?.close();
+        contextDb?.close();
     }
 }

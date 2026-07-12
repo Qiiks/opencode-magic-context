@@ -78,10 +78,23 @@ export interface PromptIO {
     ): Promise<string>;
 }
 
+export class PromptCancelledError extends Error {
+    constructor(message = "Cancelled.") {
+        super(message);
+        this.name = "PromptCancelledError";
+    }
+}
+
+export function isPromptCancelledError(error: unknown): error is PromptCancelledError {
+    return error instanceof PromptCancelledError;
+}
+
 function handleCancel(value: unknown, cancelMessage = "Cancelled."): void {
     if (isCancel(value)) {
         clackCancel(cancelMessage);
-        process.exit(0);
+        // Let the command unwind normally so setup can avoid later writes and
+        // close any resources it owns instead of terminating the process here.
+        throw new PromptCancelledError(cancelMessage);
     }
 }
 

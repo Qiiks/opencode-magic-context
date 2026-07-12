@@ -13,13 +13,13 @@ import { closeDatabase, openDatabase } from "@magic-context/core/features/magic-
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
-import { Database } from "@magic-context/core/shared/sqlite";
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
 
 import { isDevPathPluginEntry, matchesPluginEntry } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
 import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
+import { openExistingContextDatabase } from "../lib/database-access";
 import { collectDiagnostics } from "../lib/diagnostics-opencode";
 import {
     checkLocalEmbeddingRuntime,
@@ -1093,11 +1093,16 @@ export async function runDoctor(
     if (!existsSync(dbPath)) {
         log.info(`Shared context DB not yet created at ${dbPath} (will be created on first run)`);
     } else {
-        pass(`Shared context DB exists at ${dbPath}`);
+        log.info(`Shared context DB exists at ${dbPath}`);
         try {
-            const db = new Database(dbPath, { readonly: true });
+            // The schema compatibility check runs before integrity checks so a
+            // newer schema can never be reported healthy by an older CLI.
+            const db = openExistingContextDatabase(dbPath, { readonly: true });
+            if (db === null) {
+                throw new Error(`Shared context DB no longer exists at ${dbPath}`);
+            }
             try {
-                pass("openDatabase() opened the shared DB");
+                pass("Opened the shared DB with a supported schema");
                 try {
                     const integrity = db.prepare("PRAGMA integrity_check").get() as
                         | { integrity_check?: string }

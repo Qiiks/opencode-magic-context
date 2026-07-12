@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { stringify as stringifyJsonc } from "comment-json";
 import { isDevPathPluginEntry, matchesPluginEntry } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
@@ -10,6 +10,7 @@ import {
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
 import { runDreamerSetup } from "../lib/dreamer-setup";
+import { assertJsoncConfigsParseable, readJsoncConfigForUpdate } from "../lib/jsonc-config";
 import { pickModel } from "../lib/model-picker";
 import { detectOpenCode } from "../lib/opencode-detect";
 import { getAvailableModels, getOpenCodeVersion } from "../lib/opencode-helpers";
@@ -30,21 +31,15 @@ function ensureDir(dir: string): void {
     }
 }
 
-function readJsonc(path: string): Record<string, unknown> | null {
-    const content = readFileSync(path, "utf-8");
-    try {
-        return parseJsonc(content) as Record<string, unknown>;
-    } catch (err) {
-        console.error(`  ⚠ Failed to parse ${path}: ${err instanceof Error ? err.message : err}`);
-        return null;
-    }
-}
 // ─── Config Manipulators ──────────────────────────────────
 
-function addPluginToOpenCodeConfig(configPath: string, format: "json" | "jsonc" | "none"): void {
-    ensureDir(dirname(configPath));
-
+export function addPluginToOpenCodeConfig(
+    configPath: string,
+    format: "json" | "jsonc" | "none",
+    removeDcp = false,
+): void {
     if (format === "none") {
+        ensureDir(dirname(configPath));
         const config = {
             plugin: [PLUGIN_ENTRY],
             compaction: { auto: false, prune: false },
@@ -54,11 +49,7 @@ function addPluginToOpenCodeConfig(configPath: string, format: "json" | "jsonc" 
     }
 
     // Read existing config, merge our changes, preserve everything else
-    const existing = readJsonc(configPath);
-    if (!existing) {
-        log.warn(`Could not parse ${configPath} — skipping to avoid data loss`);
-        return;
-    }
+    const existing = readJsoncConfigForUpdate(configPath);
 
     // Operate on the raw plugin array — entries can be:
     //   • a string:  "@cortexkit/opencode-magic-context@latest"
@@ -66,7 +57,10 @@ function addPluginToOpenCodeConfig(configPath: string, format: "json" | "jsonc" 
     //   • a dev URL: "file:///abs/path/.../packages/plugin"
     // We preserve every entry shape; matchesPluginEntry / isDevPathPluginEntry
     // safely accept both strings and tuples.
-    const rawPlugins: unknown[] = Array.isArray(existing.plugin) ? existing.plugin : [];
+    let rawPlugins: unknown[] = Array.isArray(existing.plugin) ? existing.plugin : [];
+    if (removeDcp) {
+        rawPlugins = rawPlugins.filter((plugin) => !matchesPluginEntry(plugin, DCP_PLUGIN_NAME));
+    }
     const hasNpmEntry = rawPlugins.some((p) => matchesPluginEntry(p, PLUGIN_NAME));
     const hasDevEntry = rawPlugins.some((p) => isDevPathPluginEntry(p));
 
@@ -87,19 +81,14 @@ function addPluginToOpenCodeConfig(configPath: string, format: "json" | "jsonc" 
     writeFileAtomic(configPath, `${stringifyJsonc(existing, null, 2)}\n`);
 }
 
-function addPluginToTuiConfig(configPath: string, format: "json" | "jsonc" | "none"): void {
-    ensureDir(dirname(configPath));
-
+export function addPluginToTuiConfig(configPath: string, format: "json" | "jsonc" | "none"): void {
     if (format === "none") {
+        ensureDir(dirname(configPath));
         writeFileAtomic(configPath, `${stringifyJsonc({ plugin: [PLUGIN_ENTRY] }, null, 2)}\n`);
         return;
     }
 
-    const existing = readJsonc(configPath);
-    if (!existing) {
-        log.warn(`Could not parse ${configPath} — skipping to avoid data loss`);
-        return;
-    }
+    const existing = readJsoncConfigForUpdate(configPath);
 
     // Same rules as the main opencode config — preserve tuple entries and
     // never replace dev-path entries.
@@ -130,13 +119,12 @@ function pluginEntryName(entry: unknown): string {
 async function resolveDcpConflictBeforeSetup(
     configPath: string,
     format: "json" | "jsonc" | "none",
-): Promise<void> {
-    if (format === "none") return;
-    const ocConfig = readJsonc(configPath);
-    if (!ocConfig) return;
+): Promise<boolean> {
+    if (format === "none") return false;
+    const ocConfig = readJsoncConfigForUpdate(configPath);
     const plugins = Array.isArray(ocConfig.plugin) ? ocConfig.plugin : [];
     const dcpIndexes = findDcpPluginIndexes(plugins);
-    if (dcpIndexes.length === 0) return;
+    if (dcpIndexes.length === 0) return false;
 
     log.warn(`Found conflicting plugin: ${pluginEntryName(plugins[dcpIndexes[0]])}`);
     log.message(
@@ -144,16 +132,13 @@ async function resolveDcpConflictBeforeSetup(
             "Running both simultaneously will cause unpredictable behavior.",
     );
     const shouldRemove = await confirm("Remove opencode-dcp from your config?", true);
-    if (shouldRemove) {
-        ocConfig.plugin = plugins.filter((_plugin, index) => !dcpIndexes.includes(index));
-        writeFileAtomic(configPath, `${stringifyJsonc(ocConfig, null, 2)}\n`);
-        log.success("Removed opencode-dcp from plugin list");
-    } else {
+    if (!shouldRemove) {
         log.warn("Skipped — you may experience context management conflicts");
     }
+    return shouldRemove;
 }
 
-function writeMagicContextConfig(
+export function writeMagicContextConfig(
     configPath: string,
     options: {
         historianModel: string | null;
@@ -166,9 +151,8 @@ function writeMagicContextConfig(
         claudeMax: boolean;
     },
 ): void {
-    // Read existing config to preserve user's other settings
-    const config: Record<string, unknown> =
-        (existsSync(configPath) ? readJsonc(configPath) : null) ?? {};
+    // A malformed existing file must abort rather than become an empty config.
+    const config = readJsoncConfigForUpdate(configPath);
 
     // Always set $schema for editor autocomplete/validation
     if (!config.$schema) {
@@ -295,25 +279,35 @@ export async function runSetup(dryRun = false): Promise<number> {
         existsSync(paths.magicContextConfig) ||
         paths.tuiConfigFormat !== "none";
 
-    // ─── Step 4: Check for DCP plugin conflict before mutating setup files ────────
     if (!dryRun) {
-        await resolveDcpConflictBeforeSetup(paths.opencodeConfig, paths.opencodeConfigFormat);
+        try {
+            // Fail before touching any setup target if one existing file is malformed.
+            assertJsoncConfigsParseable([
+                paths.opencodeConfig,
+                paths.magicContextConfig,
+                paths.tuiConfig,
+            ]);
+        } catch (error) {
+            log.error(error instanceof Error ? error.message : String(error));
+            outro("Setup stopped — fix the malformed config and rerun setup.");
+            return 1;
+        }
     }
 
-    // ─── Step 5: Add plugin & disable compaction ────────
+    // ─── Step 4: Check for DCP plugin conflict before mutating setup files ────────
+    const removeDcp = dryRun
+        ? false
+        : await resolveDcpConflictBeforeSetup(paths.opencodeConfig, paths.opencodeConfigFormat);
+
+    // Collect every interactive choice before applying setup writes. A cancelled
+    // wizard can then unwind without leaving only some target files updated.
     if (dryRun) {
         log.message(
             `[dry-run] would add the plugin to ${paths.opencodeConfig} and disable compaction`,
         );
-    } else {
-        addPluginToOpenCodeConfig(paths.opencodeConfig, paths.opencodeConfigFormat);
-        log.success(`Plugin added to ${paths.opencodeConfig}`);
-        log.info("Disabled built-in compaction (auto=false, prune=false)");
-        log.message(
-            "Magic Context handles context management — built-in compaction would interfere",
-        );
     }
 
+    let conflictFix: Parameters<typeof fixConflicts>[1] | null = null;
     if (hadExistingSetup) {
         const conflicts = detectConflicts(process.cwd());
         if (conflicts.hasConflict) {
@@ -331,14 +325,7 @@ export async function runSetup(dryRun = false): Promise<number> {
                 );
 
                 if (shouldFixConflicts) {
-                    const actions = fixConflicts(process.cwd(), conflicts.conflicts);
-                    if (actions.length > 0) {
-                        for (const action of actions) {
-                            log.success(action);
-                        }
-                    } else {
-                        log.info("No additional conflict changes were needed");
-                    }
+                    conflictFix = conflicts.conflicts;
                 } else {
                     log.warn(
                         "Skipped automatic conflict fixes — Magic Context may remain disabled",
@@ -386,23 +373,9 @@ export async function runSetup(dryRun = false): Promise<number> {
         }
     }
 
-    // Write magic-context config
     if (dryRun) {
         log.message(`[dry-run] would write Magic Context config to ${paths.magicContextConfig}`);
         log.message(`[dry-run] would add the TUI sidebar plugin to ${paths.tuiConfig}`);
-    } else {
-        writeMagicContextConfig(paths.magicContextConfig, {
-            historianModel,
-            dreamerEnabled,
-            dreamerModel,
-            dreamerTasks,
-            sidekickEnabled,
-            sidekickModel,
-            claudeMax,
-        });
-        log.success(`Config written to ${paths.magicContextConfig}`);
-        addPluginToTuiConfig(paths.tuiConfig, paths.tuiConfigFormat);
-        log.success(`TUI sidebar plugin added to ${basename(paths.tuiConfig)}`);
     }
 
     // ─── Step 8: Oh-My-OpenCode compatibility ───────────
@@ -413,6 +386,7 @@ export async function runSetup(dryRun = false): Promise<number> {
     // omoContextWindowMonitor, and omoAnthropicRecovery. Audit tools
     // sometimes flag this `!hadExistingSetup` gate as "OMO check skipped
     // for existing users" — that's a false positive.
+    let disableOmoHooks = false;
     if (paths.omoConfig && !hadExistingSetup) {
         log.warn(`Found oh-my-opencode config: ${paths.omoConfig}`);
         log.message(
@@ -429,6 +403,44 @@ export async function runSetup(dryRun = false): Promise<number> {
             log.message("[dry-run] would offer to disable conflicting oh-my-opencode hooks");
         }
         if (shouldDisable) {
+            disableOmoHooks = true;
+        } else {
+            log.warn("Skipped — you may experience context management conflicts");
+        }
+    }
+
+    if (!dryRun) {
+        addPluginToOpenCodeConfig(paths.opencodeConfig, paths.opencodeConfigFormat, removeDcp);
+        log.success(`Plugin added to ${paths.opencodeConfig}`);
+        if (removeDcp) log.success("Removed opencode-dcp from plugin list");
+        log.info("Disabled built-in compaction (auto=false, prune=false)");
+        log.message(
+            "Magic Context handles context management — built-in compaction would interfere",
+        );
+
+        if (conflictFix) {
+            const actions = fixConflicts(process.cwd(), conflictFix);
+            if (actions.length > 0) {
+                for (const action of actions) log.success(action);
+            } else {
+                log.info("No additional conflict changes were needed");
+            }
+        }
+
+        writeMagicContextConfig(paths.magicContextConfig, {
+            historianModel,
+            dreamerEnabled,
+            dreamerModel,
+            dreamerTasks,
+            sidekickEnabled,
+            sidekickModel,
+            claudeMax,
+        });
+        log.success(`Config written to ${paths.magicContextConfig}`);
+        addPluginToTuiConfig(paths.tuiConfig, paths.tuiConfigFormat);
+        log.success(`TUI sidebar plugin added to ${basename(paths.tuiConfig)}`);
+
+        if (disableOmoHooks) {
             const actions = fixConflicts(process.cwd(), {
                 compactionAuto: false,
                 compactionPrune: false,
@@ -437,12 +449,9 @@ export async function runSetup(dryRun = false): Promise<number> {
                 omoContextWindowMonitor: true,
                 omoAnthropicRecovery: true,
             });
-
             if (actions.includes("Disabled conflicting oh-my-opencode hooks")) {
                 log.success("Hooks disabled in oh-my-opencode config");
             }
-        } else {
-            log.warn("Skipped — you may experience context management conflicts");
         }
     }
 

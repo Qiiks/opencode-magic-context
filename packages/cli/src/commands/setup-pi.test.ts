@@ -38,7 +38,9 @@ class MockPrompts implements PromptIO {
         info: (message: string) => this.messages.push(`info:${message}`),
         success: (message: string) => this.messages.push(`success:${message}`),
         warn: (message: string) => this.messages.push(`warn:${message}`),
+        error: (message: string) => this.messages.push(`error:${message}`),
         message: (message: string) => this.messages.push(`message:${message}`),
+        step: (message: string) => this.messages.push(`step:${message}`),
     };
 
     intro(message: string): void {
@@ -95,6 +97,38 @@ afterEach(() => {
 });
 
 describe("runSetup", () => {
+    it("aborts before writing when an existing target is malformed", async () => {
+        const root = makeTempRoot();
+        const agentDir = join(root, ".pi", "agent");
+        setConfigEnv(root, agentDir);
+        mkdirSync(agentDir, { recursive: true });
+        const settingsPath = join(agentDir, "settings.json");
+        const malformed = `{\n  "packages": [\n`;
+        writeFileSync(settingsPath, malformed);
+
+        const env: SetupEnvironment = {
+            detectPiBinary: () => ({ path: join(root, "bin", "pi"), source: "path" }),
+            getPiVersion: () => "0.74.0",
+            getAvailableModels: () => ["anthropic/claude-haiku-4-5"],
+            paths: {
+                getPiAgentConfigDir: () => agentDir,
+                getPiUserConfigPath: () =>
+                    join(root, ".config", "cortexkit", "magic-context.jsonc"),
+                getPiUserExtensionsPath: () => settingsPath,
+            },
+        };
+        const prompts = new MockPrompts({ confirms: [] });
+
+        const code = await runSetup({ prompts, env });
+
+        expect(code).toBe(1);
+        expect(readFileSync(settingsPath, "utf-8")).toBe(malformed);
+        expect(existsSync(env.paths.getPiUserConfigPath())).toBe(false);
+        expect(prompts.messages.join("\n")).toContain(
+            `Refusing to overwrite unparseable config ${settingsPath} at line 3, column 1`,
+        );
+    });
+
     it("preserves object-form Pi package entries and detects object-form Magic Context", () => {
         const root = makeTempRoot();
         const settingsPath = join(root, "settings.json");

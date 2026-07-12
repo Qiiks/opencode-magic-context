@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "@magic-context/core/shared/sqlite";
@@ -203,6 +203,7 @@ describe("migrateOpenCodeSessionToPi", () => {
 
         const result = migrateOpenCodeSessionToPi({
             db,
+            cortexkitDb: null,
             sessionId,
             piSessionsRoot: root,
             now: new Date("2026-04-30T11:46:47.422Z"),
@@ -262,6 +263,7 @@ describe("migrateOpenCodeSessionToPi", () => {
         const { sessionId } = insertSyntheticSession(db);
         const result = migrateOpenCodeSessionToPi({
             db,
+            cortexkitDb: null,
             sessionId,
             piSessionsRoot: tempDir(),
             maxMessages: 2,
@@ -286,6 +288,7 @@ describe("migrateOpenCodeSessionToPi", () => {
         const writes: string[] = [];
         const result = migrateOpenCodeSessionToPi({
             db,
+            cortexkitDb: null,
             sessionId,
             piSessionsRoot: root,
             dryRun: true,
@@ -344,6 +347,51 @@ describe("migrateOpenCodeSessionToPi", () => {
         expect(order[0]).toBe("write");
         expect(order[1]).toBe("db-commit");
         expect(order).not.toContain("unlink");
+    });
+
+    it("skips a missing context DB without creating an empty file", () => {
+        const db = makeDb();
+        const { sessionId } = insertSyntheticSession(db);
+        const root = tempDir();
+        const contextDbPath = join(root, "missing", "context.db");
+
+        const result = migrateOpenCodeSessionToPi({
+            db,
+            cortexkitDbPath: contextDbPath,
+            sessionId,
+            piSessionsRoot: root,
+            now: new Date("2026-04-30T11:46:47.422Z"),
+        });
+
+        expect(result.compartmentsCopied).toBe(0);
+        expect(existsSync(contextDbPath)).toBe(false);
+    });
+
+    it("refuses a newer context DB before writing migration output", () => {
+        const db = makeDb();
+        const { sessionId } = insertSyntheticSession(db);
+        const root = tempDir();
+        const contextDbPath = join(root, "context.db");
+        const contextDb = new Database(contextDbPath);
+        contextDb.exec(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations (version) VALUES (52)",
+        );
+        contextDb.close();
+        const writes: string[] = [];
+
+        expect(() =>
+            migrateOpenCodeSessionToPi({
+                db,
+                cortexkitDbPath: contextDbPath,
+                sessionId,
+                piSessionsRoot: root,
+                fs: {
+                    writeFileAtomic: (path) => writes.push(path),
+                    unlinkSync: () => {},
+                },
+            }),
+        ).toThrow("database schema v52 is newer than this CLI supports (max v51)");
+        expect(writes).toEqual([]);
     });
 });
 

@@ -17,6 +17,7 @@
  *   --help, -h              Print help and exit
  */
 import { createRequire } from "node:module";
+import { isPromptCancelledError } from "./lib/prompts";
 
 function getVersion(): string {
     const req = createRequire(import.meta.url);
@@ -92,31 +93,36 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     const command = argv[0];
     const rest = argv.slice(1);
 
-    if (command === "setup") {
-        const { runSetup } = await import("./commands/setup");
-        return runSetup(rest);
-    }
+    try {
+        if (command === "setup") {
+            const { runSetup } = await import("./commands/setup");
+            return runSetup(rest);
+        }
 
-    if (command === "doctor") {
-        if (rest[0] === "migrate") {
-            const { runMigrateCli } = await import("./commands/migrate");
-            return runMigrateCli(rest.slice(1));
+        if (command === "doctor") {
+            if (rest[0] === "migrate") {
+                const { runMigrateCli } = await import("./commands/migrate");
+                return runMigrateCli(rest.slice(1));
+            }
+            if (rest[0] === "migrate-session") {
+                const { runMigrateSessionCli } = await import("./commands/migrate-session");
+                return runMigrateSessionCli(rest.slice(1));
+            }
+            const { runDoctor } = await import("./commands/doctor");
+            const rekeyV22DirIdentity = valueAfter(rest, "--rekey-v22-dir-identity");
+            return runDoctor({
+                force: rest.includes("--force"),
+                issue: rest.includes("--issue"),
+                clear: rest.includes("--clear"),
+                checkV22Backfill: rest.includes("--check-v22-backfill"),
+                retryV22Backfill: rest.includes("--retry-v22-backfill"),
+                ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),
+                argv: rest,
+            });
         }
-        if (rest[0] === "migrate-session") {
-            const { runMigrateSessionCli } = await import("./commands/migrate-session");
-            return runMigrateSessionCli(rest.slice(1));
-        }
-        const { runDoctor } = await import("./commands/doctor");
-        const rekeyV22DirIdentity = valueAfter(rest, "--rekey-v22-dir-identity");
-        return runDoctor({
-            force: rest.includes("--force"),
-            issue: rest.includes("--issue"),
-            clear: rest.includes("--clear"),
-            checkV22Backfill: rest.includes("--check-v22-backfill"),
-            retryV22Backfill: rest.includes("--retry-v22-backfill"),
-            ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),
-            argv: rest,
-        });
+    } catch (error) {
+        if (isPromptCancelledError(error)) return 0;
+        throw error;
     }
 
     console.error(`Unknown command: ${command}`);
