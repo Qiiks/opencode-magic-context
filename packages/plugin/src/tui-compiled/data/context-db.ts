@@ -102,7 +102,13 @@ const STICKY_MAX_ENTRIES = 100;
 const stickySidebarCache = new Map<string, CachedSnapshot>();
 
 function rememberSidebarSnapshot(snapshot: SidebarSnapshot): void {
-    if (!snapshot.sessionId || snapshot.inputTokens <= 0) return;
+    if (!snapshot.sessionId) return;
+    if (snapshot.inputTokens <= 0) {
+        // A successful zero is authoritative (new/deleted/reverted session) and
+        // must prevent a later transport failure from resurrecting old values.
+        stickySidebarCache.delete(snapshot.sessionId);
+        return;
+    }
     // LRU-style bound: drop the oldest entry once we hit the cap. With a
     // 5-min TTL most stale entries time out naturally; this just prevents
     // unbounded growth across many session switches in a long TUI session.
@@ -126,17 +132,7 @@ function recallSidebarSnapshot(sessionId: string, fallback: SidebarSnapshot): Si
         stickySidebarCache.delete(sessionId);
         return fallback;
     }
-    if (!hasInFlightEvidence(fallback)) {
-        stickySidebarCache.delete(sessionId);
-        return fallback;
-    }
     return cached.snapshot;
-}
-
-function hasInFlightEvidence(snapshot: SidebarSnapshot): boolean {
-    return (
-        snapshot.compartmentInProgress || snapshot.historianRunning || snapshot.pendingOpsCount > 0
-    );
 }
 
 /** Fetch sidebar snapshot from the server via RPC. */
@@ -249,14 +245,23 @@ export async function loadEmbedDetail(sessionId: string, directory: string): Pro
     }
 }
 
-/** Get compartment count via RPC. */
-export async function getCompartmentCount(sessionId: string): Promise<number> {
-    if (!rpcClient) return 0;
+export type CompartmentCountResult = { ok: true; count: number } | { ok: false; error: string };
+
+/** Get compartment count without making transport failure look like a real zero. */
+export async function getCompartmentCount(sessionId: string): Promise<CompartmentCountResult> {
+    if (!rpcClient) return { ok: false, error: "RPC client is not initialized" };
     try {
-        const result = await rpcClient.call<{ count: number }>("compartment-count", { sessionId });
-        return result.count ?? 0;
-    } catch {
-        return 0;
+        const result = await rpcClient.call<{ count?: number; error?: string }>(
+            "compartment-count",
+            { sessionId },
+        );
+        if (typeof result.error === "string") return { ok: false, error: result.error };
+        if (typeof result.count !== "number" || !Number.isFinite(result.count)) {
+            return { ok: false, error: "Invalid compartment count response" };
+        }
+        return { ok: true, count: result.count };
+    } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
 }
 

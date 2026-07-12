@@ -65,6 +65,58 @@ async function waitFor(condition: () => boolean, label: string, timeoutMs = 4_00
 }
 
 describe("notification socket", () => {
+    test("a home-screen socket receives globals but leaves scoped notifications pending", async () => {
+        drainNotifications(Number.MAX_SAFE_INTEGER);
+        const dataHome = makeDataHome();
+        const directory = "/repo-home-screen";
+        await startServer(dataHome, directory);
+        initRpcClient(directory);
+
+        const received: SocketNotification[] = [];
+        startNotificationSocket({
+            getSessionId: () => null,
+            onNotification: (notification) => {
+                received.push(notification);
+                return true;
+            },
+        });
+        await waitFor(() => isTuiConnected(), "home-screen socket connection");
+        expect(isTuiConnected("ses_hidden")).toBe(false);
+
+        pushNotification("scoped", { action: "show-status-dialog" }, "ses_hidden");
+        pushNotification("global", { action: "show-status-dialog" });
+        await waitFor(
+            () => received.some((notification) => notification.type === "global"),
+            "global home-screen notification",
+        );
+        expect(received.some((notification) => notification.type === "scoped")).toBe(false);
+        expect(drainNotifications(0, "ses_hidden", { sessionOnly: true })).toHaveLength(1);
+    });
+
+    test("overlapping starts create one socket and one delivery", async () => {
+        drainNotifications(Number.MAX_SAFE_INTEGER);
+        const dataHome = makeDataHome();
+        const directory = "/repo-overlapping-start";
+        await startServer(dataHome, directory);
+        initRpcClient(directory);
+
+        let deliveries = 0;
+        const options = {
+            getSessionId: () => "ses_once",
+            onNotification: () => {
+                deliveries += 1;
+                return true;
+            },
+        };
+        startNotificationSocket(options);
+        startNotificationSocket(options);
+        await waitFor(() => isTuiConnected("ses_once"), "single overlapping connection");
+        pushNotification("once", { ok: true }, "ses_once");
+        await waitFor(() => deliveries === 1, "single notification delivery");
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        expect(deliveries).toBe(1);
+    });
+
     test("uses the active session cursor when switching sessions", async () => {
         drainNotifications(Number.MAX_SAFE_INTEGER);
         const dataHome = makeDataHome();
