@@ -47,7 +47,7 @@ import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
-import { getSdkContextLimit, getSdkInputLimit } from "../../shared/models-dev-cache";
+import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import { applyMidTurnDeferral, detectMidTurnBypassReason } from "./boundary-execution";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
@@ -713,6 +713,7 @@ export function createTransform(deps: TransformDeps) {
 
         let recoveryNoHeadEscapeActive = false;
         let emergencyRecoveryArmed = false;
+        let emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null = null;
         let usagePercentageSynthetic = false;
 
         // Overflow-triggered emergency recovery: if a prior provider response
@@ -777,7 +778,13 @@ export function createTransform(deps: TransformDeps) {
                     // Flag-only arm: undefined reportedLimit sets
                     // needs_emergency_recovery WITHOUT writing
                     // detected_context_limit.
-                    recordOverflowDetected(db, sessionId, undefined, armModelKey);
+                    recordOverflowDetected(
+                        db,
+                        sessionId,
+                        undefined,
+                        armModelKey,
+                        "proactive_model_shrink",
+                    );
                     // recordOverflowDetected does NOT reset the no-eligible-head
                     // count. A stale count from the prior model would make
                     // noHeadEscape (below) suppress the bump we just armed, so
@@ -787,6 +794,7 @@ export function createTransform(deps: TransformDeps) {
 
                 const overflowState = getOverflowState(db, sessionId);
                 emergencyRecoveryArmed = overflowState.needsEmergencyRecovery;
+                emergencyRecoveryOrigin = overflowState.emergencyRecoveryOrigin;
                 if (contextUsageEarly.percentage < 80 && !overflowState.needsEmergencyRecovery) {
                     resetProtectedTailNoEligibleHead(db, sessionId);
                 }
@@ -1763,8 +1771,9 @@ export function createTransform(deps: TransformDeps) {
                 hardSignals: m0HardSignals,
             },
         });
-        // Fresh-tokenize only in the emergency band. Routine transforms keep the
-        // existing cached sidebar accounting and pay no additional wire walk.
+        // Fresh-tokenize only in the emergency band. This estimate is telemetry,
+        // never an abort gate: provider-accurate accounting is deferred to the
+        // module-side implementation.
         const finalWireEstimate =
             contextUsage.percentage >= 95
                 ? estimateFinalWireInputTokens({
@@ -1775,16 +1784,17 @@ export function createTransform(deps: TransformDeps) {
                       agentName: notificationParams.agent,
                   })
                 : undefined;
-        const trustedInputLimit =
-            contextUsage.percentage >= 95 && modelForBudget
-                ? getSdkInputLimit(modelForBudget.providerID, modelForBudget.modelID)
-                : undefined;
+        if (finalWireEstimate) {
+            sessionLog(
+                sessionId,
+                `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"}`,
+            );
+        }
         const emergencyFailClosed = evaluateEmergencyFailClosed({
             usagePercentage: contextUsage.percentage,
-            finalWireInputTokens: finalWireEstimate?.trusted ? finalWireEstimate.tokens : undefined,
-            trustedInputLimitTokens: trustedInputLimit,
             emergencyRecoveryArmed,
-            usagePercentageSynthetic,
+            emergencyRecoveryOrigin,
+            foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
         });
         if (emergencyFailClosed.shouldAbort) {
             if (!deps.client) {
@@ -1812,9 +1822,12 @@ export function createTransform(deps: TransformDeps) {
                 );
                 throw error;
             }
+            // The abort prevents a fresh provider usage sample. Release the
+            // stale-sample latch so the retry can reclaim additional tools.
+            clearEmergencyDropSample(db, sessionId);
             sessionLog(
                 sessionId,
-                `EMERGENCY: fail-closed (reason=${emergencyFailClosed.reason}, finalEstimate=${finalWireEstimate?.trusted ? finalWireEstimate.tokens : "untrusted"}, inputLimit=${trustedInputLimit ?? "untrusted"}, margin=${emergencyFailClosed.errorMarginTokens}, syntheticUsage=${usagePercentageSynthetic})`,
+                `EMERGENCY: fail-closed (reason=${emergencyFailClosed.reason}, recoveryOrigin=${emergencyRecoveryOrigin ?? "unknown"}, finalEstimate=${finalWireEstimate?.tokens ?? "unavailable"}, estimateTrusted=${finalWireEstimate?.trusted ?? false}, syntheticUsage=${usagePercentageSynthetic})`,
             );
             return;
         }

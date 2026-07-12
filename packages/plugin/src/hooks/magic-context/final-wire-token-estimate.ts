@@ -97,10 +97,10 @@ export interface FinalWireTokenEstimate {
 }
 
 /**
- * Estimate the complete outgoing prompt after transform mutations. System and tool
- * definitions use the same calibrated measurements as the sidebar; messages are
- * always re-read from the final array so pending drops and folds cannot leave stale
- * cached counts in a fail-closed decision.
+ * Telemetry-only estimate of the outgoing prompt after transform mutations.
+ * System and tool definitions use the sidebar's calibrated measurements, while
+ * messages are re-read from the final array. This is diagnostic data, not an
+ * abort gate; provider-accurate gating is deferred to module-side Rust accounting.
  */
 export function estimateFinalWireInputTokens(
     input: FinalWireTokenEstimateInput,

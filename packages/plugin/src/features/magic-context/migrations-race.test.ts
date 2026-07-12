@@ -29,7 +29,7 @@ describe("migration race tolerance", () => {
             initializeDatabase(setup);
             runMigrations(setup);
             setup.exec(`
-                DELETE FROM schema_migrations WHERE version = 51;
+                DELETE FROM schema_migrations WHERE version >= 51;
                 DROP TABLE tool_owner_backfill_state;
             `);
             closeQuietly(setup);
@@ -54,8 +54,8 @@ describe("migration race tolerance", () => {
                 $`bun -e ${script}`.json() as Promise<{ version: number; table: boolean }>,
             ]);
 
-            expect(first).toEqual({ version: 51, table: true });
-            expect(second).toEqual({ version: 51, table: true });
+            expect(first).toEqual({ version: 52, table: true });
+            expect(second).toEqual({ version: 52, table: true });
 
             const verify = new Database(path);
             expect(

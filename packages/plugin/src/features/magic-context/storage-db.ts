@@ -44,7 +44,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 51;
+export const LATEST_SUPPORTED_VERSION = 52;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1230,11 +1230,11 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // when parseReportedLimit() extracts a number; cleared on model switch.
     ensureColumn(db, "session_meta", "detected_context_limit", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "detected_context_limit_model_key", "TEXT");
-    // True when the current session has hit an unrecovered context overflow
-    // and needs the emergency recovery path (block at 95%, abort current
-    // request, fire historian + aggressive drops) on its next transform pass.
-    // Cleared once recovery succeeds.
+    // True when the session needs emergency recovery after either a provider
+    // overflow or proactive model shrink. The persisted origin distinguishes
+    // provider-proven abort eligibility from best-effort proactive recovery.
     ensureColumn(db, "session_meta", "needs_emergency_recovery", "INTEGER DEFAULT 0");
+    ensureColumn(db, "session_meta", "emergency_recovery_origin", "TEXT DEFAULT ''");
     // Deferred compaction-marker drain (plan v6). Intentionally NO DEFAULT
     // clause — absence is SQL NULL, presence is a JSON blob. Reader must
     // filter `IS NOT NULL AND != ''`. This column MUST NOT be added to

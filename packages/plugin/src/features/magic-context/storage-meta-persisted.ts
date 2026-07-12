@@ -1594,26 +1594,31 @@ export function clearHistorianFailureState(db: Database, sessionId: string): voi
 
 // ── Overflow detection state ──
 //
-// When a provider returns a context-overflow error, we persist two signals:
-//   - detected_context_limit: the real limit reported in the error (when we
-//     can parse one). Used as the highest-priority source in the context
-//     limit resolver — the model itself is more authoritative than models.dev.
-//   - needs_emergency_recovery: a one-shot flag that tells the next transform
-//     pass to enter the 95% emergency recovery path (block, abort current
-//     request, fire historian + aggressive drops) even if pressure math says
-//     we are below 95%. Cleared once recovery succeeds or session is cleared.
+// Recovery can be armed by either a provider rejection or a proactive model
+// shrink check. Persisting the origin keeps restarts from conflating the two:
+// only the provider's own overflow rejection is trustworthy enough for the
+// transform to abort before another request. Numeric gating is deferred to the
+// module-side provider-accurate estimator.
+
+export type EmergencyRecoveryOrigin = "provider_overflow" | "proactive_model_shrink";
 
 export interface PersistedOverflowState {
     /** Provider-reported context limit from the overflow error; 0 means none detected. */
     detectedContextLimit: number;
     /** Model key that produced the detected limit, when known. */
     detectedContextLimitModelKey: string | null;
-    /** True while recovery is still required after an overflow. */
+    /** True while emergency recovery is still required. */
     needsEmergencyRecovery: boolean;
+    /** Why recovery was armed; null for unarmed or untyped legacy state. */
+    emergencyRecoveryOrigin: EmergencyRecoveryOrigin | null;
 }
 
 function normalizeDetectedLimitModelKey(modelKey: string | null | undefined): string | null {
     return typeof modelKey === "string" && modelKey.length > 0 ? modelKey : null;
+}
+
+function normalizeEmergencyRecoveryOrigin(value: unknown): EmergencyRecoveryOrigin | null {
+    return value === "provider_overflow" || value === "proactive_model_shrink" ? value : null;
 }
 
 export function getOverflowState(
@@ -1623,13 +1628,14 @@ export function getOverflowState(
 ): PersistedOverflowState {
     const result = db
         .prepare(
-            "SELECT detected_context_limit, detected_context_limit_model_key, needs_emergency_recovery FROM session_meta WHERE session_id = ?",
+            "SELECT detected_context_limit, detected_context_limit_model_key, needs_emergency_recovery, emergency_recovery_origin FROM session_meta WHERE session_id = ?",
         )
         .get(sessionId) as
         | {
               detected_context_limit?: number;
               detected_context_limit_model_key?: string | null;
               needs_emergency_recovery?: number;
+              emergency_recovery_origin?: string | null;
           }
         | undefined;
     if (!result) {
@@ -1637,6 +1643,7 @@ export function getOverflowState(
             detectedContextLimit: 0,
             detectedContextLimitModelKey: null,
             needsEmergencyRecovery: false,
+            emergencyRecoveryOrigin: null,
         };
     }
     const storedModelKey = normalizeDetectedLimitModelKey(result.detected_context_limit_model_key);
@@ -1651,34 +1658,42 @@ export function getOverflowState(
             : true;
     const needs =
         typeof result.needs_emergency_recovery === "number" && result.needs_emergency_recovery > 0;
+    const persistedOrigin = normalizeEmergencyRecoveryOrigin(result.emergency_recovery_origin);
+    // Legacy provider-overflow rows predate the origin column. A positive detected
+    // limit is provider proof; an untyped flag without one is not abort-eligible.
+    const recoveryOrigin = needs
+        ? (persistedOrigin ?? (limit > 0 ? "provider_overflow" : null))
+        : null;
     return {
         detectedContextLimit: modelMatches ? limit : 0,
         detectedContextLimitModelKey: storedModelKey,
         needsEmergencyRecovery: needs,
+        emergencyRecoveryOrigin: recoveryOrigin,
     };
 }
 
 /**
- * Record that a provider reported an overflow. Sets the recovery flag
- * unconditionally; also persists the real limit if one was extracted from the
- * error message. Transactional so the two fields always agree.
+ * Arm emergency recovery with its source. Provider overflow is the default;
+ * proactive model-shrink callers must pass that origin explicitly. A parsed
+ * provider limit is persisted transactionally with the arm.
  */
 export function recordOverflowDetected(
     db: Database,
     sessionId: string,
     reportedLimit: number | undefined,
     modelKey?: string | null,
+    origin: EmergencyRecoveryOrigin = "provider_overflow",
 ): void {
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
         if (typeof reportedLimit === "number" && reportedLimit > 0) {
             db.prepare(
-                "UPDATE session_meta SET detected_context_limit = ?, detected_context_limit_model_key = ?, needs_emergency_recovery = 1, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
-            ).run(reportedLimit, normalizeDetectedLimitModelKey(modelKey), sessionId);
+                "UPDATE session_meta SET detected_context_limit = ?, detected_context_limit_model_key = ?, needs_emergency_recovery = 1, emergency_recovery_origin = ?, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
+            ).run(reportedLimit, normalizeDetectedLimitModelKey(modelKey), origin, sessionId);
         } else {
             db.prepare(
-                "UPDATE session_meta SET needs_emergency_recovery = 1, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
-            ).run(sessionId);
+                "UPDATE session_meta SET needs_emergency_recovery = 1, emergency_recovery_origin = ?, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
+            ).run(origin, sessionId);
         }
     })();
 }
@@ -1710,11 +1725,11 @@ export function clearEmergencyRecovery(db: Database, sessionId: string): void {
         ensureSessionMetaRow(db, sessionId);
         try {
             db.prepare(
-                "UPDATE session_meta SET needs_emergency_recovery = 0, recovery_no_eligible_head_count = 0 WHERE session_id = ?",
+                "UPDATE session_meta SET needs_emergency_recovery = 0, emergency_recovery_origin = '', recovery_no_eligible_head_count = 0 WHERE session_id = ?",
             ).run(sessionId);
         } catch {
             db.prepare(
-                "UPDATE session_meta SET needs_emergency_recovery = 0 WHERE session_id = ?",
+                "UPDATE session_meta SET needs_emergency_recovery = 0, emergency_recovery_origin = '' WHERE session_id = ?",
             ).run(sessionId);
         }
     })();

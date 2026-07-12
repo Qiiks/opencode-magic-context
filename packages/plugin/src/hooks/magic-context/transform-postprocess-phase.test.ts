@@ -35,7 +35,6 @@ import {
     abortSessionFailClosed,
     checkM0MutationDriftAndSignal,
     clearPendingCompactionMarkerAfterSuccessfulDrain,
-    EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE,
     evaluateEmergencyFailClosed,
     finalizeMessageRepresentation,
     runPostTransformPhase,
@@ -399,66 +398,48 @@ describe("deferred compaction marker CAS drain", () => {
 });
 
 describe("emergency fail-closed decision", () => {
-    it("does not abort when the final transformed wire is under the input cap", () => {
+    it("aborts provider-proven overflow in the emergency band when no fold landed", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 95,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+            }),
+        ).toEqual({ shouldAbort: true, reason: "provider-overflow-abort" });
+    });
+
+    it("allows provider-proven recovery when a historian fold materialized this pass", () => {
         expect(
             evaluateEmergencyFailClosed({
                 usagePercentage: 108,
-                finalWireInputTokens: 96_000,
-                trustedInputLimitTokens: 100_000,
-                emergencyRecoveryArmed: false,
-                usagePercentageSynthetic: false,
-            }).shouldAbort,
-        ).toBe(false);
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: true,
+            }),
+        ).toEqual({ shouldAbort: false, reason: "proceed" });
     });
 
-    it("does not abort a marginal over-estimate inside the estimator margin", () => {
-        const decision = evaluateEmergencyFailClosed({
-            usagePercentage: 103,
-            finalWireInputTokens: 103_000,
-            trustedInputLimitTokens: 100_000,
-            emergencyRecoveryArmed: false,
-            usagePercentageSynthetic: false,
-        });
-
-        expect(EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE).toBe(5);
-        expect(decision.errorMarginTokens).toBe(5_000);
-        expect(decision.shouldAbort).toBe(false);
-    });
-
-    it("uses the numeric final wire regardless of fold-publication state", () => {
+    it("never aborts proactive model-shrink recovery", () => {
         expect(
             evaluateEmergencyFailClosed({
                 usagePercentage: 112,
-                finalWireInputTokens: 108_000,
-                trustedInputLimitTokens: 100_000,
-                emergencyRecoveryArmed: false,
-                usagePercentageSynthetic: false,
-            }).shouldAbort,
-        ).toBe(true);
-        expect(
-            evaluateEmergencyFailClosed({
-                usagePercentage: 112,
-                finalWireInputTokens: 90_000,
-                trustedInputLimitTokens: 100_000,
-                emergencyRecoveryArmed: false,
-                usagePercentageSynthetic: false,
-            }).shouldAbort,
-        ).toBe(false);
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "proactive_model_shrink",
+                foldMaterializedThisPass: false,
+            }),
+        ).toEqual({ shouldAbort: false, reason: "proceed" });
     });
 
-    it("aborts armed synthetic recovery when no trusted input cap exists", () => {
-        const decision = evaluateEmergencyFailClosed({
-            usagePercentage: 95,
-            finalWireInputTokens: undefined,
-            trustedInputLimitTokens: undefined,
-            emergencyRecoveryArmed: true,
-            usagePercentageSynthetic: true,
-        });
-
-        expect(decision).toMatchObject({
-            shouldAbort: true,
-            reason: "untrusted-recovery",
-        });
+    it("does not abort below the emergency band", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 94.9,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+            }),
+        ).toEqual({ shouldAbort: false, reason: "below-emergency-band" });
     });
 });
 
@@ -558,17 +539,7 @@ describe("postprocess emergency drop accounting", () => {
             const estimate = estimateMessageTokens(message);
             return total + estimate.conversation + estimate.toolCall;
         }, 0);
-        const finalInputTokens = 10_000 + finalMessageTokens;
-        const decision = () =>
-            evaluateEmergencyFailClosed({
-                usagePercentage: 108,
-                finalWireInputTokens: finalInputTokens,
-                trustedInputLimitTokens: finalInputTokens + 5_000,
-                emergencyRecoveryArmed: false,
-                usagePercentageSynthetic: false,
-            });
-        expect(decision().shouldAbort).toBe(false);
-        expect(decision().shouldAbort).toBe(false);
+        expect(finalMessageTokens).toBeGreaterThan(0);
     });
 
     it("reports estimated tokens reclaimed by successful emergency tool drops", async () => {

@@ -3252,7 +3252,15 @@ function sendPiIgnoredNotification(
 		.ui?.notify;
 	if (typeof uiNotify === "function") {
 		try {
-			void uiNotify.call(ctx.ui, message);
+			const result = uiNotify.call(ctx.ui, message);
+			if (
+				result &&
+				typeof (result as PromiseLike<unknown>).then === "function"
+			) {
+				void Promise.resolve(result).catch((error) =>
+					sessionLog("pi", "UI notification rejected:", error),
+				);
+			}
 			return;
 		} catch {
 			// Fall through to session log below.

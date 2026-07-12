@@ -8,7 +8,6 @@ import {
     type FinalWireTokenEstimate,
 } from "./final-wire-token-estimate";
 import type { MessageLike } from "./tag-messages";
-import { evaluateEmergencyFailClosed } from "./transform-postprocess-phase";
 
 const MODEL = { providerID: "test-provider", modelID: "test-model", agentName: "build" };
 
@@ -38,18 +37,8 @@ function toolMessage(output: string): MessageLike {
     } as unknown as MessageLike;
 }
 
-function decide(finalWireInputTokens: number, inputLimit: number) {
-    return evaluateEmergencyFailClosed({
-        usagePercentage: 108,
-        finalWireInputTokens,
-        trustedInputLimitTokens: inputLimit,
-        emergencyRecoveryArmed: false,
-        usagePercentageSynthetic: false,
-    });
-}
-
 describe("final outgoing-wire token estimate", () => {
-    it("sees a flushed pending drop on every repeated aborted-pass retry", () => {
+    it("reflects a flushed pending drop in telemetry", () => {
         const largeOutput = Array.from({ length: 40_000 }, (_, index) => `token_${index}`).join(
             " ",
         );
@@ -62,24 +51,18 @@ describe("final outgoing-wire token estimate", () => {
         expect(beforeDrop.trusted).toBe(true);
         expect(afterDrop.tokens).toBeLessThan(inputLimit);
         expect(beforeDrop.tokens).toBeGreaterThan(inputLimit * 1.05);
-        expect(decide(beforeDrop.tokens, inputLimit).shouldAbort).toBe(true);
-        expect(decide(afterDrop.tokens, inputLimit).shouldAbort).toBe(false);
-        expect(decide(afterDrop.tokens, inputLimit).shouldAbort).toBe(false);
     });
 
-    it("aborts a zero-trim rebuilt fold because the final wire stayed over", () => {
+    it("reports telemetry for an unchanged rebuilt fold", () => {
         const unchanged = estimate([
             toolMessage(Array.from({ length: 20_000 }, (_, index) => `fold_${index}`).join(" ")),
         ]);
         const inputLimit = Math.floor(unchanged.tokens / 1.1);
 
-        expect(decide(unchanged.tokens, inputLimit)).toMatchObject({
-            shouldAbort: true,
-            reason: "numeric-overflow",
-        });
+        expect(unchanged.tokens).toBeGreaterThan(inputLimit);
     });
 
-    it("allows a completed recomp refresh whose final messages are actually trimmed", () => {
+    it("reports a compact completed recomp refresh", () => {
         const trimmed = estimate([
             {
                 info: { id: "summary", role: "user" },
@@ -89,9 +72,7 @@ describe("final outgoing-wire token estimate", () => {
             } as MessageLike,
         ]);
 
-        expect(decide(trimmed.tokens, trimmed.tokens + 5_000)).toMatchObject({
-            shouldAbort: false,
-            reason: "numeric-safe",
-        });
+        expect(trimmed.trusted).toBe(true);
+        expect(trimmed.messageTokens.conversation).toBeGreaterThan(0);
     });
 });

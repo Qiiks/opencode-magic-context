@@ -2232,6 +2232,43 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("handles a rejected asynchronous emergency notification", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-emergency-notice-reject";
+		try {
+			updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				scheduler: { executeThresholdPercentage: 65 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const notify = mock(async () => {
+				throw new Error("toast unavailable");
+			});
+			const messages = [userMessage("continue", 1)] as never[];
+
+			await handler({ messages }, {
+				...fakeContext(sessionId, process.cwd(), ["entry-1"], messages),
+				ui: { notify },
+				getContextUsage: () => ({
+					tokens: 85_000,
+					percent: 85,
+					contextWindow: 100_000,
+				}),
+			} as never);
+			await Promise.resolve();
+
+			expect(notify).toHaveBeenCalledTimes(1);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("disarms emergency recovery only after real pressure falls below the force threshold", async () => {
 		async function runRecoveryPass(sessionId: string, tokens: number) {
 			const db = createTestDb();

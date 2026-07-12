@@ -37,6 +37,10 @@ import {
     updateSessionMeta,
     updateTagStatus,
 } from "../../features/magic-context/storage";
+import {
+    getEmergencyInputSample,
+    setEmergencyDropSample,
+} from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
 import { recordToolDefinition } from "../../features/magic-context/tool-definition-tokens";
 import type { ContextUsage } from "../../features/magic-context/types";
@@ -2418,7 +2422,7 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         });
         await seedNewModelLimit(272_000);
 
-        const { transform } = makeTransform(db, "ses-shrink", NEW_MODEL, {
+        const { transform, abort } = makeTransform(db, "ses-shrink", NEW_MODEL, {
             percentage: 58,
             inputTokens: 300_000,
         });
@@ -2431,6 +2435,42 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         expect(overflow.needsEmergencyRecovery).toBe(true);
         // Flag-only: no catalog/auth limit pinned into detected_context_limit.
         expect(overflow.detectedContextLimit).toBe(0);
+        expect(overflow.emergencyRecoveryOrigin).toBe("proactive_model_shrink");
+        expect(abort).not.toHaveBeenCalled();
+    });
+
+    it("does not abort a stale proactive arm after restart zeroed the input sample", async () => {
+        useTempDataHome("transform-shrink-switch-stale-restart-");
+        const sessionId = "ses-stale-proactive";
+        createOpenCodeDbForTransform(sessionId, [{ id: "m-raw-1", role: "user", text: "recent" }]);
+        const db = openDatabase();
+        recordOverflowDetected(db, sessionId, undefined, NEW_KEY, "proactive_model_shrink");
+
+        const { transform, abort } = makeTransform(db, sessionId, NEW_MODEL, {
+            percentage: 0,
+            inputTokens: 0,
+        });
+        await transform(
+            {},
+            {
+                messages: [
+                    {
+                        info: {
+                            id: "m-user-restart",
+                            role: "user",
+                            sessionID: sessionId,
+                            model: NEW_MODEL,
+                        },
+                        parts: [{ type: "text", text: "continue" }],
+                    },
+                ],
+            },
+        );
+
+        expect(getOverflowState(db, sessionId).emergencyRecoveryOrigin).toBe(
+            "proactive_model_shrink",
+        );
+        expect(abort).not.toHaveBeenCalled();
     });
 
     it("does not arm on a normal SAME-model turn whose input fits the model", async () => {
@@ -2790,7 +2830,7 @@ describe("createTransform historian failure handling", () => {
         expect(emergencyNotifications).toHaveLength(0);
     });
 
-    it("notifies before awaiting self-abort when post-drop input is clearly over the model limit", async () => {
+    it("notifies before awaiting self-abort for provider-proven overflow", async () => {
         useTempDataHome("transform-fail-closed-order-");
         const sessionId = "ses-fail-closed-order";
         createOpenCodeDbForTransform(sessionId, [{ id: "m-raw-1", role: "user", text: "recent" }]);
@@ -2813,6 +2853,8 @@ describe("createTransform historian failure handling", () => {
         });
         const db = openDatabase();
         updateSessionMeta(db, sessionId, { systemPromptTokens: 110_000 });
+        recordOverflowDetected(db, sessionId, 100_000, "test-provider/emergency-100k");
+        setEmergencyDropSample(db, sessionId, 110_000);
         const order: string[] = [];
         const prompt = mock(async () => {
             order.push("notify");
@@ -2886,6 +2928,7 @@ describe("createTransform historian failure handling", () => {
             path: { id: sessionId },
             throwOnError: true,
         });
+        expect(getEmergencyInputSample(db, sessionId)).toBe(0);
         const notificationInput = prompt.mock.calls[0]?.[0] as {
             body?: { parts?: Array<{ text?: string }> };
         };

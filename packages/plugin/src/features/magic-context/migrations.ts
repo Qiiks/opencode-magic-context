@@ -1907,6 +1907,15 @@ const MIGRATIONS: Migration[] = [
             healAllNullColumns(db);
         },
     },
+    {
+        version: 52,
+        description: "persist emergency recovery origin",
+        up(db: Database): void {
+            if (tableExists(db, "session_meta")) {
+                ensureColumn(db, "session_meta", "emergency_recovery_origin", "TEXT DEFAULT ''");
+            }
+        },
+    },
 ];
 
 /**

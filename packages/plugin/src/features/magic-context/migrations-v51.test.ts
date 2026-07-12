@@ -28,7 +28,7 @@ describe("migration v51 — durable backfill state and strict healing", () => {
             expect(migrationRecorded(db, 51)).toBe(true);
 
             db.exec(`
-                DELETE FROM schema_migrations WHERE version = 51;
+                DELETE FROM schema_migrations WHERE version >= 51;
                 DROP TABLE tool_owner_backfill_state;
             `);
             db.prepare("INSERT INTO session_meta (session_id, cache_ttl) VALUES (?, NULL)").run(
@@ -74,7 +74,7 @@ describe("migration v51 — durable backfill state and strict healing", () => {
             initializeDatabase(db);
             runMigrations(db);
             db.exec(`
-                DELETE FROM schema_migrations WHERE version = 51;
+                DELETE FROM schema_migrations WHERE version >= 51;
                 DROP TABLE tool_owner_backfill_state;
             `);
 

@@ -221,6 +221,8 @@ export interface PostTransformPhaseResult {
     explicitMaterializedSuccessfully: boolean;
     deferredMaterializedSuccessfully: boolean;
     materialized: boolean;
+    /** True only when this pass consumed newly folded historian history. */
+    historianFoldMaterializedThisPass: boolean;
     materializeReason: string | null;
     droppedTokens: number;
     emergencyReclaimedTokens: number;
@@ -228,12 +230,6 @@ export interface PostTransformPhaseResult {
     emergency: boolean;
     bustedThisPass: boolean;
 }
-
-/**
- * The final-wire estimate cannot model every provider framing token. Require a
- * five-percent overshoot before breaking a turn when a trusted input cap exists.
- */
-export const EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE = 5;
 
 export interface ConfirmedAbortClient {
     session?: {
@@ -264,44 +260,28 @@ export async function abortSessionFailClosed(
 
 export interface EmergencyFailClosedDecision {
     shouldAbort: boolean;
-    errorMarginTokens: number;
-    reason: "below-emergency-band" | "numeric-safe" | "numeric-overflow" | "untrusted-recovery";
+    reason: "below-emergency-band" | "provider-overflow-abort" | "proceed";
 }
 
 export function evaluateEmergencyFailClosed(input: {
     usagePercentage: number;
-    finalWireInputTokens: number | undefined;
-    trustedInputLimitTokens: number | undefined;
     emergencyRecoveryArmed: boolean;
-    usagePercentageSynthetic: boolean;
+    emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null;
+    foldMaterializedThisPass: boolean;
 }): EmergencyFailClosedDecision {
     if (input.usagePercentage < 95) {
-        return { shouldAbort: false, errorMarginTokens: 0, reason: "below-emergency-band" };
+        return { shouldAbort: false, reason: "below-emergency-band" };
     }
-    const modelLimitTokens = input.trustedInputLimitTokens ?? 0;
-    const errorMarginTokens =
-        modelLimitTokens > 0
-            ? Math.ceil(modelLimitTokens * (EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE / 100))
-            : 0;
-    if (
-        input.finalWireInputTokens !== undefined &&
-        Number.isFinite(input.finalWireInputTokens) &&
-        modelLimitTokens > 0
-    ) {
-        const shouldAbort = input.finalWireInputTokens > modelLimitTokens + errorMarginTokens;
-        return {
-            shouldAbort,
-            errorMarginTokens,
-            reason: shouldAbort ? "numeric-overflow" : "numeric-safe",
-        };
-    }
-    // A real provider overflow already proved the turn unsafe. If restart state
-    // erased the measured input or only a combined context window is known, a
-    // guessed boundary can make the abort unreachable; stop conservatively.
+    // Inside messages.transform, only the provider's own rejection proves that
+    // this turn shape overflows. Local numeric estimates remain telemetry until
+    // module-side accounting can reproduce provider-accurate framing.
+    const shouldAbort =
+        input.emergencyRecoveryArmed &&
+        input.emergencyRecoveryOrigin === "provider_overflow" &&
+        !input.foldMaterializedThisPass;
     return {
-        shouldAbort: input.emergencyRecoveryArmed,
-        errorMarginTokens,
-        reason: "untrusted-recovery",
+        shouldAbort,
+        reason: shouldAbort ? "provider-overflow-abort" : "proceed",
     };
 }
 
@@ -1475,6 +1455,7 @@ export async function runPostTransformPhase(
         explicitMaterializedSuccessfully,
         deferredMaterializedSuccessfully,
         materialized,
+        historianFoldMaterializedThisPass: historyWasConsumedThisPass,
         materializeReason,
         droppedTokens,
         emergencyReclaimedTokens,
