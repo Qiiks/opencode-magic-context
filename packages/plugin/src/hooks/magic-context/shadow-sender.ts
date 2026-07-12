@@ -54,6 +54,8 @@ const CONNECT_BACKOFF_INITIAL_MS = 1_000;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
+const SHADOW_SEND_TIMEOUT_MS = 15_000;
+const SHADOW_QUEUE_MAX_DEPTH = 2;
 const RESEED_COOLDOWN_MS = 30 * 60 * 1_000;
 const RESEED_ATTEMPT_CAP = 5;
 
@@ -111,6 +113,7 @@ export interface ShadowTransport {
         projectRoot: string;
         method: "shadow_reset" | "state_sync" | "shadow_transform";
         body: unknown;
+        signal?: AbortSignal;
     }): Promise<unknown>;
     closeSession?(sessionId: string): void;
 }
@@ -120,12 +123,14 @@ export interface ShadowSender {
     resetSession(sessionId: string, reason: string): void;
     clearSession(sessionId: string): void;
     getStats(sessionId: string): Readonly<ShadowSenderCounters>;
+    getQueueDepth(sessionId: string): number;
 }
 
 interface ShadowSenderCounters {
     enqueued: number;
     dropped_oldest: number;
     send_failures: number;
+    send_timeouts: number;
     connection_skips: number;
     ordinal_unresolved: number;
     ordinal_mismatch: number;
@@ -228,6 +233,7 @@ function emptyCounters(): ShadowSenderCounters {
         enqueued: 0,
         dropped_oldest: 0,
         send_failures: 0,
+        send_timeouts: 0,
         connection_skips: 0,
         ordinal_unresolved: 0,
         ordinal_mismatch: 0,
@@ -961,7 +967,14 @@ function isSeedBoundaryReject(error: unknown): boolean {
 
 function isConnectionFailure(error: unknown): boolean {
     const code = errorCode(error);
-    if (code === "ENOENT" || code === "ECONNREFUSED" || code === "ECONNRESET") return true;
+    if (
+        code === "ENOENT" ||
+        code === "ECONNREFUSED" ||
+        code === "ECONNRESET" ||
+        code === "ETIMEDOUT"
+    ) {
+        return true;
+    }
     const text = error instanceof Error ? error.message : String(error);
     return text.includes("backoff") || text.includes("connection") || text.includes("ECONN");
 }
@@ -1029,12 +1042,16 @@ export function createShadowSender(
         now?: () => number;
         reseedCooldownMs?: number;
         reseedAttemptCap?: number;
+        sendTimeoutMs?: number;
+        queueMaxDepth?: number;
     } = {},
 ): ShadowSender {
     const transport = options.transport ?? new SubcShadowTransport();
     const now = options.now ?? Date.now;
     const reseedCooldownMs = options.reseedCooldownMs ?? RESEED_COOLDOWN_MS;
     const reseedAttemptCap = options.reseedAttemptCap ?? RESEED_ATTEMPT_CAP;
+    const sendTimeoutMs = Math.max(1, options.sendTimeoutMs ?? SHADOW_SEND_TIMEOUT_MS);
+    const queueMaxDepth = Math.max(1, options.queueMaxDepth ?? SHADOW_QUEUE_MAX_DEPTH);
     const sessions = new Map<string, SessionQueueState>();
     const subagentSessions = new Set<string>();
 
@@ -1059,24 +1076,57 @@ export function createShadowSender(
 
     const pushWork = (sessionId: string, work: ShadowWorkItem): void => {
         const state = getState(sessionId);
+        let dropped = 0;
         if (work.kind === "pass") {
             state.counters.enqueued += 1;
-            let dropped = 0;
+            // A queued pass is also the pending state-sync/seed unit: its large
+            // payload is built only after dequeue. Superseding the whole pass here
+            // guarantees that a stalled send can retain at most one newer snapshot.
             for (let index = state.queue.length - 1; index >= 0; index -= 1) {
                 if (state.queue[index]?.kind !== "pass") continue;
                 state.queue.splice(index, 1);
                 dropped += 1;
             }
-            if (dropped > 0) {
-                state.counters.dropped_oldest += dropped;
-                sessionLog(
-                    sessionId,
-                    `shadow: dropped ${dropped} stale queued pass${dropped === 1 ? "" : "es"}`,
-                );
-            }
         }
         state.queue.push(work);
+        while (state.queue.length > queueMaxDepth) {
+            const oldestNonEssential = state.queue.findIndex(
+                (item, index) => item.kind === "pass" && index < state.queue.length - 1,
+            );
+            state.queue.splice(oldestNonEssential >= 0 ? oldestNonEssential : 0, 1);
+            dropped += 1;
+        }
+        // Shadow comparison is best-effort instrumentation. A counter is enough
+        // to diagnose pressure without turning each dropped pass into log traffic.
+        state.counters.dropped_oldest += dropped;
         schedule(sessionId);
+    };
+
+    const callTransport = async (
+        state: SessionQueueState,
+        args: Parameters<ShadowTransport["call"]>[0],
+    ): Promise<unknown> => {
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+                state.counters.send_timeouts += 1;
+                const error = new Error(`shadow send timeout after ${sendTimeoutMs}ms`) as Error & {
+                    code?: string;
+                };
+                error.code = "ETIMEDOUT";
+                controller.abort(error);
+                reject(error);
+            }, sendTimeoutMs);
+        });
+        try {
+            return await Promise.race([
+                transport.call({ ...args, signal: controller.signal }),
+                timeout,
+            ]);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
     };
 
     const runQueue = async (sessionId: string, state: SessionQueueState): Promise<void> => {
@@ -1129,7 +1179,7 @@ export function createShadowSender(
     }): Promise<void> => {
         const projectRoot = args.projectRoot ?? process.cwd();
         const body = toFlatWireBody(buildShadowResetBody(args));
-        const response = await transport.call({
+        const response = await callTransport(args.state, {
             sessionId: args.sessionId,
             projectRoot,
             method: "shadow_reset",
@@ -1308,7 +1358,7 @@ export function createShadowSender(
         if (syncPayload !== null) {
             let response: unknown;
             try {
-                response = await transport.call({
+                response = await callTransport(state, {
                     sessionId: pass.sessionId,
                     projectRoot: pass.projectRoot,
                     method: "state_sync",
@@ -1339,7 +1389,7 @@ export function createShadowSender(
         const transformBody = toFlatWireBody(
             buildShadowTransformBody({ pass: preparedPass, state }),
         );
-        const response = await transport.call({
+        const response = await callTransport(state, {
             sessionId: pass.sessionId,
             projectRoot: pass.projectRoot,
             method: "shadow_transform",
@@ -1406,6 +1456,9 @@ export function createShadowSender(
         getStats(sessionId: string): Readonly<ShadowSenderCounters> {
             return { ...getState(sessionId).counters };
         },
+        getQueueDepth(sessionId: string): number {
+            return getState(sessionId).queue.length;
+        },
     };
 }
 
@@ -1416,7 +1469,7 @@ class SubcShadowTransport implements ShadowTransport {
     private reader: SocketReader | null = null;
     private nextCorr = 1;
     private routes = new Map<string, number>();
-    private pending = Promise.resolve();
+    private activeSession: string | null = null;
     private nextProbeMs = 0;
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
     private requestTimeoutMs: number;
@@ -1436,21 +1489,36 @@ class SubcShadowTransport implements ShadowTransport {
         projectRoot: string;
         method: "shadow_reset" | "state_sync" | "shadow_transform";
         body: unknown;
+        signal?: AbortSignal;
     }): Promise<unknown> {
-        const run = async (): Promise<unknown> => {
+        // Never serialize shadow calls by chaining promises: each waiting closure
+        // would retain its full wire body behind one stalled socket. This lane is
+        // best-effort, so rejecting concurrent work is safer than buffering it.
+        if (this.activeSession !== null) {
+            const error = new Error("shadow transport busy; work dropped") as Error & {
+                code?: string;
+            };
+            error.code = "EBUSY";
+            throw error;
+        }
+        if (args.signal?.aborted) throw args.signal.reason;
+
+        this.activeSession = args.sessionId;
+        const onAbort = () => this.invalidateConnection();
+        args.signal?.addEventListener("abort", onAbort, { once: true });
+        try {
             const route = await this.ensureRoute(args.sessionId, args.projectRoot);
+            if (args.signal?.aborted) throw args.signal.reason;
             return await this.unaryJson(route, args.body);
-        };
-        const next = this.pending.then(run, run);
-        this.pending = next.then(
-            () => undefined,
-            () => undefined,
-        );
-        return next;
+        } finally {
+            args.signal?.removeEventListener("abort", onAbort);
+            this.activeSession = null;
+        }
     }
 
     closeSession(sessionId: string): void {
         this.routes.delete(sessionId);
+        if (this.activeSession === sessionId) this.invalidateConnection();
     }
 
     private async ensureRoute(sessionId: string, projectRoot: string): Promise<number> {

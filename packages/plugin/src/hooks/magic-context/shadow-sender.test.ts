@@ -228,6 +228,43 @@ class FakeTransport implements ShadowTransport {
     }
 }
 
+class StallingSyncTransport implements ShadowTransport {
+    methods: string[] = [];
+    transformBodies: unknown[] = [];
+    retainedBody: unknown | null = null;
+    private stalled = false;
+    private seq = 0;
+
+    async call(req: {
+        method: "shadow_reset" | "state_sync" | "shadow_transform";
+        body: unknown;
+        signal?: AbortSignal;
+    }): Promise<unknown> {
+        this.methods.push(req.method);
+        if (req.method === "shadow_reset") {
+            this.seq = 0;
+            return { result: { shadow_generation: 1, shadow_seq: 0 } };
+        }
+        if (req.method === "state_sync" && !this.stalled) {
+            this.stalled = true;
+            this.retainedBody = req.body;
+            return await new Promise((_, reject) => {
+                req.signal?.addEventListener(
+                    "abort",
+                    () => {
+                        this.retainedBody = null;
+                        reject(req.signal?.reason ?? new Error("aborted"));
+                    },
+                    { once: true },
+                );
+            });
+        }
+        this.seq += 1;
+        if (req.method === "shadow_transform") this.transformBodies.push(req.body);
+        return { result: { shadow_seq: this.seq, quarantined: false } };
+    }
+}
+
 class FakeSocket extends EventEmitter {
     destroyed = false;
     onWrite: ((chunk: Buffer) => void) | null = null;
@@ -493,7 +530,7 @@ describe("shadow sender", () => {
         expect(sender.getStats(sessionId).transforms_sent).toBe(1);
     });
 
-    it("keeps only the newest unsent pass per session", async () => {
+    it("coalesces pending state-sync work into the newest unsent pass", async () => {
         useTempDataHome("shadow-fifo-");
         const sessionId = "s-fifo";
         createOpenCodeDb(sessionId, [
@@ -518,6 +555,7 @@ describe("shadow sender", () => {
                 }),
             );
         }
+        expect(sender.getQueueDepth(sessionId)).toBe(1);
         expect(sender.getStats(sessionId).dropped_oldest).toBe(1);
         transport.releaseReset?.();
         await waitFor(
@@ -530,6 +568,7 @@ describe("shadow sender", () => {
             .filter((call) => call.method === "shadow_transform")
             .map((call) => (call.body as { pass_inputs: { now_ms: number } }).pass_inputs.now_ms);
         expect(sentNowMs).toEqual([1, 3]);
+        expect(transport.calls.filter((call) => call.method === "state_sync")).toHaveLength(1);
         const firstTransformIndex = transport.calls.findIndex(
             (call) => call.method === "shadow_transform",
         );
@@ -542,6 +581,98 @@ describe("shadow sender", () => {
             .map((call) => call.body as { seed_pass: boolean });
         expect(transformBodies[0].seed_pass).toBe(true);
         expect(transformBodies.slice(1).every((body) => body.seed_pass === false)).toBe(true);
+    });
+
+    it("keeps the per-session queue within its absolute bound and preserves the newest pass", async () => {
+        useTempDataHome("shadow-queue-bound-");
+        const sessionId = "s-queue-bound";
+        createOpenCodeDb(
+            sessionId,
+            Array.from({ length: 8 }, (_, index) => ({
+                id: `m${index + 1}`,
+                role: "user",
+                text: String(index + 1),
+            })),
+        );
+        const db = openDatabase();
+        const transport = new FakeTransport();
+        transport.blockFirstReset();
+        const sender = createShadowSender({ transport, queueMaxDepth: 1 });
+
+        for (let index = 1; index <= 8; index += 1) {
+            const msg = message(sessionId, `m${index}`, String(index));
+            sender.enqueue(
+                basePass({
+                    db,
+                    sessionId,
+                    inputMessages: [msg],
+                    outputMessages: [msg],
+                    nowMs: index,
+                }),
+            );
+        }
+
+        expect(sender.getQueueDepth(sessionId)).toBe(1);
+        expect(sender.getStats(sessionId).dropped_oldest).toBe(6);
+        transport.releaseReset?.();
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 2,
+        );
+        const sentNowMs = transport.calls
+            .filter((call) => call.method === "shadow_transform")
+            .map((call) => (call.body as { pass_inputs: { now_ms: number } }).pass_inputs.now_ms);
+        expect(sentNowMs).toEqual([1, 8]);
+    });
+
+    it("times out a stalled sync, releases its payload, and drains the bounded latest pass", async () => {
+        useTempDataHome("shadow-stalled-sync-");
+        const sessionId = "s-stalled-sync";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", text: "one" },
+            { id: "m2", role: "user", text: "two" },
+            { id: "m3", role: "user", text: "three" },
+        ]);
+        const db = openDatabase();
+        const transport = new StallingSyncTransport();
+        const sender = createShadowSender({ transport, sendTimeoutMs: 20, queueMaxDepth: 1 });
+        const pass = (index: number) => {
+            const msg = message(sessionId, `m${index}`, String(index));
+            return basePass({
+                db,
+                sessionId,
+                inputMessages: [msg],
+                outputMessages: [msg],
+                nowMs: index,
+            });
+        };
+
+        sender.enqueue(pass(1));
+        await waitFor(() => transport.retainedBody !== null);
+        sender.enqueue(pass(2));
+        sender.enqueue(pass(3));
+
+        expect(sender.getQueueDepth(sessionId)).toBe(1);
+        expect(sender.getStats(sessionId).dropped_oldest).toBe(1);
+        await waitFor(() => sender.getStats(sessionId).transforms_sent === 1);
+
+        expect(sender.getStats(sessionId).send_timeouts).toBe(1);
+        expect(transport.retainedBody).toBeNull();
+        expect(sender.getQueueDepth(sessionId)).toBe(0);
+        expect(transport.methods).toEqual([
+            "shadow_reset",
+            "state_sync",
+            "shadow_reset",
+            "state_sync",
+            "shadow_transform",
+        ]);
+        const compared = transport.transformBodies[0] as {
+            pass_inputs: { now_ms: number };
+            input: Array<{ info: { id: string } }>;
+            ts_output: Array<{ info: { id: string } }>;
+        };
+        expect(compared.pass_inputs.now_ms).toBe(3);
+        expect(compared.input.map((entry) => entry.info.id)).toEqual(["m3"]);
+        expect(compared.ts_output.map((entry) => entry.info.id)).toEqual(["m3"]);
     });
 
     it("uses id-only and point readers across ordinal, declared-trim, and state-sync paths", () => {
@@ -1157,6 +1288,43 @@ describe("shadow sender", () => {
             "state_sync",
             "shadow_transform",
         ]);
+    });
+
+    it("drops concurrent transport work instead of retaining bodies behind a stalled call", async () => {
+        const transport = new __shadowSenderTest.SubcShadowTransport(
+            "/unused/connection.json",
+            "magic-context",
+            1_000,
+        );
+        const internals = transport as unknown as {
+            ensureRoute: () => Promise<number>;
+        };
+        let releaseRoute: ((route: number) => void) | undefined;
+        internals.ensureRoute = () =>
+            new Promise((resolve) => {
+                releaseRoute = resolve;
+            });
+        const controller = new AbortController();
+        const first = transport.call({
+            sessionId: "s-busy-one",
+            projectRoot: "/tmp/project",
+            method: "state_sync",
+            body: { large: "first" },
+            signal: controller.signal,
+        });
+
+        await expect(
+            transport.call({
+                sessionId: "s-busy-two",
+                projectRoot: "/tmp/project",
+                method: "state_sync",
+                body: { large: "must-not-queue" },
+            }),
+        ).rejects.toThrow("transport busy");
+
+        controller.abort(new Error("test complete"));
+        releaseRoute?.(1);
+        await expect(first).rejects.toThrow("test complete");
     });
 
     it("destroys a timed-out socket and succeeds immediately on a clean socket", async () => {
