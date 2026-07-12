@@ -109,7 +109,7 @@ import {
     type TagTarget,
     tagMessages,
 } from "./transform-operations";
-import { runPostTransformPhase } from "./transform-postprocess-phase";
+import { evaluateEmergencyFailClosed, runPostTransformPhase } from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
 
 // Per-session message token cache. Keyed by message ID, value is the token
@@ -424,7 +424,6 @@ export interface TransformDeps {
 
 export function createTransform(deps: TransformDeps) {
     const loadedSessions = new Set<string>();
-    const lastEmergencyNotificationCount = new Map<string, number>();
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
@@ -969,10 +968,6 @@ export function createTransform(deps: TransformDeps) {
         const consumingDeferredEarly =
             canConsumeDeferredEarly && deferredHistoryWasPendingAtPassStart;
         const isCacheBusting = historyRefreshExplicitBeforePrepare || consumingDeferredEarly;
-        if (historianFailureState.failureCount === 0) {
-            lastEmergencyNotificationCount.delete(sessionId);
-        }
-
         const notificationParams = deps.getNotificationParams?.(sessionId) ?? {};
         const boundaryContextLimit =
             resolvedContextLimit && resolvedContextLimit > 0
@@ -1104,34 +1099,6 @@ export function createTransform(deps: TransformDeps) {
         ) {
             skipCompartmentAwaitForThisPass = true;
             const emergencyPercentage = contextUsageEarly.percentage.toFixed(1);
-            const abortingClient = deps.client as
-                | {
-                      session?: { abort?: (input: { path: { id: string } }) => Promise<unknown> };
-                  }
-                | undefined;
-            if (typeof abortingClient?.session?.abort === "function") {
-                void abortingClient.session
-                    .abort({ path: { id: sessionId } })
-                    .catch((error: unknown) => {
-                        sessionLog(
-                            sessionId,
-                            "transform: emergency abort failed:",
-                            getErrorMessage(error),
-                        );
-                    });
-            }
-
-            const lastNotifiedCount = lastEmergencyNotificationCount.get(sessionId) ?? 0;
-            if (deps.client && historianFailureState.failureCount > lastNotifiedCount) {
-                lastEmergencyNotificationCount.set(sessionId, historianFailureState.failureCount);
-                void sendIgnoredMessage(
-                    deps.client,
-                    sessionId,
-                    `⚠️ Context Emergency — Context is at ${emergencyPercentage}% and historian has failed ${historianFailureState.failureCount} times (last error: ${truncateHistorianEmergencyError(historianFailureState.lastError)}). Aborting this message to prevent context overflow. Historian will retry automatically. If this persists, change your historian model in magic-context.jsonc and restart OpenCode.`,
-                    notificationParams,
-                );
-            }
-
             const recoveryStarted = startRecoveryRun();
             // If recovery can't start because there is no eligible pre-tail
             // history to compact, the runner no-op that normally counts this
@@ -1153,7 +1120,7 @@ export function createTransform(deps: TransformDeps) {
             }
             sessionLog(
                 sessionId,
-                `EMERGENCY: aborting session at ${emergencyPercentage}%, historian failures: ${historianFailureState.failureCount}`,
+                `EMERGENCY: historian recovery requested at ${emergencyPercentage}%, failures: ${historianFailureState.failureCount}`,
             );
         } else if (
             fullFeatureMode &&
@@ -1791,6 +1758,58 @@ export function createTransform(deps: TransformDeps) {
                 hardSignals: m0HardSignals,
             },
         });
+        // A generic injection-cache rebuild is not proof that the historian
+        // published anything. Count only an awaited publication or a deferred
+        // publication signal that rebuilt a real DB-backed injection as a landed fold.
+        const historianFoldLandedThisPass =
+            compartmentPhase.justAwaitedPublication ||
+            (deferredHistoryWasPendingAtPassStart &&
+                rebuiltHistoryFromInitialPrepare &&
+                pendingCompartmentInjection?.rebuiltFromDb === true);
+        const emergencyModelLimit =
+            resolvedContextLimit ??
+            (emergencyCeilingLimit > 0 ? Math.round(emergencyCeilingLimit) : undefined);
+        const emergencyFailClosed = evaluateEmergencyFailClosed({
+            usagePercentage: contextUsage.percentage,
+            historianFoldLandedThisPass,
+            currentInputTokens: contextUsage.inputTokens,
+            emergencyReclaimedTokens: postTransformResult.emergencyReclaimedTokens,
+            modelLimitTokens: emergencyModelLimit,
+        });
+        if (emergencyFailClosed.shouldAbort && deps.client) {
+            // The notice must finish before self-abort: OpenCode detaches the hook
+            // effect on interruption, so an unawaited notification is lost exactly
+            // when the user most needs recovery instructions.
+            await sendIgnoredMessage(
+                deps.client,
+                sessionId,
+                "Context full — /ctx-flush or /clear to continue.",
+                notificationParams,
+            );
+            const abortingClient = deps.client as {
+                session?: { abort?: (input: { path: { id: string } }) => Promise<unknown> };
+            };
+            if (typeof abortingClient.session?.abort === "function") {
+                try {
+                    // Returning a reduced message array still creates a provider
+                    // request. Awaited self-abort interrupts OpenCode's run before
+                    // that doomed request can be assembled.
+                    await abortingClient.session.abort({ path: { id: sessionId } });
+                } catch (error) {
+                    sessionLog(
+                        sessionId,
+                        "transform: emergency fail-closed abort failed:",
+                        getErrorMessage(error),
+                    );
+                }
+            }
+            sessionLog(
+                sessionId,
+                `EMERGENCY: fail-closed after drops (estimated=${emergencyFailClosed.postDropInputTokens}, limit=${emergencyModelLimit}, margin=${emergencyFailClosed.errorMarginTokens})`,
+            );
+            return;
+        }
+
         if (postTransformResult.bustedThisPass) {
             recordPendingTransformDecision(sessionId, {
                 tsMs: Date.now(),
@@ -2244,13 +2263,4 @@ export function resolveHistoryBudgetTokens(
                 100) *
             historyBudgetPercentage,
     );
-}
-
-function truncateHistorianEmergencyError(error: string | null): string {
-    const normalized = (error ?? "unknown error").replace(/\s+/g, " ").trim();
-    if (normalized.length <= 100) {
-        return normalized;
-    }
-
-    return `${normalized.slice(0, 100)}…`;
 }

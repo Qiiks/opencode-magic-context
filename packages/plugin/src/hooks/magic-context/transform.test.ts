@@ -2641,7 +2641,7 @@ describe("createTransform historian failure handling", () => {
         }
         await new Promise((resolve) => setTimeout(resolve, 0));
 
-        expect(abort).toHaveBeenCalledTimes(2);
+        expect(abort).not.toHaveBeenCalled();
         expect(loadProtectedTailMeta(db, "ses-empty-head-escape").recoveryNoEligibleHeadCount).toBe(
             2,
         );
@@ -2699,13 +2699,13 @@ describe("createTransform historian failure handling", () => {
         }
         await new Promise((resolve) => setTimeout(resolve, 0));
 
-        expect(abort).toHaveBeenCalledTimes(2);
+        expect(abort).not.toHaveBeenCalled();
         expect(
             loadProtectedTailMeta(db, "ses-empty-head-escape-95").recoveryNoEligibleHeadCount,
         ).toBe(2);
     });
 
-    it("aborts at 95% and only sends the emergency notification once per failure count", async () => {
+    it("does not abort solely because historian failures exist at 95%", async () => {
         useTempDataHome("transform-historian-emergency-");
         createOpenCodeDbForTransform("ses-emergency", [
             { id: "m-raw-1", role: "user", text: "recent 1" },
@@ -2785,13 +2785,103 @@ describe("createTransform historian failure handling", () => {
                     (input.body?.parts?.[0]?.text ?? "").includes("Context Emergency"),
             );
 
-        expect(abort).toHaveBeenCalledTimes(3);
-        expect(emergencyNotifications).toHaveLength(2);
-        expect(emergencyNotifications[0]?.body?.parts?.[0]?.text).toContain("96.0%");
-        expect(emergencyNotifications[0]?.body?.parts?.[0]?.text).toContain(
-            "429 rate limit from historian provider",
+        expect(abort).not.toHaveBeenCalled();
+        expect(emergencyNotifications).toHaveLength(0);
+    });
+
+    it("notifies before awaiting self-abort when post-drop input is clearly over the model limit", async () => {
+        useTempDataHome("transform-fail-closed-order-");
+        const sessionId = "ses-fail-closed-order";
+        createOpenCodeDbForTransform(sessionId, [{ id: "m-raw-1", role: "user", text: "recent" }]);
+        await refreshModelLimitsFromApi({
+            config: {
+                providers: async () => ({
+                    data: {
+                        providers: [
+                            {
+                                id: "test-provider",
+                                models: { "emergency-100k": { limit: { input: 100_000 } } },
+                            },
+                        ],
+                    },
+                }),
+            },
+        });
+        const order: string[] = [];
+        const prompt = mock(async () => {
+            order.push("notify");
+            return {};
+        });
+        const abort = mock(async () => {
+            order.push("abort");
+            return {};
+        });
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp", title: "Emergency" } })),
+                prompt,
+                abort,
+            },
+        } as unknown as PluginContext["client"];
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: mock(() => "defer" as const) },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    {
+                        usage: { percentage: 110, inputTokens: 110_000 },
+                        updatedAt: Date.now(),
+                    },
+                ],
+            ]),
+            db: openDatabase(),
+            historyRefreshSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set<string>(),
+            lastHeuristicsTurnId: new Map<string, string>(),
+            clearReasoningAge: 50,
+            protectedTags: 0,
+            client,
+            directory: "/tmp",
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "test-provider", modelID: "emergency-100k" }],
+            ]),
+            getModelKey: () => "test-provider/emergency-100k",
+            getNotificationParams: () => ({
+                agent: "build",
+                providerId: "test-provider",
+                modelId: "emergency-100k",
+                variant: "high",
+            }),
+        });
+
+        await transform(
+            {},
+            {
+                messages: [
+                    {
+                        info: {
+                            id: "m-user",
+                            role: "user",
+                            sessionID: sessionId,
+                            model: {
+                                providerID: "test-provider",
+                                modelID: "emergency-100k",
+                            },
+                        },
+                        parts: [{ type: "text", text: "continue" }],
+                    },
+                ],
+            },
         );
-        expect(emergencyNotifications[1]?.body?.parts?.[0]?.text).toContain("503 overloaded");
+
+        expect(order).toEqual(["notify", "abort"]);
+        const notificationInput = prompt.mock.calls[0]?.[0] as {
+            body?: { parts?: Array<{ text?: string }> };
+        };
+        expect(notificationInput.body?.parts?.[0]?.text).toBe(
+            "Context full — /ctx-flush or /clear to continue.",
+        );
     });
 
     it("starts historian recovery on the first transform pass after restart and clears failure state on success", async () => {

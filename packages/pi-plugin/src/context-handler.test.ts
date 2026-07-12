@@ -2197,6 +2197,41 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("shows the actionable emergency notification when Pi cannot abort the turn", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-emergency-notice";
+		try {
+			updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				scheduler: { executeThresholdPercentage: 65 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const notify = mock(() => undefined);
+			const messages = [userMessage("continue", 1)] as never[];
+			await handler({ messages }, {
+				...fakeContext(sessionId, process.cwd(), ["entry-1"], messages),
+				ui: { notify },
+				getContextUsage: () => ({
+					tokens: 85_000,
+					percent: 85,
+					contextWindow: 100_000,
+				}),
+			} as never);
+
+			expect(notify).toHaveBeenCalledWith(
+				"Context full — /ctx-flush or /clear to continue.",
+			);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("disarms emergency recovery only after real pressure falls below the force threshold", async () => {
 		async function runRecoveryPass(sessionId: string, tokens: number) {
 			const db = createTestDb();

@@ -223,9 +223,50 @@ export interface PostTransformPhaseResult {
     materialized: boolean;
     materializeReason: string | null;
     droppedTokens: number;
+    emergencyReclaimedTokens: number;
     droppedCount: number;
     emergency: boolean;
     bustedThisPass: boolean;
+}
+
+/**
+ * Emergency reclaim estimates content removed from the wire but cannot account
+ * perfectly for provider framing and replacement placeholders. Require a five-percent
+ * overshoot before breaking a turn so a boundary estimate never causes a false abort.
+ */
+export const EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE = 5;
+
+export interface EmergencyFailClosedDecision {
+    shouldAbort: boolean;
+    postDropInputTokens: number;
+    errorMarginTokens: number;
+}
+
+export function evaluateEmergencyFailClosed(input: {
+    usagePercentage: number;
+    historianFoldLandedThisPass: boolean;
+    currentInputTokens: number;
+    emergencyReclaimedTokens: number;
+    modelLimitTokens: number | undefined;
+}): EmergencyFailClosedDecision {
+    const modelLimitTokens = input.modelLimitTokens ?? 0;
+    const postDropInputTokens = Math.max(
+        0,
+        input.currentInputTokens - input.emergencyReclaimedTokens,
+    );
+    const errorMarginTokens =
+        modelLimitTokens > 0
+            ? Math.ceil(modelLimitTokens * (EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE / 100))
+            : 0;
+    return {
+        shouldAbort:
+            input.usagePercentage >= 95 &&
+            !input.historianFoldLandedThisPass &&
+            modelLimitTokens > 0 &&
+            postDropInputTokens > modelLimitTokens + errorMarginTokens,
+        postDropInputTokens,
+        errorMarginTokens,
+    };
 }
 
 export function finalizeMessageRepresentation(
@@ -463,6 +504,7 @@ export async function runPostTransformPhase(
     let heuristicOrReasoningDidMutate = false;
     let droppedCount = 0;
     const droppedTokens = 0;
+    let emergencyReclaimedTokens = 0;
     let emergency = false;
     let m0RematerializedThisPass = false;
     let m0MaterializeReason: string | null = null;
@@ -564,6 +606,7 @@ export async function runPostTransformPhase(
                 cleanup.droppedInjections +
                 cleanup.mutatedTextTags;
             emergency ||= cleanup.emergencyDroppedTools > 0;
+            emergencyReclaimedTokens += cleanup.emergencyReclaimedTokens;
             const t7 = performance.now();
             // Typed reasoning clearing is canonical-Anthropic-only. clearOldReasoning
             // rewrites a reasoning part's `thinking`/`text` to "[cleared]"; only
@@ -1398,6 +1441,7 @@ export async function runPostTransformPhase(
         materialized,
         materializeReason,
         droppedTokens,
+        emergencyReclaimedTokens,
         droppedCount,
         emergency,
         bustedThisPass,
