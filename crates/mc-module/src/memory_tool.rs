@@ -1,8 +1,9 @@
 //! Store-backed ctx_memory tool primitives.
 //!
 //! This module is intentionally route/identity agnostic: callers pass the already-resolved
-//! project (and, for the session-aware search helper, session) that the daemon bound. The
-//! guard code mirrors the render visibility boundary before allowing any mutation.
+//! project (and, for the session-aware search helper, session) that the daemon bound. Shared
+//! visibility is read-only for primary agents; facade mutations require project ownership,
+//! which the store rechecks inside the mutation transaction.
 
 use std::collections::BTreeSet;
 
@@ -18,7 +19,6 @@ pub enum MemoryToolError {
     EmptyMerge,
     DuplicateSourceId { id: i64 },
     NotFound { id: i64 },
-    NotVisible { id: i64 },
     Inactive { id: i64, status: String },
     Superseded { id: i64, superseded_by: i64 },
     CrossCategoryMerge { categories: Vec<String> },
@@ -34,9 +34,6 @@ impl std::fmt::Display for MemoryToolError {
                 write!(f, "duplicate source memory id {id}")
             }
             MemoryToolError::NotFound { id } => write!(f, "memory {id} was not found"),
-            MemoryToolError::NotVisible { id } => {
-                write!(f, "memory {id} is not visible to this project")
-            }
             MemoryToolError::Inactive { id, status } => {
                 write!(f, "memory {id} is not mutable in status {status}")
             }
@@ -88,7 +85,7 @@ struct RankedSearchResult {
     recency: i64,
 }
 
-/// Update a visible, primary (active/permanent and not superseded) memory.
+/// Update an owned, primary (active/permanent and not superseded) memory.
 pub fn update_memory(
     store: &McStore,
     project_path: &str,
@@ -100,10 +97,10 @@ pub fn update_memory(
     if content.is_empty() {
         return Err(MemoryToolError::EmptyContent);
     }
-    let memory = load_visible_memory(store, project_path, id)?;
+    let memory = load_owned_memory(store, project_path, id)?;
     ensure_primary_mutable(&memory)?;
     store
-        .update_memory_content(id, content, now_ms)?
+        .update_memory_content(project_path, id, content, now_ms)?
         .ok_or(MemoryToolError::NotFound { id })
 }
 
@@ -116,19 +113,43 @@ pub fn archive_memory(
     reason: Option<&str>,
     now_ms: i64,
 ) -> Result<bool, MemoryToolError> {
-    let memory = load_visible_memory(store, project_path, id)?;
+    let memory = load_owned_memory(store, project_path, id)?;
     ensure_not_superseded(&memory)?;
     if memory.status == "archived" {
         return Ok(false);
     }
     ensure_active_or_permanent(&memory)?;
     store
-        .archive_memory(id, reason, now_ms)?
+        .archive_memory(project_path, id, reason, now_ms)?
         .ok_or(MemoryToolError::NotFound { id })?;
     Ok(true)
 }
 
-/// Merge visible, primary source memories into a visible, primary target. The target and
+/// Archive a batch only after every owned row passes validation. The store repeats these
+/// checks while locked and commits the batch atomically.
+pub fn archive_memories(
+    store: &McStore,
+    project_path: &str,
+    ids: &[i64],
+    reason: Option<&str>,
+    now_ms: i64,
+) -> Result<Vec<i64>, MemoryToolError> {
+    let Some(first_id) = ids.first().copied() else {
+        return Err(MemoryToolError::EmptyMerge);
+    };
+    for id in ids {
+        let memory = load_owned_memory(store, project_path, *id)?;
+        ensure_not_superseded(&memory)?;
+        if memory.status != "archived" {
+            ensure_active_or_permanent(&memory)?;
+        }
+    }
+    store
+        .archive_memories(project_path, ids, reason, now_ms)?
+        .ok_or(MemoryToolError::NotFound { id: first_id })
+}
+
+/// Merge owned, primary source memories into an owned, primary target. The target and
 /// every source must share exactly one category; cross-category merges are rejected before
 /// any store mutation so a miscategorization cannot silently destroy a distinct fact.
 pub fn merge_memories(
@@ -149,16 +170,16 @@ pub fn merge_memories(
 
     let mut seen = BTreeSet::new();
     for id in source_ids {
-        if !seen.insert(*id) {
+        if *id == target_id || !seen.insert(*id) {
             return Err(MemoryToolError::DuplicateSourceId { id: *id });
         }
     }
 
-    let target = load_visible_memory(store, project_path, target_id)?;
+    let target = load_owned_memory(store, project_path, target_id)?;
     ensure_primary_mutable(&target)?;
     let mut rows = vec![target.clone()];
     for source_id in source_ids {
-        let source = load_visible_memory(store, project_path, *source_id)?;
+        let source = load_owned_memory(store, project_path, *source_id)?;
         ensure_primary_mutable(&source)?;
         rows.push(source);
     }
@@ -171,7 +192,7 @@ pub fn merge_memories(
     }
 
     store
-        .merge_memories(target_id, source_ids, merged_content, now_ms)?
+        .merge_memories(project_path, target_id, source_ids, merged_content, now_ms)?
         .ok_or(MemoryToolError::NotFound { id: target_id })
 }
 
@@ -184,7 +205,14 @@ pub fn search_memories_and_compartments(
     query: &str,
     limit: usize,
 ) -> Result<Vec<MemorySearchResult>, MemoryToolError> {
-    search_memories_and_compartments_for_session(store, project_path, project_path, query, limit)
+    search_memories_and_compartments_for_session(
+        store,
+        project_path,
+        project_path,
+        query,
+        limit,
+        true,
+    )
 }
 
 /// Keyword search over visible project memories and the resolved session's compartments.
@@ -196,6 +224,7 @@ pub fn search_memories_and_compartments_for_session(
     session_id: &str,
     query: &str,
     limit: usize,
+    include_memories: bool,
 ) -> Result<Vec<MemorySearchResult>, MemoryToolError> {
     let query = query.trim();
     if query.is_empty() || limit == 0 {
@@ -203,9 +232,11 @@ pub fn search_memories_and_compartments_for_session(
     }
 
     let mut ranked = Vec::new();
-    for memory in store.search_visible_memory_contents(project_path, query)? {
-        if first_match(&memory.content, query).is_some() {
-            ranked.push(memory_search_hit(memory, query));
+    if include_memories {
+        for memory in store.search_visible_memory_contents(project_path, query)? {
+            if first_match(&memory.content, query).is_some() {
+                ranked.push(memory_search_hit(memory, query));
+            }
         }
     }
     for compartment in store.search_compartments_like(session_id, query)? {
@@ -234,40 +265,16 @@ pub fn search_memories_and_compartments_for_session(
     Ok(ranked.into_iter().map(|r| r.result).collect())
 }
 
-fn load_visible_memory(
+fn load_owned_memory(
     store: &McStore,
     project_path: &str,
     id: i64,
 ) -> Result<StoredMemoryFull, MemoryToolError> {
     let memory = store
         .get_memory_full(id)?
+        .filter(|memory| memory.project_path == project_path)
         .ok_or(MemoryToolError::NotFound { id })?;
-    if memory_visible_to_project(store, project_path, &memory)? {
-        Ok(memory)
-    } else {
-        Err(MemoryToolError::NotVisible { id })
-    }
-}
-
-fn memory_visible_to_project(
-    store: &McStore,
-    project_path: &str,
-    memory: &StoredMemoryFull,
-) -> Result<bool, MemoryToolError> {
-    let membership = store.resolve_workspace_membership(project_path)?;
-    Ok(match membership {
-        None => memory.project_path == project_path,
-        Some(membership) => {
-            if !membership.union_identities.contains(&memory.project_path) {
-                return Ok(false);
-            }
-            if memory.project_path == membership.own_identity {
-                true
-            } else {
-                membership.share_categories.contains(&memory.category)
-            }
-        }
-    })
+    Ok(memory)
 }
 
 fn ensure_primary_mutable(memory: &StoredMemoryFull) -> Result<(), MemoryToolError> {
@@ -507,20 +514,20 @@ mod tests {
 
         assert!(matches!(
             update_memory(&store, own, foreign_private, "edited", 2),
-            Err(MemoryToolError::NotVisible { id }) if id == foreign_private
+            Err(MemoryToolError::NotFound { id }) if id == foreign_private
         ));
         assert!(matches!(
             archive_memory(&store, own, foreign_private, None, 2),
-            Err(MemoryToolError::NotVisible { id }) if id == foreign_private
+            Err(MemoryToolError::NotFound { id }) if id == foreign_private
         ));
         assert!(matches!(
             merge_memories(&store, own, foreign_private, &[own_private], "merged", 2),
-            Err(MemoryToolError::NotVisible { id }) if id == foreign_private
+            Err(MemoryToolError::NotFound { id }) if id == foreign_private
         ));
     }
 
     #[test]
-    fn foreign_shared_mutation_allowed_for_update_merge_and_archive() {
+    fn foreign_shared_mutation_rejected_for_update_merge_and_archive() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let own = "git:own";
@@ -531,19 +538,55 @@ mod tests {
         let target = insert(&store, foreign, "CONSTRAINTS", "shared target", 1);
         let source = insert(&store, foreign, "CONSTRAINTS", "shared source", 1);
 
-        let updated = update_memory(&store, own, updatable, "shared edited", 2).unwrap();
-        assert_eq!(updated.content, "shared edited");
-        assert!(archive_memory(&store, own, archivable, Some("old"), 2).unwrap());
-        let merged = merge_memories(&store, own, target, &[source], "shared merged", 2).unwrap();
-        assert_eq!(merged.content, "shared merged");
+        assert!(matches!(
+            update_memory(&store, own, updatable, "shared edited", 2),
+            Err(MemoryToolError::NotFound { id }) if id == updatable
+        ));
+        assert!(matches!(
+            archive_memory(&store, own, archivable, Some("old"), 2),
+            Err(MemoryToolError::NotFound { id }) if id == archivable
+        ));
+        assert!(matches!(
+            merge_memories(&store, own, target, &[source], "shared merged", 2),
+            Err(MemoryToolError::NotFound { id }) if id == target
+        ));
+        assert_eq!(
+            store.get_memory_full(updatable).unwrap().unwrap().content,
+            "shared update"
+        );
+        assert_eq!(
+            store.get_memory_full(archivable).unwrap().unwrap().status,
+            "active"
+        );
         assert_eq!(
             store
                 .get_memory_full(source)
                 .unwrap()
                 .unwrap()
                 .superseded_by_memory_id,
-            Some(target)
+            None
         );
+    }
+
+    #[test]
+    fn merge_duplicate_content_returns_specific_error_without_partial_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let project = "git:proj";
+        let target = insert(&store, project, "CONSTRAINTS", "target", 1);
+        let source = insert(&store, project, "CONSTRAINTS", "canonical", 1);
+
+        let error = merge_memories(&store, project, target, &[source], "canonical", 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("memory content already exists as ID {source}")));
+        assert_eq!(
+            store.get_memory_full(target).unwrap().unwrap().content,
+            "target"
+        );
+        let source_row = store.get_memory_full(source).unwrap().unwrap();
+        assert_eq!(source_row.status, "active");
+        assert_eq!(source_row.superseded_by_memory_id, None);
     }
 
     #[test]
@@ -614,6 +657,29 @@ mod tests {
                 .max_memory_mutation_id(&[project.to_string()])
                 .unwrap(),
             after_first
+        );
+    }
+
+    #[test]
+    fn batch_archive_rolls_back_when_any_id_is_not_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let own = "git:own";
+        let foreign = "git:foreign";
+        let own_id = insert(&store, own, "CONSTRAINTS", "owned", 1);
+        let foreign_id = insert(&store, foreign, "CONSTRAINTS", "foreign", 1);
+
+        assert!(matches!(
+            archive_memories(&store, own, &[own_id, foreign_id], None, 2),
+            Err(MemoryToolError::NotFound { id }) if id == foreign_id
+        ));
+        assert_eq!(
+            store.get_memory_full(own_id).unwrap().unwrap().status,
+            "active"
+        );
+        assert_eq!(
+            store.get_memory_full(foreign_id).unwrap().unwrap().status,
+            "active"
         );
     }
 

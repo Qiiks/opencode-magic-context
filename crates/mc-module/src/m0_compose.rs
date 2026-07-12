@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use mc_store::{McStore, McStoreError};
+use mc_store::{McStore, McStoreError, MemoryRevision};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
 use crate::decay_render::DecayRenderCompartment;
@@ -69,6 +69,8 @@ pub struct M0Composition {
     pub memory_mutation_cursor: i64,
     /// The highest memory id folded into m0.
     pub max_memory_id: i64,
+    /// Source revision captured in the same SQLite snapshot as the rendered rows.
+    pub memory_revision: MemoryRevision,
     /// The canonical project-docs hash, a SNAPSHOT MARKER persisted with the bytes (NOT a
     /// HARD trigger — see `M0ContentEpoch`). Records which docs version is in m0 so the
     /// next natural HARD re-reads current docs.
@@ -95,6 +97,8 @@ pub struct M0ComposeInputs<'a> {
     /// covers its ordinal. Passing it explicitly keeps m0 composition deterministic and
     /// replayable.
     pub covered_system_messages: &'a [String],
+    /// Disabled memory removes both project memories and the user-profile memory block.
+    pub memory_enabled: bool,
 }
 
 /// Read the store and compose the HARD m0 bytes + watermarks. `estimate_tokens` is the
@@ -123,25 +127,34 @@ pub fn compose_m0_from_store(
             None => (String::new(), None, None, 0),
         };
 
-    // --- memories: own-only, or the workspace union (foreign shared-category attributed) ---
+    // --- memories: rows and watermarks share one SQLite snapshot ---
     let membership = store.resolve_workspace_membership(inputs.project_path)?;
-    let (memories, source_name_by_id, union_paths) = match &membership {
-        Some(m) => {
-            let mems = store.load_workspace_union_memories(m, inputs.now_ms)?;
-            let source = workspace_source_names(&mems, m);
-            (mems, source, m.union_identities.clone())
-        }
-        None => {
-            let mems = store.load_active_memories(inputs.project_path, inputs.now_ms)?;
-            (mems, HashMap::new(), vec![inputs.project_path.to_string()])
+    let snapshot = if inputs.memory_enabled {
+        store.load_memory_render_snapshot(
+            inputs.project_path,
+            membership.as_ref(),
+            inputs.now_ms,
+        )?
+    } else {
+        mc_store::MemoryRenderSnapshot {
+            memories: Vec::new(),
+            revision: MemoryRevision::default(),
         }
     };
-    let rendered_memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
-    let max_memory_id = store.max_memory_id(&union_paths)?;
-    let memory_mutation_cursor = store.max_memory_mutation_id(&union_paths)?;
+    let source_name_by_id = membership
+        .as_ref()
+        .map(|value| workspace_source_names(&snapshot.memories, value))
+        .unwrap_or_else(HashMap::new);
+    let rendered_memory_ids: Vec<i64> = snapshot.memories.iter().map(|memory| memory.id).collect();
+    let max_memory_id = snapshot.revision.max_memory_id;
+    let memory_mutation_cursor = snapshot.revision.mutation_cursor;
 
     // --- user-profile + project-docs ---
-    let user_profile = store.load_active_user_memories()?;
+    let user_profile = if inputs.memory_enabled {
+        store.load_active_user_memories()?
+    } else {
+        Vec::new()
+    };
     let docs = read_project_docs_canonical(inputs.project_directory);
 
     // --- compose the m0 bytes via the shared render_m0 (no trim until the estimator
@@ -156,7 +169,7 @@ pub fn compose_m0_from_store(
             user_profile: &user_profile,
             covered_system_messages: inputs.covered_system_messages,
             compartments: &decay_compartments,
-            memories: &memories,
+            memories: &snapshot.memories,
             source_name_by_id: &source_name_by_id,
             history_budget_tokens: inputs.history_budget_tokens,
             decay_pressure_multiplier: 1.0,
@@ -173,6 +186,7 @@ pub fn compose_m0_from_store(
         rendered_memory_ids,
         memory_mutation_cursor,
         max_memory_id,
+        memory_revision: snapshot.revision,
         docs_hash: docs.canonical_hash,
     })
 }
@@ -181,7 +195,7 @@ pub fn compose_m0_from_store(
 mod tests {
     use super::*;
     use cortexkit_store_types::StorageDescriptor;
-    use mc_store::{ModuleMeta, StoredCompartment};
+    use mc_store::{InsertMemoryInput, ModuleMeta, StoredCompartment};
 
     fn no_estimate(_: &str) -> usize {
         0
@@ -232,6 +246,7 @@ mod tests {
             now_ms: 0,
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
+            memory_enabled: true,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -260,6 +275,7 @@ mod tests {
             now_ms: 0,
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
+            memory_enabled: true,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -268,6 +284,41 @@ mod tests {
         assert_eq!(m0.coverage_ordinal, None);
         assert_eq!(m0.folded_compartment_seq, 0);
         assert!(m0.rendered_memory_ids.is_empty());
+    }
+
+    #[test]
+    fn memory_disabled_omits_memory_blocks_and_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .insert_memory(InsertMemoryInput {
+                project_path: "git:proj",
+                category: "CONSTRAINTS",
+                content: "must stay hidden",
+                source_session_id: None,
+                source_type: Some("agent"),
+                importance: Some(50),
+                expires_at: None,
+                metadata_json: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        let inputs = M0ComposeInputs {
+            session_id: "ses",
+            project_path: "git:proj",
+            project_directory: dir.path().to_str().unwrap(),
+            now_ms: 2,
+            history_budget_tokens: 60_000.0,
+            covered_system_messages: &[],
+            memory_enabled: false,
+        };
+
+        let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
+        assert!(!composed.m0_bytes.contains("must stay hidden"));
+        assert!(!composed.m0_bytes.contains("<project-memory>"));
+        assert!(composed.rendered_memory_ids.is_empty());
+        assert_eq!(composed.max_memory_id, 0);
+        assert_eq!(composed.memory_mutation_cursor, 0);
     }
 
     #[test]
@@ -289,6 +340,7 @@ mod tests {
             now_ms: 0,
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
+            memory_enabled: true,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(composed.coverage_ordinal, Some(30));
@@ -312,6 +364,7 @@ mod tests {
             now_ms: 1000,
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
+            memory_enabled: true,
         };
         let a = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         let b = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();

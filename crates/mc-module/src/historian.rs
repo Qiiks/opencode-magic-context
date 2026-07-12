@@ -1376,6 +1376,7 @@ mod tests {
             project_path: "git:proj",
             project_directory: "/nonexistent-docs",
             history_budget_tokens: 60_000.0,
+            memory_enabled: true,
             now_ms: 0,
             execute_threshold_percentage: 65.0,
             smart_drops: false,

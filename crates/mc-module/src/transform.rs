@@ -113,6 +113,8 @@ pub struct ProducerContext<'a> {
     /// The history budget in tokens, FROZEN at route bind (byte-affecting: a different
     /// budget → a different m0 trim → different bytes, so it can't change mid-session).
     pub history_budget_tokens: f64,
+    /// Whether memory tools and m0 memory rendering are enabled for this binding.
+    pub memory_enabled: bool,
     /// The wall-clock now (ms) for THIS pass. Used only to SET `meta.expiry_cutoff_ms` on
     /// a HARD (the first materialization freezes it); every later pass reads the frozen
     /// meta value, never this, so expiry never drifts the bytes between passes.
@@ -1033,6 +1035,7 @@ fn apply_once(
     }
 
     let mut coverage_shrunk_on_bust = false;
+    let mut commit_memory_revision = None;
 
     match plan {
         PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
@@ -1059,6 +1062,7 @@ fn apply_once(
                     now_ms: ctx.now_ms,
                     history_budget_tokens: ctx.history_budget_tokens,
                     covered_system_messages: &covered_system_messages,
+                    memory_enabled: ctx.memory_enabled,
                 },
                 estimate_tokens,
             )?;
@@ -1140,6 +1144,7 @@ fn apply_once(
                                 now_ms: ctx.now_ms,
                                 history_budget_tokens: ctx.history_budget_tokens,
                                 covered_system_messages: &recut_covered_system_messages,
+                                memory_enabled: ctx.memory_enabled,
                             },
                             estimate_tokens,
                         )?;
@@ -1224,6 +1229,7 @@ fn apply_once(
             meta.coverage_start_ordinal = comp.first_covered_ordinal;
             meta.coverage_compartment_seq = Some(comp.folded_compartment_seq);
             meta.folded_compartment_seq = comp.folded_compartment_seq;
+            commit_memory_revision = Some(comp.memory_revision.clone());
             meta.rendered_memory_ids = comp.rendered_memory_ids;
             meta.memory_mutation_cursor = comp.memory_mutation_cursor;
             meta.max_memory_id = comp.max_memory_id;
@@ -1413,7 +1419,18 @@ fn apply_once(
             Vec::new()
         };
         if consumed_drop_ids.is_empty() {
-            store.commit(&req.session_id, commit_expected, &core, &meta)?
+            if let Some(revision) = commit_memory_revision.as_ref() {
+                store.commit_with_consumed_drops(
+                    &req.session_id,
+                    commit_expected,
+                    &core,
+                    &meta,
+                    &[],
+                    Some(revision),
+                )?
+            } else {
+                store.commit(&req.session_id, commit_expected, &core, &meta)?
+            }
         } else {
             store.commit_with_consumed_drops(
                 &req.session_id,
@@ -1421,6 +1438,7 @@ fn apply_once(
                 &core,
                 &meta,
                 &consumed_drop_ids,
+                commit_memory_revision.as_ref(),
             )?
         }
     } else {
@@ -3230,6 +3248,7 @@ mod tests {
             project_path: project,
             project_directory: dir,
             history_budget_tokens: 60_000.0,
+            memory_enabled: true,
             now_ms,
             execute_threshold_percentage: 65.0,
             smart_drops: false,
@@ -5158,7 +5177,8 @@ mod tests {
         );
         assert_eq!(before.action, "HARD");
 
-        s.update_memory_content(memory_id, "corrected", 1).unwrap();
+        s.update_memory_content("git:proj", memory_id, "corrected", 1)
+            .unwrap();
         let soft = run(
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
@@ -7771,7 +7791,7 @@ mod tests {
 
     #[test]
     fn global_memory_render_epoch_hards_all_profiles_once_then_stabilizes() {
-        assert_eq!(crate::MEMORY_RENDER_FORMAT_EPOCH, 1);
+        assert_eq!(crate::MEMORY_RENDER_FORMAT_EPOCH, 2);
         for profile in [
             SerializerProfile::OwnedLlmRunner,
             SerializerProfile::Pi,
@@ -7808,7 +7828,9 @@ mod tests {
                 String::new(),
             );
             assert_eq!(loaded.meta.last_render_config, current_cfg);
-            assert!(current_cfg.contains("mre:4:mre1"));
+            assert!(
+                current_cfg.contains(&format!("mre:4:mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH))
+            );
 
             loaded.meta.last_render_config = effective_render_config_with_epochs(
                 &s,

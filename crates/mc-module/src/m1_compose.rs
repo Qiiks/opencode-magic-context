@@ -423,14 +423,18 @@ mod tests {
 
             match case {
                 "update" => {
-                    store.update_memory_content(target, "corrected", 2).unwrap();
+                    store
+                        .update_memory_content(project, target, "corrected", 2)
+                        .unwrap();
                 }
                 "archive" => {
-                    store.archive_memory(target, Some("obsolete"), 2).unwrap();
+                    store
+                        .archive_memory(project, target, Some("obsolete"), 2)
+                        .unwrap();
                 }
                 "merge" => {
                     store
-                        .merge_memories(target, &[merge_source.unwrap()], "merged", 2)
+                        .merge_memories(project, target, &[merge_source.unwrap()], "merged", 2)
                         .unwrap();
                 }
                 _ => unreachable!(),
