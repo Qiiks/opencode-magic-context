@@ -59,7 +59,11 @@ function bearerToken(req: Request): string {
 }
 
 function websocketToken(req: Request): string {
-    return bearerToken(req);
+    const headerToken = bearerToken(req);
+    if (headerToken) return headerToken;
+    // v0.32 TUI clients put the token in the upgrade URL. Keep this fallback only
+    // for the v0.32→v0.32.1 skew window; remove it when v0.32 clients are unsupported.
+    return new URL(req.url).searchParams.get("token") ?? "";
 }
 
 /**

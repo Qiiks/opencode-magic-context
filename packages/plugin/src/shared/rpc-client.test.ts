@@ -98,10 +98,16 @@ async function waitFor(condition: () => boolean, label: string, timeoutMs = 2_00
     throw new Error(`Timed out waiting for ${label}`);
 }
 
-async function openSocket(port: number, token: string): Promise<WebSocket> {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, {
-        headers: { Authorization: `Bearer ${token}` },
-    });
+async function openSocket(
+    port: number,
+    token: string,
+    legacyQueryAuth = false,
+): Promise<WebSocket> {
+    const ws = legacyQueryAuth
+        ? new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`)
+        : new WebSocket(`ws://127.0.0.1:${port}/ws`, {
+              headers: { Authorization: `Bearer ${token}` },
+          });
     await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("socket open timed out")), 2_000);
         ws.addEventListener(
@@ -258,6 +264,31 @@ describe("MagicContextRpcClient", () => {
             const health = await fetch(`http://127.0.0.1:${port}/health`);
             expect(health.status).toBe(200);
         } finally {
+            server.stop();
+        }
+    });
+
+    test("accepts a frozen v0.32 websocket upgrade with query-token auth", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-ws-v032";
+        const server = new MagicContextRpcServer(storageDir, directory);
+        const port = await server.start();
+        const record = readNewestPortRecord(storageDir, directory);
+        expect(typeof record?.token).toBe("string");
+
+        const ws = await openSocket(port, record?.token ?? "", true);
+        try {
+            const helloAck = waitForJsonMessage(ws, (message) => message.type === "hello-ack");
+            ws.send(
+                JSON.stringify({
+                    type: "hello",
+                    token: record?.token,
+                    sessionId: "ses_v032",
+                }),
+            );
+            expect((await helloAck).type).toBe("hello-ack");
+        } finally {
+            ws.close();
             server.stop();
         }
     });
@@ -439,6 +470,25 @@ describe("MagicContextRpcClient", () => {
 
         const client = new MagicContextRpcClient(storageDir, directory);
         expect(await client.call<{ value: string }>("value")).toEqual({ value: "live" });
+    });
+
+    test("discovers a frozen v0.32 health response without an instance id", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-v032-health";
+        const legacy = await startRpcServer(() => ({ value: "legacy" }), {
+            pid: process.pid,
+        });
+        writePortFileForPid(
+            storageDir,
+            directory,
+            legacy.port,
+            process.pid,
+            Date.now(),
+            "new-client-record",
+        );
+
+        const client = new MagicContextRpcClient(storageDir, directory);
+        expect(await client.call<{ value: string }>("value")).toEqual({ value: "legacy" });
     });
 
     test("prefers this process and validates every discovery candidate identity", async () => {

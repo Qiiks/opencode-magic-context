@@ -147,36 +147,6 @@ export function buildSidebarSnapshot(
     // callers), the snapshot falls back to the runtime default of 65%.
     config?: Record<string, unknown>,
 ): SidebarSnapshot {
-    const empty: SidebarSnapshot = {
-        sessionId,
-        usagePercentage: 0,
-        inputTokens: 0,
-        contextLimit: 0,
-        systemPromptTokens: 0,
-        compartmentCount: 0,
-        memoryCount: 0,
-        memoryBlockCount: 0,
-        pendingOpsCount: 0,
-        historianRunning: false,
-        compartmentInProgress: false,
-        sessionNoteCount: 0,
-        readySmartNoteCount: 0,
-        cacheTtl: "5m",
-        lastDreamerRunAt: null,
-        projectIdentity: null,
-        compartmentTokens: 0,
-        factTokens: 0,
-        memoryTokens: 0,
-        docsTokens: 0,
-        profileTokens: 0,
-        conversationTokens: 0,
-        toolCallTokens: 0,
-        toolDefinitionTokens: 0,
-        executeThreshold: 65,
-        newWorkTokens: null,
-        totalInputTokens: null,
-    };
-
     try {
         const projectIdentity = resolveProjectIdentity(directory);
 
@@ -460,26 +430,31 @@ export function buildSidebarSnapshot(
         return applyStickySnapshotCache(sessionId, fresh);
     } catch (err) {
         log("[rpc] sidebar-snapshot error:", err);
-        // Preserve live recomp/upgrade progress even when the full snapshot build
-        // throws (e.g. a concurrent BEGIN-IMMEDIATE publish makes a DB read hit
-        // SQLITE_BUSY mid-recomp). Without this, a transient build failure emits a
-        // progress-less snapshot and the TUI's recomp poll would lose the bar
-        // (dogfood 2026-05-30).
-        const p = liveSessionState?.recompProgressBySession.get(sessionId);
-        if (!p) return empty;
-        return {
-            ...empty,
-            recompProgress: {
-                kind: p.kind ?? "recomp",
-                phase: p.phase,
-                processedMessages: p.processedMessages,
-                totalMessages: p.totalMessages,
-                passCount: p.passCount,
-                compartmentsCreated: p.compartmentsCreated,
-                message: p.message,
-                note: p.note,
-            },
-        };
+        throw err;
+    }
+}
+
+/** Convert snapshot-build failures into a transport-failure envelope. A genuine
+ * zero snapshot remains a successful value so deleted sessions stay deleted. */
+export function buildSidebarSnapshotRpcResponse(
+    db: Database,
+    sessionId: string,
+    directory: string,
+    liveSessionState?: LiveSessionState,
+    injectionBudgetTokens?: number,
+    config?: Record<string, unknown>,
+): Record<string, unknown> {
+    try {
+        return buildSidebarSnapshot(
+            db,
+            sessionId,
+            directory,
+            liveSessionState,
+            injectionBudgetTokens,
+            config,
+        ) as unknown as Record<string, unknown>;
+    } catch {
+        return { error: "sidebar snapshot unavailable" };
     }
 }
 
@@ -720,14 +695,14 @@ export function registerRpcHandlers(
         const dir = String(params.directory ?? directory);
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
-        return buildSidebarSnapshot(
+        return buildSidebarSnapshotRpcResponse(
             db,
             sessionId,
             dir,
             liveSessionState,
             injectionBudgetTokens,
             rawConfig,
-        ) as unknown as Record<string, unknown>;
+        );
     });
 
     rpcServer.handle("status-detail", async (params) => {

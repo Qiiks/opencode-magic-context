@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
     __resetNotificationStateForTests,
     drainNotifications,
@@ -9,6 +9,7 @@ import {
     pushNotification,
 } from "../../shared/rpc-notifications";
 import { MagicContextRpcServer } from "../../shared/rpc-server";
+import { rpcPortFilePath } from "../../shared/rpc-utils";
 import { closeRpc, initRpcClient } from "./context-db";
 import {
     _resetNotificationSocketStateForTesting,
@@ -19,6 +20,7 @@ import {
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const tempDirs: string[] = [];
 const servers: MagicContextRpcServer[] = [];
+const legacyServers: Array<ReturnType<typeof Bun.serve>> = [];
 
 afterEach(() => {
     _resetNotificationSocketStateForTesting();
@@ -26,6 +28,7 @@ afterEach(() => {
     for (const server of servers.splice(0)) {
         server.stop();
     }
+    for (const server of legacyServers.splice(0)) server.stop(true);
     __resetNotificationStateForTests();
     for (const dir of tempDirs.splice(0)) {
         rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -53,6 +56,77 @@ async function startServer(dataHome: string, directory: string): Promise<MagicCo
     await server.start();
     servers.push(server);
     return server;
+}
+
+function startLegacyServer(
+    dataHome: string,
+    directory: string,
+    notifications: SocketNotification[],
+): {
+    sockets: Set<{ close(): void }>;
+    helloCursors: number[];
+    ackCursors: number[];
+} {
+    const token = "v032-query-token";
+    const sockets = new Set<{ close(): void }>();
+    const helloCursors: number[] = [];
+    const ackCursors: number[] = [];
+    const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch(req, bunServer) {
+            const url = new URL(req.url);
+            if (url.pathname === "/health") {
+                // Frozen v0.32 response: pid only, with no instance_id.
+                return Response.json({ ok: true, pid: process.pid });
+            }
+            if (
+                url.pathname === "/ws" &&
+                req.headers.get("authorization") === `Bearer ${token}` &&
+                bunServer.upgrade(req, { data: {} })
+            ) {
+                return undefined;
+            }
+            return new Response("Not Found", { status: 404 });
+        },
+        websocket: {
+            open(ws) {
+                sockets.add(ws);
+            },
+            message(ws, raw) {
+                const msg = JSON.parse(String(raw)) as {
+                    type?: string;
+                    lastReceivedId?: number;
+                    cursor?: number;
+                };
+                if (msg.type === "hello") {
+                    const cursor = Number(msg.lastReceivedId ?? 0);
+                    helloCursors.push(cursor);
+                    for (const notification of notifications) {
+                        if (notification.id > cursor) {
+                            ws.send(JSON.stringify({ type: "notification", notification }));
+                        }
+                    }
+                    // Frozen v0.32 acknowledgement: protocol epoch fields did not exist.
+                    ws.send(JSON.stringify({ type: "hello-ack" }));
+                } else if (msg.type === "ack" && typeof msg.cursor === "number") {
+                    ackCursors.push(msg.cursor);
+                }
+            },
+            close(ws) {
+                sockets.delete(ws);
+            },
+        },
+    });
+    legacyServers.push(server);
+
+    const portFile = rpcPortFilePath(storageDir(dataHome), directory, process.pid);
+    mkdirSync(dirname(portFile), { recursive: true });
+    writeFileSync(
+        portFile,
+        JSON.stringify({ port: server.port, pid: process.pid, started_at: Date.now(), token }),
+    );
+    return { sockets, helloCursors, ackCursors };
 }
 
 async function waitFor(condition: () => boolean, label: string, timeoutMs = 4_000): Promise<void> {
@@ -245,6 +319,41 @@ describe("notification socket", () => {
         });
         await waitFor(() => slowCalls === 2, "failed notification redelivery");
         expect(fastCalls).toBe(1);
+    });
+
+    test("legacy mode keeps its watermark behind a declined notification across reconnect", async () => {
+        const dataHome = makeDataHome();
+        const directory = "/repo-v032-notifications";
+        const sessionId = "ses_v032";
+        const legacy = startLegacyServer(dataHome, directory, [
+            { id: 1, type: "declined", payload: {}, sessionId },
+            { id: 2, type: "consumed", payload: {}, sessionId },
+        ]);
+        initRpcClient(directory);
+
+        let declinedCalls = 0;
+        let consumedCalls = 0;
+        startNotificationSocket({
+            getSessionId: () => sessionId,
+            onNotification: (notification) => {
+                if (notification.type === "declined") {
+                    declinedCalls += 1;
+                    return declinedCalls > 1;
+                }
+                consumedCalls += 1;
+                return true;
+            },
+        });
+
+        await waitFor(() => declinedCalls === 1 && consumedCalls === 1, "legacy backlog handling");
+        expect(Math.max(0, ...legacy.ackCursors)).toBe(0);
+        for (const ws of legacy.sockets) ws.close();
+
+        await waitFor(() => legacy.helloCursors.length >= 2, "legacy reconnect hello");
+        await waitFor(() => declinedCalls === 2, "declined notification redelivery");
+        expect(legacy.helloCursors[1]).toBe(0);
+        expect(consumedCalls).toBe(1);
+        await waitFor(() => legacy.ackCursors.includes(2), "gap-safe legacy watermark advance");
     });
 
     test("serializes back-to-back dialog notification handlers", async () => {

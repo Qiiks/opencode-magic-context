@@ -148,9 +148,11 @@ export async function loadSidebarSnapshot(
             directory,
         });
         if ((result as unknown as Record<string, unknown>).error) {
+            // Snapshot-build errors are explicit failure envelopes, equivalent to
+            // a transport failure: retain the last known-good client snapshot.
             return recallSidebarSnapshot(sessionId, empty);
         }
-        // Trust successful server responses. The server has its own sticky
+        // Trust successful server responses, including authoritative zeroes. The server has its own sticky
         // sidebar cache (`sidebar-snapshot-cache.ts`) that handles transient
         // zero-token windows by hybriding cached breakdown values into a
         // fresh snapshot, AND clears that cache on `session.deleted`. If the
