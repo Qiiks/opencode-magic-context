@@ -130,4 +130,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 1;
 }
 
-main().then((code) => process.exit(code));
+main()
+    .then((code) => process.exit(code))
+    .catch((error) => {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exit(1);
+    });

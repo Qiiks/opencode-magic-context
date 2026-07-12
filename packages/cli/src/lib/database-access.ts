@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
     getPersistedSchemaVersion,
@@ -67,4 +67,22 @@ export function openExistingContextDatabase(
         db.close();
         throw error;
     }
+}
+
+/** Create a consistent SQLite snapshot, including committed WAL contents. */
+export async function backupDatabaseSnapshot(db: DatabaseType, destination: string): Promise<void> {
+    const serializable = db as DatabaseType & { serialize?: () => Uint8Array };
+    if (typeof serializable.serialize === "function") {
+        writeFileSync(destination, serializable.serialize(), { flag: "wx" });
+        return;
+    }
+
+    const moduleName = "node:" + "sqlite";
+    const sqlite = (await import(moduleName)) as {
+        backup?: (source: unknown, path: string) => Promise<void>;
+    };
+    if (typeof sqlite.backup !== "function") {
+        throw new Error("The active SQLite runtime does not provide a snapshot backup API");
+    }
+    await sqlite.backup(db, destination);
 }

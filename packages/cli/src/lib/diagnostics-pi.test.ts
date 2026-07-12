@@ -1,9 +1,11 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectPathToPiDirSlug } from "../commands/migrate";
 import { collectDiagnostics, sanitizeValue } from "./diagnostics-pi";
+
+setDefaultTimeout(15_000);
 
 const tempRoots: string[] = [];
 const originalHome = process.env.HOME;

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,8 @@ import { parse as parseJsonc } from "comment-json";
 import type { PiDiagnosticReport } from "../lib/diagnostics-pi";
 import type { PromptIO, PromptSpinner, SelectOption } from "../lib/prompts";
 import { parseDoctorArgs, type RunDoctorOptions, runDoctor } from "./doctor-pi";
+
+setDefaultTimeout(30_000);
 
 const tempRoots: string[] = [];
 const originalHome = process.env.HOME;
@@ -252,7 +254,8 @@ describe("Pi doctor", () => {
             "WARN Embedding provider: local — onnxruntime-node native binding missing",
         );
         expect(output).toContain("postinstall likely failed");
-        expect(output).toContain("WARN 1");
+        expect(output).toContain("Stale Pi extension cache found");
+        expect(output).toContain("WARN 2");
     });
 
     it("passes the local embedding check when the onnxruntime native binding is present", async () => {

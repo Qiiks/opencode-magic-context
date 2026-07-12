@@ -16,7 +16,11 @@ import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path"
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
 
-import { isDevPathPluginEntry, matchesPluginEntry } from "../adapters/opencode";
+import {
+    isDevPathPluginEntry,
+    isLocalPathPluginEntry,
+    matchesPluginEntry,
+} from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
 import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
 import { openExistingContextDatabase } from "../lib/database-access";
@@ -30,6 +34,7 @@ import { bundleIssueReport } from "../lib/logs-opencode";
 import { migrateDreamerV2ForDoctor } from "../lib/migrate-dreamer-v2-doctor";
 import { migrateExperimentalPinKeyFilesForDoctor } from "../lib/migrate-experimental-doctor";
 import { detectOpenCode } from "../lib/opencode-detect";
+import { getOpenCodeVersion } from "../lib/opencode-helpers";
 import {
     getOpenCodePluginCacheRoots,
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION as PLUGIN_ENTRY_WITH_VERSION,
@@ -360,11 +365,19 @@ async function runIssueFlow(): Promise<number> {
 // resolver error in the log. Shared by the explicit-`local` branch AND the
 // no-config / default-provider path (local is the default, so a missing config
 // still means local embeddings).
-function checkLocalEmbeddingRuntimeForDoctor(): { issues: number; localRuntimeBroken?: boolean } {
+function checkLocalEmbeddingRuntimeForDoctor(): {
+    issues: number;
+    localRuntimeBroken?: boolean;
+    unverified?: boolean;
+} {
     const runtime = checkLocalEmbeddingRuntime(getOpenCodePluginCacheRoots());
     if (isLocalEmbeddingRuntimeBroken(runtime)) {
         log.warn(formatLocalEmbeddingRuntimeDoctorWarning(runtime));
         return { issues: 1, localRuntimeBroken: true };
+    }
+    if (runtime.state === "unknown") {
+        log.warn(`Local embedding runtime unverified: ${runtime.reason}`);
+        return { issues: 0, unverified: true };
     }
     log.success("Embedding provider: local (Xenova/all-MiniLM-L6-v2 bundled)");
     return { issues: 0 };
@@ -372,7 +385,7 @@ function checkLocalEmbeddingRuntimeForDoctor(): { issues: number; localRuntimeBr
 
 async function checkEmbeddingConfig(
     magicContextConfigPath: string,
-): Promise<{ issues: number; localRuntimeBroken?: boolean }> {
+): Promise<{ issues: number; localRuntimeBroken?: boolean; unverified?: boolean }> {
     if (!existsSync(magicContextConfigPath)) {
         // No config → local provider defaults apply. Still verify the local
         // runtime: local is the DEFAULT, so "no config" means local embeddings,
@@ -609,7 +622,12 @@ export async function runDoctor(
         // and the plugin cache (both present for a Desktop install), so continue.
         pass("OpenCode Desktop detected (CLI not installed)");
     } else {
-        pass("OpenCode installed");
+        const version = getOpenCodeVersion(detection.binary);
+        if (version === null) {
+            fail(`OpenCode CLI was found at ${detection.binary} but could not be executed`);
+        } else {
+            pass(`OpenCode ${version} installed`);
+        }
     }
 
     // 1b. CLI vs npm latest
@@ -912,6 +930,18 @@ export async function runDoctor(
             const existingIdx = rawPlugins.findIndex(
                 (entry) => matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
             );
+            if (
+                rawPlugins.some(
+                    (entry) =>
+                        isLocalPathPluginEntry(entry) &&
+                        String(entry).includes("magic-context") &&
+                        !isDevPathPluginEntry(entry),
+                )
+            ) {
+                warn(
+                    "An unverifiable local OpenCode plugin path was ignored because its package name is not Magic Context",
+                );
+            }
             const configName =
                 paths.opencodeConfigFormat === "jsonc" ? "opencode.jsonc" : "opencode.json";
 
@@ -923,7 +953,10 @@ export async function runDoctor(
                 return null;
             };
 
-            if (existingIdx >= 0 && rawPlugins[existingIdx] === PLUGIN_ENTRY_WITH_VERSION) {
+            if (
+                existingIdx >= 0 &&
+                entryAsString(rawPlugins[existingIdx]) === PLUGIN_ENTRY_WITH_VERSION
+            ) {
                 pass(`Plugin registered in ${configName}`);
             } else if (existingIdx >= 0) {
                 const oldEntry = rawPlugins[existingIdx];
@@ -1017,6 +1050,18 @@ export async function runDoctor(
             const tuiIdx = tuiRawPlugins.findIndex(
                 (entry) => matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
             );
+            if (
+                tuiRawPlugins.some(
+                    (entry) =>
+                        isLocalPathPluginEntry(entry) &&
+                        String(entry).includes("magic-context") &&
+                        !isDevPathPluginEntry(entry),
+                )
+            ) {
+                warn(
+                    "An unverifiable local TUI plugin path was ignored because its package name is not Magic Context",
+                );
+            }
             const tuiEntryAsString = (entry: unknown): string => {
                 if (typeof entry === "string") return entry;
                 if (Array.isArray(entry) && typeof entry[0] === "string") return entry[0];
@@ -1051,13 +1096,15 @@ export async function runDoctor(
                     }
                 }
             } else {
-                pass("TUI sidebar plugin configured");
+                fail("TUI sidebar plugin is missing after the repair attempt");
             }
-        } catch {
-            pass("TUI sidebar plugin configured");
+        } catch (error) {
+            fail(
+                `Could not verify TUI sidebar config: ${error instanceof Error ? error.message : String(error)}`,
+            );
         }
     } else {
-        pass("TUI sidebar plugin configured (tui.json created)");
+        fail("Could not create or verify the TUI sidebar config");
     }
 
     // 7. Check user memories + dreamer compatibility.
@@ -1085,6 +1132,7 @@ export async function runDoctor(
     const embeddingCheck = await checkEmbeddingConfig(paths.magicContextConfig);
     issues += embeddingCheck.issues;
     if (embeddingCheck.issues > 0) failCount += embeddingCheck.issues;
+    else if (embeddingCheck.unverified) warnCount++;
     else passCount++;
 
     // 7c. Shared context DB exists, opens, integrity_check, row counts.

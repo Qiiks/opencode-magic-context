@@ -10,6 +10,7 @@ import {
     getPiUserExtensionsPath,
 } from "../lib/paths";
 import { detectPiBinary, PI_PACKAGE_SOURCE } from "../lib/pi-helpers";
+import { isPiMagicContextPackageEntry } from "../lib/pi-package-entry";
 import type {
     HarnessAdapter,
     HarnessConfigPaths,
@@ -33,7 +34,7 @@ export class PiAdapter implements HarnessAdapter {
         const settings = readPiSettings();
         if (!settings) return false;
         const packages = (settings.packages ?? []) as unknown[];
-        return packages.some((entry) => matchesPiPackage(entry));
+        return packages.some((entry) => isPiMagicContextPackageEntry(entry));
     }
 
     getConfigPaths(): HarnessConfigPaths {
@@ -54,7 +55,7 @@ export class PiAdapter implements HarnessAdapter {
                 ? (settings.packages as unknown[])
                 : [];
 
-            const idx = packages.findIndex((entry) => matchesPiPackage(entry));
+            const idx = packages.findIndex((entry) => isPiMagicContextPackageEntry(entry));
             if (idx === -1) {
                 packages.push(PI_PACKAGE_SOURCE);
                 settings.packages = packages;
@@ -96,7 +97,7 @@ export class PiAdapter implements HarnessAdapter {
             }
             const before = settings.packages.length;
             settings.packages = settings.packages.filter(
-                (entry: unknown) => !matchesPiPackage(entry),
+                (entry: unknown) => !isPiMagicContextPackageEntry(entry),
             );
             if (settings.packages.length === before) {
                 return {
@@ -186,33 +187,6 @@ function writePiSettings(settings: PiSettingsLike): void {
     ensureDir(settingsPath);
     const text = stringifyJsonc(settings, null, 2);
     writeFileAtomic(settingsPath, `${text}\n`);
-}
-
-/**
- * Match a Pi packages array entry against our plugin source.
- *
- * Pi `packages` entries are sources like:
- *   - "npm:@cortexkit/pi-magic-context"
- *   - "npm:@cortexkit/pi-magic-context@1.0.0"
- *   - { name: "@cortexkit/pi-magic-context", source: "npm:..." }
- *   - "file:/path/to/local/dev"
- *
- * We accept anything that resolves to our package name. Local file paths
- * are intentionally NOT considered the same entry — a user installing the
- * published plugin while pointing at a local dev checkout is two separate
- * entries by design (so dev installs don't get silently overridden).
- */
-function matchesPiPackage(entry: unknown): boolean {
-    if (typeof entry === "string") {
-        if (entry.startsWith("file:")) return false;
-        return entry.includes(PLUGIN_NAME);
-    }
-    if (entry !== null && typeof entry === "object") {
-        const obj = entry as { name?: unknown; source?: unknown };
-        if (typeof obj.name === "string" && obj.name === PLUGIN_NAME) return true;
-        if (typeof obj.source === "string") return matchesPiPackage(obj.source);
-    }
-    return false;
 }
 
 function ensureDir(filePath: string): void {

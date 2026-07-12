@@ -364,7 +364,7 @@ describe("runSetup", () => {
 
         const code = await runSetup({ prompts, env });
 
-        expect(code).toBe(0);
+        expect(code).toBe(1);
         expect(existsSync(agentDir)).toBe(false);
         expect(prompts.messages.join("\n")).toContain("Pi not found");
     });
