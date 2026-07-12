@@ -47,7 +47,7 @@ import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
-import { getSdkContextLimit } from "../../shared/models-dev-cache";
+import { getSdkContextLimit, getSdkInputLimit } from "../../shared/models-dev-cache";
 import { applyMidTurnDeferral, detectMidTurnBypassReason } from "./boundary-execution";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
@@ -66,8 +66,8 @@ import {
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
+import { estimateFinalWireInputTokens, estimateMessageTokens } from "./final-wire-token-estimate";
 import type { LiveModelBySession } from "./hook-handlers";
-import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
 import {
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
@@ -83,7 +83,6 @@ import {
 } from "./protected-tail-boundary";
 import { readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
-import { estimateTokens } from "./read-session-formatting";
 import { extractInMemoryMessageViews } from "./read-session-raw";
 import { sendIgnoredMessage } from "./send-session-notification";
 import { modelAcceptsEmptyContent } from "./sentinel";
@@ -109,7 +108,11 @@ import {
     type TagTarget,
     tagMessages,
 } from "./transform-operations";
-import { evaluateEmergencyFailClosed, runPostTransformPhase } from "./transform-postprocess-phase";
+import {
+    abortSessionFailClosed,
+    evaluateEmergencyFailClosed,
+    runPostTransformPhase,
+} from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
 
 // Per-session message token cache. Keyed by message ID, value is the token
@@ -710,6 +713,7 @@ export function createTransform(deps: TransformDeps) {
 
         let recoveryNoHeadEscapeActive = false;
         let emergencyRecoveryArmed = false;
+        let usagePercentageSynthetic = false;
 
         // Overflow-triggered emergency recovery: if a prior provider response
         // included a context-overflow error, the event handler persisted
@@ -804,6 +808,7 @@ export function createTransform(deps: TransformDeps) {
                         ...contextUsageEarly,
                         percentage: 95,
                     };
+                    usagePercentageSynthetic = true;
                 } else if (recoveryNoHeadEscapeActive && deps.client) {
                     void sendIgnoredMessage(
                         deps.client,
@@ -1758,25 +1763,33 @@ export function createTransform(deps: TransformDeps) {
                 hardSignals: m0HardSignals,
             },
         });
-        // A generic injection-cache rebuild is not proof that the historian
-        // published anything. Count only an awaited publication or a deferred
-        // publication signal that rebuilt a real DB-backed injection as a landed fold.
-        const historianFoldLandedThisPass =
-            compartmentPhase.justAwaitedPublication ||
-            (deferredHistoryWasPendingAtPassStart &&
-                rebuiltHistoryFromInitialPrepare &&
-                pendingCompartmentInjection?.rebuiltFromDb === true);
-        const emergencyModelLimit =
-            resolvedContextLimit ??
-            (emergencyCeilingLimit > 0 ? Math.round(emergencyCeilingLimit) : undefined);
+        // Fresh-tokenize only in the emergency band. Routine transforms keep the
+        // existing cached sidebar accounting and pay no additional wire walk.
+        const finalWireEstimate =
+            contextUsage.percentage >= 95
+                ? estimateFinalWireInputTokens({
+                      messages,
+                      systemPromptTokens: sessionMeta.systemPromptTokens,
+                      providerID: modelForBudget?.providerID,
+                      modelID: modelForBudget?.modelID,
+                      agentName: notificationParams.agent,
+                  })
+                : undefined;
+        const trustedInputLimit =
+            contextUsage.percentage >= 95 && modelForBudget
+                ? getSdkInputLimit(modelForBudget.providerID, modelForBudget.modelID)
+                : undefined;
         const emergencyFailClosed = evaluateEmergencyFailClosed({
             usagePercentage: contextUsage.percentage,
-            historianFoldLandedThisPass,
-            currentInputTokens: contextUsage.inputTokens,
-            emergencyReclaimedTokens: postTransformResult.emergencyReclaimedTokens,
-            modelLimitTokens: emergencyModelLimit,
+            finalWireInputTokens: finalWireEstimate?.trusted ? finalWireEstimate.tokens : undefined,
+            trustedInputLimitTokens: trustedInputLimit,
+            emergencyRecoveryArmed,
+            usagePercentageSynthetic,
         });
-        if (emergencyFailClosed.shouldAbort && deps.client) {
+        if (emergencyFailClosed.shouldAbort) {
+            if (!deps.client) {
+                throw new Error("Cannot fail closed: OpenCode client is unavailable");
+            }
             // The notice must finish before self-abort: OpenCode detaches the hook
             // effect on interruption, so an unawaited notification is lost exactly
             // when the user most needs recovery instructions.
@@ -1786,26 +1799,22 @@ export function createTransform(deps: TransformDeps) {
                 "Context full — /ctx-flush or /clear to continue.",
                 notificationParams,
             );
-            const abortingClient = deps.client as {
-                session?: { abort?: (input: { path: { id: string } }) => Promise<unknown> };
-            };
-            if (typeof abortingClient.session?.abort === "function") {
-                try {
-                    // Returning a reduced message array still creates a provider
-                    // request. Awaited self-abort interrupts OpenCode's run before
-                    // that doomed request can be assembled.
-                    await abortingClient.session.abort({ path: { id: sessionId } });
-                } catch (error) {
-                    sessionLog(
-                        sessionId,
-                        "transform: emergency fail-closed abort failed:",
-                        getErrorMessage(error),
-                    );
-                }
+            try {
+                // Returning any message array still creates a provider request.
+                // Await and validate self-abort so only a confirmed interruption
+                // can return normally from this already-unsendable branch.
+                await abortSessionFailClosed(deps.client, sessionId);
+            } catch (error) {
+                sessionLog(
+                    sessionId,
+                    "transform: emergency fail-closed abort failed; refusing to return a sendable prompt:",
+                    getErrorMessage(error),
+                );
+                throw error;
             }
             sessionLog(
                 sessionId,
-                `EMERGENCY: fail-closed after drops (estimated=${emergencyFailClosed.postDropInputTokens}, limit=${emergencyModelLimit}, margin=${emergencyFailClosed.errorMarginTokens})`,
+                `EMERGENCY: fail-closed (reason=${emergencyFailClosed.reason}, finalEstimate=${finalWireEstimate?.trusted ? finalWireEstimate.tokens : "untrusted"}, inputLimit=${trustedInputLimit ?? "untrusted"}, margin=${emergencyFailClosed.errorMarginTokens}, syntheticUsage=${usagePercentageSynthetic})`,
             );
             return;
         }
@@ -1904,122 +1913,10 @@ export function createTransform(deps: TransformDeps) {
                     continue;
                 }
             }
-            let conv = 0;
-            let tool = 0;
-            for (const part of message.parts) {
-                if (!part || typeof part !== "object") continue;
-                const p = part as {
-                    type?: string;
-                    text?: string;
-                    thinking?: string;
-                    signature?: string;
-                    data?: string;
-                    ignored?: boolean;
-                    state?: { input?: unknown; output?: unknown };
-                    args?: unknown;
-                    input?: unknown;
-                    content?: unknown;
-                    mime?: string;
-                    metadata?: { anthropic?: { signature?: string } };
-                };
-                if (p.ignored) continue;
-                switch (p.type) {
-                    case "text": {
-                        if (typeof p.text === "string") {
-                            conv += estimateTokens(p.text);
-                        }
-                        break;
-                    }
-                    case "reasoning": {
-                        // OpenCode's internal representation of reasoning.
-                        // Content is in `text`, signature is in metadata.
-                        if (typeof p.text === "string") conv += estimateTokens(p.text);
-                        const sig = p.metadata?.anthropic?.signature;
-                        if (typeof sig === "string") conv += estimateTokens(sig);
-                        break;
-                    }
-                    case "thinking": {
-                        // Anthropic wire-format thinking part. Content is in
-                        // `thinking`, signature is in `signature`. Typical
-                        // signature ~3,500 chars / ~600 tokens per block.
-                        if (typeof p.thinking === "string") conv += estimateTokens(p.thinking);
-                        if (typeof p.signature === "string") conv += estimateTokens(p.signature);
-                        break;
-                    }
-                    case "redacted_thinking": {
-                        // Redacted thinking: opaque `data` blob, billed as input.
-                        if (typeof p.data === "string") conv += estimateTokens(p.data);
-                        break;
-                    }
-                    case "file": {
-                        // Images: Anthropic bills by visual tokens using
-                        // (width × height) / 750. Parse PNG/JPEG/WebP/GIF
-                        // headers from the data URL to get real dimensions
-                        // instead of over-estimating from base64 char length.
-                        // https://docs.claude.com/en/build-with-claude/vision
-                        if (typeof p.mime === "string" && p.mime.startsWith("image/")) {
-                            const url =
-                                typeof (p as { url?: unknown }).url === "string"
-                                    ? (p as { url: string }).url
-                                    : undefined;
-                            if (url?.startsWith("data:")) {
-                                conv += estimateImageTokensFromDataUrl(url);
-                            } else {
-                                conv += 1200; // fallback for non-data-url refs
-                            }
-                        }
-                        break;
-                    }
-                    case "tool": {
-                        // OpenCode format: { state: { input, output } }
-                        if (p.state && typeof p.state === "object") {
-                            if (p.state.input !== undefined) {
-                                const s =
-                                    typeof p.state.input === "string"
-                                        ? p.state.input
-                                        : JSON.stringify(p.state.input);
-                                if (s) tool += estimateTokens(s);
-                            }
-                            if (p.state.output !== undefined) {
-                                const s =
-                                    typeof p.state.output === "string"
-                                        ? p.state.output
-                                        : JSON.stringify(p.state.output);
-                                if (s) tool += estimateTokens(s);
-                            }
-                        }
-                        break;
-                    }
-                    case "tool-invocation": {
-                        if (p.args !== undefined) {
-                            const s = typeof p.args === "string" ? p.args : JSON.stringify(p.args);
-                            if (s) tool += estimateTokens(s);
-                        }
-                        break;
-                    }
-                    case "tool_use": {
-                        if (p.input !== undefined) {
-                            const s =
-                                typeof p.input === "string" ? p.input : JSON.stringify(p.input);
-                            if (s) tool += estimateTokens(s);
-                        }
-                        break;
-                    }
-                    case "tool_result": {
-                        if (p.content !== undefined) {
-                            const s =
-                                typeof p.content === "string"
-                                    ? p.content
-                                    : JSON.stringify(p.content);
-                            if (s) tool += estimateTokens(s);
-                        }
-                        break;
-                    }
-                }
-            }
-            if (mid) msgTokens.set(mid, { conversation: conv, toolCall: tool });
-            conversationTokens += conv;
-            toolCallTokens += tool;
+            const estimated = estimateMessageTokens(message);
+            if (mid) msgTokens.set(mid, estimated);
+            conversationTokens += estimated.conversation;
+            toolCallTokens += estimated.toolCall;
         }
         try {
             updateSessionMeta(db, sessionId, { conversationTokens, toolCallTokens });

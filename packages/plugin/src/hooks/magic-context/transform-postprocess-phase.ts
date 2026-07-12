@@ -230,42 +230,78 @@ export interface PostTransformPhaseResult {
 }
 
 /**
- * Emergency reclaim estimates content removed from the wire but cannot account
- * perfectly for provider framing and replacement placeholders. Require a five-percent
- * overshoot before breaking a turn so a boundary estimate never causes a false abort.
+ * The final-wire estimate cannot model every provider framing token. Require a
+ * five-percent overshoot before breaking a turn when a trusted input cap exists.
  */
 export const EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE = 5;
 
+export interface ConfirmedAbortClient {
+    session?: {
+        abort?: (input: {
+            path: { id: string };
+            throwOnError: true;
+        }) => Promise<{ data?: boolean; error?: unknown }>;
+    };
+}
+
+export async function abortSessionFailClosed(
+    client: ConfirmedAbortClient,
+    sessionId: string,
+): Promise<void> {
+    if (typeof client.session?.abort !== "function") {
+        throw new Error("OpenCode session.abort is unavailable");
+    }
+    const result = await client.session.abort({
+        path: { id: sessionId },
+        throwOnError: true,
+    });
+    if (result.data !== true) {
+        throw new Error(
+            `OpenCode session.abort was not confirmed: ${JSON.stringify(result.error ?? result.data)}`,
+        );
+    }
+}
+
 export interface EmergencyFailClosedDecision {
     shouldAbort: boolean;
-    postDropInputTokens: number;
     errorMarginTokens: number;
+    reason: "below-emergency-band" | "numeric-safe" | "numeric-overflow" | "untrusted-recovery";
 }
 
 export function evaluateEmergencyFailClosed(input: {
     usagePercentage: number;
-    historianFoldLandedThisPass: boolean;
-    currentInputTokens: number;
-    emergencyReclaimedTokens: number;
-    modelLimitTokens: number | undefined;
+    finalWireInputTokens: number | undefined;
+    trustedInputLimitTokens: number | undefined;
+    emergencyRecoveryArmed: boolean;
+    usagePercentageSynthetic: boolean;
 }): EmergencyFailClosedDecision {
-    const modelLimitTokens = input.modelLimitTokens ?? 0;
-    const postDropInputTokens = Math.max(
-        0,
-        input.currentInputTokens - input.emergencyReclaimedTokens,
-    );
+    if (input.usagePercentage < 95) {
+        return { shouldAbort: false, errorMarginTokens: 0, reason: "below-emergency-band" };
+    }
+    const modelLimitTokens = input.trustedInputLimitTokens ?? 0;
     const errorMarginTokens =
         modelLimitTokens > 0
             ? Math.ceil(modelLimitTokens * (EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE / 100))
             : 0;
+    if (
+        input.finalWireInputTokens !== undefined &&
+        Number.isFinite(input.finalWireInputTokens) &&
+        modelLimitTokens > 0
+    ) {
+        const shouldAbort = input.finalWireInputTokens > modelLimitTokens + errorMarginTokens;
+        return {
+            shouldAbort,
+            errorMarginTokens,
+            reason: shouldAbort ? "numeric-overflow" : "numeric-safe",
+        };
+    }
+    // A real provider overflow already proved the turn unsafe. If restart state
+    // erased the measured input or only a combined context window is known, a
+    // guessed boundary can make the abort unreachable; stop conservatively.
     return {
-        shouldAbort:
-            input.usagePercentage >= 95 &&
-            !input.historianFoldLandedThisPass &&
-            modelLimitTokens > 0 &&
-            postDropInputTokens > modelLimitTokens + errorMarginTokens,
-        postDropInputTokens,
+        shouldAbort: input.emergencyRecoveryArmed,
         errorMarginTokens,
+        reason: "untrusted-recovery",
     };
 }
 

@@ -6,6 +6,7 @@ import {
     clearModelsDevCache,
     getModelsDevCacheState,
     getSdkContextLimit,
+    getSdkInputLimit,
     refreshModelLimitsAfterAuthOnce,
     refreshModelLimitsFromApi,
     resetAuthRewarmLatchForTest,
@@ -62,7 +63,9 @@ describe("models-dev-cache (SDK-only)", () => {
         );
 
         expect(getSdkContextLimit("github-copilot", "gpt-5.3-codex")).toBe(272000);
+        expect(getSdkInputLimit("github-copilot", "gpt-5.3-codex")).toBe(272000);
         expect(getSdkContextLimit("github-copilot", "legacy-only-context")).toBe(100000);
+        expect(getSdkInputLimit("github-copilot", "legacy-only-context")).toBeUndefined();
         expect(getSdkContextLimit("unknown", "unknown")).toBeUndefined();
     });
 
@@ -78,6 +81,7 @@ describe("models-dev-cache (SDK-only)", () => {
             ]),
         );
         expect(getSdkContextLimit("openai", "gpt-5.5")).toBe(272000);
+        expect(getSdkInputLimit("openai", "gpt-5.5")).toBe(272000);
     });
 
     test("derived experimental.modes inherit the effective (input) limit", async () => {
@@ -172,6 +176,7 @@ describe("models-dev-cache (SDK-only)", () => {
                 makeClient([{ id: "openai", models: { "gpt-5.5": { limit: { input: 272000 } } } }]),
             );
             expect(getSdkContextLimit("openai", "gpt-5.5")).toBe(272000);
+            expect(getSdkInputLimit("openai", "gpt-5.5")).toBe(272000);
 
             // Simulate a restart: in-memory cache gone, but the persisted file
             // remains under XDG_DATA_HOME. The next lookup seeds from disk.
