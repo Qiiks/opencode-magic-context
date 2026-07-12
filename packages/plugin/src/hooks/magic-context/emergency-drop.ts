@@ -95,8 +95,8 @@ export interface EmergencyDropPlan {
     reason: string;
 }
 
-function bytesToTokens(bytes: number): number {
-    return Math.round(bytes * TOKENS_PER_BYTE);
+export function estimateEmergencyDropReclaimTokens(tag: EmergencyDropTag): number {
+    return Math.round(tagReclaimBytes(tag) * TOKENS_PER_BYTE);
 }
 
 /**
@@ -192,7 +192,7 @@ export function planEmergencyDrop(input: {
     let tailTokens = 0;
     for (const tag of floorTags) {
         if (tag.status !== "active") continue;
-        tailTokens += bytesToTokens(tagReclaimBytes(tag));
+        tailTokens += estimateEmergencyDropReclaimTokens(tag);
     }
     const fixedFloor = Math.max(currentTotalInputTokens - tailTokens, 0);
     const workingSpan = Math.max(ceilingTokens - fixedFloor, 0);
@@ -247,7 +247,7 @@ export function planEmergencyDrop(input: {
             selected.push(tag.tagNumber);
             // Match the floor's tagReclaimBytes exactly: drop() removes output +
             // invocation args + preceding reasoning, so all three reclaim.
-            reclaimed += bytesToTokens(tagReclaimBytes(tag));
+            reclaimed += estimateEmergencyDropReclaimTokens(tag);
             if (reclaimed >= reclaimTokens) break outer;
         }
     }

@@ -33,6 +33,8 @@ import { applyFlushedStatuses } from "./transform-operations";
 import {
     checkM0MutationDriftAndSignal,
     clearPendingCompactionMarkerAfterSuccessfulDrain,
+    EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE,
+    evaluateEmergencyFailClosed,
     finalizeMessageRepresentation,
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
@@ -394,6 +396,55 @@ describe("deferred compaction marker CAS drain", () => {
     });
 });
 
+describe("emergency fail-closed decision", () => {
+    it("does not abort when emergency drops salvage the pending input", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 108,
+                historianFoldLandedThisPass: false,
+                currentInputTokens: 108_000,
+                emergencyReclaimedTokens: 12_000,
+                modelLimitTokens: 100_000,
+            }).shouldAbort,
+        ).toBe(false);
+    });
+
+    it("does not abort a marginal over-estimate inside the estimator margin", () => {
+        const decision = evaluateEmergencyFailClosed({
+            usagePercentage: 103,
+            historianFoldLandedThisPass: false,
+            currentInputTokens: 103_000,
+            emergencyReclaimedTokens: 0,
+            modelLimitTokens: 100_000,
+        });
+
+        expect(EMERGENCY_ESTIMATOR_ERROR_MARGIN_PERCENTAGE).toBe(5);
+        expect(decision.errorMarginTokens).toBe(5_000);
+        expect(decision.shouldAbort).toBe(false);
+    });
+
+    it("aborts only when a failed fold remains clearly over after drops", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 112,
+                historianFoldLandedThisPass: false,
+                currentInputTokens: 112_000,
+                emergencyReclaimedTokens: 4_000,
+                modelLimitTokens: 100_000,
+            }).shouldAbort,
+        ).toBe(true);
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 112,
+                historianFoldLandedThisPass: true,
+                currentInputTokens: 112_000,
+                emergencyReclaimedTokens: 0,
+                modelLimitTokens: 100_000,
+            }).shouldAbort,
+        ).toBe(false);
+    });
+});
+
 describe("postprocess emergency drop accounting", () => {
     it("plans emergency floor from tags that remain active after pending ops", async () => {
         db = new Database(":memory:");
@@ -458,6 +509,31 @@ describe("postprocess emergency drop accounting", () => {
             [3, "active"],
             [4, "active"],
         ]);
+    });
+
+    it("reports estimated tokens reclaimed by successful emergency tool drops", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-postprocess-reclaim";
+        const messages = [1, 2, 3, 4].map((tag) => makeToolMessage(`tool-${tag}`));
+        const targets = new Map<number, TagTarget>();
+        for (let tag = 1; tag <= 4; tag++) {
+            insertTag(db, sessionId, `tool-${tag}`, "tool", 8000, tag, 0, "bash");
+            targets.set(tag, makeDropTarget(messages[tag - 1]!));
+        }
+
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+                contextUsage: { percentage: 110, inputTokens: 20_000 },
+                emergencyCeilingTokens: 10_000,
+                currentTurnId: "turn-reclaim",
+            }),
+        );
+
+        expect(result.emergencyReclaimedTokens).toBeGreaterThan(0);
+        expect(result.emergency).toBe(true);
     });
 });
 

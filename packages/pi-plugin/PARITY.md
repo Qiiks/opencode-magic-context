@@ -278,6 +278,22 @@ bytes unchanged.
 
 ---
 
+## 9c. Emergency overflow termination follows each host's control surface
+
+**OpenCode:** after the ≥95% historian attempt and emergency tool drops, the
+transform re-estimates the pending input. If no historian fold landed and the
+prompt is still clearly over the model limit, it sends the actionable
+`/ctx-flush` or `/clear` notification and then awaits `session.abort()`. Awaiting
+self-abort interrupts the run before OpenCode creates a doomed provider request.
+
+**Pi:** the context extension API has no turn-abort primitive. At ≥95%, Pi sends
+the same loud actionable notification, waits briefly for any in-flight historian,
+and applies its existing emergency drops, but must return the best-effort reduced
+context to Pi. Magic Context intentionally does not invent an abort mechanism
+outside Pi's extension API.
+
+---
+
 ## 10. Cleared reasoning: Pi EMPTIES (drops signature); OpenCode writes `[cleared]`→sentinel, gated
 
 When Magic Context clears an aged reasoning/thinking block, the two harnesses use

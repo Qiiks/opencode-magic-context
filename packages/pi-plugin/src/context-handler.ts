@@ -2431,9 +2431,13 @@ export function registerPiContextHandler(
 				const now = Date.now();
 				if (now - lastNotifiedAt >= EMERGENCY_NOTIFICATION_COOLDOWN_MS) {
 					lastEmergencyNotificationAtMs.set(sessionId, now);
+					sendPiIgnoredNotification(
+						ctx,
+						"Context full — /ctx-flush or /clear to continue.",
+					);
 					sessionLog(
 						sessionId,
-						`EMERGENCY: usage=${usagePercentage.toFixed(1)}% — awaiting in-flight historian + applying drop-all-tools`,
+						`EMERGENCY: usage=${usagePercentage.toFixed(1)}% — notified user, awaiting in-flight historian + applying drop-all-tools`,
 					);
 				}
 
