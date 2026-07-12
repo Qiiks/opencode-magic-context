@@ -708,19 +708,19 @@ pub fn historian_producer_session_id(
         .collect();
     let slug = slug.trim_matches('-');
     let slug = if slug.is_empty() { "project" } else { slug };
-    let lineage = fnv1a_hex8(session_id);
+    let lineage = fnv1a_hex16(session_id);
     format!("mc-historian:{slug}:{lineage}:{firing_seq}")
 }
 
-/// FNV-1a 64-bit, rendered as the first 8 hex chars — enough to separate the
-/// handful of concurrent lineages a project realistically carries.
-fn fnv1a_hex8(input: &str) -> String {
+/// FNV-1a 64-bit rendered in full so producer sessions retain the hash's
+/// collision resistance across adversarially chosen lineage keys.
+fn fnv1a_hex16(input: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    format!("{hash:016x}")[..8].to_string()
+    format!("{hash:016x}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1186,12 +1186,21 @@ fn publish_output_from_awaiting(
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
 
-    let validated = match validate_historian_output(
-        &output.text,
-        validation_chunk,
-        prior_compartments,
-        validate_options,
-    ) {
+    let validation_result = if output.length_capped {
+        Err(HistorianValidationError {
+            message:
+                "Historian output hit the length cap; refusing a potentially partial document."
+                    .to_string(),
+        })
+    } else {
+        validate_historian_output(
+            &output.text,
+            validation_chunk,
+            prior_compartments,
+            validate_options,
+        )
+    };
+    let validated = match validation_result {
         Ok(validated) => validated,
         Err(err) => {
             let cap_hint = if output.length_capped {
@@ -1434,14 +1443,17 @@ mod tests {
                 ChunkLine {
                     ordinal: 2,
                     message_id: "m2#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 3,
                     message_id: "m3#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 4,
                     message_id: "m4#0".into(),
+                    anchorable: true,
                 },
             ],
             present_ordinals: vec![1, 2, 3, 4],
@@ -1559,6 +1571,23 @@ mod tests {
             text,
             length_capped: false,
         }
+    }
+
+    #[test]
+    fn full_lineage_hash_separates_keys_that_collided_at_32_bits() {
+        let first = historian_producer_session_id("proj", "lineage-ZiDxmBSjhQbv", 2);
+        let second = historian_producer_session_id("proj", "lineage-OPeZDtvlh9LD", 2);
+
+        assert_ne!(first, second);
+        let first_hash = first.split(':').nth(2).expect("hash segment");
+        let second_hash = second.split(':').nth(2).expect("hash segment");
+        assert_eq!(first_hash.len(), 16);
+        assert_eq!(second_hash.len(), 16);
+        assert_eq!(
+            &first_hash[..8],
+            &second_hash[..8],
+            "the regression keys collided under the former 32-bit prefix"
+        );
     }
 
     #[test]
@@ -2143,6 +2172,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_lineages_reattach_and_publish_in_isolated_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let left_lineage = "lineage-ZiDxmBSjhQbv";
+        let right_lineage = "lineage-OPeZDtvlh9LD";
+        let left_producer_session = historian_producer_session_id("proj", left_lineage, 1);
+        let right_producer_session = historian_producer_session_id("proj", right_lineage, 1);
+        assert_ne!(left_producer_session, right_producer_session);
+
+        for (lineage, producer_session, run_id) in [
+            (left_lineage, left_producer_session.as_str(), "run-left"),
+            (right_lineage, right_producer_session.as_str(), "run-right"),
+        ] {
+            store
+                .replace_compartments(lineage, &[comp(1, 1, 1, "m1", "C1 summary")])
+                .unwrap();
+            let fired =
+                match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap() {
+                    FireOutcome::Fired(state) => state,
+                    FireOutcome::Busy(_) => unreachable!(),
+                };
+            let awaiting =
+                producer_started(&fired, producer_session.to_string(), run_id.to_string()).unwrap();
+            store
+                .commit(
+                    lineage,
+                    None,
+                    &CoreState::default(),
+                    &ModuleMeta {
+                        historian: awaiting,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut left_producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Ok(producer_output(historian_xml("left summary"))));
+        let mut right_producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Ok(producer_output(historian_xml("right summary"))));
+        let left_request = HistorianReattachRequest {
+            store: &store,
+            session_id: left_lineage,
+            project_path: "git:proj",
+            observed_chunk_fingerprint: "fp",
+            validation_chunk: &chunk,
+            chunk_transcript: "U: left transcript",
+            prior_compartments: &prior,
+            validate_options: validate_options(),
+            publication_floor_ordinal: 4,
+            now_ms: 123,
+            failure_backoff_at_ms: 999,
+        };
+        let right_request = HistorianReattachRequest {
+            store: &store,
+            session_id: right_lineage,
+            project_path: "git:proj",
+            observed_chunk_fingerprint: "fp",
+            validation_chunk: &chunk,
+            chunk_transcript: "U: right transcript",
+            prior_compartments: &prior,
+            validate_options: validate_options(),
+            publication_floor_ordinal: 4,
+            now_ms: 123,
+            failure_backoff_at_ms: 999,
+        };
+
+        let (left, right) = tokio::join!(
+            reattach_historian_producer(&mut left_producer, left_request),
+            reattach_historian_producer(&mut right_producer, right_request),
+        );
+
+        assert!(matches!(
+            left.unwrap(),
+            HistorianReattachOutcome::Published(_)
+        ));
+        assert!(matches!(
+            right.unwrap(),
+            HistorianReattachOutcome::Published(_)
+        ));
+        assert_eq!(left_producer.observed_sessions, vec![left_producer_session]);
+        assert_eq!(
+            right_producer.observed_sessions,
+            vec![right_producer_session]
+        );
+        let left_tail = store
+            .load_compartments(left_lineage)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let right_tail = store
+            .load_compartments(right_lineage)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(left_tail.p1.as_deref(), Some("left summary"));
+        assert_eq!(right_tail.p1.as_deref(), Some("right summary"));
+    }
+
+    #[tokio::test]
     async fn reattach_redrains_full_run_from_start() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -2328,6 +2461,37 @@ mod tests {
                 && detail.contains("run-1 received terminal control unit"),
             "a replay terminal for another run id must not publish this firing: {detail}"
         );
+    }
+
+    #[tokio::test]
+    async fn length_capped_closed_output_is_rejected_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut capped = producer_output(historian_xml("closed but incomplete summary"));
+        capped.length_capped = true;
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-cap")))
+            .with_output(Ok(capped));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Validation(_)));
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert!(state
+            .last_failure
+            .as_deref()
+            .is_some_and(|detail| detail.contains("length cap")));
     }
 
     #[tokio::test]
@@ -2591,14 +2755,17 @@ mod tests {
                 ChunkLine {
                     ordinal: 2,
                     message_id: "m2#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 3,
                     message_id: "m3#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 4,
                     message_id: "m4#0".into(),
+                    anchorable: true,
                 },
             ],
             present_ordinals: vec![1, 2, 3, 4],

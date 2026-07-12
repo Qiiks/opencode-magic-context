@@ -28,14 +28,18 @@ pub struct MessageRange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkLine {
     pub ordinal: u64,
-    /// CONTRACT: the FLAT BLOCK ID (`<mid>#<index>`) of the line's last block — never a
-    /// bare harness/CK message id. This value becomes the published compartment's
-    /// end_message_id and, when that compartment folds, the coverage boundary anchor.
-    /// Boundary presence is checked against live flat block ids, so any other vocabulary
-    /// mints an anchor that can never be present (the transform's mint-absent guard then
-    /// fails the fold loudly). The production chunk builder must derive this from the
-    /// flattened projection, not from the raw CK message id.
+    /// The real flat block id (`<mid>#<index>`) of the line's last block. This is empty
+    /// only when the raw message has no flat blocks and therefore cannot anchor a
+    /// compartment boundary.
     pub message_id: String,
+    /// Whether `message_id` names a real flat block. A compartment must end on an
+    /// anchorable block so publication cannot mint an impossible coverage boundary.
+    #[serde(default = "chunk_line_anchorable_by_default")]
+    pub anchorable: bool,
+}
+
+fn chunk_line_anchorable_by_default() -> bool {
+    true
 }
 
 /// The raw-history slice that the historian was asked to summarize.
@@ -221,12 +225,27 @@ fn validation_error(message: impl Into<String>) -> HistorianValidationError {
     }
 }
 
-/// Parse the historian's XML-ish output using the same permissive extraction
-/// semantics as the TypeScript host parser. Malformed XML simply yields fewer
-/// usable structures; validation decides whether that is acceptable.
+/// Require one complete historian output envelope, then use the TypeScript host
+/// parser's permissive extraction semantics for structures inside that root.
+/// Malformed inner XML yields fewer usable structures for validation to assess.
 pub fn parse_compartment_output(
     text: &str,
 ) -> Result<ParsedCompartmentOutput, HistorianValidationError> {
+    let Some(root) = output_document_regex().captures(text) else {
+        return Err(validation_error(
+            "Historian output must be one complete <output> root document.",
+        ));
+    };
+    let root_body = root
+        .name("body")
+        .map(|capture| capture.as_str())
+        .unwrap_or_default();
+    if output_tag_regex().is_match(root_body) {
+        return Err(validation_error(
+            "Historian output must contain exactly one <output> root document.",
+        ));
+    }
+
     let mut compartments = Vec::new();
     let mut facts = Vec::new();
 
@@ -472,8 +491,13 @@ pub fn validate_historian_output(
             .last()
             .map(|c| c.end_message)
             .unwrap_or(chunk.end_index);
-        let lookahead_margin = chunk.end_index.saturating_sub(last_end);
-        if lookahead_margin <= BOUNDARY_HEALING_SLACK {
+        // Discard-last measures real lookahead messages, not gaps in a sparse
+        // ordinal space where retired message numbers can be arbitrarily far apart.
+        let lookahead_count = present_ordinals
+            .iter()
+            .filter(|ordinal| **ordinal > last_end && **ordinal <= chunk.end_index)
+            .count() as u64;
+        if lookahead_count <= BOUNDARY_HEALING_SLACK {
             compartments.pop();
             discarded_last = true;
         }
@@ -821,6 +845,12 @@ fn map_parsed_compartments_to_chunk(
                 chunk.end_index
             ));
         };
+        if !end_line.anchorable || end_line.message_id.is_empty() {
+            return Err(format!(
+                "Compartment ending at raw message {} cannot anchor a boundary because that message has no flat blocks",
+                compartment.end_message
+            ));
+        }
         mapped.push(ValidatedCompartment {
             sequence: sequence_offset + index as u64,
             start_message: compartment.start_message,
@@ -938,7 +968,7 @@ fn keep_side_channel(
     discarded_last: bool,
 ) -> bool {
     match origin_compartment_index {
-        Some(index) => index <= persisted_count,
+        Some(index) => (1..=persisted_count).contains(&index),
         None => !discarded_last,
     }
 }
@@ -980,6 +1010,18 @@ fn unescape_xml(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+}
+
+fn output_document_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?is)\A\s*<output(?:\s[^>]*)?>(?P<body>.*)</output\s*>\s*\z").unwrap()
+    })
+}
+
+fn output_tag_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?is)</?output(?:\s[^>]*)?>").unwrap())
 }
 
 fn compartment_regex() -> &'static Regex {
@@ -1155,6 +1197,7 @@ mod tests {
                 .map(|ordinal| ChunkLine {
                     ordinal,
                     message_id: format!("msg-{ordinal}"),
+                    anchorable: true,
                 })
                 .collect(),
             present_ordinals: (start..=end).collect(),
@@ -1184,9 +1227,17 @@ mod tests {
         assert!(!cases.is_empty(), "empty validate golden");
 
         for case in &cases {
-            let parsed = parse_compartment_output(&case.input.text)
-                .unwrap_or_else(|error| panic!("{} parse failed: {error}", case.label));
-            assert_eq!(parsed, case.parsed, "parsed mismatch in {}", case.label);
+            match parse_compartment_output(&case.input.text) {
+                Ok(parsed) => assert_eq!(parsed, case.parsed, "parsed mismatch in {}", case.label),
+                Err(error) => {
+                    assert!(
+                        !case.validation.ok && error.message.contains("<output> root document"),
+                        "only malformed envelopes may diverge from the permissive TypeScript parser in {}",
+                        case.label
+                    );
+                    continue;
+                }
+            }
 
             let got = verdict(validate_historian_output(
                 &case.input.text,
@@ -1265,14 +1316,17 @@ mod tests {
                 ChunkLine {
                     ordinal: 1,
                     message_id: "m1#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 1,
                     message_id: "m1-dup#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 2,
                     message_id: "m2#0".into(),
+                    anchorable: true,
                 },
             ],
             present_ordinals: vec![1, 1, 2],
@@ -1288,14 +1342,17 @@ mod tests {
                 ChunkLine {
                     ordinal: 1,
                     message_id: "m1#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 3,
                     message_id: "m3#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 2,
                     message_id: "m2#0".into(),
+                    anchorable: true,
                 },
             ],
             present_ordinals: vec![1, 2, 3],
@@ -1323,6 +1380,102 @@ mod tests {
         );
         assert_eq!(two_result.compartments.len(), 1);
         assert_eq!(two_result.unprocessed_from, 3);
+    }
+
+    #[test]
+    fn parser_requires_one_complete_output_root() {
+        let rootless = r#"<compartments><compartment start="1" end="1" title="t"><p1>x</p1></compartment></compartments><meta><unprocessed_from>2</unprocessed_from></meta>"#;
+        let truncated = r#"<output><compartments><compartment start="1" end="1" title="t"><p1>x</p1></compartment></compartments>"#;
+        let nested = format!("<output>{}</output>", xml(&[(1, 1, "nested")], 2, ""));
+
+        for malformed in [rootless, truncated, nested.as_str()] {
+            let error = parse_compartment_output(malformed).expect_err("invalid root rejected");
+            assert!(error.message.contains("<output> root document"));
+        }
+    }
+
+    #[test]
+    fn compartment_end_must_be_anchorable() {
+        let mut chunk = chunk(1, 2);
+        chunk.lines[1].message_id.clear();
+        chunk.lines[1].anchorable = false;
+        let text = xml(&[(1, 2, "zero-block tail")], 3, "");
+
+        let error = validate_historian_output(&text, &chunk, &[], ValidateOptions::default())
+            .expect_err("a zero-block endpoint cannot publish");
+        assert!(error.message.contains("cannot anchor a boundary"));
+
+        chunk.lines[1].message_id = "m2#0".to_string();
+        chunk.lines[1].anchorable = true;
+        let validated = validate_historian_output(&text, &chunk, &[], ValidateOptions::default())
+            .expect("a real flat-block endpoint remains publishable");
+        assert_eq!(validated.compartments[0].end_message_id, "m2#0");
+    }
+
+    #[test]
+    fn discard_last_counts_present_sparse_lookahead_messages() {
+        let sparse = HistorianChunk {
+            start_index: 1,
+            end_index: 100,
+            lines: [1, 2, 100]
+                .into_iter()
+                .map(|ordinal| ChunkLine {
+                    ordinal,
+                    message_id: format!("m{ordinal}#0"),
+                    anchorable: true,
+                })
+                .collect(),
+            present_ordinals: vec![1, 2, 100],
+            tool_only_ranges: Vec::new(),
+        };
+        let text = xml(&[(1, 1, "first"), (2, 2, "provisional")], 100, "");
+
+        let validated = validate_historian_output(&text, &sparse, &[], ValidateOptions::default())
+            .expect("sparse chunk validates");
+        assert!(validated.discarded_last);
+        assert_eq!(validated.compartments.len(), 1);
+        assert_eq!(validated.unprocessed_from, 2);
+    }
+
+    #[test]
+    fn zero_side_channel_anchor_is_suppressed() {
+        let extra = r#"
+<facts><PROJECT_RULES>
+* [at_compartment=0] Drop the zero rule.
+* [at_compartment=1] Keep the first rule.
+</PROJECT_RULES></facts>
+<events>
+<causal_incident at_compartment="0"><summary>zero event</summary></causal_incident>
+<trajectory_correction at_compartment="1"><summary>first event</summary></trajectory_correction>
+</events>
+<user_observations>
+* [at_compartment=0] Drop the zero observation.
+* [at_compartment=1] Keep the first observation.
+</user_observations>
+<primer_candidates>
+<primer at_compartment="0">Drop the zero primer?</primer>
+<primer at_compartment="1">Keep the first primer?</primer>
+</primer_candidates>
+"#;
+        let text = xml(&[(1, 2, "only")], 3, extra);
+        let validated =
+            validate_historian_output(&text, &chunk(1, 2), &[], ValidateOptions::default())
+                .expect("valid compartment publishes");
+
+        assert_eq!(validated.facts.len(), 1);
+        assert_eq!(validated.facts[0].content, "Keep the first rule.");
+        assert_eq!(validated.events.len(), 1);
+        assert_eq!(validated.events[0].kind, "trajectory_correction");
+        assert_eq!(validated.user_observations.len(), 1);
+        assert_eq!(
+            validated.user_observations[0].content,
+            "Keep the first observation."
+        );
+        assert_eq!(validated.primer_candidates.len(), 1);
+        assert_eq!(
+            validated.primer_candidates[0].question,
+            "Keep the first primer?"
+        );
     }
 
     #[test]
