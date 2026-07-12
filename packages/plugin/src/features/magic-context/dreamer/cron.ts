@@ -197,11 +197,12 @@ export function nextOccurrence(
     cron: ParsedCron,
     after: Date,
     excludeCivilMinute?: string,
+    maxSearchMs = MAX_SEARCH_MS,
 ): Date | null {
     const afterMs = after.getTime();
     // Align to the next whole minute strictly after `after` (never returns `after`).
     let cursorMs = Math.floor(afterMs / MINUTE_MS) * MINUTE_MS + MINUTE_MS;
-    const capMs = afterMs + MAX_SEARCH_MS;
+    const capMs = afterMs + Math.max(0, Math.min(MAX_SEARCH_MS, maxSearchMs));
 
     while (cursorMs <= capMs) {
         const candidate = new Date(cursorMs);
@@ -228,6 +229,7 @@ export function nextDueAtMs(
     expression: string,
     afterMs: number,
     consumedScheduledAtMs?: number,
+    maxSearchMs = MAX_SEARCH_MS,
 ): number | null {
     if (expression.trim().length === 0) return null;
     const parsed = parseCron(expression);
@@ -236,6 +238,6 @@ export function nextDueAtMs(
         consumedScheduledAtMs !== undefined
             ? civilMinuteKey(new Date(consumedScheduledAtMs))
             : undefined;
-    const next = nextOccurrence(parsed.cron, new Date(afterMs), exclude);
+    const next = nextOccurrence(parsed.cron, new Date(afterMs), exclude, maxSearchMs);
     return next ? next.getTime() : null;
 }

@@ -60,6 +60,34 @@ describe("smart-note readFile capability", () => {
         });
     });
 
+    test("rechecks canonical directory symlinks against the secret denylist", async () => {
+        await withTempDir(async (dir) => {
+            await mkdir(path.join(dir, "secrets"));
+            await writeFile(path.join(dir, "secrets", "token.json"), "secret", "utf8");
+            await symlink(path.join(dir, "secrets"), path.join(dir, "public"));
+            const cap = createSmartNoteCapabilities({
+                projectRoot: dir,
+                signal: new AbortController().signal,
+            });
+
+            expect(await cap.readFile("public/token.json")).toBeNull();
+        });
+    });
+
+    test("allows benign directory symlinks that remain inside the project", async () => {
+        await withTempDir(async (dir) => {
+            await mkdir(path.join(dir, "docs"));
+            await writeFile(path.join(dir, "docs", "guide.txt"), "guide", "utf8");
+            await symlink(path.join(dir, "docs"), path.join(dir, "public-docs"));
+            const cap = createSmartNoteCapabilities({
+                projectRoot: dir,
+                signal: new AbortController().signal,
+            });
+
+            expect(await cap.readFile("public-docs/guide.txt")).toBe("guide");
+        });
+    });
+
     test("denies final symlink and parent symlink escapes", async () => {
         await withTempDir(async (dir) => {
             const outside = await mkdtemp(path.join(tmpdir(), "mc-smart-note-outside-"));

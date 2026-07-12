@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
-import type { SmartNoteCapabilityApi } from "./capabilities";
+import { createSmartNoteCapabilities, type SmartNoteCapabilityApi } from "./capabilities";
 import { runCompiledSmartNoteCheck } from "./sandbox-runner";
 import { SmartNoteNetworkError } from "./types";
 
@@ -29,13 +33,32 @@ describe("compiled smart-note QuickJS runner", () => {
         expect(result.ok).toBe(false);
     });
 
-    test("interrupts infinite loops", async () => {
+    test("interrupts infinite loops as execution failures", async () => {
         const result = await runCompiledSmartNoteCheck({
             compiledCheck: `function check() { while (true) {} }`,
             capabilities: fakeCap,
             timeoutMs: 50,
         });
         expect(result.ok).toBe(false);
+        if (!result.ok) expect(result.cancelled).toBe(false);
+    });
+
+    test("returns a typed cancelled result for a pre-aborted run", async () => {
+        const controller = new AbortController();
+        controller.abort(new Error("sweep deadline"));
+
+        const result = await runCompiledSmartNoteCheck({
+            compiledCheck: `function check() { return { met: true }; }`,
+            capabilities: fakeCap,
+            signal: controller.signal,
+        });
+
+        expect(result).toEqual({
+            ok: false,
+            cancelled: true,
+            error: "sweep deadline",
+            network: false,
+        });
     });
 
     test("aborts host capabilities on the run timeout and frees the shared lock", async () => {
@@ -97,6 +120,49 @@ describe("compiled smart-note QuickJS runner", () => {
             ),
         ])) as Awaited<ReturnType<typeof runCompiledSmartNoteCheck>>;
         expect(followup).toEqual({ ok: true, result: { met: true } });
+    });
+
+    test("rejects a project FIFO without wedging the shared sandbox lock", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "mc-smart-note-fifo-"));
+        try {
+            const fifo = path.join(dir, "events.fifo");
+            const created = spawnSync("mkfifo", [fifo]);
+            if (created.error || created.status !== 0) return;
+
+            const controller = new AbortController();
+            const abortTimer = setTimeout(
+                () => controller.abort(new Error("sweep budget exhausted")),
+                50,
+            );
+            const startedAt = Date.now();
+            const result = await runCompiledSmartNoteCheck({
+                compiledCheck: `function check(cap) { cap.readFile("events.fifo"); cap.httpGet("https://example.test/"); return { met: false }; }`,
+                capabilityFactory: (signal) => ({
+                    ...createSmartNoteCapabilities({ projectRoot: dir, signal }),
+                    httpGet: () =>
+                        new Promise((_resolve, reject) => {
+                            const abort = () =>
+                                reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted"));
+                            if (signal.aborted) abort();
+                            else signal.addEventListener("abort", abort, { once: true });
+                        }),
+                }),
+                signal: controller.signal,
+                timeoutMs: 500,
+            });
+            clearTimeout(abortTimer);
+            expect(result.ok).toBe(false);
+            if (!result.ok) expect(result.cancelled).toBe(true);
+            expect(Date.now() - startedAt).toBeLessThan(500);
+
+            const followup = await runCompiledSmartNoteCheck({
+                compiledCheck: `function check() { return { met: true }; }`,
+                capabilities: fakeCap,
+            });
+            expect(followup).toEqual({ ok: true, result: { met: true } });
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
     });
 
     test("serializes concurrent checks whose host calls suspend (shared-module asyncify safety)", async () => {

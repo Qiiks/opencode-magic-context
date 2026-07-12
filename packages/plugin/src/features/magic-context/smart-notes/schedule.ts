@@ -20,7 +20,7 @@ export function nextSmartNoteCheckDueAt(
     const now = options.now ?? Date.now();
     const floorMs = options.floorMs ?? SMART_NOTE_CHECK_FLOOR_MS;
     const ceilingMs = options.ceilingMs ?? SMART_NOTE_CHECK_CEILING_MS;
-    const rawNext = cron?.trim() ? nextDueAtMs(cron, now) : null;
+    const rawNext = cron?.trim() ? nextDueAtMs(cron, now, undefined, ceilingMs) : null;
     const rawDelta = rawNext ? rawNext - now : SMART_NOTE_CHECK_DEFAULT_INTERVAL_MS;
     const clamped = Math.min(ceilingMs, Math.max(floorMs, rawDelta));
     const jittered = clamped + deterministicJitterMs(clamped, options.noteId, options.hash);

@@ -217,12 +217,15 @@ export function createPinnedLookup(candidate: { address: string; family: 4 | 6 }
     return hook as unknown as LookupFunction;
 }
 
-function requestValidatedAddress(
+export function requestValidatedAddress(
     validation: SmartNoteUrlValidation,
     candidate: ResolvedSmartNoteAddress,
     options: { signal: AbortSignal; timeoutMs: number; bodyLimitBytes: number },
 ): Promise<{ status: number; body: string }> {
-    return new Promise((resolve, reject) => {
+    // A request-local agent prevents global keep-alive or proxying agents from
+    // reusing a socket that was not opened through the pinned lookup below.
+    const agent = createSmartNoteRequestAgent();
+    return new Promise<{ status: number; body: string }>((resolve, reject) => {
         const url = validation.url;
         const hostHeader = url.host;
         const request = https.request(
@@ -247,6 +250,7 @@ function requestValidatedAddress(
                 // form; returning the wrong shape was the bug that broke every
                 // network-touching check.
                 lookup: createPinnedLookup(candidate),
+                agent,
                 timeout: options.timeoutMs,
             },
             (response) => {
@@ -321,7 +325,11 @@ function requestValidatedAddress(
         });
         request.on("close", () => options.signal.removeEventListener("abort", onAbort));
         request.end();
-    });
+    }).finally(() => agent.destroy());
+}
+
+export function createSmartNoteRequestAgent(): https.Agent {
+    return new https.Agent({ keepAlive: false, maxSockets: 1 });
 }
 
 function canonicalDnsName(hostname: string): string {

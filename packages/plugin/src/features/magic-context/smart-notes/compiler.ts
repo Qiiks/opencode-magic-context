@@ -7,14 +7,16 @@ import { extractLatestAssistantText } from "../../../shared/assistant-message-ex
 import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
+import { nextOccurrence, parseCron } from "../dreamer/cron";
 import { recordChildInvocation } from "../subagent-token-capture";
 import type { SmartNoteCapabilityFactory } from "./capabilities";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./compiler-prompt";
 import { runCompiledSmartNoteCheck } from "./sandbox-runner";
-import type {
-    SmartNoteCapabilityName,
-    SmartNoteCheckManifest,
-    SmartNoteCheckResult,
+import {
+    SMART_NOTE_CHECK_CEILING_MS,
+    type SmartNoteCapabilityName,
+    type SmartNoteCheckManifest,
+    type SmartNoteCheckResult,
 } from "./types";
 
 interface CompileSmartNoteArgs {
@@ -42,6 +44,7 @@ export interface CompileSmartNoteSuccess {
 
 export interface CompileSmartNoteFailure {
     ok: false;
+    cancelled: boolean;
     error: string;
 }
 
@@ -53,10 +56,18 @@ interface CompilerResponse {
     check_cron: string;
 }
 
+const MAX_COMPILER_OUTPUT_CHARS = 128 * 1024;
+const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
+const MAX_MANIFEST_ENTRIES = 64;
+const MAX_CRON_CHARS = 256;
+const MAX_COMPILER_ERROR_CHARS = 2 * 1024;
+
 export async function compileSmartNoteCheck(
     args: CompileSmartNoteArgs,
 ): Promise<CompileSmartNoteResult> {
-    if (!args.note.surfaceCondition) return { ok: false, error: "note has no surface condition" };
+    if (!args.note.surfaceCondition) {
+        return { ok: false, cancelled: false, error: "note has no surface condition" };
+    }
     const prompt = `Compile this smart note condition into a sandbox check.
 
 Project identity: ${args.projectIdentity}
@@ -146,6 +157,7 @@ Remember: output only the JSON object described by the system prompt.`;
         const response = run.validated;
         const compiledCheck = normalizeCompiledCheck(response.compiled_check);
         const manifest = normalizeManifest(response.manifest);
+        const checkCron = normalizeCron(response.check_cron);
         for (const warning of manifestAdvisoryWarnings(compiledCheck, manifest)) {
             log(`[dreamer] smart note #${args.note.id}: manifest advisory — ${warning}`);
         }
@@ -156,11 +168,15 @@ Remember: output only the JSON object described by the system prompt.`;
             timeoutMs: 2_000,
         });
         if (!dryRun.ok) {
-            recordInvocation({ status: "failed", messages: run.output, error: dryRun.error });
-            return { ok: false, error: `dry-run failed: ${dryRun.error}` };
+            const error = boundedError(`dry-run failed: ${dryRun.error}`);
+            recordInvocation({
+                status: dryRun.cancelled ? "aborted" : "failed",
+                messages: run.output,
+                error,
+            });
+            return { ok: false, cancelled: dryRun.cancelled, error };
         }
         recordInvocation({ status: "completed", messages: run.output });
-        const checkCron = normalizeCron(response.check_cron);
         return {
             ok: true,
             compiledCheck,
@@ -170,8 +186,10 @@ Remember: output only the JSON object described by the system prompt.`;
             dryRun: dryRun.result,
         };
     } catch (error) {
-        recordInvocation({ status: "failed", error });
-        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        const cancelled = args.signal.aborted;
+        const message = boundedError(error instanceof Error ? error.message : String(error));
+        recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
+        return { ok: false, cancelled, error: message };
     } finally {
         // Compiler prompts include note content and conditions, so they are
         // deleted regardless of debug-retention settings.
@@ -183,6 +201,9 @@ Remember: output only the JSON object described by the system prompt.`;
 
 export function parseCompilerOutput(output: string | null): CompilerResponse {
     if (!output) throw new Error("smart-note compiler returned no output");
+    if (output.length > MAX_COMPILER_OUTPUT_CHARS) {
+        throw new Error("smart-note compiler output exceeds 128 KiB");
+    }
     const json = extractJsonObject(output);
     const parsed = JSON.parse(json) as Partial<CompilerResponse>;
     if (typeof parsed.compiled_check !== "string") throw new Error("compiled_check missing");
@@ -193,6 +214,9 @@ export function parseCompilerOutput(output: string | null): CompilerResponse {
 }
 
 export function normalizeCompiledCheck(source: string): string {
+    if (Buffer.byteLength(source, "utf8") > MAX_COMPILED_CHECK_BYTES) {
+        throw new Error("compiled_check exceeds 64 KiB");
+    }
     let code = source.trim();
     const fence = code.match(/^```(?:javascript|js)?\s*([\s\S]*?)```$/i);
     if (fence) code = fence[1].trim();
@@ -206,21 +230,28 @@ export function normalizeCompiledCheck(source: string): string {
     if (/\b(?:import|require)\b/.test(code)) {
         throw new Error("compiled_check must not import modules");
     }
+    if (Buffer.byteLength(code, "utf8") > MAX_COMPILED_CHECK_BYTES) {
+        throw new Error("compiled_check exceeds 64 KiB");
+    }
     return code;
 }
 
 export function normalizeManifest(manifest: SmartNoteCheckManifest): SmartNoteCheckManifest {
     const capabilities = Array.isArray(manifest.capabilities)
         ? unique(
-              manifest.capabilities.filter((cap): cap is SmartNoteCapabilityName =>
-                  ["readFile", "gitHeadSha", "gitTag", "gitLog", "httpGet"].includes(String(cap)),
-              ),
+              manifest.capabilities
+                  .slice(0, MAX_MANIFEST_ENTRIES)
+                  .filter((cap): cap is SmartNoteCapabilityName =>
+                      ["readFile", "gitHeadSha", "gitTag", "gitLog", "httpGet"].includes(
+                          String(cap),
+                      ),
+                  ),
           )
         : [];
     return {
         capabilities,
         readFiles: uniqueStrings(manifest.readFiles),
-        hosts: uniqueStrings(manifest.hosts?.map((h) => h.toLowerCase())),
+        hosts: uniqueStrings(manifest.hosts, (host) => host.toLowerCase()),
         urls: uniqueStrings(manifest.urls),
         signals: uniqueStrings(manifest.signals),
         summary: typeof manifest.summary === "string" ? manifest.summary.slice(0, 160) : undefined,
@@ -310,23 +341,38 @@ function literalCalls(code: string, method: "readFile" | "httpGet"): string[] {
     return values;
 }
 
-function normalizeCron(cron: string): string {
-    const trimmed = cron.trim();
-    return trimmed.length > 0 ? trimmed : "0 * * * *";
+export function normalizeCron(cron: string): string {
+    if (cron.length > MAX_CRON_CHARS) throw new Error("check_cron exceeds 256 characters");
+    const normalized = cron.trim() || "0 * * * *";
+    const parsed = parseCron(normalized);
+    if (!parsed.ok) throw new Error(`invalid check_cron: ${parsed.error}`);
+    const next = nextOccurrence(parsed.cron, new Date(), undefined, SMART_NOTE_CHECK_CEILING_MS);
+    if (!next) throw new Error("check_cron has no occurrence within the scheduling ceiling");
+    return normalized;
 }
 
 function unique<T>(items: T[]): T[] {
     return [...new Set(items)];
 }
 
-function uniqueStrings(items: unknown): string[] | undefined {
+function uniqueStrings(
+    items: unknown,
+    normalize: (value: string) => string = (value) => value,
+): string[] | undefined {
     if (!Array.isArray(items)) return undefined;
     const values = unique(
-        items.filter((item): item is string => typeof item === "string" && item.length > 0),
+        items
+            .slice(0, MAX_MANIFEST_ENTRIES)
+            .filter((item): item is string => typeof item === "string" && item.length > 0)
+            .map(normalize),
     );
     return values.length > 0 ? values : undefined;
 }
 
+function boundedError(error: string): string {
+    return error.slice(0, MAX_COMPILER_ERROR_CHARS);
+}
+
 export function logSmartNoteCompilerFailure(noteId: number, error: string): void {
-    log(`[dreamer] smart note #${noteId}: compiler failed — ${error}`);
+    log(`[dreamer] smart note #${noteId}: compiler failed — ${boundedError(error)}`);
 }
