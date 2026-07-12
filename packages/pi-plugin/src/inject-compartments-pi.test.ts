@@ -19,6 +19,7 @@ import {
 	getActiveUserMemories,
 	insertUserMemory,
 } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
+import { COMPARTMENT_RENDER_EPOCH } from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	__test,
@@ -500,6 +501,53 @@ describe("injectM0M1Pi", () => {
 
 			expect(textOf(second[0] as never)).toBe(firstM0);
 			expect(textOf(second[1] as never)).toBe(firstM1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("folds a legacy render epoch once, then replays m[0]/m[1] byte-identically", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-render-epoch-"));
+		try {
+			const state = piState("ses-pi-render-epoch", cwd);
+			injectM0M1Pi(state, db, [userMessage("first", 10)] as never);
+			db.prepare(
+				"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_upgrade_state = ? WHERE session_id = ?",
+			).run(
+				Buffer.from("<session-history>legacy renderer bytes</session-history>"),
+				"pi-m0m1-v2:ready",
+				state.sessionId,
+			);
+
+			expect(mustMaterializePi(state, db)).toEqual({
+				value: true,
+				reason: "compartment_render_epoch",
+			});
+			const foldedMessages = [userMessage("same", 11)];
+			const folded = injectM0M1Pi(state, db, foldedMessages as never);
+			const foldedM0 = textOf(foldedMessages[0] as never);
+			const foldedM1 = textOf(foldedMessages[1] as never);
+			const replay1 = [userMessage("same", 11)];
+			const replay2 = [userMessage("same", 11)];
+			const replayResult1 = injectM0M1Pi(state, db, replay1 as never);
+			const replayResult2 = injectM0M1Pi(state, db, replay2 as never);
+
+			expect(folded.m0Materialized).toBe(true);
+			expect(folded.m0Reason).toBe("compartment_render_epoch");
+			expect(replayResult1.m0Materialized).toBe(false);
+			expect(replayResult2.m0Materialized).toBe(false);
+			expect(textOf(replay1[0] as never)).toBe(foldedM0);
+			expect(textOf(replay2[0] as never)).toBe(foldedM0);
+			expect(textOf(replay1[1] as never)).toBe(foldedM1);
+			expect(textOf(replay2[1] as never)).toBe(foldedM1);
+			expect(
+				getOrCreateSessionMeta(db, state.sessionId).cachedM0UpgradeState,
+			).toContain(COMPARTMENT_RENDER_EPOCH);
+			expect(mustMaterializePi(state, db)).toEqual({
+				value: false,
+				reason: null,
+			});
 		} finally {
 			closeQuietly(db);
 		}

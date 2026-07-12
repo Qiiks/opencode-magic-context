@@ -24,6 +24,7 @@ import {
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { COMPARTMENT_RENDER_EPOCH } from "./compartment-render-epoch";
 import {
     clearInjectionCache,
     injectM0M1,
@@ -704,6 +705,77 @@ describe("m[0]/m[1] materialization", () => {
         expect(decision).toEqual({ value: false, reason: null });
     });
 
+    it("folds a legacy render epoch once, then replays m[0]/m[1] byte-identically", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+        });
+        db.prepare(
+            "UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_upgrade_state = ? WHERE session_id = ?",
+        ).run(
+            Buffer.from("<session-history>legacy renderer bytes</session-history>"),
+            "ready",
+            SESSION_ID,
+        );
+        const state = readStateFromMeta();
+
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+            }),
+        ).toEqual({ value: true, reason: "compartment_render_epoch" });
+
+        const folded = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+        });
+        const replay1 = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+        });
+        const replay2 = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+        });
+
+        expect(folded.m0RematerializedThisPass).toBe(true);
+        expect(folded.decision.reason).toBe("compartment_render_epoch");
+        expect(replay1.m0RematerializedThisPass).toBe(false);
+        expect(replay2.m0RematerializedThisPass).toBe(false);
+        expect(replay1.m0Bytes).toEqual(folded.m0Bytes);
+        expect(replay2.m0Bytes).toEqual(folded.m0Bytes);
+        expect(replay1.m1Text).toBe(folded.m1Text);
+        expect(replay2.m1Text).toBe(folded.m1Text);
+        expect(state.cachedM0UpgradeState).toContain(COMPARTMENT_RENDER_EPOCH);
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+            }),
+        ).toEqual({ value: false, reason: null });
+    });
+
     it("keeps single-project m[0]/m[1] bytes identical with the no-workspace context", () => {
         const render = (explicitSingleProjectContext: boolean): string => {
             const localDb = makeDb();
@@ -746,7 +818,7 @@ describe("m[0]/m[1] materialization", () => {
             cachedM0MaxMutationId: 0,
             cachedM0ProjectDocsHash: "",
             cachedM0SessionFactsVersion: 0,
-            cachedM0UpgradeState: "ready",
+            cachedM0UpgradeState: `ready|compartment-render:${COMPARTMENT_RENDER_EPOCH}`,
         };
 
         expect(
@@ -1335,7 +1407,9 @@ describe("m[0]/m[1] materialization", () => {
         expect(row.cached_m0_project_docs_hash).toBe("");
         expect(typeof row.cached_m0_materialized_at).toBe("number");
         expect(row.cached_m0_session_facts_version).toBe(0);
-        expect(row.cached_m0_upgrade_state).toBe("ready");
+        expect(row.cached_m0_upgrade_state).toBe(
+            `ready|compartment-render:${COMPARTMENT_RENDER_EPOCH}`,
+        );
     });
 
     it("materializeM0 persists memory_block_ids/count for the rendered memory set", () => {
@@ -1516,7 +1590,9 @@ describe("m[0]/m[1] materialization", () => {
         expect(state.cachedM0ProjectDocsHash).toBe("");
         expect(typeof state.cachedM0MaterializedAt).toBe("number");
         expect(state.cachedM0SessionFactsVersion).toBe(0);
-        expect(state.cachedM0UpgradeState).toBe("ready");
+        expect(state.cachedM0UpgradeState).toBe(
+            `ready|compartment-render:${COMPARTMENT_RENDER_EPOCH}`,
+        );
         expect(state.snapshotMarkers?.maxMemoryId).toBe(0);
         expect(
             mustMaterialize({

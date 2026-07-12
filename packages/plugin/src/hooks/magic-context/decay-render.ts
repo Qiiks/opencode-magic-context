@@ -54,9 +54,9 @@ function formatDateRange(startDate?: string | null, endDate?: string | null): st
 }
 
 function sanitizeCompartmentTitle(title: string): string {
-    // Historian-authored titles are untrusted: keep them on one line and XML-escape
-    // wrapper delimiters before placing them inside <session-history>.
-    return escapeXmlContent(title.replace(/\p{Cc}+/gu, " "));
+    // Historian-authored titles are untrusted: Cc, line-separator, and paragraph-
+    // separator runs must collapse or they can forge a visually multiline heading.
+    return escapeXmlContent(title.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " "));
 }
 
 function compartmentHeading(c: DecayRenderCompartment): string {

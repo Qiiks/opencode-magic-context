@@ -619,6 +619,7 @@ pub struct HistorianFireRequest<'a> {
     pub validate_options: ValidateOptions,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
+    pub completion_now_ms: fn() -> i64,
 }
 
 pub struct HistorianReattachRequest<'a> {
@@ -633,6 +634,7 @@ pub struct HistorianReattachRequest<'a> {
     pub publication_floor_ordinal: u64,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
+    pub completion_now_ms: fn() -> i64,
 }
 
 /// Session-id prefix for the module's own producer (child) sessions. The transform
@@ -815,6 +817,17 @@ fn decide_producer_failure(
     }
 }
 
+pub(crate) fn completion_failure_backoff_at_ms(
+    started_at_ms: i64,
+    configured_backoff_at_ms: i64,
+    completed_at_ms: i64,
+) -> i64 {
+    let cooldown_ms = configured_backoff_at_ms
+        .saturating_sub(started_at_ms)
+        .max(0);
+    completed_at_ms.saturating_add(cooldown_ms)
+}
+
 fn classified_backoff_at_ms(
     now_ms: i64,
     default_failure_backoff_at_ms: i64,
@@ -909,14 +922,20 @@ where
         {
             Ok(handle) => handle,
             Err(err) => {
+                let completed_at_ms = (request.completion_now_ms)();
+                let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                    request.now_ms,
+                    request.failure_backoff_at_ms,
+                    completed_at_ms,
+                );
                 let decision = decide_producer_failure(
                     &err,
                     model,
                     &request.model_chain[index + 1..],
                     &mut auth_blocked_providers,
                     &mut all_failures_permanent,
-                    request.now_ms,
-                    request.failure_backoff_at_ms,
+                    completed_at_ms,
+                    failure_backoff_at_ms,
                 );
                 persist_historian_state(
                     request.store,
@@ -952,14 +971,15 @@ where
                         let detail = format!(
                             "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
                         );
+                        let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                            request.now_ms,
+                            request.failure_backoff_at_ms,
+                            (request.completion_now_ms)(),
+                        );
                         persist_historian_state(
                             request.store,
                             request.session_id,
-                            abandon_with_detail(
-                                &awaiting,
-                                request.failure_backoff_at_ms,
-                                Some(detail),
-                            ),
+                            abandon_with_detail(&awaiting, failure_backoff_at_ms, Some(detail)),
                         )?;
                         producer.close().await;
                         return Err(HistorianDriveError::Producer(recovery_err));
@@ -968,14 +988,20 @@ where
             }
             Err(err) => {
                 let _ = producer.cancel(&handle.run_id).await;
+                let completed_at_ms = (request.completion_now_ms)();
+                let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                    request.now_ms,
+                    request.failure_backoff_at_ms,
+                    completed_at_ms,
+                );
                 let decision = decide_producer_failure(
                     &err,
                     model,
                     &request.model_chain[index + 1..],
                     &mut auth_blocked_providers,
                     &mut all_failures_permanent,
-                    request.now_ms,
-                    request.failure_backoff_at_ms,
+                    completed_at_ms,
+                    failure_backoff_at_ms,
                 );
                 persist_historian_state(
                     request.store,
@@ -1012,10 +1038,23 @@ where
             prior_compartments: request.prior_compartments,
             validate_options: request.validate_options,
             created_at_ms: request.now_ms,
+            failure_started_at_ms: request.now_ms,
             failure_backoff_at_ms: request.failure_backoff_at_ms,
+            completion_now_ms: request.completion_now_ms,
         });
         producer.close().await;
-        let row_version = publish_result?;
+        let row_version = match publish_result {
+            Ok(row_version) => row_version,
+            Err(HistorianDriveError::Validation(err)) => {
+                // Validation rejection is model-local output failure. Exhaust the
+                // configured fallback chain before returning the final rejection.
+                if has_eligible_model(&request.model_chain[index + 1..], &auth_blocked_providers) {
+                    continue;
+                }
+                return Err(HistorianDriveError::Validation(err));
+            }
+            Err(err) => return Err(err),
+        };
         return Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
             row_version,
             producer_session_id,
@@ -1059,11 +1098,12 @@ where
     let state = match producer.status(&producer_run_id).await {
         Ok(state) => state,
         Err(_) => {
-            abandon_current_state(
-                request.store,
-                request.session_id,
+            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                request.now_ms,
                 request.failure_backoff_at_ms,
-            )?;
+                (request.completion_now_ms)(),
+            );
+            abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
             producer.close().await;
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
@@ -1072,11 +1112,12 @@ where
     match state {
         RunState::Terminal | RunState::Active => {}
         RunState::Missing { .. } => {
-            abandon_current_state(
-                request.store,
-                request.session_id,
+            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                request.now_ms,
                 request.failure_backoff_at_ms,
-            )?;
+                (request.completion_now_ms)(),
+            );
+            abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
             producer.close().await;
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
@@ -1098,17 +1139,23 @@ where
                 }
                 _ => None,
             };
+            let completed_at_ms = (request.completion_now_ms)();
+            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                request.now_ms,
+                request.failure_backoff_at_ms,
+                completed_at_ms,
+            );
             let backoff_at_ms =
                 err.classification()
-                    .map_or(request.failure_backoff_at_ms, |classification| {
+                    .map_or(failure_backoff_at_ms, |classification| {
                         if classification.class == ErrorClass::Transient {
                             classified_backoff_at_ms(
-                                request.now_ms,
-                                request.failure_backoff_at_ms,
+                                completed_at_ms,
+                                failure_backoff_at_ms,
                                 classification,
                             )
                         } else {
-                            request.failure_backoff_at_ms
+                            failure_backoff_at_ms
                         }
                     });
             abandon_current_state_with_detail(
@@ -1139,7 +1186,9 @@ where
         prior_compartments: request.prior_compartments,
         validate_options: request.validate_options,
         created_at_ms: request.now_ms,
+        failure_started_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
+        completion_now_ms: request.completion_now_ms,
     });
     producer.close().await;
     let row_version = publish_result?;
@@ -1163,7 +1212,9 @@ struct PublishOutputRequest<'a> {
     prior_compartments: &'a [StoredCompartmentRange],
     validate_options: ValidateOptions,
     created_at_ms: i64,
+    failure_started_at_ms: i64,
     failure_backoff_at_ms: i64,
+    completion_now_ms: fn() -> i64,
 }
 
 fn publish_output_from_awaiting(
@@ -1181,7 +1232,9 @@ fn publish_output_from_awaiting(
         prior_compartments,
         validate_options,
         created_at_ms,
+        failure_started_at_ms,
         failure_backoff_at_ms,
+        completion_now_ms,
     } = request;
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
@@ -1203,6 +1256,11 @@ fn publish_output_from_awaiting(
     let validated = match validation_result {
         Ok(validated) => validated,
         Err(err) => {
+            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                failure_started_at_ms,
+                failure_backoff_at_ms,
+                completion_now_ms(),
+            );
             let cap_hint = if output.length_capped {
                 " [output hit the length cap: raise the output budget or shrink the chunk]"
             } else {
@@ -1637,6 +1695,7 @@ mod tests {
             validate_options: validate_options(),
             now_ms: 123,
             failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
         }
     }
 
@@ -1657,6 +1716,7 @@ mod tests {
             publication_floor_ordinal: 4,
             now_ms: 123,
             failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
         }
     }
 
@@ -2228,6 +2288,7 @@ mod tests {
             publication_floor_ordinal: 4,
             now_ms: 123,
             failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
         };
         let right_request = HistorianReattachRequest {
             store: &store,
@@ -2241,6 +2302,7 @@ mod tests {
             publication_floor_ordinal: 4,
             now_ms: 123,
             failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
         };
 
         let (left, right) = tokio::join!(
@@ -2666,6 +2728,7 @@ mod tests {
             publication_floor_ordinal: 4,
             now_ms: 123,
             failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
         };
         let err = reattach_historian_producer(&mut producer, request)
             .await
@@ -2716,6 +2779,84 @@ mod tests {
         );
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn validation_rejection_advances_to_valid_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-invalid")))
+            .with_output(Ok(producer_output("not historian xml".to_string())))
+            .with_start(Ok(run_handle("run-valid")))
+            .with_output(Ok(producer_output(historian_xml("fallback summary"))));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .expect("a valid fallback must publish after primary validation rejection");
+
+        let HistorianDriveOutcome::Completed(success) = outcome else {
+            panic!("expected completed fallback run");
+        };
+        assert_eq!(success.model, "other/model-b");
+        assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(
+            store
+                .load_historian_assembly_snapshot("ses")
+                .unwrap()
+                .compartments
+                .len(),
+            2
+        );
+    }
+
+    fn completion_after_long_model_run() -> i64 {
+        120_000
+    }
+
+    #[tokio::test]
+    async fn all_validation_rejections_preserve_final_error_and_start_cooldown_at_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-invalid-a")))
+            .with_output(Ok(producer_output("not historian xml".to_string())))
+            .with_start(Ok(run_handle("run-invalid-b")))
+            .with_output(Ok(producer_output("<output/>".to_string())));
+        let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+        request.now_ms = 0;
+        request.failure_backoff_at_ms = HISTORIAN_FAILURE_BACKOFF_MS;
+        request.completion_now_ms = completion_after_long_model_run;
+
+        let err = run_historian_firing(&mut producer, request)
+            .await
+            .expect_err("the final validation rejection must be returned");
+        let HistorianDriveError::Validation(final_error) = err else {
+            panic!("expected final validation error");
+        };
+        let state = store.load("ses").unwrap().meta.historian;
+
+        assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(
+            state.last_failure.as_deref(),
+            Some(format!("validate rejected: {final_error}").as_str()),
+        );
+        assert_eq!(state.failure_backoff_at_ms, Some(180_000));
+        assert!(
+            completion_after_long_model_run() < state.failure_backoff_at_ms.unwrap(),
+            "a model run longer than the cooldown must not leave immediate refire eligible"
+        );
     }
 
     #[tokio::test]
