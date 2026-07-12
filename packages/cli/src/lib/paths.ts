@@ -71,7 +71,9 @@ export function detectConfigPaths(): ConfigPaths {
         opencodeConfig = jsonPath;
         opencodeConfigFormat = "json";
     } else {
-        opencodeConfig = jsonPath;
+        // Fresh installs use JSONC so users can add comments without creating a
+        // second, higher-precedence config later.
+        opencodeConfig = jsoncPath;
         opencodeConfigFormat = "none";
     }
 

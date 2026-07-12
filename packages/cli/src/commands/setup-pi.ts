@@ -239,8 +239,8 @@ export async function runSetup(options: RunSetupOptions = {}): Promise<number> {
         prompts.log.message(
             "Install Pi first, then rerun setup. If Pi is installed in a custom location, add it to PATH.",
         );
-        prompts.outro("Setup skipped");
-        return 0;
+        prompts.outro("Setup stopped — install Pi and try again");
+        return 1;
     }
 
     const version = env.getPiVersion(pi.path);

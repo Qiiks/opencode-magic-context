@@ -1,8 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { findOnPath } from "./find-on-path";
+import { findOnPath, isExecutableFile } from "./find-on-path";
 
 export interface PiBinaryInfo {
     path: string;
@@ -19,11 +18,12 @@ export function detectPiBinary(): PiBinaryInfo | null {
     const fromPath = findOnPath("pi");
     if (fromPath) return { path: fromPath, source: "path" };
 
+    const home = process.env.HOME?.trim() || homedir();
     const homeCandidate =
         process.platform === "win32"
-            ? join(homedir(), ".pi", "bin", "pi.cmd")
-            : join(homedir(), ".pi", "bin", "pi");
-    if (existsSync(homeCandidate)) return { path: homeCandidate, source: "home" };
+            ? join(home, ".pi", "bin", "pi.cmd")
+            : join(home, ".pi", "bin", "pi");
+    if (isExecutableFile(homeCandidate)) return { path: homeCandidate, source: "home" };
 
     return null;
 }
@@ -64,11 +64,10 @@ function stripAnsi(text: string): string {
     return text.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g"), "");
 }
 
-// provider / model identifier shapes — letters, digits, and the punctuation that
-// real ids use (gpt-5.4, qwen2.5-coder:7b, claude-fable-5, opencode-go,
-// github-copilot). No slash inside either half; the slash only joins them.
 const PROVIDER_TOKEN = /^[a-z0-9][a-z0-9._-]*$/i;
-const MODEL_TOKEN = /^[a-z0-9][a-z0-9._:-]*$/i;
+const MODEL_TOKEN = /^[a-z0-9][a-z0-9._:/-]*$/i;
+const SIZE_TOKEN = /^(?:\d+(?:\.\d+)?[kmgt]?|-)$/i;
+const CAPABILITY_TOKEN = /^(?:yes|no|true|false|-)$/i;
 
 /**
  * Parse `pi --list-models` output into `provider/model` ids.
@@ -87,27 +86,35 @@ const MODEL_TOKEN = /^[a-z0-9][a-z0-9._:-]*$/i;
  */
 export function parseModelListOutput(output: string): string[] {
     const models = new Set<string>();
+    let sawHeader = false;
+
     for (const rawLine of stripAnsi(output).split(/\r?\n/)) {
-        const line = rawLine.trim().replace(/^[•*-]\s*/, "");
-        if (!line || line.toLowerCase().includes("usage:")) continue;
-
+        const line = rawLine.trim();
+        if (!line) continue;
         const cols = line.split(/\s+/);
-        const first = cols[0]?.replace(/,$/, "") ?? "";
+        const lower = cols.map((column) => column.toLowerCase());
 
-        // Already slash-joined (forward-compat): take the first token verbatim.
-        if (first.includes("/")) {
-            if (!/^https?:\/\//.test(first)) models.add(first);
+        if (
+            lower[0] === "provider" &&
+            lower[1] === "model" &&
+            lower.some((column) => column.startsWith("context"))
+        ) {
+            sawHeader = true;
             continue;
         }
+        if (!sawHeader || cols.length < 6) continue;
 
-        // Table row: column 0 = provider, column 1 = model. Skip the header
-        // (`provider  model  …`) and any non-identifier rows (separators, notes).
-        const provider = first;
-        const model = cols[1]?.replace(/,$/, "") ?? "";
-        if (provider.toLowerCase() === "provider" && model.toLowerCase() === "model") {
-            continue;
-        }
-        if (PROVIDER_TOKEN.test(provider) && MODEL_TOKEN.test(model)) {
+        const provider = cols[0] ?? "";
+        const model = cols[1] ?? "";
+        const metadata = cols.slice(-4);
+        if (
+            PROVIDER_TOKEN.test(provider) &&
+            MODEL_TOKEN.test(model) &&
+            SIZE_TOKEN.test(metadata[0] ?? "") &&
+            SIZE_TOKEN.test(metadata[1] ?? "") &&
+            CAPABILITY_TOKEN.test(metadata[2] ?? "") &&
+            CAPABILITY_TOKEN.test(metadata[3] ?? "")
+        ) {
             models.add(`${provider}/${model}`);
         }
     }

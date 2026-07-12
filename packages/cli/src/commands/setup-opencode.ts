@@ -3,7 +3,11 @@ import { basename, dirname } from "node:path";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import { stringify as stringifyJsonc } from "comment-json";
-import { isDevPathPluginEntry, matchesPluginEntry } from "../adapters/opencode";
+import {
+    isDevPathPluginEntry,
+    isLocalPathPluginEntry,
+    matchesPluginEntry,
+} from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
     hasUserConfigLocationMigrationRefusal,
@@ -63,6 +67,18 @@ export function addPluginToOpenCodeConfig(
     }
     const hasNpmEntry = rawPlugins.some((p) => matchesPluginEntry(p, PLUGIN_NAME));
     const hasDevEntry = rawPlugins.some((p) => isDevPathPluginEntry(p));
+    if (
+        rawPlugins.some(
+            (p) =>
+                isLocalPathPluginEntry(p) &&
+                String(p).includes("magic-context") &&
+                !isDevPathPluginEntry(p),
+        )
+    ) {
+        log.warn(
+            "An unverifiable local OpenCode plugin path was ignored; its package name is not Magic Context.",
+        );
+    }
 
     // Don't double-add if either an npm entry OR a local dev-path entry exists.
     // Dev paths are intentionally NOT replaced — that would silently disable
@@ -95,6 +111,18 @@ export function addPluginToTuiConfig(configPath: string, format: "json" | "jsonc
     const rawPlugins: unknown[] = Array.isArray(existing.plugin) ? existing.plugin : [];
     const hasNpmEntry = rawPlugins.some((p) => matchesPluginEntry(p, PLUGIN_NAME));
     const hasDevEntry = rawPlugins.some((p) => isDevPathPluginEntry(p));
+    if (
+        rawPlugins.some(
+            (p) =>
+                isLocalPathPluginEntry(p) &&
+                String(p).includes("magic-context") &&
+                !isDevPathPluginEntry(p),
+        )
+    ) {
+        log.warn(
+            "An unverifiable local TUI plugin path was ignored; its package name is not Magic Context.",
+        );
+    }
 
     if (!hasNpmEntry && !hasDevEntry) {
         rawPlugins.push(PLUGIN_ENTRY);

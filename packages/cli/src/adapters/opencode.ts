@@ -1,5 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, isAbsolute, parse as parsePath, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { writeFileAtomic } from "../lib/atomic-write";
 import { detectOpenCode } from "../lib/opencode-detect";
@@ -233,31 +234,58 @@ export class OpenCodeAdapter implements HarnessAdapter {
     }
 }
 
+export function isLocalPathPluginEntry(entry: unknown): boolean {
+    const candidate =
+        typeof entry === "string"
+            ? entry
+            : Array.isArray(entry) && typeof entry[0] === "string"
+              ? entry[0]
+              : null;
+    if (!candidate) return false;
+    return (
+        candidate.startsWith("file://") ||
+        isAbsolute(candidate) ||
+        candidate.startsWith("./") ||
+        candidate.startsWith("../")
+    );
+}
+
 /**
- * Match a plugin entry that resolves to a local dev checkout of magic-context:
- *   - "file:///abs/path/.../opencode-magic-context"
- *   - "/abs/path/.../opencode-magic-context/packages/plugin"
- *   - "./relative/path/.../opencode-magic-context"
- *
- * Tuple entries `["file://...", { options }]` are also recognized.
- *
- * Setup and doctor must detect these so they don't double-add @latest, but
- * must NEVER replace them — that would silently disable the developer's
- * local plugin instance.
- *
- * Exported because both `setup-opencode.ts` and `doctor-opencode.ts` need this
- * exact same logic; previous duplication caused drift (e.g. one path matching
- * `opencode-magic-context` only, the other also matching bare `magic-context`).
+ * Match a local plugin entry only when its nearest package.json identifies the
+ * OpenCode Magic Context package. A basename substring is not sufficient: paths
+ * such as `magic-context-theme` must not suppress the real plugin registration.
  */
 export function isDevPathPluginEntry(entry: unknown): boolean {
-    let candidate: string | null = null;
-    if (typeof entry === "string") candidate = entry;
-    else if (Array.isArray(entry) && typeof entry[0] === "string") candidate = entry[0];
-    if (!candidate) return false;
-    const isPath =
-        candidate.startsWith("file://") || candidate.startsWith("/") || candidate.startsWith("./");
-    if (!isPath) return false;
-    return candidate.includes("opencode-magic-context") || candidate.includes("magic-context");
+    const candidate =
+        typeof entry === "string"
+            ? entry
+            : Array.isArray(entry) && typeof entry[0] === "string"
+              ? entry[0]
+              : null;
+    if (!candidate || !isLocalPathPluginEntry(entry)) return false;
+
+    let localPath: string;
+    try {
+        if (candidate.startsWith("file://")) {
+            localPath = fileURLToPath(candidate);
+        } else {
+            localPath = resolve(candidate);
+        }
+
+        if (statSync(localPath).isFile()) localPath = dirname(localPath);
+        const root = parsePath(localPath).root;
+        while (localPath !== root) {
+            const packagePath = resolve(localPath, "package.json");
+            if (existsSync(packagePath)) {
+                const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as { name?: unknown };
+                return pkg.name === PLUGIN_NAME;
+            }
+            localPath = dirname(localPath);
+        }
+    } catch {
+        // An unreadable or unresolved path cannot prove that our plugin is installed.
+    }
+    return false;
 }
 
 /**

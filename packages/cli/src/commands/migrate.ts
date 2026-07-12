@@ -1,11 +1,11 @@
 import { randomBytes } from "node:crypto";
 import { unlinkSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { writeFileAtomic } from "../lib/atomic-write";
 import { openExistingContextDatabase, openExistingDatabase } from "../lib/database-access";
+import { getOpenCodeDatabasePath, projectPathToPiSessionSlug } from "../lib/migration-paths";
 import { getPiSessionsRoot } from "../lib/paths";
 
 export interface MigrateOpenCodeSessionToPiOptions {
@@ -170,7 +170,7 @@ const MIGRATION_COMPACTION_SUMMARY =
     "Magic Context compacted prior conversation. See <session-history> block for the structured summary.";
 
 function defaultOpenCodeDbPath(): string {
-    return join(homedir(), ".local", "share", "opencode", "opencode.db");
+    return getOpenCodeDatabasePath();
 }
 
 function defaultCortexkitDbPath(): string {
@@ -189,8 +189,11 @@ function stmt<T>(db: DatabaseLike, sql: string): StatementLike<T> {
     return db.prepare(sql) as unknown as StatementLike<T>;
 }
 
-export function projectPathToPiDirSlug(projectPath: string): string {
-    return `--${projectPath.replace(/^\/+|\/+$/g, "").replaceAll("/", "-")}--`;
+export function projectPathToPiDirSlug(
+    projectPath: string,
+    platform: NodeJS.Platform = process.platform,
+): string {
+    return projectPathToPiSessionSlug(projectPath, platform);
 }
 
 export function formatPiFilenameTimestamp(date: Date): string {
@@ -568,34 +571,46 @@ function buildPiEntries(params: {
 }
 
 function fetchRows(db: DatabaseLike, sessionId: string, maxMessages: number | undefined) {
-    const session = stmt<OpenCodeSessionRow>(
-        db,
-        "SELECT id, title, directory, path, time_created FROM session WHERE id = ?",
-    ).get(sessionId);
-    if (!session) throw new Error(`OpenCode session not found: ${sessionId}`);
-
-    const sourceMessageCount =
-        stmt<{ count: number }>(
+    db.exec("PRAGMA busy_timeout=5000");
+    db.exec("BEGIN DEFERRED");
+    try {
+        const session = stmt<OpenCodeSessionRow>(
             db,
-            "SELECT COUNT(*) AS count FROM message WHERE session_id = ?",
-        ).get(sessionId)?.count ?? 0;
+            "SELECT id, title, directory, path, time_created FROM session WHERE id = ?",
+        ).get(sessionId);
+        if (!session) throw new Error(`OpenCode session not found: ${sessionId}`);
 
-    const limitClause = maxMessages ? "LIMIT ?" : "";
-    const params = maxMessages ? [sessionId, maxMessages] : [sessionId];
-    const newestFirst = stmt<OpenCodeMessageRow>(
-        db,
-        `SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created DESC, id DESC ${limitClause}`,
-    ).all(...params);
-    const messages = newestFirst.reverse();
-    const ids = messages.map((row) => row.id);
-    const parts = ids.length
-        ? stmt<OpenCodePartRow>(
-              db,
-              `SELECT id, message_id, time_created, data FROM part WHERE message_id IN (${ids.map(() => "?").join(",")}) ORDER BY time_created, id`,
-          ).all(...ids)
-        : [];
+        const sourceMessageCount =
+            stmt<{ count: number }>(
+                db,
+                "SELECT COUNT(*) AS count FROM message WHERE session_id = ?",
+            ).get(sessionId)?.count ?? 0;
 
-    return { session, sourceMessageCount, messages, parts };
+        const limitClause = maxMessages ? "LIMIT ?" : "";
+        const params = maxMessages ? [sessionId, maxMessages] : [sessionId];
+        const newestFirst = stmt<OpenCodeMessageRow>(
+            db,
+            `SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created DESC, id DESC ${limitClause}`,
+        ).all(...params);
+        const messages = newestFirst.reverse();
+        const ids = messages.map((row) => row.id);
+        const parts = ids.length
+            ? stmt<OpenCodePartRow>(
+                  db,
+                  `SELECT id, message_id, time_created, data FROM part WHERE message_id IN (${ids.map(() => "?").join(",")}) ORDER BY time_created, id`,
+              ).all(...ids)
+            : [];
+
+        db.exec("COMMIT");
+        return { session, sourceMessageCount, messages, parts };
+    } catch (error) {
+        try {
+            db.exec("ROLLBACK");
+        } catch {
+            // Preserve the read failure if the transaction already closed.
+        }
+        throw error;
+    }
 }
 
 /**

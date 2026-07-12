@@ -20,10 +20,20 @@ export async function runSetup(argv: string[]): Promise<number> {
     const dryRun = argv.includes("--dry-run");
     intro(dryRun ? "Magic Context setup (dry run)" : "Magic Context setup");
 
-    const adapters = await resolveAdaptersForCommand(argv, {
-        allowMulti: true,
-        verb: "setup",
-    });
+    let adapters: HarnessAdapter[];
+    try {
+        adapters = await resolveAdaptersForCommand(argv, {
+            // Both harness wizards write the same Magic Context config. Keep setup
+            // single-target until shared choices are collected once and registration
+            // is split into harness-specific phases.
+            allowMulti: false,
+            verb: "setup",
+        });
+    } catch (error) {
+        log.error(error instanceof Error ? error.message : String(error));
+        outro("Setup stopped — correct the command arguments and try again.");
+        return 1;
+    }
 
     if (adapters.length === 0) {
         outro("No harness selected. Nothing to do.");
@@ -34,14 +44,13 @@ export async function runSetup(argv: string[]): Promise<number> {
     for (const adapter of adapters) {
         log.step(`Configuring ${adapter.displayName} (${adapter.pluginPackageName})…`);
 
-        if (!adapter.isInstalled()) {
-            log.warn(`${adapter.displayName} host not found on PATH. ${adapter.getInstallHint()}.`);
+        // Each harness owns its no-host flow. In particular, an explicit OpenCode
+        // setup can continue for a Desktop or not-yet-installed host.
+        const code = await dispatchSetup(adapter, dryRun);
+        if (code !== 0) {
             anyFailure = true;
             continue;
         }
-
-        const code = await dispatchSetup(adapter, dryRun);
-        if (code !== 0) anyFailure = true;
         if (!dryRun) printNextSteps(adapter);
     }
 

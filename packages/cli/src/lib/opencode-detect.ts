@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { findOnPath } from "./find-on-path";
+import { findOnPath, isExecutableFile } from "./find-on-path";
 
 /**
  * How OpenCode is present on this machine.
@@ -38,6 +38,7 @@ const OPENCODE_DESKTOP_SETTINGS_FILE = "opencode.settings";
  */
 export interface DetectDeps {
     exists: (path: string) => boolean;
+    isExecutable: (path: string) => boolean;
     home: string;
     platform: NodeJS.Platform;
     env: NodeJS.ProcessEnv;
@@ -48,7 +49,8 @@ export interface DetectDeps {
 function defaultDeps(): DetectDeps {
     return {
         exists: existsSync,
-        home: homedir(),
+        isExecutable: isExecutableFile,
+        home: process.env.HOME?.trim() || homedir(),
         platform: process.platform,
         env: process.env,
         onPath: findOnPath,
@@ -95,11 +97,11 @@ function extraCliCandidates(d: DetectDeps): string[] {
 /** Resolve a runnable `opencode` CLI binary, or null. */
 function resolveCliBinary(d: DetectDeps): string | null {
     const stockBin = stockCliBinary(d);
-    if (d.exists(stockBin)) return stockBin;
+    if (d.isExecutable(stockBin)) return stockBin;
     const onPath = d.onPath("opencode");
-    if (onPath) return onPath;
+    if (onPath && d.isExecutable(onPath)) return onPath;
     for (const candidate of extraCliCandidates(d)) {
-        if (d.exists(candidate)) return candidate;
+        if (d.isExecutable(candidate)) return candidate;
     }
     return null;
 }
