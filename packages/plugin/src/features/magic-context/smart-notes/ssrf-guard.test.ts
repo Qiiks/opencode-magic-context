@@ -1,8 +1,11 @@
 import { describe, expect, mock, test } from "bun:test";
+import * as https from "node:https";
 
 import {
     createPinnedLookup,
+    createSmartNoteRequestAgent,
     guardedSmartNoteHttpGet,
+    requestValidatedAddress,
     type SmartNoteResolver,
     validateSmartNoteHttpUrl,
 } from "./ssrf-guard";
@@ -203,5 +206,35 @@ describe("createPinnedLookup", () => {
             received = addresses;
         });
         expect(received).toEqual([{ address: "203.0.113.7", family: 4 }]);
+    });
+});
+
+describe("guarded HTTPS request agent", () => {
+    test("does not use a pre-seeded keep-alive global agent", async () => {
+        const originalCreateConnection = https.globalAgent.createConnection;
+        const globalCreateConnection = mock(originalCreateConnection.bind(https.globalAgent));
+        https.globalAgent.createConnection = globalCreateConnection;
+        try {
+            const dedicated = createSmartNoteRequestAgent();
+            expect(dedicated).not.toBe(https.globalAgent);
+            expect(dedicated.keepAlive).toBe(false);
+            expect(dedicated.maxSockets).toBe(1);
+            dedicated.destroy();
+
+            await expect(
+                requestValidatedAddress(
+                    {
+                        url: new URL("https://example.test:1/"),
+                        hostname: "example.test",
+                        addresses: [],
+                    },
+                    { address: "127.0.0.1", family: 4, classification: "global" },
+                    { signal, timeoutMs: 100, bodyLimitBytes: 1024 },
+                ),
+            ).rejects.toBeInstanceOf(SmartNoteNetworkError);
+            expect(globalCreateConnection).not.toHaveBeenCalled();
+        } finally {
+            https.globalAgent.createConnection = originalCreateConnection;
+        }
     });
 });

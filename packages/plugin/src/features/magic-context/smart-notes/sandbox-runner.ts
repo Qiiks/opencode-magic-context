@@ -73,17 +73,28 @@ export interface RunCompiledSmartNoteCheckSuccess {
 
 export interface RunCompiledSmartNoteCheckFailure {
     ok: false;
+    cancelled: false;
     error: string;
     network: boolean;
 }
 
+export interface RunCompiledSmartNoteCheckCancelled {
+    ok: false;
+    cancelled: true;
+    error: string;
+    network: false;
+}
+
 export type RunCompiledSmartNoteCheckResult =
     | RunCompiledSmartNoteCheckSuccess
-    | RunCompiledSmartNoteCheckFailure;
+    | RunCompiledSmartNoteCheckFailure
+    | RunCompiledSmartNoteCheckCancelled;
 
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_HEAP_LIMIT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_STACK_LIMIT_BYTES = 512 * 1024;
+const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
+const MAX_SANDBOX_ERROR_CHARS = 2 * 1024;
 
 // Host calls can outlive the VM interrupt path, so any capability that touches
 // the outside world must listen to this run's controller. Otherwise one tarpit
@@ -111,6 +122,10 @@ function throwIfRunAborted(signal: AbortSignal): void {
 export async function runCompiledSmartNoteCheck(
     options: RunCompiledSmartNoteCheckOptions,
 ): Promise<RunCompiledSmartNoteCheckResult> {
+    if (options.signal?.aborted) return cancelledResult(options.signal.reason);
+    if (Buffer.byteLength(options.compiledCheck, "utf8") > MAX_COMPILED_CHECK_BYTES) {
+        return failureResult("compiled check exceeds 64 KiB", false);
+    }
     // Serialize the actual sandbox work (see withSandboxLock): only one
     // asyncify-suspended eval may exist at a time on the shared module. The
     // per-check timeout and host-capability controller start INSIDE the lock so
@@ -121,18 +136,20 @@ export async function runCompiledSmartNoteCheck(
 async function runCompiledSmartNoteCheckLocked(
     options: RunCompiledSmartNoteCheckOptions,
 ): Promise<RunCompiledSmartNoteCheckResult> {
+    if (options.signal?.aborted) return cancelledResult(options.signal.reason);
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const controller = new AbortController();
-    const externalAbort = () => controller.abort(options.signal?.reason);
-    if (options.signal?.aborted) {
-        externalAbort();
-    } else {
-        options.signal?.addEventListener("abort", externalAbort, { once: true });
-    }
-    const timer = setTimeout(
-        () => controller.abort(new Error("smart-note check timed out")),
-        timeoutMs,
-    );
+    let externallyCancelled = false;
+    let executionTimedOut = false;
+    const externalAbort = () => {
+        externallyCancelled = true;
+        controller.abort(options.signal?.reason);
+    };
+    options.signal?.addEventListener("abort", externalAbort, { once: true });
+    const timer = setTimeout(() => {
+        executionTimedOut = true;
+        controller.abort(new Error("smart-note check timed out"));
+    }, timeoutMs);
     try {
         throwIfRunAborted(controller.signal);
         const capabilities = resolveCapabilitiesForRun(options, controller.signal);
@@ -151,22 +168,42 @@ async function runCompiledSmartNoteCheckLocked(
             const result = await evalCheck(context, options.compiledCheck);
             const checkResult = result as { met?: unknown } | null;
             if (!checkResult || typeof checkResult.met !== "boolean") {
-                return { ok: false, error: "check() must return { met: boolean }", network: false };
+                return failureResult("check() must return { met: boolean }", false);
             }
             return { ok: true, result: { met: checkResult.met } };
         } finally {
             context.dispose();
         }
     } catch (error) {
-        return {
-            ok: false,
-            error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-            network: isSmartNoteNetworkError(error),
-        };
+        // Queue deadlines and lease loss are control flow, not evidence that a
+        // healthy compiled check is failing. Only this run's own timeout counts.
+        if (externallyCancelled && !executionTimedOut) return cancelledResult(error);
+        return failureResult(formatSandboxError(error), isSmartNoteNetworkError(error));
     } finally {
         clearTimeout(timer);
         options.signal?.removeEventListener("abort", externalAbort);
     }
+}
+
+function failureResult(error: string, network: boolean): RunCompiledSmartNoteCheckFailure {
+    return { ok: false, cancelled: false, error: truncate(error), network };
+}
+
+function cancelledResult(reason: unknown): RunCompiledSmartNoteCheckCancelled {
+    return {
+        ok: false,
+        cancelled: true,
+        error: truncate(reason instanceof Error ? reason.message : String(reason ?? "cancelled")),
+        network: false,
+    };
+}
+
+function formatSandboxError(error: unknown): string {
+    return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
+function truncate(value: string): string {
+    return value.slice(0, MAX_SANDBOX_ERROR_CHARS);
 }
 
 function installCapabilityObject(context: QuickJSAsyncContext, cap: SmartNoteCapabilityApi): void {
