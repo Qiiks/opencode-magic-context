@@ -163,9 +163,12 @@ export function advanceToolReclaimWatermark(
 }
 
 export function clearSession(db: Database, sessionId: string): void {
+    // Every session-scoped table must be cleared here; the structural storage-db
+    // test discovers tables with session_id and seeds each one to enforce this list.
     db.transaction(() => {
         db.prepare("DELETE FROM pending_ops WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM source_contents WHERE session_id = ?").run(sessionId);
+        db.prepare("DELETE FROM tool_owner_backfill_state WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM tags WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM session_meta WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM session_projects WHERE session_id = ?").run(sessionId);

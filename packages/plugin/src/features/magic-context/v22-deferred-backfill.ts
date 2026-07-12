@@ -365,7 +365,7 @@ export async function runDeferredV22Backfill(
             }
 
             writeMeta(db, BACKFILL_CURSOR_META_KEY, String(finalCursor));
-        })();
+        }).immediate();
 
         processedRows += batch.length;
         lastCursor = finalCursor;

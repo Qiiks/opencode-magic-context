@@ -248,7 +248,8 @@ function acquireSessionLease(db: Database, sessionId: string, now: number): bool
     const result = db
         .prepare(
             `INSERT INTO tool_owner_backfill_state(session_id, status, started_at, lease_expires_at)
-             VALUES (?, 'running', ?, ?)
+             SELECT ?, 'running', ?, ?
+             WHERE EXISTS (SELECT 1 FROM tags WHERE session_id = ?)
              ON CONFLICT(session_id) DO UPDATE SET
                  status = 'running',
                  started_at = excluded.started_at,
@@ -258,7 +259,7 @@ function acquireSessionLease(db: Database, sessionId: string, now: number): bool
                 OR (tool_owner_backfill_state.status = 'running'
                     AND tool_owner_backfill_state.lease_expires_at < ?)`,
         )
-        .run(sessionId, now, expiresAt, now);
+        .run(sessionId, now, expiresAt, sessionId, now);
     return (result.changes ?? 0) === 1;
 }
 
@@ -464,7 +465,7 @@ function applyOwnersForSession(
             const result = updateRowStmt.run(ownerId, orphan.id);
             rowsUpdated += result.changes ?? 0;
         }
-    })();
+    }).immediate();
 
     const rowsLeftNull = (
         db

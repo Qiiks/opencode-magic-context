@@ -111,58 +111,73 @@ describe("storage-db", () => {
             );
         });
 
-        it("#when clearSession runs on a fresh DB #then every table it deletes from exists (no rollback)", () => {
-            // Regression guard: clearSession runs ~18 DELETEs in one
-            // transaction. If any target table is missing on a fresh install
-            // (e.g. a new DELETE added without a CREATE/migration), the first
-            // prepare() throws inside the tx and rolls back EVERY delete — so no
-            // per-session row is ever removed (unbounded growth). openDatabase
-            // runs initializeDatabase() THEN runMigrations(), and a fresh DB
-            // applies all migrations, so every table must exist. This asserts
-            // clearSession completes and actually removes the seeded row.
+        it("#when clearSession runs #then every session-scoped table is emptied", () => {
+            // Discover the contract from schema shape instead of maintaining a
+            // second table list. Any new table with session_id is seeded here and
+            // must be cleared by clearSession, so lifecycle omissions fail loudly.
             useTempDataHome("storage-db-clearsession-");
             const db = openDatabase();
-
             const sessionId = "ses_clearsession_fresh";
-            db.prepare("INSERT INTO session_meta (session_id, harness) VALUES (?, 'opencode')").run(
-                sessionId,
-            );
-            expect(
-                db.prepare("SELECT 1 FROM session_meta WHERE session_id = ?").get(sessionId),
-            ).toBeTruthy();
+            const tableNames = (
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    )
+                    .all() as Array<{ name: string }>
+            )
+                .map((row) => row.name)
+                .filter((table) => {
+                    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+                        name: string;
+                    }>;
+                    return columns.some((column) => column.name === "session_id");
+                });
 
-            // Every table clearSession touches must exist on a fresh DB.
-            const clearSessionTables = [
-                "pending_ops",
-                "source_contents",
-                "tags",
-                "session_meta",
-                "compartment_chunk_embeddings",
-                "compartments",
-                "session_facts",
-                "compartment_state_lease",
-                "notes",
-                "recomp_compartments",
-                "recomp_facts",
-                "user_memory_candidates",
-                "m0_mutation_log",
-                "compartment_events",
-                "subagent_invocations",
-                "historian_runs",
-                "plugin_messages",
-            ];
-            for (const table of clearSessionTables) {
+            db.exec("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON");
+            for (const table of tableNames) {
+                const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+                    name: string;
+                    type: string;
+                    notnull: number;
+                    dflt_value: string | null;
+                    pk: number;
+                }>;
+                const insertedColumns = columns.filter(
+                    (column) =>
+                        column.name === "session_id" ||
+                        (column.dflt_value === null &&
+                            (column.notnull === 1 ||
+                                (column.pk > 0 && column.type.toUpperCase() !== "INTEGER"))),
+                );
+                const values = insertedColumns.map((column) => {
+                    if (column.name === "session_id") return sessionId;
+                    const type = column.type.toUpperCase();
+                    if (type.includes("INT") || type.includes("REAL")) return 1;
+                    if (type.includes("BLOB")) return new Uint8Array([1]);
+                    return "seed";
+                });
+                const placeholders = insertedColumns.map(() => "?").join(", ");
+                db.prepare(
+                    `INSERT INTO ${table} (${insertedColumns.map((column) => column.name).join(", ")}) VALUES (${placeholders})`,
+                ).run(...values);
                 expect(
                     db
-                        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
-                        .get(table),
-                ).toBeTruthy();
+                        .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE session_id = ?`)
+                        .get(sessionId),
+                ).toEqual({ count: 1 });
             }
+            db.exec("PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON");
 
-            expect(() => clearSession(db, sessionId)).not.toThrow();
-            expect(
-                db.prepare("SELECT 1 FROM session_meta WHERE session_id = ?").get(sessionId),
-            ).toBeFalsy();
+            clearSession(db, sessionId);
+
+            for (const table of tableNames) {
+                expect(
+                    db
+                        .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE session_id = ?`)
+                        .get(sessionId),
+                    `${table} retained session-scoped rows`,
+                ).toEqual({ count: 0 });
+            }
         });
 
         it("#when called first time #then creates required session-scoped indexes", () => {
