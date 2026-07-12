@@ -217,6 +217,8 @@ struct CacheEventsFromDbArgs {
 struct LimitArgs {
     limit: Option<usize>,
     show_unmanaged: Option<bool>,
+    hide_subagents: Option<bool>,
+    harness_filter: Option<db::Harness>,
 }
 
 #[derive(Deserialize)]
@@ -611,6 +613,8 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             json(db::get_session_cache_stats_from_db(
                 a.limit.unwrap_or(5),
                 a.show_unmanaged.unwrap_or(false),
+                a.hide_subagents.unwrap_or(false),
+                a.harness_filter,
             ))
         }
         "get_config" => {

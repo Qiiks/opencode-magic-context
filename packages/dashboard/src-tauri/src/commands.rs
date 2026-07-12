@@ -520,8 +520,15 @@ pub fn get_cache_events_from_db(
 pub fn get_session_cache_stats_from_db(
     limit: Option<usize>,
     show_unmanaged: Option<bool>,
+    hide_subagents: Option<bool>,
+    harness_filter: Option<db::Harness>,
 ) -> Vec<db::SessionCacheStats> {
-    db::get_session_cache_stats_from_db(limit.unwrap_or(5), show_unmanaged.unwrap_or(false))
+    db::get_session_cache_stats_from_db(
+        limit.unwrap_or(5),
+        show_unmanaged.unwrap_or(false),
+        hide_subagents.unwrap_or(false),
+        harness_filter,
+    )
 }
 
 // ── Config commands ─────────────────────────────────────────
