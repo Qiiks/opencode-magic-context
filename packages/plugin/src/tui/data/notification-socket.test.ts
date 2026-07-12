@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+    __resetNotificationStateForTests,
     drainNotifications,
     isTuiConnected,
     pushNotification,
@@ -25,7 +26,7 @@ afterEach(() => {
     for (const server of servers.splice(0)) {
         server.stop();
     }
-    drainNotifications(Number.MAX_SAFE_INTEGER);
+    __resetNotificationStateForTests();
     for (const dir of tempDirs.splice(0)) {
         rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
@@ -99,8 +100,8 @@ describe("notification socket", () => {
         expect(received.map((notification) => notification.type)).toContain("for-b");
     });
 
-    test("resets the cached endpoint after websocket close so reconnect discovers a new server", async () => {
-        drainNotifications(Number.MAX_SAFE_INTEGER);
+    test("clears cursors and deduplication when a fresh server reuses notification ids", async () => {
+        __resetNotificationStateForTests();
         const dataHome = makeDataHome();
         const directory = "/repo-reconnect";
         const first = await startServer(dataHome, directory);
@@ -116,16 +117,120 @@ describe("notification socket", () => {
         });
         await waitFor(() => isTuiConnected("ses_R"), "initial websocket connection");
 
-        const second = await startServer(dataHome, directory);
-        expect(second).toBeDefined();
+        pushNotification("before-restart", { action: "show-status-dialog" }, "ses_R");
+        await waitFor(() => received.length === 1, "first notification acknowledgement");
+        await waitFor(
+            () => drainNotifications(0, "ses_R").length === 0,
+            "first server queue to empty",
+        );
+        expect(received[0].id).toBe(1);
+
         first.stop();
         await waitFor(() => !isTuiConnected("ses_R"), "old websocket sink removed");
-        await waitFor(() => isTuiConnected("ses_R"), "websocket reconnected to replacement server");
+        // A process restart recreates module state as well as the RPC server. The
+        // client state intentionally survives so reused ids exercise epoch reset.
+        __resetNotificationStateForTests();
+        pushNotification("queued-after-restart", { action: "show-status-dialog" }, "ses_R");
+        const second = await startServer(dataHome, directory);
+        expect(second).toBeDefined();
 
-        pushNotification("after-restart", { action: "show-status-dialog" }, "ses_R");
         await waitFor(
-            () => received.some((notification) => notification.type === "after-restart"),
-            "notification from replacement server",
+            () => received.some((notification) => notification.type === "queued-after-restart"),
+            "reused id from replacement server backlog",
         );
+        const restarted = received.find(
+            (notification) => notification.type === "queued-after-restart",
+        );
+        expect(restarted?.id).toBe(received[0].id);
+    });
+
+    test("acknowledges only consumed ids and redelivers a failed earlier notification", async () => {
+        __resetNotificationStateForTests();
+        const dataHome = makeDataHome();
+        const directory = "/repo-exact-ack";
+        await startServer(dataHome, directory);
+        initRpcClient(directory);
+
+        let releaseFirst: ((consumed: boolean) => void) | undefined;
+        const firstResult = new Promise<boolean>((resolve) => {
+            releaseFirst = resolve;
+        });
+        let slowCalls = 0;
+        let fastCalls = 0;
+        startNotificationSocket({
+            getSessionId: () => "ses_exact",
+            onNotification: (notification) => {
+                if (notification.type === "slow") {
+                    slowCalls += 1;
+                    return slowCalls === 1 ? firstResult : true;
+                }
+                fastCalls += 1;
+                return true;
+            },
+        });
+        await waitFor(() => isTuiConnected("ses_exact"), "exact ack socket connection");
+
+        pushNotification("slow", { action: "show-status-dialog" }, "ses_exact");
+        pushNotification("fast", { action: "show-toast" }, "ses_exact");
+        await waitFor(() => slowCalls === 1, "blocked first handler");
+        expect(fastCalls).toBe(0);
+        releaseFirst?.(false);
+        await waitFor(() => fastCalls === 1, "later handler completion");
+        await waitFor(() => {
+            const pending = drainNotifications(0, "ses_exact");
+            return pending.length === 1 && pending[0].type === "slow";
+        }, "only failed notification to remain queued");
+
+        _resetNotificationSocketStateForTesting();
+        await waitFor(() => !isTuiConnected("ses_exact"), "socket disconnect before redelivery");
+        startNotificationSocket({
+            getSessionId: () => "ses_exact",
+            onNotification: (notification) => {
+                if (notification.type === "slow") slowCalls += 1;
+                if (notification.type === "fast") fastCalls += 1;
+                return true;
+            },
+        });
+        await waitFor(() => slowCalls === 2, "failed notification redelivery");
+        expect(fastCalls).toBe(1);
+    });
+
+    test("serializes back-to-back dialog notification handlers", async () => {
+        __resetNotificationStateForTests();
+        const dataHome = makeDataHome();
+        const directory = "/repo-serialized-dialogs";
+        await startServer(dataHome, directory);
+        initRpcClient(directory);
+
+        let releaseFirst: (() => void) | undefined;
+        const firstSettled = new Promise<void>((resolve) => {
+            releaseFirst = resolve;
+        });
+        const events: string[] = [];
+        startNotificationSocket({
+            getSessionId: () => "ses_dialogs",
+            onNotification: async (notification) => {
+                events.push(`start:${notification.type}`);
+                if (notification.type === "dialog-one") await firstSettled;
+                events.push(`finish:${notification.type}`);
+                return true;
+            },
+        });
+        await waitFor(() => isTuiConnected("ses_dialogs"), "dialog socket connection");
+
+        pushNotification("dialog-one", { action: "show-status-dialog" }, "ses_dialogs");
+        pushNotification("dialog-two", { action: "show-upgrade-dialog" }, "ses_dialogs");
+        await waitFor(() => events.includes("start:dialog-one"), "first dialog handler start");
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        expect(events).toEqual(["start:dialog-one"]);
+
+        releaseFirst?.();
+        await waitFor(() => events.includes("finish:dialog-two"), "second dialog handler finish");
+        expect(events).toEqual([
+            "start:dialog-one",
+            "finish:dialog-one",
+            "start:dialog-two",
+            "finish:dialog-two",
+        ]);
     });
 });

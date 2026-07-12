@@ -64,7 +64,7 @@ function notificationMatchesSink(notification: RpcNotification, sink: Notificati
  *  also enqueues it so a TUI that is momentarily disconnected (reconnecting, or
  *  not yet connected) still receives it on its next hello via the backlog drain.
  *  At-least-once: a live push that the socket drops is re-delivered from the
- *  queue on reconnect (pruned only when the client acks via `lastReceivedId`). */
+ *  queue on reconnect (pruned only when the client acknowledges it). */
 export function pushNotification(
     type: string,
     payload: Record<string, unknown>,
@@ -107,6 +107,21 @@ export function pushNotification(
     }
 }
 
+export function acknowledgeNotifications(ids: readonly number[]): void {
+    const acknowledged = new Set(ids.filter((id) => Number.isSafeInteger(id) && id > 0));
+    if (acknowledged.size === 0) return;
+    // Exact removal preserves an earlier notification when a later handler finishes
+    // first or the earlier handler declines to consume its notification.
+    queue = queue.filter((notification) => !acknowledged.has(notification.id));
+}
+
+/** Reset process-local state to simulate a fresh server module in protocol tests. */
+export function __resetNotificationStateForTests(): void {
+    queue = [];
+    nextNotificationId = 1;
+    sinks.clear();
+}
+
 export interface DrainNotificationsOptions {
     /**
      * Cursor for global notifications when a session-scoped client sends separate
@@ -133,8 +148,8 @@ function cursor(value: number | undefined): number {
  *  behavior.
  *
  *  Delivery is at-least-once (non-destructive return + prune-on-ack): a returned
- *  notification stays queued until a later call acks it via the matching scope's
- *  cursor, so a dropped WS socket re-delivers unhandled backlog on reconnect. */
+ *  notification stays queued until an exact acknowledgement or a legacy cursor
+ *  removes it, so a dropped WS socket re-delivers unhandled backlog on reconnect. */
 export function drainNotifications(
     lastReceivedId = 0,
     sessionId?: string,

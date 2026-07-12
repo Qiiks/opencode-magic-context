@@ -18,6 +18,7 @@ type NonRetryableRpcError = Error & { [NON_RETRYABLE_RPC_ERROR]: true };
 export class MagicContextRpcClient {
     private port: number | null = null;
     private token: string | null = null;
+    private instanceId: string | null = null;
     private portDir: string;
     private legacyPortFilePath: string;
     private healthChecked = false;
@@ -101,11 +102,15 @@ export class MagicContextRpcClient {
      *  channel). Reuses the same health-checked port-file discovery as `call`,
      *  so the WS client and the HTTP client always agree on which server instance
      *  (and token) to use. Returns null when no live server is found. */
-    async resolveEndpoint(): Promise<{ port: number; token: string | null } | null> {
+    async resolveEndpoint(): Promise<{
+        port: number;
+        token: string | null;
+        instanceId: string | null;
+    } | null> {
         try {
             const port = await this.resolvePort();
             if (port === null) return null;
-            return { port, token: this.token };
+            return { port, token: this.token, instanceId: this.instanceId };
         } catch {
             return null;
         }
@@ -133,6 +138,7 @@ export class MagicContextRpcClient {
                 if (alive) {
                     this.port = record.port;
                     this.token = record.token ?? null;
+                    this.instanceId = record.instance_id ?? null;
                     this.healthChecked = true;
                     return record.port;
                 }
@@ -198,6 +204,7 @@ export class MagicContextRpcClient {
     reset(): void {
         this.port = null;
         this.token = null;
+        this.instanceId = null;
         this.healthChecked = false;
     }
 }

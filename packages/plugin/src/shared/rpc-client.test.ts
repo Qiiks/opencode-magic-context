@@ -4,7 +4,12 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { MagicContextRpcClient } from "./rpc-client";
-import { drainNotifications, isTuiConnected, pushNotification } from "./rpc-notifications";
+import {
+    __resetNotificationStateForTests,
+    drainNotifications,
+    isTuiConnected,
+    pushNotification,
+} from "./rpc-notifications";
 import { MagicContextRpcServer } from "./rpc-server";
 import { parseRpcPortFile, type RpcPortFileRecord, rpcPortDir, rpcPortFilePath } from "./rpc-utils";
 
@@ -20,6 +25,7 @@ afterEach(async () => {
     for (const server of servers.splice(0)) {
         await server.close();
     }
+    __resetNotificationStateForTests();
     for (const dir of tempDirs.splice(0)) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -300,6 +306,52 @@ describe("MagicContextRpcClient", () => {
         }
     });
 
+    test("accepts legacy cursor acknowledgements during protocol skew", async () => {
+        __resetNotificationStateForTests();
+        const storageDir = makeTempDir();
+        const directory = "/repo-legacy-ack";
+        const server = new MagicContextRpcServer(storageDir, directory);
+        const port = await server.start();
+        const record = readNewestPortRecord(storageDir, directory);
+        expect(typeof record?.token).toBe("string");
+
+        pushNotification("legacy-one", { ok: true }, "ses_legacy");
+        pushNotification("legacy-two", { ok: true }, "ses_legacy");
+        const queued = drainNotifications(0, "ses_legacy", { sessionOnly: true });
+        expect(queued).toHaveLength(2);
+
+        const ws = await openSocket(port, record?.token ?? "");
+        try {
+            const helloAck = waitForJsonMessage<{
+                type?: string;
+                instanceId?: string;
+            }>(ws, (message) => message.type === "hello-ack");
+            ws.send(
+                JSON.stringify({
+                    type: "hello",
+                    token: record?.token,
+                    sessionId: "ses_legacy",
+                }),
+            );
+            expect((await helloAck).instanceId).toBe(record?.instance_id);
+
+            ws.send(
+                JSON.stringify({
+                    type: "ack",
+                    cursor: queued[0].id,
+                    sessionId: "ses_legacy",
+                }),
+            );
+            await waitFor(() => {
+                const pending = drainNotifications(0, "ses_legacy", { sessionOnly: true });
+                return pending.length === 1 && pending[0].id === queued[1].id;
+            }, "legacy cursor acknowledgement pruning");
+        } finally {
+            ws.close();
+            server.stop();
+        }
+    });
+
     test("same-process servers keep distinct port files during overlap", async () => {
         const storageDir = makeTempDir();
         const directory = "/repo-port-collision";
@@ -319,7 +371,9 @@ describe("MagicContextRpcClient", () => {
             expect(remaining?.port).toBe(secondPort);
 
             const client = new MagicContextRpcClient(storageDir, directory);
-            expect((await client.resolveEndpoint())?.port).toBe(secondPort);
+            const endpoint = await client.resolveEndpoint();
+            expect(endpoint?.port).toBe(secondPort);
+            expect(endpoint?.instanceId).toBe(remaining?.instance_id);
         } finally {
             first.stop();
             second.stop();

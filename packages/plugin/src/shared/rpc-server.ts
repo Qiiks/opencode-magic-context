@@ -13,6 +13,7 @@ import { dirname } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { log } from "./logger";
 import {
+    acknowledgeNotifications,
     drainNotifications,
     type NotificationSink,
     registerNotificationSink,
@@ -293,8 +294,8 @@ export class MagicContextRpcServer {
         }
     }
 
-    /** WS message handler: hello (auth + sink registration + backlog drain) and
-     *  ack (cursor advance → queue prune). All other messages are ignored. */
+    /** WS message handler: hello (auth + sink registration + backlog delivery) and
+     *  ack (exact removal or legacy cursor pruning). All other messages are ignored. */
     private handleWsMessage(ws: ServerWebSocket<WsData>, raw: string | Buffer): void {
         let msg: {
             type?: string;
@@ -303,6 +304,10 @@ export class MagicContextRpcServer {
             lastReceivedId?: number;
             globalLastReceivedId?: number;
             ackScope?: string;
+            protocol?: number;
+            instanceId?: string;
+            ids?: unknown;
+            cursor?: number;
         };
         try {
             msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"));
@@ -343,40 +348,66 @@ export class MagicContextRpcServer {
             ws.data.unregister = registerNotificationSink(sink);
             this.sockets.add(ws);
 
-            // Deliver any backlog the client hasn't seen (at-least-once). Modern
-            // clients send separate session and global cursors; keeping those
-            // watermarks independent prevents a high id in one session from pruning
-            // lower unseen notifications in another session.
-            const lastReceivedId = Number(msg.lastReceivedId ?? 0);
-            const sessionCursor = Number.isFinite(lastReceivedId) ? lastReceivedId : 0;
-            const hasGlobalCursor = typeof msg.globalLastReceivedId === "number";
-            const globalLastReceivedId = hasGlobalCursor
-                ? Number.isFinite(msg.globalLastReceivedId)
-                    ? msg.globalLastReceivedId
-                    : 0
-                : 0;
-            const backlog =
-                ws.data.sessionId === undefined && hasGlobalCursor
-                    ? drainNotifications(globalLastReceivedId, undefined, { globalOnly: true })
-                    : drainNotifications(
-                          sessionCursor,
-                          ws.data.sessionId,
-                          hasGlobalCursor
-                              ? { globalLastReceivedId: globalLastReceivedId }
-                              : undefined,
-                      );
+            const usesExactAcknowledgements = msg.protocol === 2;
+            // The epoch arrives before backlog frames so the client can discard
+            // cursors and deduplication entries from a replaced server first.
+            ws.send(
+                JSON.stringify({
+                    type: "hello-ack",
+                    protocol: 2,
+                    instanceId: this.instanceId,
+                }),
+            );
+
+            let backlog: ReturnType<typeof drainNotifications>;
+            if (usesExactAcknowledgements) {
+                // Protocol 2 never treats a high handled id as proof that lower ids
+                // were consumed. Exact acknowledgements are the only destructive
+                // operation, so declined or interrupted dialogs survive reconnects.
+                backlog =
+                    ws.data.sessionId === undefined
+                        ? drainNotifications(0, undefined, { globalOnly: true })
+                        : drainNotifications(0, ws.data.sessionId, {
+                              globalLastReceivedId: 0,
+                          });
+            } else {
+                // Legacy clients use independent session and global watermarks.
+                const lastReceivedId = Number(msg.lastReceivedId ?? 0);
+                const sessionCursor = Number.isFinite(lastReceivedId) ? lastReceivedId : 0;
+                const hasGlobalCursor = typeof msg.globalLastReceivedId === "number";
+                const globalLastReceivedId = hasGlobalCursor
+                    ? Number.isFinite(msg.globalLastReceivedId)
+                        ? msg.globalLastReceivedId
+                        : 0
+                    : 0;
+                backlog =
+                    ws.data.sessionId === undefined && hasGlobalCursor
+                        ? drainNotifications(globalLastReceivedId, undefined, { globalOnly: true })
+                        : drainNotifications(
+                              sessionCursor,
+                              ws.data.sessionId,
+                              hasGlobalCursor
+                                  ? { globalLastReceivedId: globalLastReceivedId }
+                                  : undefined,
+                          );
+            }
             for (const notification of backlog) {
                 ws.send(JSON.stringify({ type: "notification", notification }));
             }
-            ws.send(JSON.stringify({ type: "hello-ack" }));
             return;
         }
 
         if (msg.type === "ack") {
-            // Advance only the cursor scope the client handled. Acking session A
-            // must not prune session B, and acking a global notification must not
-            // become a session watermark. Cheap, event-driven queue cleanup.
-            const lastReceivedId = Number(msg.lastReceivedId ?? 0);
+            if (Array.isArray(msg.ids)) {
+                acknowledgeNotifications(
+                    msg.ids.filter((id): id is number => typeof id === "number"),
+                );
+                return;
+            }
+
+            // Keep watermark acknowledgements during the one-release skew window.
+            // Scope isolation remains mandatory for these legacy messages.
+            const lastReceivedId = Number(msg.cursor ?? msg.lastReceivedId ?? 0);
             if (Number.isFinite(lastReceivedId) && lastReceivedId > 0) {
                 if (msg.ackScope === "global") {
                     drainNotifications(lastReceivedId, undefined, { globalOnly: true });

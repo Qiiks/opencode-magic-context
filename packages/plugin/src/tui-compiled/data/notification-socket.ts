@@ -30,8 +30,8 @@ export interface SocketNotification {
 interface NotificationSocketOptions {
     /** Current active session id (re-read cheaply to follow session switches). */
     getSessionId: () => string | null;
-    /** Handle one delivered notification. Returns true if it was consumed (so its
-     *  id can advance the ack cursor). Async because dialog handlers await. */
+    /** Handle one delivered notification. Returns true only after it is fully
+     *  consumed and can be acknowledged. Async because dialog handlers await. */
     onNotification: (notification: SocketNotification) => boolean | Promise<boolean>;
 }
 
@@ -55,17 +55,19 @@ let connectGeneration = 0;
 const GLOBAL_CURSOR_KEY = "global";
 const SESSION_CURSOR_PREFIX = "session:";
 const MAX_DEDUPED_NOTIFICATION_IDS = 500;
+const LEGACY_INSTANCE_ID = "legacy";
 
 /**
- * Notification ids are process-global, but acknowledgement cursors are scoped. A
- * high id consumed in session A must not become the prune watermark for session B;
- * global notifications also carry their own cursor so they cannot skip session
- * backlog. The id set de-dupes at-least-once re-delivery when a reconnect sends
- * a session cursor that is intentionally lower than the global cursor.
+ * Notification ids restart with every server instance. Epoch-prefixing cursor keys
+ * and deduplication ids prevents a surviving TUI from applying a replaced server's
+ * high watermark or remembered ids to the replacement's fresh queue.
  */
+let activeInstanceId: string | null = null;
 const lastHandledIdByCursor = new Map<string, number>();
-const handledNotificationIds = new Set<number>();
-const handledNotificationIdOrder: number[] = [];
+const handledNotificationIds = new Set<string>();
+const handledNotificationIdOrder: string[] = [];
+/** Dialog actions share UI state, so notification handlers must never overlap. */
+let notificationHandlingChain: Promise<void> = Promise.resolve();
 
 /** Open the persistent notification socket. Idempotent: a second call while open
  *  is a no-op. Reconnects on its own after any drop. */
@@ -137,6 +139,7 @@ async function connect(): Promise<void> {
         scheduleReconnect();
         return;
     }
+    switchNotificationEpoch(endpoint.instanceId ?? LEGACY_INSTANCE_ID);
     socket = ws;
 
     ws.addEventListener("open", () => {
@@ -147,7 +150,7 @@ async function connect(): Promise<void> {
 
     ws.addEventListener("message", (event) => {
         if (socket !== ws) return;
-        void handleSocketMessage(ws, String((event as MessageEvent).data));
+        handleSocketMessage(ws, String((event as MessageEvent).data), endpoint.token);
     });
 
     const onDown = () => {
@@ -168,55 +171,49 @@ function sendHello(ws: WebSocket, token: string | null): void {
     ws.send(
         JSON.stringify({
             type: "hello",
+            protocol: 2,
+            instanceId: activeInstanceId,
             token: token ?? "",
             sessionId,
+            // Older servers still read these scoped cursors. Protocol 2 servers
+            // rely only on exact acknowledgements and do not prune from them.
             lastReceivedId: cursorForKey(cursorKeyForSession(sessionId)),
-            globalLastReceivedId: cursorForKey(GLOBAL_CURSOR_KEY),
+            globalLastReceivedId: cursorForKey(cursorKeyForSession(undefined)),
         }),
     );
 }
 
-async function handleSocketMessage(ws: WebSocket, raw: string): Promise<void> {
-    let msg: { type?: string; notification?: SocketNotification; error?: string };
+function handleSocketMessage(ws: WebSocket, raw: string, token: string | null): void {
+    let msg: {
+        type?: string;
+        notification?: SocketNotification;
+        error?: string;
+        instanceId?: string;
+    };
     try {
         msg = JSON.parse(raw);
     } catch {
         return;
     }
 
+    if (msg.type === "hello-ack" && typeof msg.instanceId === "string") {
+        if (msg.instanceId !== activeInstanceId) {
+            switchNotificationEpoch(msg.instanceId);
+            // The server does not prune protocol 2 backlog from hello cursors, so a
+            // corrected hello safely establishes fresh epoch-scoped state.
+            sendHello(ws, token);
+        }
+        return;
+    }
+
     if (msg.type === "notification" && msg.notification) {
         const notification = msg.notification;
-        // Client-side session filter mirrors the old poller's per-message re-check:
-        // a session-scoped notification is only acted on while the TUI is actually
-        // viewing that session (the active session can change between queueing and
-        // delivery). Global (session-less) notifications always apply.
-        const active = opts?.getSessionId() ?? null;
-        if (notification.sessionId && active && notification.sessionId !== active) {
-            // Not for the session we're viewing — do NOT ack it (a TUI on the right
-            // session, or a later switch back, should still get it). Just skip.
-            return;
-        }
-        if (handledNotificationIds.has(notification.id)) {
-            sendAck(ws, notification);
-            return;
-        }
-
-        let consumed = false;
-        try {
-            consumed = await Promise.resolve(opts?.onNotification(notification) ?? false);
-        } catch {
-            consumed = false;
-        }
-        // A dispose/reinit during an awaited dialog handler invalidates this socket.
-        if (socket !== ws || getRpcGeneration() !== connectGeneration) return;
-        if (consumed) {
-            rememberHandledId(notification.id);
-            advanceCursor(notificationCursorKey(notification), notification.id);
-            // Ack only the notification's own cursor scope. A dropped ack is safe:
-            // the next hello sends the same per-scope cursors and duplicates are
-            // ignored locally.
-            sendAck(ws, notification);
-        }
+        const deliveryInstanceId = activeInstanceId ?? LEGACY_INSTANCE_ID;
+        // A single promise chain prevents two dialog actions from replacing each
+        // other's UI while either handler is still awaiting user input.
+        notificationHandlingChain = notificationHandlingChain
+            .then(() => handleNotification(ws, notification, deliveryInstanceId))
+            .catch(() => {});
         return;
     }
 
@@ -231,14 +228,57 @@ async function handleSocketMessage(ws: WebSocket, raw: string): Promise<void> {
     }
 }
 
+async function handleNotification(
+    ws: WebSocket,
+    notification: SocketNotification,
+    deliveryInstanceId: string,
+): Promise<void> {
+    if (
+        socket !== ws ||
+        getRpcGeneration() !== connectGeneration ||
+        activeInstanceId !== deliveryInstanceId
+    ) {
+        return;
+    }
+    // Client-side session filtering follows session switches that happen between
+    // queueing and delivery. Global notifications always apply.
+    const active = opts?.getSessionId() ?? null;
+    if (notification.sessionId && active && notification.sessionId !== active) return;
+
+    if (handledNotificationIds.has(notificationDedupKey(notification.id, deliveryInstanceId))) {
+        sendAck(ws, notification.id);
+        return;
+    }
+
+    let consumed = false;
+    try {
+        consumed = await Promise.resolve(opts?.onNotification(notification) ?? false);
+    } catch {
+        consumed = false;
+    }
+    // A dispose, reconnect, or epoch correction during an awaited dialog invalidates
+    // the delivery. The server retains it for the current socket to redeliver.
+    if (
+        socket !== ws ||
+        getRpcGeneration() !== connectGeneration ||
+        activeInstanceId !== deliveryInstanceId
+    ) {
+        return;
+    }
+    if (consumed) {
+        rememberHandledId(notification.id, deliveryInstanceId);
+        advanceCursor(notificationCursorKey(notification), notification.id);
+        sendAck(ws, notification.id);
+    }
+}
+
 function cursorKeyForSession(sessionId: string | null | undefined): string {
-    return sessionId ? `${SESSION_CURSOR_PREFIX}${sessionId}` : GLOBAL_CURSOR_KEY;
+    const scope = sessionId ? `${SESSION_CURSOR_PREFIX}${sessionId}` : GLOBAL_CURSOR_KEY;
+    return `${activeInstanceId ?? LEGACY_INSTANCE_ID}:${scope}`;
 }
 
 function notificationCursorKey(notification: SocketNotification): string {
-    return notification.sessionId
-        ? `${SESSION_CURSOR_PREFIX}${notification.sessionId}`
-        : GLOBAL_CURSOR_KEY;
+    return cursorKeyForSession(notification.sessionId);
 }
 
 function cursorForKey(key: string): number {
@@ -249,25 +289,40 @@ function advanceCursor(key: string, id: number): void {
     if (id > cursorForKey(key)) lastHandledIdByCursor.set(key, id);
 }
 
-function rememberHandledId(id: number): void {
-    if (handledNotificationIds.has(id)) return;
-    handledNotificationIds.add(id);
-    handledNotificationIdOrder.push(id);
+function notificationDedupKey(
+    id: number,
+    instanceId = activeInstanceId ?? LEGACY_INSTANCE_ID,
+): string {
+    return `${instanceId}:${id}`;
+}
+
+function rememberHandledId(id: number, instanceId: string): void {
+    const key = notificationDedupKey(id, instanceId);
+    if (handledNotificationIds.has(key)) return;
+    handledNotificationIds.add(key);
+    handledNotificationIdOrder.push(key);
     while (handledNotificationIdOrder.length > MAX_DEDUPED_NOTIFICATION_IDS) {
         const evicted = handledNotificationIdOrder.shift();
         if (evicted !== undefined) handledNotificationIds.delete(evicted);
     }
 }
 
-function sendAck(ws: WebSocket, notification: SocketNotification): void {
-    const lastReceivedId = cursorForKey(notificationCursorKey(notification));
-    const ack = notification.sessionId
-        ? { type: "ack", sessionId: notification.sessionId, lastReceivedId }
-        : { type: "ack", ackScope: "global", lastReceivedId };
+function switchNotificationEpoch(instanceId: string): void {
+    if (activeInstanceId === instanceId) return;
+    activeInstanceId = instanceId;
+    lastHandledIdByCursor.clear();
+    handledNotificationIds.clear();
+    handledNotificationIdOrder.length = 0;
+}
+
+function sendAck(ws: WebSocket, id: number): void {
     try {
-        ws.send(JSON.stringify(ack));
+        // Exact ids avoid deleting an earlier notification whose handler failed
+        // while a later notification was consumed successfully.
+        ws.send(JSON.stringify({ type: "ack", ids: [id] }));
     } catch {
-        // best-effort; reconnect hello re-syncs via per-scope cursors
+        // Best-effort: an unacknowledged row is safely deduplicated and re-acked
+        // when the server delivers it again after reconnecting.
     }
 }
 
@@ -277,6 +332,8 @@ export function _resetNotificationSocketStateForTesting(): void {
     lastHandledIdByCursor.clear();
     handledNotificationIds.clear();
     handledNotificationIdOrder.length = 0;
+    activeInstanceId = null;
+    notificationHandlingChain = Promise.resolve();
 }
 
 /** Cheap session-change watcher: re-scope the socket only when the active session
