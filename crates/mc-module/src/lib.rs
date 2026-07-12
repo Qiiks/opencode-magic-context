@@ -135,7 +135,7 @@ pub const DEFAULT_MODULE_ID: &str = "magic-context";
 /// safety fold.
 /// Bumps when the shared project-memory render changes. Epoch 1 is the compact,
 /// category-grouped `#id: fact` format and applies to every serializer profile.
-pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 1;
+pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 2;
 /// Bumps when the shared compartment render changes. Epoch 1 replaces rendered
 /// `<compartment>` elements with markdown headings in m0 and m1.
 pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 1;
@@ -470,6 +470,7 @@ struct ShadowReportInput {
 struct FacadeScope {
     memory_project_path: String,
     conversation_key: String,
+    memory_enabled: bool,
 }
 
 fn default_cache_ttl() -> String {
@@ -2033,6 +2034,7 @@ impl McHandler {
                 project_path: &project_path,
                 project_directory: &project_path,
                 history_budget_tokens: binding.history_budget_tokens,
+                memory_enabled: binding.config.memory_enabled,
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
                 smart_drops: binding.config.smart_drops,
@@ -2474,6 +2476,7 @@ impl McHandler {
                 .pass_inputs
                 .history_budget_tokens
                 .unwrap_or(binding.history_budget_tokens),
+            memory_enabled: binding.config.memory_enabled,
             now_ms: parsed.pass_inputs.now_ms,
             execute_threshold_percentage: parsed.pass_inputs.effective_execute_threshold,
             smart_drops: binding.config.smart_drops,
@@ -2623,6 +2626,7 @@ impl McHandler {
             Ok(Some(resolved)) => Ok(FacadeScope {
                 memory_project_path: binding.project_root.to_string_lossy().to_string(),
                 conversation_key: resolved.session_id,
+                memory_enabled: binding.config.memory_enabled,
             }),
             Ok(None) => Err(session_unresolved_error()),
             Err(SessionResolveError::Timeout) => Err(HandlerOutcome::Error {
@@ -2721,10 +2725,19 @@ impl McHandler {
         let Some(action) = string_arg(args, "action") else {
             return invalid_params_error("ctx_memory requires an action");
         };
+        if let Err(error) = validate_memory_id_arguments(args)
+            .and_then(|_| validate_string_cap(args, "content", MAX_MEMORY_CONTENT_BYTES))
+            .and_then(|_| validate_string_cap(args, "reason", MAX_SHORT_FIELD_BYTES))
+        {
+            return tool_error_result(format!("Error: {error}."));
+        }
         let facade_scope = match self.resolve_facade_scope(channel).await {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
+        if !facade_scope.memory_enabled {
+            return tool_error_result("Error: memory is disabled for this project.".to_string());
+        }
         let store = match self.store.get() {
             Some(store) => store,
             None => return store_unavailable_error(),
@@ -2738,6 +2751,12 @@ impl McHandler {
                         "Error: 'category' is required when action is 'write'.",
                     );
                 };
+                if !MEMORY_CATEGORIES.contains(&category) {
+                    return tool_error_result(format!(
+                        "Error: category must be one of {}.",
+                        MEMORY_CATEGORIES.join(", ")
+                    ));
+                }
                 let Some(content) = non_empty_string_arg(args, "content") else {
                     return tool_error_result(
                         "Error: 'content' is required when action is 'write'.",
@@ -2790,14 +2809,16 @@ impl McHandler {
                     );
                 }
                 let reason = string_arg(args, "reason");
-                let mut archived = Vec::new();
-                for id in ids {
-                    match memory_tool::archive_memory(store, memory_project, id, reason, now_ms()) {
-                        Ok(true) => archived.push(id),
-                        Ok(false) => {}
-                        Err(error) => return tool_error_result(format!("Error: {error}")),
-                    }
-                }
+                let archived = match memory_tool::archive_memories(
+                    store,
+                    memory_project,
+                    &ids,
+                    reason,
+                    now_ms(),
+                ) {
+                    Ok(archived) => archived,
+                    Err(error) => return tool_error_result(format!("Error: {error}")),
+                };
                 if archived.is_empty() {
                     mcp_text_result("No active memories needed archiving.".to_string(), false)
                 } else {
@@ -2849,6 +2870,9 @@ impl McHandler {
         let Some(query) = non_empty_string_arg(args, "query") else {
             return tool_error_result("Error: 'query' is required for ctx_search.");
         };
+        if let Err(error) = validate_string_cap(args, "query", MAX_QUERY_BYTES) {
+            return tool_error_result(format!("Error: {error}."));
+        }
         let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
         let facade_scope = match self.resolve_facade_scope(channel).await {
             Ok(scope) => scope,
@@ -2866,6 +2890,7 @@ impl McHandler {
             conversation_key,
             query,
             limit,
+            facade_scope.memory_enabled,
         ) {
             Ok(results) => {
                 let rendered = results
@@ -2952,6 +2977,16 @@ impl McHandler {
         let Some(args) = facade_arguments(request) else {
             return invalid_params_error("ctx_note arguments must be an object");
         };
+        if let Err(error) = validate_string_cap(args, "content", MAX_NOTE_CONTENT_BYTES)
+            .and_then(|_| validate_string_cap(args, "surface_condition", MAX_SHORT_FIELD_BYTES))
+        {
+            return tool_error_result(format!("Error: {error}."));
+        }
+        if args.get("surface_condition").is_some() {
+            return tool_error_result(
+                "Error: smart notes are not supported on this surface.".to_string(),
+            );
+        }
         let facade_scope = match self.resolve_facade_scope(channel).await {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
@@ -2999,8 +3034,11 @@ impl McHandler {
             "read" => {
                 let limit = usize_arg(args, "limit").unwrap_or(25).clamp(1, 100);
                 let offset = usize_arg(args, "offset").unwrap_or(0);
+                if i64::try_from(offset).is_err() {
+                    return tool_error_result("Error: 'offset' is too large.".to_string());
+                }
                 match store.read_notes(project, session, limit, offset) {
-                    Ok(notes) => mcp_text_result(render_notes(notes, offset), false),
+                    Ok(notes) => mcp_text_result(render_notes(notes, offset, limit), false),
                     Err(error) => tool_error_result(format!("Error: {error}")),
                 }
             }
@@ -3127,6 +3165,9 @@ impl ModuleHandler for McHandler {
     }
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        if body.len() > MAX_FACADE_FRAME_BYTES {
+            return invalid_params_error("request body exceeds the 1 MiB limit");
+        }
         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
         self.dispatch_value(ctx.channel(), request).await
     }
@@ -3293,6 +3334,73 @@ fn store_unavailable_error() -> HandlerOutcome {
     }
 }
 
+const MAX_FACADE_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_NOTE_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_SHORT_FIELD_BYTES: usize = 4 * 1024;
+const MAX_QUERY_BYTES: usize = 1024;
+const MAX_MEMORY_IDS: usize = 100;
+const CTX_EXPAND_BYTE_BUDGET: usize = 15_000 * 4;
+const MEMORY_CATEGORIES: [&str; 5] = [
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "DECISIONS",
+    "PREFERENCES",
+    "WORKFLOW",
+];
+
+fn validate_string_cap(
+    args: &Map<String, Value>,
+    key: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    if let Some(value) = args.get(key).and_then(Value::as_str) {
+        if value.len() > max_bytes {
+            return Err(format!("'{key}' exceeds the {max_bytes}-byte limit"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_memory_id_arguments(args: &Map<String, Value>) -> Result<(), String> {
+    for key in ["id", "target_id"] {
+        if let Some(value) = args.get(key) {
+            if value.as_i64().is_none_or(|id| id <= 0) {
+                return Err(format!("'{key}' must be a positive 64-bit integer"));
+            }
+        }
+    }
+    for key in ["ids", "source_ids"] {
+        if let Some(value) = args.get(key) {
+            let Some(values) = value.as_array() else {
+                return Err(format!(
+                    "'{key}' must be an array of positive 64-bit integers"
+                ));
+            };
+            if values.len() > MAX_MEMORY_IDS {
+                return Err(format!("'{key}' exceeds the {MAX_MEMORY_IDS}-item limit"));
+            }
+            if values
+                .iter()
+                .any(|value| value.as_i64().is_none_or(|id| id <= 0))
+            {
+                return Err(format!(
+                    "'{key}' must contain only positive 64-bit integers"
+                ));
+            }
+        }
+    }
+    if let (Some(target), Some(sources)) = (
+        args.get("target_id").and_then(Value::as_i64),
+        args.get("source_ids").and_then(Value::as_array),
+    ) {
+        if sources.iter().any(|source| source.as_i64() == Some(target)) {
+            return Err("merge target must not appear in source_ids".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn facade_arguments(request: &Value) -> Option<&Map<String, Value>> {
     request.get("arguments")?.as_object()
 }
@@ -3317,6 +3425,19 @@ fn usize_arg(args: &Map<String, Value>, key: &str) -> Option<usize> {
         .and_then(|value| usize::try_from(value).ok())
 }
 
+fn truncate_expand_output(mut output: String) -> String {
+    if output.len() <= CTX_EXPAND_BYTE_BUDGET {
+        return output;
+    }
+    let mut boundary = CTX_EXPAND_BYTE_BUDGET;
+    while !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.truncate(boundary);
+    output.push_str("\n\n[truncated at the ~15,000-token ctx_expand budget]");
+    output
+}
+
 fn render_message_expand(row: StoredChunkTranscript, message: i64) -> String {
     let mut lines = vec![
         format!(
@@ -3333,7 +3454,7 @@ fn render_message_expand(row: StoredChunkTranscript, message: i64) -> String {
     lines.push(row.transcript.unwrap_or_else(|| {
         "[no longer recoverable: transcript bytes could not be decompressed]".to_string()
     }));
-    lines.join("\n")
+    truncate_expand_output(lines.join("\n"))
 }
 
 fn render_range_expand(
@@ -3374,10 +3495,10 @@ fn render_range_expand(
             ),
         }
     }
-    lines.join("\n")
+    truncate_expand_output(lines.join("\n"))
 }
 
-fn render_notes(notes: Vec<StoredNote>, offset: usize) -> String {
+fn render_notes(notes: Vec<StoredNote>, offset: usize, limit: usize) -> String {
     if notes.is_empty() {
         return "## Notes\n\nNo active session notes.".to_string();
     }
@@ -3400,19 +3521,21 @@ fn render_notes(notes: Vec<StoredNote>, offset: usize) -> String {
             note.id, note.content, anchor, condition
         ));
     }
-    if notes.len() == 25 {
-        lines.push(String::new());
-        lines.push(format!(
-            "Showing {} notes (newest first). For older notes: ctx_note(action=\"read\", offset={}).",
-            notes.len(),
-            offset + notes.len()
-        ));
+    if notes.len() == limit {
+        if let Some(next_offset) = offset.checked_add(notes.len()) {
+            lines.push(String::new());
+            lines.push(format!(
+                "Showing {} notes (newest first). For older notes: ctx_note(action=\"read\", offset={next_offset}).",
+                notes.len()
+            ));
+        }
     }
     lines.push(String::new());
     lines.push("To dismiss a stale note: ctx_note(action=\"dismiss\", note_id=N)".to_string());
     lines.join("\n")
 }
 
+// The facade never panics on agent input; an absent or malformed id stays a typed tool error.
 fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
     if let Some(id) = i64_arg(args, "id") {
         return Some(id);
@@ -3459,13 +3582,8 @@ fn merge_ids(args: &Map<String, Value>) -> Option<(i64, Vec<i64>)> {
 }
 
 fn dedup_i64s(ids: Vec<i64>) -> Vec<i64> {
-    let mut deduped = Vec::new();
-    for id in ids {
-        if !deduped.contains(&id) {
-            deduped.push(id);
-        }
-    }
-    deduped
+    let mut seen = HashSet::with_capacity(ids.len());
+    ids.into_iter().filter(|id| seen.insert(*id)).collect()
 }
 
 fn join_i64s(ids: &[i64]) -> String {
@@ -4355,6 +4473,7 @@ fn ctx_memory_schema() -> Value {
             },
             "content": {
                 "type": "string",
+                "maxLength": 65536,
                 "description": "Standalone memory text. Required for write, update, and merge."
             },
             "id": {
@@ -4364,6 +4483,7 @@ fn ctx_memory_schema() -> Value {
             },
             "ids": {
                 "type": "array",
+                "maxItems": 100,
                 "items": { "type": "integer", "minimum": 1 },
                 "description": "Memory ids. For update provide exactly one. For archive provide one or more. For merge, the first id is kept and updated, and the remaining ids are superseded."
             },
@@ -4374,11 +4494,13 @@ fn ctx_memory_schema() -> Value {
             },
             "source_ids": {
                 "type": "array",
+                "maxItems": 100,
                 "items": { "type": "integer", "minimum": 1 },
                 "description": "Merge form: memory ids to supersede into target_id."
             },
             "reason": {
                 "type": "string",
+                "maxLength": 4096,
                 "description": "Optional short reason for archive."
             }
         },
@@ -4393,6 +4515,7 @@ fn ctx_search_schema() -> Value {
         "properties": {
             "query": {
                 "type": "string",
+                "maxLength": 1024,
                 "description": "Literal keyword or phrase to find in memories and summarized history."
             },
             "limit": {
@@ -4425,11 +4548,11 @@ fn ctx_note_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "action": { "type": "string", "enum": ["write", "read", "update", "dismiss"], "description": "Operation to perform. Defaults to write when content is provided, otherwise read." },
-            "content": { "type": "string", "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
+            "content": { "type": "string", "maxLength": 65536, "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
             "note_id": { "type": "integer", "minimum": 1, "description": "Note id for update or dismiss." },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Maximum active notes to return." },
             "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes." },
-            "surface_condition": { "type": "string", "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." }
+            "surface_condition": { "type": "string", "maxLength": 4096, "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." }
         }
     })
 }
@@ -4554,7 +4677,7 @@ mod tests {
 
     #[test]
     fn profile_render_epoch_is_profile_specific_and_zero_for_unchanged_profiles() {
-        assert_eq!(MEMORY_RENDER_FORMAT_EPOCH, 1);
+        assert_eq!(MEMORY_RENDER_FORMAT_EPOCH, 2);
         assert_eq!(
             profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic),
             PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
@@ -5506,7 +5629,10 @@ mod tests {
         assert_eq!(status["row_version"], Value::Null);
         assert_eq!(status["historian"]["last_no_fire"], Value::Null);
         assert_eq!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 1);
-        assert_eq!(status["epochs"]["memory_render_epoch"], json!(1));
+        assert_eq!(
+            status["epochs"]["memory_render_epoch"],
+            json!(MEMORY_RENDER_FORMAT_EPOCH)
+        );
         assert_eq!(status["epochs"]["compartment_render_epoch"], json!(1));
         assert_eq!(status["epochs"]["profile_epoch"], json!(1));
         assert_eq!(
@@ -5696,7 +5822,16 @@ mod tests {
             )
             .await,
         );
-        assert!(write.contains("Surface condition recorded"));
+        assert!(write.contains("smart notes are not supported"));
+        let write = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "write", "content": "remember the lattice"}),
+            )
+            .await,
+        );
+        assert!(write.contains("Saved session note"));
         let read = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
         assert!(read.contains("remember the lattice"));
         let hits =
@@ -6133,6 +6268,13 @@ mod tests {
         crate::healing::set_tagging_enabled_for_tests(None);
     }
 
+    #[test]
+    fn expand_output_is_bounded_to_the_typescript_token_budget() {
+        let output = truncate_expand_output("x".repeat(CTX_EXPAND_BYTE_BUDGET * 2));
+        assert!(output.len() <= CTX_EXPAND_BYTE_BUDGET + 64);
+        assert!(output.contains("~15,000-token ctx_expand budget"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn facade_never_panics_on_malformed_memory_arguments() {
         let producer = Arc::new(ProducerState::default());
@@ -6169,6 +6311,43 @@ mod tests {
                 "malformed arguments must return a typed tool error: {arguments}"
             );
         }
+        let oversized = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "x".repeat(MAX_MEMORY_CONTENT_BYTES + 1),
+            }),
+        )
+        .await;
+        assert!(tool_is_error(oversized));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_disabled_rejects_mutation_and_excludes_memory_search() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
+        let mut config = default_test_config();
+        config.memory_enabled = false;
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, config, resolver);
+        let mut disabled_binding = binding("/repo", "token");
+        disabled_binding.config.memory_enabled = false;
+        handler.bind_route(7, disabled_binding);
+        insert_memory(&store, "/repo", "CONSTRAINTS", "hidden needle", 1);
+
+        assert!(tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({"action": "write", "category": "CONSTRAINTS", "content": "blocked"}),
+            )
+            .await
+        ));
+        let results =
+            tool_json_array(call_facade(&handler, "ctx_search", json!({"query": "needle"})).await);
+        assert!(results.iter().all(|result| result["source"] != "memory"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6223,7 +6402,7 @@ mod tests {
         let shared_target = insert_memory(&store, foreign, "CONSTRAINTS", "shared target", 1);
         let shared_source = insert_memory(&store, foreign, "CONSTRAINTS", "shared source", 1);
 
-        assert!(!tool_is_error(
+        assert!(tool_is_error(
             call_facade(
                 &handler,
                 "ctx_memory",
@@ -6231,7 +6410,7 @@ mod tests {
             )
             .await
         ));
-        assert!(!tool_is_error(
+        assert!(tool_is_error(
             call_facade(
                 &handler,
                 "ctx_memory",
@@ -6239,7 +6418,7 @@ mod tests {
             )
             .await
         ));
-        assert!(!tool_is_error(
+        assert!(tool_is_error(
             call_facade(
                 &handler,
                 "ctx_memory",
@@ -6253,7 +6432,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .superseded_by_memory_id,
-            Some(shared_target)
+            None
         );
 
         let cross_target = insert_memory(&store, own, "CONSTRAINTS", "constraint", 1);
@@ -6795,6 +6974,7 @@ mod tests {
                 project_path: &baseline_project_path,
                 project_directory: &baseline_project_path,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+                memory_enabled: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
@@ -7355,6 +7535,7 @@ mod tests {
                 project_path: &project_path_string,
                 project_directory: &project_path_string,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+                memory_enabled: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
@@ -7797,6 +7978,7 @@ mod tests {
                 now_ms: 0,
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
+                memory_enabled: true,
             },
             |_| 0,
         )
