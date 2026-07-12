@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { Database } from "@magic-context/core/shared/sqlite";
 import { parse as parseJsonc } from "comment-json";
+import { openExistingContextDatabase } from "../lib/database-access";
 import type { PiDiagnosticReport } from "../lib/diagnostics-pi";
 import type { PromptIO, PromptSpinner, SelectOption } from "../lib/prompts";
 import { parseDoctorArgs, type RunDoctorOptions, runDoctor } from "./doctor-pi";
@@ -172,11 +173,11 @@ function baseOptions(root: string, cwd: string, prompts: MockPrompts): RunDoctor
             }),
             getPiVersion: () => "0.74.0",
             getLatestNpmVersion: () => "0.1.0",
+            openExistingContextDatabase: () => createMockDb(),
             openDatabase: () => {
                 currentDb = createMockDb();
                 return currentDb;
             },
-            isDatabasePersisted: () => true,
             closeDatabase: () => currentDb?.close(),
             now: () => new Date("2026-04-28T12:34:56Z"),
             execFileSync: () => {
@@ -236,6 +237,45 @@ describe("Pi doctor", () => {
         expect(output).toContain("PASS SQLite integrity_check: ok");
         expect(output).toContain("Summary: PASS");
         expect(output).toContain("FAIL 0");
+    });
+
+    it("leaves an older supported shared DB schema unchanged", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        const dbPath = join(root, ".local", "share", "cortexkit", "magic-context", "context.db");
+        rmSync(dbPath);
+        const fixture = new Database(dbPath);
+        fixture.exec(`
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+            INSERT INTO schema_migrations(version) VALUES (50);
+            CREATE TABLE tags (id INTEGER);
+            CREATE TABLE compartments (id INTEGER);
+            CREATE TABLE memories (id INTEGER);
+            CREATE TABLE notes (id INTEGER);
+            CREATE TABLE dream_runs (id INTEGER);
+        `);
+        fixture.close();
+        if (!options.deps) throw new Error("expected doctor dependencies");
+        options.deps.openExistingContextDatabase = openExistingContextDatabase;
+
+        const code = await runDoctor(options);
+
+        expect(code).toBe(0);
+        const reopened = new Database(dbPath);
+        const version = reopened
+            .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+            .get() as {
+            version: number;
+        };
+        reopened.close();
+        expect(version.version).toBe(50);
+        expect(prompts.messages.join("\n")).toContain(
+            "PASS Opened the shared DB read-only with a supported schema",
+        );
     });
 
     it("warns when the local onnxruntime native binding is absent", async () => {

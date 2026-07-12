@@ -258,6 +258,54 @@ describe("migrateOpenCodeSessionToPi", () => {
         expect(JSON.stringify(entries)).not.toContain("step-finish");
     });
 
+    it("chunks part lookups below conservative SQLite bind limits", () => {
+        const db = makeDb();
+        const sessionId = "ses_many_messages";
+        db.prepare(
+            "INSERT INTO session (id, title, directory, path, time_created) VALUES (?, ?, ?, ?, ?)",
+        ).run(sessionId, "Large", "/tmp/large", null, 1);
+        const insertMessage = db.prepare(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+        );
+        const insertPart = db.prepare(
+            "INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)",
+        );
+        db.transaction(() => {
+            for (let index = 0; index < 1001; index++) {
+                const messageId = `msg_${index.toString().padStart(4, "0")}`;
+                insertMessage.run(messageId, sessionId, index, JSON.stringify({ role: "user" }));
+                insertPart.run(
+                    `part_${index.toString().padStart(4, "0")}`,
+                    messageId,
+                    sessionId,
+                    index,
+                    JSON.stringify({ type: "text", text: `message ${index}` }),
+                );
+            }
+        })();
+        const limitedDb = {
+            prepare(sql: string) {
+                const bindCount = (sql.match(/\?/g) ?? []).length;
+                if (bindCount > 999) throw new Error("too many SQL variables");
+                return db.prepare(sql);
+            },
+            exec: (sql: string) => db.exec(sql),
+            close: () => db.close(),
+        };
+
+        const result = migrateOpenCodeSessionToPi({
+            db: limitedDb as never,
+            cortexkitDb: null,
+            sessionId,
+            piSessionsRoot: tempDir(),
+            now: new Date("2026-04-30T11:46:47.422Z"),
+            dryRun: true,
+        });
+
+        expect(result.sourceMessageCount).toBe(1001);
+        expect(result.messageCount).toBe(1002);
+    });
+
     it("limits to the most recent N source messages in chronological order", () => {
         const db = makeDb();
         const { sessionId } = insertSyntheticSession(db);

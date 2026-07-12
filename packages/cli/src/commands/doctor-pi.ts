@@ -17,17 +17,18 @@ import {
 import {
     type ContextDatabase,
     closeDatabase,
-    isDatabasePersisted,
     openDatabase,
 } from "@magic-context/core/features/magic-context/storage";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
     hasUserConfigLocationMigrationRefusal,
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
+import { openExistingContextDatabase } from "../lib/database-access";
 import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
     checkLocalEmbeddingRuntimeByResolution,
@@ -95,8 +96,8 @@ interface DoctorDeps {
     getLatestNpmVersion: () => string | null;
     selfVersion: () => string;
     probeEmbeddingEndpoint: typeof probeEmbeddingEndpoint;
+    openExistingContextDatabase: typeof openExistingContextDatabase;
     openDatabase: typeof openDatabase;
-    isDatabasePersisted: typeof isDatabasePersisted;
     closeDatabase: typeof closeDatabase;
     now: () => Date;
     execFileSync: typeof execFileSync;
@@ -120,8 +121,8 @@ const DEFAULT_DEPS: DoctorDeps = {
     getLatestNpmVersion: () => getLatestNpmVersion(PACKAGE_NAME),
     selfVersion,
     probeEmbeddingEndpoint,
+    openExistingContextDatabase,
     openDatabase,
-    isDatabasePersisted,
     closeDatabase,
     now: () => new Date(),
     execFileSync,
@@ -580,53 +581,43 @@ async function runHealthChecks(options: {
             `Shared context DB not found yet at ${dbPath}; runtime will create it`,
         );
 
-    let db: ContextDatabase | null = null;
-    try {
-        db = options.deps.openDatabase();
-        if (!db) {
-            // openDatabase() returns null on the schema fence (shared DB newer
-            // than this binary supports). Report and skip DB-dependent checks;
-            // the embedding checks below do not need the DB handle.
+    if (existedBeforeOpen) {
+        let db: ContextDatabase | null = null;
+        try {
+            // Doctor must observe the installed runtime's schema without migrating it.
+            // The existing-only readonly helper applies the schema fence before queries.
+            db = options.deps.openExistingContextDatabase(dbPath, { readonly: true });
+            if (!db) {
+                add(results, "fail", `Shared context DB no longer exists at ${dbPath}`);
+            } else {
+                add(results, "pass", "Opened the shared DB read-only with a supported schema");
+
+                const integrity = db.prepare("PRAGMA integrity_check").get() as {
+                    integrity_check?: unknown;
+                };
+                if (integrity?.integrity_check === "ok")
+                    add(results, "pass", "SQLite integrity_check: ok");
+                else
+                    add(
+                        results,
+                        "fail",
+                        `SQLite integrity_check: ${String(integrity?.integrity_check ?? "unknown")}`,
+                    );
+
+                const counts = ROW_COUNT_TABLES.map(
+                    (table) => `${table}=${countTable(db as ContextDatabase, table) ?? "n/a"}`,
+                ).join(", ");
+                add(results, "info", `Shared DB row counts: ${counts}`);
+            }
+        } catch (error) {
             add(
                 results,
                 "fail",
-                "openDatabase() returned no handle; the shared DB schema is newer than this binary supports (upgrade Magic Context)",
+                `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}`,
             );
-        } else {
-            if (options.deps.isDatabasePersisted(db))
-                add(results, "pass", "openDatabase() opened the shared DB");
-            else
-                add(
-                    results,
-                    "fail",
-                    "openDatabase() fell back to an in-memory DB; shared DB is broken or unwritable",
-                );
-
-            const integrity = db.prepare("PRAGMA integrity_check").get() as {
-                integrity_check?: unknown;
-            };
-            if (integrity?.integrity_check === "ok")
-                add(results, "pass", "SQLite integrity_check: ok");
-            else
-                add(
-                    results,
-                    "fail",
-                    `SQLite integrity_check: ${String(integrity?.integrity_check ?? "unknown")}`,
-                );
-
-            const counts = ROW_COUNT_TABLES.map(
-                (table) => `${table}=${countTable(db as ContextDatabase, table) ?? "n/a"}`,
-            ).join(", ");
-            add(results, "info", `Shared DB row counts: ${counts}`);
+        } finally {
+            db?.close();
         }
-    } catch (error) {
-        add(
-            results,
-            "fail",
-            `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}`,
-        );
-    } finally {
-        options.deps.closeDatabase();
     }
 
     // Read user config (tokens expand) and project config (tokens stay literal —

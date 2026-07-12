@@ -168,6 +168,7 @@ const DEFAULT_PROVIDER = "openai-codex";
 const DEFAULT_MODEL = "gpt-5.5";
 const MIGRATION_COMPACTION_SUMMARY =
     "Magic Context compacted prior conversation. See <session-history> block for the structured summary.";
+const PART_LOOKUP_CHUNK_SIZE = 900;
 
 function defaultOpenCodeDbPath(): string {
     return getOpenCodeDatabasePath();
@@ -594,12 +595,24 @@ function fetchRows(db: DatabaseLike, sessionId: string, maxMessages: number | un
         ).all(...params);
         const messages = newestFirst.reverse();
         const ids = messages.map((row) => row.id);
-        const parts = ids.length
-            ? stmt<OpenCodePartRow>(
-                  db,
-                  `SELECT id, message_id, time_created, data FROM part WHERE message_id IN (${ids.map(() => "?").join(",")}) ORDER BY time_created, id`,
-              ).all(...ids)
-            : [];
+        const parts: OpenCodePartRow[] = [];
+        // Keep every lookup inside this deferred transaction while bounding each
+        // IN list below SQLite's conservative 999-variable configurations.
+        for (let offset = 0; offset < ids.length; offset += PART_LOOKUP_CHUNK_SIZE) {
+            const chunk = ids.slice(offset, offset + PART_LOOKUP_CHUNK_SIZE);
+            parts.push(
+                ...stmt<OpenCodePartRow>(
+                    db,
+                    `SELECT id, message_id, time_created, data FROM part WHERE message_id IN (${chunk.map(() => "?").join(",")})`,
+                ).all(...chunk),
+            );
+        }
+        parts.sort((left, right) => {
+            if (left.time_created !== right.time_created) {
+                return left.time_created - right.time_created;
+            }
+            return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+        });
 
         db.exec("COMMIT");
         return { session, sourceMessageCount, messages, parts };

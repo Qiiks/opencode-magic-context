@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { parse as parseJsonc } from "comment-json";
 import {
     addPluginToOpenCodeConfig,
+    addPluginToTuiConfig,
     findDcpPluginIndexes,
     writeMagicContextConfig,
 } from "./setup-opencode";
@@ -38,6 +39,27 @@ describe("setup-opencode config safety", () => {
             }),
         ).toThrow(`Refusing to overwrite unparseable config ${path}`);
         expect(readFileSync(path, "utf-8")).toBe(malformed);
+    });
+
+    it("re-detects targets created after discovery and merges them", () => {
+        const root = tempDir();
+        const opencodePath = join(root, "opencode.jsonc");
+        const tuiPath = join(root, "tui.jsonc");
+        writeFileSync(opencodePath, `{"theme":"dark","plugin":["other"]}`);
+        writeFileSync(tuiPath, `{"layout":"wide","plugin":["other-tui"]}`);
+
+        // "none" is the stale pre-prompt detection result.
+        addPluginToOpenCodeConfig(opencodePath, "none");
+        addPluginToTuiConfig(tuiPath, "none");
+
+        expect(parseJsonc(readFileSync(opencodePath, "utf-8"))).toMatchObject({
+            theme: "dark",
+            plugin: ["other", "@cortexkit/opencode-magic-context@latest"],
+        });
+        expect(parseJsonc(readFileSync(tuiPath, "utf-8"))).toMatchObject({
+            layout: "wide",
+            plugin: ["other-tui", "@cortexkit/opencode-magic-context@latest"],
+        });
     });
 
     it("creates a missing config and merges a valid config", () => {
