@@ -224,6 +224,10 @@ describe("context overflow recovery", () => {
             );
             expect(afterOverflow.detected_context_limit).toBe(120000);
 
+            const recoveryWasPendingBeforeFollowup =
+                (readState().needs_emergency_recovery ?? 0) === 1;
+            const mainCallsBeforeFollowup = mainCalls;
+
             // Drive the recovery turn. On opencode >=1.16 this is the pass that
             // bumps to 95% and fires the emergency historian; on <=1.15 recovery
             // already completed in-turn and this is just a normal follow-up (the
@@ -237,6 +241,12 @@ describe("context overflow recovery", () => {
             } catch {
                 // tolerated — recovery is asserted via persisted state, not the
                 // prompt's own resolution.
+            }
+            if (recoveryWasPendingBeforeFollowup) {
+                // The fail-closed transform must interrupt the run before OpenCode
+                // emits another doomed main-model request. Historian traffic is
+                // counted separately by the matcher above.
+                expect(mainCalls).toBe(mainCallsBeforeFollowup);
             }
 
             // Wait for the recovery cycle to complete. End state evidence:

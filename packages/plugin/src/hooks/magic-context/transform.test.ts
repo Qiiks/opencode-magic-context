@@ -38,6 +38,7 @@ import {
     updateTagStatus,
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
+import { recordToolDefinition } from "../../features/magic-context/tool-definition-tokens";
 import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
@@ -2343,7 +2344,7 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         liveModel: { providerID: string; modelID: string },
         usage: { percentage: number; inputTokens: number },
     ) {
-        const abort = mock(async () => ({}));
+        const abort = mock(async () => ({ data: true }));
         const prompt = mock(async () => ({}));
         const liveModelBySession = new Map([[sessionId, liveModel]]);
         const transform = createTransform({
@@ -2590,7 +2591,7 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
 });
 
 describe("createTransform historian failure handling", () => {
-    it("lets an armed empty-head emergency proceed after the bounded no-head escape", async () => {
+    it("fails closed until the bounded no-head escape lowers synthetic pressure", async () => {
         useTempDataHome("transform-empty-head-escape-");
         createOpenCodeDbForTransform("ses-empty-head-escape", [
             { id: "m-raw-1", role: "user", text: "recent 1" },
@@ -2601,7 +2602,7 @@ describe("createTransform historian failure handling", () => {
         incrementHistorianFailure(db, "ses-empty-head-escape", "historian failed");
         recordOverflowDetected(db, "ses-empty-head-escape", 8_000);
 
-        const abort = mock(async () => ({}));
+        const abort = mock(async () => ({ data: true }));
         const prompt = mock(async () => ({}));
         const transform = createTransform({
             tagger: createTagger(),
@@ -2641,13 +2642,13 @@ describe("createTransform historian failure handling", () => {
         }
         await new Promise((resolve) => setTimeout(resolve, 0));
 
-        expect(abort).not.toHaveBeenCalled();
+        expect(abort).toHaveBeenCalledTimes(2);
         expect(loadProtectedTailMeta(db, "ses-empty-head-escape").recoveryNoEligibleHeadCount).toBe(
             2,
         );
     });
 
-    it("does not permanently abort a genuinely >=95% armed empty head", async () => {
+    it("keeps failing closed at real >=95% pressure after the no-head escape", async () => {
         useTempDataHome("transform-empty-head-escape-95-");
         createOpenCodeDbForTransform("ses-empty-head-escape-95", [
             { id: "m-raw-1", role: "user", text: "recent 1" },
@@ -2658,7 +2659,7 @@ describe("createTransform historian failure handling", () => {
         incrementHistorianFailure(db, "ses-empty-head-escape-95", "historian failed");
         recordOverflowDetected(db, "ses-empty-head-escape-95", 8_000);
 
-        const abort = mock(async () => ({}));
+        const abort = mock(async () => ({ data: true }));
         const transform = createTransform({
             tagger: createTagger(),
             scheduler: { shouldExecute: mock(() => "defer" as const) },
@@ -2699,7 +2700,7 @@ describe("createTransform historian failure handling", () => {
         }
         await new Promise((resolve) => setTimeout(resolve, 0));
 
-        expect(abort).not.toHaveBeenCalled();
+        expect(abort).toHaveBeenCalledTimes(3);
         expect(
             loadProtectedTailMeta(db, "ses-empty-head-escape-95").recoveryNoEligibleHeadCount,
         ).toBe(2);
@@ -2807,6 +2808,11 @@ describe("createTransform historian failure handling", () => {
                 }),
             },
         });
+        recordToolDefinition("test-provider", "emergency-100k", "build", "read", "Read a file", {
+            type: "object",
+        });
+        const db = openDatabase();
+        updateSessionMeta(db, sessionId, { systemPromptTokens: 110_000 });
         const order: string[] = [];
         const prompt = mock(async () => {
             order.push("notify");
@@ -2814,7 +2820,7 @@ describe("createTransform historian failure handling", () => {
         });
         const abort = mock(async () => {
             order.push("abort");
-            return {};
+            return { data: true };
         });
         const client = {
             session: {
@@ -2835,7 +2841,7 @@ describe("createTransform historian failure handling", () => {
                     },
                 ],
             ]),
-            db: openDatabase(),
+            db,
             historyRefreshSessions: new Set<string>(),
             pendingMaterializationSessions: new Set<string>(),
             lastHeuristicsTurnId: new Map<string, string>(),
@@ -2876,6 +2882,10 @@ describe("createTransform historian failure handling", () => {
         );
 
         expect(order).toEqual(["notify", "abort"]);
+        expect(abort).toHaveBeenCalledWith({
+            path: { id: sessionId },
+            throwOnError: true,
+        });
         const notificationInput = prompt.mock.calls[0]?.[0] as {
             body?: { parts?: Array<{ text?: string }> };
         };
