@@ -1797,6 +1797,15 @@ impl McHandler {
                 message: "ctx_reduce is not accepted on shadow:<real_session> routes".to_string(),
             };
         }
+        let command_id = match command_id_from_agent_drops_request(&request) {
+            Ok(command_id) => command_id,
+            Err(message) => {
+                return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message,
+                }
+            }
+        };
         let mut drop_ids = drop_ids_from_command(&request);
         // Raw-string form ("1-3", "§1§,99"): canonicalize server-side with the same
         // parser the MCP facade uses, so range/§ syntax is owned here and consumers
@@ -1834,11 +1843,19 @@ impl McHandler {
             drop_ids.sort();
             drop_ids.dedup();
         }
-        if drop_ids.is_empty() {
+        if drop_ids.is_empty() && command_id.is_none() {
             return respond(json!({ "ok": true, "queued": 0 }));
         }
-        match store.append_pending_agent_drops(session_id, &drop_ids, now_ms()) {
-            Ok(queued) => respond(json!({ "ok": true, "queued": queued })),
+        match store.append_pending_agent_drops_with_command(
+            session_id,
+            command_id.as_deref(),
+            &drop_ids,
+            now_ms(),
+        ) {
+            Ok(outcome) if outcome.duplicate => {
+                respond(json!({ "ok": true, "queued": 0, "duplicate": true }))
+            }
+            Ok(outcome) => respond(json!({ "ok": true, "queued": outcome.queued })),
             Err(e) => HandlerOutcome::Error {
                 code: "store_write_failed".to_string(),
                 message: e.to_string(),
@@ -3385,6 +3402,7 @@ fn store_unavailable_error() -> HandlerOutcome {
 }
 
 const MAX_FACADE_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_AGENT_DROPS_COMMAND_ID_BYTES: usize = 128;
 const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_NOTE_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_SHORT_FIELD_BYTES: usize = 4 * 1024;
@@ -3797,6 +3815,25 @@ fn drop_ids_from_command(request: &Value) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+fn command_id_from_agent_drops_request(request: &Value) -> Result<Option<String>, String> {
+    let Some(value) = request.get("command_id") else {
+        return Ok(None);
+    };
+    let Some(command_id) = value.as_str() else {
+        return Err("'command_id' must be a string".to_string());
+    };
+    let command_id = command_id.trim();
+    if command_id.is_empty() {
+        return Err("'command_id' must not be empty".to_string());
+    }
+    if command_id.len() > MAX_AGENT_DROPS_COMMAND_ID_BYTES {
+        return Err(format!(
+            "'command_id' exceeds the {MAX_AGENT_DROPS_COMMAND_ID_BYTES}-byte limit"
+        ));
+    }
+    Ok(Some(command_id.to_string()))
 }
 
 fn is_shadow_session(session_id: &str) -> bool {
@@ -6724,6 +6761,21 @@ mod tests {
         }
     }
 
+    fn queue_drop_command_with_id(handler: &McHandler, target_id: &str, command_id: &str) -> Value {
+        match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "kind": "ctx_reduce",
+                "session_id": "ses",
+                "drop_ids": [target_id],
+                "command_id": command_id,
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        }
+    }
+
     fn historian_output_for_prompt(prompt: &str) -> String {
         let (start, end) = prompt_ordinal_range(prompt).unwrap_or((1, 3));
         historian_output(start, end, "autonomous summary")
@@ -6898,18 +6950,72 @@ mod tests {
         assert!(m0_text(&second).contains("autonomous summary"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn ctx_reduce_command_appends_and_transform_drains_queue() {
+    #[test]
+    fn ctx_reduce_without_command_id_keeps_drop_ids_response() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
-        let queued = queue_drop_command(&handler, "a#0");
-        assert_eq!(queued["queued"].as_u64(), Some(1));
+
+        let first = queue_drop_command(&handler, "a#0");
+        assert_eq!(first, json!({ "ok": true, "queued": 1 }));
+        let repeat = queue_drop_command(&handler, "a#0");
+        assert_eq!(repeat, json!({ "ok": true, "queued": 0 }));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ctx_reduce_command_id_is_idempotent_while_drops_are_pending() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let first = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        assert_eq!(first, json!({ "ok": true, "queued": 1 }));
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+
+        let retry = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_command_id_survives_transform_drain() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let queued = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        assert_eq!(queued, json!({ "ok": true, "queued": 1 }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
 
         let response = call_transform(&handler, vec![ck("a", 1, "drop me")]).await;
         assert!(serde_json::to_string(&response)
             .unwrap()
             .contains("[dropped]"));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        let retry = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        let new_request = queue_drop_command_with_id(&handler, "a#0", "tool-use-2");
+        assert_eq!(new_request, json!({ "ok": true, "queued": 1 }));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ctx_reduce_command_rejects_empty_and_oversized_command_ids() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        for command_id in [json!(""), json!(" \t "), json!("x".repeat(129))] {
+            let outcome = handler.handle_agent_drops_value(
+                7,
+                json!({
+                    "method": "agent_drops.append",
+                    "session_id": "ses",
+                    "drop_ids": ["a#0"],
+                    "command_id": command_id,
+                }),
+            );
+            assert_eq!(error_code(outcome), "bad_request");
+        }
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
@@ -6951,8 +7057,7 @@ mod tests {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         };
-        assert_eq!(response["ok"], true);
-        assert_eq!(response["queued"].as_u64(), Some(2));
+        assert_eq!(response, json!({ "ok": true, "queued": 2 }));
         let pending = store.load_pending_agent_drops("ses").unwrap();
         assert_eq!(pending.len(), 2);
 
@@ -6968,7 +7073,7 @@ mod tests {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         };
-        assert_eq!(repeat["queued"].as_u64(), Some(0));
+        assert_eq!(repeat, json!({ "ok": true, "queued": 0 }));
 
         // Malformed range syntax is a typed bad_request, nothing partially queued.
         match handler.handle_agent_drops_value(
@@ -6983,6 +7088,53 @@ mod tests {
             other => panic!("expected bad_request, got: {other:?}"),
         }
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ctx_reduce_command_id_works_with_raw_drop_string() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .mint_or_get_tags(
+                "ses",
+                &[TagMintInput {
+                    block_id: "a#0".to_string(),
+                    kind: "tool_result".to_string(),
+                    token_count: 10,
+                    source_bytes: b"one".to_vec(),
+                }],
+                1_000,
+            )
+            .unwrap();
+
+        let first = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1-3",
+                "command_id": " tool-use-raw ",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(first, json!({ "ok": true, "queued": 1 }));
+
+        let retry = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1-3",
+                "command_id": "tool-use-raw",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

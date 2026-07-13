@@ -358,6 +358,7 @@ pub const SHADOW_SESSION_PREFIX: &str = "shadow:";
 const NO_ROW: i64 = -1;
 const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
 const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
+const MAX_REDUCE_COMMAND_LEDGER_ROWS_PER_SESSION: i64 = 512;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -722,6 +723,21 @@ const MIGRATIONS: &[Migration] = &[
         // from forgeable tag syntax.
         statements: "
         ALTER TABLE mc_tags ADD COLUMN source_bytes BLOB NOT NULL DEFAULT X'';
+    ",
+    },
+    Migration {
+        version: 16,
+        // Command ids survive queue consumption so a response-loss retry cannot reapply a
+        // ctx_reduce request after its original drops have drained.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_reduce_command_ledger (
+            session_id   TEXT NOT NULL,
+            command_id   TEXT NOT NULL,
+            queued_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (session_id, command_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_reduce_command_ledger_session_newest
+            ON mc_reduce_command_ledger(session_id, queued_at_ms DESC, command_id DESC);
     ",
     },
 ];
@@ -1288,6 +1304,12 @@ pub struct PendingAgentDrop {
     pub id: i64,
     pub target_id: String,
     pub queued_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendOutcome {
+    pub queued: u64,
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1987,22 +2009,76 @@ impl McStore {
         target_ids: &[String],
         queued_at_ms: i64,
     ) -> Result<usize, McStoreError> {
-        let mut inserted = 0usize;
-        self.inner.with_conn_fenced(|tx| {
+        let outcome = self.append_pending_agent_drops_with_command(
+            session_id,
+            None,
+            target_ids,
+            queued_at_ms,
+        )?;
+        Ok(outcome.queued as usize)
+    }
+
+    /// Append ctx_reduce drops and, when supplied, durably record the command that requested
+    /// them. A repeated command is acknowledged without touching pending queue rows.
+    pub fn append_pending_agent_drops_with_command(
+        &self,
+        session_id: &str,
+        command_id: Option<&str>,
+        target_ids: &[String],
+        queued_at_ms: i64,
+    ) -> Result<AppendOutcome, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            if let Some(command_id) = command_id {
+                let recorded = tx.execute(
+                    "INSERT OR IGNORE INTO mc_reduce_command_ledger
+                         (session_id, command_id, queued_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![session_id, command_id, queued_at_ms],
+                )?;
+                if recorded == 0 {
+                    return Ok(AppendOutcome {
+                        queued: 0,
+                        duplicate: true,
+                    });
+                }
+            }
+
+            let mut queued = 0u64;
             for target_id in target_ids {
                 let target_id = target_id.trim();
                 if target_id.is_empty() {
                     continue;
                 }
-                inserted += tx.execute(
+                queued += tx.execute(
                     "INSERT OR IGNORE INTO pending_agent_drops (session_id, target_id, queued_at)
                      VALUES (?1, ?2, ?3)",
                     params![session_id, target_id, queued_at_ms],
+                )? as u64;
+            }
+
+            if command_id.is_some() {
+                // Command ids break timestamp ties so pruning is stable even when several
+                // requests arrive within the same millisecond.
+                tx.execute(
+                    "DELETE FROM mc_reduce_command_ledger
+                     WHERE session_id = ?1
+                       AND command_id NOT IN (
+                           SELECT command_id
+                           FROM mc_reduce_command_ledger
+                           WHERE session_id = ?1
+                           ORDER BY queued_at_ms DESC, command_id DESC
+                           LIMIT ?2
+                       )",
+                    params![session_id, MAX_REDUCE_COMMAND_LEDGER_ROWS_PER_SESSION],
                 )?;
             }
-            Ok(())
+
+            Ok(AppendOutcome {
+                queued,
+                duplicate: false,
+            })
         })?;
-        Ok(inserted)
+        Ok(outcome)
     }
 
     /// Load queued ctx_reduce drops in the deterministic drain order.
@@ -2454,6 +2530,10 @@ impl McStore {
             )?;
             tx.execute(
                 "DELETE FROM pending_agent_drops WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_reduce_command_ledger WHERE session_id = ?1",
                 params![session_id],
             )?;
             tx.execute(
@@ -5203,6 +5283,26 @@ mod tests {
         }
     }
 
+    fn command_ledger_ids(store: &McStore, session_id: &str) -> Vec<String> {
+        store
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT command_id
+                     FROM mc_reduce_command_ledger
+                     WHERE session_id = ?1
+                     ORDER BY queued_at_ms ASC, command_id ASC",
+                )?;
+                let rows = statement.query_map(params![session_id], |row| row.get(0))?;
+                let mut command_ids = Vec::new();
+                for row in rows {
+                    command_ids.push(row?);
+                }
+                Ok(command_ids)
+            })
+            .unwrap()
+    }
+
     fn insert_input<'a>(
         project_path: &'a str,
         category: &'a str,
@@ -5339,6 +5439,207 @@ mod tests {
             .commit_with_consumed_drops("ses", None, &core, &meta, &[queued[0].id], None)
             .unwrap();
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        assert!(command_ledger_ids(&store, "ses").is_empty());
+    }
+
+    #[test]
+    fn command_id_duplicate_is_recognized_while_drops_are_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let target_ids = vec!["a#0".to_string()];
+
+        let first = store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .unwrap();
+        assert_eq!(
+            first,
+            AppendOutcome {
+                queued: 1,
+                duplicate: false,
+            }
+        );
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+
+        let retry = store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2)
+            .unwrap();
+        assert_eq!(
+            retry,
+            AppendOutcome {
+                queued: 0,
+                duplicate: true,
+            }
+        );
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
+        assert_eq!(command_ledger_ids(&store, "ses"), vec!["tool-use-1"]);
+    }
+
+    #[test]
+    fn command_id_duplicate_survives_consumption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let target_ids = vec!["a#0".to_string()];
+        store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .unwrap();
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+        store
+            .commit_with_consumed_drops(
+                "ses",
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+                &[pending[0].id],
+                None,
+            )
+            .unwrap();
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        let retry = store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2)
+            .unwrap();
+        assert_eq!(
+            retry,
+            AppendOutcome {
+                queued: 0,
+                duplicate: true,
+            }
+        );
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn different_command_id_requeues_after_consumption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let target_ids = vec!["a#0".to_string()];
+        store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .unwrap();
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+        store
+            .commit_with_consumed_drops(
+                "ses",
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+                &[pending[0].id],
+                None,
+            )
+            .unwrap();
+
+        let next = store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-2"), &target_ids, 2)
+            .unwrap();
+        assert_eq!(
+            next,
+            AppendOutcome {
+                queued: 1,
+                duplicate: false,
+            }
+        );
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_command_append_rolls_back_ledger_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_pending_agent_drop
+                     BEFORE INSERT ON pending_agent_drops
+                     BEGIN
+                         SELECT RAISE(ABORT, 'forced pending append failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let target_ids = vec!["a#0".to_string()];
+
+        assert!(store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .is_err());
+        assert!(command_ledger_ids(&store, "ses").is_empty());
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_pending_agent_drop")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2)
+                .unwrap(),
+            AppendOutcome {
+                queued: 1,
+                duplicate: false,
+            }
+        );
+    }
+
+    #[test]
+    fn command_id_ledger_retains_the_newest_512_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let target_ids = vec!["a#0".to_string()];
+
+        for queued_at_ms in 0..513i64 {
+            let command_id = format!("command-{queued_at_ms:03}");
+            let outcome = store
+                .append_pending_agent_drops_with_command(
+                    "ses",
+                    Some(&command_id),
+                    &target_ids,
+                    queued_at_ms,
+                )
+                .unwrap();
+            assert!(!outcome.duplicate);
+        }
+
+        let command_ids = command_ledger_ids(&store, "ses");
+        assert_eq!(command_ids.len(), 512);
+        assert_eq!(command_ids.first().map(String::as_str), Some("command-001"));
+        assert_eq!(command_ids.last().map(String::as_str), Some("command-512"));
+        assert!(!command_ids.iter().any(|id| id == "command-000"));
+
+        let pruned_retry = store
+            .append_pending_agent_drops_with_command("ses", Some("command-000"), &target_ids, 513)
+            .unwrap();
+        assert!(!pruned_retry.duplicate);
+    }
+
+    #[test]
+    fn reset_shadow_session_clears_command_ledger_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let session_id = "shadow:cleanup";
+        let target_ids = vec!["a#0".to_string()];
+        store
+            .append_pending_agent_drops_with_command(session_id, Some("tool-use-1"), &target_ids, 1)
+            .unwrap();
+        store.reset_shadow_session(session_id, session_id).unwrap();
+
+        assert_eq!(
+            store
+                .append_pending_agent_drops_with_command(
+                    session_id,
+                    Some("tool-use-1"),
+                    &target_ids,
+                    2,
+                )
+                .unwrap(),
+            AppendOutcome {
+                queued: 1,
+                duplicate: false,
+            }
+        );
     }
 
     #[test]
