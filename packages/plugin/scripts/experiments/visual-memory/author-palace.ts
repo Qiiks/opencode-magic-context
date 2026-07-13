@@ -17,15 +17,31 @@ const BAND_GROUPS: ReadonlyArray<ReadonlyArray<(typeof CATEGORY_ORDER)[number]>>
     ["CONFIG_VALUES"],
     ["NAMING", "KNOWN_ISSUES"],
 ];
-const COLUMN_COUNT = 3;
-const ROOM_WIDTH = 72;
+const LAYOUT_FONT =
+    process.env.PALACE_LAYOUT_FONT === "jetbrains-mono-10" ? "jetbrains-mono-10" : "spleen-5x8";
+const CELL_WIDTH = LAYOUT_FONT === "jetbrains-mono-10" ? 6 : 5;
+const CELL_HEIGHT = LAYOUT_FONT === "jetbrains-mono-10" ? 11 : 8;
+const COLUMN_COUNT = LAYOUT_FONT === "jetbrains-mono-10" ? 2 : 3;
 const COLUMN_GAP = 1;
-const PAGE_ROW_CAPACITY = 136;
+const PAGE_WIDTH_PIXELS = 1_092;
+const PAGE_HEIGHT_PIXELS = 1_092;
+const ROOM_WIDTH = Math.floor(
+    (Math.floor(PAGE_WIDTH_PIXELS / CELL_WIDTH) - (COLUMN_COUNT - 1) * COLUMN_GAP) / COLUMN_COUNT,
+);
+const BANNER_HEIGHT_PIXELS = CELL_HEIGHT;
+const BODY_LINE_PITCH = CELL_HEIGHT + 1;
 const PAGE_WIDTH_CHARS = COLUMN_COUNT * ROOM_WIDTH;
 const MAX_LINE_CHARS = PAGE_WIDTH_CHARS + (COLUMN_COUNT - 1) * COLUMN_GAP;
 const MAX_PALACE_CHARS = 70_000;
 const SOURCE_PATH = "/tmp/visual-memory/trimmed-memories-source.txt";
 const HERE = dirname(fileURLToPath(import.meta.url));
+const ALTERNATE_LAYOUT = LAYOUT_FONT === "jetbrains-mono-10";
+const PALACE_OUTPUT = ALTERNATE_LAYOUT
+    ? "/tmp/visual-memory/palace-jb-layout.txt"
+    : join(HERE, "palace.txt");
+const COVERAGE_OUTPUT = ALTERNATE_LAYOUT
+    ? "/tmp/visual-memory/coverage-jb-layout.json"
+    : join(HERE, "coverage.json");
 
 type Category = (typeof CATEGORY_ORDER)[number];
 type SpecEntry = {
@@ -59,30 +75,43 @@ type RoomSummary = {
     endLine: number;
     heightCells: number;
     sharedPairCount: number;
+    continuation: boolean;
+    segment: number;
     page: number;
     pageLine: number;
+    pageTopPixels: number;
+    heightPixels: number;
 };
 type LayoutItem = {
     kind: "category" | "room";
     category: Category;
     categories?: Category[];
     room?: string;
+    continuation?: boolean;
+    segment?: number;
     column: number;
     startLine: number;
     endLine: number;
     page: number;
     pageLine: number;
+    pageTopPixels: number;
+    heightPixels: number;
 };
 
 type Box = {
     category: Category;
     name: string;
     lines: string[];
+    bodyLines: string[];
+    entryBodyLines: Map<number, number>;
     relativeLines: Map<number, number>;
     entries: SpecEntry[];
     merges: SpecEntry[];
     peakImportance: number;
     sharedPairCount: number;
+    continuation: boolean;
+    segment: number;
+    heightPixels: number;
 };
 
 function codepoints(value: string): number {
@@ -336,6 +365,38 @@ function appendEntry(body: string[], cue: string, width: number): number {
     return placement;
 }
 
+function frameBox(
+    name: string,
+    bodyLines: string[],
+    peakImportance: number,
+    continuation: boolean,
+): string[] {
+    const innerWidth = ROOM_WIDTH - 2;
+    const high = peakImportance >= 70;
+    const [tl, fill, tr, side, bl, br] = high
+        ? ["╔", "═", "╗", "║", "╚", "╝"]
+        : ["┌", "─", "┐", "│", "└", "┘"];
+    const bottom = `${bl}${fill.repeat(innerWidth)}${br}`;
+    if (continuation) {
+        const marker = " … ";
+        const remaining = innerWidth - codepoints(marker);
+        const top = `${tl}${fill.repeat(Math.floor(remaining / 2))}${marker}${fill.repeat(Math.ceil(remaining / 2))}${tr}`;
+        return [
+            top,
+            ...bodyLines.map((line) => `${side}${line.padEnd(innerWidth)}${side}`),
+            bottom,
+        ];
+    }
+    const titlePadding = innerWidth - codepoints(name);
+    const title = `${" ".repeat(Math.floor(titlePadding / 2))}${name}${" ".repeat(Math.ceil(titlePadding / 2))}`;
+    return [
+        `${tl}${fill.repeat(innerWidth)}${tr}`,
+        `${side}${title}${side}`,
+        ...bodyLines.map((line) => `${side}${line.padEnd(innerWidth)}${side}`),
+        bottom,
+    ];
+}
+
 function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Box {
     const entries = allEntries
         .filter((entry) => entry.mergeInto === undefined)
@@ -352,8 +413,8 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
         throw new Error(`2x room title ${name} exceeds ${innerWidth} cells`);
     }
 
-    const body: string[] = [];
-    const relativeLines = new Map<number, number>();
+    const bodyLines: string[] = [];
+    const entryBodyLines = new Map<number, number>();
     const shortEntryLimit = Math.floor((innerWidth - 4) / 2);
     let sharedPairCount = 0;
     for (let index = 0; index < entries.length; index++) {
@@ -371,15 +432,22 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
             codepoints(nextCue) <= shortEntryLimit &&
             codepoints(shared) <= innerWidth
         ) {
-            const bodyLine = body.length;
-            body.push(shared);
-            relativeLines.set(entry.id, bodyLine + 2);
-            relativeLines.set(next.id, bodyLine + 2);
+            const bodyLine = bodyLines.length;
+            bodyLines.push(shared);
+            entryBodyLines.set(entry.id, bodyLine);
+            entryBodyLines.set(next.id, bodyLine);
             sharedPairCount++;
             index++;
             continue;
         }
-        const bodyLine = appendEntry(body, cue, innerWidth);
+        const bodyLine = appendEntry(bodyLines, cue, innerWidth);
+        entryBodyLines.set(entry.id, bodyLine);
+    }
+    const peakImportance = Math.max(...allEntries.map((entry) => entry.importance));
+    const relativeLines = new Map<number, number>();
+    for (const entry of entries) {
+        const bodyLine = entryBodyLines.get(entry.id);
+        if (bodyLine === undefined) throw new Error(`body line missing for ${entry.id}`);
         relativeLines.set(entry.id, bodyLine + 2);
     }
     for (const merge of merges) {
@@ -388,30 +456,86 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
         if (targetLine === undefined) throw new Error(`merge target line missing for ${merge.id}`);
         relativeLines.set(merge.id, targetLine);
     }
-
-    const peakImportance = Math.max(...allEntries.map((entry) => entry.importance));
-    const high = peakImportance >= 70;
-    const [tl, fill, tr, side, bl, br] = high
-        ? ["╔", "═", "╗", "║", "╚", "╝"]
-        : ["┌", "─", "┐", "│", "└", "┘"];
-    const titlePadding = innerWidth - codepoints(name);
-    const title = `${" ".repeat(Math.floor(titlePadding / 2))}${name}${" ".repeat(Math.ceil(titlePadding / 2))}`;
-    const lines = [
-        `${tl}${fill.repeat(innerWidth)}${tr}`,
-        `${side}${title}${side}`,
-        ...body.map((line) => `${side}${line.padEnd(innerWidth)}${side}`),
-        `${bl}${fill.repeat(innerWidth)}${br}`,
-    ];
     return {
         category,
         name,
-        lines,
+        lines: frameBox(name, bodyLines, peakImportance, false),
+        bodyLines,
+        entryBodyLines,
         relativeLines,
         entries,
         merges,
         peakImportance,
         sharedPairCount,
+        continuation: false,
+        segment: 0,
+        heightPixels: 3 * CELL_HEIGHT + bodyLines.length * BODY_LINE_PITCH,
     };
+}
+
+function segmentBox(
+    box: Box,
+    start: number,
+    end: number,
+    continuation: boolean,
+    segment: number,
+): Box {
+    const bodyLines = box.bodyLines.slice(start, end);
+    const entries = box.entries.filter((entry) => {
+        const line = box.entryBodyLines.get(entry.id);
+        return line !== undefined && line >= start && line < end;
+    });
+    const entryIds = new Set(entries.map((entry) => entry.id));
+    const merges = box.merges.filter(
+        (merge) => merge.mergeInto !== undefined && entryIds.has(merge.mergeInto),
+    );
+    const entryBodyLines = new Map<number, number>();
+    const relativeLines = new Map<number, number>();
+    const headerLines = continuation ? 1 : 2;
+    for (const entry of entries) {
+        const originalLine = box.entryBodyLines.get(entry.id);
+        if (originalLine === undefined) throw new Error(`split body line missing for ${entry.id}`);
+        const bodyLine = originalLine - start;
+        entryBodyLines.set(entry.id, bodyLine);
+        relativeLines.set(entry.id, bodyLine + headerLines);
+    }
+    for (const merge of merges) {
+        const targetLine =
+            merge.mergeInto === undefined ? undefined : relativeLines.get(merge.mergeInto);
+        if (targetLine === undefined) throw new Error(`split merge target missing for ${merge.id}`);
+        relativeLines.set(merge.id, targetLine);
+    }
+    return {
+        ...box,
+        lines: frameBox(box.name, bodyLines, box.peakImportance, continuation),
+        bodyLines,
+        entryBodyLines,
+        relativeLines,
+        entries,
+        merges,
+        sharedPairCount: entries.length - new Set(entryBodyLines.values()).size,
+        continuation,
+        segment,
+        heightPixels:
+            (continuation ? 2 * CELL_HEIGHT : 3 * CELL_HEIGHT) + bodyLines.length * BODY_LINE_PITCH,
+    };
+}
+
+function splitBox(box: Box): [Box, Box] | undefined {
+    const boundaries = [
+        ...new Set(box.entries.map((entry) => box.entryBodyLines.get(entry.id) ?? 0)),
+    ]
+        .filter((line) => line > 0 && line < box.bodyLines.length)
+        .sort((a, b) => a - b);
+    if (boundaries.length === 0) return undefined;
+    const midpoint = box.bodyLines.length / 2;
+    const boundary = boundaries.reduce((best, candidate) =>
+        Math.abs(candidate - midpoint) < Math.abs(best - midpoint) ? candidate : best,
+    );
+    return [
+        segmentBox(box, 0, boundary, box.continuation, box.segment),
+        segmentBox(box, boundary, box.bodyLines.length, true, box.segment + 1),
+    ];
 }
 
 function renderPalace(specs: SpecEntry[]): {
@@ -419,7 +543,14 @@ function renderPalace(specs: SpecEntry[]): {
     placements: Map<number, Placement>;
     rooms: RoomSummary[];
     layoutItems: LayoutItem[];
-    pages: Array<{ page: number; startLine: number; endLine: number; heightCells: number }>;
+    pages: Array<{
+        page: number;
+        startLine: number;
+        endLine: number;
+        heightCells: number;
+        heightPixels: number;
+    }>;
+    leveling: { gapRowsBefore: number; gapRowsAfter: number; splitCount: number };
 } {
     const grouped = new Map<string, SpecEntry[]>();
     for (const spec of specs) {
@@ -430,15 +561,22 @@ function renderPalace(specs: SpecEntry[]): {
     }
 
     const assignmentFor = (boxes: Box[]): number[] => {
-        let best: { columns: number[]; max: number; range: number } | undefined;
+        let best: { columns: number[]; max: number; range: number; rowRange: number } | undefined;
         const columns = Array<number>(boxes.length).fill(0);
         const heights = Array<number>(COLUMN_COUNT).fill(0);
+        const rowHeights = Array<number>(COLUMN_COUNT).fill(0);
         const visit = (index: number): void => {
             if (index === boxes.length) {
                 const max = Math.max(...heights);
                 const range = max - Math.min(...heights);
-                if (!best || max < best.max || (max === best.max && range < best.range)) {
-                    best = { columns: [...columns], max, range };
+                const rowRange = Math.max(...rowHeights) - Math.min(...rowHeights);
+                if (
+                    !best ||
+                    max < best.max ||
+                    (max === best.max && rowRange < best.rowRange) ||
+                    (max === best.max && rowRange === best.rowRange && range < best.range)
+                ) {
+                    best = { columns: [...columns], max, range, rowRange };
                 }
                 return;
             }
@@ -447,14 +585,73 @@ function renderPalace(specs: SpecEntry[]): {
             const lastColumn = index === 0 ? 1 : COLUMN_COUNT;
             for (let column = 0; column < lastColumn; column++) {
                 columns[index] = column;
-                heights[column] += box.lines.length;
+                heights[column] += box.heightPixels;
+                rowHeights[column] += box.lines.length;
                 if (!best || Math.max(...heights) <= best.max) visit(index + 1);
-                heights[column] -= box.lines.length;
+                heights[column] -= box.heightPixels;
+                rowHeights[column] -= box.lines.length;
             }
         };
         visit(0);
         if (!best) throw new Error("unable to assign masonry band");
         return best.columns;
+    };
+
+    const levelBand = (
+        inputBoxes: Box[],
+        inputAssignment: number[],
+    ): {
+        boxes: Box[];
+        assignment: number[];
+        gapBefore: number;
+        gapAfter: number;
+        splits: number;
+    } => {
+        const boxes = [...inputBoxes];
+        const assignment = [...inputAssignment];
+        const heights = (): number[] => {
+            const result = Array<number>(COLUMN_COUNT).fill(0);
+            for (const [index, box] of boxes.entries())
+                result[assignment[index] ?? 0] += box.lines.length;
+            return result;
+        };
+        const initialHeights = heights();
+        const gapBefore = Math.max(...initialHeights) - Math.min(...initialHeights);
+        let splits = 0;
+        while (splits < COLUMN_COUNT) {
+            const current = heights();
+            const tallest = current.indexOf(Math.max(...current));
+            const shortest = current.indexOf(Math.min(...current));
+            const gap = current[tallest] - current[shortest];
+            if (gap <= 4) break;
+            let splitIndex = -1;
+            for (let index = boxes.length - 1; index >= 0; index--) {
+                if (assignment[index] === tallest) {
+                    splitIndex = index;
+                    break;
+                }
+            }
+            const candidate = splitIndex >= 0 ? boxes[splitIndex] : undefined;
+            const split = candidate ? splitBox(candidate) : undefined;
+            if (!candidate || !split) break;
+            const [first, continuation] = split;
+            const nextHeights = [...current];
+            nextHeights[tallest] += first.lines.length - candidate.lines.length;
+            nextHeights[shortest] += continuation.lines.length;
+            const nextGap = Math.max(...nextHeights) - Math.min(...nextHeights);
+            if (nextGap >= gap) break;
+            boxes.splice(splitIndex, 1, first, continuation);
+            assignment.splice(splitIndex, 1, tallest, shortest);
+            splits++;
+        }
+        const finalHeights = heights();
+        return {
+            boxes,
+            assignment,
+            gapBefore,
+            gapAfter: Math.max(...finalHeights) - Math.min(...finalHeights),
+            splits,
+        };
     };
 
     const subsetForCapacity = (
@@ -469,6 +666,8 @@ function renderPalace(specs: SpecEntry[]): {
                   selectedMax: number;
                   remainderRange: number;
                   selectedHeight: number;
+                  maxRowGap: number;
+                  totalRowGap: number;
               }
             | undefined;
         const limit = 1 << boxes.length;
@@ -481,28 +680,48 @@ function renderPalace(specs: SpecEntry[]): {
                 .filter((box): box is Box => Boolean(box));
             const remainder = boxes.filter((_, index) => (mask & (1 << index)) === 0);
             const columns = assignmentFor(selected);
+            const selectedLeveled = levelBand(selected, columns);
             const selectedHeights = Array<number>(COLUMN_COUNT).fill(0);
-            for (const [index, box] of selected.entries()) {
-                selectedHeights[columns[index] ?? 0] += box.lines.length;
+            for (const [index, box] of selectedLeveled.boxes.entries()) {
+                selectedHeights[selectedLeveled.assignment[index] ?? 0] += box.heightPixels;
             }
             const selectedMax = Math.max(...selectedHeights);
             if (selectedMax > capacity) continue;
             const remainderColumns = assignmentFor(remainder);
+            const remainderLeveled = levelBand(remainder, remainderColumns);
             const remainderHeights = Array<number>(COLUMN_COUNT).fill(0);
-            for (const [index, box] of remainder.entries()) {
-                remainderHeights[remainderColumns[index] ?? 0] += box.lines.length;
+            for (const [index, box] of remainderLeveled.boxes.entries()) {
+                remainderHeights[remainderLeveled.assignment[index] ?? 0] += box.heightPixels;
             }
             const remainderMax = Math.max(...remainderHeights);
             const remainderRange = remainderMax - Math.min(...remainderHeights);
-            const selectedHeight = selected.reduce((total, box) => total + box.lines.length, 0);
+            const selectedHeight = selectedLeveled.boxes.reduce(
+                (total, box) => total + box.heightPixels,
+                0,
+            );
+            const selectedRowGap = selectedLeveled.gapAfter;
+            const remainderRowGap = remainderLeveled.gapAfter;
+            const maxRowGap = Math.max(selectedRowGap, remainderRowGap);
+            const totalRowGap = selectedRowGap + remainderRowGap;
             if (
                 !best ||
-                remainderMax < best.remainderMax ||
-                (remainderMax === best.remainderMax && selectedMax > best.selectedMax) ||
-                (remainderMax === best.remainderMax &&
+                maxRowGap < best.maxRowGap ||
+                (maxRowGap === best.maxRowGap && totalRowGap < best.totalRowGap) ||
+                (maxRowGap === best.maxRowGap &&
+                    totalRowGap === best.totalRowGap &&
+                    remainderMax < best.remainderMax) ||
+                (maxRowGap === best.maxRowGap &&
+                    totalRowGap === best.totalRowGap &&
+                    remainderMax === best.remainderMax &&
+                    selectedMax > best.selectedMax) ||
+                (maxRowGap === best.maxRowGap &&
+                    totalRowGap === best.totalRowGap &&
+                    remainderMax === best.remainderMax &&
                     selectedMax === best.selectedMax &&
                     remainderRange < best.remainderRange) ||
-                (remainderMax === best.remainderMax &&
+                (maxRowGap === best.maxRowGap &&
+                    totalRowGap === best.totalRowGap &&
+                    remainderMax === best.remainderMax &&
                     selectedMax === best.selectedMax &&
                     remainderRange === best.remainderRange &&
                     selectedHeight > best.selectedHeight)
@@ -514,6 +733,8 @@ function renderPalace(specs: SpecEntry[]): {
                     selectedMax,
                     remainderRange,
                     selectedHeight,
+                    maxRowGap,
+                    totalRowGap,
                 };
             }
         }
@@ -523,9 +744,13 @@ function renderPalace(specs: SpecEntry[]): {
 
     const palaceLines: string[] = [];
     const pageLines: string[][] = [[]];
+    const pagePixelHeights: number[] = [0];
     const placements = new Map<number, Placement>();
     const roomSummaries: RoomSummary[] = [];
     const layoutItems: LayoutItem[] = [];
+    let gapRowsBefore = 0;
+    let gapRowsAfter = 0;
+    let splitCount = 0;
     const categoryBanner = (categories: readonly Category[], continued: boolean): string => {
         const label = ` <${categories.join(" + ")}${continued ? " CONT." : ""}> `;
         const remaining = PAGE_WIDTH_CHARS - codepoints(label);
@@ -554,21 +779,24 @@ function renderPalace(specs: SpecEntry[]): {
         let continued = false;
         while (remaining.length > 0) {
             let pageIndex = pageLines.length - 1;
-            let available = PAGE_ROW_CAPACITY - (pageLines[pageIndex]?.length ?? 0) - 1;
+            let available =
+                PAGE_HEIGHT_PIXELS - (pagePixelHeights[pageIndex] ?? 0) - BANNER_HEIGHT_PIXELS;
             if (available <= 0) {
                 pageLines.push([]);
+                pagePixelHeights.push(0);
                 pageIndex++;
-                available = PAGE_ROW_CAPACITY - 1;
+                available = PAGE_HEIGHT_PIXELS - BANNER_HEIGHT_PIXELS;
             }
-            if (Math.min(...remaining.map((box) => box.lines.length)) > available) {
+            if (Math.min(...remaining.map((box) => box.heightPixels)) > available) {
                 pageLines.push([]);
+                pagePixelHeights.push(0);
                 continued = true;
                 continue;
             }
             const fullAssignment = assignmentFor(remaining);
             const fullHeights = Array<number>(COLUMN_COUNT).fill(0);
             for (const [index, box] of remaining.entries()) {
-                fullHeights[fullAssignment[index] ?? 0] += box.lines.length;
+                fullHeights[fullAssignment[index] ?? 0] += box.heightPixels;
             }
             let segmentBoxes: Box[];
             let assignment: number[];
@@ -586,17 +814,30 @@ function renderPalace(specs: SpecEntry[]): {
                 assignment = subset.columns;
             }
 
+            const leveled = levelBand(segmentBoxes, assignment);
+            segmentBoxes = leveled.boxes;
+            assignment = leveled.assignment;
+            gapRowsBefore += leveled.gapBefore;
+            gapRowsAfter += leveled.gapAfter;
+            splitCount += leveled.splits;
+
             const columns = Array.from({ length: COLUMN_COUNT }, () => [] as string[]);
             const heights = Array<number>(COLUMN_COUNT).fill(0);
+            const pixelHeights = Array<number>(COLUMN_COUNT).fill(0);
             for (const [index, box] of segmentBoxes.entries()) {
                 const column = assignment[index] ?? 0;
                 columns[column].push(...box.lines);
                 heights[column] += box.lines.length;
+                pixelHeights[column] += box.heightPixels;
             }
             const bandHeight = Math.max(...heights);
+            const bandHeightPixels = Math.max(...pixelHeights);
+            if (bandHeightPixels > available)
+                throw new Error(`leveled band exceeds page by ${bandHeightPixels - available}px`);
             const page = pageIndex + 1;
             const pageLine = (pageLines[pageIndex]?.length ?? 0) + 1;
             const bannerLine = palaceLines.length + 1;
+            const bannerTopPixels = pagePixelHeights[pageIndex] ?? 0;
             const banner = categoryBanner(categories, continued);
             palaceLines.push(banner);
             pageLines[pageIndex]?.push(banner);
@@ -609,17 +850,23 @@ function renderPalace(specs: SpecEntry[]): {
                 endLine: bannerLine,
                 page,
                 pageLine,
+                pageTopPixels: bannerTopPixels,
+                heightPixels: BANNER_HEIGHT_PIXELS,
             });
 
             const bandStartLine = palaceLines.length + 1;
             const bandPageLine = (pageLines[pageIndex]?.length ?? 0) + 1;
             const columnRows = Array<number>(COLUMN_COUNT).fill(0);
+            const columnPixelRows = Array<number>(COLUMN_COUNT).fill(0);
             for (const [index, box] of segmentBoxes.entries()) {
                 const column = assignment[index] ?? 0;
                 const row = columnRows[column] ?? 0;
                 columnRows[column] = row + box.lines.length;
+                const pixelRow = columnPixelRows[column] ?? 0;
+                columnPixelRows[column] = pixelRow + box.heightPixels;
                 const startLine = bandStartLine + row;
                 const roomPageLine = bandPageLine + row;
+                const roomPageTopPixels = bannerTopPixels + BANNER_HEIGHT_PIXELS + pixelRow;
                 for (const entry of [...box.entries, ...box.merges]) {
                     const relativeLine = box.relativeLines.get(entry.id);
                     if (relativeLine === undefined)
@@ -647,18 +894,26 @@ function renderPalace(specs: SpecEntry[]): {
                     endLine: startLine + box.lines.length - 1,
                     heightCells: box.lines.length,
                     sharedPairCount: box.sharedPairCount,
+                    continuation: box.continuation,
+                    segment: box.segment,
                     page,
                     pageLine: roomPageLine,
+                    pageTopPixels: roomPageTopPixels,
+                    heightPixels: box.heightPixels,
                 });
                 layoutItems.push({
                     kind: "room",
                     category: box.category,
                     room: box.name,
+                    continuation: box.continuation,
+                    segment: box.segment,
                     column,
                     startLine,
                     endLine: startLine + box.lines.length - 1,
                     page,
                     pageLine: roomPageLine,
+                    pageTopPixels: roomPageTopPixels,
+                    heightPixels: box.heightPixels,
                 });
             }
 
@@ -671,10 +926,13 @@ function renderPalace(specs: SpecEntry[]): {
                 pageLines[pageIndex]?.push(line);
             }
 
+            pagePixelHeights[pageIndex] = bannerTopPixels + BANNER_HEIGHT_PIXELS + bandHeightPixels;
+
             const selected = new Set(selectedIndexes);
             remaining = remaining.filter((_, index) => !selected.has(index));
             if (remaining.length > 0) {
                 pageLines.push([]);
+                pagePixelHeights.push(0);
                 continued = true;
             }
         }
@@ -698,18 +956,26 @@ function renderPalace(specs: SpecEntry[]): {
             startLine,
             endLine: startLine + lines.length - 1,
             heightCells: lines.length,
+            heightPixels: pagePixelHeights[index] ?? 0,
         };
         startLine += lines.length;
         return page;
     });
-    return { palace, placements, rooms: roomSummaries, layoutItems, pages };
+    return {
+        palace,
+        placements,
+        rooms: roomSummaries,
+        layoutItems,
+        pages,
+        leveling: { gapRowsBefore, gapRowsAfter, splitCount },
+    };
 }
 
 const sourceText = readFileSync(SOURCE_PATH, "utf8");
 const source = parseSource(sourceText);
 const specs = readSpecs();
 validate(source, specs);
-const { palace, placements, rooms, layoutItems, pages } = renderPalace(specs);
+const { palace, placements, rooms, layoutItems, pages, leveling } = renderPalace(specs);
 const cueLengths = specs
     .filter((entry) => entry.mergeInto === undefined)
     .map((entry) => codepoints(displayCue(entry)))
@@ -727,12 +993,16 @@ const coverage = {
     palaceChars: palace.length,
     maxLineChars: Math.max(...palace.trimEnd().split("\n").map(codepoints)),
     layout: {
+        font: LAYOUT_FONT,
+        cellWidth: CELL_WIDTH,
+        cellHeight: CELL_HEIGHT,
         columns: COLUMN_COUNT,
         roomWidthChars: ROOM_WIDTH,
         pageWidthChars: PAGE_WIDTH_CHARS,
         columnGapChars: COLUMN_GAP,
         canvasHeightCells: palace.trimEnd().split("\n").length,
-        pageRowCapacity: PAGE_ROW_CAPACITY,
+        pageHeightPixels: PAGE_HEIGHT_PIXELS,
+        bodyLinePitch: BODY_LINE_PITCH,
         pages,
         cueLengthDistribution: {
             min: cueLengths[0] ?? 0,
@@ -743,6 +1013,9 @@ const coverage = {
             max: cueLengths.at(-1) ?? 0,
         },
         sharedPairCount: rooms.reduce((total, room) => total + room.sharedPairCount, 0),
+        bandGapRowsBefore: leveling.gapRowsBefore,
+        bandGapRowsAfter: leveling.gapRowsAfter,
+        roomSplitCount: leveling.splitCount,
         items: layoutItems,
     },
     rooms,
@@ -754,11 +1027,12 @@ const coverage = {
 };
 if (placements.size !== source.length)
     throw new Error(`coverage has ${placements.size}/${source.length}`);
-writeFileSync(join(HERE, "palace.txt"), palace);
-writeFileSync(join(HERE, "coverage.json"), `${JSON.stringify(coverage, null, 4)}\n`);
+writeFileSync(PALACE_OUTPUT, palace);
+writeFileSync(COVERAGE_OUTPUT, `${JSON.stringify(coverage, null, 4)}\n`);
 console.log(
     JSON.stringify({
-        palace: basename(join(HERE, "palace.txt")),
+        palace: basename(PALACE_OUTPUT),
+        font: LAYOUT_FONT,
         chars: palace.length,
         lines: palace.trimEnd().split("\n").length,
         entries: entryCount,
@@ -768,5 +1042,7 @@ console.log(
         pages: pages.map((page) => page.heightCells),
         cueLengths: coverage.layout.cueLengthDistribution,
         sharedPairs: coverage.layout.sharedPairCount,
+        bandGaps: { before: leveling.gapRowsBefore, after: leveling.gapRowsAfter },
+        roomSplits: leveling.splitCount,
     }),
 );
