@@ -1,11 +1,10 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { SocketTimeoutError, SubcError } from "@cortexkit/subc-client";
 import {
     appendCompartments,
     replaceAllCompartmentState,
@@ -205,15 +204,11 @@ class FakeTransport implements ShadowTransport {
         }
         if (req.method === "state_sync" && this.seedBoundaryFailuresRemaining > 0) {
             this.seedBoundaryFailuresRemaining -= 1;
-            const error = new Error("stale seed boundary") as Error & { code?: string };
-            error.code = "shadow_seed_boundary_mismatch";
-            throw error;
+            throw new SubcError("stale seed boundary", "shadow_seed_boundary_mismatch");
         }
         if (req.method === "shadow_transform" && this.rejectNextTransform) {
             this.rejectNextTransform = false;
-            const error = new Error("generation mismatch") as Error & { code?: string };
-            error.code = "stale_generation";
-            throw error;
+            throw new SubcError("generation mismatch", "stale_generation");
         }
         if (req.method === "shadow_reset") {
             this.seq = 0;
@@ -272,34 +267,6 @@ class StallingSyncTransport implements ShadowTransport {
         if (req.method === "shadow_transform") this.transformBodies.push(req.body);
         return { result: { shadow_seq: this.seq, quarantined: false } };
     }
-}
-
-class FakeSocket extends EventEmitter {
-    destroyed = false;
-    onWrite: ((chunk: Buffer) => void) | null = null;
-
-    write(chunk: Uint8Array): boolean {
-        this.onWrite?.(Buffer.from(chunk));
-        return true;
-    }
-
-    destroy(): this {
-        if (this.destroyed) return this;
-        this.destroyed = true;
-        this.emit("close");
-        return this;
-    }
-}
-
-function responseFrame(channel: number, corr: number, body: unknown): Buffer {
-    const payload = Buffer.from(JSON.stringify(body));
-    const header = Buffer.alloc(17);
-    header.writeUInt32LE(payload.length, 0);
-    header.writeUInt8(1, 4);
-    header.writeUInt8(1, 5);
-    header.writeUInt16LE(channel, 7);
-    header.writeBigUInt64LE(BigInt(corr), 9);
-    return Buffer.concat([header, payload]);
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -1028,18 +995,14 @@ describe("shadow sender", () => {
         }
     });
 
-    it("classifies the inner read timeout and reopens the route without burning reseed allowance", async () => {
+    it("classifies a shared-client socket timeout and reopens the route without burning reseed allowance", async () => {
         useTempDataHome("shadow-reseed-read-timeout-");
         const sessionId = "s-reseed-read-timeout";
         createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "one" }]);
         const db = openDatabase();
 
-        const reader = new __shadowSenderTest.SocketReader(new FakeSocket() as unknown as Socket);
-        const readError = await reader.readExact(1, 5).catch((error: unknown) => error);
-        expect(readError).toEqual(expect.objectContaining({ code: "ETIMEDOUT" }));
-
         const transport = new FakeTransport();
-        transport.resetTimeoutError = readError as Error;
+        transport.resetTimeoutError = new SocketTimeoutError("subc request timed out");
         transport.quarantinedResponsesRemaining = 2;
         transport.resetTimeoutAtCall = 2;
         const sender = createShadowSender({
@@ -1625,48 +1588,6 @@ describe("shadow sender", () => {
         controller.abort(new Error("test complete"));
         releaseRoute?.(1);
         await expect(first).rejects.toThrow("test complete");
-    });
-
-    it("destroys a timed-out socket and succeeds immediately on a clean socket", async () => {
-        const first = new FakeSocket();
-        const second = new FakeSocket();
-        second.onWrite = () => {
-            queueMicrotask(() =>
-                second.emit("data", responseFrame(1, 2, { result: { ok: true } })),
-            );
-        };
-        const sockets = [first, second];
-        const transport = new __shadowSenderTest.SubcShadowTransport(
-            "/unused/connection.json",
-            "magic-context",
-            20,
-        );
-        const internals = transport as unknown as {
-            socket: Socket | null;
-            reader: unknown;
-            ensureConnected: () => Promise<void>;
-            ensureRoute: () => Promise<number>;
-        };
-        let nextSocket = 0;
-        internals.ensureRoute = async () => 1;
-        internals.ensureConnected = async () => {
-            if (internals.socket && !internals.socket.destroyed && internals.reader) return;
-            const socket = sockets[nextSocket++];
-            internals.socket = socket as unknown as Socket;
-            internals.reader = new __shadowSenderTest.SocketReader(socket as unknown as Socket);
-        };
-        const request = {
-            sessionId: "s-socket",
-            projectRoot: "/tmp/project",
-            method: "shadow_transform" as const,
-            body: { method: "shadow_transform" },
-        };
-
-        await expect(transport.call(request)).rejects.toThrow("read timeout");
-        expect(first.destroyed).toBe(true);
-        await expect(transport.call(request)).resolves.toEqual({ result: { ok: true } });
-        expect(nextSocket).toBe(2);
-        expect(second.destroyed).toBe(false);
     });
 
     it("keeps sender exceptions off the transform hot path", () => {

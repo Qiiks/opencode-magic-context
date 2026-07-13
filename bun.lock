@@ -95,6 +95,7 @@
       "name": "@cortexkit/opencode-magic-context",
       "version": "0.30.2",
       "dependencies": {
+        "@cortexkit/subc-client": "0.4.0",
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
         "@opencode-ai/plugin": "^1.17.11",
@@ -338,6 +339,8 @@
     "@cortexkit/opencode-magic-context-e2e": ["@cortexkit/opencode-magic-context-e2e@workspace:packages/e2e-tests"],
 
     "@cortexkit/pi-magic-context": ["@cortexkit/pi-magic-context@workspace:packages/pi-plugin"],
+
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.4.0", "", {}, "sha512-MhZ2p4HDzVW2y83GM76Ep95H1X5+3duj4SSKIxI/ucK8sjDzvEDUEqL5XeHKNQOcZqAy/+cfwsbku9HbClftxg=="],
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
 
