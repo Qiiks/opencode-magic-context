@@ -8,6 +8,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { extractCompleteManifestBody } from "../../../src/features/magic-context/dreamer/manifest-parser.ts";
+
 import { isExactToken, validate } from "./author-palace.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -16,8 +18,11 @@ const OUTPUT_DIR = "/tmp/visual-memory";
 const REPORT_PATH = join(HERE, "TRIAL-REPORT.md");
 const SYSTEM_PROMPT_PATH = join(HERE, "author-trial-system-prompt.md");
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_MODELS_ENDPOINT = "https://openrouter.ai/api/v1/models";
 const MAX_OUTPUT_TOKENS = 16_384;
 const ANCHOR_FIDELITY_FLOOR = 85;
+const MIN_ROOMS_PER_CATEGORY = 4;
+const MAX_ROOMS_PER_CATEGORY = 8;
 
 const CATEGORY_ORDER = [
     "PROJECT_RULES",
@@ -59,8 +64,39 @@ type Assessment = {
     failures: Record<FailureKind, ValidationFailure[]>;
     anchorFidelity: { matched: number; total: number; percent: number };
     importance: { matched: number; total: number; mismatches: number[] };
-    rooms: { generated: string[]; frontier: string[] };
+    rooms: {
+        generated: string[];
+        frontier: string[];
+        generatedEntryCounts: Array<{ name: string; count: number }>;
+    };
     samples: Array<{ id: number; frontierCue: string; generatedCue: string }>;
+};
+type TokenUsage = {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+};
+type OpenRouterPricing = {
+    prompt?: number;
+    completion?: number;
+};
+type OpenRouterModel = {
+    id: string;
+    name?: string;
+    pricing?: OpenRouterPricing;
+};
+type ModelPlan = {
+    label: string;
+    requestedModel: string;
+    fallbackModels: string[];
+};
+type ModelRun = {
+    plan: ModelPlan;
+    model: string;
+    substitution?: string;
+    pricing?: OpenRouterPricing;
+    pricingNote?: string;
+    results: TrialResult[];
 };
 type TrialResult = {
     label: string;
@@ -71,10 +107,40 @@ type TrialResult = {
     retry: { attempted: boolean; recovered?: boolean; initialParseError?: string };
     requestError?: string;
     parseError?: string;
+    usage: TokenUsage[];
     assessment?: Assessment;
 };
 
 type ChatMessage = { role: "system" | "user"; content: string };
+type OpenRouterCompletion = { content: string; usage?: TokenUsage };
+
+const FRONTIER_ROOM_TARGETS: Record<TrialCategory, number> = {
+    PROJECT_RULES: 7,
+    ARCHITECTURE: 16,
+};
+
+const MODEL_MATRIX: ModelPlan[] = [
+    {
+        label: "DeepSeek V4 Flash",
+        requestedModel: "deepseek/deepseek-v4-flash",
+        fallbackModels: ["deepseek/deepseek-v3.2"],
+    },
+    {
+        label: "DeepSeek V4 Pro",
+        requestedModel: "deepseek/deepseek-v4-pro",
+        fallbackModels: ["deepseek/deepseek-v3.2"],
+    },
+    {
+        label: "Kimi K2",
+        requestedModel: "moonshotai/kimi-k2",
+        fallbackModels: ["moonshotai/kimi-k2.6", "moonshotai/kimi-k2.5"],
+    },
+    {
+        label: "Gemini 3.5 Flash",
+        requestedModel: "google/gemini-3.5-flash",
+        fallbackModels: ["google/gemini-3-flash-preview", "google/gemini-2.5-flash"],
+    },
+];
 
 const FAILURE_KINDS: FailureKind[] = [
     "missing polarity mechanism",
@@ -158,18 +224,197 @@ function renderCategoryPrompt(category: TrialCategory, memories: SourceMemory[])
     return `# Palace cue authoring task\n\nAuthor the complete ${category} manifest below. The header ID and importance are required output fields; copy importance exactly. The source text is the only factual input.\n\n<${category}>\n${pool}\n</${category}>`;
 }
 
-function parseSpecArray(raw: string): { specs?: SpecEntry[]; error?: string } {
-    let parsed: unknown;
+function decodeXml(value: string, context: string): string {
+    if (/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/.test(value)) {
+        throw new Error(`${context} contains an unescaped or unknown XML entity`);
+    }
+    return value.replace(/&(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/g, (_match, entity: string) => {
+        switch (entity) {
+            case "amp":
+                return "&";
+            case "lt":
+                return "<";
+            case "gt":
+                return ">";
+            case "quot":
+                return '"';
+            case "apos":
+                return "'";
+            default: {
+                const codePoint = Number.parseInt(
+                    entity.startsWith("#x") ? entity.slice(2) : entity.slice(1),
+                    entity.startsWith("#x") ? 16 : 10,
+                );
+                if (
+                    !Number.isSafeInteger(codePoint) ||
+                    codePoint <= 0 ||
+                    codePoint > 0x10ffff ||
+                    (codePoint >= 0xd800 && codePoint <= 0xdfff)
+                ) {
+                    throw new Error(`${context} contains an invalid XML numeric entity`);
+                }
+                return String.fromCodePoint(codePoint);
+            }
+        }
+    });
+}
+
+function parseXmlAttributes(raw: string, context: string): Map<string, string> {
+    const attributes = new Map<string, string>();
+    const attributePattern = /\s+([A-Za-z_:][\w:.-]*)\s*=\s*"([^"]*)"/g;
+    let cursor = 0;
+    for (const match of raw.matchAll(attributePattern)) {
+        const start = match.index ?? 0;
+        if (raw.slice(cursor, start).trim()) throw new Error(`${context} has malformed attributes`);
+        const name = match[1];
+        const rawValue = match[2];
+        if (!name || rawValue === undefined) throw new Error(`${context} has malformed attributes`);
+        if (attributes.has(name)) throw new Error(`${context} repeats attribute ${name}`);
+        attributes.set(name, decodeXml(rawValue, `${context} attribute ${name}`));
+        cursor = start + match[0].length;
+    }
+    if (raw.slice(cursor).trim()) throw new Error(`${context} has malformed attributes`);
+    return attributes;
+}
+
+function requireAttribute(attributes: Map<string, string>, name: string, context: string): string {
+    const value = attributes.get(name);
+    if (value === undefined || value.length === 0) throw new Error(`${context} missing ${name} attribute`);
+    return value;
+}
+
+function allowOnlyAttributes(
+    attributes: Map<string, string>,
+    allowed: readonly string[],
+    context: string,
+): void {
+    for (const name of attributes.keys()) {
+        if (!allowed.includes(name)) throw new Error(`${context} has unsupported attribute ${name}`);
+    }
+}
+
+function parseManifestInteger(value: string, context: string): number {
+    if (!/^\d+$/.test(value)) throw new Error(`${context} must be a numeric integer`);
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed)) throw new Error(`${context} must be a safe integer`);
+    return parsed;
+}
+
+function parsePalaceManifest(
+    raw: string,
+    expectedCategory: TrialCategory,
+    importanceById: Map<number, number>,
+): SpecEntry[] {
+    const text = raw.trim();
+    if (!text.startsWith("<palace")) {
+        throw new Error("palace manifest must begin with <palace");
+    }
+    if (!text.endsWith("</palace>")) {
+        try {
+            extractCompleteManifestBody(text, "palace");
+        } catch (error) {
+            throw new Error(errorMessage(error));
+        }
+        throw new Error("palace manifest must end with </palace>");
+    }
+
+    const rootMatch = /^<palace\b([^>]*)>([\s\S]*)<\/palace>$/.exec(text);
+    if (!rootMatch) throw new Error("palace manifest must contain one complete <palace> root");
+    const body = extractCompleteManifestBody(text, "palace");
+    if (body !== rootMatch[2]) {
+        throw new Error("palace manifest must contain exactly one root element");
+    }
+
+    const rootAttributes = parseXmlAttributes(rootMatch[1] ?? "", "palace root");
+    allowOnlyAttributes(rootAttributes, ["category"], "palace root");
+    const category = requireAttribute(rootAttributes, "category", "palace root");
+    if (!CATEGORY_ORDER.includes(category as Category)) {
+        throw new Error(`palace root has unknown category ${category}`);
+    }
+    if (category !== expectedCategory) {
+        throw new Error(`palace root category ${category} does not match ${expectedCategory}`);
+    }
+
+    const specs: SpecEntry[] = [];
+    const roomPattern = /<room\b([^>]*)>([\s\S]*?)<\/room>/g;
+    let roomCursor = 0;
+    for (const roomMatch of body.matchAll(roomPattern)) {
+        const roomStart = roomMatch.index ?? 0;
+        if (body.slice(roomCursor, roomStart).trim()) {
+            throw new Error("palace manifest contains content outside a room");
+        }
+        const roomAttributes = parseXmlAttributes(roomMatch[1] ?? "", "room");
+        allowOnlyAttributes(roomAttributes, ["name"], "room");
+        const room = requireAttribute(roomAttributes, "name", "room");
+        const roomBody = roomMatch[2] ?? "";
+        const childPattern = /<entry\b([^>]*)>([\s\S]*?)<\/entry>|<merge\b([^>]*)\/>/g;
+        let childCursor = 0;
+        let childCount = 0;
+        for (const childMatch of roomBody.matchAll(childPattern)) {
+            const childStart = childMatch.index ?? 0;
+            if (roomBody.slice(childCursor, childStart).trim()) {
+                throw new Error(`room ${room} contains an unknown XML element or text`);
+            }
+            if (childMatch[1] !== undefined) {
+                const entryAttributes = parseXmlAttributes(childMatch[1], `entry in room ${room}`);
+                allowOnlyAttributes(entryAttributes, ["id", "importance"], `entry in room ${room}`);
+                const id = parseManifestInteger(
+                    requireAttribute(entryAttributes, "id", `entry in room ${room}`),
+                    `entry id in room ${room}`,
+                );
+                const importance = parseManifestInteger(
+                    requireAttribute(entryAttributes, "importance", `entry ${id}`),
+                    `entry ${id} importance`,
+                );
+                const rawCue = childMatch[2] ?? "";
+                if (rawCue.includes("<")) {
+                    throw new Error(`entry ${id} must XML-escape literal < characters in its cue`);
+                }
+                const cue = decodeXml(rawCue.trim(), `entry ${id} cue`);
+                if (!cue) throw new Error(`entry ${id} has an empty cue`);
+                specs.push({ id, category: category as Category, room, cue, importance });
+            } else {
+                const mergeAttributes = parseXmlAttributes(childMatch[3] ?? "", `merge in room ${room}`);
+                allowOnlyAttributes(mergeAttributes, ["id", "into", "importance"], `merge in room ${room}`);
+                const id = parseManifestInteger(
+                    requireAttribute(mergeAttributes, "id", `merge in room ${room}`),
+                    `merge id in room ${room}`,
+                );
+                const mergeInto = parseManifestInteger(
+                    requireAttribute(mergeAttributes, "into", `merge ${id}`),
+                    `merge ${id} target`,
+                );
+                const reportedImportance = mergeAttributes.get("importance");
+                const importance =
+                    reportedImportance === undefined
+                        ? (importanceById.get(id) ?? Number.NaN)
+                        : parseManifestInteger(reportedImportance, `merge ${id} importance`);
+                specs.push({ id, category: category as Category, room, mergeInto, importance });
+            }
+            childCount++;
+            childCursor = childStart + childMatch[0].length;
+        }
+        if (roomBody.slice(childCursor).trim()) {
+            throw new Error(`room ${room} contains an unknown XML element or text`);
+        }
+        if (childCount === 0) throw new Error(`room ${room} has no entries`);
+        roomCursor = roomStart + roomMatch[0].length;
+    }
+    if (body.slice(roomCursor).trim()) throw new Error("palace manifest contains content outside a room");
+    if (specs.length === 0) throw new Error("palace manifest contains no entries");
+    return specs;
+}
+
+function parseSpecXml(
+    raw: string,
+    expectedCategory: TrialCategory,
+    importanceById: Map<number, number>,
+): { specs?: SpecEntry[]; error?: string } {
     try {
-        parsed = JSON.parse(raw);
+        return { specs: parsePalaceManifest(raw, expectedCategory, importanceById) };
     } catch (error) {
-        return { error: `JSON parse failed: ${errorMessage(error)}` };
+        return { error: `XML parse failed: ${errorMessage(error)}` };
     }
-    if (!Array.isArray(parsed)) return { error: "JSON root must be an array" };
-    if (parsed.some((entry) => typeof entry !== "object" || entry === null || Array.isArray(entry))) {
-        return { error: "JSON array must contain only object entries" };
-    }
-    return { specs: parsed as SpecEntry[] };
 }
 
 function responseContent(payload: unknown): string | undefined {
@@ -199,6 +444,30 @@ function responseContent(payload: unknown): string | undefined {
     return parts.length > 0 ? parts.join("") : undefined;
 }
 
+function responseUsage(payload: unknown): TokenUsage | undefined {
+    if (typeof payload !== "object" || payload === null) return undefined;
+    const usage = (payload as { usage?: unknown }).usage;
+    if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return undefined;
+    const value = usage as {
+        prompt_tokens?: unknown;
+        completion_tokens?: unknown;
+        total_tokens?: unknown;
+        input_tokens?: unknown;
+        output_tokens?: unknown;
+    };
+    const prompt = value.prompt_tokens ?? value.input_tokens;
+    const completion = value.completion_tokens ?? value.output_tokens;
+    if (typeof prompt !== "number" || typeof completion !== "number") return undefined;
+    if (!Number.isFinite(prompt) || !Number.isFinite(completion)) return undefined;
+    const total = value.total_tokens;
+    return {
+        promptTokens: prompt,
+        completionTokens: completion,
+        totalTokens:
+            typeof total === "number" && Number.isFinite(total) ? total : prompt + completion,
+    };
+}
+
 function responseShape(payload: unknown): string {
     if (typeof payload !== "object" || payload === null) return "non-object payload";
     const choices = (payload as { choices?: unknown }).choices;
@@ -224,7 +493,7 @@ async function callOpenRouter(
     apiKey: string,
     model: string,
     messages: ChatMessage[],
-): Promise<string> {
+): Promise<OpenRouterCompletion> {
     const response = await fetch(OPENROUTER_ENDPOINT, {
         method: "POST",
         headers: {
@@ -236,7 +505,8 @@ async function callOpenRouter(
             messages,
             temperature: 0.1,
             max_tokens: MAX_OUTPUT_TOKENS,
-            reasoning: { enabled: false },
+            // Gemini 3.5 Flash rejects explicitly disabled reasoning, so OpenRouter must choose its required mode.
+            ...(model === "google/gemini-3.5-flash" ? {} : { reasoning: { enabled: false } }),
         }),
         signal: AbortSignal.timeout(10 * 60 * 1_000),
     });
@@ -253,11 +523,11 @@ async function callOpenRouter(
     }
     const content = responseContent(payload);
     if (!content) throw new Error(`OpenRouter response has no assistant text (${responseShape(payload)})`);
-    return content;
+    return { content, usage: responseUsage(payload) };
 }
 
 function rawOutputPath(label: string, category: TrialCategory): string {
-    return join(OUTPUT_DIR, `trial-${label}-${category}.json`);
+    return join(OUTPUT_DIR, `trial-${label}-${category}.xml`);
 }
 
 async function runTrial(args: {
@@ -271,15 +541,19 @@ async function runTrial(args: {
     systemPrompt: string;
 }): Promise<TrialResult> {
     const categorySource = args.source.filter((memory) => memory.category === args.category);
+    const importanceById = new Map(args.allSource.map((memory) => [memory.id, memory.importance]));
     const prompt = renderCategoryPrompt(args.category, categorySource);
     const rawPath = rawOutputPath(args.label, args.category);
     const baseMessages: ChatMessage[] = [
         { role: "system", content: args.systemPrompt },
         { role: "user", content: prompt },
     ];
+    const usage: TokenUsage[] = [];
     let raw: string;
     try {
-        raw = await callOpenRouter(args.apiKey, args.model, baseMessages);
+        const completion = await callOpenRouter(args.apiKey, args.model, baseMessages);
+        raw = completion.content;
+        if (completion.usage) usage.push(completion.usage);
     } catch (error) {
         return {
             label: args.label,
@@ -289,25 +563,28 @@ async function runTrial(args: {
             attempts: 1,
             retry: { attempted: false },
             requestError: errorMessage(error),
+            usage,
         };
     }
 
-    let parsed = parseSpecArray(raw);
+    let parsed = parseSpecXml(raw, args.category, importanceById);
     let attempts = 1;
     const retry: TrialResult["retry"] = { attempted: false };
     if (!parsed.specs) {
         retry.attempted = true;
         retry.initialParseError = parsed.error;
-        writeFileSync(rawPath.replace(/\.json$/, ".attempt-1.raw"), raw);
+        writeFileSync(rawPath.replace(/\.xml$/, ".attempt-1.xml"), raw);
         attempts++;
         try {
-            raw = await callOpenRouter(args.apiKey, args.model, [
+            const completion = await callOpenRouter(args.apiKey, args.model, [
                 ...baseMessages,
                 {
                     role: "user",
-                    content: `The previous response was rejected before validation: ${parsed.error ?? "invalid JSON"}. Return a fresh, complete JSON array only, including its final ].`,
+                    content: `The previous response was rejected before validation: ${parsed.error ?? "invalid XML"}. Return a fresh, complete XML palace manifest only. It must begin with <palace and end with </palace>.`,
                 },
             ]);
+            raw = completion.content;
+            if (completion.usage) usage.push(completion.usage);
         } catch (error) {
             return {
                 label: args.label,
@@ -317,9 +594,10 @@ async function runTrial(args: {
                 attempts,
                 retry,
                 requestError: errorMessage(error),
+                usage,
             };
         }
-        parsed = parseSpecArray(raw);
+        parsed = parseSpecXml(raw, args.category, importanceById);
         retry.recovered = Boolean(parsed.specs);
     }
 
@@ -333,6 +611,7 @@ async function runTrial(args: {
             attempts,
             retry,
             parseError: parsed.error,
+            usage,
         };
     }
 
@@ -343,6 +622,7 @@ async function runTrial(args: {
         rawPath,
         attempts,
         retry,
+        usage,
         assessment: assessCandidate({
             category: args.category,
             source: categorySource,
@@ -354,10 +634,9 @@ async function runTrial(args: {
 }
 
 function emptyFailures(): Record<FailureKind, ValidationFailure[]> {
-    return Object.fromEntries(FAILURE_KINDS.map((kind) => [kind, []])) as Record<
-        FailureKind,
-        ValidationFailure[]
-    >;
+    const failures = {} as Record<FailureKind, ValidationFailure[]>;
+    for (const kind of FAILURE_KINDS) failures[kind] = [];
+    return failures;
 }
 
 function classifyValidatorError(message: string): FailureKind {
@@ -553,7 +832,7 @@ function assessCandidate(args: {
     }
 
     const frontierById = new Map(args.frontier.map((entry) => [entry.id, entry]));
-    const samples = evenlySpaced(args.source, 6).map((memory) => ({
+    const samples = evenlySpaced(args.source, 4).map((memory) => ({
         id: memory.id,
         frontierCue: cueField(frontierById.get(memory.id)),
         generatedCue: cueField(generatedById.get(memory.id)),
@@ -574,6 +853,10 @@ function assessCandidate(args: {
                 .sort((a, b) => a.localeCompare(b)),
         ),
     ];
+    const generatedEntryCounts = generatedRooms.map((name) => ({
+        name,
+        count: args.generated.filter((entry) => entry.room === name).length,
+    }));
 
     return {
         coverage: {
@@ -593,7 +876,11 @@ function assessCandidate(args: {
             total: args.source.length,
             mismatches: importanceMismatches,
         },
-        rooms: { generated: generatedRooms, frontier: frontierRooms },
+        rooms: {
+            generated: generatedRooms,
+            frontier: frontierRooms,
+            generatedEntryCounts,
+        },
         samples,
     };
 }
@@ -618,7 +905,7 @@ function renderFailures(failures: Record<FailureKind, ValidationFailure[]>): str
 
 function renderAssessment(result: TrialResult): string[] {
     const lines = [
-        `## ${result.label}: ${result.category}`,
+        `### ${result.label}: ${result.category}`,
         "",
         `- Model: \`${result.model}\``,
         `- Raw completion: \`${result.rawPath}\``,
@@ -644,7 +931,7 @@ function renderAssessment(result: TrialResult): string[] {
     if (result.parseError) {
         lines.push(
             `- Fail-closed parse rejection: ${inline(result.parseError)}`,
-            "- Coverage: not measured because the complete JSON root was rejected.",
+            "- Coverage: not measured because the complete XML root was rejected.",
             "- Hard validator failures: not measured because validation never receives a partial manifest.",
             "- Anchor fidelity: not measured because validation never receives a partial manifest.",
             "- Room quality and side-by-side cues: not measured because validation never receives a partial manifest.",
@@ -667,16 +954,16 @@ function renderAssessment(result: TrialResult): string[] {
             assessment.manifestValidationError ? `failed — ${inline(assessment.manifestValidationError)}` : "passed"
         }`,
         "",
-        "### Hard validator failures",
+        "#### Hard validator failures",
         "",
         ...renderFailures(assessment.failures),
         "",
-        "### Room quality",
+        "#### Room quality",
         "",
-        `- ${result.label} rooms (${assessment.rooms.generated.length}): ${assessment.rooms.generated.join(", ") || "none"}`,
-        `- Frontier rooms (${assessment.rooms.frontier.length}): ${assessment.rooms.frontier.join(", ") || "none"}`,
+        `- ${result.label} rooms (${assessment.rooms.generated.length}): ${assessment.rooms.generatedEntryCounts.map((room) => `${room.name} (${room.count})`).join(", ") || "none"}`,
+        `- Frontier spec rooms (${assessment.rooms.frontier.length}; Round-2 comparison target ${FRONTIER_ROOM_TARGETS[result.category]}): ${assessment.rooms.frontier.join(", ") || "none"}`,
         "",
-        "### Six evenly spaced cue comparisons",
+        "#### Four evenly spaced cue comparisons",
         "",
     );
     for (const sample of assessment.samples) {
@@ -698,37 +985,302 @@ function renderAssessment(result: TrialResult): string[] {
     return lines;
 }
 
-function qualityGaps(result: TrialResult): string[] {
+function roomBudgetGaps(assessment: Assessment): string[] {
+    // The prompt exempts genuinely tiny categories; neither trial category is tiny.
+    if (assessment.coverage.total < MIN_ROOMS_PER_CATEGORY * 3) return [];
+    const gaps: string[] = [];
+    const roomCount = assessment.rooms.generated.length;
+    if (roomCount < MIN_ROOMS_PER_CATEGORY || roomCount > MAX_ROOMS_PER_CATEGORY) {
+        gaps.push(`room count ${roomCount} outside ${MIN_ROOMS_PER_CATEGORY}-${MAX_ROOMS_PER_CATEGORY}`);
+    }
+    const undersized = assessment.rooms.generatedEntryCounts.filter((room) => room.count < 3);
+    if (undersized.length > 0) {
+        gaps.push(
+            `rooms below 3 entries (${undersized.map((room) => `${room.name}=${room.count}`).join(", ")})`,
+        );
+    }
+    return gaps;
+}
+
+function hardQualityGaps(result: TrialResult): string[] {
     if (result.requestError) return ["request failure"];
     if (result.parseError) return ["fail-closed parse rejection"];
     const assessment = result.assessment;
     if (!assessment) return ["missing assessment"];
     const gaps: string[] = [];
     if (assessment.coverage.uncovered.length > 0) gaps.push("uncovered memories");
-    const failedKinds = FAILURE_KINDS.filter((kind) => assessment.failures[kind].length > 0);
-    gaps.push(...failedKinds);
-    if (assessment.anchorFidelity.percent < ANCHOR_FIDELITY_FLOOR) {
-        gaps.push(`anchor fidelity ${assessment.anchorFidelity.percent}% < ${ANCHOR_FIDELITY_FLOOR}%`);
-    }
+    gaps.push(...FAILURE_KINDS.filter((kind) => assessment.failures[kind].length > 0));
     if (assessment.importance.mismatches.length > 0) gaps.push("importance passthrough mismatches");
     return [...new Set(gaps)];
 }
 
-function verdict(ds4f: TrialResult[], baseline: TrialResult | undefined): string {
-    const gaps = ds4f.flatMap((result) =>
-        qualityGaps(result).map((gap) => `${result.category}: ${gap}`),
-    );
-    const baselineSignal = !baseline
-        ? "No GPT-5.6-sol baseline was requested."
-        : baseline.requestError
-          ? "The GPT-5.6-sol sanity baseline was unavailable through this OpenRouter key."
-          : baseline.parseError
-            ? "The GPT-5.6-sol sanity baseline also failed fail-closed parsing, so inspect the harness before drawing model conclusions."
-            : "The GPT-5.6-sol sanity baseline completed and is included above for comparison.";
-    if (gaps.length === 0) {
-        return `**SHIP-ON-FLASH.** Both DS4F categories cleared the acceptance gate: complete fail-closed JSON, full coverage, no validator-class failures, exact importance passthrough, and at least ${ANCHOR_FIDELITY_FLOOR}% anchor fidelity. ${baselineSignal}`;
+function softQualityGaps(result: TrialResult): string[] {
+    const assessment = result.assessment;
+    if (!assessment) return [];
+    const gaps = roomBudgetGaps(assessment);
+    if (assessment.anchorFidelity.percent < ANCHOR_FIDELITY_FLOOR) {
+        gaps.push(`anchor fidelity ${assessment.anchorFidelity.percent}% < ${ANCHOR_FIDELITY_FLOOR}%`);
     }
-    return `**SHIP-WITH-STRONGER-MODEL-RECOMMENDED.** DS4F missed the acceptance gate because ${gaps.join("; ")}. ${baselineSignal}`;
+    return gaps;
+}
+
+function modelVerdict(run: ModelRun): {
+    verdict: "VIABLE" | "VIABLE-WITH-CAVEATS" | "NOT-VIABLE";
+    reasons: string[];
+} {
+    const hardGaps = run.results.flatMap((result) =>
+        hardQualityGaps(result).map((gap) => `${result.category}: ${gap}`),
+    );
+    if (hardGaps.length > 0) return { verdict: "NOT-VIABLE", reasons: hardGaps };
+
+    const caveats = run.results.flatMap((result) =>
+        softQualityGaps(result).map((gap) => `${result.category}: ${gap}`),
+    );
+    if (caveats.length > 0) return { verdict: "VIABLE-WITH-CAVEATS", reasons: caveats };
+    return {
+        verdict: "VIABLE",
+        reasons: [
+            `all selected categories passed fail-closed XML, coverage, validator, importance, anchor, and room-budget gates`,
+        ],
+    };
+}
+
+function parseOutcome(result: TrialResult): string {
+    if (result.requestError || result.parseError) return "fail";
+    return result.retry.recovered ? "retry-recovered" : "pass";
+}
+
+function compactFailureCounts(assessment: Assessment | undefined): string {
+    if (!assessment) return "—";
+    return FAILURE_KINDS.map((kind) => `${kind.replace(/ /g, "-")}=${assessment.failures[kind].length}`).join(", ");
+}
+
+function tableCell(value: string): string {
+    return value.replace(/\|/g, "\\|").replace(/\n/g, " ");
+}
+
+function renderMatrix(runs: ModelRun[]): string[] {
+    return [
+        "## Matrix",
+        "",
+        "Parse is `pass`, `retry-recovered`, or `fail`; failure counts are ordered as the named validator classes.",
+        "",
+        "| Model | Category | Parse | Coverage | Validator failure classes (counts) | Anchor fidelity | Rooms (frontier target) |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+        ...runs.flatMap((run) =>
+            run.results.map((result) => {
+                const assessment = result.assessment;
+                return `| ${tableCell(`${run.plan.label} (${run.model})`)} | ${result.category} | ${parseOutcome(result)} | ${assessment ? `${assessment.coverage.covered}/${assessment.coverage.total}` : "—"} | ${tableCell(compactFailureCounts(assessment))} | ${assessment ? `${assessment.anchorFidelity.percent}%` : "—"} | ${assessment ? `${assessment.rooms.generated.length}/${FRONTIER_ROOM_TARGETS[result.category]}` : "—"} |`;
+            }),
+        ),
+        "",
+    ];
+}
+
+function parseOpenRouterPrice(value: unknown): number | undefined {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+    if (typeof value !== "string" || !value.trim()) return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function parseOpenRouterPricing(value: unknown): OpenRouterPricing | undefined {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    const pricing = value as { prompt?: unknown; completion?: unknown };
+    const prompt = parseOpenRouterPrice(pricing.prompt);
+    const completion = parseOpenRouterPrice(pricing.completion);
+    return prompt === undefined && completion === undefined ? undefined : { prompt, completion };
+}
+
+async function fetchOpenRouterModels(apiKey: string): Promise<OpenRouterModel[]> {
+    const response = await fetch(OPENROUTER_MODELS_ENDPOINT, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(30_000),
+    });
+    const responseText = await response.text();
+    if (!response.ok) {
+        throw new Error(`OpenRouter model catalog ${response.status}: ${responseText.replace(/\s+/g, " ").slice(0, 300)}`);
+    }
+    let payload: unknown;
+    try {
+        payload = JSON.parse(responseText);
+    } catch (error) {
+        throw new Error(`OpenRouter model catalog returned non-JSON: ${errorMessage(error)}`);
+    }
+    const data = typeof payload === "object" && payload !== null ? (payload as { data?: unknown }).data : undefined;
+    if (!Array.isArray(data)) throw new Error("OpenRouter model catalog has no data array");
+    return data.flatMap((item) => {
+        if (typeof item !== "object" || item === null || Array.isArray(item)) return [];
+        const model = item as { id?: unknown; name?: unknown; pricing?: unknown };
+        if (typeof model.id !== "string") return [];
+        const pricing = parseOpenRouterPricing(model.pricing);
+        return [
+            {
+                id: model.id,
+                ...(typeof model.name === "string" ? { name: model.name } : {}),
+                ...(pricing ? { pricing } : {}),
+            },
+        ];
+    });
+}
+
+function closestFallback(plan: ModelPlan, models: OpenRouterModel[]): string | undefined {
+    const available = new Set(models.map((model) => model.id));
+    for (const fallback of plan.fallbackModels) {
+        if (models.length === 0 || available.has(fallback)) return fallback;
+    }
+    const provider = plan.requestedModel.split("/")[0];
+    const requestedTerms = plan.requestedModel
+        .split(/[/._-]+/)
+        .filter((term) => term.length > 1 && term !== provider);
+    return models
+        .filter((model) => model.id.startsWith(`${provider}/`) && model.id !== plan.requestedModel)
+        .sort((a, b) => {
+            const score = (id: string): number =>
+                requestedTerms.reduce((total, term) => total + (id.includes(term) ? 1 : 0), 0);
+            return score(b.id) - score(a.id) || a.id.localeCompare(b.id);
+        })[0]?.id;
+}
+
+function isMissingModelResult(result: TrialResult): boolean {
+    return Boolean(
+        result.requestError &&
+            (/OpenRouter 404\b/i.test(result.requestError) ||
+                /OpenRouter 400:.*model .*not found/i.test(result.requestError)),
+    );
+}
+
+async function runModelPlan(args: {
+    apiKey: string;
+    plan: ModelPlan;
+    categories: TrialCategory[];
+    source: SourceMemory[];
+    frontier: SpecEntry[];
+    systemPrompt: string;
+    availableModels: OpenRouterModel[];
+    catalogError?: string;
+}): Promise<ModelRun> {
+    let model = args.plan.requestedModel;
+    let substitution: string | undefined;
+    const results: TrialResult[] = [];
+    for (const category of args.categories) {
+        let result = await runTrial({
+            apiKey: args.apiKey,
+            label: args.plan.label,
+            model,
+            category,
+            source: args.source,
+            allSource: args.source,
+            frontier: args.frontier,
+            systemPrompt: args.systemPrompt,
+        });
+        if (model === args.plan.requestedModel && isMissingModelResult(result)) {
+            const fallback = closestFallback(args.plan, args.availableModels);
+            if (fallback) {
+                model = fallback;
+                substitution = `Requested ${args.plan.requestedModel} returned model-not-found; substituted ${fallback}.`;
+                result = await runTrial({
+                    apiKey: args.apiKey,
+                    label: args.plan.label,
+                    model,
+                    category,
+                    source: args.source,
+                    allSource: args.source,
+                    frontier: args.frontier,
+                    systemPrompt: args.systemPrompt,
+                });
+            }
+        }
+        results.push(result);
+    }
+
+    const modelInfo = args.availableModels.find((candidate) => candidate.id === model);
+    return {
+        plan: args.plan,
+        model,
+        ...(substitution ? { substitution } : {}),
+        ...(modelInfo?.pricing ? { pricing: modelInfo.pricing } : {}),
+        pricingNote: modelInfo?.pricing
+            ? "OpenRouter model-catalog input/output prices retrieved at run time."
+            : args.catalogError
+              ? `OpenRouter pricing unavailable: ${args.catalogError}`
+              : `OpenRouter model catalog did not provide input/output pricing for ${model}.`,
+        results,
+    };
+}
+
+function summarizeUsage(run: ModelRun): TokenUsage & { calls: number } {
+    const usage = run.results.flatMap((result) => result.usage);
+    return usage.reduce<TokenUsage & { calls: number }>(
+        (total, entry) => ({
+            calls: total.calls + 1,
+            promptTokens: total.promptTokens + entry.promptTokens,
+            completionTokens: total.completionTokens + entry.completionTokens,
+            totalTokens: total.totalTokens + entry.totalTokens,
+        }),
+        { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    );
+}
+
+function estimatedRunCost(run: ModelRun): number | undefined {
+    if (run.pricing?.prompt === undefined || run.pricing.completion === undefined) return undefined;
+    const usage = summarizeUsage(run);
+    if (usage.calls === 0) return undefined;
+    return usage.promptTokens * run.pricing.prompt + usage.completionTokens * run.pricing.completion;
+}
+
+function formatPerMillion(price: number | undefined): string {
+    if (price === undefined) return "unavailable";
+    const perMillion = price * 1_000_000;
+    return `$${perMillion.toFixed(perMillion < 1 ? 3 : 2)}/M`;
+}
+
+function formatCost(cost: number | undefined): string {
+    if (cost === undefined) return "unavailable";
+    return `$${cost.toFixed(cost < 0.01 ? 5 : 3)}`;
+}
+
+function renderCostTable(runs: ModelRun[]): string[] {
+    return [
+        "## Cost per model run",
+        "",
+        "Estimates use the OpenRouter model-catalog input/output price at run time and the API-reported tokens for all completed calls, including parse retries. Cache, tool, and provider-specific surcharges are not included.",
+        "",
+        "| Model | Input / output price | Reported usage | Estimated run cost | Pricing note |",
+        "| --- | --- | --- | --- | --- |",
+        ...runs.map((run) => {
+            const usage = summarizeUsage(run);
+            const usageText =
+                usage.calls === 0
+                    ? "no reported usage"
+                    : `${usage.calls} response(s); ${usage.promptTokens} input + ${usage.completionTokens} output`;
+            return `| ${tableCell(`${run.plan.label} (${run.model})`)} | ${formatPerMillion(run.pricing?.prompt)} / ${formatPerMillion(run.pricing?.completion)} | ${usageText} | ${formatCost(estimatedRunCost(run))} | ${tableCell(run.pricingNote ?? "pricing unavailable")} |`;
+        }),
+        "",
+    ];
+}
+
+function renderRoundTwoReport(runs: ModelRun[]): string {
+    const verdicts = runs.map((run) => ({ run, ...modelVerdict(run) }));
+    return [
+        "# Round 2",
+        "",
+        `Run: ${new Date().toISOString()}`,
+        "",
+        "This round is a non-agentic, single-call-per-category authoring trial across the requested OpenRouter model matrix. XML parsing is fail-closed: the reply must be one complete `<palace>` root beginning with `<palace` and ending with `</palace>`; the harness never strips fences, extracts a substring, or applies a partial manifest. A parse rejection receives one error-fed retry. Parsed XML entries are converted to the existing `SpecEntry` shape and checked by the unchanged `author-palace.ts` validator. The strict safety gate requires complete XML, 100% coverage, no validator-class failures, and exact importance passthrough; cue quality also targets at least 85% anchor fidelity and the 4–8-room, three-entries-per-room budget.",
+        "",
+        ...renderMatrix(runs),
+        ...renderCostTable(runs),
+        "## Per-model verdicts",
+        "",
+        ...verdicts.flatMap(({ run, verdict, reasons }) => [
+            `- **${run.plan.label}: ${verdict}.** ${reasons.join("; ")}${run.substitution ? ` ${run.substitution}` : ""}`,
+        ]),
+        "",
+        "## Cell details",
+        "",
+        ...runs.flatMap((run) => run.results.flatMap(renderAssessment)),
+    ].join("\n");
 }
 
 function requestedCategories(): TrialCategory[] {
@@ -754,71 +1306,44 @@ async function main(): Promise<void> {
     const source = parseSourceMemories(readFileSync(SOURCE_PATH, "utf8"), importanceById);
     const categories = requestedCategories();
 
-    const ds4f: TrialResult[] = [];
-    for (const category of categories) {
-        ds4f.push(
-            await runTrial({
+    let availableModels: OpenRouterModel[] = [];
+    let catalogError: string | undefined;
+    try {
+        availableModels = await fetchOpenRouterModels(apiKey);
+    } catch (error) {
+        catalogError = errorMessage(error);
+    }
+
+    const runs: ModelRun[] = [];
+    for (const plan of MODEL_MATRIX) {
+        runs.push(
+            await runModelPlan({
                 apiKey,
-                label: "ds4f",
-                model: "deepseek/deepseek-v4-flash",
-                category,
+                plan,
+                categories,
                 source,
-                allSource: source,
                 frontier,
                 systemPrompt,
+                availableModels,
+                ...(catalogError ? { catalogError } : {}),
             }),
         );
     }
 
-    let baseline: TrialResult | undefined;
-    if (categories.includes("PROJECT_RULES")) {
-        baseline = await runTrial({
-            apiKey,
-            label: "gpt-5.6-sol",
-            model: "openai/gpt-5.6-sol",
-            category: "PROJECT_RULES",
-            source,
-            allSource: source,
-            frontier,
-            systemPrompt,
-        });
-    }
-
-    const report = [
-        "# Palace Authoring Trial",
-        "",
-        `Run: ${new Date().toISOString()}`,
-        "",
-        "This is a non-agentic, single-call-per-category authoring trial. JSON parsing is fail-closed: no fence stripping, substring extraction, or partial manifest application. Each generated entry is overlaid onto the frontier manifest and checked with the exported `author-palace.ts` validator; the full generated category is also checked in one combined manifest. The acceptance gate requires complete JSON, 100% coverage, no validator-class failures, exact importance passthrough, and at least 85% exact-anchor fidelity.",
-        "",
-        "# DS4F results",
-        "",
-        ...ds4f.flatMap(renderAssessment),
-        "# GPT-5.6-sol sanity baseline",
-        "",
-        ...(baseline ? renderAssessment(baseline) : ["Not run: PROJECT_RULES was not selected.", ""]),
-        "# Verdict",
-        "",
-        verdict(ds4f, baseline),
-        "",
-    ].join("\n");
-    writeFileSync(REPORT_PATH, report);
+    const priorReport = readFileSync(REPORT_PATH, "utf8");
+    const roundTwoIndex = priorReport.search(/^# Round 2\b/m);
+    const preservedReport = (roundTwoIndex >= 0 ? priorReport.slice(0, roundTwoIndex) : priorReport).trimEnd();
+    writeFileSync(REPORT_PATH, `${preservedReport}\n\n${renderRoundTwoReport(runs).trimEnd()}\n`);
     console.log(`report=${REPORT_PATH}`);
-    for (const result of ds4f) {
-        const coverage = result.assessment?.coverage;
-        console.log(
-            `${result.label}/${result.category}: ${
-                result.requestError ?? result.parseError ?? `${coverage?.covered}/${coverage?.total} covered`
-            }`,
-        );
-    }
-    if (baseline) {
-        const coverage = baseline.assessment?.coverage;
-        console.log(
-            `${baseline.label}/${baseline.category}: ${
-                baseline.requestError ?? baseline.parseError ?? `${coverage?.covered}/${coverage?.total} covered`
-            }`,
-        );
+    for (const run of runs) {
+        for (const result of run.results) {
+            const coverage = result.assessment?.coverage;
+            console.log(
+                `${run.plan.label}/${result.category}: ${
+                    result.requestError ?? result.parseError ?? `${coverage?.covered}/${coverage?.total} covered`
+                }`,
+            );
+        }
     }
 }
 
