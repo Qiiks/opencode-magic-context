@@ -13,8 +13,9 @@ const CATEGORY_ORDER = [
 const COLUMN_COUNT = 3;
 const ROOM_WIDTH = 90;
 const COLUMN_GAP = 2;
-const MAX_LINE_CHARS = COLUMN_COUNT * ROOM_WIDTH + (COLUMN_COUNT - 1) * COLUMN_GAP;
-const MAX_PALACE_CHARS = 50_000;
+const PAGE_WIDTH_CHARS = COLUMN_COUNT * ROOM_WIDTH;
+const MAX_LINE_CHARS = PAGE_WIDTH_CHARS + (COLUMN_COUNT - 1) * COLUMN_GAP;
+const MAX_PALACE_CHARS = 70_000;
 const SOURCE_PATH = "/tmp/visual-memory/trimmed-memories-source.txt";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -119,20 +120,24 @@ function isExactToken(value: string): boolean {
 }
 
 function compactCue(raw: string, room: string): string {
+    const hubWords = room
+        .split(/[^A-Za-z0-9]+/)
+        .filter((word) => word.length >= 2)
+        .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    let value = raw;
+    if (hubWords.length > 0) {
+        value = value.replace(
+            new RegExp(`(?<![\\w/._-])(?:${hubWords.join("|")})(?![\\w/._-])`, "gi"),
+            "",
+        );
+    }
     const protectedValues: string[] = [];
-    let value = raw.replace(/`[^`]+`|[^\s()`]+/g, (match) => {
+    value = value.replace(/`[^`]+`|[^\s()`]+/g, (match) => {
         if (!match.startsWith("`") && !isExactToken(match)) return match;
         const marker = `QZ${protectedValues.length}ZQ`;
         protectedValues.push(match);
         return marker;
     });
-    const hubWords = room
-        .split(/\s+(?:&|and)\s+|\s+/)
-        .filter((word) => word.length >= 5)
-        .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-    if (hubWords.length > 0) {
-        value = value.replace(new RegExp(`\\b(?:${hubWords.join("|")})\\b`, "gi"), "");
-    }
     const replacements: Array<[RegExp, string]> = [
         [/\bconfigurations?\b/gi, "cfg"],
         [/\bbackground\b/gi, "bg"],
@@ -192,6 +197,13 @@ function validate(source: SourceMemory[], specs: SpecEntry[]): void {
         if (cue && /#\d+/.test(cue)) throw new Error(`memory id leaked into cue ${spec.id}`);
         if (cue) {
             const renderedCue = displayCue(spec);
+            for (const hubWord of spec.room
+                .split(/[^A-Za-z0-9]+/)
+                .filter((word) => word.length >= 2)) {
+                if (new RegExp(`(?<![\\w/._-])${hubWord}(?![\\w/._-])`, "i").test(renderedCue)) {
+                    throw new Error(`hub noun repeated in cue ${spec.id}: ${renderedCue}`);
+                }
+            }
             const negativeRule = /\b(?:must not|never|without|instead of|excludes?)\b/i.test(
                 renderedCue,
             );
@@ -207,6 +219,30 @@ function validate(source: SourceMemory[], specs: SpecEntry[]): void {
                     `polarity mechanism missing from rendered cue ${spec.id}: ${renderedCue}`,
                 );
             }
+            let marker = renderedCue.indexOf("⊘");
+            while (marker >= 0) {
+                const nextMarker = renderedCue.indexOf("⊘", marker + 1);
+                const mechanism = renderedCue.indexOf("(", marker + 1);
+                if (mechanism < 0 || (nextMarker >= 0 && mechanism > nextMarker)) {
+                    throw new Error(
+                        `polarity mechanism must follow marker ${spec.id}: ${renderedCue}`,
+                    );
+                }
+                let depth = 0;
+                let close = -1;
+                for (let index = mechanism; index < renderedCue.length; index++) {
+                    if (renderedCue[index] === "(") depth++;
+                    if (renderedCue[index] === ")") depth--;
+                    if (depth === 0) {
+                        close = index;
+                        break;
+                    }
+                }
+                if (close < mechanism) {
+                    throw new Error(`polarity mechanism is unclosed ${spec.id}: ${renderedCue}`);
+                }
+                marker = renderedCue.indexOf("⊘", close + 1);
+            }
             const unclosed = [...renderedCue].reduce(
                 (depth, character) => depth + (character === "(" ? 1 : character === ")" ? -1 : 0),
                 0,
@@ -216,8 +252,23 @@ function validate(source: SourceMemory[], specs: SpecEntry[]): void {
             const exactAnchors = (cue.match(/`[^`]+`|[^\s()`]+/g) ?? []).filter(
                 (anchor) => anchor.startsWith("`") || isExactToken(anchor),
             );
+            const hubAnchors = new Set(
+                spec.room
+                    .split(/[^A-Za-z0-9]+/)
+                    .filter(Boolean)
+                    .map((word) => word.toLowerCase()),
+            );
             for (const rawAnchor of exactAnchors) {
                 const anchor = rawAnchor.replace(/^[,;]+|[,;]+$/g, "");
+                if (hubAnchors.has(anchor.replace(/[^A-Za-z0-9]+/g, "").toLowerCase())) continue;
+                let anchorWithoutHub = anchor;
+                for (const hubWord of hubAnchors) {
+                    anchorWithoutHub = anchorWithoutHub.replace(
+                        new RegExp(`(?<![\\w/._-])${hubWord}(?![\\w/._-])`, "gi"),
+                        "",
+                    );
+                }
+                if (anchorWithoutHub !== anchor && renderedCue.includes(anchorWithoutHub)) continue;
                 if (["AND", "APIs", "NEVER", "OR", "RAM", "SAME"].includes(anchor)) continue;
                 if (anchor && !renderedCue.includes(anchor)) {
                     throw new Error(
@@ -250,29 +301,21 @@ function longestToken(entries: SpecEntry[]): number {
 
 function appendEntry(body: string[], cue: string, width: number): number {
     const words = cue.split(/\s+/).filter(Boolean);
-    let lineIndex = body.length - 1;
-    let prefix = body[lineIndex]?.length ? "¦" : "•";
-    const firstLine =
-        lineIndex < 0 || codepoints(`${body[lineIndex]}${prefix}${words[0] ?? ""}`) > width;
-    if (firstLine) {
-        body.push("");
-        lineIndex = body.length - 1;
-        prefix = "•";
-    }
-    const placement = lineIndex;
+    if (words.length === 0) throw new Error("empty palace cue");
+    const placement = body.length;
+    let line = "•";
     for (const word of words) {
-        const separator =
-            prefix || body[lineIndex].endsWith("¦") || body[lineIndex].endsWith("•") ? "" : " ";
-        const candidate = `${body[lineIndex]}${prefix}${separator}${word}`.trimEnd();
+        const separator = line === "•" || line === " " ? "" : " ";
+        const candidate = `${line}${separator}${word}`;
         if (codepoints(candidate) <= width) {
-            body[lineIndex] = candidate;
-            prefix = "";
+            line = candidate;
             continue;
         }
-        body.push(word);
-        lineIndex = body.length - 1;
-        prefix = "";
+        body.push(line);
+        line = ` ${word}`;
+        if (codepoints(line) > width) throw new Error(`anchor exceeds room width: ${word}`);
     }
+    body.push(line);
     return placement;
 }
 
@@ -337,49 +380,47 @@ function renderPalace(specs: SpecEntry[]): {
         grouped.set(key, list);
     }
 
-    const columns = Array.from({ length: COLUMN_COUNT }, () => [] as string[]);
-    const heights = Array<number>(COLUMN_COUNT).fill(0);
+    const palaceLines: string[] = [];
     const placements = new Map<number, Placement>();
     const roomSummaries: RoomSummary[] = [];
     const layoutItems: LayoutItem[] = [];
-
-    const shortestColumn = (): number => {
-        let selected = 0;
-        for (let column = 1; column < COLUMN_COUNT; column++) {
-            if (heights[column] < heights[selected]) selected = column;
-        }
-        return selected;
-    };
-    const placeLines = (lines: string[]): { column: number; row: number } => {
-        const column = shortestColumn();
-        const row = heights[column];
-        columns[column].push(...lines);
-        heights[column] += lines.length;
-        return { column, row };
-    };
     const categoryBanner = (category: Category): string => {
         const label = ` <${category}> `;
-        const remaining = ROOM_WIDTH - codepoints(label);
+        const remaining = PAGE_WIDTH_CHARS - codepoints(label);
         return `${"─".repeat(Math.floor(remaining / 2))}${label}${"─".repeat(Math.ceil(remaining / 2))}`;
     };
 
     for (const category of CATEGORY_ORDER) {
-        const banner = placeLines([categoryBanner(category)]);
+        const bannerLine = palaceLines.length + 1;
+        palaceLines.push(categoryBanner(category));
         layoutItems.push({
             kind: "category",
             category,
-            column: banner.column,
-            startLine: banner.row + 1,
-            endLine: banner.row + 1,
+            column: 0,
+            startLine: bannerLine,
+            endLine: bannerLine,
         });
 
+        const columns = Array.from({ length: COLUMN_COUNT }, () => [] as string[]);
+        const heights = Array<number>(COLUMN_COUNT).fill(0);
+        const shortestColumn = (): number => {
+            let selected = 0;
+            for (let column = 1; column < COLUMN_COUNT; column++) {
+                if (heights[column] < heights[selected]) selected = column;
+            }
+            return selected;
+        };
         const boxes = [...grouped.entries()]
             .filter(([key]) => key.startsWith(`${category}\u0000`))
             .map(([key, entries]) => buildBox(category, key.slice(category.length + 1), entries))
             .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+        const bandStartLine = palaceLines.length + 1;
         for (const box of boxes) {
-            const placed = placeLines(box.lines);
-            const startLine = placed.row + 1;
+            const column = shortestColumn();
+            const row = heights[column];
+            columns[column].push(...box.lines);
+            heights[column] += box.lines.length;
+            const startLine = bandStartLine + row;
             for (const entry of [...box.entries, ...box.merges]) {
                 const relativeLine = box.relativeLines.get(entry.id);
                 if (relativeLine === undefined)
@@ -388,7 +429,7 @@ function renderPalace(specs: SpecEntry[]): {
                     category: box.category,
                     room: box.name,
                     palaceLine: startLine + relativeLine,
-                    palaceColumn: placed.column * (ROOM_WIDTH + COLUMN_GAP) + 1,
+                    palaceColumn: column * (ROOM_WIDTH + COLUMN_GAP) + 1,
                     ...(entry.mergeInto === undefined ? {} : { mergedInto: entry.mergeInto }),
                 });
             }
@@ -400,7 +441,7 @@ function renderPalace(specs: SpecEntry[]): {
                 memoryCount: box.entries.length + box.merges.length,
                 peakImportance: box.peakImportance,
                 border: box.peakImportance >= 70 ? "double" : "single",
-                column: placed.column,
+                column,
                 startLine,
                 endLine: startLine + box.lines.length - 1,
                 heightCells: box.lines.length,
@@ -409,20 +450,23 @@ function renderPalace(specs: SpecEntry[]): {
                 kind: "room",
                 category: box.category,
                 room: box.name,
-                column: placed.column,
+                column,
                 startLine,
                 endLine: startLine + box.lines.length - 1,
             });
         }
+
+        const bandHeight = Math.max(...heights);
+        for (let row = 0; row < bandHeight; row++) {
+            palaceLines.push(
+                columns
+                    .map((column) => (column[row] ?? "").padEnd(ROOM_WIDTH))
+                    .join(" ".repeat(COLUMN_GAP))
+                    .trimEnd(),
+            );
+        }
     }
 
-    const canvasHeight = Math.max(...heights);
-    const palaceLines = Array.from({ length: canvasHeight }, (_, row) =>
-        columns
-            .map((column) => (column[row] ?? "").padEnd(ROOM_WIDTH))
-            .join(" ".repeat(COLUMN_GAP))
-            .trimEnd(),
-    );
     const palace = `${palaceLines.join("\n")}\n`;
     const longLines = palaceLines
         .map((line, index) => ({ line: index + 1, chars: codepoints(line) }))
@@ -455,6 +499,7 @@ const coverage = {
     layout: {
         columns: COLUMN_COUNT,
         roomWidthChars: ROOM_WIDTH,
+        pageWidthChars: PAGE_WIDTH_CHARS,
         columnGapChars: COLUMN_GAP,
         canvasHeightCells: palace.trimEnd().split("\n").length,
         items: layoutItems,
