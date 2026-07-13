@@ -129,7 +129,7 @@
         "id": 4864,
         "category": "NAMING",
         "room": "Names & IDs",
-        "cue": "⚠ older cue `bash-<8hex>` vs Alfonso `bg-`",
+        "cue": "! older cue `bash-<8hex>` vs Alfonso `bg-`",
         "importance": 50
     },
     {

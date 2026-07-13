@@ -10,12 +10,11 @@ const CATEGORY_ORDER = [
     "NAMING",
     "KNOWN_ISSUES",
 ] as const;
-const MAX_LINE_CHARS = 152;
-const MAX_PALACE_CHARS = 20_000;
-const TARGET_CUE_CHARS = 8;
-const GRID_COLUMNS = 4;
-const GRID_COLUMN_WIDTH = 37;
-const GRID_GAP = 0;
+const COLUMN_COUNT = 3;
+const ROOM_WIDTH = 90;
+const COLUMN_GAP = 2;
+const MAX_LINE_CHARS = COLUMN_COUNT * ROOM_WIDTH + (COLUMN_COUNT - 1) * COLUMN_GAP;
+const MAX_PALACE_CHARS = 50_000;
 const SOURCE_PATH = "/tmp/visual-memory/trimmed-memories-source.txt";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -29,7 +28,13 @@ type SpecEntry = {
     importance: number;
 };
 type SourceMemory = { id: number; category: Category };
-type Placement = { category: Category; room: string; palaceLine: number; mergedInto?: number };
+type Placement = {
+    category: Category;
+    room: string;
+    palaceLine: number;
+    palaceColumn: number;
+    mergedInto?: number;
+};
 type RoomSummary = {
     category: Category;
     name: string;
@@ -38,6 +43,16 @@ type RoomSummary = {
     memoryCount: number;
     peakImportance: number;
     border: "single" | "double";
+    column: number;
+    startLine: number;
+    endLine: number;
+    heightCells: number;
+};
+type LayoutItem = {
+    kind: "category" | "room";
+    category: Category;
+    room?: string;
+    column: number;
     startLine: number;
     endLine: number;
 };
@@ -45,8 +60,6 @@ type RoomSummary = {
 type Box = {
     category: Category;
     name: string;
-    width: number;
-    span: number;
     lines: string[];
     relativeLines: Map<number, number>;
     entries: SpecEntry[];
@@ -117,94 +130,36 @@ function compactCue(raw: string, room: string): string {
         .split(/\s+(?:&|and)\s+|\s+/)
         .filter((word) => word.length >= 5)
         .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-    if (hubWords.length > 0)
+    if (hubWords.length > 0) {
         value = value.replace(new RegExp(`\\b(?:${hubWords.join("|")})\\b`, "gi"), "");
+    }
     const replacements: Array<[RegExp, string]> = [
         [/\bconfigurations?\b/gi, "cfg"],
         [/\bbackground\b/gi, "bg"],
-        [/\bprojects?\b/gi, "proj"],
-        [/\bworktrees?\b/gi, "wt"],
-        [/\bplugins?\b/gi, "plug"],
-        [/\bmemories?\b/gi, "mem"],
-        [/\bsemantic\b/gi, "sem"],
-        [/\bprocess(?:es)?\b/gi, "proc"],
-        [/\bsessions?\b/gi, "sess"],
-        [/\bstorage\b/gi, "store"],
-        [/\breleases?\b/gi, "rel"],
-        [/\bpackages?\b/gi, "pkg"],
-        [/\bresponses?\b/gi, "reply"],
-        [/\bresults?\b/gi, "out"],
         [/\benvironment\b/gi, "env"],
-        [/\bidentit(?:y|ies)\b/gi, "ID"],
-        [/\bperformance\b/gi, "perf"],
-        [/\bimportance\b/gi, "imp"],
-        [/\btemporary\b/gi, "tmp"],
-        [/\boperation(?:s)?\b/gi, "op"],
         [/\bparameters?\b/gi, "params"],
-        [/\barguments?\b/gi, "args"],
-        [/\bnotifications?\b/gi, "notif"],
-        [/\bcompletion(?:s)?\b/gi, "done"],
-        [/\bverification\b/gi, "verify"],
-        [/\bdeterministic\b/gi, "stable"],
-        [/\btransaction(?:al)?\b/gi, "txn"],
-        [/\bdiagnostics\b/gi, "diags"],
-        [/\bsynchronous\b/gi, "sync"],
-        [/\basynchronous\b/gi, "async"],
-        [/\bconcurrent(?:ly|cy)?\b/gi, "parallel"],
-        [/\boptional\b/gi, "opt"],
-        [/\bminimum\b/gi, "min"],
-        [/\bmaximum\b/gi, "max"],
-        [/\btemporary\b/gi, "temp"],
-        [/\bdifferent\b/gi, "≠"],
-        [/\bsame\b/gi, "="],
-        [/\bempty\b/gi, "∅"],
-        [/\bmissing\b/gi, "∅"],
-        [/\breturns?\b/gi, "→"],
-        [/\bwrites?\b/gi, "→"],
-        [/\breads?\b/gi, "←"],
-        [/\bsets?\b/gi, "="],
-        [/\bincludes?\b/gi, "+"],
-        [/\bcontains?\b/gi, "has"],
-        [/\bsupports?\b/gi, "+"],
-        [/\bwithout\b/gi, "⊘"],
-        [/\binstead of\b/gi, "⊘"],
-        [/\brather than\b/gi, "⊘"],
-        [/\bto prevent\b/gi, "⊘"],
-        [/\bprevent(?:s|ing)?\b/gi, "⊘"],
         [/\bbefore\b/gi, "≺"],
         [/\bafter\b/gi, "≻"],
         [/\bbecause\b/gi, "∵"],
+        [/\breturns?\b/gi, "→"],
+        [/\bwrites?\b/gi, "→"],
+        [/\breads?\b/gi, "←"],
         [/\brequires?\b/gi, "→"],
-        [/\busing\b/gi, "via"],
-        [/\bwith\b/gi, "+"],
-        [/\band\b/gi, "+"],
-        [/\bor\b/gi, "|"],
         [/\bevery\b/gi, "∀"],
-        [/\bnone\b/gi, "∅"],
         [/\ball\b/gi, "∀"],
+        [/\bnone\b/gi, "∅"],
         [/\bzero\b/gi, "0"],
-        [/\bsource\b/gi, "src"],
-        [/\bfunction\b/gi, "fn"],
-        [/\bdefault\b/gi, "dflt"],
-        [/\bcurrent\b/gi, "cur"],
-        [/\bexisting\b/gi, "existing"],
         [/\bthe\b/gi, ""],
         [/\ban?\b/gi, ""],
-        [/\s*;\s*/g, ";"],
-        [/\s*\+\s*/g, "+"],
+        [/\s*;\s*/g, "; "],
         [/\s*→\s*/g, "→"],
         [/\s*←\s*/g, "←"],
-        [/\s*=\s*/g, "="],
-        [/\s*\|\s*/g, "|"],
-        [/\s*:\s*/g, ":"],
-        [/\s*,\s*/g, ","],
+        [/\s*≺\s*/g, "≺"],
+        [/\s*≻\s*/g, "≻"],
+        [/\s*∵\s*/g, "∵"],
         [/\s{2,}/g, " "],
     ];
     for (const [pattern, replacement] of replacements) value = value.replace(pattern, replacement);
-    value = value.replace(/\b[a-z]{3,}\b/g, (word) => {
-        if (/^qz\d+zq$/i.test(word)) return word;
-        return `${word[0]}${word.slice(1).replace(/[aeiou]/g, "")}`;
-    });
     value = protectedValues.reduce(
         (result, item, index) => result.replace(`QZ${index}ZQ`, () => item),
         value,
@@ -212,43 +167,9 @@ function compactCue(raw: string, room: string): string {
     return value.trim().replace(/^[-:;,]+|[-:;,]+$/g, "");
 }
 
-function pruneCue(value: string): string {
-    if (codepoints(value) <= TARGET_CUE_CHARS) return value;
-    const words =
-        value.match(
-            /[^\s`]+`[^`]*`[^\s`]*|`[^`]*`|\([^)]*\)|[^\s`]*[\\/_:@$%<>=.|][^\s`]*|[^\s`()]+/g,
-        ) ?? [];
-    const keep = new Set<number>();
-    const keepWindow = (index: number, before: number, after: number): void => {
-        for (let offset = -before; offset <= after; offset++) {
-            if (index + offset >= 0 && index + offset < words.length) keep.add(index + offset);
-        }
-    };
-    words.forEach((word, index) => {
-        const codeLike =
-            /`[^`]+`/.test(word) ||
-            isExactToken(word) ||
-            (value.includes("⊘") && /^\([^()]+\)$/.test(word));
-        if (codeLike) keepWindow(index, 0, 0);
-        if (/[⊘←→≺≻]/.test(word)) keepWindow(index, 0, 1);
-    });
-    if (keep.size === 0) keep.add(0);
-    let length = [...keep].reduce((total, index) => total + codepoints(words[index] ?? "") + 1, 0);
-    for (let index = 0; index < words.length && length < TARGET_CUE_CHARS; index++) {
-        if (keep.has(index)) continue;
-        const next = codepoints(words[index] ?? "") + 1;
-        if (length + next <= TARGET_CUE_CHARS) {
-            keep.add(index);
-            length += next;
-        }
-    }
-    const pruned = words.filter((_, index) => keep.has(index)).join(" ");
-    return pruned;
-}
-
 function displayCue(entry: SpecEntry): string {
     const raw = Array.isArray(entry.cue) ? entry.cue.join("; ") : (entry.cue ?? "");
-    return pruneCue(compactCue(raw, entry.room));
+    return compactCue(raw, entry.room);
 }
 
 function validate(source: SourceMemory[], specs: SpecEntry[]): void {
@@ -271,6 +192,14 @@ function validate(source: SourceMemory[], specs: SpecEntry[]): void {
         if (cue && /#\d+/.test(cue)) throw new Error(`memory id leaked into cue ${spec.id}`);
         if (cue) {
             const renderedCue = displayCue(spec);
+            const negativeRule = /\b(?:must not|never|without|instead of|excludes?)\b/i.test(
+                renderedCue,
+            );
+            if (negativeRule && !renderedCue.includes("⊘")) {
+                throw new Error(
+                    `negative rule missing polarity marker in cue ${spec.id}: ${renderedCue}`,
+                );
+            }
             const polarityCount = renderedCue.split("⊘").length - 1;
             const mechanismCount = renderedCue.match(/\([^()]+\)/g)?.length ?? 0;
             if (polarityCount > mechanismCount) {
@@ -354,17 +283,20 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
     const merges = allEntries
         .filter((entry) => entry.mergeInto !== undefined)
         .sort((a, b) => a.id - b.id);
-    const peakImportance = Math.max(...allEntries.map((entry) => entry.importance));
-    const requiredOuterWidth = Math.max(longestToken(entries) + 4, codepoints(name) + 4);
-    const span = Math.ceil((requiredOuterWidth + GRID_GAP) / (GRID_COLUMN_WIDTH + GRID_GAP));
-    if (span > GRID_COLUMNS) throw new Error(`room ${name} needs ${requiredOuterWidth} columns`);
-    const width = span * GRID_COLUMN_WIDTH + (span - 1) * GRID_GAP;
-    const innerWidth = width - 2;
+    const innerWidth = ROOM_WIDTH - 2;
+    const requiredTokenWidth = longestToken(entries);
+    if (requiredTokenWidth > innerWidth) {
+        throw new Error(`room ${name} has ${requiredTokenWidth}-char anchor (max ${innerWidth})`);
+    }
+    if (codepoints(name) * 2 > innerWidth) {
+        throw new Error(`2x room title ${name} exceeds ${innerWidth} cells`);
+    }
+
     const body: string[] = [];
     const relativeLines = new Map<number, number>();
     for (const entry of entries) {
         const bodyLine = appendEntry(body, displayCue(entry), innerWidth);
-        relativeLines.set(entry.id, bodyLine + 1);
+        relativeLines.set(entry.id, bodyLine + 4);
     }
     for (const merge of merges) {
         const targetLine =
@@ -373,24 +305,29 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
         relativeLines.set(merge.id, targetLine);
     }
 
+    const peakImportance = Math.max(...allEntries.map((entry) => entry.importance));
     const high = peakImportance >= 70;
-    const [tl, fill, tr, side, bl, br] = high
-        ? ["╔", "═", "╗", "║", "╚", "╝"]
-        : ["┌", "─", "┐", "│", "└", "┘"];
-    const title = ` ${name} `;
-    const titleFill = Math.max(0, innerWidth - codepoints(title) - 1);
+    const [tl, fill, tr, side, middleLeft, middleRight, bl, br] = high
+        ? ["╔", "═", "╗", "║", "╠", "╣", "╚", "╝"]
+        : ["┌", "─", "┐", "│", "├", "┤", "└", "┘"];
+    const titlePadding = innerWidth - codepoints(name);
+    const title = `${" ".repeat(Math.floor(titlePadding / 2))}${name}${" ".repeat(Math.ceil(titlePadding / 2))}`;
     const lines = [
-        `${tl}${fill}${title}${fill.repeat(titleFill)}${tr}`,
+        `${tl}${fill.repeat(innerWidth)}${tr}`,
+        `${side}${title}${side}`,
+        `${side}${" ".repeat(innerWidth)}${side}`,
+        `${middleLeft}${fill.repeat(innerWidth)}${middleRight}`,
         ...body.map((line) => `${side}${line.padEnd(innerWidth)}${side}`),
         `${bl}${fill.repeat(innerWidth)}${br}`,
     ];
-    return { category, name, width, span, lines, relativeLines, entries, merges, peakImportance };
+    return { category, name, lines, relativeLines, entries, merges, peakImportance };
 }
 
 function renderPalace(specs: SpecEntry[]): {
     palace: string;
     placements: Map<number, Placement>;
     rooms: RoomSummary[];
+    layoutItems: LayoutItem[];
 } {
     const grouped = new Map<string, SpecEntry[]>();
     for (const spec of specs) {
@@ -399,65 +336,50 @@ function renderPalace(specs: SpecEntry[]): {
         list.push(spec);
         grouped.set(key, list);
     }
+
+    const columns = Array.from({ length: COLUMN_COUNT }, () => [] as string[]);
+    const heights = Array<number>(COLUMN_COUNT).fill(0);
     const placements = new Map<number, Placement>();
     const roomSummaries: RoomSummary[] = [];
-    const palaceLines: string[] = [];
+    const layoutItems: LayoutItem[] = [];
+
+    const shortestColumn = (): number => {
+        let selected = 0;
+        for (let column = 1; column < COLUMN_COUNT; column++) {
+            if (heights[column] < heights[selected]) selected = column;
+        }
+        return selected;
+    };
+    const placeLines = (lines: string[]): { column: number; row: number } => {
+        const column = shortestColumn();
+        const row = heights[column];
+        columns[column].push(...lines);
+        heights[column] += lines.length;
+        return { column, row };
+    };
+    const categoryBanner = (category: Category): string => {
+        const label = ` <${category}> `;
+        const remaining = ROOM_WIDTH - codepoints(label);
+        return `${"─".repeat(Math.floor(remaining / 2))}${label}${"─".repeat(Math.ceil(remaining / 2))}`;
+    };
+
     for (const category of CATEGORY_ORDER) {
-        palaceLines.push(`<${category}>`);
+        const banner = placeLines([categoryBanner(category)]);
+        layoutItems.push({
+            kind: "category",
+            category,
+            column: banner.column,
+            startLine: banner.row + 1,
+            endLine: banner.row + 1,
+        });
+
         const boxes = [...grouped.entries()]
             .filter(([key]) => key.startsWith(`${category}\u0000`))
             .map(([key, entries]) => buildBox(category, key.slice(category.length + 1), entries))
             .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-        const heights = Array<number>(GRID_COLUMNS).fill(0);
-        const placed: Array<{ box: Box; column: number; row: number; sharedTop: boolean }> = [];
-        const footprintBottom = new Map<string, number>();
         for (const box of boxes) {
-            let bestColumn = 0;
-            let bestRow = Number.POSITIVE_INFINITY;
-            for (let column = 0; column <= GRID_COLUMNS - box.span; column++) {
-                const columnHeight = Math.max(...heights.slice(column, column + box.span));
-                const footprint = `${column}:${box.span}`;
-                const canShare = footprintBottom.get(footprint) === columnHeight;
-                const row = canShare ? columnHeight - 1 : columnHeight;
-                if (row < bestRow) {
-                    bestColumn = column;
-                    bestRow = row;
-                }
-            }
-            const footprint = `${bestColumn}:${box.span}`;
-            const sharedTop = footprintBottom.get(footprint) === bestRow + 1;
-            placed.push({ box, column: bestColumn, row: bestRow, sharedTop });
-            const bottom = bestRow + box.lines.length;
-            footprintBottom.set(footprint, bottom);
-            for (let column = bestColumn; column < bestColumn + box.span; column++)
-                heights[column] = bottom;
-        }
-
-        const canvasHeight = Math.max(...heights);
-        const canvas = Array.from({ length: canvasHeight }, () =>
-            Array<string>(MAX_LINE_CHARS).fill(" "),
-        );
-        for (const { box, column, row, sharedTop } of placed) {
-            const left = column * (GRID_COLUMN_WIDTH + GRID_GAP);
-            box.lines.forEach((line, lineOffset) => {
-                [...line].forEach((character, characterOffset) => {
-                    const x = left + characterOffset;
-                    const canvasLine = canvas[row + lineOffset];
-                    if (!canvasLine) throw new Error(`canvas row missing for ${box.name}`);
-                    if ((!sharedTop || lineOffset > 0) && canvasLine[x] !== " ") {
-                        throw new Error(
-                            `room overlap at ${category}:${box.name}:${row + lineOffset + 1}:${x + 1}`,
-                        );
-                    }
-                    canvasLine[x] = character;
-                });
-            });
-        }
-        const canvasStart = palaceLines.length + 1;
-        palaceLines.push(...canvas.map((line) => line.join("").trimEnd()));
-
-        for (const { box, row } of placed) {
-            const startLine = canvasStart + row;
+            const placed = placeLines(box.lines);
+            const startLine = placed.row + 1;
             for (const entry of [...box.entries, ...box.merges]) {
                 const relativeLine = box.relativeLines.get(entry.id);
                 if (relativeLine === undefined)
@@ -466,6 +388,7 @@ function renderPalace(specs: SpecEntry[]): {
                     category: box.category,
                     room: box.name,
                     palaceLine: startLine + relativeLine,
+                    palaceColumn: placed.column * (ROOM_WIDTH + COLUMN_GAP) + 1,
                     ...(entry.mergeInto === undefined ? {} : { mergedInto: entry.mergeInto }),
                 });
             }
@@ -477,30 +400,48 @@ function renderPalace(specs: SpecEntry[]): {
                 memoryCount: box.entries.length + box.merges.length,
                 peakImportance: box.peakImportance,
                 border: box.peakImportance >= 70 ? "double" : "single",
+                column: placed.column,
+                startLine,
+                endLine: startLine + box.lines.length - 1,
+                heightCells: box.lines.length,
+            });
+            layoutItems.push({
+                kind: "room",
+                category: box.category,
+                room: box.name,
+                column: placed.column,
                 startLine,
                 endLine: startLine + box.lines.length - 1,
             });
         }
     }
 
+    const canvasHeight = Math.max(...heights);
+    const palaceLines = Array.from({ length: canvasHeight }, (_, row) =>
+        columns
+            .map((column) => (column[row] ?? "").padEnd(ROOM_WIDTH))
+            .join(" ".repeat(COLUMN_GAP))
+            .trimEnd(),
+    );
     const palace = `${palaceLines.join("\n")}\n`;
     const longLines = palaceLines
         .map((line, index) => ({ line: index + 1, chars: codepoints(line) }))
         .filter((item) => item.chars > MAX_LINE_CHARS);
-    if (longLines.length > 0)
+    if (longLines.length > 0) {
         throw new Error(`lines exceed ${MAX_LINE_CHARS}: ${JSON.stringify(longLines)}`);
+    }
     if (palace.length > MAX_PALACE_CHARS) {
         throw new Error(`palace has ${palace.length} chars (max ${MAX_PALACE_CHARS})`);
     }
     if (/#\d+/.test(palace)) throw new Error("memory id leaked into palace.txt");
-    return { palace, placements, rooms: roomSummaries };
+    return { palace, placements, rooms: roomSummaries, layoutItems };
 }
 
 const sourceText = readFileSync(SOURCE_PATH, "utf8");
 const source = parseSource(sourceText);
 const specs = readSpecs();
 validate(source, specs);
-const { palace, placements, rooms } = renderPalace(specs);
+const { palace, placements, rooms, layoutItems } = renderPalace(specs);
 const entryCount = specs.filter((entry) => entry.mergeInto === undefined).length;
 const mergeCount = specs.length - entryCount;
 const coverage = {
@@ -511,6 +452,13 @@ const coverage = {
     representedMemoryCount: entryCount + mergeCount,
     palaceChars: palace.length,
     maxLineChars: Math.max(...palace.trimEnd().split("\n").map(codepoints)),
+    layout: {
+        columns: COLUMN_COUNT,
+        roomWidthChars: ROOM_WIDTH,
+        columnGapChars: COLUMN_GAP,
+        canvasHeightCells: palace.trimEnd().split("\n").length,
+        items: layoutItems,
+    },
     rooms,
     memories: Object.fromEntries(
         [...placements.entries()]
