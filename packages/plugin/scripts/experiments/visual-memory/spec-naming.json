@@ -1,0 +1,142 @@
+[
+    {
+        "id": 5509,
+        "category": "NAMING",
+        "room": "Tool schema",
+        "cue": "config keys snake_case; plugin preferred over plugins",
+        "importance": 65
+    },
+    {
+        "id": 5508,
+        "category": "NAMING",
+        "room": "Tool schema",
+        "cue": "tool params camelCase; filePath preferred over file",
+        "importance": 65
+    },
+    {
+        "id": 6416,
+        "category": "NAMING",
+        "room": "Subc",
+        "cue": "Subconscious daemon→subc",
+        "importance": 50
+    },
+    {
+        "id": 7735,
+        "category": "NAMING",
+        "room": "Subc",
+        "cue": "subc/MCP routes bare delete|move|import|refactor|safety; agent IDs retain aft_",
+        "importance": 48
+    },
+    {
+        "id": 7892,
+        "category": "NAMING",
+        "room": "Tool schema",
+        "cue": "permission IDs aft_search vs grep independently gated",
+        "importance": 45
+    },
+    {
+        "id": 6497,
+        "category": "NAMING",
+        "room": "Tool schema",
+        "cue": "callgraph flat name_match edge suffix `~`; exact/type_match unmarked",
+        "importance": 45
+    },
+    {
+        "id": 8844,
+        "category": "NAMING",
+        "room": "Federation",
+        "cue": "trusted module-direct principals=alfonso-core, broca",
+        "importance": 42
+    },
+    {
+        "id": 8254,
+        "category": "NAMING",
+        "room": "Federation",
+        "cue": "harness class `fed:<fp>`",
+        "importance": 40
+    },
+    {
+        "id": 8284,
+        "category": "NAMING",
+        "room": "Federation",
+        "cue": "storage slug `fed--<prefix16>--<hash8>`",
+        "importance": 38
+    },
+    {
+        "id": 8353,
+        "category": "NAMING",
+        "room": "Federation",
+        "cue": "gatherer harness `runner`; session `alfonso:<gatherer-id>`",
+        "importance": 35
+    },
+    {
+        "id": 8261,
+        "category": "NAMING",
+        "room": "Federation",
+        "cue": "malformed fingerprint code=bad_harness_fingerprint",
+        "importance": 30
+    },
+    {
+        "id": 4918,
+        "category": "NAMING",
+        "room": "CLI",
+        "cue": "crates.io=agent-file-tools; Rust lib+CLI=aft",
+        "importance": 60
+    },
+    {
+        "id": 7928,
+        "category": "NAMING",
+        "room": "Tool schema",
+        "cue": "expected clone marker `aft:expected-duplicate`",
+        "importance": 55
+    },
+    {
+        "id": 7420,
+        "category": "NAMING",
+        "room": "Subc",
+        "cue": "worktree bridge pidfile `<worktreePath>.aft-bridge.pid`",
+        "importance": 55
+    },
+    {
+        "id": 4931,
+        "category": "NAMING",
+        "room": "Tool schema",
+        "cue": "built-in LSP id=python; ⊘pyright (config key mismatch)",
+        "importance": 55
+    },
+    {
+        "id": 7281,
+        "category": "NAMING",
+        "room": "Subc",
+        "cue": "MCP segment `mcp--<sanitized-client>-<raw-name-hash>`",
+        "importance": 50
+    },
+    {
+        "id": 7222,
+        "category": "NAMING",
+        "room": "Subc",
+        "mergeInto": 7281,
+        "importance": 45
+    },
+    {
+        "id": 7834,
+        "category": "NAMING",
+        "room": "Task IDs",
+        "cue": "background task `bash-<16hex>` vs Alfonso delegated `bg-`",
+        "importance": 50
+    },
+    {
+        "id": 4864,
+        "category": "NAMING",
+        "room": "Task IDs",
+        "cue": "! older cue `bash-<8hex>` vs Alfonso `bg-`",
+        "importance": 50
+    },
+    {
+        "id": 8620,
+        "category": "NAMING",
+        "room": "CLI",
+        "cue": "CLI: module restart|stop|start|status|list; health; describe",
+        "importance": 40
+    }
+]

@@ -1,0 +1,399 @@
+[
+    {
+        "id": 6686,
+        "category": "CONFIG_VALUES",
+        "room": "Bash",
+        "cue": "bash object→unspecified rewrite/compress/background=true",
+        "importance": 65
+    },
+    {
+        "id": 4883,
+        "category": "CONFIG_VALUES",
+        "room": "Bash",
+        "cue": "subagent async commands synchronous unless bash.subagent_background=true",
+        "importance": 60
+    },
+    {
+        "id": 4852,
+        "category": "CONFIG_VALUES",
+        "room": "Bash",
+        "cue": "bash_status/bash_kill/transport timeout ⊘bridge restart (own timeout handling)",
+        "importance": 60
+    },
+    {
+        "id": 5557,
+        "category": "CONFIG_VALUES",
+        "room": "Bash",
+        "cue": "bash.timeout positive integer; hard kill cap survives promotion",
+        "importance": 58
+    },
+    {
+        "id": 5555,
+        "category": "CONFIG_VALUES",
+        "room": "Bash",
+        "cue": "enablement resolves top-level bash→experimental.bash.*→old flat→tool_surface defaults",
+        "importance": 45
+    },
+    {
+        "id": 7296,
+        "category": "CONFIG_VALUES",
+        "room": "Bash",
+        "cue": "bash.foreground_window=15s",
+        "importance": 30
+    },
+    {
+        "id": 7297,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "format_on_edit idle debounce=90s",
+        "importance": 30
+    },
+    {
+        "id": 7295,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "format_on_edit=false",
+        "importance": 30
+    },
+    {
+        "id": 8554,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "Pi optionalInt schema: Type.Optional + Type.Union + Type.Integer({minimum,maximum}) + Type.String()",
+        "importance": 35
+    },
+    {
+        "id": 6598,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "formatter_timeout_secs/type_checker_timeout_secs user-only; project stripped+warned",
+        "importance": 65
+    },
+    {
+        "id": 7343,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "user ~/.config/cortexkit/aft.jsonc; project <project>/.cortexkit/aft.jsonc; legacy→.MOVED_READPLEASE",
+        "importance": 60
+    },
+    {
+        "id": 6152,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "mergeInto": 7343,
+        "importance": 60
+    },
+    {
+        "id": 4890,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": ".jsonc parse/write via comment-json (preserve comments)",
+        "importance": 55
+    },
+    {
+        "id": 4848,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "dataHome: XDG_DATA_HOME Unix; LOCALAPPDATA Windows; then standard home",
+        "importance": 54
+    },
+    {
+        "id": 4854,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "safe semantic settings deep-merge user+project",
+        "importance": 52
+    },
+    {
+        "id": 5473,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "lsp.versions canonical pin for npm + GitHub-release installs",
+        "importance": 50
+    },
+    {
+        "id": 8125,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "disabled_tools string[] e.g. [\"edit\"] prevents replacing host built-in (disabled-name-gate)",
+        "importance": 45
+    },
+    {
+        "id": 7912,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "enabled:boolean default=true, project-safe",
+        "importance": 15
+    },
+    {
+        "id": 6974,
+        "category": "CONFIG_VALUES",
+        "room": "Scheduler",
+        "cue": "Phase4 live actor soft cap≈8",
+        "importance": 60
+    },
+    {
+        "id": 8281,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "harness fingerprint `[0-9a-f]{32,64}`; malformed→fail loud",
+        "importance": 48
+    },
+    {
+        "id": 8619,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "daemon RLIMIT_NOFILE=8192",
+        "importance": 45
+    },
+    {
+        "id": 8214,
+        "category": "CONFIG_VALUES",
+        "room": "Scheduler",
+        "cue": "interim process-wide maintenance build cap=2",
+        "importance": 42
+    },
+    {
+        "id": 8122,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "multi_root.scan_depth=3; max_roots=32",
+        "importance": 40
+    },
+    {
+        "id": 8089,
+        "category": "CONFIG_VALUES",
+        "room": "E2E",
+        "cue": "CI NEXTEST_TEST_THREADS=num-cpus",
+        "importance": 40
+    },
+    {
+        "id": 8260,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "mergeInto": 8281,
+        "importance": 35
+    },
+    {
+        "id": 8283,
+        "category": "CONFIG_VALUES",
+        "room": "Scheduler",
+        "cue": "maintenance submissions=4/tick",
+        "importance": 25
+    },
+    {
+        "id": 8282,
+        "category": "CONFIG_VALUES",
+        "room": "Scheduler",
+        "cue": "reliable-push drain=32/turn",
+        "importance": 25
+    },
+    {
+        "id": 8157,
+        "category": "CONFIG_VALUES",
+        "room": "E2E",
+        "cue": "SUBC_CORE_BIN→cached binary on Linux/macOS CI",
+        "importance": 25
+    },
+    {
+        "id": 8167,
+        "category": "CONFIG_VALUES",
+        "room": "Release",
+        "cue": "private release secrets CK_CI_APP_ID + CK_CI_APP_PRIVATE_KEY",
+        "importance": 20
+    },
+    {
+        "id": 7949,
+        "category": "CONFIG_VALUES",
+        "room": "E2E",
+        "cue": [
+            "E2ETest aft-ready snapshot stores shared-folder path; revert wipes external repoint",
+            "repo move→switch snapshot→shf-host-del/add→delete old→new aft-ready"
+        ],
+        "importance": 50
+    },
+    {
+        "id": 8872,
+        "category": "CONFIG_VALUES",
+        "room": "Release",
+        "cue": [
+            "[profile.stage]: thin LTO, codegen-units=4, strip=false, debug=1",
+            "`cargo build --profile stage -p agent-file-tools`; target/stage; releases fat-LTO stripped"
+        ],
+        "importance": 48
+    },
+    {
+        "id": 8533,
+        "category": "CONFIG_VALUES",
+        "room": "E2E",
+        "cue": [
+            "Windows host ssh -i ~/.ssh/id_ed25519 ufuka@192.168.1.47; repo %USERPROFILE%\\aft",
+            "rustc1.96.1; git C:\\Program Files\\Git\\cmd\\git.exe; PowerShell5.1"
+        ],
+        "importance": 45
+    },
+    {
+        "id": 8588,
+        "category": "CONFIG_VALUES",
+        "room": "E2E",
+        "cue": [
+            "Windows=ROG Ally bare commands; macOS=M1 test@tests-MacBook-Pro.local",
+            "M1 /Users/test/bench.lock owner.json; ask SYNAPSE; ⊘/Users/test/bench-* or ~/models (bench-home)"
+        ],
+        "importance": 28
+    },
+    {
+        "id": 7425,
+        "category": "CONFIG_VALUES",
+        "room": "Images",
+        "cue": "image processing timeout=10s (bounded pool)",
+        "importance": 45
+    },
+    {
+        "id": 7424,
+        "category": "CONFIG_VALUES",
+        "room": "Images",
+        "cue": "resize longer-side cap=1024px",
+        "importance": 42
+    },
+    {
+        "id": 7548,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "aft_zoom container menu threshold=150 lines",
+        "importance": 35
+    },
+    {
+        "id": 6296,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "local all-MiniLM-L6-v2 backend string=fastembed (fingerprint compatibility)",
+        "importance": 65
+    },
+    {
+        "id": 6058,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "fingerprint=backend+model+normalized base_url+dimension+chunk version; change→full rebuild",
+        "importance": 65
+    },
+    {
+        "id": 4879,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "search cache key=git root commit; non-git=canonical root path",
+        "importance": 65
+    },
+    {
+        "id": 4851,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "semantic.timeout_ms=25s (before parent bridge timeout)",
+        "importance": 65
+    },
+    {
+        "id": 5432,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "MAX_EMBED_TEXT_CHARS=1600 (~400 tokens <512 backend)",
+        "importance": 60
+    },
+    {
+        "id": 7367,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "expansion: cosine≥0.60, rank0, non-test, ≤250 lines",
+        "importance": 58
+    },
+    {
+        "id": 5218,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "getCacheDir Windows `%LOCALAPPDATA%\\aft\\bin`, fallback APPDATA or ~/AppData/Local",
+        "importance": 56
+    },
+    {
+        "id": 6057,
+        "category": "CONFIG_VALUES",
+        "room": "Callgraph",
+        "cue": "AFT_CALLGRAPH_BUILD_WAIT_MS default0; tests large→sync build",
+        "importance": 55
+    },
+    {
+        "id": 5229,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "prepare ONNX iff semantic_search + fastembed/unset; ⊘openai_compatible/ollama (HTTP)",
+        "importance": 55
+    },
+    {
+        "id": 5460,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "raw ort weights=Qdrant/all-MiniLM-L6-v2-onnx tokenizer.json+model.onnx",
+        "importance": 50
+    },
+    {
+        "id": 7574,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "semantic cache V7; accepts V6 on disk",
+        "importance": 40
+    },
+    {
+        "id": 7495,
+        "category": "CONFIG_VALUES",
+        "room": "Embeddings",
+        "cue": "MAX_TOP_K overfetch=100",
+        "importance": 40
+    },
+    {
+        "id": 7465,
+        "category": "CONFIG_VALUES",
+        "room": "Callgraph",
+        "cue": "extensions +java,kt,kts,rb,swift,scala,lua,pl,pm",
+        "importance": 40
+    },
+    {
+        "id": 7464,
+        "category": "CONFIG_VALUES",
+        "room": "Callgraph",
+        "cue": "max_callgraph_files deleted (legacy in-memory layer removed)",
+        "importance": 25
+    },
+    {
+        "id": 8327,
+        "category": "CONFIG_VALUES",
+        "room": "Config",
+        "cue": "duplicate thresholds cost≥20 + span≥10 lines",
+        "importance": 28
+    },
+    {
+        "id": 8843,
+        "category": "CONFIG_VALUES",
+        "room": "Scheduler",
+        "cue": "writer promotion age=6s",
+        "importance": 25
+    },
+    {
+        "id": 8842,
+        "category": "CONFIG_VALUES",
+        "room": "Scheduler",
+        "cue": "watcher slice soft deadline=250ms",
+        "importance": 25
+    },
+    {
+        "id": 8841,
+        "category": "CONFIG_VALUES",
+        "room": "Scheduler",
+        "cue": "watcher slice budget=2048 paths",
+        "importance": 25
+    },
+    {
+        "id": 8352,
+        "category": "CONFIG_VALUES",
+        "room": "Scheduler",
+        "cue": "watcher/LSP drain cap=256",
+        "importance": 30
+    }
+]

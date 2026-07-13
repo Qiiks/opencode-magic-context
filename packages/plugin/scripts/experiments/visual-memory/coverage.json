@@ -1,0 +1,4143 @@
+{
+    "source": "/tmp/visual-memory/trimmed-memories-source.txt",
+    "sourceMemoryCount": 334,
+    "entryCount": 329,
+    "mergeCount": 5,
+    "representedMemoryCount": 334,
+    "palaceChars": 49044,
+    "maxLineChars": 218,
+    "layout": {
+        "font": "spleen-5x8",
+        "cellWidth": 5,
+        "cellHeight": 8,
+        "columns": 3,
+        "roomWidthChars": 72,
+        "pageWidthChars": 216,
+        "columnGapChars": 1,
+        "canvasHeightCells": 228,
+        "pageHeightPixels": 1092,
+        "bodyLinePitch": 9,
+        "pages": [
+            {
+                "page": 1,
+                "startLine": 1,
+                "endLine": 123,
+                "heightCells": 123,
+                "heightPixels": 1088
+            },
+            {
+                "page": 2,
+                "startLine": 124,
+                "endLine": 228,
+                "heightCells": 105,
+                "heightPixels": 911
+            }
+        ],
+        "cueLengthDistribution": {
+            "min": 20,
+            "p25": 57,
+            "median": 71,
+            "p75": 84,
+            "p90": 105,
+            "max": 204
+        },
+        "sharedPairCount": 4,
+        "bandGapRowsBefore": 46,
+        "bandGapRowsAfter": 16,
+        "roomSplitCount": 3,
+        "items": [
+            {
+                "kind": "category",
+                "category": "PROJECT_RULES",
+                "categories": [
+                    "PROJECT_RULES"
+                ],
+                "column": 0,
+                "startLine": 1,
+                "endLine": 1,
+                "page": 1,
+                "pageLine": 1,
+                "pageTopPixels": 0,
+                "heightPixels": 8
+            },
+            {
+                "kind": "room",
+                "category": "PROJECT_RULES",
+                "room": "E2E",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 2,
+                "endLine": 20,
+                "page": 1,
+                "pageLine": 2,
+                "pageTopPixels": 8,
+                "heightPixels": 168
+            },
+            {
+                "kind": "room",
+                "category": "PROJECT_RULES",
+                "room": "Engineering policy",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 2,
+                "endLine": 26,
+                "page": 1,
+                "pageLine": 2,
+                "pageTopPixels": 8,
+                "heightPixels": 222
+            },
+            {
+                "kind": "room",
+                "category": "PROJECT_RULES",
+                "room": "Inspect & tools",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 2,
+                "endLine": 22,
+                "page": 1,
+                "pageLine": 2,
+                "pageTopPixels": 8,
+                "heightPixels": 186
+            },
+            {
+                "kind": "room",
+                "category": "PROJECT_RULES",
+                "room": "Plugin",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 21,
+                "endLine": 37,
+                "page": 1,
+                "pageLine": 21,
+                "pageTopPixels": 176,
+                "heightPixels": 150
+            },
+            {
+                "kind": "room",
+                "category": "PROJECT_RULES",
+                "room": "Release & CI",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 27,
+                "endLine": 51,
+                "page": 1,
+                "pageLine": 27,
+                "pageTopPixels": 230,
+                "heightPixels": 222
+            },
+            {
+                "kind": "room",
+                "category": "PROJECT_RULES",
+                "room": "Tests",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 23,
+                "endLine": 52,
+                "page": 1,
+                "pageLine": 23,
+                "pageTopPixels": 194,
+                "heightPixels": 267
+            },
+            {
+                "kind": "room",
+                "category": "PROJECT_RULES",
+                "room": "Worktrees",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 38,
+                "endLine": 56,
+                "page": 1,
+                "pageLine": 38,
+                "pageTopPixels": 326,
+                "heightPixels": 168
+            },
+            {
+                "kind": "category",
+                "category": "ARCHITECTURE",
+                "categories": [
+                    "ARCHITECTURE"
+                ],
+                "column": 0,
+                "startLine": 57,
+                "endLine": 57,
+                "page": 1,
+                "pageLine": 57,
+                "pageTopPixels": 494,
+                "heightPixels": 8
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Artifacts",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 58,
+                "endLine": 102,
+                "page": 1,
+                "pageLine": 58,
+                "pageTopPixels": 502,
+                "heightPixels": 402
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Bash",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 103,
+                "endLine": 119,
+                "page": 1,
+                "pageLine": 103,
+                "pageTopPixels": 904,
+                "heightPixels": 150
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Bridge",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 58,
+                "endLine": 67,
+                "page": 1,
+                "pageLine": 58,
+                "pageTopPixels": 502,
+                "heightPixels": 87
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Embeddings",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 58,
+                "endLine": 78,
+                "page": 1,
+                "pageLine": 58,
+                "pageTopPixels": 502,
+                "heightPixels": 186
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Inspect & LSP",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 79,
+                "endLine": 122,
+                "page": 1,
+                "pageLine": 79,
+                "pageTopPixels": 688,
+                "heightPixels": 393
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Subc",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 68,
+                "endLine": 117,
+                "page": 1,
+                "pageLine": 68,
+                "pageTopPixels": 589,
+                "heightPixels": 447
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "TUI",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 118,
+                "endLine": 122,
+                "page": 1,
+                "pageLine": 118,
+                "pageTopPixels": 1036,
+                "heightPixels": 42
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "TUI",
+                "continuation": true,
+                "segment": 1,
+                "column": 0,
+                "startLine": 120,
+                "endLine": 123,
+                "page": 1,
+                "pageLine": 120,
+                "pageTopPixels": 1054,
+                "heightPixels": 34
+            },
+            {
+                "kind": "category",
+                "category": "ARCHITECTURE",
+                "categories": [
+                    "ARCHITECTURE"
+                ],
+                "column": 0,
+                "startLine": 124,
+                "endLine": 124,
+                "page": 2,
+                "pageLine": 1,
+                "pageTopPixels": 0,
+                "heightPixels": 8
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Prompts",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 125,
+                "endLine": 131,
+                "page": 2,
+                "pageLine": 2,
+                "pageTopPixels": 8,
+                "heightPixels": 60
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Synapse",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 125,
+                "endLine": 131,
+                "page": 2,
+                "pageLine": 2,
+                "pageTopPixels": 8,
+                "heightPixels": 60
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Watcher & scheduler",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 125,
+                "endLine": 142,
+                "page": 2,
+                "pageLine": 2,
+                "pageTopPixels": 8,
+                "heightPixels": 159
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Watcher & scheduler",
+                "continuation": true,
+                "segment": 1,
+                "column": 0,
+                "startLine": 132,
+                "endLine": 141,
+                "page": 2,
+                "pageLine": 9,
+                "pageTopPixels": 68,
+                "heightPixels": 88
+            },
+            {
+                "kind": "room",
+                "category": "ARCHITECTURE",
+                "room": "Watcher & scheduler",
+                "continuation": true,
+                "segment": 2,
+                "column": 1,
+                "startLine": 132,
+                "endLine": 141,
+                "page": 2,
+                "pageLine": 9,
+                "pageTopPixels": 68,
+                "heightPixels": 88
+            },
+            {
+                "kind": "category",
+                "category": "CONSTRAINTS",
+                "categories": [
+                    "CONSTRAINTS"
+                ],
+                "column": 0,
+                "startLine": 143,
+                "endLine": 143,
+                "page": 2,
+                "pageLine": 20,
+                "pageTopPixels": 167,
+                "heightPixels": 8
+            },
+            {
+                "kind": "room",
+                "category": "CONSTRAINTS",
+                "room": "Host platform",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 144,
+                "endLine": 172,
+                "page": 2,
+                "pageLine": 21,
+                "pageTopPixels": 175,
+                "heightPixels": 258
+            },
+            {
+                "kind": "room",
+                "category": "CONSTRAINTS",
+                "room": "OpenCode SDK",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 144,
+                "endLine": 172,
+                "page": 2,
+                "pageLine": 21,
+                "pageTopPixels": 175,
+                "heightPixels": 258
+            },
+            {
+                "kind": "room",
+                "category": "CONSTRAINTS",
+                "room": "Release",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 144,
+                "endLine": 154,
+                "page": 2,
+                "pageLine": 21,
+                "pageTopPixels": 175,
+                "heightPixels": 96
+            },
+            {
+                "kind": "room",
+                "category": "CONSTRAINTS",
+                "room": "Shell",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 155,
+                "endLine": 166,
+                "page": 2,
+                "pageLine": 32,
+                "pageTopPixels": 271,
+                "heightPixels": 105
+            },
+            {
+                "kind": "room",
+                "category": "CONSTRAINTS",
+                "room": "Subc",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 167,
+                "endLine": 177,
+                "page": 2,
+                "pageLine": 44,
+                "pageTopPixels": 376,
+                "heightPixels": 96
+            },
+            {
+                "kind": "category",
+                "category": "CONFIG_VALUES",
+                "categories": [
+                    "CONFIG_VALUES"
+                ],
+                "column": 0,
+                "startLine": 178,
+                "endLine": 178,
+                "page": 2,
+                "pageLine": 55,
+                "pageTopPixels": 472,
+                "heightPixels": 8
+            },
+            {
+                "kind": "room",
+                "category": "CONFIG_VALUES",
+                "room": "Bash",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 179,
+                "endLine": 190,
+                "page": 2,
+                "pageLine": 56,
+                "pageTopPixels": 480,
+                "heightPixels": 105
+            },
+            {
+                "kind": "room",
+                "category": "CONFIG_VALUES",
+                "room": "Callgraph",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 179,
+                "endLine": 184,
+                "page": 2,
+                "pageLine": 56,
+                "pageTopPixels": 480,
+                "heightPixels": 51
+            },
+            {
+                "kind": "room",
+                "category": "CONFIG_VALUES",
+                "room": "Config",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 185,
+                "endLine": 209,
+                "page": 2,
+                "pageLine": 62,
+                "pageTopPixels": 531,
+                "heightPixels": 222
+            },
+            {
+                "kind": "room",
+                "category": "CONFIG_VALUES",
+                "room": "E2E",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 179,
+                "endLine": 192,
+                "page": 2,
+                "pageLine": 56,
+                "pageTopPixels": 480,
+                "heightPixels": 123
+            },
+            {
+                "kind": "room",
+                "category": "CONFIG_VALUES",
+                "room": "Embeddings",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 193,
+                "endLine": 209,
+                "page": 2,
+                "pageLine": 70,
+                "pageTopPixels": 603,
+                "heightPixels": 150
+            },
+            {
+                "kind": "room",
+                "category": "CONFIG_VALUES",
+                "room": "Images",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 191,
+                "endLine": 195,
+                "page": 2,
+                "pageLine": 68,
+                "pageTopPixels": 585,
+                "heightPixels": 42
+            },
+            {
+                "kind": "room",
+                "category": "CONFIG_VALUES",
+                "room": "Release",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 196,
+                "endLine": 202,
+                "page": 2,
+                "pageLine": 73,
+                "pageTopPixels": 627,
+                "heightPixels": 60
+            },
+            {
+                "kind": "room",
+                "category": "CONFIG_VALUES",
+                "room": "Scheduler",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 203,
+                "endLine": 210,
+                "page": 2,
+                "pageLine": 80,
+                "pageTopPixels": 687,
+                "heightPixels": 69
+            },
+            {
+                "kind": "category",
+                "category": "NAMING",
+                "categories": [
+                    "NAMING",
+                    "KNOWN_ISSUES"
+                ],
+                "column": 0,
+                "startLine": 211,
+                "endLine": 211,
+                "page": 2,
+                "pageLine": 88,
+                "pageTopPixels": 756,
+                "heightPixels": 8
+            },
+            {
+                "kind": "room",
+                "category": "NAMING",
+                "room": "CLI",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 212,
+                "endLine": 216,
+                "page": 2,
+                "pageLine": 89,
+                "pageTopPixels": 764,
+                "heightPixels": 42
+            },
+            {
+                "kind": "room",
+                "category": "NAMING",
+                "room": "Federation",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 212,
+                "endLine": 219,
+                "page": 2,
+                "pageLine": 89,
+                "pageTopPixels": 764,
+                "heightPixels": 69
+            },
+            {
+                "kind": "room",
+                "category": "NAMING",
+                "room": "Subc",
+                "continuation": false,
+                "segment": 0,
+                "column": 1,
+                "startLine": 220,
+                "endLine": 227,
+                "page": 2,
+                "pageLine": 97,
+                "pageTopPixels": 833,
+                "heightPixels": 69
+            },
+            {
+                "kind": "room",
+                "category": "NAMING",
+                "room": "Task IDs",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 212,
+                "endLine": 216,
+                "page": 2,
+                "pageLine": 89,
+                "pageTopPixels": 764,
+                "heightPixels": 42
+            },
+            {
+                "kind": "room",
+                "category": "NAMING",
+                "room": "Tool schema",
+                "continuation": false,
+                "segment": 0,
+                "column": 0,
+                "startLine": 217,
+                "endLine": 225,
+                "page": 2,
+                "pageLine": 94,
+                "pageTopPixels": 806,
+                "heightPixels": 78
+            },
+            {
+                "kind": "room",
+                "category": "KNOWN_ISSUES",
+                "room": "Tool API",
+                "continuation": false,
+                "segment": 0,
+                "column": 2,
+                "startLine": 217,
+                "endLine": 228,
+                "page": 2,
+                "pageLine": 94,
+                "pageTopPixels": 806,
+                "heightPixels": 105
+            }
+        ]
+    },
+    "rooms": [
+        {
+            "category": "PROJECT_RULES",
+            "name": "E2E",
+            "entryCount": 9,
+            "mergeCount": 0,
+            "memoryCount": 9,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 0,
+            "startLine": 2,
+            "endLine": 20,
+            "heightCells": 19,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 2,
+            "pageTopPixels": 8,
+            "heightPixels": 168
+        },
+        {
+            "category": "PROJECT_RULES",
+            "name": "Engineering policy",
+            "entryCount": 13,
+            "mergeCount": 0,
+            "memoryCount": 13,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 1,
+            "startLine": 2,
+            "endLine": 26,
+            "heightCells": 25,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 2,
+            "pageTopPixels": 8,
+            "heightPixels": 222
+        },
+        {
+            "category": "PROJECT_RULES",
+            "name": "Inspect & tools",
+            "entryCount": 12,
+            "mergeCount": 0,
+            "memoryCount": 12,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 2,
+            "startLine": 2,
+            "endLine": 22,
+            "heightCells": 21,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 2,
+            "pageTopPixels": 8,
+            "heightPixels": 186
+        },
+        {
+            "category": "PROJECT_RULES",
+            "name": "Plugin",
+            "entryCount": 8,
+            "mergeCount": 0,
+            "memoryCount": 8,
+            "peakImportance": 67,
+            "border": "single",
+            "column": 0,
+            "startLine": 21,
+            "endLine": 37,
+            "heightCells": 17,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 21,
+            "pageTopPixels": 176,
+            "heightPixels": 150
+        },
+        {
+            "category": "PROJECT_RULES",
+            "name": "Release & CI",
+            "entryCount": 13,
+            "mergeCount": 1,
+            "memoryCount": 14,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 1,
+            "startLine": 27,
+            "endLine": 51,
+            "heightCells": 25,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 27,
+            "pageTopPixels": 230,
+            "heightPixels": 222
+        },
+        {
+            "category": "PROJECT_RULES",
+            "name": "Tests",
+            "entryCount": 17,
+            "mergeCount": 0,
+            "memoryCount": 17,
+            "peakImportance": 67,
+            "border": "single",
+            "column": 2,
+            "startLine": 23,
+            "endLine": 52,
+            "heightCells": 30,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 23,
+            "pageTopPixels": 194,
+            "heightPixels": 267
+        },
+        {
+            "category": "PROJECT_RULES",
+            "name": "Worktrees",
+            "entryCount": 10,
+            "mergeCount": 0,
+            "memoryCount": 10,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 0,
+            "startLine": 38,
+            "endLine": 56,
+            "heightCells": 19,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 38,
+            "pageTopPixels": 326,
+            "heightPixels": 168
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Artifacts",
+            "entryCount": 25,
+            "mergeCount": 0,
+            "memoryCount": 25,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 0,
+            "startLine": 58,
+            "endLine": 102,
+            "heightCells": 45,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 58,
+            "pageTopPixels": 502,
+            "heightPixels": 402
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Bash",
+            "entryCount": 9,
+            "mergeCount": 0,
+            "memoryCount": 9,
+            "peakImportance": 67,
+            "border": "single",
+            "column": 0,
+            "startLine": 103,
+            "endLine": 119,
+            "heightCells": 17,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 103,
+            "pageTopPixels": 904,
+            "heightPixels": 150
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Bridge",
+            "entryCount": 4,
+            "mergeCount": 0,
+            "memoryCount": 4,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 1,
+            "startLine": 58,
+            "endLine": 67,
+            "heightCells": 10,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 58,
+            "pageTopPixels": 502,
+            "heightPixels": 87
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Embeddings",
+            "entryCount": 12,
+            "mergeCount": 0,
+            "memoryCount": 12,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 2,
+            "startLine": 58,
+            "endLine": 78,
+            "heightCells": 21,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 58,
+            "pageTopPixels": 502,
+            "heightPixels": 186
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Inspect & LSP",
+            "entryCount": 22,
+            "mergeCount": 0,
+            "memoryCount": 22,
+            "peakImportance": 67,
+            "border": "single",
+            "column": 2,
+            "startLine": 79,
+            "endLine": 122,
+            "heightCells": 44,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 79,
+            "pageTopPixels": 688,
+            "heightPixels": 393
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Subc",
+            "entryCount": 26,
+            "mergeCount": 0,
+            "memoryCount": 26,
+            "peakImportance": 66,
+            "border": "single",
+            "column": 1,
+            "startLine": 68,
+            "endLine": 117,
+            "heightCells": 50,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 68,
+            "pageTopPixels": 589,
+            "heightPixels": 447
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "TUI",
+            "entryCount": 1,
+            "mergeCount": 0,
+            "memoryCount": 1,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 1,
+            "startLine": 118,
+            "endLine": 122,
+            "heightCells": 5,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 1,
+            "pageLine": 118,
+            "pageTopPixels": 1036,
+            "heightPixels": 42
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "TUI",
+            "entryCount": 1,
+            "mergeCount": 0,
+            "memoryCount": 1,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 0,
+            "startLine": 120,
+            "endLine": 123,
+            "heightCells": 4,
+            "sharedPairCount": 0,
+            "continuation": true,
+            "segment": 1,
+            "page": 1,
+            "pageLine": 120,
+            "pageTopPixels": 1054,
+            "heightPixels": 34
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Prompts",
+            "entryCount": 3,
+            "mergeCount": 0,
+            "memoryCount": 3,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 0,
+            "startLine": 125,
+            "endLine": 131,
+            "heightCells": 7,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 2,
+            "pageTopPixels": 8,
+            "heightPixels": 60
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Synapse",
+            "entryCount": 1,
+            "mergeCount": 0,
+            "memoryCount": 1,
+            "peakImportance": 52,
+            "border": "single",
+            "column": 1,
+            "startLine": 125,
+            "endLine": 131,
+            "heightCells": 7,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 2,
+            "pageTopPixels": 8,
+            "heightPixels": 60
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Watcher & scheduler",
+            "entryCount": 9,
+            "mergeCount": 1,
+            "memoryCount": 10,
+            "peakImportance": 66,
+            "border": "single",
+            "column": 2,
+            "startLine": 125,
+            "endLine": 142,
+            "heightCells": 18,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 2,
+            "pageTopPixels": 8,
+            "heightPixels": 159
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Watcher & scheduler",
+            "entryCount": 5,
+            "mergeCount": 0,
+            "memoryCount": 5,
+            "peakImportance": 66,
+            "border": "single",
+            "column": 0,
+            "startLine": 132,
+            "endLine": 141,
+            "heightCells": 10,
+            "sharedPairCount": 0,
+            "continuation": true,
+            "segment": 1,
+            "page": 2,
+            "pageLine": 9,
+            "pageTopPixels": 68,
+            "heightPixels": 88
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Watcher & scheduler",
+            "entryCount": 4,
+            "mergeCount": 0,
+            "memoryCount": 4,
+            "peakImportance": 66,
+            "border": "single",
+            "column": 1,
+            "startLine": 132,
+            "endLine": 141,
+            "heightCells": 10,
+            "sharedPairCount": 0,
+            "continuation": true,
+            "segment": 2,
+            "page": 2,
+            "pageLine": 9,
+            "pageTopPixels": 68,
+            "heightPixels": 88
+        },
+        {
+            "category": "CONSTRAINTS",
+            "name": "Host platform",
+            "entryCount": 15,
+            "mergeCount": 0,
+            "memoryCount": 15,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 0,
+            "startLine": 144,
+            "endLine": 172,
+            "heightCells": 29,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 21,
+            "pageTopPixels": 175,
+            "heightPixels": 258
+        },
+        {
+            "category": "CONSTRAINTS",
+            "name": "OpenCode SDK",
+            "entryCount": 15,
+            "mergeCount": 0,
+            "memoryCount": 15,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 1,
+            "startLine": 144,
+            "endLine": 172,
+            "heightCells": 29,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 21,
+            "pageTopPixels": 175,
+            "heightPixels": 258
+        },
+        {
+            "category": "CONSTRAINTS",
+            "name": "Release",
+            "entryCount": 5,
+            "mergeCount": 0,
+            "memoryCount": 5,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 2,
+            "startLine": 144,
+            "endLine": 154,
+            "heightCells": 11,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 21,
+            "pageTopPixels": 175,
+            "heightPixels": 96
+        },
+        {
+            "category": "CONSTRAINTS",
+            "name": "Shell",
+            "entryCount": 6,
+            "mergeCount": 0,
+            "memoryCount": 6,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 2,
+            "startLine": 155,
+            "endLine": 166,
+            "heightCells": 12,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 32,
+            "pageTopPixels": 271,
+            "heightPixels": 105
+        },
+        {
+            "category": "CONSTRAINTS",
+            "name": "Subc",
+            "entryCount": 5,
+            "mergeCount": 0,
+            "memoryCount": 5,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 2,
+            "startLine": 167,
+            "endLine": 177,
+            "heightCells": 11,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 44,
+            "pageTopPixels": 376,
+            "heightPixels": 96
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "Bash",
+            "entryCount": 6,
+            "mergeCount": 0,
+            "memoryCount": 6,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 0,
+            "startLine": 179,
+            "endLine": 190,
+            "heightCells": 12,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 56,
+            "pageTopPixels": 480,
+            "heightPixels": 105
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "Callgraph",
+            "entryCount": 3,
+            "mergeCount": 0,
+            "memoryCount": 3,
+            "peakImportance": 55,
+            "border": "single",
+            "column": 1,
+            "startLine": 179,
+            "endLine": 184,
+            "heightCells": 6,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 56,
+            "pageTopPixels": 480,
+            "heightPixels": 51
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "Config",
+            "entryCount": 17,
+            "mergeCount": 2,
+            "memoryCount": 19,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 1,
+            "startLine": 185,
+            "endLine": 209,
+            "heightCells": 25,
+            "sharedPairCount": 1,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 62,
+            "pageTopPixels": 531,
+            "heightPixels": 222
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "E2E",
+            "entryCount": 5,
+            "mergeCount": 0,
+            "memoryCount": 5,
+            "peakImportance": 50,
+            "border": "single",
+            "column": 2,
+            "startLine": 179,
+            "endLine": 192,
+            "heightCells": 14,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 56,
+            "pageTopPixels": 480,
+            "heightPixels": 123
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "Embeddings",
+            "entryCount": 10,
+            "mergeCount": 0,
+            "memoryCount": 10,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 2,
+            "startLine": 193,
+            "endLine": 209,
+            "heightCells": 17,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 70,
+            "pageTopPixels": 603,
+            "heightPixels": 150
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "Images",
+            "entryCount": 2,
+            "mergeCount": 0,
+            "memoryCount": 2,
+            "peakImportance": 45,
+            "border": "single",
+            "column": 0,
+            "startLine": 191,
+            "endLine": 195,
+            "heightCells": 5,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 68,
+            "pageTopPixels": 585,
+            "heightPixels": 42
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "Release",
+            "entryCount": 2,
+            "mergeCount": 0,
+            "memoryCount": 2,
+            "peakImportance": 48,
+            "border": "single",
+            "column": 0,
+            "startLine": 196,
+            "endLine": 202,
+            "heightCells": 7,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 73,
+            "pageTopPixels": 627,
+            "heightPixels": 60
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "Scheduler",
+            "entryCount": 8,
+            "mergeCount": 0,
+            "memoryCount": 8,
+            "peakImportance": 60,
+            "border": "single",
+            "column": 0,
+            "startLine": 203,
+            "endLine": 210,
+            "heightCells": 8,
+            "sharedPairCount": 3,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 80,
+            "pageTopPixels": 687,
+            "heightPixels": 69
+        },
+        {
+            "category": "NAMING",
+            "name": "CLI",
+            "entryCount": 2,
+            "mergeCount": 0,
+            "memoryCount": 2,
+            "peakImportance": 60,
+            "border": "single",
+            "column": 0,
+            "startLine": 212,
+            "endLine": 216,
+            "heightCells": 5,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 89,
+            "pageTopPixels": 764,
+            "heightPixels": 42
+        },
+        {
+            "category": "NAMING",
+            "name": "Federation",
+            "entryCount": 5,
+            "mergeCount": 0,
+            "memoryCount": 5,
+            "peakImportance": 42,
+            "border": "single",
+            "column": 1,
+            "startLine": 212,
+            "endLine": 219,
+            "heightCells": 8,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 89,
+            "pageTopPixels": 764,
+            "heightPixels": 69
+        },
+        {
+            "category": "NAMING",
+            "name": "Subc",
+            "entryCount": 4,
+            "mergeCount": 1,
+            "memoryCount": 5,
+            "peakImportance": 55,
+            "border": "single",
+            "column": 1,
+            "startLine": 220,
+            "endLine": 227,
+            "heightCells": 8,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 97,
+            "pageTopPixels": 833,
+            "heightPixels": 69
+        },
+        {
+            "category": "NAMING",
+            "name": "Task IDs",
+            "entryCount": 2,
+            "mergeCount": 0,
+            "memoryCount": 2,
+            "peakImportance": 50,
+            "border": "single",
+            "column": 2,
+            "startLine": 212,
+            "endLine": 216,
+            "heightCells": 5,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 89,
+            "pageTopPixels": 764,
+            "heightPixels": 42
+        },
+        {
+            "category": "NAMING",
+            "name": "Tool schema",
+            "entryCount": 6,
+            "mergeCount": 0,
+            "memoryCount": 6,
+            "peakImportance": 65,
+            "border": "single",
+            "column": 0,
+            "startLine": 217,
+            "endLine": 225,
+            "heightCells": 9,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 94,
+            "pageTopPixels": 806,
+            "heightPixels": 78
+        },
+        {
+            "category": "KNOWN_ISSUES",
+            "name": "Tool API",
+            "entryCount": 7,
+            "mergeCount": 0,
+            "memoryCount": 7,
+            "peakImportance": 50,
+            "border": "single",
+            "column": 2,
+            "startLine": 217,
+            "endLine": 228,
+            "heightCells": 12,
+            "sharedPairCount": 0,
+            "continuation": false,
+            "segment": 0,
+            "page": 2,
+            "pageLine": 94,
+            "pageTopPixels": 806,
+            "heightPixels": 105
+        }
+    ],
+    "memories": {
+        "19": {
+            "category": "KNOWN_ISSUES",
+            "room": "Tool API",
+            "palaceLine": 219,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 96
+        },
+        "245": {
+            "category": "KNOWN_ISSUES",
+            "room": "Tool API",
+            "palaceLine": 220,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 97
+        },
+        "246": {
+            "category": "KNOWN_ISSUES",
+            "room": "Tool API",
+            "palaceLine": 221,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 98
+        },
+        "247": {
+            "category": "KNOWN_ISSUES",
+            "room": "Tool API",
+            "palaceLine": 222,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 99
+        },
+        "248": {
+            "category": "KNOWN_ISSUES",
+            "room": "Tool API",
+            "palaceLine": 223,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 100
+        },
+        "249": {
+            "category": "KNOWN_ISSUES",
+            "room": "Tool API",
+            "palaceLine": 225,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 102
+        },
+        "353": {
+            "category": "KNOWN_ISSUES",
+            "room": "Tool API",
+            "palaceLine": 227,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 104
+        },
+        "4755": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 29,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 29
+        },
+        "4760": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 30,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 30
+        },
+        "4761": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 31,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 31
+        },
+        "4773": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 4,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 4
+        },
+        "4775": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 6,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 6
+        },
+        "4789": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 33,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 33
+        },
+        "4791": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 4,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 4
+        },
+        "4827": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 146,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 23
+        },
+        "4833": {
+            "category": "CONSTRAINTS",
+            "room": "Shell",
+            "palaceLine": 157,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 34
+        },
+        "4836": {
+            "category": "CONSTRAINTS",
+            "room": "Release",
+            "palaceLine": 146,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 23
+        },
+        "4837": {
+            "category": "CONSTRAINTS",
+            "room": "Release",
+            "palaceLine": 148,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 25
+        },
+        "4842": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 148,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 25
+        },
+        "4843": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 150,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 27
+        },
+        "4844": {
+            "category": "CONSTRAINTS",
+            "room": "Shell",
+            "palaceLine": 159,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 36
+        },
+        "4848": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 187,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 64
+        },
+        "4851": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 195,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 72
+        },
+        "4852": {
+            "category": "CONFIG_VALUES",
+            "room": "Bash",
+            "palaceLine": 181,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 58
+        },
+        "4854": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 189,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 66
+        },
+        "4864": {
+            "category": "NAMING",
+            "room": "Task IDs",
+            "palaceLine": 214,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 91
+        },
+        "4879": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 196,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 73
+        },
+        "4882": {
+            "category": "ARCHITECTURE",
+            "room": "Prompts",
+            "palaceLine": 127,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 4
+        },
+        "4883": {
+            "category": "CONFIG_VALUES",
+            "room": "Bash",
+            "palaceLine": 183,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 60
+        },
+        "4890": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 190,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 67
+        },
+        "4915": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 5,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 5
+        },
+        "4916": {
+            "category": "CONSTRAINTS",
+            "room": "Release",
+            "palaceLine": 150,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 27
+        },
+        "4918": {
+            "category": "NAMING",
+            "room": "CLI",
+            "palaceLine": 214,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 91
+        },
+        "4922": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 8,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 8
+        },
+        "4931": {
+            "category": "NAMING",
+            "room": "Tool schema",
+            "palaceLine": 219,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 96
+        },
+        "4940": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 9,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 9
+        },
+        "5210": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 7,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 7
+        },
+        "5216": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 25,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 25
+        },
+        "5218": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 191,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 68
+        },
+        "5219": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 151,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 28
+        },
+        "5223": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 153,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 30
+        },
+        "5224": {
+            "category": "CONSTRAINTS",
+            "room": "Release",
+            "palaceLine": 151,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 28
+        },
+        "5229": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 197,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 74
+        },
+        "5240": {
+            "category": "ARCHITECTURE",
+            "room": "Bash",
+            "palaceLine": 105,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 105
+        },
+        "5248": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 60,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 60
+        },
+        "5262": {
+            "category": "ARCHITECTURE",
+            "room": "Bridge",
+            "palaceLine": 60,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 60
+        },
+        "5266": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 27,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 27
+        },
+        "5269": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 40,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 40
+        },
+        "5297": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 8,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 8
+        },
+        "5308": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 34,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 34
+        },
+        "5422": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 35,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 35
+        },
+        "5429": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 61,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 61
+        },
+        "5432": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 199,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 76
+        },
+        "5460": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 200,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 77
+        },
+        "5473": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 193,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 70
+        },
+        "5508": {
+            "category": "NAMING",
+            "room": "Tool schema",
+            "palaceLine": 220,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 97
+        },
+        "5509": {
+            "category": "NAMING",
+            "room": "Tool schema",
+            "palaceLine": 221,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 98
+        },
+        "5541": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 37,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 37
+        },
+        "5547": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin",
+            "palaceLine": 23,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 23
+        },
+        "5550": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 28,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 28
+        },
+        "5555": {
+            "category": "CONFIG_VALUES",
+            "room": "Bash",
+            "palaceLine": 185,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 62
+        },
+        "5557": {
+            "category": "CONFIG_VALUES",
+            "room": "Bash",
+            "palaceLine": 187,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 64
+        },
+        "5589": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 81,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 81
+        },
+        "5592": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 83,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 83
+        },
+        "5595": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 85,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 85
+        },
+        "5604": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 60,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 60
+        },
+        "5615": {
+            "category": "CONSTRAINTS",
+            "room": "Shell",
+            "palaceLine": 160,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 37
+        },
+        "5618": {
+            "category": "ARCHITECTURE",
+            "room": "Bridge",
+            "palaceLine": 62,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 62
+        },
+        "5706": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 87,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 87
+        },
+        "5724": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 61,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 61
+        },
+        "5736": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 62,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 62
+        },
+        "5778": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 63,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 63
+        },
+        "5785": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 29,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 29
+        },
+        "5809": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 10,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 10
+        },
+        "5903": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 62,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 62
+        },
+        "5911": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 11,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 11
+        },
+        "5978": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 65,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 65
+        },
+        "6057": {
+            "category": "CONFIG_VALUES",
+            "room": "Callgraph",
+            "palaceLine": 181,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 58
+        },
+        "6058": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 202,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 79
+        },
+        "6059": {
+            "category": "ARCHITECTURE",
+            "room": "Bash",
+            "palaceLine": 107,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 107
+        },
+        "6093": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 31,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 31
+        },
+        "6094": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 63,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 63
+        },
+        "6102": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 64,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 64
+        },
+        "6105": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 146,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 23
+        },
+        "6112": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 41,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 41
+        },
+        "6116": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 65,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 65
+        },
+        "6145": {
+            "category": "ARCHITECTURE",
+            "room": "Bridge",
+            "palaceLine": 64,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 64
+        },
+        "6150": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 9,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 9
+        },
+        "6152": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 197,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 74,
+            "mergedInto": 7343
+        },
+        "6159": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 89,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 89
+        },
+        "6160": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 90,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 90
+        },
+        "6161": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 11,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 11
+        },
+        "6173": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 42,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 42
+        },
+        "6255": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 66,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 66
+        },
+        "6258": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 92,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 92
+        },
+        "6296": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 204,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 81
+        },
+        "6363": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 154,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 31
+        },
+        "6366": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 13,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 13
+        },
+        "6369": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 14,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 14
+        },
+        "6394": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 32,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 32
+        },
+        "6415": {
+            "category": "CONSTRAINTS",
+            "room": "Subc",
+            "palaceLine": 169,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 46
+        },
+        "6416": {
+            "category": "NAMING",
+            "room": "Subc",
+            "palaceLine": 222,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 99
+        },
+        "6428": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 93,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 93
+        },
+        "6438": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 15,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 15
+        },
+        "6446": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 156,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 33
+        },
+        "6452": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 68,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 68
+        },
+        "6486": {
+            "category": "ARCHITECTURE",
+            "room": "Prompts",
+            "palaceLine": 129,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 6
+        },
+        "6487": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 158,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 35
+        },
+        "6492": {
+            "category": "CONSTRAINTS",
+            "room": "Release",
+            "palaceLine": 153,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 30
+        },
+        "6497": {
+            "category": "NAMING",
+            "room": "Tool schema",
+            "palaceLine": 222,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 99
+        },
+        "6504": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 12,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 12
+        },
+        "6524": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin",
+            "palaceLine": 24,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 24
+        },
+        "6527": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin",
+            "palaceLine": 26,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 26
+        },
+        "6556": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 17,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 17
+        },
+        "6562": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 70,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 70
+        },
+        "6564": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 70,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 70
+        },
+        "6598": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 194,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 71
+        },
+        "6616": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 73,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 73
+        },
+        "6686": {
+            "category": "CONFIG_VALUES",
+            "room": "Bash",
+            "palaceLine": 188,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 65
+        },
+        "6689": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 148,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 25
+        },
+        "6730": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 150,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 27
+        },
+        "6732": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 14,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 14
+        },
+        "6733": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 72,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 72
+        },
+        "6738": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 95,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 95
+        },
+        "6845": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 127,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 4
+        },
+        "6870": {
+            "category": "ARCHITECTURE",
+            "room": "Bash",
+            "palaceLine": 108,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 108
+        },
+        "6887": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 97,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 97
+        },
+        "6894": {
+            "category": "PROJECT_RULES",
+            "room": "E2E",
+            "palaceLine": 4,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 4
+        },
+        "6896": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 15,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 15
+        },
+        "6974": {
+            "category": "CONFIG_VALUES",
+            "room": "Scheduler",
+            "palaceLine": 205,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 82
+        },
+        "6979": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 33,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 33
+        },
+        "6981": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 73,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 73
+        },
+        "7006": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 74,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 74
+        },
+        "7012": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 76,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 76
+        },
+        "7017": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 78,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 78
+        },
+        "7087": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 19,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 19
+        },
+        "7088": {
+            "category": "ARCHITECTURE",
+            "room": "Bash",
+            "palaceLine": 109,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 109
+        },
+        "7207": {
+            "category": "PROJECT_RULES",
+            "room": "E2E",
+            "palaceLine": 7,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 7
+        },
+        "7210": {
+            "category": "ARCHITECTURE",
+            "room": "Bash",
+            "palaceLine": 111,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 111
+        },
+        "7220": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 99,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 99
+        },
+        "7221": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 80,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 80
+        },
+        "7222": {
+            "category": "NAMING",
+            "room": "Subc",
+            "palaceLine": 223,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 100,
+            "mergedInto": 7281
+        },
+        "7241": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 75,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 75
+        },
+        "7281": {
+            "category": "NAMING",
+            "room": "Subc",
+            "palaceLine": 223,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 100
+        },
+        "7285": {
+            "category": "PROJECT_RULES",
+            "room": "E2E",
+            "palaceLine": 8,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 8
+        },
+        "7293": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 34,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 34
+        },
+        "7294": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 101,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 101
+        },
+        "7295": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 196,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 73
+        },
+        "7296": {
+            "category": "CONFIG_VALUES",
+            "room": "Bash",
+            "palaceLine": 189,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 66
+        },
+        "7297": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 196,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 73
+        },
+        "7308": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 66,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 66
+        },
+        "7343": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 197,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 74
+        },
+        "7353": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 77,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 77
+        },
+        "7354": {
+            "category": "ARCHITECTURE",
+            "room": "Bash",
+            "palaceLine": 112,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 112
+        },
+        "7355": {
+            "category": "CONSTRAINTS",
+            "room": "Shell",
+            "palaceLine": 161,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 38
+        },
+        "7367": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 206,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 83
+        },
+        "7383": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 35,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 35
+        },
+        "7385": {
+            "category": "CONSTRAINTS",
+            "room": "Shell",
+            "palaceLine": 163,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 40
+        },
+        "7419": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 152,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 29
+        },
+        "7420": {
+            "category": "NAMING",
+            "room": "Subc",
+            "palaceLine": 224,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 101
+        },
+        "7424": {
+            "category": "CONFIG_VALUES",
+            "room": "Images",
+            "palaceLine": 193,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 70
+        },
+        "7425": {
+            "category": "CONFIG_VALUES",
+            "room": "Images",
+            "palaceLine": 194,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 71
+        },
+        "7448": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 153,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 30
+        },
+        "7464": {
+            "category": "CONFIG_VALUES",
+            "room": "Callgraph",
+            "palaceLine": 182,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 59
+        },
+        "7465": {
+            "category": "CONFIG_VALUES",
+            "room": "Callgraph",
+            "palaceLine": 183,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 60
+        },
+        "7467": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 103,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 103
+        },
+        "7495": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 207,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 84
+        },
+        "7499": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 67,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 67
+        },
+        "7500": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 69,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 69
+        },
+        "7501": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 71,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 71
+        },
+        "7511": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 39,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 39
+        },
+        "7520": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 107,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 107
+        },
+        "7521": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 109,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 109
+        },
+        "7528": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 73,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 73
+        },
+        "7537": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 74,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 74
+        },
+        "7538": {
+            "category": "ARCHITECTURE",
+            "room": "Embeddings",
+            "palaceLine": 76,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 76
+        },
+        "7542": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 154,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 31
+        },
+        "7548": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 199,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 76
+        },
+        "7554": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 42,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 42
+        },
+        "7569": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 45,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 45
+        },
+        "7570": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 82,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 82
+        },
+        "7571": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 84,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 84
+        },
+        "7572": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 86,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 86
+        },
+        "7573": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 87,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 87
+        },
+        "7574": {
+            "category": "CONFIG_VALUES",
+            "room": "Embeddings",
+            "palaceLine": 208,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 85
+        },
+        "7592": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 88,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 88
+        },
+        "7615": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 90,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 90
+        },
+        "7633": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 111,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 111
+        },
+        "7695": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 37,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 37
+        },
+        "7699": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 46,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 46
+        },
+        "7702": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 39,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 39
+        },
+        "7722": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 129,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 6
+        },
+        "7723": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 131,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 8
+        },
+        "7727": {
+            "category": "PROJECT_RULES",
+            "room": "E2E",
+            "palaceLine": 9,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 9
+        },
+        "7728": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 92,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 92
+        },
+        "7735": {
+            "category": "NAMING",
+            "room": "Subc",
+            "palaceLine": 225,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 102
+        },
+        "7738": {
+            "category": "ARCHITECTURE",
+            "room": "Bridge",
+            "palaceLine": 65,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 65
+        },
+        "7753": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 95,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 95
+        },
+        "7754": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 133,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 10
+        },
+        "7767": {
+            "category": "CONSTRAINTS",
+            "room": "Subc",
+            "palaceLine": 171,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 48
+        },
+        "7800": {
+            "category": "PROJECT_RULES",
+            "room": "E2E",
+            "palaceLine": 11,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 11
+        },
+        "7801": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 135,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 12
+        },
+        "7802": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 97,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 97
+        },
+        "7814": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 136,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 13
+        },
+        "7815": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 159,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 36
+        },
+        "7834": {
+            "category": "NAMING",
+            "room": "Task IDs",
+            "palaceLine": 215,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 92
+        },
+        "7835": {
+            "category": "ARCHITECTURE",
+            "room": "TUI",
+            "palaceLine": 120,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 120
+        },
+        "7863": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin",
+            "palaceLine": 27,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 27
+        },
+        "7892": {
+            "category": "NAMING",
+            "room": "Tool schema",
+            "palaceLine": 223,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 100
+        },
+        "7903": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 160,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 37
+        },
+        "7912": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 200,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 77
+        },
+        "7916": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 42,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 42
+        },
+        "7918": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin",
+            "palaceLine": 30,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 30
+        },
+        "7928": {
+            "category": "NAMING",
+            "room": "Tool schema",
+            "palaceLine": 224,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 101
+        },
+        "7931": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 113,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 113
+        },
+        "7932": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 115,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 115
+        },
+        "7939": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 116,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 116
+        },
+        "7940": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 118,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 118
+        },
+        "7949": {
+            "category": "CONFIG_VALUES",
+            "room": "E2E",
+            "palaceLine": 181,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 58
+        },
+        "7958": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 79,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 79
+        },
+        "7990": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 44,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 44
+        },
+        "7991": {
+            "category": "PROJECT_RULES",
+            "room": "E2E",
+            "palaceLine": 13,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 13
+        },
+        "7992": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 119,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 119
+        },
+        "8029": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 162,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 39
+        },
+        "8040": {
+            "category": "ARCHITECTURE",
+            "room": "Inspect & LSP",
+            "palaceLine": 120,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 120
+        },
+        "8050": {
+            "category": "ARCHITECTURE",
+            "room": "Synapse",
+            "palaceLine": 127,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 4
+        },
+        "8076": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 164,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 41
+        },
+        "8087": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 81,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 81
+        },
+        "8088": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 156,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 33
+        },
+        "8089": {
+            "category": "CONFIG_VALUES",
+            "room": "E2E",
+            "palaceLine": 184,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 61
+        },
+        "8091": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 158,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 35
+        },
+        "8121": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 160,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 37
+        },
+        "8122": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 201,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 78
+        },
+        "8124": {
+            "category": "CONSTRAINTS",
+            "room": "Subc",
+            "palaceLine": 173,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 50
+        },
+        "8125": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 202,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 79
+        },
+        "8130": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 140,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 17,
+            "mergedInto": 8298
+        },
+        "8156": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 98,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 98
+        },
+        "8157": {
+            "category": "CONFIG_VALUES",
+            "room": "E2E",
+            "palaceLine": 185,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 62
+        },
+        "8158": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 100,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 100
+        },
+        "8165": {
+            "category": "ARCHITECTURE",
+            "room": "Bash",
+            "palaceLine": 114,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 114
+        },
+        "8167": {
+            "category": "CONFIG_VALUES",
+            "room": "Release",
+            "palaceLine": 198,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 75
+        },
+        "8186": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 83,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 83
+        },
+        "8187": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 84,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 84
+        },
+        "8188": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 85,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 85
+        },
+        "8189": {
+            "category": "CONSTRAINTS",
+            "room": "Subc",
+            "palaceLine": 174,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 51
+        },
+        "8193": {
+            "category": "PROJECT_RULES",
+            "room": "Inspect & tools",
+            "palaceLine": 21,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 21
+        },
+        "8195": {
+            "category": "ARCHITECTURE",
+            "room": "Bash",
+            "palaceLine": 117,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 117
+        },
+        "8198": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 45,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 45
+        },
+        "8199": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 46,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 46
+        },
+        "8201": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 44,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 44
+        },
+        "8214": {
+            "category": "CONFIG_VALUES",
+            "room": "Scheduler",
+            "palaceLine": 206,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 83
+        },
+        "8253": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 103,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 103
+        },
+        "8254": {
+            "category": "NAMING",
+            "room": "Federation",
+            "palaceLine": 214,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 91
+        },
+        "8255": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 50,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 50,
+            "mergedInto": 8391
+        },
+        "8256": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 138,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 15
+        },
+        "8257": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 139,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 16
+        },
+        "8258": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 86,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 86
+        },
+        "8259": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 161,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 38
+        },
+        "8260": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 204,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 81,
+            "mergedInto": 8281
+        },
+        "8261": {
+            "category": "NAMING",
+            "room": "Federation",
+            "palaceLine": 215,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 92
+        },
+        "8271": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 48,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 48
+        },
+        "8280": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 105,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 105
+        },
+        "8281": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 204,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 81
+        },
+        "8282": {
+            "category": "CONFIG_VALUES",
+            "room": "Scheduler",
+            "palaceLine": 207,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 84
+        },
+        "8283": {
+            "category": "CONFIG_VALUES",
+            "room": "Scheduler",
+            "palaceLine": 207,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 84
+        },
+        "8284": {
+            "category": "NAMING",
+            "room": "Federation",
+            "palaceLine": 216,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 93
+        },
+        "8298": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 140,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 17
+        },
+        "8299": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 107,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 107
+        },
+        "8314": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin",
+            "palaceLine": 31,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 31
+        },
+        "8326": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 133,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 10
+        },
+        "8327": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 205,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 82
+        },
+        "8340": {
+            "category": "ARCHITECTURE",
+            "room": "Bash",
+            "palaceLine": 118,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 118
+        },
+        "8345": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 109,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 109
+        },
+        "8346": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 111,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 111
+        },
+        "8347": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 134,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 11
+        },
+        "8348": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 136,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 13
+        },
+        "8349": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 112,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 112
+        },
+        "8350": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 114,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 114
+        },
+        "8351": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 162,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 39
+        },
+        "8352": {
+            "category": "CONFIG_VALUES",
+            "room": "Scheduler",
+            "palaceLine": 208,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 85
+        },
+        "8353": {
+            "category": "NAMING",
+            "room": "Federation",
+            "palaceLine": 217,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 94
+        },
+        "8354": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin",
+            "palaceLine": 33,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 33
+        },
+        "8355": {
+            "category": "ARCHITECTURE",
+            "room": "TUI",
+            "palaceLine": 121,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 121
+        },
+        "8356": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 166,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 43
+        },
+        "8357": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 168,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 45
+        },
+        "8385": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 138,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 15
+        },
+        "8389": {
+            "category": "PROJECT_RULES",
+            "room": "E2E",
+            "palaceLine": 15,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 15
+        },
+        "8391": {
+            "category": "PROJECT_RULES",
+            "room": "Release & CI",
+            "palaceLine": 50,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 50
+        },
+        "8400": {
+            "category": "PROJECT_RULES",
+            "room": "E2E",
+            "palaceLine": 17,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 17
+        },
+        "8405": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 164,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 41
+        },
+        "8440": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 18,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 18
+        },
+        "8457": {
+            "category": "PROJECT_RULES",
+            "room": "E2E",
+            "palaceLine": 18,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 18
+        },
+        "8458": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 46,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 46
+        },
+        "8505": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 87,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 87
+        },
+        "8531": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 47,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 47
+        },
+        "8533": {
+            "category": "CONFIG_VALUES",
+            "room": "E2E",
+            "palaceLine": 186,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 63
+        },
+        "8534": {
+            "category": "ARCHITECTURE",
+            "room": "Prompts",
+            "palaceLine": 130,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 7
+        },
+        "8535": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode SDK",
+            "palaceLine": 170,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 47
+        },
+        "8554": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 206,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 83
+        },
+        "8555": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 139,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 16
+        },
+        "8577": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 133,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 10
+        },
+        "8579": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 89,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 89
+        },
+        "8588": {
+            "category": "CONFIG_VALUES",
+            "room": "E2E",
+            "palaceLine": 189,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 66
+        },
+        "8590": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 47,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 47
+        },
+        "8601": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 91,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 91
+        },
+        "8612": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 50,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 50
+        },
+        "8614": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 94,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 94
+        },
+        "8615": {
+            "category": "ARCHITECTURE",
+            "room": "Subc",
+            "palaceLine": 115,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 115
+        },
+        "8616": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 136,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 13
+        },
+        "8617": {
+            "category": "CONSTRAINTS",
+            "room": "Subc",
+            "palaceLine": 175,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 52
+        },
+        "8618": {
+            "category": "CONSTRAINTS",
+            "room": "Shell",
+            "palaceLine": 165,
+            "palaceColumn": 147,
+            "page": 2,
+            "pageLine": 42
+        },
+        "8619": {
+            "category": "CONFIG_VALUES",
+            "room": "Config",
+            "palaceLine": 208,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 85
+        },
+        "8620": {
+            "category": "NAMING",
+            "room": "CLI",
+            "palaceLine": 215,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 92
+        },
+        "8621": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 166,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 43
+        },
+        "8623": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin",
+            "palaceLine": 35,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 35
+        },
+        "8633": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 20,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 20
+        },
+        "8713": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 51,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 51
+        },
+        "8729": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 49,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 49
+        },
+        "8730": {
+            "category": "PROJECT_RULES",
+            "room": "Worktrees",
+            "palaceLine": 54,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 54
+        },
+        "8731": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 96,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 96
+        },
+        "8733": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 98,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 98
+        },
+        "8734": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 169,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 46
+        },
+        "8735": {
+            "category": "CONSTRAINTS",
+            "room": "Host platform",
+            "palaceLine": 171,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 48
+        },
+        "8837": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 22,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 22
+        },
+        "8838": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 138,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 15
+        },
+        "8839": {
+            "category": "ARCHITECTURE",
+            "room": "Watcher & scheduler",
+            "palaceLine": 140,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 17
+        },
+        "8840": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts",
+            "palaceLine": 100,
+            "palaceColumn": 1,
+            "page": 1,
+            "pageLine": 100
+        },
+        "8841": {
+            "category": "CONFIG_VALUES",
+            "room": "Scheduler",
+            "palaceLine": 208,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 85
+        },
+        "8842": {
+            "category": "CONFIG_VALUES",
+            "room": "Scheduler",
+            "palaceLine": 209,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 86
+        },
+        "8843": {
+            "category": "CONFIG_VALUES",
+            "room": "Scheduler",
+            "palaceLine": 209,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 86
+        },
+        "8844": {
+            "category": "NAMING",
+            "room": "Federation",
+            "palaceLine": 218,
+            "palaceColumn": 74,
+            "page": 2,
+            "pageLine": 95
+        },
+        "8872": {
+            "category": "CONFIG_VALUES",
+            "room": "Release",
+            "palaceLine": 199,
+            "palaceColumn": 1,
+            "page": 2,
+            "pageLine": 76
+        },
+        "8912": {
+            "category": "PROJECT_RULES",
+            "room": "Tests",
+            "palaceLine": 50,
+            "palaceColumn": 147,
+            "page": 1,
+            "pageLine": 50
+        },
+        "8913": {
+            "category": "PROJECT_RULES",
+            "room": "Engineering policy",
+            "palaceLine": 24,
+            "palaceColumn": 74,
+            "page": 1,
+            "pageLine": 24
+        }
+    }
+}

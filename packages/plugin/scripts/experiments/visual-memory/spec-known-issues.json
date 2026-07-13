@@ -1,0 +1,51 @@
+[
+    {
+        "id": 353,
+        "category": "KNOWN_ISSUES",
+        "room": "Tool API",
+        "cue": "tool.definition hook ⊘model/agent info (cannot tailor definitions)",
+        "importance": 50
+    },
+    {
+        "id": 249,
+        "category": "KNOWN_ISSUES",
+        "room": "Tool API",
+        "cue": "hoisted apply_patch ⊘huge metadata.diagnostics (Biome repos attach payload)",
+        "importance": 50
+    },
+    {
+        "id": 248,
+        "category": "KNOWN_ISSUES",
+        "room": "Tool API",
+        "cue": "TS buildUnifiedDiff ⊘optimal insertion summaries (heuristic suboptimal)",
+        "importance": 50
+    },
+    {
+        "id": 247,
+        "category": "KNOWN_ISSUES",
+        "room": "Tool API",
+        "cue": "aft_navigate ⊘some cross-file refs (LSP resolves more)",
+        "importance": 50
+    },
+    {
+        "id": 246,
+        "category": "KNOWN_ISSUES",
+        "room": "Tool API",
+        "cue": "hoisted edit ⊘weak-model safety (replace + advanced modes mixed)",
+        "importance": 50
+    },
+    {
+        "id": 245,
+        "category": "KNOWN_ISSUES",
+        "room": "Tool API",
+        "cue": "shared sessions ⊘same-path undo isolation (agents overwrite backups)",
+        "importance": 50
+    },
+    {
+        "id": 19,
+        "category": "KNOWN_ISSUES",
+        "room": "Tool API",
+        "cue": "aft_edit ⊘literal `\\n` match ergonomics (escape becomes newline)",
+        "importance": 50
+    }
+]
