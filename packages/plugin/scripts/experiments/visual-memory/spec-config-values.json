@@ -59,7 +59,7 @@
         "id": 8554,
         "category": "CONFIG_VALUES",
         "room": "Config",
-        "cue": "Pi optionalInt=Type.Optional(Type.Union([Type.Integer({minimum,maximum}),Type.String()]))",
+        "cue": "Pi optionalInt schema: Type.Optional + Type.Union + Type.Integer({minimum,maximum}) + Type.String()",
         "importance": 35
     },
     {

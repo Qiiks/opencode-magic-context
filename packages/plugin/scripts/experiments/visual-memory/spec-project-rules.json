@@ -5,7 +5,7 @@
         "room": "Plugin",
         "cue": [
             "shortcircuit: empty→empty; ⊘fabrication (filter summarizes only actual bytes)",
-            "guard compress_filters_test.rs::builtin_filters_never_fabricate_output_for_empty_input"
+            "guard compress_filters_test.rs + builtin_filters_never_fabricate_output_for_empty_input"
         ],
         "importance": 67
     },
@@ -185,7 +185,7 @@
     {
         "id": 5266,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "semantic platform changes preserve Intel Mac",
         "importance": 60
     },
@@ -261,7 +261,7 @@
     {
         "id": 6093,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "SQLite busy_timeout before journal_mode=WAL (cold-open race)",
         "importance": 65
     },
@@ -275,7 +275,7 @@
     {
         "id": 7383,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "rolled_back:true→success + unchanged; ⊘hard error (rollback succeeded)",
         "importance": 65
     },
@@ -341,7 +341,7 @@
     {
         "id": 7695,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": [
             "byte-golden `\\n` fixtures→root .gitattributes eol=lf; binary *.raw",
             "⊘local windows-gnu check as proof (compile-only, no byte test)"
@@ -423,28 +423,28 @@
     {
         "id": 6394,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "promptAsync exactly one: synthetic:true wake OR ignored:true panel",
         "importance": 60
     },
     {
         "id": 5216,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "isTerminalStatus allowlist completed|failed|killed|timed_out; ⊘`!=running` (unknown states)",
         "importance": 65
     },
     {
         "id": 8201,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "client timeout→explicit bash_kill; ⊘orphan execution (executor starvation)",
         "importance": 63
     },
     {
         "id": 8531,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "CPU flake brief: ≤8 hogs, nice -n 19, EXIT/INT/TERM traps, pgrep between rounds",
         "importance": 65
     },
@@ -500,14 +500,14 @@
     {
         "id": 8912,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "⊘bind/configure nonexistent roots (stale restored sessions consume modules)",
         "importance": 50
     },
     {
         "id": 7702,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": [
             "nonzero shell test: Windows native `cmd /c \"echo x&exit 7\"`; Unix `printf x; exit 7`",
             "⊘bare PowerShell `exit N` (kills wrapper before exit-marker)"
@@ -517,21 +517,21 @@
     {
         "id": 5550,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "Unix APIs e.g. PermissionsExt→#[cfg(unix)] (Windows compile)",
         "importance": 65
     },
     {
         "id": 7916,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "logger assertions spy logger.log; ⊘shared logfile/sleeps (parallel flakes)",
         "importance": 60
     },
     {
         "id": 7293,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "format subsystem tests opt in format_on_edit:true",
         "importance": 60
     },
@@ -545,7 +545,7 @@
     {
         "id": 6979,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "cargo commands serial (shared target build-lock/CPU)",
         "importance": 60
     },
@@ -562,21 +562,21 @@
     {
         "id": 5785,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "Windows verification=native Windows; ⊘Unix target-check shim (Unix-gated helpers)",
         "importance": 60
     },
     {
         "id": 8458,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "real FSEvents tests→serialized watcher_integration binary",
         "importance": 58
     },
     {
         "id": 8729,
         "category": "PROJECT_RULES",
-        "room": "E2E",
+        "room": "Tests",
         "cue": "src/ gate includes `--lib` touched module (unit failures)",
         "importance": 40
     },

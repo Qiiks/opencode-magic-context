@@ -10,9 +10,17 @@ const CATEGORY_ORDER = [
     "NAMING",
     "KNOWN_ISSUES",
 ] as const;
+const BAND_GROUPS: ReadonlyArray<ReadonlyArray<(typeof CATEGORY_ORDER)[number]>> = [
+    ["PROJECT_RULES"],
+    ["ARCHITECTURE"],
+    ["CONSTRAINTS"],
+    ["CONFIG_VALUES"],
+    ["NAMING", "KNOWN_ISSUES"],
+];
 const COLUMN_COUNT = 3;
-const ROOM_WIDTH = 90;
-const COLUMN_GAP = 2;
+const ROOM_WIDTH = 72;
+const COLUMN_GAP = 1;
+const PAGE_ROW_CAPACITY = 136;
 const PAGE_WIDTH_CHARS = COLUMN_COUNT * ROOM_WIDTH;
 const MAX_LINE_CHARS = PAGE_WIDTH_CHARS + (COLUMN_COUNT - 1) * COLUMN_GAP;
 const MAX_PALACE_CHARS = 70_000;
@@ -34,6 +42,8 @@ type Placement = {
     room: string;
     palaceLine: number;
     palaceColumn: number;
+    page: number;
+    pageLine: number;
     mergedInto?: number;
 };
 type RoomSummary = {
@@ -48,14 +58,20 @@ type RoomSummary = {
     startLine: number;
     endLine: number;
     heightCells: number;
+    sharedPairCount: number;
+    page: number;
+    pageLine: number;
 };
 type LayoutItem = {
     kind: "category" | "room";
     category: Category;
+    categories?: Category[];
     room?: string;
     column: number;
     startLine: number;
     endLine: number;
+    page: number;
+    pageLine: number;
 };
 
 type Box = {
@@ -66,6 +82,7 @@ type Box = {
     entries: SpecEntry[];
     merges: SpecEntry[];
     peakImportance: number;
+    sharedPairCount: number;
 };
 
 function codepoints(value: string): number {
@@ -337,9 +354,33 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
 
     const body: string[] = [];
     const relativeLines = new Map<number, number>();
-    for (const entry of entries) {
-        const bodyLine = appendEntry(body, displayCue(entry), innerWidth);
-        relativeLines.set(entry.id, bodyLine + 4);
+    const shortEntryLimit = Math.floor((innerWidth - 4) / 2);
+    let sharedPairCount = 0;
+    for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index];
+        if (!entry) continue;
+        const cue = displayCue(entry);
+        const next = entries[index + 1];
+        const nextCue = next ? displayCue(next) : "";
+        const shared = `•${cue} • ${nextCue}`;
+        if (
+            next &&
+            !cue.includes("⊘") &&
+            !nextCue.includes("⊘") &&
+            codepoints(cue) <= shortEntryLimit &&
+            codepoints(nextCue) <= shortEntryLimit &&
+            codepoints(shared) <= innerWidth
+        ) {
+            const bodyLine = body.length;
+            body.push(shared);
+            relativeLines.set(entry.id, bodyLine + 2);
+            relativeLines.set(next.id, bodyLine + 2);
+            sharedPairCount++;
+            index++;
+            continue;
+        }
+        const bodyLine = appendEntry(body, cue, innerWidth);
+        relativeLines.set(entry.id, bodyLine + 2);
     }
     for (const merge of merges) {
         const targetLine =
@@ -350,20 +391,27 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
 
     const peakImportance = Math.max(...allEntries.map((entry) => entry.importance));
     const high = peakImportance >= 70;
-    const [tl, fill, tr, side, middleLeft, middleRight, bl, br] = high
-        ? ["╔", "═", "╗", "║", "╠", "╣", "╚", "╝"]
-        : ["┌", "─", "┐", "│", "├", "┤", "└", "┘"];
+    const [tl, fill, tr, side, bl, br] = high
+        ? ["╔", "═", "╗", "║", "╚", "╝"]
+        : ["┌", "─", "┐", "│", "└", "┘"];
     const titlePadding = innerWidth - codepoints(name);
     const title = `${" ".repeat(Math.floor(titlePadding / 2))}${name}${" ".repeat(Math.ceil(titlePadding / 2))}`;
     const lines = [
         `${tl}${fill.repeat(innerWidth)}${tr}`,
         `${side}${title}${side}`,
-        `${side}${" ".repeat(innerWidth)}${side}`,
-        `${middleLeft}${fill.repeat(innerWidth)}${middleRight}`,
         ...body.map((line) => `${side}${line.padEnd(innerWidth)}${side}`),
         `${bl}${fill.repeat(innerWidth)}${br}`,
     ];
-    return { category, name, lines, relativeLines, entries, merges, peakImportance };
+    return {
+        category,
+        name,
+        lines,
+        relativeLines,
+        entries,
+        merges,
+        peakImportance,
+        sharedPairCount,
+    };
 }
 
 function renderPalace(specs: SpecEntry[]): {
@@ -371,6 +419,7 @@ function renderPalace(specs: SpecEntry[]): {
     placements: Map<number, Placement>;
     rooms: RoomSummary[];
     layoutItems: LayoutItem[];
+    pages: Array<{ page: number; startLine: number; endLine: number; heightCells: number }>;
 } {
     const grouped = new Map<string, SpecEntry[]>();
     for (const spec of specs) {
@@ -380,90 +429,254 @@ function renderPalace(specs: SpecEntry[]): {
         grouped.set(key, list);
     }
 
+    const assignmentFor = (boxes: Box[]): number[] => {
+        let best: { columns: number[]; max: number; range: number } | undefined;
+        const columns = Array<number>(boxes.length).fill(0);
+        const heights = Array<number>(COLUMN_COUNT).fill(0);
+        const visit = (index: number): void => {
+            if (index === boxes.length) {
+                const max = Math.max(...heights);
+                const range = max - Math.min(...heights);
+                if (!best || max < best.max || (max === best.max && range < best.range)) {
+                    best = { columns: [...columns], max, range };
+                }
+                return;
+            }
+            const box = boxes[index];
+            if (!box) return;
+            const lastColumn = index === 0 ? 1 : COLUMN_COUNT;
+            for (let column = 0; column < lastColumn; column++) {
+                columns[index] = column;
+                heights[column] += box.lines.length;
+                if (!best || Math.max(...heights) <= best.max) visit(index + 1);
+                heights[column] -= box.lines.length;
+            }
+        };
+        visit(0);
+        if (!best) throw new Error("unable to assign masonry band");
+        return best.columns;
+    };
+
+    const subsetForCapacity = (
+        boxes: Box[],
+        capacity: number,
+    ): { indexes: number[]; columns: number[] } => {
+        let best:
+            | {
+                  indexes: number[];
+                  columns: number[];
+                  remainderMax: number;
+                  selectedMax: number;
+                  remainderRange: number;
+                  selectedHeight: number;
+              }
+            | undefined;
+        const limit = 1 << boxes.length;
+        for (let mask = 1; mask < limit - 1; mask++) {
+            const indexes = boxes
+                .map((_, index) => index)
+                .filter((index) => (mask & (1 << index)) !== 0);
+            const selected = indexes
+                .map((index) => boxes[index])
+                .filter((box): box is Box => Boolean(box));
+            const remainder = boxes.filter((_, index) => (mask & (1 << index)) === 0);
+            const columns = assignmentFor(selected);
+            const selectedHeights = Array<number>(COLUMN_COUNT).fill(0);
+            for (const [index, box] of selected.entries()) {
+                selectedHeights[columns[index] ?? 0] += box.lines.length;
+            }
+            const selectedMax = Math.max(...selectedHeights);
+            if (selectedMax > capacity) continue;
+            const remainderColumns = assignmentFor(remainder);
+            const remainderHeights = Array<number>(COLUMN_COUNT).fill(0);
+            for (const [index, box] of remainder.entries()) {
+                remainderHeights[remainderColumns[index] ?? 0] += box.lines.length;
+            }
+            const remainderMax = Math.max(...remainderHeights);
+            const remainderRange = remainderMax - Math.min(...remainderHeights);
+            const selectedHeight = selected.reduce((total, box) => total + box.lines.length, 0);
+            if (
+                !best ||
+                remainderMax < best.remainderMax ||
+                (remainderMax === best.remainderMax && selectedMax > best.selectedMax) ||
+                (remainderMax === best.remainderMax &&
+                    selectedMax === best.selectedMax &&
+                    remainderRange < best.remainderRange) ||
+                (remainderMax === best.remainderMax &&
+                    selectedMax === best.selectedMax &&
+                    remainderRange === best.remainderRange &&
+                    selectedHeight > best.selectedHeight)
+            ) {
+                best = {
+                    indexes,
+                    columns,
+                    remainderMax,
+                    selectedMax,
+                    remainderRange,
+                    selectedHeight,
+                };
+            }
+        }
+        if (!best) throw new Error(`no room fits ${capacity}-row page remainder`);
+        return { indexes: best.indexes, columns: best.columns };
+    };
+
     const palaceLines: string[] = [];
+    const pageLines: string[][] = [[]];
     const placements = new Map<number, Placement>();
     const roomSummaries: RoomSummary[] = [];
     const layoutItems: LayoutItem[] = [];
-    const categoryBanner = (category: Category): string => {
-        const label = ` <${category}> `;
+    const categoryBanner = (categories: readonly Category[], continued: boolean): string => {
+        const label = ` <${categories.join(" + ")}${continued ? " CONT." : ""}> `;
         const remaining = PAGE_WIDTH_CHARS - codepoints(label);
         return `${"─".repeat(Math.floor(remaining / 2))}${label}${"─".repeat(Math.ceil(remaining / 2))}`;
     };
 
-    for (const category of CATEGORY_ORDER) {
-        const bannerLine = palaceLines.length + 1;
-        palaceLines.push(categoryBanner(category));
-        layoutItems.push({
-            kind: "category",
-            category,
-            column: 0,
-            startLine: bannerLine,
-            endLine: bannerLine,
-        });
-
-        const columns = Array.from({ length: COLUMN_COUNT }, () => [] as string[]);
-        const heights = Array<number>(COLUMN_COUNT).fill(0);
-        const shortestColumn = (): number => {
-            let selected = 0;
-            for (let column = 1; column < COLUMN_COUNT; column++) {
-                if (heights[column] < heights[selected]) selected = column;
+    for (const categories of BAND_GROUPS) {
+        const primaryCategory = categories[0];
+        if (!primaryCategory) throw new Error("empty band group");
+        let remaining = [...grouped.entries()]
+            .filter(([, entries]) => {
+                const category = entries[0]?.category;
+                return category ? categories.includes(category) : false;
+            })
+            .map(([key, entries]) => {
+                const category = entries[0]?.category;
+                if (!category) throw new Error(`empty room group ${key}`);
+                return buildBox(category, key.slice(category.length + 1), entries);
+            })
+            .sort((a, b) => {
+                const categoryOrder =
+                    CATEGORY_ORDER.indexOf(a.category) - CATEGORY_ORDER.indexOf(b.category);
+                if (categoryOrder !== 0) return categoryOrder;
+                return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+            });
+        let continued = false;
+        while (remaining.length > 0) {
+            let pageIndex = pageLines.length - 1;
+            let available = PAGE_ROW_CAPACITY - (pageLines[pageIndex]?.length ?? 0) - 1;
+            if (available <= 0) {
+                pageLines.push([]);
+                pageIndex++;
+                available = PAGE_ROW_CAPACITY - 1;
             }
-            return selected;
-        };
-        const boxes = [...grouped.entries()]
-            .filter(([key]) => key.startsWith(`${category}\u0000`))
-            .map(([key, entries]) => buildBox(category, key.slice(category.length + 1), entries))
-            .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-        const bandStartLine = palaceLines.length + 1;
-        for (const box of boxes) {
-            const column = shortestColumn();
-            const row = heights[column];
-            columns[column].push(...box.lines);
-            heights[column] += box.lines.length;
-            const startLine = bandStartLine + row;
-            for (const entry of [...box.entries, ...box.merges]) {
-                const relativeLine = box.relativeLines.get(entry.id);
-                if (relativeLine === undefined)
-                    throw new Error(`placement missing for ${entry.id}`);
-                placements.set(entry.id, {
+            if (Math.min(...remaining.map((box) => box.lines.length)) > available) {
+                pageLines.push([]);
+                continued = true;
+                continue;
+            }
+            const fullAssignment = assignmentFor(remaining);
+            const fullHeights = Array<number>(COLUMN_COUNT).fill(0);
+            for (const [index, box] of remaining.entries()) {
+                fullHeights[fullAssignment[index] ?? 0] += box.lines.length;
+            }
+            let segmentBoxes: Box[];
+            let assignment: number[];
+            let selectedIndexes: number[];
+            if (Math.max(...fullHeights) <= available) {
+                segmentBoxes = remaining;
+                assignment = fullAssignment;
+                selectedIndexes = remaining.map((_, index) => index);
+            } else {
+                const subset = subsetForCapacity(remaining, available);
+                selectedIndexes = subset.indexes;
+                segmentBoxes = selectedIndexes
+                    .map((index) => remaining[index])
+                    .filter((box): box is Box => Boolean(box));
+                assignment = subset.columns;
+            }
+
+            const columns = Array.from({ length: COLUMN_COUNT }, () => [] as string[]);
+            const heights = Array<number>(COLUMN_COUNT).fill(0);
+            for (const [index, box] of segmentBoxes.entries()) {
+                const column = assignment[index] ?? 0;
+                columns[column].push(...box.lines);
+                heights[column] += box.lines.length;
+            }
+            const bandHeight = Math.max(...heights);
+            const page = pageIndex + 1;
+            const pageLine = (pageLines[pageIndex]?.length ?? 0) + 1;
+            const bannerLine = palaceLines.length + 1;
+            const banner = categoryBanner(categories, continued);
+            palaceLines.push(banner);
+            pageLines[pageIndex]?.push(banner);
+            layoutItems.push({
+                kind: "category",
+                category: primaryCategory,
+                categories: [...categories],
+                column: 0,
+                startLine: bannerLine,
+                endLine: bannerLine,
+                page,
+                pageLine,
+            });
+
+            const bandStartLine = palaceLines.length + 1;
+            const bandPageLine = (pageLines[pageIndex]?.length ?? 0) + 1;
+            const columnRows = Array<number>(COLUMN_COUNT).fill(0);
+            for (const [index, box] of segmentBoxes.entries()) {
+                const column = assignment[index] ?? 0;
+                const row = columnRows[column] ?? 0;
+                columnRows[column] = row + box.lines.length;
+                const startLine = bandStartLine + row;
+                const roomPageLine = bandPageLine + row;
+                for (const entry of [...box.entries, ...box.merges]) {
+                    const relativeLine = box.relativeLines.get(entry.id);
+                    if (relativeLine === undefined)
+                        throw new Error(`placement missing for ${entry.id}`);
+                    placements.set(entry.id, {
+                        category: box.category,
+                        room: box.name,
+                        palaceLine: startLine + relativeLine,
+                        palaceColumn: column * (ROOM_WIDTH + COLUMN_GAP) + 1,
+                        page,
+                        pageLine: roomPageLine + relativeLine,
+                        ...(entry.mergeInto === undefined ? {} : { mergedInto: entry.mergeInto }),
+                    });
+                }
+                roomSummaries.push({
+                    category: box.category,
+                    name: box.name,
+                    entryCount: box.entries.length,
+                    mergeCount: box.merges.length,
+                    memoryCount: box.entries.length + box.merges.length,
+                    peakImportance: box.peakImportance,
+                    border: box.peakImportance >= 70 ? "double" : "single",
+                    column,
+                    startLine,
+                    endLine: startLine + box.lines.length - 1,
+                    heightCells: box.lines.length,
+                    sharedPairCount: box.sharedPairCount,
+                    page,
+                    pageLine: roomPageLine,
+                });
+                layoutItems.push({
+                    kind: "room",
                     category: box.category,
                     room: box.name,
-                    palaceLine: startLine + relativeLine,
-                    palaceColumn: column * (ROOM_WIDTH + COLUMN_GAP) + 1,
-                    ...(entry.mergeInto === undefined ? {} : { mergedInto: entry.mergeInto }),
+                    column,
+                    startLine,
+                    endLine: startLine + box.lines.length - 1,
+                    page,
+                    pageLine: roomPageLine,
                 });
             }
-            roomSummaries.push({
-                category: box.category,
-                name: box.name,
-                entryCount: box.entries.length,
-                mergeCount: box.merges.length,
-                memoryCount: box.entries.length + box.merges.length,
-                peakImportance: box.peakImportance,
-                border: box.peakImportance >= 70 ? "double" : "single",
-                column,
-                startLine,
-                endLine: startLine + box.lines.length - 1,
-                heightCells: box.lines.length,
-            });
-            layoutItems.push({
-                kind: "room",
-                category: box.category,
-                room: box.name,
-                column,
-                startLine,
-                endLine: startLine + box.lines.length - 1,
-            });
-        }
 
-        const bandHeight = Math.max(...heights);
-        for (let row = 0; row < bandHeight; row++) {
-            palaceLines.push(
-                columns
+            for (let row = 0; row < bandHeight; row++) {
+                const line = columns
                     .map((column) => (column[row] ?? "").padEnd(ROOM_WIDTH))
                     .join(" ".repeat(COLUMN_GAP))
-                    .trimEnd(),
-            );
+                    .trimEnd();
+                palaceLines.push(line);
+                pageLines[pageIndex]?.push(line);
+            }
+
+            const selected = new Set(selectedIndexes);
+            remaining = remaining.filter((_, index) => !selected.has(index));
+            if (remaining.length > 0) {
+                pageLines.push([]);
+                continued = true;
+            }
         }
     }
 
@@ -478,14 +691,31 @@ function renderPalace(specs: SpecEntry[]): {
         throw new Error(`palace has ${palace.length} chars (max ${MAX_PALACE_CHARS})`);
     }
     if (/#\d+/.test(palace)) throw new Error("memory id leaked into palace.txt");
-    return { palace, placements, rooms: roomSummaries, layoutItems };
+    let startLine = 1;
+    const pages = pageLines.map((lines, index) => {
+        const page = {
+            page: index + 1,
+            startLine,
+            endLine: startLine + lines.length - 1,
+            heightCells: lines.length,
+        };
+        startLine += lines.length;
+        return page;
+    });
+    return { palace, placements, rooms: roomSummaries, layoutItems, pages };
 }
 
 const sourceText = readFileSync(SOURCE_PATH, "utf8");
 const source = parseSource(sourceText);
 const specs = readSpecs();
 validate(source, specs);
-const { palace, placements, rooms, layoutItems } = renderPalace(specs);
+const { palace, placements, rooms, layoutItems, pages } = renderPalace(specs);
+const cueLengths = specs
+    .filter((entry) => entry.mergeInto === undefined)
+    .map((entry) => codepoints(displayCue(entry)))
+    .sort((a, b) => a - b);
+const percentile = (value: number): number =>
+    cueLengths[Math.round((cueLengths.length - 1) * value)] ?? 0;
 const entryCount = specs.filter((entry) => entry.mergeInto === undefined).length;
 const mergeCount = specs.length - entryCount;
 const coverage = {
@@ -502,6 +732,17 @@ const coverage = {
         pageWidthChars: PAGE_WIDTH_CHARS,
         columnGapChars: COLUMN_GAP,
         canvasHeightCells: palace.trimEnd().split("\n").length,
+        pageRowCapacity: PAGE_ROW_CAPACITY,
+        pages,
+        cueLengthDistribution: {
+            min: cueLengths[0] ?? 0,
+            p25: percentile(0.25),
+            median: percentile(0.5),
+            p75: percentile(0.75),
+            p90: percentile(0.9),
+            max: cueLengths.at(-1) ?? 0,
+        },
+        sharedPairCount: rooms.reduce((total, room) => total + room.sharedPairCount, 0),
         items: layoutItems,
     },
     rooms,
@@ -524,5 +765,8 @@ console.log(
         merges: mergeCount,
         memories: placements.size,
         rooms: rooms.length,
+        pages: pages.map((page) => page.heightCells),
+        cueLengths: coverage.layout.cueLengthDistribution,
+        sharedPairs: coverage.layout.sharedPairCount,
     }),
 );

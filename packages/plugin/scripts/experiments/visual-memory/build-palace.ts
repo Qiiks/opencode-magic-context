@@ -15,10 +15,12 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SOURCE_PATH = "/tmp/visual-memory/trimmed-memories-source.txt";
 const OUTPUT_DIR = "/tmp/visual-memory";
-const PROSE_IMAGE_BASELINE_TOKENS = 3_431;
 const MAX_PALACE_CHARS = 70_000;
 const RENDER_STYLE = { aa: true } as const;
 const TITLE_SCALE = 2;
+const PATCH_SIZE = 28;
+const PAGE_WIDTH_PIXELS = 1_092;
+const PAGE_HEIGHT_PIXELS = 1_092;
 const BODY_INK = [18, 20, 24] as const;
 const PROHIBITION_INK = [148, 28, 35] as const;
 const CATEGORY_INK: Record<string, readonly [number, number, number]> = {
@@ -33,10 +35,13 @@ const CATEGORY_INK: Record<string, readonly [number, number, number]> = {
 type LayoutItem = {
     kind: "category" | "room";
     category: string;
+    categories?: string[];
     room?: string;
     column: number;
     startLine: number;
     endLine: number;
+    page: number;
+    pageLine: number;
 };
 type CoverageRoom = {
     category: string;
@@ -50,6 +55,9 @@ type CoverageRoom = {
     startLine: number;
     endLine: number;
     heightCells: number;
+    sharedPairCount: number;
+    page: number;
+    pageLine: number;
 };
 type Coverage = {
     sourceMemoryCount: number;
@@ -64,6 +72,17 @@ type Coverage = {
         pageWidthChars: number;
         columnGapChars: number;
         canvasHeightCells: number;
+        pageRowCapacity: number;
+        pages: Array<{ page: number; startLine: number; endLine: number; heightCells: number }>;
+        cueLengthDistribution: {
+            min: number;
+            p25: number;
+            median: number;
+            p75: number;
+            p90: number;
+            max: number;
+        };
+        sharedPairCount: number;
         items: LayoutItem[];
     };
     rooms: CoverageRoom[];
@@ -74,6 +93,8 @@ type Coverage = {
             room: string;
             palaceLine: number;
             palaceColumn: number;
+            page: number;
+            pageLine: number;
             mergedInto?: number;
         }
     >;
@@ -294,8 +315,8 @@ function blitPanel(
     cellWidth: number,
     cellHeight: number,
 ): void {
-    const categoryColor = CATEGORY_INK[panel.item.category];
-    assert.ok(categoryColor, `missing category color for ${panel.item.category}`);
+    const baseCategoryColor = CATEGORY_INK[panel.item.category];
+    assert.ok(baseCategoryColor, `missing category color for ${panel.item.category}`);
     const rows = panel.height / cellHeight;
     const columns = panel.width / cellWidth;
     for (let y = 0; y < panel.height; y++) {
@@ -308,10 +329,16 @@ function blitPanel(
             const border =
                 panel.item.kind === "category" ||
                 row === 0 ||
-                row === 3 ||
                 row === rows - 1 ||
                 column === 0 ||
                 column === columns - 1;
+            const bannerCategories = panel.item.categories ?? [panel.item.category];
+            const bannerCategory =
+                bannerCategories.length > 1 && column >= columns / 2
+                    ? bannerCategories.at(-1)
+                    : bannerCategories[0];
+            const categoryColor =
+                CATEGORY_INK[bannerCategory ?? panel.item.category] ?? baseCategoryColor;
             const color = red ? PROHIBITION_INK : border ? categoryColor : BODY_INK;
             const index = ((top + y) * target.width + left + x) * 3;
             for (let channel = 0; channel < 3; channel++) {
@@ -406,14 +433,20 @@ for (const item of coverage.layout.items) {
     if (item.kind === "room") {
         const room = roomByKey.get(`${item.category}\u0000${item.room ?? ""}`);
         assert.ok(room, `coverage room missing for ${item.category}/${item.room}`);
-        assert.ok(lines.length >= 5, `room ${room.name} lacks reserved title rows`);
+        assert.ok(lines.length >= 3, `room ${room.name} lacks merged title rows`);
         const redCells = prohibitionCells(lines, `${item.category}/${room.name}`);
-        const side = [...(lines[1] ?? "")][0] ?? "│";
-        lines[1] = `${side}${" ".repeat(coverage.layout.roomWidthChars - 2)}${side}`;
-        lines[2] = `${side}${" ".repeat(coverage.layout.roomWidthChars - 2)}${side}`;
-        const panel = await renderPanelText(lines.join("\n"), coverage.layout.roomWidthChars);
         const title = await renderPanelText(room.name, [...room.name].length);
         const scaledTitle = upscale2x(title);
+        const titleCells = Math.ceil(scaledTitle.width / renderCellWidth(RENDER_STYLE));
+        const titleStart = Math.floor((coverage.layout.roomWidthChars - titleCells) / 2);
+        const top = [...(lines[0] ?? "")];
+        for (let column = titleStart; column < titleStart + titleCells; column++) {
+            if (column > 0 && column < coverage.layout.roomWidthChars - 1) top[column] = " ";
+        }
+        lines[0] = top.join("");
+        const side = [...(lines[1] ?? "")][0] ?? "│";
+        lines[1] = `${side}${" ".repeat(coverage.layout.roomWidthChars - 2)}${side}`;
+        const panel = await renderPanelText(lines.join("\n"), coverage.layout.roomWidthChars);
         droppedChars += panel.droppedChars + title.droppedChars;
         panels.push({
             ...panel,
@@ -431,99 +464,135 @@ for (const item of coverage.layout.items) {
 
 const cellWidth = renderCellWidth(RENDER_STYLE);
 const cellHeight = renderCellHeight(RENDER_STYLE);
+const measuredColumns = Math.floor(PAGE_WIDTH_PIXELS / cellWidth);
+const measuredRows = Math.floor(PAGE_HEIGHT_PIXELS / cellHeight);
+assert.equal(
+    coverage.layout.pageRowCapacity,
+    measuredRows,
+    "author page-row capacity drifted from atlas",
+);
+assert.ok(
+    coverage.layout.pageWidthChars <= measuredColumns,
+    "author page width exceeds atlas capacity",
+);
 const columnWidthPixels = coverage.layout.roomWidthChars * cellWidth;
-const pageWidth = coverage.layout.pageWidthChars * cellWidth;
-const pageHeight = coverage.layout.canvasHeightCells * cellHeight;
-const pagePixels = new Uint8Array(pageWidth * pageHeight * 3).fill(255);
-const page: RgbImage = { pixels: pagePixels, width: pageWidth, height: pageHeight };
-let contentPixels = 0;
+const contentWidthPixels = coverage.layout.pageWidthChars * cellWidth;
+const pageLeft = Math.floor((PAGE_WIDTH_PIXELS - contentWidthPixels) / 2);
+assert.ok(pageLeft >= 0, "palace content exceeds fixed page width");
+const pageCanvases = coverage.layout.pages.map((layoutPage, index) => {
+    const last = index === coverage.layout.pages.length - 1;
+    const usedHeight = layoutPage.heightCells * cellHeight;
+    const height = last
+        ? Math.max(PATCH_SIZE, Math.ceil(usedHeight / PATCH_SIZE) * PATCH_SIZE)
+        : PAGE_HEIGHT_PIXELS;
+    assert.ok(height <= PAGE_HEIGHT_PIXELS, `page ${layoutPage.page} exceeds fixed geometry`);
+    return {
+        layout: layoutPage,
+        image: {
+            pixels: new Uint8Array(PAGE_WIDTH_PIXELS * height * 3).fill(255),
+            width: PAGE_WIDTH_PIXELS,
+            height,
+        } satisfies RgbImage,
+        contentPixels: 0,
+    };
+});
 for (const panel of panels) {
+    const page = pageCanvases[panel.item.page - 1];
+    assert.ok(page, `missing canvas for page ${panel.item.page}`);
     const expectedHeight = (panel.item.endLine - panel.item.startLine + 1) * cellHeight;
-    const expectedWidth = panel.item.kind === "category" ? pageWidth : columnWidthPixels;
+    const expectedWidth = panel.item.kind === "category" ? contentWidthPixels : columnWidthPixels;
     assert.equal(panel.width, expectedWidth, "masonry panel width drifted");
     assert.equal(
         panel.height,
         expectedHeight,
         `masonry panel height drifted for ${panel.item.category}/${panel.item.room ?? "banner"}`,
     );
-    const left = panel.item.column * columnWidthPixels;
-    const top = (panel.item.startLine - 1) * cellHeight;
-    blitPanel(page, panel, left, top, cellWidth, cellHeight);
+    const left = pageLeft + panel.item.column * columnWidthPixels;
+    const top = (panel.item.pageLine - 1) * cellHeight;
+    assert.ok(top + panel.height <= page.image.height, `panel exceeds page ${panel.item.page}`);
+    blitPanel(page.image, panel, left, top, cellWidth, cellHeight);
     if (panel.title) {
         const titleLeft = left + Math.floor((panel.width - panel.title.width) / 2);
-        const titleTop = top + cellHeight;
         const titleColor = CATEGORY_INK[panel.item.category];
         assert.ok(titleColor, `missing title color for ${panel.item.category}`);
-        blitColoredInk(page, panel.title, titleLeft, titleTop, titleColor);
+        blitColoredInk(page.image, panel.title, titleLeft, top, titleColor);
     }
-    contentPixels += panel.width * panel.height;
+    page.contentPixels += panel.width * panel.height;
 }
 assert.equal(droppedChars, 0, "glyph atlas dropped palace characters");
 const prohibitionCellCount = panels.reduce((total, panel) => total + panel.redCells.size, 0);
 assert.ok(prohibitionCellCount > 0, "prohibition palette was not exercised");
-const canvasPixels = page.width * page.height;
-assert.ok(contentPixels <= canvasPixels, "masonry panels exceed cropped canvas");
-let inkPixels = 0;
-for (let index = 0; index < page.pixels.length; index += 3) {
-    if (
-        (page.pixels[index] ?? 255) < 250 ||
-        (page.pixels[index + 1] ?? 255) < 250 ||
-        (page.pixels[index + 2] ?? 255) < 250
-    ) {
-        inkPixels++;
-    }
-}
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
 for (const file of readdirSync(OUTPUT_DIR)) {
     if (/^palace-page\d+\.png$/.test(file)) unlinkSync(join(OUTPUT_DIR, file));
 }
-const outputPath = join(OUTPUT_DIR, "palace-page1.png");
-await Bun.write(outputPath, await encodeRgbPng(page.pixels, page.width, page.height));
-
-const imageTokens = Math.ceil(canvasPixels / 750);
+const patchTokens = (width: number, height: number): number =>
+    Math.ceil(width / PATCH_SIZE) * Math.ceil(height / PATCH_SIZE);
+const pagesDetail = [];
+let imageTokens = 0;
+let canvasPixels = 0;
+let contentPixels = 0;
+let inkPixels = 0;
+for (const page of pageCanvases) {
+    let pageInkPixels = 0;
+    for (let index = 0; index < page.image.pixels.length; index += 3) {
+        if (
+            (page.image.pixels[index] ?? 255) < 250 ||
+            (page.image.pixels[index + 1] ?? 255) < 250 ||
+            (page.image.pixels[index + 2] ?? 255) < 250
+        ) {
+            pageInkPixels++;
+        }
+    }
+    const cellColumns = Math.floor(page.image.width / cellWidth);
+    const cellRows = Math.floor(page.image.height / cellHeight);
+    const sourcePageLines = palaceLines.slice(page.layout.startLine - 1, page.layout.endLine);
+    const nonPadCharacterCells = sourcePageLines.reduce(
+        (total, line) => total + [...line].filter((character) => character !== " ").length,
+        0,
+    );
+    const tokens = patchTokens(page.image.width, page.image.height);
+    const outputPath = join(OUTPUT_DIR, `palace-page${page.layout.page}.png`);
+    await Bun.write(
+        outputPath,
+        await encodeRgbPng(page.image.pixels, page.image.width, page.image.height),
+    );
+    const pageCanvasPixels = page.image.width * page.image.height;
+    const totalCharacterCells = cellColumns * cellRows;
+    pagesDetail.push({
+        page: page.layout.page,
+        path: outputPath,
+        width: page.image.width,
+        height: page.image.height,
+        patchColumns: Math.ceil(page.image.width / PATCH_SIZE),
+        patchRows: Math.ceil(page.image.height / PATCH_SIZE),
+        imageTokens: tokens,
+        contentPixels: page.contentPixels,
+        canvasPixels: pageCanvasPixels,
+        panelFillPercent: Number(((page.contentPixels / pageCanvasPixels) * 100).toFixed(2)),
+        nonPadCharacterCells,
+        totalCharacterCells,
+        fillRatio: Number((nonPadCharacterCells / totalCharacterCells).toFixed(4)),
+        fillPercent: Number(((nonPadCharacterCells / totalCharacterCells) * 100).toFixed(2)),
+        inkPixels: pageInkPixels,
+    });
+    imageTokens += tokens;
+    canvasPixels += pageCanvasPixels;
+    contentPixels += page.contentPixels;
+    inkPixels += pageInkPixels;
+}
 const proseTextTokens = source.length / 4;
 const palaceTextTokens = palace.length / 4;
-const categories = [...new Set(coverage.layout.items.map((item) => item.category))];
-const bands = categories.map((category) => {
-    const banner = coverage.layout.items.find(
-        (item) => item.category === category && item.kind === "category",
-    );
-    assert.ok(banner, `missing category banner for ${category}`);
-    const rooms = coverage.rooms.filter((room) => room.category === category);
-    const endLine = Math.max(banner.endLine, ...rooms.map((room) => room.endLine));
-    const heightCells = endLine - banner.startLine + 1;
-    const occupiedColumnCells =
-        coverage.layout.columns + rooms.reduce((total, room) => total + room.heightCells, 0);
-    const capacityColumnCells = heightCells * coverage.layout.columns;
-    return {
-        category,
-        heightCells,
-        occupiedColumnCells,
-        capacityColumnCells,
-        utilizationPercent: Number(((occupiedColumnCells / capacityColumnCells) * 100).toFixed(2)),
-    };
-});
-const unbandedHeights = Array<number>(coverage.layout.columns).fill(0);
-for (const room of coverage.rooms) {
-    let column = 0;
-    for (let candidate = 1; candidate < unbandedHeights.length; candidate++) {
-        if (unbandedHeights[candidate] < unbandedHeights[column]) column = candidate;
-    }
-    unbandedHeights[column] += room.heightCells;
-}
-const unbandedHeightCells = Math.max(...unbandedHeights) + categories.length;
-const bandingExtraRows = coverage.layout.canvasHeightCells - unbandedHeightCells;
 const report = {
     chars: palace.length,
-    pages: 1,
+    pages: pagesDetail.length,
     droppedChars,
     imageTokens,
     textTokenEquivalent: Number(palaceTextTokens.toFixed(2)),
     proseTextTokens: Number(proseTextTokens.toFixed(2)),
     compressionRatios: {
         versusProseAsText: ratio(proseTextTokens, imageTokens),
-        versusProseAsImage: ratio(PROSE_IMAGE_BASELINE_TOKENS, imageTokens),
     },
     utilization: {
         contentPixels,
@@ -532,16 +601,12 @@ const report = {
         contentToCanvasPercent: Number(((contentPixels / canvasPixels) * 100).toFixed(2)),
         inkPixels,
         inkToCanvasPercent: Number(((inkPixels / canvasPixels) * 100).toFixed(2)),
-        bands,
-        unbandedHeightCells,
-        bandedHeightCells: coverage.layout.canvasHeightCells,
-        bandingExtraRows,
-        bandingCanvasOverheadPercent: Number(
-            ((bandingExtraRows / coverage.layout.canvasHeightCells) * 100).toFixed(2),
-        ),
-        bandedVersusUnbandedGrowthPercent: Number(
-            ((coverage.layout.canvasHeightCells / unbandedHeightCells - 1) * 100).toFixed(2),
-        ),
+        pages: pagesDetail.map((page) => ({
+            page: page.page,
+            fillRatio: page.fillRatio,
+            fillPercent: page.fillPercent,
+            panelFillPercent: page.panelFillPercent,
+        })),
     },
     composition: {
         approach:
@@ -549,6 +614,15 @@ const report = {
         columns: coverage.layout.columns,
         columnWidthChars: coverage.layout.roomWidthChars,
         columnWidthPixels,
+        measuredAtlasCell: { width: cellWidth, height: cellHeight },
+        measuredPageCapacity: { columns: measuredColumns, rows: measuredRows },
+        pageGeometry: {
+            width: PAGE_WIDTH_PIXELS,
+            fullHeight: PAGE_HEIGHT_PIXELS,
+            patchSize: PATCH_SIZE,
+        },
+        cueLengthDistribution: coverage.layout.cueLengthDistribution,
+        sharedPairCount: coverage.layout.sharedPairCount,
         titleScale: TITLE_SCALE,
         palette: CATEGORY_INK,
         prohibitionInk: PROHIBITION_INK,
@@ -561,22 +635,16 @@ const report = {
         merges: coverage.mergeCount,
         representedMemories: coverage.representedMemoryCount,
     },
-    pagesDetail: [
-        {
-            page: 1,
-            path: outputPath,
-            width: page.width,
-            height: page.height,
-            imageTokens,
-        },
-    ],
+    pagesDetail,
     rooms: coverage.rooms.map((room) => ({
         category: room.category,
         name: room.name,
         entries: room.entryCount,
         merges: room.mergeCount,
         memories: room.memoryCount,
+        page: room.page,
         column: room.column,
+        sharedPairs: room.sharedPairCount,
     })),
 };
 console.log(`chars=${report.chars}`);
@@ -586,7 +654,10 @@ console.log(`imageTokens=${report.imageTokens}`);
 console.log(`textTokenEquivalent=${report.textTokenEquivalent}`);
 console.log(`contentToCanvas=${report.utilization.contentToCanvasPercent}%`);
 console.log(`inkToCanvas=${report.utilization.inkToCanvasPercent}%`);
-console.log(`bandingCanvasOverhead=${report.utilization.bandingCanvasOverheadPercent}%`);
+for (const page of report.pagesDetail) {
+    console.log(
+        `page${page.page}=${page.width}x${page.height} patches=${page.patchColumns}x${page.patchRows} tokens=${page.imageTokens} fill=${page.fillPercent}%`,
+    );
+}
 console.log(`versusProseAsText=${report.compressionRatios.versusProseAsText}x`);
-console.log(`versusProseAsImage=${report.compressionRatios.versusProseAsImage}x`);
 console.log(`RESULT_JSON=${JSON.stringify(report)}`);
