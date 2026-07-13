@@ -1046,3 +1046,5 @@ console.log(
         roomSplits: leveling.splitCount,
     }),
 );
+
+export { isExactToken, validate };
