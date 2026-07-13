@@ -1,0 +1,1853 @@
+{
+    "source": "/tmp/visual-memory/trimmed-memories-source.txt",
+    "sourceMemoryCount": 334,
+    "entryCount": 329,
+    "mergeCount": 5,
+    "representedMemoryCount": 334,
+    "palaceChars": 19655,
+    "maxLineChars": 148,
+    "rooms": [
+        {
+            "category": "PROJECT_RULES",
+            "name": "Knowledge & workflow",
+            "entryCount": 21,
+            "mergeCount": 0,
+            "memoryCount": 21,
+            "peakImportance": 65,
+            "border": "single",
+            "startLine": 2,
+            "endLine": 17
+        },
+        {
+            "category": "PROJECT_RULES",
+            "name": "Plugin & tooling",
+            "entryCount": 19,
+            "mergeCount": 0,
+            "memoryCount": 19,
+            "peakImportance": 67,
+            "border": "single",
+            "startLine": 18,
+            "endLine": 30
+        },
+        {
+            "category": "PROJECT_RULES",
+            "name": "Repo & delivery",
+            "entryCount": 20,
+            "mergeCount": 1,
+            "memoryCount": 21,
+            "peakImportance": 65,
+            "border": "single",
+            "startLine": 31,
+            "endLine": 47
+        },
+        {
+            "category": "PROJECT_RULES",
+            "name": "Runtime & tests",
+            "entryCount": 22,
+            "mergeCount": 0,
+            "memoryCount": 22,
+            "peakImportance": 67,
+            "border": "single",
+            "startLine": 31,
+            "endLine": 48
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Artifacts & storage",
+            "entryCount": 24,
+            "mergeCount": 0,
+            "memoryCount": 24,
+            "peakImportance": 65,
+            "border": "single",
+            "startLine": 50,
+            "endLine": 67
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Code intelligence",
+            "entryCount": 31,
+            "mergeCount": 0,
+            "memoryCount": 31,
+            "peakImportance": 67,
+            "border": "single",
+            "startLine": 50,
+            "endLine": 73
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Routes & controls",
+            "entryCount": 33,
+            "mergeCount": 0,
+            "memoryCount": 33,
+            "peakImportance": 67,
+            "border": "single",
+            "startLine": 67,
+            "endLine": 98
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Runtime & TUI",
+            "entryCount": 13,
+            "mergeCount": 0,
+            "memoryCount": 13,
+            "peakImportance": 65,
+            "border": "single",
+            "startLine": 73,
+            "endLine": 81
+        },
+        {
+            "category": "ARCHITECTURE",
+            "name": "Scheduler & drains",
+            "entryCount": 21,
+            "mergeCount": 1,
+            "memoryCount": 22,
+            "peakImportance": 66,
+            "border": "single",
+            "startLine": 81,
+            "endLine": 95
+        },
+        {
+            "category": "CONSTRAINTS",
+            "name": "OpenCode & providers",
+            "entryCount": 18,
+            "mergeCount": 0,
+            "memoryCount": 18,
+            "peakImportance": 65,
+            "border": "single",
+            "startLine": 100,
+            "endLine": 132
+        },
+        {
+            "category": "CONSTRAINTS",
+            "name": "Platform & Windows",
+            "entryCount": 28,
+            "mergeCount": 0,
+            "memoryCount": 28,
+            "peakImportance": 65,
+            "border": "single",
+            "startLine": 100,
+            "endLine": 122
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "Runtime config & limits",
+            "entryCount": 39,
+            "mergeCount": 2,
+            "memoryCount": 41,
+            "peakImportance": 65,
+            "border": "single",
+            "startLine": 134,
+            "endLine": 151
+        },
+        {
+            "category": "CONFIG_VALUES",
+            "name": "Semantic & cache",
+            "entryCount": 14,
+            "mergeCount": 0,
+            "memoryCount": 14,
+            "peakImportance": 65,
+            "border": "single",
+            "startLine": 152,
+            "endLine": 163
+        },
+        {
+            "category": "NAMING",
+            "name": "Names & IDs",
+            "entryCount": 19,
+            "mergeCount": 1,
+            "memoryCount": 20,
+            "peakImportance": 65,
+            "border": "single",
+            "startLine": 165,
+            "endLine": 175
+        },
+        {
+            "category": "KNOWN_ISSUES",
+            "name": "Known limits",
+            "entryCount": 7,
+            "mergeCount": 0,
+            "memoryCount": 7,
+            "peakImportance": 50,
+            "border": "single",
+            "startLine": 177,
+            "endLine": 188
+        }
+    ],
+    "memories": {
+        "19": {
+            "category": "KNOWN_ISSUES",
+            "room": "Known limits",
+            "palaceLine": 178
+        },
+        "245": {
+            "category": "KNOWN_ISSUES",
+            "room": "Known limits",
+            "palaceLine": 179
+        },
+        "246": {
+            "category": "KNOWN_ISSUES",
+            "room": "Known limits",
+            "palaceLine": 180
+        },
+        "247": {
+            "category": "KNOWN_ISSUES",
+            "room": "Known limits",
+            "palaceLine": 181
+        },
+        "248": {
+            "category": "KNOWN_ISSUES",
+            "room": "Known limits",
+            "palaceLine": 182
+        },
+        "249": {
+            "category": "KNOWN_ISSUES",
+            "room": "Known limits",
+            "palaceLine": 184
+        },
+        "353": {
+            "category": "KNOWN_ISSUES",
+            "room": "Known limits",
+            "palaceLine": 186
+        },
+        "4755": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 32
+        },
+        "4760": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 32
+        },
+        "4761": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 33
+        },
+        "4773": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 3
+        },
+        "4775": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 3
+        },
+        "4789": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 34
+        },
+        "4791": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 19
+        },
+        "4827": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 101
+        },
+        "4833": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 101
+        },
+        "4836": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 101
+        },
+        "4837": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 102
+        },
+        "4842": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 103
+        },
+        "4843": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 105
+        },
+        "4844": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 103
+        },
+        "4848": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 135
+        },
+        "4851": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 153
+        },
+        "4852": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 135
+        },
+        "4854": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 135
+        },
+        "4864": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 166
+        },
+        "4879": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 153
+        },
+        "4882": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 74
+        },
+        "4883": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 136
+        },
+        "4890": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 136
+        },
+        "4915": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 19
+        },
+        "4916": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 104
+        },
+        "4918": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 166
+        },
+        "4922": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 4
+        },
+        "4931": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 166
+        },
+        "4940": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 4
+        },
+        "5210": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 20
+        },
+        "5216": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 32
+        },
+        "5218": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 154
+        },
+        "5219": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 107
+        },
+        "5223": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 109
+        },
+        "5224": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 105
+        },
+        "5229": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 155
+        },
+        "5240": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 74
+        },
+        "5248": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 51
+        },
+        "5262": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 75
+        },
+        "5266": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 5
+        },
+        "5269": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 35
+        },
+        "5297": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 20
+        },
+        "5308": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 35
+        },
+        "5422": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 35
+        },
+        "5429": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 51
+        },
+        "5432": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 156
+        },
+        "5460": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 157
+        },
+        "5473": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 136
+        },
+        "5508": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 167
+        },
+        "5509": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 167
+        },
+        "5541": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 5
+        },
+        "5547": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 21
+        },
+        "5550": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 33
+        },
+        "5555": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 137
+        },
+        "5557": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 137
+        },
+        "5589": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 51
+        },
+        "5592": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 52
+        },
+        "5595": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 53
+        },
+        "5604": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 53
+        },
+        "5615": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 106
+        },
+        "5618": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 76
+        },
+        "5706": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 54
+        },
+        "5724": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 54
+        },
+        "5736": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 55
+        },
+        "5778": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 55
+        },
+        "5785": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 33
+        },
+        "5809": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 6
+        },
+        "5903": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 51
+        },
+        "5911": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 7
+        },
+        "5978": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 56
+        },
+        "6057": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 158
+        },
+        "6058": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 159
+        },
+        "6059": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 76
+        },
+        "6093": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 36
+        },
+        "6094": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 51
+        },
+        "6102": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 52
+        },
+        "6105": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 107
+        },
+        "6112": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 7
+        },
+        "6116": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 52
+        },
+        "6145": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 76
+        },
+        "6150": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 21
+        },
+        "6152": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 139,
+            "mergedInto": 7343
+        },
+        "6159": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 56
+        },
+        "6160": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 56
+        },
+        "6161": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 21
+        },
+        "6173": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 8
+        },
+        "6255": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 52
+        },
+        "6258": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 57
+        },
+        "6296": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 160
+        },
+        "6363": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 110
+        },
+        "6366": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 8
+        },
+        "6369": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 21
+        },
+        "6394": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 34
+        },
+        "6415": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 112
+        },
+        "6416": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 168
+        },
+        "6428": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 57
+        },
+        "6438": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 22
+        },
+        "6446": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 114
+        },
+        "6452": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 53
+        },
+        "6486": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 76
+        },
+        "6487": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 115
+        },
+        "6492": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 108
+        },
+        "6497": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 168
+        },
+        "6504": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 8
+        },
+        "6524": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 23
+        },
+        "6527": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 23
+        },
+        "6556": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 24
+        },
+        "6562": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 68
+        },
+        "6564": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 54
+        },
+        "6598": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 138
+        },
+        "6616": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 69
+        },
+        "6686": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 138
+        },
+        "6689": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 108
+        },
+        "6730": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 109
+        },
+        "6732": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 9
+        },
+        "6733": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 69
+        },
+        "6738": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 58
+        },
+        "6845": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 82
+        },
+        "6870": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 70
+        },
+        "6887": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 59
+        },
+        "6894": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 35
+        },
+        "6896": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 9
+        },
+        "6974": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 138
+        },
+        "6979": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 36
+        },
+        "6981": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 70
+        },
+        "7006": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 70
+        },
+        "7012": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 71
+        },
+        "7017": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 72
+        },
+        "7087": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 25
+        },
+        "7088": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 72
+        },
+        "7207": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 36
+        },
+        "7210": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 73
+        },
+        "7220": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 59
+        },
+        "7221": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 73
+        },
+        "7222": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 168,
+            "mergedInto": 7281
+        },
+        "7241": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 56
+        },
+        "7281": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 168
+        },
+        "7285": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 37
+        },
+        "7293": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 38
+        },
+        "7294": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 60
+        },
+        "7295": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 139
+        },
+        "7296": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 139
+        },
+        "7297": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 139
+        },
+        "7308": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 60
+        },
+        "7343": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 139
+        },
+        "7353": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 57
+        },
+        "7354": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 74
+        },
+        "7355": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 116
+        },
+        "7367": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 160
+        },
+        "7383": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 37
+        },
+        "7385": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 110
+        },
+        "7419": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 111
+        },
+        "7420": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 170
+        },
+        "7424": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 140
+        },
+        "7425": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 140
+        },
+        "7448": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 111
+        },
+        "7464": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 161
+        },
+        "7465": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 162
+        },
+        "7467": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 61
+        },
+        "7495": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 162
+        },
+        "7499": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 63
+        },
+        "7500": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 64
+        },
+        "7501": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 65
+        },
+        "7511": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 37
+        },
+        "7520": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 66
+        },
+        "7521": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 66
+        },
+        "7528": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 83
+        },
+        "7537": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 83
+        },
+        "7538": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 84
+        },
+        "7542": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 112
+        },
+        "7548": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 140
+        },
+        "7554": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 38
+        },
+        "7569": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 11
+        },
+        "7570": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 75
+        },
+        "7571": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 76
+        },
+        "7572": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 76
+        },
+        "7573": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 77
+        },
+        "7574": {
+            "category": "CONFIG_VALUES",
+            "room": "Semantic & cache",
+            "palaceLine": 162
+        },
+        "7592": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 77
+        },
+        "7615": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 78
+        },
+        "7633": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 68
+        },
+        "7695": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 40
+        },
+        "7699": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 41
+        },
+        "7702": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 38
+        },
+        "7722": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 84
+        },
+        "7723": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 85
+        },
+        "7727": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 40
+        },
+        "7728": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 78
+        },
+        "7735": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 170
+        },
+        "7738": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 77
+        },
+        "7753": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 79
+        },
+        "7754": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 85
+        },
+        "7767": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 113
+        },
+        "7800": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 41
+        },
+        "7801": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 86
+        },
+        "7802": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 80
+        },
+        "7814": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 86
+        },
+        "7815": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 117
+        },
+        "7834": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 171
+        },
+        "7835": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 77
+        },
+        "7863": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 25
+        },
+        "7892": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 171
+        },
+        "7903": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 119
+        },
+        "7912": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 141
+        },
+        "7916": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 42
+        },
+        "7918": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 27
+        },
+        "7928": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 172
+        },
+        "7931": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 69
+        },
+        "7932": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 70
+        },
+        "7939": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 70
+        },
+        "7940": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 71
+        },
+        "7949": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 141
+        },
+        "7958": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 58
+        },
+        "7990": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 43
+        },
+        "7991": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 42
+        },
+        "7992": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 71
+        },
+        "8029": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 120
+        },
+        "8040": {
+            "category": "ARCHITECTURE",
+            "room": "Code intelligence",
+            "palaceLine": 72
+        },
+        "8050": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 81
+        },
+        "8076": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 121
+        },
+        "8087": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 58
+        },
+        "8088": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 114
+        },
+        "8089": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 141
+        },
+        "8091": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 115
+        },
+        "8121": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 116
+        },
+        "8122": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 142
+        },
+        "8124": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 116
+        },
+        "8125": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 142
+        },
+        "8130": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 88,
+            "mergedInto": 8298
+        },
+        "8156": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 83
+        },
+        "8157": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 143
+        },
+        "8158": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 85
+        },
+        "8165": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 87
+        },
+        "8167": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 143
+        },
+        "8186": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 58
+        },
+        "8187": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 59
+        },
+        "8188": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 59
+        },
+        "8189": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 124
+        },
+        "8193": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 27
+        },
+        "8195": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 78
+        },
+        "8198": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 43
+        },
+        "8199": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 43
+        },
+        "8201": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 43
+        },
+        "8214": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 143
+        },
+        "8253": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 90
+        },
+        "8254": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 172
+        },
+        "8255": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 45,
+            "mergedInto": 8391
+        },
+        "8256": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 87
+        },
+        "8257": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 87
+        },
+        "8258": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 59
+        },
+        "8259": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 116
+        },
+        "8260": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 144,
+            "mergedInto": 8281
+        },
+        "8261": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 172
+        },
+        "8271": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 44
+        },
+        "8280": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 90
+        },
+        "8281": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 144
+        },
+        "8282": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 144
+        },
+        "8283": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 144
+        },
+        "8284": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 173
+        },
+        "8298": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 88
+        },
+        "8299": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 92
+        },
+        "8314": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 27
+        },
+        "8326": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 89
+        },
+        "8327": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 144
+        },
+        "8340": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 79
+        },
+        "8345": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 93
+        },
+        "8346": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 94
+        },
+        "8347": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 89
+        },
+        "8348": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 90
+        },
+        "8349": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 94
+        },
+        "8350": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 96
+        },
+        "8351": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 117
+        },
+        "8352": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 144
+        },
+        "8353": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 173
+        },
+        "8354": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 28
+        },
+        "8355": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 79
+        },
+        "8356": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 126
+        },
+        "8357": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 128
+        },
+        "8385": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 90
+        },
+        "8389": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 44
+        },
+        "8391": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 45
+        },
+        "8400": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 44
+        },
+        "8405": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 118
+        },
+        "8440": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 11
+        },
+        "8457": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 45
+        },
+        "8458": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 45
+        },
+        "8505": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 60
+        },
+        "8531": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 46
+        },
+        "8533": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 145
+        },
+        "8534": {
+            "category": "ARCHITECTURE",
+            "room": "Runtime & TUI",
+            "palaceLine": 80
+        },
+        "8535": {
+            "category": "CONSTRAINTS",
+            "room": "OpenCode & providers",
+            "palaceLine": 130
+        },
+        "8554": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 146
+        },
+        "8555": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 91
+        },
+        "8577": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 91
+        },
+        "8579": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 60
+        },
+        "8588": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 146
+        },
+        "8590": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 45
+        },
+        "8601": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 61
+        },
+        "8612": {
+            "category": "PROJECT_RULES",
+            "room": "Repo & delivery",
+            "palaceLine": 46
+        },
+        "8614": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 63
+        },
+        "8615": {
+            "category": "ARCHITECTURE",
+            "room": "Routes & controls",
+            "palaceLine": 96
+        },
+        "8616": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 93
+        },
+        "8617": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 118
+        },
+        "8618": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 118
+        },
+        "8619": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 148
+        },
+        "8620": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 173
+        },
+        "8621": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 119
+        },
+        "8623": {
+            "category": "PROJECT_RULES",
+            "room": "Plugin & tooling",
+            "palaceLine": 28
+        },
+        "8633": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 12
+        },
+        "8713": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 13
+        },
+        "8729": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 46
+        },
+        "8730": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 14
+        },
+        "8731": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 64
+        },
+        "8733": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 65
+        },
+        "8734": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 120
+        },
+        "8735": {
+            "category": "CONSTRAINTS",
+            "room": "Platform & Windows",
+            "palaceLine": 121
+        },
+        "8837": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 15
+        },
+        "8838": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 94
+        },
+        "8839": {
+            "category": "ARCHITECTURE",
+            "room": "Scheduler & drains",
+            "palaceLine": 94
+        },
+        "8840": {
+            "category": "ARCHITECTURE",
+            "room": "Artifacts & storage",
+            "palaceLine": 65
+        },
+        "8841": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 148
+        },
+        "8842": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 148
+        },
+        "8843": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 148
+        },
+        "8844": {
+            "category": "NAMING",
+            "room": "Names & IDs",
+            "palaceLine": 174
+        },
+        "8872": {
+            "category": "CONFIG_VALUES",
+            "room": "Runtime config & limits",
+            "palaceLine": 148
+        },
+        "8912": {
+            "category": "PROJECT_RULES",
+            "room": "Runtime & tests",
+            "palaceLine": 46
+        },
+        "8913": {
+            "category": "PROJECT_RULES",
+            "room": "Knowledge & workflow",
+            "palaceLine": 16
+        }
+    }
+}

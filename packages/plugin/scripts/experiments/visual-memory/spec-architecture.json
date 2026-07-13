@@ -1,0 +1,890 @@
+[
+    {
+        "id": 6564,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": [
+            "project artifacts key=root, shared harnesses: search/semantic/symbol/callgraph/inspect",
+            "session state key=(harness,session): undo/backups/bash/checkpoints"
+        ],
+        "importance": 65
+    },
+    {
+        "id": 8840,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "ArtifactAccess::for_root fallback=borrow-only+warning; ⊘probe (latency-critical git spawn)",
+        "importance": 60
+    },
+    {
+        "id": 8614,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "persist root→cache-key after successful probe; failure→last-known or retryable; ⊘path fallback (identity split)",
+        "importance": 58
+    },
+    {
+        "id": 8187,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "worktree-class bind: ⊘cold build (borrow shared owner artifacts)",
+        "importance": 58
+    },
+    {
+        "id": 8087,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "owner+standalone coexist same root via fs_lock + harness-namespaced stores",
+        "importance": 58
+    },
+    {
+        "id": 8731,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "worktree roots=pure borrowers; read/query-only stores; ⊘writer leases (owner-only)",
+        "importance": 55
+    },
+    {
+        "id": 8579,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "writer lease loser→read-only + stale-with-disclosure; ⊘error (RO-fallback)",
+        "importance": 50
+    },
+    {
+        "id": 8258,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "owner liveness: own PID always alive (OS/tasklist flakes)",
+        "importance": 45
+    },
+    {
+        "id": 8733,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "backup hydration deferred first write; Tier-2 ⊘worktree scans (borrower economy)",
+        "importance": 48
+    },
+    {
+        "id": 8601,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": [
+            "artifact_cache_key root commit: aft 90ff783f3f4c5cf2; opencode aa69d52ef2dcad4d",
+            "alfonso be627d40119a995e; magic-context e274ab0872bb490b; subc 29f01b6c90df2c83; synapse 3e6b8ee50bb2bb06"
+        ],
+        "importance": 35
+    },
+    {
+        "id": 5240,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "PTY kill synchronous on Windows→TimedOut(124)|Killed; ⊘async hang",
+        "importance": 65
+    },
+    {
+        "id": 6145,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "sidebar RPC heartbeat 15s recreates deleted port file",
+        "importance": 60
+    },
+    {
+        "id": 5618,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "bridge lazy-spawns AFT binary on first request; ⊘passive status spawn (passive-poll)",
+        "importance": 60
+    },
+    {
+        "id": 5262,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "version check→ensureBinary + pool.replaceBinary; ⊘host restart (hot-swap)",
+        "importance": 65
+    },
+    {
+        "id": 6059,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "completion reminder debounce 200ms, cap1000ms (prefix cache)",
+        "importance": 45
+    },
+    {
+        "id": 8195,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "Unix startup one-time `$SHELL -l -c 'printf %s $PATH'` when PATH bare",
+        "importance": 55
+    },
+    {
+        "id": 8340,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "expire_pending_bash_asks at loop top (busy select starvation)",
+        "importance": 56
+    },
+    {
+        "id": 6428,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "insert_method_dispatch_edges_chunked partitions caller files by chunk_size (RAM bound)",
+        "importance": 65
+    },
+    {
+        "id": 6258,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "Tier-2 cached aggregates filtered on demand by query scope",
+        "importance": 65
+    },
+    {
+        "id": 6160,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "test-support dirs ⊘reports (fixtures/testdata false positives); imports still keep prod exports live",
+        "importance": 65
+    },
+    {
+        "id": 6159,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "same-file value refs e.g. Zod composition→live",
+        "importance": 60
+    },
+    {
+        "id": 5724,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "cold DB write=single transaction; parse dominates",
+        "importance": 60
+    },
+    {
+        "id": 5706,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "Rust resolver caches crate-name→src prefixes; ⊘recursive walks (cache-hit)",
+        "importance": 60
+    },
+    {
+        "id": 5592,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "wildcard-imported exports→uncertain reason=wildcard_import; ⊘unused verdict (unknown binding)",
+        "importance": 60
+    },
+    {
+        "id": 5595,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "failed/dead LSP cached per workspace root; ⊘repeated reconnect (retry-stop)",
+        "importance": 65
+    },
+    {
+        "id": 5589,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "status_bar_counts=None until dead_code+unused_exports+duplicates all populated",
+        "importance": 60
+    },
+    {
+        "id": 8040,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "Rust macro call refs resolve file-local + same-file/visible imports; ⊘project-wide names (false live)",
+        "importance": 60
+    },
+    {
+        "id": 7939,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "F6 executable-file roots: only framework exports default|GET|loader seed; ⊘all route exports (hides helpers)",
+        "importance": 62
+    },
+    {
+        "id": 7940,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "framework decorator matching import-binding + alias aware",
+        "importance": 55
+    },
+    {
+        "id": 7992,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "macro token trees ⊘precise-edge store (name-match pollution)",
+        "importance": 52
+    },
+    {
+        "id": 7294,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "direct aft_inspect=synchronous incremental refresh+recompute; status bar async",
+        "importance": 55
+    },
+    {
+        "id": 6452,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "configure.rs rejects relative roots→invalid_request (canonical absolute resolution)",
+        "importance": 65
+    },
+    {
+        "id": 6116,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "AftRpcClient/Server delete port file only recorded PID dead",
+        "importance": 65
+    },
+    {
+        "id": 5903,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "legacy migration copies; ⊘move (rollback preserves source)",
+        "importance": 60
+    },
+    {
+        "id": 6255,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "aft-tokenizer build.rs temp+rename writes src/claude_data.rs (concurrent-build safety)",
+        "importance": 60
+    },
+    {
+        "id": 5248,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "warnings dedupe via bridge DB state (cross-session)",
+        "importance": 60
+    },
+    {
+        "id": 5429,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "LSP schema extensions+binary optional (built-in overrides)",
+        "importance": 60
+    },
+    {
+        "id": 8188,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "equivalent-config rebind idempotent→zero new warm work",
+        "importance": 62
+    },
+    {
+        "id": 7241,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "mode threads user_config_path through runner (hermetic tests; ⊘real user config)",
+        "importance": 60
+    },
+    {
+        "id": 7353,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "migration conflict: first harness writes global; other→aft.jsonc.<harness>_OLD",
+        "importance": 48
+    },
+    {
+        "id": 8505,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "trigram delta flush graceful shutdown if dirty, 25ms lock; panic ⊘disk work (panic-path)",
+        "importance": 45
+    },
+    {
+        "id": 6094,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "HTML fetch→htmd Markdown + .md cache (reuse parser)",
+        "importance": 45
+    },
+    {
+        "id": 8186,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "reconfigure cancel-or-adopt detached builds via per-root generations",
+        "importance": 64
+    },
+    {
+        "id": 6102,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "configure eagerly warms CallGraphStore (avoid first-use latency)",
+        "importance": 60
+    },
+    {
+        "id": 7958,
+        "category": "ARCHITECTURE",
+        "room": "Artifacts & storage",
+        "cue": "stale diagnostics flagged, hidden from warm readers; ⊘eviction (would fabricate zero)",
+        "importance": 58
+    },
+    {
+        "id": 5604,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "local MiniLM mean-pool + L2 normalize→Qdrant/fastembed parity",
+        "importance": 60
+    },
+    {
+        "id": 5736,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "chunk reuse key=blake3(embed_text) + exact-string verify",
+        "importance": 65
+    },
+    {
+        "id": 5778,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "trigram + semantic separate binary indexes; ⊘SQLite bottleneck (bin-files)",
+        "importance": 65
+    },
+    {
+        "id": 5978,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "search index paths absolute in RAM, relative on disk (portable)",
+        "importance": 65
+    },
+    {
+        "id": 7499,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "priors: P2 definition exact-Identifier; P1/P4 NL-only; P3 qualified via V7",
+        "importance": 51
+    },
+    {
+        "id": 7500,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "priors require rank_score/raw-cosine split + semantic-only sort + cap_protected",
+        "importance": 52
+    },
+    {
+        "id": 7501,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "P2 exact boost needs minimum raw cosine (⊘List/Map collisions reserving slots)",
+        "importance": 50
+    },
+    {
+        "id": 7308,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "queries read resident store; ⊘cold build (latency)",
+        "importance": 50
+    },
+    {
+        "id": 6738,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "within-root concurrency→tsconfig_membership thread-safe lock; ⊘RefCell (mutex)",
+        "importance": 65
+    },
+    {
+        "id": 6887,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "TreeSitterProvider Send+Sync via per-call FileParser; ⊘RefCell mutation (per-call)",
+        "importance": 62
+    },
+    {
+        "id": 7633,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "apply_patch→crates/aft/src/patch matcher; ⊘fuzzy_match.rs (preserve MatchTier line ladder)",
+        "importance": 62
+    },
+    {
+        "id": 7932,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": ".h→C; ⊘Objective-C (avoid C/C++ regression)",
+        "importance": 64
+    },
+    {
+        "id": 7931,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "Objective-C=outline only; ⊘import/dead-code/call extraction (no support)",
+        "importance": 58
+    },
+    {
+        "id": 7467,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": [
+            "semantic extensions=every real tree-sitter symbol query; generic collect_file_chunks_from_source",
+            "⊘HTML/Markdown/JSON (query=None); sync guard semantic_extension_policy_stays_in_sync_with_parser_code_arms"
+        ],
+        "importance": 67
+    },
+    {
+        "id": 7220,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "MCP storage segment strip `/ \\ :`, collapse -, prefix mcp-- (⊘traversal)",
+        "importance": 65
+    },
+    {
+        "id": 7520,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "transaction rollback stays on even user backups off (edit_match/move_symbol/lsp_rename)",
+        "importance": 64
+    },
+    {
+        "id": 7521,
+        "category": "ARCHITECTURE",
+        "room": "Code intelligence",
+        "cue": "lsp_rename rollback=CheckpointStore; ⊘BackupStore (user toggle isolation)",
+        "importance": 62
+    },
+    {
+        "id": 6486,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "Pi returns agent plain text + details structured JSON",
+        "importance": 65
+    },
+    {
+        "id": 7835,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "RPC/sidebar push=Bun.serve gated `typeof Bun !== \"undefined\"` for Bun-only TUI",
+        "importance": 55
+    },
+    {
+        "id": 4882,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "prompt context merges recent agent/model/variant→provider prefix reuse",
+        "importance": 65
+    },
+    {
+        "id": 7738,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "@cortexkit/subc-client devDependency bundled in published distribution",
+        "importance": 55
+    },
+    {
+        "id": 8534,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "Pi TypeBox builds literal JSON Schema runtime; OpenCode converts Zod",
+        "importance": 48
+    },
+    {
+        "id": 8355,
+        "category": "ARCHITECTURE",
+        "room": "Runtime & TUI",
+        "cue": "TSX precompile with host transform→opentui:runtime-module:* single runtime/reactivity",
+        "importance": 65
+    },
+    {
+        "id": 6562,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "subc-core=transport/routing/lifecycle/lease/hooks/secrets; ⊘business logic (module-scope)",
+        "importance": 65
+    },
+    {
+        "id": 7573,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "one SubcClient/process + per-call identity; routes root+session",
+        "importance": 62
+    },
+    {
+        "id": 6870,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "concurrent executor only daemon path; standalone NDJSON direct",
+        "importance": 62
+    },
+    {
+        "id": 8253,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "federation side dedupes; ⊘idempotency tokens (envelope only deterministic terminal reply)",
+        "importance": 60
+    },
+    {
+        "id": 8165,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": [
+            "native plumbing five: bash_status, bash_drain_completions, bash_ack_completions",
+            "undo_preview, checkpoint_paths; all session-scoped, ⊘config/trust/privilege (5-safe-tools)"
+        ],
+        "importance": 58
+    },
+    {
+        "id": 7570,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "standalone NDJSON + daemon use run_tool_call translate→orchestrate→dispatch→format; plugin execute thin",
+        "importance": 65
+    },
+    {
+        "id": 7571,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "server owns zoom fan-out + outline dispatch + target merge; ⊘TS/Rust duplication (server-side)",
+        "importance": 58
+    },
+    {
+        "id": 7221,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "subc_translate in run_tool_call before lane; ⊘aliases in shared main::dispatch (validation)",
+        "importance": 60
+    },
+    {
+        "id": 7006,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "bind session ID→RawRequest (undo/backups/bash isolation + completions)",
+        "importance": 60
+    },
+    {
+        "id": 6733,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "daemon spawns AFT `--subc <connection-file-path>`",
+        "importance": 60
+    },
+    {
+        "id": 8349,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "harness=`runner` storage/trust; client identity in session `alfonso:<gatherer-id>`",
+        "importance": 58
+    },
+    {
+        "id": 8299,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "health reply rides frame loop; ⊘out-of-band cheap answer (must measure loop liveness)",
+        "importance": 58
+    },
+    {
+        "id": 8615,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "failed/expired bind→next rebind recreates actor; ⊘already-pending/config-divergence rejection (expired)",
+        "importance": 50
+    },
+    {
+        "id": 8350,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "Windows ConnectionReset|ConnectionAborted→clean daemon-closed EOF",
+        "importance": 50
+    },
+    {
+        "id": 7572,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "session end→SubcPool.closeRouteChannel (resource + teardown)",
+        "importance": 50
+    },
+    {
+        "id": 7210,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "tool manifest requires execution_mode",
+        "importance": 50
+    },
+    {
+        "id": 8345,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "pins subc-protocol 0.8 + subc-transport 0.3.2 (typed principal, HealthCheck)",
+        "importance": 40
+    },
+    {
+        "id": 7814,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "awaiting-ack completion vs authoritative drain snapshot; ⊘TTL (premature eviction/double delivery)",
+        "importance": 64
+    },
+    {
+        "id": 7801,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "background wake lock-free epoch; stale CLEAR ⊘newer wake (epoch)",
+        "importance": 66
+    },
+    {
+        "id": 8298,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "health/root list try-lock only→busy/empty; ⊘blocking responder (try-lock)",
+        "importance": 61
+    },
+    {
+        "id": 8130,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "mergeInto": 8298,
+        "importance": 60
+    },
+    {
+        "id": 7754,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "loop decoupled AppContext; reliable_rx sets wakes; maintenance pass clears authoritatively",
+        "importance": 60
+    },
+    {
+        "id": 7538,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "embedding retry wait clears Tier-2 cold-seed gate (⊘code-health starvation)",
+        "importance": 58
+    },
+    {
+        "id": 7528,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "active semantic build defers callgraph warm + Tier-2 scans (peak RSS)",
+        "importance": 56
+    },
+    {
+        "id": 8577,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": [
+            "bind queues ConfigureTail then CompletionDrains; maintenance_pending=true",
+            "next_maintenance_at +250ms gives completion priority"
+        ],
+        "importance": 55
+    },
+    {
+        "id": 8555,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "reliable Push unbounded/nonblocking; lossy capacity1024 newest via LossyOverflow",
+        "importance": 55
+    },
+    {
+        "id": 7723,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "PersistentCancelSignal=AtomicBool+Notify enable() (⊘lost wakeup)",
+        "importance": 55
+    },
+    {
+        "id": 7537,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "cold gate=per-AppContext accumulation flag; ⊘Building (also cached/incremental)",
+        "importance": 55
+    },
+    {
+        "id": 8326,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "post-ack configure→ConfigureMaintenanceJob queue, async runtime-drain",
+        "importance": 54
+    },
+    {
+        "id": 8256,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "RouteBind completions processed loop top before Push/maintenance",
+        "importance": 54
+    },
+    {
+        "id": 8385,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "binds bypass maintenance queue; ⊘wait (storm starvation)",
+        "importance": 62
+    },
+    {
+        "id": 8257,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "drain-tick at loop top; ⊘starvation (tick precedes select)",
+        "importance": 53
+    },
+    {
+        "id": 8839,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "reads-first interactive admission; writer promotion age=6s",
+        "importance": 52
+    },
+    {
+        "id": 8347,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "heartbeat process-wide timer thread + RAII leases; independent Mutating lane",
+        "importance": 52
+    },
+    {
+        "id": 7722,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "watchdog emits BashLongRunning; deferred driver handles only final response",
+        "importance": 52
+    },
+    {
+        "id": 7354,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "dynamic bash targets ⊘wildcard external-dir ask (variables/subshell footgun); command approval remains",
+        "importance": 67
+    },
+    {
+        "id": 8346,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "RouteBind.consumer_capabilities typed elicitation; absent→flat deny",
+        "importance": 66
+    },
+    {
+        "id": 7615,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "unsupported tool distinct catch-all error code; ⊘parallel name allowlist (validation drift)",
+        "importance": 65
+    },
+    {
+        "id": 7592,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "server strips preview before translation/fallback; preview ⊘disk mutation (stripped)",
+        "importance": 60
+    },
+    {
+        "id": 7088,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "execution_mode=external effects; ⊘internal warming mutation (keeps reads pure)",
+        "importance": 58
+    },
+    {
+        "id": 6616,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "RawAftConfig deny_unknown_fields top-level only; nested non-strict matches TS",
+        "importance": 60
+    },
+    {
+        "id": 8156,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "unknown_channel→reopen+retry once (`not_sent`); ⊘outcome-unknown retry (double mutation)",
+        "importance": 65
+    },
+    {
+        "id": 7802,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "route cache singleflight+tombstones (concurrent open/closed channel)",
+        "importance": 65
+    },
+    {
+        "id": 7017,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "fan-out separates matched channels vs sent frames; buffer keys channel presence",
+        "importance": 65
+    },
+    {
+        "id": 6981,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "Push coalesced upstream→shallow egress",
+        "importance": 60
+    },
+    {
+        "id": 8280,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "writer send timeout+backoff; ⊘drop (retry+backoff); warn-once; ⊘park forever on `reserve().await` (backpressure-starves-writer)",
+        "importance": 59
+    },
+    {
+        "id": 7728,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": [
+            "peer roster ephemeral; inbox durable with session_id",
+            "reply raw session_id despite empty roster; known SUBCONSCIOUS ses_12a4fa38dffe81Fz7Y2AsWb5Cg"
+        ],
+        "importance": 55
+    },
+    {
+        "id": 7012,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "StatusChanged=project/session-less; Progress ⊘production emitters (contract-only)",
+        "importance": 55
+    },
+    {
+        "id": 7753,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": "bg_events dedicated channel; ⊘dispatch saturation blocking completion wakes (wake-lane)",
+        "importance": 63
+    },
+    {
+        "id": 8838,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "drain phases Collect→Apply; budget2048 paths + soft250ms (preemptible)",
+        "importance": 66
+    },
+    {
+        "id": 6845,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "attach_status_bar mutates tsconfig_membership/status_bar_last_emitted→serial",
+        "importance": 58
+    },
+    {
+        "id": 8348,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": [
+            "WATCHER_EVENT_DRAIN_BATCH_CAP=LSP_EVENT_DRAIN_BATCH_CAP=256 per job",
+            "requeue remainder; standalone drains unbounded"
+        ],
+        "importance": 50
+    },
+    {
+        "id": 8616,
+        "category": "ARCHITECTURE",
+        "room": "Scheduler & drains",
+        "cue": "image resize dedicated thread/request; timer=processing only; ⊘OnceLock/global pool (load timeout)",
+        "importance": 55
+    },
+    {
+        "id": 8050,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": [
+            "~/Work/Projects/CortexKit/synapse=stateless embeddings/rerank/micro-LLM; later image/STT/TTS",
+            "AFT keeps retrieval; llm-runner owns session/tool semantics; handoff SYNAPSE/FOUNDING.md"
+        ],
+        "importance": 52
+    },
+    {
+        "id": 8158,
+        "category": "ARCHITECTURE",
+        "room": "Routes & controls",
+        "cue": [
+            "packages/aft-bridge/src/__tests__/e2e/: subc-rig|subc-lane|subc-lifecycle",
+            "fetch-subc-core.sh pinned+sha256; missing binary/secrets→loud skip, ⊘failure (optional)"
+        ],
+        "importance": 55
+    }
+]

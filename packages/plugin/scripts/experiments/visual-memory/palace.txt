@@ -1,0 +1,188 @@
+<PROJECT_RULES>
+┌─ Knowledge & workflow ─────────────────────────────────────────────────┐
+│•cntrdctn→explct dcsn;⊘unltrl bhvr (prr-dcsn)¦OpenCode; ⊘nstd `opencode │
+│run` (shrd server/SQLite cllsn)¦MIT mnfsts+LICENSE¦paragraph=one (GFM   │
+│hrd-brks nwln)¦sm Mac¦GitHub identity=~/.local/bin/gh-alfonso-aft;      │
+│rpls→apprvl+--bdy-fl¦cntrcts:run-manifest.json+run-summary.tsv          │
+│•D=deterministic/no-LLM; S=stochastic/provider-metered¦incremental=false│
+│•correctness/algorithm, ⊘prf mgntd (CPU cntntn)¦`aft warmup`¦prose=agent│
+│actn;⊘hmn imprtv (agnt owns tl cll)¦`#N` GitHub issue/PR;¦AFT           │
+│arm:aft_inspect off;⊘AFT hnts;agent.build.prompt=`                      │
+│`;explore/general/task/skill (spprss expnsn)¦notes/close @-tag¦bgs→cmplt│
+│rt-cs rsltn;⊘workaround/bypass (dfrs dfct)¦msn→rsm SAME task/resteer;   │
+│⊘intgrtn slf-fx (hds rtr sgnl)¦⊘ltncy evdnc (prlll rstc cntsts wll tm)  │
+│;M1: bench.lock+png SYNAPSE; mchnsm+DEBUG_BOUND_MULTIPLIER¦M5           │
+│escalation=/tmp/m5-build.lock¦lp:2–3 scpd→trpl-chck                     │
+│cd+msr→pln→msns→vrfy→rpt¦dffrnttr;negatives=⊘excluded+mchnsm (plrty)    │
+└────────────────────────────────────────────────────────────────────────┘
+┌─ Plugin & tooling ──────────────────────────────────────────────────────────────────────────────────────────┐
+│•dscrptns:⊘`Returns:` blcks (srfc cnvntn)¦new/graduated flds→bth plg src/config.ts;+OpenCode                 │
+│scripts/build-schema.ts¦dryRun ast_grep_replace; edt+checkpoint/undo¦template=`(absolute or relative to      │
+│project root)`¦PID > ≻ bndls¦changes→z.toJSONSchema+z.object+def.args+io:"input"; msr¦TS/JS¦exprt→cnfgr      │
+│harness→inspect_tier2_run→inspect¦bash.background:false→remove params/tools/descriptions/guidance; ⊘prtl dsbl│
+│(srfc lks ftr)¦compress/*.rs fixtures=real NBSP U+00A0 / ASCII U+0020¦timestamps=absolute                    │
+│(deterministic/cache-stable)¦cnts:⊘rmt schema/network (envrnmntl) ;TS2688/type-resolution=count              │
+│•execution_mode=hand-classify writes/deletes; ⊘ln drvtn (lns+intrnl effcts)¦shrtcrct:∅→∅;⊘fbrctn (fltr smmrzs│
+│only actl byts) compress_filters_test.rs::builtin_filters_never_fabricate_output_for_empty_input             │
+│•rebuild→scripts/dev-rebuild.sh¦fields→tool_call_parity_test.rs mskng¦TUI: runtimeDependencies=0; TSX        │
+│exprts;⊘vl imprts (hst rntm owns vls)¦gt;⊘imprt-only prb (msss JSX egr frz)¦file:// plugin→TS mrg            │
+│dst:aft-brdg,opncd-,pi                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─ Repo & delivery ──────────────────────────────────────────────────────┐┌─ Runtime & tests ──────────────────────────────────────────────────────┐
+│•flr→fx blckr,delete/repush=vrsn¦packages/aft-bridge ≺ TS               ││•isTerminalStatus completed|failed|killed|timed_out; ⊘`!=running`       │
+│•@cortexkit/aft-*                                                       ││(unknwn stts)¦e.g. PermissionsExt→#[cfg (unx)¦verification=native       │
+│package→version-sync.mjs+validate-packages.mjs+release.yml¦rl ≺ tg      ││Windows;⊘Unix trgt-chck (Unix-gtd hlprs)¦promptAsync on:synthetic:true  │
+│•LockGuard::drop ≺ lckfl¦cmmts+=Alfonso 289616620+¦index.ts imprts→bn rn││OR ignored:true¦E2ETest: crss-bld→stg ~/Downloads→\psf\Home\Downloads;  │
+│lnt;⊘pkg tsts (Biome nt rn)¦busy_timeout ≺ journal_mode=WAL             ││gst exc;pwsh→PowerShell5 fllbck¦(shrd trgt build-lock/CPU)¦E2E          │
+│•rolled_back:true→success+unchngd;⊘hrd errr (rllbck sccdd)¦PR→gh pr     ││catalog.list; ⊘sttc cpy (drfts)¦translate/format→TS-generated           │
+│modified/unverifiable¦Tests/CI=`scripts/watch-ci.sh [commit]            ││capture-subc-parity.ts¦format_on_edit:true¦tst:Windows `cmd /c "echo    │
+│[workflow]`;Release= `scripts/wait-release.sh vX.Y.Z` ;⊘nhp pll         ││x&exit 7"` `printf x; exit 7` ;⊘br PowerShell `exit N` (klls wrppr ≺    │
+│(detach/quoting ls)¦`\n` fxtrs→rt .gitattributes eol=lf; *.rw;⊘lcl      ││ext-mrkr)¦subc_bridge_test.rs env→run_subc_bridge_test_with_env insd    │
+│wndws-gn (cmpl-only,no byt tst)¦drctly:`bash scripts/watch-ci.sh        ││•SubcTransportPool structuredContent rply;malformed/missing→protocol    │
+│main`;wtch `RESULT=` ;⊘`... >log & echo pid` (trckd shll exts ≺ wtchr   ││errr¦logger.log; ⊘shrd logfile/sleeps (prlll flks)¦prlll:ldgr-chck ≺    │
+│ot)¦wvs:⊘shrd vrsn (cllsn)¦rvw trs¦A/B >30min→dedicated chckt           ││rtry+sttlng¦tmt→explct bash_kill; ⊘orphn exctn (exctr strvtn)           │
+│•trlr:Co-authored-by <289616620+alfonso-aft@users.noreply.github.com>   ││•gate=`--cargo-profile release`;debug=4x+mn¦`storm = 1`                 │
+│•(CI fail-fast/autocancel msks lnt)¦⊘prlll rp-mttng (tmt cn strnd dtchd)││•names/descriptions/schemas+prmpts¦FSEvents→srlzd watcher_integration   │
+│;A/B=2 base/head¦state/logs→durable hm;⊘/tmp (rbt lss)                  ││•CPU brf:≤8 19, EXIT/INT/TERM¦src/ gt+`--lib`¦⊘bind/configure nnxstnt   │
+└────────────────────────────────────────────────────────────────────────┘│(stl rstrd sss cnsm mdls)                                               │
+                                                                          └────────────────────────────────────────────────────────────────────────┘
+<ARCHITECTURE>
+┌─ Artifacts & storage ──────────────────────────────────────────────────┐┌─ Code intelligence ────────────────────────────────────────────────────┐
+│•ddp DB¦LSP opt¦cps;⊘mv (rllbck prsrvs src)¦HTML ftch→htmd Markdown+.md ││•status_bar_counts=None dead_code+unused_exports+duplicates             │
+│•CallGraphStore¦AftRpcClient/Server PID¦build.rs                        ││•exprts→uncrtn reason=wildcard_import; ⊘unsd vrdct (unknwn bndng)       │
+│tmp+rnm→src/claude_data.rs (prlll-bld sfty)¦configure.rs                ││•failed/dead LSP rt;⊘rptd rcnnct (rtry-stp)¦MiniLM mn-pl+L2             │
+│roots→invalid_request (cnncl abslt rsltn)¦key=root,                     ││normalize→Qdrant/fastembed prty¦crt-nm→src prfxs;⊘rcrsv wlks (cch-ht)¦DB│
+│hrnsss:search/semantic/symbol/callgraph/inspect;                        ││write=single¦key=blake3(embed_text)+exct-strng¦indxs;⊘SQLite bttlnck    │
+│key=(hrnss,sss):undo/backups/bash/checkpoints¦user_config_path (hrmtc   ││(bn-fls)¦in RAM,¦=-fl e.g. cmpstn→lv¦⊘rprts (fixtures/testdata fls      │
+│tsts;⊘rl usr cnfg)¦cnflct:frst hrnss→glbl;other→aft.jsonc.<harness>_OLD ││pstvs)¦Tier-2¦insert_method_dispatch_edges_chunked chunk_size (RAM bnd) │
+│•rdrs;⊘evctn (wld fbrct 0)¦cxst=rt fs_lock+hrnss-nmspcd¦cancel-or-adopt ││•concurrency→tsconfig_membership thrd-sf lck;⊘RefCell (mtx)             │
+│•bnd:⊘cld bld (brrw shrd ownr )¦idmptnt→0 nw¦lvnss:own PID (OS/tasklist ││•TreeSitterProvider FileParser; ⊘RefCell mttn (pr-cll)¦MCP `/ \ :`      │
+│flks)¦drty,25ms ⊘dsk wrk (pnc-pth)¦lsr→←-only+stale-with-disclosure;    ││(⊘trvrsl)¦aft_inspect=synchronous¦qrs←rsdnt str;⊘cld bld (ltncy)        │
+│⊘errr (RO-fallback)¦artifact_cache_key cmmt:aft 90ff783f3f4c5cf2;       ││•extensions=every collect_file_chunks_from_source; ⊘HTML/Markdown/JSON  │
+│aa69d52ef2dcad4d; be627d40119a995e; e274ab0872bb490b; 29f01b6c90df2c83; ││(query=None)                                                            │
+│3e6b8ee50bb2bb06¦rt→cch-ky ≻ sccssfl prb;flr→lst-knwn|rtrybl;⊘pth fllbck││semantic_extension_policy_stays_in_sync_with_parser_code_arms¦prrs:P2   │
+│(ID splt)¦roots=pure brrwrs;read/query-only strs;⊘wrtr lss (ownr-only)  ││exct-Identifier;P1/P4 NL-only; P3 V7¦prrs→rank_score/raw-cosine         │
+│•frst→;Tier-2 ⊘wt scns (brrwr ecnmy)¦ArtifactAccess::for_root           ││splt+sm-only srt+cap_protected¦P2 (⊘List/Map cllsns rsrvng slts)        │
+│fallback=borrow-only+warning; ⊘prb (ltncy-crtcl gt spwn)                ││•(edit_match/move_symbol/lsp_rename)¦lsp_rename                         │
+┌─ Routes & controls ────────────────────────────────────────────────────┐│rollback=CheckpointStore; ⊘BackupStore (usr tggl isltn)                 │
+│•subc-core=transport/routing/lifecycle/lease/hooks/secrets; ⊘bsnss lgc  ││•apply_patch→crates/aft/src/patch mtchr;⊘fuzzy_match.rs (prsrv MatchTier│
+│(mdl-scp)¦RawAftConfig deny_unknown_fields TS¦AFT `--subc               ││ln lddr)¦Objective-C=outline only;⊘import/dead-code/call extrctn (no+)  │
+│<connection-file-path>`¦NDJSON¦upstrm→shllw egrss¦ID→RawRequest         ││•.h→C; ⊘Objective-C (avd C/C++ rgrssn)¦F6 rts:only default|GET|loader   │
+│(undo/backups/bash isltn+dn)¦StatusChanged=project/session-less; ⊘prdctn││sd;⊘∀ rt (hds hlprs)¦frmwrk¦⊘prcs-edg str (nm-mtch plltn)               │
+│emttrs (cntrct-only)¦fn-ot¦execution_mode=external effcts;⊘intrnl wrmng ││•fl-lcl+same-file/visible imprts;⊘prj-wd nms (fls lv)                   │
+│(kps←pr)¦mnfst→execution_mode¦subc_translate run_tool_call ≺ ln;⊘alss in│┌─ Runtime & TUI ────────────────────────────────────────────────────────┐
+│main::dispatch (vldtn)¦⊘wldcrd extrnl-dr (variables/subshell ftgn)      ││•agent/model/variant→provider prfx¦PTY Windows→TimedOut(124)|Killed;    │
+│•NDJSON+dmn run_tool_call trnslt→orchstrt→dsptch→frmt;plg exct          ││⊘async hng¦check→ensureBinary+pool.replaceBinary; ⊘hst rstrt (ht-swp)   │
+│•mrg;⊘TS/Rust dplctn (srvr-sd)¦end→SubcPool.closeRouteChannel           ││•AFT rqst;⊘pssv stts (pssv-pll)¦200ms, cap1000ms¦RPC 15s¦Pi→agnt pln    │
+│(rsrc+trdwn)¦SubcClient/process+pr-cll ID;rt+sss¦≺ translation/fallback;││JSON¦@cortexkit/subc-client devDependency¦RPC/sidebar push=Bun.serve    │
+│⊘dsk mttn (strppd)¦cd;⊘prlll nm (vldtn drft)¦drbl+session_id; session_id││`typeof Bun !== "undefined"` TUI¦`$SHELL -l -c 'printf %s $PATH'` PATH  │
+│SUBCONSCIOUS ses_12a4fa38dffe81Fz7Y2AsWb5Cg¦bg_events chnnl;⊘dsptch     ││•expire_pending_bash_asks¦TSX transform→opentui:runtime-module:* sngl   │
+│strtn (wk-ln)¦(prlll open/closed chnnl)                                 ││runtime/reactivity¦TypeBox JSON Schema;OpenCode                         │
+│•~/Work/Projects/CortexKit/synapse=stateless                            │┌─ Scheduler & drains ───────────────────────────────────────────────────┐
+│embeddings/rerank/micro-LLM; image/STT/TTS; AFT session/tool            ││•attach_status_bar tsconfig_membership/status_bar_last_emitted→serial   │
+│SYNAPSE/FOUNDING.md¦unknown_channel→reopen+retry onc                    ││•wrm+Tier-2 (pk RSS)¦gate=per-AppContext flg;⊘Building (als             │
+│(`not_sent`);⊘otcm-unknwn rtry (dbl mttn)                               ││cached/incremental)¦Tier-2 (⊘cd-hlth strvtn)¦BashLongRunning;           │
+│•packages/aft-bridge/src/__tests__/e2e/:                                ││•PersistentCancelSignal=AtomicBool+Notify (⊘lst wkp)¦AppContext;        │
+│subc-rig|subc-lane|subc-lifecycle; fetch-subc-core.sh pinned+sha256;    ││reliable_rx=wks;mntnnc¦CLEAR ⊘nwr wk (epch)¦snpsht;⊘TTL (prmtr          │
+│binary/secrets→loud skp,⊘flr (opt)¦fv:bash_status,                      ││eviction/double dlvry)¦RouteBind ≺ Push/maintenance¦tp;⊘strvtn (tck     │
+│bash_drain_completions, bash_ack_completions; undo_preview,             ││prcds slct)¦health/root only→busy/empty; ⊘blckng rspndr (try-lck)       │
+│checkpoint_paths; sss-scpd,⊘config/trust/privilege (5-safe-tools)       ││•configure→ConfigureMaintenanceJob q,async¦thrd+RAII                    │
+│•ddps;⊘idmptncy tkns (envlp only stbl trmnl rply)¦tmt+bckff;⊘drp        ││•WATCHER_EVENT_DRAIN_BATCH_CAP=LSP_EVENT_DRAIN_BATCH_CAP=256¦q;⊘wt (strm│
+│(rtry+bckff) ;wrn-onc;⊘prk frvr `reserve().await`                       ││strvtn)¦unbounded/nonblocking; capacity1024 LossyOverflow¦ConfigureTail │
+│(backpressure-starves-writer)¦lp;⊘out-of-band chp (mst msr lp lvnss)    ││CompletionDrains; maintenance_pending=true; next_maintenance_at +250ms  │
+│•0.8+sbc-trnsprt 0.3.2 (typd prncpl,HealthCheck)                        ││•thread/request; timer=processing only;⊘OnceLock/global pl (ld tmt)     │
+│•RouteBind.consumer_capabilities elcttn;absnt→flt dny¦harness=`runner`  ││•Collect→Apply;budget2048 pths+soft250ms¦←-frst intrctv age=6s          │
+│storage/trust; ID `alfonso:<gatherer-id>`                               │└────────────────────────────────────────────────────────────────────────┘
+│•ConnectionReset|ConnectionAborted→clean dmn-clsd EOF¦failed/expired    │
+│bnd→nxt rbnd actr;⊘already-pending/config-divergence rjctn (exprd)      │
+└────────────────────────────────────────────────────────────────────────┘
+<CONSTRAINTS>
+┌─ OpenCode & providers ────────────┐┌─ Platform & Windows ───────────────────────────────────────────────────┐
+│•1.15.x `InstanceRef not provided` ││•npm.cmd; npm;`spawn`;⊘.cmd rsltn (explct-exctbl)¦GITHUB_TOKEN `release:│
+│upstrm;⊘prgrmmtc AFT (Effect lss   ││published` ;⊘dwnstrm rlnc (GITHUB_TOKEN)¦GitHub tags/cache              │
+│rf)¦tree-sitter-vue                ││v-prfxd;bare→404/cache mss;bdy¦prrty:$SHELL→pwsh.exe→powershell.exe→Git │
+│script=raw_text; ⊘TS AST .vue      ││bash.exe→cmd.exe flr¦⊘frst pblsh (rgstry→exstng pkg)                    │
+│(raw_text)¦SDK ⊘pblsh fl           ││•actions/setup-node@v5 always-auth=false wrnng;⊘rp-sd fx                │
+│events/internal (nt expsd)         ││(actions/setup-node iss 1379)¦dtchd;⊘inhrt (←-Host blcks frvr vs fl-fst)│
+│•arrays/objects→JSON.stringify;    ││•raw.githubusercontent text/plain→path-extension-first; ⊘src cchd (MIME)│
+│sclr at-rndr;⊘[objct Object]       ││•crates.io API→User-Agent¦HTML buttons/self-links/permalinks→explicit   │
+│(scalar-UI)¦LSP ⊘Bun rqrmnt        ││htmd¦ORT prblt:macOS arm64, Linux/Windows x64+arm64; ⊘Intel Mac (mnl    │
+│(Node/npm-only usrs)¦noReply       ││instll)¦PIPESTATUS+`set -o pipefail` ⊘prtbl acrss pwsh/cmd/Unix         │
+│⊘model/variant (InstanceRef crsh)  ││(shll-spcfc)¦.git/info/exclude ⊘fls insd (Git lmttn)¦TcpStream          │
+│;sendIgnoredMessage¦session/thread ││nnblckng→=blckng|←WouldBlock¦std::fs::rename rplcs;⊘pr-dlt (crsh wndw)  │
+│e.g. UUIDv7; ⊘sttlss rcnstrctn     ││•route.open channel/call; ⊘ID ddp (mntnc)                               │
+│(UUIDv7)¦ast_grep_replace e.g.     ││•crt←~/.gitconfig+~/.gitignore_global; tsts HOME+USERPROFILE            │
+│$$$BODY¦api.ui.Dialog Enter/Esc    ││•core.fsmonitor=true→daemon/repo/worktree; ⊘undr chrn (fsvntsd strtn)   │
+│•only;⊘blckng external_directory   ││•nd→nd formatters/LSP¦ld-snstv;subc-client>=0.3.3 budget30s¦my→∅ undr   │
+│(advsry)¦plugins=Node/Electron→RPC ││cntntn→lv ownr¦socket=ConnectionReset|ConnectionAborted, ⊘cln EOF (rst) │
+│prtbl node:http                    ││•⊘vrbtm `\\?\` (nrmlz cnnclz otpt)¦CPU→false sprvsr¦PATH syntx;⊘POSIX   │
+│•grants=InstanceState mmry;⊘rstrt  ││prnt (fails/misbehaves)¦macOS26 load=XProtect/AppleSystemPolicy; -9     │
+│prsstnc (vltl)¦spcfr;⊘vrbl (wrkspc ││C,⊘cpd /bin/echo (lnch-cnstrnt)¦macOS ID flnm→rnmd bnry SHA-256         │
+│nt inlnd)¦OpenAI-compatible        ││•namespace=harness only;⊘prj ky (sss shr dr)                            │
+│`{type:'object'}`                  │└────────────────────────────────────────────────────────────────────────┘
+│;⊘anyOf|oneOf|allOf                │
+│(DeepSeek400/GLM ∅ args)¦RouteBind │
+│reconnect/reopen cnfgr→pssbl strms │
+│•⊘skp Solid node_modules (egr      │
+│children/props frz frst pnt)       │
+│•OpenTUI                           │
+│0.4+opentui:runtime-module:*; 0.3  │
+│TSX→raw¦typs;⊘∅ `{}` /Type.Any     │
+│(strct vldtr rjcts)                │
+└───────────────────────────────────┘
+<CONFIG_VALUES>
+┌─ Runtime config & limits ───────────────────────────────────────────────────────────────────────────────────┐
+│•dataHome: XDG_DATA_HOME Unix;LOCALAPPDATA¦bash_status/bash_kill/transport ⊘brdg rstrt (own tmt hndlng)¦sf sm│
+│•bash.subagent_background=true¦.jsonc parse/write¦lsp.versions npm+GitHub-release                            │
+│•bash→experimental.bash.*→old flat→tool_surface dflts¦bash.timeout                                           │
+│•formatter_timeout_secs/type_checker_timeout_secs¦objct→unspcfd rewrite/compress/background=true¦Phase4 cap≈8│
+│•format_on_edit=false¦bash.foreground_window=15s¦format_on_edit debounce=90s¦~/.config/cortexkit/aft.jsonc;  │
+│<project>/.cortexkit/aft.jsonc; legacy→.MOVED_READPLEASE¦cap=1024px¦timeout=10s¦aft_zoom threshold=150       │
+│•enabled:boolean default=true,¦E2ETest mv→swtch snapshot→shf-host-del/add→delete old→nw aft-rdy¦CI           │
+│NEXTEST_TEST_THREADS=num-cpus¦multi_root.scan_depth=3; max_roots=32¦disabled_tools e.g. ⊘ rplcng             │
+│(disabled-name-gate)¦SUBC_CORE_BIN→cached bnry Linux/macOS CI¦CK_CI_APP_ID+CK_CI_APP_PRIVATE_KEY¦cap=2       │
+│•`[0-9a-f]{32,64}` ;mlfrmd→fl ld¦drain=32/turn¦submissions=4/tick¦cost≥20+span≥10¦watcher/LSP cap=256        │
+│•~/.ssh/id_ed25519 ufuka@192.168.1.47; %USERPROFILE%\aft; rustc1.96.1; C:\Program Files\Git\cmd\git.exe;     │
+│PowerShell5.1¦optionalInt=Type.Optional(Type.Union([Type.Integer({mn,mx}),Type.String()]))¦Windows=ROG       │
+│cmmnds;macOS=M1 test@tests-MacBook-Pro.local; M1 /Users/test/bench.lock owner.json; SYNAPSE;                 │
+│⊘/Users/test/bench-*|~/models (bnch-hm)¦RLIMIT_NOFILE=8192¦budget=2048¦deadline=250ms¦age=6s¦[profile.stage]:│
+│LTO, codegen-units=4, strip=false, debug=1; `cargo build --profile stage -p agent-file-tools` ;target/stage; │
+│fat-LTO                                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─ Semantic & cache ─────────────────────────────────────────────────────┐
+│•semantic.timeout_ms=25s (≺ prnt brdg tmt)¦key=git                      │
+│cmmt;non-git=canonical¦getCacheDir `%LOCALAPPDATA%\aft\bin`             │
+│APPDATA|~/AppData/Local¦ONNX semantic_search+fastembed/unset;           │
+│⊘openai_compatible/ollama (HTTP)¦MAX_EMBED_TEXT_CHARS=1600 (~400 tkns   │
+│<512 bcknd)¦weights=Qdrant/all-MiniLM-L6-v2-onnx                        │
+│tokenizer.json+model.onnx¦AFT_CALLGRAPH_BUILD_WAIT_MS default0; lrg→sync│
+│bld¦fingerprint=backend+model+normalized base_url+dimension+chunk       │
+│vrsn;chng→fll rbld¦all-MiniLM-L6-v2 string=fastembed¦expnsn:cosine≥0.60,│
+│rank0, nn-tst,≤250¦max_callgraph_files                                  │
+│•extnsns+jv,kt,kts,rb,swft,scl,l,pl,pm¦MAX_TOP_K overfetch=100¦V7; V6   │
+└────────────────────────────────────────────────────────────────────────┘
+<NAMING>
+┌─ Names & IDs ──────────────────────────────────────────────────────────┐
+│•`bash-<8hex>` `bg-`¦crates.io=agent-file-tools; lib+CLI=aft¦LSP        │
+│id=python; ⊘pyrght (cnfg ky msmtch)¦camelCase; filePath¦snake_case;     │
+│•dmn→sbc¦name_match `~` ;exact/type_match¦MCP                           │
+│`mcp--<sanitized-client>-<raw-name-hash>`                               │
+│•`<worktreePath>.aft-bridge.pid`¦subc/MCP                               │
+│delete|move|import|refactor|safety; aft_¦`bash-<16hex>` `bg-`¦aft_search│
+│•`aft:expected-duplicate`¦`fed:<fp>`¦code=bad_harness_fingerprint       │
+│•`fed--<prefix16>--<hash8>`¦`runner` `alfonso:<gatherer-id>`¦CLI:       │
+│restart|stop|start|status|list;¦principals=alfonso-core,                │
+└────────────────────────────────────────────────────────────────────────┘
+<KNOWN_ISSUES>
+┌─ Known limits ────────────────────┐
+│•aft_edit ⊘ltrl `\n` (escp bcms    │
+│nwln)¦⊘=-pth und (agnts ovrwrt     │
+│bckps)¦⊘wk-mdl sfty (rplc+advncd   │
+│mds mxd)¦aft_navigate ⊘sm crss-fl  │
+│(LSP rslvs mr)¦TS buildUnifiedDiff │
+│⊘optml insrtn (hrstc sbptml)       │
+│•apply_patch ⊘hg                   │
+│metadata.diagnostics (Biome rps    │
+│attch pyld)¦tool.definition        │
+│⊘model/agent inf (cnnt tlr dfntns) │
+└───────────────────────────────────┘

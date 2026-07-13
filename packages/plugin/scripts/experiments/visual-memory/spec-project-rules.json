@@ -1,0 +1,625 @@
+[
+    {
+        "id": 7863,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": [
+            "shortcircuit: empty→empty; ⊘fabrication (filter summarizes only actual bytes)",
+            "guard compress_filters_test.rs::builtin_filters_never_fabricate_output_for_empty_input"
+        ],
+        "importance": 67
+    },
+    {
+        "id": 6524,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": [
+            "compress/*.rs fixtures=real captured bytes + hexdump -C",
+            "match structural prefixes across NBSP U+00A0 / ASCII U+0020"
+        ],
+        "importance": 65
+    },
+    {
+        "id": 6527,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "git-log compression timestamps=absolute (deterministic/cache-stable)",
+        "importance": 60
+    },
+    {
+        "id": 8193,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "new volatile status fields→tool_call_parity_test.rs masking list",
+        "importance": 65
+    },
+    {
+        "id": 7087,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "execution_mode=hand-classify observable file writes/deletes; ⊘lane derivation (lanes include internal effects)",
+        "importance": 65
+    },
+    {
+        "id": 6556,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "status counts: ⊘remote schema/network (environmental); TS2688/type-resolution=count",
+        "importance": 65
+    },
+    {
+        "id": 6369,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "plant guaranteed-dead export→configure harness→inspect_tier2_run→inspect",
+        "importance": 60
+    },
+    {
+        "id": 6161,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "docs distinguish TS/JS import-graph verified vs Rust call-graph estimated",
+        "importance": 55
+    },
+    {
+        "id": 6150,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": [
+            "schema changes→z.toJSONSchema + z.object + def.args + io:\"input\"",
+            "measure surface tokens via aft-tokenizer"
+        ],
+        "importance": 65
+    },
+    {
+        "id": 5210,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "dryRun only ast_grep_replace; others real edit + checkpoint/undo",
+        "importance": 65
+    },
+    {
+        "id": 4791,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "tool descriptions: ⊘`Returns:` blocks (surface convention)",
+        "importance": 40
+    },
+    {
+        "id": 8623,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "repo file:// live plugin→TS merge rebuild dist: aft-bridge, opencode-plugin, pi-plugin",
+        "importance": 65
+    },
+    {
+        "id": 8314,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": [
+            "TUI: runtimeDependencies=0; peer deps optional; dev deps exact",
+            "raw TSX exports; ⊘value imports (host runtime owns values)"
+        ],
+        "importance": 64
+    },
+    {
+        "id": 8354,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "packed-install visual+behavior gate; ⊘import-only probe (misses JSX eager freeze)",
+        "importance": 55
+    },
+    {
+        "id": 5547,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "live bridge PID > binary mtime; restart host after bundles rebuild",
+        "importance": 55
+    },
+    {
+        "id": 7918,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "dev rebuild→scripts/dev-rebuild.sh",
+        "importance": 30
+    },
+    {
+        "id": 4915,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": [
+            "new/graduated fields→both plugins src/config.ts",
+            "+ OpenCode scripts/build-schema.ts"
+        ],
+        "importance": 65
+    },
+    {
+        "id": 6438,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "bash.background:false→remove params/tools/descriptions/guidance; ⊘partial disable (surface leaks feature)",
+        "importance": 65
+    },
+    {
+        "id": 5297,
+        "category": "PROJECT_RULES",
+        "room": "Plugin & tooling",
+        "cue": "path params template=`(absolute or relative to project root)`",
+        "importance": 50
+    },
+    {
+        "id": 6732,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "user docs `#N` only real GitHub issue/PR; strip internal note IDs",
+        "importance": 50
+    },
+    {
+        "id": 6504,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "invocation prose=agent action; ⊘human imperative (agent owns tool call)",
+        "importance": 50
+    },
+    {
+        "id": 4940,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "release-note paragraph=one unwrapped line (GFM hard-breaks newline)",
+        "importance": 40
+    },
+    {
+        "id": 4922,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "license MIT across manifests + LICENSE",
+        "importance": 40
+    },
+    {
+        "id": 7569,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "release notes/close comments always @-tag contributors",
+        "importance": 30
+    },
+    {
+        "id": 5266,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "semantic platform changes preserve Intel Mac",
+        "importance": 60
+    },
+    {
+        "id": 6896,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": [
+            "AFT arm: aft_inspect off; ⊘AFT hints; agent.build.prompt=` `",
+            "explore/general/task/skill disabled+denied (suppress workflow expansion)"
+        ],
+        "importance": 65
+    },
+    {
+        "id": 8713,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": [
+            "⊘latency evidence on shared dev box (parallel rustc contests wall time)",
+            "M1: bench.lock + ping SYNAPSE; bounds from mechanism + DEBUG_BOUND_MULTIPLIER"
+        ],
+        "importance": 64
+    },
+    {
+        "id": 6173,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "serial clean isolation; workers judge correctness/algorithm, ⊘performance magnitude (CPU contention)",
+        "importance": 60
+    },
+    {
+        "id": 6112,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "Cargo profiles incremental=false (worktree disk + hydration)",
+        "importance": 60
+    },
+    {
+        "id": 4775,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "fresh terminal outside OpenCode; ⊘nested `opencode run` (shared server/SQLite collision)",
+        "importance": 60
+    },
+    {
+        "id": 6366,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "prewarm indexes via `aft warmup` with identical prompts",
+        "importance": 55
+    },
+    {
+        "id": 5911,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "Tier D=deterministic/no-LLM; Tier S=stochastic/provider-metered",
+        "importance": 50
+    },
+    {
+        "id": 5809,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "shared contracts: run-manifest.json + run-summary.tsv",
+        "importance": 50
+    },
+    {
+        "id": 8730,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "M5 heavy runs heads-up; contention escalation=/tmp/m5-build.lock mkdir",
+        "importance": 35
+    },
+    {
+        "id": 6093,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "SQLite busy_timeout before journal_mode=WAL (cold-open race)",
+        "importance": 65
+    },
+    {
+        "id": 5269,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "LockGuard::drop joins heartbeat before lockfile removal",
+        "importance": 65
+    },
+    {
+        "id": 7383,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "rolled_back:true→success + unchanged; ⊘hard error (rollback succeeded)",
+        "importance": 65
+    },
+    {
+        "id": 8199,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "A/B vs mason tree >30min→dedicated checkout (reclaimer may collect)",
+        "importance": 57
+    },
+    {
+        "id": 8198,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "review trees default --detach (avoid blocking rehydration)",
+        "importance": 56
+    },
+    {
+        "id": 8590,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": [
+            "⊘parallel repo-mutating chains on main checkout (timeout can strand detached)",
+            "A/B=2 dedicated trees, prebuilt binaries, interleaved base/head"
+        ],
+        "importance": 55
+    },
+    {
+        "id": 7990,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "parallel waves: ⊘shared version bumps (collision); serialize at merge",
+        "importance": 55
+    },
+    {
+        "id": 8612,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "multi-step state/logs→durable home; ⊘/tmp (reboot loss)",
+        "importance": 45
+    },
+    {
+        "id": 4761,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "new @cortexkit/aft-* package→version-sync.mjs + validate-packages.mjs + release.yml",
+        "importance": 65
+    },
+    {
+        "id": 4760,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "workflows build packages/aft-bridge before TS typecheck (dist resolution)",
+        "importance": 65
+    },
+    {
+        "id": 5422,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "plugin index.ts imports→bun run lint; ⊘package tests alone (Biome not run)",
+        "importance": 65
+    },
+    {
+        "id": 7695,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": [
+            "byte-golden `\\n` fixtures→root .gitattributes eol=lf; binary *.raw",
+            "⊘local windows-gnu check as proof (compile-only, no byte test)"
+        ],
+        "importance": 65
+    },
+    {
+        "id": 7554,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": [
+            "watch Tests/CI=`scripts/watch-ci.sh [commit] [workflow]`",
+            "Release=`scripts/wait-release.sh vX.Y.Z`; ⊘nohup poll loops (detach/quoting lies)"
+        ],
+        "importance": 65
+    },
+    {
+        "id": 4755,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "pre-publish tag failure→fix blocker, delete/repush same version tag",
+        "importance": 60
+    },
+    {
+        "id": 8391,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "pre-push bun lint + Rust gate (CI fail-fast/autocancel masks lint)",
+        "importance": 53
+    },
+    {
+        "id": 7699,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": [
+            "background directly: `bash scripts/watch-ci.sh main`; watch `RESULT=`",
+            "⊘`... >log & echo pid` (tracked shell exits before watcher result)"
+        ],
+        "importance": 45
+    },
+    {
+        "id": 7511,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": [
+            "clean contributor PR→gh pr merge; ask Ufuk approve fork workflows",
+            "cherry-pick only modified/unverifiable (otherwise loses merged credit)"
+        ],
+        "importance": 45
+    },
+    {
+        "id": 4789,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "repo-relative release asset committed before tag (body resolves tagged tree)",
+        "importance": 45
+    },
+    {
+        "id": 8271,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "Alfonso commits trailer: Co-authored-by Alfonso <289616620+alfonso-aft@users.noreply.github.com>",
+        "importance": 40
+    },
+    {
+        "id": 5308,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "cue": "ualtinok-authored commits include same Alfonso 289616620+ trailer",
+        "importance": 40
+    },
+    {
+        "id": 8255,
+        "category": "PROJECT_RULES",
+        "room": "Repo & delivery",
+        "mergeInto": 8391,
+        "importance": 25
+    },
+    {
+        "id": 6394,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "promptAsync exactly one: synthetic:true wake OR ignored:true panel",
+        "importance": 60
+    },
+    {
+        "id": 5216,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "isTerminalStatus allowlist completed|failed|killed|timed_out; ⊘`!=running` (unknown states)",
+        "importance": 65
+    },
+    {
+        "id": 8201,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "client timeout→explicit bash_kill; ⊘orphan execution (executor starvation)",
+        "importance": 63
+    },
+    {
+        "id": 8531,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "CPU flake brief: ≤8 hogs, nice -n 19, EXIT/INT/TERM traps, pgrep between rounds",
+        "importance": 65
+    },
+    {
+        "id": 8457,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "tool names/descriptions/schemas + prompts transport-invariant (prefix cache)",
+        "importance": 62
+    },
+    {
+        "id": 7285,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "translate/format→TS-generated capture-subc-parity.ts fixtures",
+        "importance": 65
+    },
+    {
+        "id": 7800,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "SubcTransportPool validates structuredContent every reply; malformed/missing→protocol error",
+        "importance": 62
+    },
+    {
+        "id": 7991,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "dispatch parallel: ledger-check before retry + settling beat (burst congestion)",
+        "importance": 60
+    },
+    {
+        "id": 7727,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "subc_bridge_test.rs process env→run_subc_bridge_test_with_env inside serial guard",
+        "importance": 60
+    },
+    {
+        "id": 8389,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "storm authoritative gate=`--cargo-profile release`; debug=4x + main ignored",
+        "importance": 58
+    },
+    {
+        "id": 8400,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "nextest group `storm = 1` serializes rigs (readiness starvation)",
+        "importance": 57
+    },
+    {
+        "id": 8912,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "⊘bind/configure nonexistent roots (stale restored sessions consume modules)",
+        "importance": 50
+    },
+    {
+        "id": 7702,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": [
+            "nonzero shell test: Windows native `cmd /c \"echo x&exit 7\"`; Unix `printf x; exit 7`",
+            "⊘bare PowerShell `exit N` (kills wrapper before exit-marker)"
+        ],
+        "importance": 67
+    },
+    {
+        "id": 5550,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "Unix APIs e.g. PermissionsExt→#[cfg(unix)] (Windows compile)",
+        "importance": 65
+    },
+    {
+        "id": 7916,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "logger assertions spy logger.log; ⊘shared logfile/sleeps (parallel flakes)",
+        "importance": 60
+    },
+    {
+        "id": 7293,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "format subsystem tests opt in format_on_edit:true",
+        "importance": 60
+    },
+    {
+        "id": 7207,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "E2E manifest pins runtime catalog.list; ⊘static copy (drifts)",
+        "importance": 60
+    },
+    {
+        "id": 6979,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "cargo commands serial (shared target build-lock/CPU)",
+        "importance": 60
+    },
+    {
+        "id": 6894,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": [
+            "E2ETest: Mac windows-gnu cross-build→stage ~/Downloads→\\psf\\Home\\Downloads",
+            "guest local copy + prlctl exec; pwsh→PowerShell5 fallback"
+        ],
+        "importance": 60
+    },
+    {
+        "id": 5785,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "Windows verification=native Windows; ⊘Unix target-check shim (Unix-gated helpers)",
+        "importance": 60
+    },
+    {
+        "id": 8458,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "real FSEvents tests→serialized watcher_integration binary",
+        "importance": 58
+    },
+    {
+        "id": 8729,
+        "category": "PROJECT_RULES",
+        "room": "Runtime & tests",
+        "cue": "src/ gate includes `--lib` touched module (unit failures)",
+        "importance": 40
+    },
+    {
+        "id": 4773,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "recurring fork contradiction→explicit decision; ⊘unilateral behavior flip (prior-decision)",
+        "importance": 65
+    },
+    {
+        "id": 8633,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "subpar mason→resume SAME task/resteer; ⊘integration self-fix (hides router signal)",
+        "importance": 55
+    },
+    {
+        "id": 8913,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "convention-divergent cues retain differentiator; negatives=⊘excluded + mechanism (polarity)",
+        "importance": 50
+    },
+    {
+        "id": 8440,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "bugs→complete root-cause resolution; ⊘workaround/bypass (defers defect)",
+        "importance": 40
+    },
+    {
+        "id": 8837,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "oracle loop: 2–3 scoped→triple-check code+measure→plan→masons→verify→repeat",
+        "importance": 30
+    },
+    {
+        "id": 5541,
+        "category": "PROJECT_RULES",
+        "room": "Knowledge & workflow",
+        "cue": "GitHub identity=~/.local/bin/gh-alfonso-aft; replies require approval + --body-file",
+        "importance": 50
+    }
+]
