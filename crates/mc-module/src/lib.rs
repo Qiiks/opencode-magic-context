@@ -1797,7 +1797,43 @@ impl McHandler {
                 message: "ctx_reduce is not accepted on shadow:<real_session> routes".to_string(),
             };
         }
-        let drop_ids = drop_ids_from_command(&request);
+        let mut drop_ids = drop_ids_from_command(&request);
+        // Raw-string form ("1-3", "§1§,99"): canonicalize server-side with the same
+        // parser the MCP facade uses, so range/§ syntax is owned here and consumers
+        // (the thalamus response-tee) never re-implement it. Tag numbers that don't
+        // resolve to a known tag are skipped: the tee replays what the model said,
+        // and the model can name stale or foreign numbers.
+        if let Some(raw) = request.get("drop").and_then(Value::as_str) {
+            let numbers = match parse_tag_range_string(raw) {
+                Ok(numbers) => numbers,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "bad_request".to_string(),
+                        message: format!("invalid drop range syntax: {error}"),
+                    }
+                }
+            };
+            let tags = match store.load_tags_for_session(session_id) {
+                Ok(tags) => tags,
+                Err(e) => {
+                    return HandlerOutcome::Error {
+                        code: "store_write_failed".to_string(),
+                        message: e.to_string(),
+                    }
+                }
+            };
+            let by_number = tags
+                .iter()
+                .map(|row| (row.tag_number, &row.block_id))
+                .collect::<HashMap<_, _>>();
+            for number in numbers {
+                if let Some(block_id) = by_number.get(&(number as i64)) {
+                    drop_ids.push((*block_id).clone());
+                }
+            }
+            drop_ids.sort();
+            drop_ids.dedup();
+        }
         if drop_ids.is_empty() {
             return respond(json!({ "ok": true, "queued": 0 }));
         }
@@ -4668,6 +4704,7 @@ mod tests {
     use mc_core::CoreState;
     use mc_store::{
         HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, StoredCompartment,
+        TagMintInput,
     };
     use tokio::sync::Notify;
 
@@ -6874,6 +6911,78 @@ mod tests {
             .unwrap()
             .contains("[dropped]"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_command_raw_drop_string_canonicalizes_server_side() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .mint_or_get_tags(
+                "ses",
+                &[
+                    TagMintInput {
+                        block_id: "a#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 10,
+                        source_bytes: b"one".to_vec(),
+                    },
+                    TagMintInput {
+                        block_id: "b#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 10,
+                        source_bytes: b"two".to_vec(),
+                    },
+                ],
+                1_000,
+            )
+            .unwrap();
+
+        // Range syntax plus an unknown tag number: known tags queue, the unknown
+        // number is skipped (the tee replays whatever the model said).
+        let response = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "§1§-2, 99",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["queued"].as_u64(), Some(2));
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+        assert_eq!(pending.len(), 2);
+
+        // Re-sending the same raw string is idempotent (structural INSERT OR IGNORE).
+        let repeat = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1-2",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(repeat["queued"].as_u64(), Some(0));
+
+        // Malformed range syntax is a typed bad_request, nothing partially queued.
+        match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "3-1",
+            }),
+        ) {
+            HandlerOutcome::Error { code, .. } => assert_eq!(code, "bad_request"),
+            other => panic!("expected bad_request, got: {other:?}"),
+        }
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
