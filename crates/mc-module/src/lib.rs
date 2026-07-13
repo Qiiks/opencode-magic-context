@@ -59,7 +59,9 @@ use mc_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest};
+use subc_client_rs::{
+    async_trait, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle,
+};
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use config::{ConfigCache, McModuleConfig};
@@ -575,7 +577,7 @@ impl ShadowMemoryMutationWire {
 }
 
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
-/// and the per-route session bindings (channel → {project, session}).
+/// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
     store: OnceLock<Arc<McStore>>,
     producer_factory: Arc<dyn HistorianProducerFactory>,
@@ -597,8 +599,10 @@ pub struct McHandler {
     #[cfg(test)]
     between_transform_and_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Route channel → its session binding. Populated at `on_bind`, removed at
-    /// `on_route_gone`. A `Mutex<HashMap>` (not a lock-free map) because writes are
-    /// rare (once per route open/close) and reads are one cheap lookup per transform.
+    /// `on_route_gone`. The SDK validates the route handle's epoch before dispatching a
+    /// request, so a channel key cannot resolve a stale route. A `Mutex<HashMap>` (not a
+    /// lock-free map) is appropriate because writes are rare (once per route open/close)
+    /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
 }
 
@@ -3132,7 +3136,7 @@ impl ModuleHandler for McHandler {
     async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
         let config = self.effective_config(&req.identity.project_root);
         self.bind_route(
-            req.route_channel,
+            req.handle.channel,
             SessionBinding {
                 project_root: req.identity.project_root.clone(),
                 harness: req.identity.harness.clone(),
@@ -3150,7 +3154,8 @@ impl ModuleHandler for McHandler {
 
     /// Drop the route's binding on teardown so a reused channel can't resolve a stale
     /// project and the map doesn't leak.
-    async fn on_route_gone(&self, channel: u16) {
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        let channel = handle.channel;
         let gone_session = {
             let bindings = self.bindings.lock().expect("bindings mutex");
             bindings.get(&channel).map(|b| b.session.clone())
@@ -3177,7 +3182,8 @@ impl ModuleHandler for McHandler {
             return invalid_params_error("request body exceeds the 1 MiB limit");
         }
         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-        self.dispatch_value(ctx.channel(), request).await
+        self.dispatch_value(ctx.route_handle().channel, request)
+            .await
     }
 }
 
