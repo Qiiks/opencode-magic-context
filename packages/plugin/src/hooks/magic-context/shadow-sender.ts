@@ -1,7 +1,17 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import net from "node:net";
+import { createHmac } from "node:crypto";
 import { join } from "node:path";
+import {
+    AdmissionClass,
+    type BindIdentity,
+    isConsumerReconnectTransient,
+    Priority,
+    type RouteHandle,
+    type RouteTarget,
+    SocketClosedError,
+    SocketTimeoutError,
+    StaleRouteHandleError,
+    SubcClient,
+} from "@cortexkit/subc-client";
 import { getCompartmentsByEndMessageId } from "../../features/magic-context/compartment-storage";
 import {
     getMaxMemoryIdForProjects,
@@ -48,19 +58,8 @@ const DEFAULT_MODULE_ID = "magic-context";
 function getDefaultConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
-const SUBC_HEADER_LEN = 17;
-const SUBC_PROTOCOL_VERSION = 1;
-const FRAME_REQUEST = 0;
-const FRAME_RESPONSE = 1;
-const FRAME_ERROR = 5;
-const PRIORITY_BACKGROUND_FLAGS = 2 << 1;
-const AUTH_CLIENT_DOMAIN = "subc-client-v1";
-const AUTH_SERVER_DOMAIN = "subc-server-v1";
-const NONCE_LEN = 32;
-const PROOF_LEN = 32;
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
-const REQUEST_TIMEOUT_MS = 5_000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const SHADOW_SEND_TIMEOUT_MS = 15_000;
 const SHADOW_QUEUE_MAX_DEPTH = 2;
@@ -227,22 +226,6 @@ interface ShadowStateSyncPayload {
         last_todo_state: string;
     };
     watermarks: ShadowWatermarks;
-}
-
-interface ConnectionInfo {
-    schema: number;
-    endpoints: Array<{ host: string; port: number }>;
-    key: number[];
-    daemon_id: number[];
-    pid: number;
-    daemon_ver: string;
-}
-
-interface SubcFrame {
-    type: number;
-    channel: number;
-    corr: number;
-    body: Buffer;
 }
 
 function emptyCounters(): ShadowSenderCounters {
@@ -1023,34 +1006,25 @@ function numericAck(response: unknown, keys: string[], fallback: number): number
 }
 
 function errorCode(error: unknown): string | null {
-    if (isRecord(error) && typeof error.code === "string") return error.code;
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        if (typeof current.code === "string") return current.code;
+        current = current.cause;
+    }
     return null;
-}
-
-function timeoutError(message: string): Error & { code: string } {
-    const error = new Error(message) as Error & { code: string };
-    error.code = "ETIMEDOUT";
-    return error;
 }
 
 function isPeerReject(error: unknown): boolean {
     const code = errorCode(error);
-    if (
+    return (
         code === "stale_generation" ||
         code === "shadow_generation_mismatch" ||
         code === "shadow_seq_mismatch" ||
         code === "seq_mismatch" ||
         code === "cas_mismatch" ||
         code === "state_cas_reject"
-    ) {
-        return true;
-    }
-    const text = error instanceof Error ? error.message : String(error);
-    return (
-        text.includes("generation") ||
-        text.includes("shadow_seq") ||
-        text.includes("seq mismatch") ||
-        text.includes("CAS")
     );
 }
 
@@ -1059,17 +1033,25 @@ function isSeedBoundaryReject(error: unknown): boolean {
 }
 
 function isConnectionFailure(error: unknown): boolean {
-    const code = errorCode(error);
     if (
-        code === "ENOENT" ||
-        code === "ECONNREFUSED" ||
-        code === "ECONNRESET" ||
-        code === "ETIMEDOUT"
+        error instanceof SocketClosedError ||
+        error instanceof SocketTimeoutError ||
+        error instanceof StaleRouteHandleError ||
+        isConsumerReconnectTransient(error)
     ) {
         return true;
     }
-    const text = error instanceof Error ? error.message : String(error);
-    return text.includes("backoff") || text.includes("connection") || text.includes("ECONN");
+    const code = errorCode(error);
+    return (
+        code === "ENOENT" ||
+        code === "ECONNREFUSED" ||
+        code === "ECONNRESET" ||
+        code === "EPIPE" ||
+        code === "ETIMEDOUT" ||
+        code === "request_deadline" ||
+        code === "route_closed" ||
+        code === "SUBC_CONNECTION_BACKOFF"
+    );
 }
 
 /**
@@ -1643,21 +1625,20 @@ export function createShadowSender(
 }
 
 class SubcShadowTransport implements ShadowTransport {
-    private connectionFile: string;
-    private moduleId: string;
-    private socket: net.Socket | null = null;
-    private reader: SocketReader | null = null;
-    private nextCorr = 1;
-    private routes = new Map<string, number>();
+    private readonly connectionFile: string;
+    private readonly moduleId: string;
+    private readonly requestTimeoutMs: number;
+    private client: SubcClient | null = null;
+    private routes = new Map<string, RouteHandle>();
     private activeSession: string | null = null;
     private nextProbeMs = 0;
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
-    private requestTimeoutMs: number;
+    private connectionGeneration = 0;
 
     constructor(
         connectionFile?: string,
         moduleId = DEFAULT_MODULE_ID,
-        requestTimeoutMs = REQUEST_TIMEOUT_MS,
+        requestTimeoutMs = SHADOW_SEND_TIMEOUT_MS,
     ) {
         this.connectionFile = connectionFile ?? getDefaultConnectionFile();
         this.moduleId = moduleId;
@@ -1671,9 +1652,8 @@ class SubcShadowTransport implements ShadowTransport {
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown> {
-        // Never serialize shadow calls by chaining promises: each waiting closure
-        // would retain its full wire body behind one stalled socket. This lane is
-        // best-effort, so rejecting concurrent work is safer than buffering it.
+        // Each waiting closure would retain its complete shadow payload. Rejecting
+        // concurrent best-effort work keeps transport memory bounded.
         if (this.activeSession !== null) {
             const error = new Error("shadow transport busy; work dropped") as Error & {
                 code?: string;
@@ -1687,9 +1667,16 @@ class SubcShadowTransport implements ShadowTransport {
         const onAbort = () => this.invalidateConnection();
         args.signal?.addEventListener("abort", onAbort, { once: true });
         try {
-            const route = await this.ensureRoute(args.sessionId, args.projectRoot);
+            const { client, route } = await this.ensureRoute(args.sessionId, args.projectRoot);
             if (args.signal?.aborted) throw args.signal.reason;
-            return await this.unaryJson(route, args.body);
+            return await client.request(route, args.body, {
+                priority: Priority.Background,
+                admissionClass: AdmissionClass.Normal,
+                timeoutMs: this.requestTimeoutMs,
+            });
+        } catch (error) {
+            if (isConnectionFailure(error)) this.invalidateConnection();
+            throw error;
         } finally {
             args.signal?.removeEventListener("abort", onAbort);
             this.activeSession = null;
@@ -1697,66 +1684,84 @@ class SubcShadowTransport implements ShadowTransport {
     }
 
     closeSession(sessionId: string): void {
+        const route = this.routes.get(sessionId);
         this.routes.delete(sessionId);
-        if (this.activeSession === sessionId) this.invalidateConnection();
-    }
-
-    private async ensureRoute(sessionId: string, projectRoot: string): Promise<number> {
-        const existing = this.routes.get(sessionId);
-        if (existing !== undefined) return existing;
-        await this.ensureConnected();
-        const body: Record<string, unknown> = {
-            op: "route.open",
-            // mc-module registers a ToolProvider role in its manifest (see
-            // crates/mc-module/src/lib.rs manifest()); it does NOT provide a
-            // management surface. Opening with the wrong kind makes the daemon
-            // reject every route with target_unavailable.
-            target: { kind: "tool_provider", module_id: this.moduleId },
-            identity: {
-                project_root: projectRoot,
-                harness: getHarness(),
-                session: `shadow:${sessionId}`,
-            },
-        };
-        const moduleId = process.env.SUBC_MODULE_ID;
-        const launchNonce = process.env.SUBC_LAUNCH_NONCE;
-        if (moduleId && launchNonce) {
-            body.consumer_identity = { module_id: moduleId, launch_nonce: launchNonce };
+        const client = this.client;
+        if (route && client) {
+            void client.closeRoute(route).catch((error: unknown) => {
+                if (this.client === client && isConnectionFailure(error)) {
+                    this.invalidateConnection(client);
+                }
+            });
+            return;
         }
-        const response = await this.unaryJson(0, body);
-        const ack = extractAckValue(response);
-        const route = ack.route_channel;
-        if (typeof route !== "number")
-            throw new Error("connection route.open missing route_channel");
-        this.routes.set(sessionId, route);
-        return route;
+        if (this.activeSession === sessionId) this.invalidateConnection(client);
     }
 
-    private async ensureConnected(): Promise<void> {
-        if (this.socket && !this.socket.destroyed && this.reader) return;
+    private async ensureRoute(
+        sessionId: string,
+        projectRoot: string,
+    ): Promise<{ client: SubcClient; route: RouteHandle }> {
+        const existing = this.routes.get(sessionId);
+        const client = await this.ensureConnected();
+        if (existing) return { client, route: existing };
+
+        const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };
+        const identity: BindIdentity = {
+            project_root: projectRoot,
+            harness: getHarness(),
+            session: `shadow:${sessionId}`,
+        };
+        const route = await client.routeOpen(target, identity);
+        if (this.client !== client) {
+            await client.closeRoute(route).catch(() => undefined);
+            const error = new Error(
+                "subc connection changed while opening shadow route",
+            ) as Error & {
+                code?: string;
+            };
+            error.code = "ECONNRESET";
+            throw error;
+        }
+        this.routes.set(sessionId, route);
+        return { client, route };
+    }
+
+    private async ensureConnected(): Promise<SubcClient> {
+        if (this.client) return this.client;
         const now = Date.now();
         if (now < this.nextProbeMs) {
-            throw new Error(`connection backoff active until ${this.nextProbeMs}`);
+            const error = new Error(
+                `subc connection backoff active until ${this.nextProbeMs}`,
+            ) as Error & {
+                code?: string;
+            };
+            error.code = "SUBC_CONNECTION_BACKOFF";
+            throw error;
         }
-        let candidate: net.Socket | null = null;
+
+        const generation = this.connectionGeneration;
+        let candidate: SubcClient | null = null;
         try {
-            const conn = readConnectionInfo(this.connectionFile);
-            const endpoint = conn.endpoints[0];
-            if (!endpoint) throw new Error("connection file has no endpoint");
-            candidate = await connectTcp(endpoint.host, endpoint.port, HANDSHAKE_TIMEOUT_MS);
-            const reader = new SocketReader(candidate);
-            await authenticateSubcClient(candidate, reader, conn, HANDSHAKE_TIMEOUT_MS);
-            const socket = candidate;
-            this.socket = socket;
-            this.reader = reader;
+            candidate = await SubcClient.connect({
+                connectionFile: this.connectionFile,
+                handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
+            });
+            if (generation !== this.connectionGeneration) {
+                candidate.close();
+                const error = new Error("subc connection attempt was superseded") as Error & {
+                    code?: string;
+                };
+                error.code = "ECONNRESET";
+                throw error;
+            }
+            this.client = candidate;
             this.routes.clear();
             this.backoffMs = CONNECT_BACKOFF_INITIAL_MS;
             this.nextProbeMs = 0;
-            socket.once("close", () => {
-                if (this.socket === socket) this.invalidateConnection(socket);
-            });
+            return candidate;
         } catch (error) {
-            candidate?.destroy();
+            candidate?.close();
             this.invalidateConnection();
             this.nextProbeMs = Date.now() + this.backoffMs;
             this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
@@ -1764,251 +1769,16 @@ class SubcShadowTransport implements ShadowTransport {
         }
     }
 
-    private invalidateConnection(socket: net.Socket | null = this.socket): void {
-        if (socket && this.socket && socket !== this.socket) return;
-        this.socket = null;
-        this.reader = null;
+    private invalidateConnection(client: SubcClient | null = this.client): void {
+        if (client && this.client && client !== this.client) return;
+        this.connectionGeneration += 1;
+        this.client = null;
         this.routes.clear();
-        socket?.destroy();
-    }
-
-    private async unaryJson(channel: number, body: unknown): Promise<unknown> {
-        await this.ensureConnected();
-        const socket = this.socket;
-        const reader = this.reader;
-        if (!socket || !reader) throw new Error("connection unavailable");
-        const corr = this.nextCorr++;
-        try {
-            await writeFrame(socket, {
-                type: FRAME_REQUEST,
-                channel,
-                corr,
-                body: Buffer.from(JSON.stringify(body)),
-            });
-            const frame = await readTerminalFor(reader, channel, corr, this.requestTimeoutMs);
-            if (frame.type === FRAME_ERROR) {
-                throw parseErrorBody(frame.body);
-            }
-            if (frame.type !== FRAME_RESPONSE) {
-                throw new Error(`unexpected subc frame type ${frame.type}`);
-            }
-            if (frame.body.length === 0) return null;
-            return JSON.parse(frame.body.toString("utf8"));
-        } catch (error) {
-            // A timeout or malformed/error frame can leave unread bytes buffered.
-            // Reusing that stream would make the next response start mid-frame.
-            this.invalidateConnection(socket);
-            throw error;
-        }
-    }
-}
-
-function readConnectionInfo(path: string): ConnectionInfo {
-    if (!existsSync(path)) throw new Error(`connection file not found: ${path}`);
-    try {
-        const mode = statSync(path).mode & 0o777;
-        if ((mode & 0o077) !== 0)
-            throw new Error(`connection file has insecure mode ${mode.toString(8)}`);
-    } catch (error) {
-        if (error instanceof Error && error.message.includes("insecure")) throw error;
-    }
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as ConnectionInfo;
-    if (parsed.schema !== 1) throw new Error(`unsupported connection schema ${parsed.schema}`);
-    if (!Array.isArray(parsed.endpoints) || parsed.endpoints.length === 0) {
-        throw new Error("connection file has no endpoints");
-    }
-    if (!Array.isArray(parsed.key) || parsed.key.length < 32)
-        throw new Error("connection key too short");
-    return parsed;
-}
-
-function connectTcp(host: string, port: number, timeoutMs: number): Promise<net.Socket> {
-    return new Promise((resolve, reject) => {
-        const socket = net.createConnection({ host, port });
-        const timer = setTimeout(() => {
-            socket.destroy();
-            reject(new Error("connection timeout"));
-        }, timeoutMs);
-        socket.once("connect", () => {
-            clearTimeout(timer);
-            resolve(socket);
-        });
-        socket.once("error", (error) => {
-            clearTimeout(timer);
-            reject(error);
-        });
-    });
-}
-
-class SocketReader {
-    private chunks: Buffer[] = [];
-    private buffered = 0;
-    private waiters: Array<() => void> = [];
-    private closed = false;
-
-    constructor(socket: net.Socket) {
-        socket.on("data", (chunk) => {
-            this.chunks.push(Buffer.from(chunk));
-            this.buffered += chunk.length;
-            this.flushWaiters();
-        });
-        socket.on("close", () => {
-            this.closed = true;
-            this.flushWaiters();
-        });
-        socket.on("error", () => {
-            this.closed = true;
-            this.flushWaiters();
-        });
-    }
-
-    async readExact(length: number, timeoutMs: number): Promise<Buffer> {
-        const deadline = Date.now() + timeoutMs;
-        while (this.buffered < length) {
-            if (this.closed) throw new Error("connection closed");
-            const remaining = deadline - Date.now();
-            if (remaining <= 0) throw timeoutError("read timeout");
-            await new Promise<void>((resolve, reject) => {
-                const timer = setTimeout(() => {
-                    this.waiters = this.waiters.filter((waiter) => waiter !== onReady);
-                    reject(timeoutError("read timeout"));
-                }, remaining);
-                const onReady = () => {
-                    clearTimeout(timer);
-                    resolve();
-                };
-                this.waiters.push(onReady);
-            });
-        }
-        const out = Buffer.allocUnsafe(length);
-        let offset = 0;
-        while (offset < length) {
-            const first = this.chunks[0];
-            const take = Math.min(first.length, length - offset);
-            first.copy(out, offset, 0, take);
-            offset += take;
-            if (take === first.length) this.chunks.shift();
-            else this.chunks[0] = first.subarray(take);
-            this.buffered -= take;
-        }
-        return out;
-    }
-
-    private flushWaiters(): void {
-        const waiters = this.waiters.splice(0);
-        for (const waiter of waiters) waiter();
-    }
-}
-
-async function writeAuthMessage(socket: net.Socket, value: unknown): Promise<void> {
-    const json = Buffer.from(JSON.stringify(value));
-    const len = Buffer.allocUnsafe(4);
-    len.writeUInt32LE(json.length, 0);
-    socket.write(Buffer.concat([len, json]));
-}
-
-async function readAuthMessage(reader: SocketReader, timeoutMs: number): Promise<unknown> {
-    const lenBytes = await reader.readExact(4, timeoutMs);
-    const len = lenBytes.readUInt32LE(0);
-    const body = await reader.readExact(len, timeoutMs);
-    return JSON.parse(body.toString("utf8"));
-}
-
-function proof(
-    key: Buffer,
-    domain: string,
-    clientNonce: Buffer,
-    serverNonce: Buffer,
-    daemonId: Buffer,
-): Buffer {
-    return createHmac("sha256", key)
-        .update(domain)
-        .update(clientNonce)
-        .update(serverNonce)
-        .update(daemonId)
-        .digest();
-}
-
-async function authenticateSubcClient(
-    socket: net.Socket,
-    reader: SocketReader,
-    conn: ConnectionInfo,
-    timeoutMs: number,
-): Promise<void> {
-    const key = Buffer.from(conn.key);
-    const clientNonce = randomBytes(NONCE_LEN);
-    await writeAuthMessage(socket, { client_nonce: [...clientNonce], role: "client" });
-    const serverProof = (await readAuthMessage(reader, timeoutMs)) as Record<string, unknown>;
-    const serverNonce = Buffer.from((serverProof.server_nonce as number[]) ?? []);
-    const daemonId = Buffer.from((serverProof.daemon_id as number[]) ?? []);
-    const serverProofBytes = Buffer.from((serverProof.server_proof as number[]) ?? []);
-    const expected = proof(key, AUTH_SERVER_DOMAIN, clientNonce, serverNonce, daemonId);
-    if (
-        daemonId.length !== conn.daemon_id.length ||
-        !timingSafeEqual(daemonId, Buffer.from(conn.daemon_id)) ||
-        serverProofBytes.length !== PROOF_LEN ||
-        !timingSafeEqual(serverProofBytes, expected)
-    ) {
-        throw new Error("invalid subc server proof");
-    }
-    const clientAuth = proof(key, AUTH_CLIENT_DOMAIN, clientNonce, serverNonce, daemonId);
-    await writeAuthMessage(socket, { client_auth: [...clientAuth] });
-}
-
-async function writeFrame(socket: net.Socket, frame: SubcFrame): Promise<void> {
-    const header = Buffer.allocUnsafe(SUBC_HEADER_LEN);
-    header.writeUInt32LE(frame.body.length, 0);
-    header.writeUInt8(SUBC_PROTOCOL_VERSION, 4);
-    header.writeUInt8(frame.type, 5);
-    header.writeUInt8(PRIORITY_BACKGROUND_FLAGS, 6);
-    header.writeUInt16LE(frame.channel, 7);
-    header.writeBigUInt64LE(BigInt(frame.corr), 9);
-    socket.write(Buffer.concat([header, frame.body]));
-}
-
-async function readFrame(reader: SocketReader, timeoutMs: number): Promise<SubcFrame> {
-    const header = await reader.readExact(SUBC_HEADER_LEN, timeoutMs);
-    const len = header.readUInt32LE(0);
-    const version = header.readUInt8(4);
-    if (version !== SUBC_PROTOCOL_VERSION)
-        throw new Error(`unsupported subc frame version ${version}`);
-    const type = header.readUInt8(5);
-    const channel = header.readUInt16LE(7);
-    const corr = Number(header.readBigUInt64LE(9));
-    const body = len > 0 ? await reader.readExact(len, timeoutMs) : Buffer.alloc(0);
-    return { type, channel, corr, body };
-}
-
-async function readTerminalFor(
-    reader: SocketReader,
-    channel: number,
-    corr: number,
-    timeoutMs: number,
-): Promise<SubcFrame> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) throw timeoutError("subc request timeout");
-        const frame = await readFrame(reader, remaining);
-        if (frame.channel === channel && frame.corr === corr) return frame;
-    }
-}
-
-function parseErrorBody(body: Buffer): Error & { code?: string } {
-    try {
-        const parsed = JSON.parse(body.toString("utf8")) as { code?: string; message?: string };
-        const error = new Error(
-            `${parsed.code ?? "subc_error"}: ${parsed.message ?? "unknown"}`,
-        ) as Error & { code?: string };
-        if (typeof parsed.code === "string") error.code = parsed.code;
-        return error;
-    } catch {
-        return new Error(body.toString("utf8") || "subc_error") as Error & { code?: string };
+        client?.close();
     }
 }
 
 export const __shadowSenderTest = {
-    SocketReader,
     SubcShadowTransport,
     buildShadowResetBody,
     buildShadowTransformBody,
