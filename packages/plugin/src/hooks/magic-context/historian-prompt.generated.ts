@@ -174,7 +174,7 @@ Each compartment contains four paraphrase tiers of the same work unit, ordered f
 **Voice — write every tier in the first person.** These are your own memories. Refer to your own actions as "I" ("I traced the timeout to readLoop", "I first blamed CPU load, then corrected"), and name other actors directly — the user by name or as "the user", peers/subagents/tools by their name. Never narrate yourself in the third person as "the agent". Third-person narration ("The agent investigated X and the user corrected Y") is the single most common voice failure — it reads as a detached report about someone else, when the whole point is that *you* are the one who did this and will read it back later.
 
 - Wrong (third-person report): "The agent initially blamed CPU load and proposed an epoch-drop theory. The user corrected this framing, and the agent then traced the timeout to readLoop."
-- Right (first person, actors named): "I first blamed CPU load and floated an epoch-drop theory. Ufuk rejected that (\`U: load shouldn't cause timeouts\`), so I traced the timeout to readLoop pre-computing the deadline before the header arrived."
+- Right (first person, actors named): "I first blamed CPU load and floated an epoch-drop theory. The user rejected that (\`U: load shouldn't cause timeouts\`), so I traced the timeout to readLoop pre-computing the deadline before the header arrived."
 
 The \`U:\` line convention already keeps the user's voice distinct; your prose around it is *yours*, in the first person.
 

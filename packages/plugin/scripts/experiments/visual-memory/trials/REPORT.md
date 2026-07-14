@@ -16,21 +16,17 @@ Raw responses, palace text, coverage, metrics, and PNGs land in each named trial
 
 | Model | Prompt | Parse | Coverage | Validator failures | Anchor fidelity | Rooms | Image tokens | Utilization | OpenRouter cost | Verdict |
 | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |
-| deepseek/deepseek-v4-flash | author-trial-system-prompt.md | retry | 415/424 | missing polarity mechanism: 1 | — | — | — | — | $0.018723 | NOT-VIABLE |
+| ollama-cloud/deepseek-v4-pro | author-trial-v3.md | fail | 49/424 | — | — | — | — | — | not returned by OpenRouter | NOT-VIABLE |
+| ollama-cloud/deepseek-v4-flash | author-trial-v3.md | fail | 49/424 | — | — | — | — | — | not returned by OpenRouter | NOT-VIABLE |
+| ollama-cloud/glm-5.2 | author-trial-v3.md | fail | 49/424 | — | — | — | — | — | not returned by OpenRouter | NOT-VIABLE |
 
 ## Per-model cost estimate
 
 | Model | Cells | Prompt tokens | Completion tokens | OpenRouter cost | Verdict |
 | --- | ---: | ---: | ---: | --- | --- |
-| deepseek/deepseek-v4-flash | 1 | 38135 | 49030 | $0.018723 | NOT-VIABLE |
-
-## Smoke cell
-
-- **Model/prompt:** deepseek/deepseek-v4-flash × author-trial-system-prompt.md
-- **Parse and coverage:** retry; 415/424
-- **Rendered metrics:** not rendered image tokens; not rendered; anchor fidelity not available.
-- **Output:** `trials/author-trial-system-prompt__deepseek-deepseek-v4-flash`
-- **Failure:** validator: negative rule missing polarity marker in cue 4961: TUI code exported via `./tui` in package.json→`src/tui/entry.mjs` resolves raw `index.tsx` or compiled fallback; TUI changes take effect without rebuilding server bundle
+| ollama-cloud/deepseek-v4-pro | 1 | 5810 | 23644 | not returned by OpenRouter | NOT-VIABLE |
+| ollama-cloud/deepseek-v4-flash | 1 | 5810 | 21404 | not returned by OpenRouter | NOT-VIABLE |
+| ollama-cloud/glm-5.2 | 1 | 18099 | 44099 | not returned by OpenRouter | NOT-VIABLE |
 
 ## Verdict policy
 

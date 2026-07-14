@@ -62,13 +62,13 @@ Choose-B (use A not B) prohibition:
 Source memory, verbatim:
 
 ```text
-#4931: The built-in LSP server id is `python`, not `pyright` in `lsp.disabled`.
+#4102: The queue worker id is `mailer`, not `mail-worker`, in `workers.disabled`.
 ```
 
 Its complete output entry is:
 
 ```xml
-<entry id="4931" importance="55">built-in LSP id=`python`; ⊘`pyright` (`lsp.disabled` lookup)</entry>
+<entry id="4102" importance="55">queue worker id=`mailer`; ⊘`mail-worker` (`workers.disabled` lookup)</entry>
 ```
 
 Deleted: `The`, `server`, `is`, `not`, and the connective sentence structure; they do not distinguish the fact. Kept verbatim: `python`, `pyright`, and `lsp.disabled`, because they are exact anchors. The parenthetical stays immediately after `⊘` because it records why `pyright` is excluded.
@@ -82,10 +82,10 @@ BEGIN REFERENCE EXAMPLES — do not emit this label or a Markdown fence in your 
 ```xml
 <palace category="NAMING">
   <room name="Tool schema">
-    <entry id="5509" importance="65">config keys snake_case; plugin preferred over plugins</entry>
-    <entry id="4931" importance="55">built-in LSP id=`python`; ⊘`pyright` (`lsp.disabled` lookup)</entry>
-    <entry id="7281" importance="50">MCP segment `mcp--&lt;sanitized-client&gt;-&lt;raw-name-hash&gt;`</entry>
-    <merge id="7222" into="7281"/>
+    <entry id="3315" importance="65">config keys snake_case; worker preferred over workers</entry>
+    <entry id="4102" importance="55">queue worker id=`mailer`; ⊘`mail-worker` (`workers.disabled` lookup)</entry>
+    <entry id="6023" importance="50">cache segment `cache--&lt;sanitized-host&gt;-&lt;raw-key-hash&gt;`</entry>
+    <merge id="6407" into="6023"/>
   </room>
 </palace>
 ```
