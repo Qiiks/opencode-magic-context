@@ -13,19 +13,19 @@ import {
 } from "/Users/ufukaltinok/Work/OSS/pxpipe/src/core/render.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SOURCE_PATH = "/tmp/visual-memory/trimmed-memories-source.txt";
-const OUTPUT_DIR = "/tmp/visual-memory";
+const SOURCE_PATH = process.env.PALACE_SOURCE_PATH ?? "/tmp/visual-memory/trimmed-memories-source.txt";
+const OUTPUT_DIR = process.env.PALACE_OUTPUT_DIR ?? "/tmp/visual-memory";
 const MAX_PALACE_CHARS = 70_000;
 const JETBRAINS_VARIANT = process.env.PALACE_RENDER_FONT === "jetbrains-mono-10";
 const RENDER_FONT = JETBRAINS_VARIANT ? "jetbrains-mono-10" : "spleen-5x8";
 const RENDER_STYLE = { aa: true, font: RENDER_FONT } as const;
-const PALACE_PATH = JETBRAINS_VARIANT
-    ? "/tmp/visual-memory/palace-jb-layout.txt"
-    : join(HERE, "palace.txt");
-const COVERAGE_PATH = JETBRAINS_VARIANT
-    ? "/tmp/visual-memory/coverage-jb-layout.json"
-    : join(HERE, "coverage.json");
-const OUTPUT_PREFIX = JETBRAINS_VARIANT ? "palace-jb-page" : "palace-page";
+const PALACE_PATH =
+    process.env.PALACE_INPUT_PATH ??
+    (JETBRAINS_VARIANT ? "/tmp/visual-memory/palace-jb-layout.txt" : join(HERE, "palace.txt"));
+const COVERAGE_PATH =
+    process.env.PALACE_COVERAGE_PATH ??
+    (JETBRAINS_VARIANT ? "/tmp/visual-memory/coverage-jb-layout.json" : join(HERE, "coverage.json"));
+const OUTPUT_PREFIX = process.env.PALACE_OUTPUT_PREFIX ?? (JETBRAINS_VARIANT ? "palace-jb-page" : "palace-page");
 const TITLE_SCALE = 2;
 const PATCH_SIZE = 28;
 const PAGE_WIDTH_PIXELS = 1_092;
@@ -493,7 +493,7 @@ const ids = sourceIds(source);
 const coveredIds = Object.keys(coverage.memories).map(Number);
 const palaceLines = palace.endsWith("\n") ? palace.slice(0, -1).split("\n") : palace.split("\n");
 
-assert.equal(ids.length, 334, "trimmed source must contain 334 memories");
+assert.ok(ids.length > 0, "source must contain at least one memory");
 assert.equal(new Set(ids).size, ids.length, "source memory ids must be unique");
 assert.deepEqual(
     [...coveredIds].sort((a, b) => a - b),
@@ -727,7 +727,7 @@ const bodyLeadingPixels = coverage.rooms.reduce(
 );
 
 let fontComparison: Record<string, unknown> | undefined;
-if (!JETBRAINS_VARIANT) {
+if (!JETBRAINS_VARIANT && process.env.PALACE_SKIP_FONT_COMPARISON !== "1") {
     const variantEnvironment = { ...process.env, PALACE_LAYOUT_FONT: "jetbrains-mono-10" };
     const authored = Bun.spawnSync({
         cmd: ["bun", join(HERE, "author-palace.ts")],
