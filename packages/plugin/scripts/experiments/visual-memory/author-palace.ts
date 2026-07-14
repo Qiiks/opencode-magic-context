@@ -43,8 +43,8 @@ const COVERAGE_OUTPUT = ALTERNATE_LAYOUT
     ? "/tmp/visual-memory/coverage-jb-layout.json"
     : join(HERE, "coverage.json");
 
-type Category = (typeof CATEGORY_ORDER)[number];
-type SpecEntry = {
+export type Category = (typeof CATEGORY_ORDER)[number];
+export type SpecEntry = {
     id: number;
     category: Category;
     room: string;
@@ -52,7 +52,7 @@ type SpecEntry = {
     mergeInto?: number;
     importance: number;
 };
-type SourceMemory = { id: number; category: Category };
+export type SourceMemory = { id: number; category: Category };
 type Placement = {
     category: Category;
     room: string;
@@ -118,7 +118,7 @@ function codepoints(value: string): number {
     return [...value].length;
 }
 
-function parseSource(source: string): SourceMemory[] {
+export function parseSource(source: string): SourceMemory[] {
     const memories: SourceMemory[] = [];
     let category: Category | undefined;
     for (const line of source.split("\n")) {
@@ -142,16 +142,16 @@ function parseSource(source: string): SourceMemory[] {
     return memories;
 }
 
-function readSpecs(): SpecEntry[] {
-    const files = readdirSync(HERE)
+export function readSpecs(directory = HERE): SpecEntry[] {
+    const files = readdirSync(directory)
         .filter((file) => file.startsWith("spec-") && file.endsWith(".json"))
         .sort();
     return files.flatMap(
-        (file) => JSON.parse(readFileSync(join(HERE, file), "utf8")) as SpecEntry[],
+            (file) => JSON.parse(readFileSync(join(directory, file), "utf8")) as SpecEntry[],
     );
 }
 
-function isExactToken(value: string): boolean {
+export function isExactToken(value: string): boolean {
     const token = value.replace(/^[('"`]+|[)'"`,;]+$/g, "");
     if (!token) return false;
     return (
@@ -223,9 +223,16 @@ function displayCue(entry: SpecEntry): string {
     return compactCue(raw, entry.room);
 }
 
-function validate(source: SourceMemory[], specs: SpecEntry[]): void {
-    if (source.length !== 334)
-        throw new Error(`expected 334 source memories, found ${source.length}`);
+function cueOutsideCode(value: string): string {
+    // Mask inline code so incomplete call fragments cannot affect the parenthesized
+    // explanations required after ⊘ markers; the original cue still preserves code verbatim.
+    return value.replace(/`[^`]*`/g, (anchor) => " ".repeat(anchor.length));
+}
+
+export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
+    if (source.length === 0) throw new Error("source contains no memories");
+    if (new Set(source.map((memory) => memory.id)).size !== source.length)
+        throw new Error("source contains duplicate memory ids");
     const sourceById = new Map(source.map((memory) => [memory.id, memory]));
     const specById = new Map<number, SpecEntry>();
     for (const spec of specs) {
@@ -250,25 +257,26 @@ function validate(source: SourceMemory[], specs: SpecEntry[]): void {
                     throw new Error(`hub noun repeated in cue ${spec.id}: ${renderedCue}`);
                 }
             }
+            const mechanismCue = cueOutsideCode(renderedCue);
             const negativeRule = /\b(?:must not|never|without|instead of|excludes?)\b/i.test(
-                renderedCue,
+                mechanismCue,
             );
-            if (negativeRule && !renderedCue.includes("⊘")) {
+            if (negativeRule && !mechanismCue.includes("⊘")) {
                 throw new Error(
                     `negative rule missing polarity marker in cue ${spec.id}: ${renderedCue}`,
                 );
             }
-            const polarityCount = renderedCue.split("⊘").length - 1;
-            const mechanismCount = renderedCue.match(/\([^()]+\)/g)?.length ?? 0;
+            const polarityCount = mechanismCue.split("⊘").length - 1;
+            const mechanismCount = mechanismCue.match(/\([^()]+\)/g)?.length ?? 0;
             if (polarityCount > mechanismCount) {
                 throw new Error(
                     `polarity mechanism missing from rendered cue ${spec.id}: ${renderedCue}`,
                 );
             }
-            let marker = renderedCue.indexOf("⊘");
+            let marker = mechanismCue.indexOf("⊘");
             while (marker >= 0) {
-                const nextMarker = renderedCue.indexOf("⊘", marker + 1);
-                const mechanism = renderedCue.indexOf("(", marker + 1);
+                const nextMarker = mechanismCue.indexOf("⊘", marker + 1);
+                const mechanism = mechanismCue.indexOf("(", marker + 1);
                 if (mechanism < 0 || (nextMarker >= 0 && mechanism > nextMarker)) {
                     throw new Error(
                         `polarity mechanism must follow marker ${spec.id}: ${renderedCue}`,
@@ -276,9 +284,9 @@ function validate(source: SourceMemory[], specs: SpecEntry[]): void {
                 }
                 let depth = 0;
                 let close = -1;
-                for (let index = mechanism; index < renderedCue.length; index++) {
-                    if (renderedCue[index] === "(") depth++;
-                    if (renderedCue[index] === ")") depth--;
+                for (let index = mechanism; index < mechanismCue.length; index++) {
+                    if (mechanismCue[index] === "(") depth++;
+                    if (mechanismCue[index] === ")") depth--;
                     if (depth === 0) {
                         close = index;
                         break;
@@ -287,9 +295,9 @@ function validate(source: SourceMemory[], specs: SpecEntry[]): void {
                 if (close < mechanism) {
                     throw new Error(`polarity mechanism is unclosed ${spec.id}: ${renderedCue}`);
                 }
-                marker = renderedCue.indexOf("⊘", close + 1);
+                marker = mechanismCue.indexOf("⊘", close + 1);
             }
-            const unclosed = [...renderedCue].reduce(
+            const unclosed = [...mechanismCue].reduce(
                 (depth, character) => depth + (character === "(" ? 1 : character === ")" ? -1 : 0),
                 0,
             );
@@ -538,7 +546,7 @@ function splitBox(box: Box): [Box, Box] | undefined {
     ];
 }
 
-function renderPalace(specs: SpecEntry[]): {
+export function renderPalace(specs: SpecEntry[]): {
     palace: string;
     placements: Map<number, Placement>;
     rooms: RoomSummary[];
@@ -971,80 +979,97 @@ function renderPalace(specs: SpecEntry[]): {
     };
 }
 
-const sourceText = readFileSync(SOURCE_PATH, "utf8");
-const source = parseSource(sourceText);
-const specs = readSpecs();
-validate(source, specs);
-const { palace, placements, rooms, layoutItems, pages, leveling } = renderPalace(specs);
-const cueLengths = specs
-    .filter((entry) => entry.mergeInto === undefined)
-    .map((entry) => codepoints(displayCue(entry)))
-    .sort((a, b) => a - b);
-const percentile = (value: number): number =>
-    cueLengths[Math.round((cueLengths.length - 1) * value)] ?? 0;
-const entryCount = specs.filter((entry) => entry.mergeInto === undefined).length;
-const mergeCount = specs.length - entryCount;
-const coverage = {
-    source: SOURCE_PATH,
-    sourceMemoryCount: source.length,
-    entryCount,
-    mergeCount,
-    representedMemoryCount: entryCount + mergeCount,
-    palaceChars: palace.length,
-    maxLineChars: Math.max(...palace.trimEnd().split("\n").map(codepoints)),
-    layout: {
-        font: LAYOUT_FONT,
-        cellWidth: CELL_WIDTH,
-        cellHeight: CELL_HEIGHT,
-        columns: COLUMN_COUNT,
-        roomWidthChars: ROOM_WIDTH,
-        pageWidthChars: PAGE_WIDTH_CHARS,
-        columnGapChars: COLUMN_GAP,
-        canvasHeightCells: palace.trimEnd().split("\n").length,
-        pageHeightPixels: PAGE_HEIGHT_PIXELS,
-        bodyLinePitch: BODY_LINE_PITCH,
-        pages,
-        cueLengthDistribution: {
-            min: cueLengths[0] ?? 0,
-            p25: percentile(0.25),
-            median: percentile(0.5),
-            p75: percentile(0.75),
-            p90: percentile(0.9),
-            max: cueLengths.at(-1) ?? 0,
+export function authorPalace(args: {
+    source: SourceMemory[];
+    specs: SpecEntry[];
+    sourceLabel?: string;
+    palaceOutput?: string;
+    coverageOutput?: string;
+}) {
+    const palaceOutput = args.palaceOutput ?? PALACE_OUTPUT;
+    const coverageOutput = args.coverageOutput ?? COVERAGE_OUTPUT;
+    validate(args.source, args.specs);
+    const { palace, placements, rooms, layoutItems, pages, leveling } = renderPalace(args.specs);
+    const cueLengths = args.specs
+        .filter((entry) => entry.mergeInto === undefined)
+        .map((entry) => codepoints(displayCue(entry)))
+        .sort((a, b) => a - b);
+    const percentile = (value: number): number =>
+        cueLengths[Math.round((cueLengths.length - 1) * value)] ?? 0;
+    const entryCount = args.specs.filter((entry) => entry.mergeInto === undefined).length;
+    const mergeCount = args.specs.length - entryCount;
+    const coverage = {
+        source: args.sourceLabel ?? SOURCE_PATH,
+        sourceMemoryCount: args.source.length,
+        entryCount,
+        mergeCount,
+        representedMemoryCount: entryCount + mergeCount,
+        palaceChars: palace.length,
+        maxLineChars: Math.max(...palace.trimEnd().split("\n").map(codepoints)),
+        layout: {
+            font: LAYOUT_FONT,
+            cellWidth: CELL_WIDTH,
+            cellHeight: CELL_HEIGHT,
+            columns: COLUMN_COUNT,
+            roomWidthChars: ROOM_WIDTH,
+            pageWidthChars: PAGE_WIDTH_CHARS,
+            columnGapChars: COLUMN_GAP,
+            canvasHeightCells: palace.trimEnd().split("\n").length,
+            pageHeightPixels: PAGE_HEIGHT_PIXELS,
+            bodyLinePitch: BODY_LINE_PITCH,
+            pages,
+            cueLengthDistribution: {
+                min: cueLengths[0] ?? 0,
+                p25: percentile(0.25),
+                median: percentile(0.5),
+                p75: percentile(0.75),
+                p90: percentile(0.9),
+                max: cueLengths.at(-1) ?? 0,
+            },
+            sharedPairCount: rooms.reduce((total, room) => total + room.sharedPairCount, 0),
+            bandGapRowsBefore: leveling.gapRowsBefore,
+            bandGapRowsAfter: leveling.gapRowsAfter,
+            roomSplitCount: leveling.splitCount,
+            items: layoutItems,
         },
-        sharedPairCount: rooms.reduce((total, room) => total + room.sharedPairCount, 0),
-        bandGapRowsBefore: leveling.gapRowsBefore,
-        bandGapRowsAfter: leveling.gapRowsAfter,
-        roomSplitCount: leveling.splitCount,
-        items: layoutItems,
-    },
-    rooms,
-    memories: Object.fromEntries(
-        [...placements.entries()]
-            .sort(([a], [b]) => a - b)
-            .map(([id, placement]) => [String(id), placement]),
-    ),
-};
-if (placements.size !== source.length)
-    throw new Error(`coverage has ${placements.size}/${source.length}`);
-writeFileSync(PALACE_OUTPUT, palace);
-writeFileSync(COVERAGE_OUTPUT, `${JSON.stringify(coverage, null, 4)}\n`);
-console.log(
-    JSON.stringify({
-        palace: basename(PALACE_OUTPUT),
-        font: LAYOUT_FONT,
-        chars: palace.length,
-        lines: palace.trimEnd().split("\n").length,
-        entries: entryCount,
-        merges: mergeCount,
-        memories: placements.size,
-        rooms: rooms.length,
-        pages: pages.map((page) => page.heightCells),
-        cueLengths: coverage.layout.cueLengthDistribution,
-        sharedPairs: coverage.layout.sharedPairCount,
-        bandGaps: { before: leveling.gapRowsBefore, after: leveling.gapRowsAfter },
-        roomSplits: leveling.splitCount,
-    }),
-);
+        rooms,
+        memories: Object.fromEntries(
+            [...placements.entries()]
+                .sort(([a], [b]) => a - b)
+                .map(([id, placement]) => [String(id), placement]),
+        ),
+    };
+    if (placements.size !== args.source.length)
+        throw new Error(`coverage has ${placements.size}/${args.source.length}`);
+    writeFileSync(palaceOutput, palace);
+    writeFileSync(coverageOutput, `${JSON.stringify(coverage, null, 4)}\n`);
+    return { palace, coverage };
+}
 
-export { isExactToken, validate };
+function main(): void {
+    const source = parseSource(readFileSync(SOURCE_PATH, "utf8"));
+    const specs = readSpecs();
+    const { palace, coverage } = authorPalace({ source, specs });
+    console.log(
+        JSON.stringify({
+            palace: basename(PALACE_OUTPUT),
+            font: LAYOUT_FONT,
+            chars: palace.length,
+            lines: palace.trimEnd().split("\n").length,
+            entries: coverage.entryCount,
+            merges: coverage.mergeCount,
+            memories: coverage.representedMemoryCount,
+            rooms: coverage.rooms.length,
+            pages: coverage.layout.pages.map((page) => page.heightCells),
+            cueLengths: coverage.layout.cueLengthDistribution,
+            sharedPairs: coverage.layout.sharedPairCount,
+            bandGaps: {
+                before: coverage.layout.bandGapRowsBefore,
+                after: coverage.layout.bandGapRowsAfter,
+            },
+            roomSplits: coverage.layout.roomSplitCount,
+        }),
+    );
+}
+
+if (import.meta.main) main();

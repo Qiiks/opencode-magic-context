@@ -79,3 +79,15 @@ docs/specs/
 
 # Rust workspace build output
 /target
+
+# Keep the reproducible visual-memory v3 inputs and latest report while leaving
+# generated model responses and PNG trial artifacts local.
+!packages/plugin/scripts/experiments/
+!packages/plugin/scripts/experiments/visual-memory/
+!packages/plugin/scripts/experiments/visual-memory/run-palace-trial.ts
+!packages/plugin/scripts/experiments/visual-memory/corpus/
+packages/plugin/scripts/experiments/visual-memory/corpus/*
+!packages/plugin/scripts/experiments/visual-memory/corpus/palace-corpus.json
+!packages/plugin/scripts/experiments/visual-memory/trials/
+packages/plugin/scripts/experiments/visual-memory/trials/*
+!packages/plugin/scripts/experiments/visual-memory/trials/REPORT.md

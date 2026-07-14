@@ -1,0 +1,2554 @@
+{
+  "schemaVersion": 1,
+  "projectIdentity": "git:93eea8cdeebd2eb57f476137abf32fa0c42cd3f5",
+  "source": {
+    "databasePath": "~/.local/share/cortexkit/magic-context/context.db",
+    "activeStatus": "active"
+  },
+  "memories": [
+    {
+      "id": 4951,
+      "category": "PROJECT_RULES",
+      "content": "Use `scripts/release-dashboard.sh <version> --notes-file <path>` for non-interactive dashboard releases; it bumps tauri.conf.json, updates the README link, waits for CI/assets, and publishes the draft release with notes.",
+      "importance": 52
+    },
+    {
+      "id": 4952,
+      "category": "PROJECT_RULES",
+      "content": "Use `scripts/wait-release.sh <tag>` for plugin release polling because release.yml runs on tag refs and `gh run list` must filter with `--branch <tag>`.",
+      "importance": 52
+    },
+    {
+      "id": 4960,
+      "category": "PROJECT_RULES",
+      "content": "Restart `opencode serve` after rebuilding the plugin, as restarting only the TUI or desktop client does not reload the server-side bundle.",
+      "importance": 58
+    },
+    {
+      "id": 4961,
+      "category": "PROJECT_RULES",
+      "content": "TUI plugin code is exported via the `./tui` export in `package.json` (pointing to `src/tui/entry.mjs` which resolves raw `index.tsx` or compiled fallback), allowing TUI changes to take effect without rebuilding the server bundle.",
+      "importance": 56
+    },
+    {
+      "id": 4973,
+      "category": "PROJECT_RULES",
+      "content": "Discord release announcements run inline from release.yml after github-release; the standalone Discord workflow is manual-only.",
+      "importance": 48
+    },
+    {
+      "id": 4975,
+      "category": "PROJECT_RULES",
+      "content": "Cache-safety-affecting changes require a detailed plan, adversarial Oracle review, explicit approval for high-risk work, unit/e2e coverage, and live wire-level byte-diff verification before shipping.",
+      "importance": 78
+    },
+    {
+      "id": 4976,
+      "category": "PROJECT_RULES",
+      "content": "Heuristic cleanup runs on execute passes, flushes, and emergency bands, bypassing the once-per-turn guard for subagents (to prevent overflow) and known m[0] hard folds.",
+      "importance": 61
+    },
+    {
+      "id": 4977,
+      "category": "PROJECT_RULES",
+      "content": "For dashboard macOS distribution, use a Developer ID Application .p12 plus App Store Connect notarization credentials; Apple Development certificates are not valid for distributable notarized builds.",
+      "importance": 65
+    },
+    {
+      "id": 4978,
+      "category": "PROJECT_RULES",
+      "content": "Historian prompt experiments use packages/plugin/scripts/test-historian-prompt.ts with real raw ranges, production-like existing state, and per-run prompt/input/output artifacts recording input and output tokens.",
+      "importance": 60
+    },
+    {
+      "id": 4981,
+      "category": "PROJECT_RULES",
+      "content": "For historian replay experiments and long-running harness tasks, use `background: true` MCP bash tasks instead of `nohup ... &` so completion reminders fire.",
+      "importance": 55
+    },
+    {
+      "id": 4982,
+      "category": "PROJECT_RULES",
+      "content": "For SCBench Magic Context runs, include child-session costs from subagent_invocations in the +MC arm and run baseline and +MC arms on the same OpenCode version, model, thinking level, prompt, environment, and problem set.",
+      "importance": 58
+    },
+    {
+      "id": 4983,
+      "category": "PROJECT_RULES",
+      "content": "Code comments must explain the WHY of the code (invariant, failure mode, constraint) and must not reference ephemeral process artifacts like council numbers, audit findings, Oracle reviews, or plan version numbers.",
+      "importance": 65
+    },
+    {
+      "id": 4984,
+      "category": "PROJECT_RULES",
+      "content": "When intentionally keeping an audit-flagged pattern, add inline comments so later audits treat it as reviewed.",
+      "importance": 58
+    },
+    {
+      "id": 4985,
+      "category": "PROJECT_RULES",
+      "content": "For council plan audits, use blind methodology: do not disclose prior audit history or \"verify these findings are closed\" framing, which causes checklist-verification bias.",
+      "importance": 55
+    },
+    {
+      "id": 4986,
+      "category": "PROJECT_RULES",
+      "content": "When patch rounds repeatedly introduce new defects in the same document, delegate patch work to a fresh model holding the plan + audit findings but no accumulated patch context.",
+      "importance": 58
+    },
+    {
+      "id": 4987,
+      "category": "PROJECT_RULES",
+      "content": "Parallel or delegated implementation uses isolated worktrees or independent checkouts with explicit file-ownership boundaries; copy ignored .alfonso plans/artifacts into the worktree before resuming.",
+      "importance": 60
+    },
+    {
+      "id": 4988,
+      "category": "PROJECT_RULES",
+      "content": "During plugin publishing, the release workflow copies root README.md to generated packages/plugin/README.md instead of maintaining a tracked duplicate.",
+      "importance": 50
+    },
+    {
+      "id": 5181,
+      "category": "PROJECT_RULES",
+      "content": "Tauri capabilities must not enable `shell:default`.",
+      "importance": 75
+    },
+    {
+      "id": 5503,
+      "category": "PROJECT_RULES",
+      "content": "The agent uses the wrapper `gh-alfonso-mc` at `~/.local/bin/gh-alfonso-mc` (sets `GH_CONFIG_DIR` to `~/.config/gh-alfonso-mc`) for all agent-authored GitHub actions to authenticate as `@alfonso-magic-context`. It is NOT on bash tool PATH by default — export PATH=\"$HOME/.local/bin:$PATH\" first.",
+      "importance": 60
+    },
+    {
+      "id": 5671,
+      "category": "PROJECT_RULES",
+      "content": "`build-reference-seeds.ts` runs `biome check --write` with cwd set to the plugin package root so the generated reference seed file falls within biome's include scope.",
+      "importance": 45
+    },
+    {
+      "id": 5672,
+      "category": "PROJECT_RULES",
+      "content": "Agent commits must use the repo's configured git identity `ualtinok <ufukaltinok@gmail.com>` as author (just `git commit`, do NOT pass `--author` or `-c user.email` overrides) and append the trailer `Co-authored-by: Alfonso [Magic Context] <288211368+alfonso-magic-context@users.noreply.github.com>`. ufukaltinok@gmail.com is verified on the user's GitHub account so commits show as `ualtinok` with their avatar; hardcoding ufuk@earendil.works or ufuk@nowhere.dev breaks attribution (GitHub shows a plain name, no avatar).",
+      "importance": 40
+    },
+    {
+      "id": 5679,
+      "category": "PROJECT_RULES",
+      "content": "Configuration schema updates are made by editing the Zod schema MagicContextConfigSchema (packages/plugin/src/config/schema/magic-context.ts), using Zod .describe() calls for field documentation as the single source of truth, and running bun packages/plugin/scripts/build-schema.ts to regenerate assets/magic-context.schema.json.",
+      "importance": 68
+    },
+    {
+      "id": 5680,
+      "category": "PROJECT_RULES",
+      "content": "Test database isolation uses two layers to prevent tests from modifying the production database: (1) packages use bunfig.toml to preload settings mapping MAGIC_CONTEXT_TEST_DATA_DIR and XDG_DATA_HOME to temp directories, and (2) resolveDatabasePath redirects to a temporary directory if NODE_ENV is \"test\" and paths are unset.",
+      "importance": 80
+    },
+    {
+      "id": 5681,
+      "category": "PROJECT_RULES",
+      "content": "Use scripts/release.sh <version> to run lint, typecheck, test, and E2E checks, generate the JSON schema and reference seed assets, re-lint for formatting drift, sync versions, and commit, tag, and push the release.",
+      "importance": 55
+    },
+    {
+      "id": 5742,
+      "category": "PROJECT_RULES",
+      "content": "To surface an `m[1]` delta in E2E tests, write an empty `m[0]` first to freeze the watermark on the first pass, then append the compartment or memory and execute a subsequent cache-busting pass.",
+      "importance": 68
+    },
+    {
+      "id": 5743,
+      "category": "PROJECT_RULES",
+      "content": "Historian mock ordinal parsing in tests uses the line-anchored regex `/^\\[(\\d+)\\] [UA]:/` scoped to `<new_messages>` to avoid matching literal brackets in prose.",
+      "importance": 45
+    },
+    {
+      "id": 5745,
+      "category": "PROJECT_RULES",
+      "content": "OpenCode host-E2E test runs explicitly append the oracle unit test `src/cache-analysis.test.ts` because it lies outside the `tests/*.test.ts` glob.",
+      "importance": 48
+    },
+    {
+      "id": 5791,
+      "category": "PROJECT_RULES",
+      "content": "Project configurations must not contain `sqlite.*` settings; they are stripped at load time for security.",
+      "importance": 72
+    },
+    {
+      "id": 5824,
+      "category": "PROJECT_RULES",
+      "content": "release.yml gates npm publish and GitHub release jobs on unit checks, Docker E2E, and host behavior E2E to prevent releases when tests are failing.",
+      "importance": 58
+    },
+    {
+      "id": 5896,
+      "category": "PROJECT_RULES",
+      "content": "Plugin releases require a tracked `.alfonso/release-notes/<tag>.md` file as the curated GitHub release body, which release.yml automatically uploads via body_path.",
+      "importance": 55
+    },
+    {
+      "id": 5971,
+      "category": "PROJECT_RULES",
+      "content": "Primary agents may only merge memories belonging to their own resolved project; cross-project memory merge is restricted to the dreamer.",
+      "importance": 75
+    },
+    {
+      "id": 5972,
+      "category": "PROJECT_RULES",
+      "content": "Tool tagging must bump the tag's byte size and token counts in the database if a later occurrence (e.g. tool result) carries a larger payload than the initial occurrence.",
+      "importance": 65
+    },
+    {
+      "id": 6015,
+      "category": "PROJECT_RULES",
+      "content": "Sidekick is restricted to read-only memory access and must not mutate ctx_memory.",
+      "importance": 74
+    },
+    {
+      "id": 6217,
+      "category": "PROJECT_RULES",
+      "content": "Releases require a clean audit (0 P0 and 0 P1) across all councils before shipping.",
+      "importance": 52
+    },
+    {
+      "id": 6250,
+      "category": "PROJECT_RULES",
+      "content": "Debugging cache busts requires establishing the timeline from logs and using wire-dump byte diffs via bun packages/plugin/scripts/analyze-cache-busts.ts to attribute prompt changes, rather than using ad-hoc diff scripts or provider explanations.",
+      "importance": 68
+    },
+    {
+      "id": 6271,
+      "category": "PROJECT_RULES",
+      "content": "The ctx_reduce tool description and guidance must frame it as deferred discard (queuing a pending operation) rather than immediate delete to encourage models to call it earlier. Safety guidance must focus on whether the information is no longer needed, cautioning that once discarded, the content is replaced by a placeholder and cannot be retrieved.",
+      "importance": 70
+    },
+    {
+      "id": 6321,
+      "category": "PROJECT_RULES",
+      "content": "The dreamer's maintain-docs task must reproduce sections in ARCHITECTURE.md enclosed in <!-- mc:protected START --> and <!-- mc:protected END --> comments byte-for-byte. These protected regions must not be edited or removed when rewriting or regenerating the file.",
+      "importance": 78
+    },
+    {
+      "id": 6599,
+      "category": "PROJECT_RULES",
+      "content": "Per-turn handlers (such as system-prompt injection) must fail open to prevent throwing errors into the main prompt path.",
+      "importance": 78
+    },
+    {
+      "id": 6740,
+      "category": "PROJECT_RULES",
+      "content": "Defer deep refactors of TypeScript plugin transform and cache logic in transform.ts and inject-compartments.ts to align with the planned transition to a shared Rust MC module.",
+      "importance": 65
+    },
+    {
+      "id": 6850,
+      "category": "PROJECT_RULES",
+      "content": "Keep the Magic Context entry default export as the `{ id, server }` object; never add named exports to packages/plugin/src/index.ts to avoid triggering the legacy loader's export scan.",
+      "importance": 85
+    },
+    {
+      "id": 6873,
+      "category": "PROJECT_RULES",
+      "content": "Maintain-memory harness trials run on a disposable copy of context.db created via SQLite online backup to protect production data.",
+      "importance": 72
+    },
+    {
+      "id": 7047,
+      "category": "PROJECT_RULES",
+      "content": "Questions about OpenCode or Pi internals and behavior must be sent to the registered peer 'OC' or 'PI' via peer_send instead of reading their respective source code.",
+      "importance": 75
+    },
+    {
+      "id": 7066,
+      "category": "PROJECT_RULES",
+      "content": "When asked to find, diagnose, or investigate an issue, locate and report the cause using search and read tools without modifying any files until instructed to apply a fix.",
+      "importance": 80
+    },
+    {
+      "id": 7255,
+      "category": "PROJECT_RULES",
+      "content": "Use `setup` for first-time or full interactive installation, `doctor` for existing installs, and `doctor --force` to clear the cached plugin install when a stale dependency tree breaks plugin loading even though the cached version matches.",
+      "importance": 55
+    },
+    {
+      "id": 7256,
+      "category": "PROJECT_RULES",
+      "content": "Docker smoke E2E runs from tests/docker/ via run-e2e.sh once packages/plugin and packages/pi-plugin builds exist, followed by host behavior E2E suites from packages/e2e-tests. E2E tests must run locally (especially after changes to packages/e2e-tests) on an idle host without concurrent shell work to prevent timing-related flakiness, with inherited NODE_ENV unset and `~/.opencode/bin` added to the PATH for OpenCode subprocesses.",
+      "importance": 55
+    },
+    {
+      "id": 7257,
+      "category": "PROJECT_RULES",
+      "content": "Before committing release-bound changes or merging delegated work, independently audit diffs and rerun typecheck, lint, build, and all relevant tests (including the full test suite for any changes to shared call paths). For workflow changes, push to master and wait for the gated CI pipeline to pass before tagging a release.",
+      "importance": 60
+    },
+    {
+      "id": 7258,
+      "category": "PROJECT_RULES",
+      "content": "Release work and related GitHub issues close only after verifying CI, package publication, GitHub release, and announcement completion; existing release notes remain unchanged with corrections shipping in a new patch release.",
+      "importance": 55
+    },
+    {
+      "id": 7259,
+      "category": "PROJECT_RULES",
+      "content": "When tuning historian or compressor prompts, cross-validate on other sessions to avoid overfitting, and cross-check aggregate metrics by inspecting representative compartments to prevent narrative regressions.",
+      "importance": 60
+    },
+    {
+      "id": 7265,
+      "category": "PROJECT_RULES",
+      "content": "Subagents running in hidden background processes must not be prompted to output reasoning.",
+      "importance": 55
+    },
+    {
+      "id": 7324,
+      "category": "PROJECT_RULES",
+      "content": "The dream-timer scheduler startup must fail open (catching database open throws) to prevent storage failures from disabling the core transform and compaction pipeline.",
+      "importance": 70
+    },
+    {
+      "id": 7502,
+      "category": "PROJECT_RULES",
+      "content": "English README is canonical; translations are best-effort and may lag.",
+      "importance": 30
+    },
+    {
+      "id": 7503,
+      "category": "PROJECT_RULES",
+      "content": "Translate prose only in README translations, keeping code blocks, config/JSONC examples, commands, links, badge URLs, and heading anchors verbatim.",
+      "importance": 32
+    },
+    {
+      "id": 7504,
+      "category": "PROJECT_RULES",
+      "content": "Masons/subagents performing translations must not use external translation tools or APIs (such as translate-shell/trans) and must perform translations directly.",
+      "importance": 35
+    },
+    {
+      "id": 7582,
+      "category": "PROJECT_RULES",
+      "content": "CI's \"Check\" job runs `biome check .` (lint AND format verification) repo-wide per package. Local pre-push verification MUST run the exact `bun run lint` (= `biome check .`) for every touched package, not scoped `biome check <subpath>` or `format --write` on touched files only — scoped/format-write runs miss whole-file format drift (import wrapping, quote style, JSX) and let CI lint go red even when targeted checks pass.",
+      "importance": 62
+    },
+    {
+      "id": 7656,
+      "category": "PROJECT_RULES",
+      "content": "E2E and unit tests that open a writable context DB handle must set a `busy_timeout` (e.g., 5000ms) to prevent SQLITE_BUSY lock-contention flakes under loaded CI.",
+      "importance": 68
+    },
+    {
+      "id": 7715,
+      "category": "PROJECT_RULES",
+      "content": "Keep docs/cache-policy/ and docs/specs/ directories gitignored and local-only to prevent internal design discussions from leaking to public repositories.",
+      "importance": 65
+    },
+    {
+      "id": 7804,
+      "category": "PROJECT_RULES",
+      "content": "The MC harness-agnostic Rust module (crates/mc-core, mc-store, mc-module→binary ck-mc, mc-tokenizer + root Cargo workspace) is PUBLIC on origin/master as of 2026-07-10 (Ufuk-approved merge of subc-migration, SHA ab196741, CI green) — the local-branch-only era and its push-hold are OVER. subc-migration continues as the working branch but now merges to master + pushes normally (master pushes still require Ufuk's go-ahead; npm releases fire only on v* tags). Prod runs ck-mc from target/release/ck-mc (source-identical to origin/master crates/), supervised by subc; owned leg = BROCA (ex llm-runner; historian producer targets module_id \"broca\", serializer profile owned-broca with owned-llmrunner registered until deletable), CC leg = THALAMUS (ex ai-proxy) on port 8378. WORKFLOW for worktree changes stays: verify at source in the mason worktree → FF-merge into subc-migration → gate the LIVE merged tree → Oracle/contract pass → keep or reset (memory 7871). ARCHITECTURE: mc-module OWNS reduction logic; cache-core stays dumb. CODEC OWNERSHIP SPLIT: spec-#2 section E = harness-model codecs (MC-owned, shipped); section F = provider-wire codecs (BROCA-owned); MC never sees provider wire. CC-leg status: hard-stop arc CLOSED 2026-07-09 (A+A'+B fold fixes, Fix C+C-2 spinner-fork guards, validate fence, covered-system absorb-into-m0 + module-side epoch self-fold, 23.4k on-wire reclaim proven); cutover-1 (guidance prepend) building at THALAMUS — gates: their rig cache-proof → Ufuk push-gate; then U0 full-array (LLMRUNNER/BROCA encoder gate), then U1 tagging flip (U1 surface BUILT + merged flip-gated behind tagging_enabled()=false, needs its own adversarial Oracle before the flip). Epoch contract with THALAMUS: memory 8664. Remaining tails: section-E projection oracles (note #452), deferred-marker activations (notes #412/#409), observer-mode for CC spinner passes (note #527), owned-llmrunner profile deletion post-cut.",
+      "importance": 80
+    },
+    {
+      "id": 7840,
+      "category": "PROJECT_RULES",
+      "content": "The workspace-union memory read must fail loud if no project identity is bound, preventing cross-project read hazards.",
+      "importance": 70
+    },
+    {
+      "id": 7844,
+      "category": "PROJECT_RULES",
+      "content": "Every cache-critical slice of the harness-agnostic MC Rust module (crates/mc-*, subc-migration branch) must pass TWO orthogonal review surfaces before commit: (1) a cache-CONTRACT review (freeze/replay discipline, the SOFT/SOFT+/HARD taxonomy, digest completeness, the determinism axes — defer composes no body, expiry/budget frozen, fingerprints canonical) and (2) an independent adversarial DATA-FLOW review of the compose internals (which bytes the producers actually emit — union-memory visibility, coverage tiling, watermark routing). These find DISJOINT bug classes: on slice 4d-m0 the contract pass cleared correctly while the data-flow Oracle caught 2 reachable data-correctness P0s the contract review structurally cannot see. Neither surface alone is sufficient. No commit may ride over a known P0; resolve or correctly-reclassify all findings from both surfaces first.",
+      "importance": 60
+    },
+    {
+      "id": 7871,
+      "category": "PROJECT_RULES",
+      "content": "Oracle/gate reviews of mason worktree changes must run AFTER merging the fix into the session-cwd branch (e.g. FF-merge into subc-migration), not while the change is worktree-only. A subagent's relative-path reads (crates/..., src/...) resolve to the SESSION CWD, not the mason's worktree, so gating a worktree-only change makes the Oracle read the pre-fix base and emit a false BLOCK (\"symbol absent / still old code\"). For local integration branches this is safe because the merge is trivially revertible (git reset --hard <base>) with no downstream consumer. Order: verify at source in the worktree → FF-merge into cwd branch → gate the live merged tree → SUBC/contract re-pass → keep or reset.",
+      "importance": 65
+    },
+    {
+      "id": 7996,
+      "category": "PROJECT_RULES",
+      "content": "When debugging structured-stream consumer failures, check for interleaved non-JSON or plain-text noise in the stream.",
+      "importance": 40
+    },
+    {
+      "id": 8098,
+      "category": "PROJECT_RULES",
+      "content": "Do not call `getWritableOpenCodeDb` or write OpenCode compaction markers on non-OpenCode harnesses.",
+      "importance": 65
+    },
+    {
+      "id": 8272,
+      "category": "PROJECT_RULES",
+      "content": "Every agent-authored git commit must end with the trailer \"Co-authored-by: Alfonso [Magic Context] <288211368+alfonso-magic-context@users.noreply.github.com>\" (bot account alfonso-magic-context, id 288211368), mirroring the AFT agent convention.",
+      "importance": 53
+    },
+    {
+      "id": 8342,
+      "category": "PROJECT_RULES",
+      "content": "Plugin tests must NEVER spawn real git processes (execFileSync/execFile of git, `git init` fixtures). On loaded macOS machines, spawned-binary assessment (syspolicyd) stalls each spawn 30-170+s, failing the release gate's local test run while CI stays green. Use the injectable exec seams instead: __setProjectIdentityTestHooks({ execFileSync }) in memory/project-identity.ts and the verification-paths seam for verify-gate reads; create real `.git` DIRECTORIES on disk when a test needs the stat-walk/ancestor/symlink detection exercised (the walk checks existence, not validity), and script git OUTPUT through the seam. Grep guard: no `execFileSync(\"git\"` / `execFile(\"git\"` in *.test.ts.",
+      "importance": 68
+    },
+    {
+      "id": 8411,
+      "category": "PROJECT_RULES",
+      "content": "Use the shared `runLeaseGuardedWrite` helper (which uses `BEGIN IMMEDIATE` transactions) for all lease-guarded database writes to prevent double-commits under SQLite WAL snapshot isolation.",
+      "importance": 71
+    },
+    {
+      "id": 8412,
+      "category": "PROJECT_RULES",
+      "content": "Memory manifest parsers must use fail-closed root-element parsing instead of regex-scanning tags to prevent truncated LLM outputs from triggering unintended memory mutations.",
+      "importance": 72
+    },
+    {
+      "id": 8476,
+      "category": "PROJECT_RULES",
+      "content": "Every dev-rig must pin a unique port (e.g., 8811) to avoid loopback port collisions on 8757 with production subc-core.",
+      "importance": 45
+    },
+    {
+      "id": 8595,
+      "category": "PROJECT_RULES",
+      "content": "CC-leg reclaim arc CLOSED (2026-07-09, all deployed to prod + drive-proven from both sides' instruments): three stacked bugs each hid the next — (1) historian substance floor blocked all folds on the verbatim-tail CC leg (fixed: bypass on !tail_reclaim profiles + A' newest-arc boundary guard + AIPROXY's 167k CC denominator); (2) CC spinner side-requests forked the lineage every real turn so folds never accumulated depth (fixed: AIPROXY Fix C trailing-swap + C-2 swap+append predicates); (3) covered mid-array system messages re-emitted as [m0(user), system, m1(user)] which Anthropic 400s (\"system must precede assistant or end array\") — the 400 fell back to raw retry, silently eating the reclaim (fixed: covered systems absorb into m0 as a <covered-system-messages> text block, dedup byte-identical first-ordinal, block omitted when empty; plus AIPROXY fail-closed validate fence). Final proof: 23.4k tokens reclaimed on-wire and held flat (86k→110k→[fold]→87k), one lineage, zero fences, received==forwarded coverage across all 17 passes.",
+      "importance": 45
+    },
+    {
+      "id": 8878,
+      "category": "PROJECT_RULES",
+      "content": "Run the full test suite in directory slices rather than as a monolith to prevent exceeding tool execution caps.",
+      "importance": 32
+    },
+    {
+      "id": 8879,
+      "category": "PROJECT_RULES",
+      "content": "Pi doctor must open the shared database read-only to prevent schema migrations during diagnostic runs.",
+      "importance": 51
+    },
+    {
+      "id": 5006,
+      "category": "ARCHITECTURE",
+      "content": "Compartment write paths (historian append, recompilation promotion, partial-recompilation preservation, and staging round-trip) preserve the p1-p4 tier columns in the compartments and recomp_compartments tables to prevent losing multi-level compressed paraphrases during context updates.",
+      "importance": 70
+    },
+    {
+      "id": 5007,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/compartment-storage.ts and compartment-lease.ts, compartment-state mutations verify a DB-backed compartment_state_lease inside a BEGIN IMMEDIATE transaction to coordinate concurrent OpenCode and Pi processes sharing the database.",
+      "importance": 78
+    },
+    {
+      "id": 5012,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/shared/models-dev-cache.ts, resolveLimit prefers limit.input over limit.context to align context pressure calculations with provider-enforced input limits.",
+      "importance": 68
+    },
+    {
+      "id": 5013,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/config/schema/magic-context.ts, the execute threshold is capped at a maximum of 80% to keep the history compression budget within the usable execution window.",
+      "importance": 74
+    },
+    {
+      "id": 5017,
+      "category": "ARCHITECTURE",
+      "content": "Caveman/density-aware compression persists result depth in tags and replays from the stored depth on every pass to prevent defer passes from restoring the original long text.",
+      "importance": 68
+    },
+    {
+      "id": 5019,
+      "category": "ARCHITECTURE",
+      "content": "The dreamer processes scheduled tasks filtered by projectIdentity to prevent executing tasks in incorrect directories or client scopes.",
+      "importance": 48
+    },
+    {
+      "id": 5020,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/plugin/dream-timer.ts, scheduled dreamer checks run from a single process-wide, plugin-level timer instead of message.updated hooks to ensure they execute when the user is idle.",
+      "importance": 72
+    },
+    {
+      "id": 5025,
+      "category": "ARCHITECTURE",
+      "content": "unifiedSearch computes a single query embedding and shares it across semantic memory and git-commit searches to prevent duplicate HTTP requests.",
+      "importance": 62
+    },
+    {
+      "id": 5026,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/git-commits/git-log-reader.ts, git commit indexing uses HEAD-only non-merge history and reads git log with \\x1f field separators to prevent errors in Node execFile and preserve commit-body formatting.",
+      "importance": 62
+    },
+    {
+      "id": 5027,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/message-index.ts, raw message search uses a lazy incremental FTS5 index in the magic-context SQLite database to avoid writing to the OpenCode database.",
+      "importance": 65
+    },
+    {
+      "id": 5028,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/search.ts, unifiedSearch excludes memories already rendered in the session history (visibleMemoryIds) and raw-message hits newer than the last compartment end (maxMessageOrdinal) since the live tail is already in context.",
+      "importance": 70
+    },
+    {
+      "id": 5031,
+      "category": "ARCHITECTURE",
+      "content": "OpenCode serializes msgs to model messages after messages.transform fires so Magic Context message-array mutations land before provider serialization.",
+      "importance": 75
+    },
+    {
+      "id": 5032,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/compaction-marker-manager.ts, OpenCode compaction markers store a static placeholder summary so filterCompacted stops at the historian boundary.",
+      "importance": 72
+    },
+    {
+      "id": 5037,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/agents/permissions.ts, hidden Magic Context agents use allow-only OpenCode permission maps (wildcard-deny first, then explicit allows) because prompt-based sessions do not receive the default subagent auto-deny wrapper.",
+      "importance": 78
+    },
+    {
+      "id": 5042,
+      "category": "ARCHITECTURE",
+      "content": "Config loading deep-merges raw user and project JSONC before Zod parsing so defaults fill only keys unset by both.",
+      "importance": 60
+    },
+    {
+      "id": 5048,
+      "category": "ARCHITECTURE",
+      "content": "Pi uses per-session RawMessageProvider overrides so shared chunking/formatting runs on Pi session data without converting to OpenCode MessageLike.",
+      "importance": 62
+    },
+    {
+      "id": 5051,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/command-handler.ts, /ctx-aug appends retrieved memory context in a <sidekick-augmentation> block to the user prompt, rather than modifying the cached project-memory block in message[0], to preserve the Anthropic prompt cache.",
+      "importance": 80
+    },
+    {
+      "id": 5052,
+      "category": "ARCHITECTURE",
+      "content": "In packages/cli/src/adapters/opencode.ts, setup merges required edits into existing config files to preserve local configuration entries and comments.",
+      "importance": 55
+    },
+    {
+      "id": 5053,
+      "category": "ARCHITECTURE",
+      "content": "In packages/cli/src/lib/find-on-path.ts, CLI host detection (including OpenCode and Pi) walks the PATH using Node primitives rather than shelling out to which or where to reliably support wrapper scripts and sandboxed environments.",
+      "importance": 60
+    },
+    {
+      "id": 5152,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/inject-compartments.ts, model key switches, system prompt hash changes, and idle TTL timeouts trigger a hard M0 materialization (folding M1 into M0) to align with provider-side cache evictions.",
+      "importance": 82
+    },
+    {
+      "id": 5158,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/system-prompt-hash.ts and packages/pi-plugin/src/system-prompt.ts, system-prompt date stabilization freezes the 'Today's date' line until the next cache-busting pass to prevent midnight date rollovers from busting the prompt-cache.",
+      "importance": 82
+    },
+    {
+      "id": 5159,
+      "category": "ARCHITECTURE",
+      "content": "Temporal awareness uses deterministic HTML gap comments on live user messages and start-date / end-date attributes on rendered compartments to ensure compact and cache-stable signals.",
+      "importance": 70
+    },
+    {
+      "id": 5173,
+      "category": "ARCHITECTURE",
+      "content": "Database migrations tolerate `schema_migrations` primary key conflicts to prevent crashes during concurrent startup of multiple plugin processes.",
+      "importance": 76
+    },
+    {
+      "id": 5174,
+      "category": "ARCHITECTURE",
+      "content": "Pi entry ID resolution uses Map<AgentMessage, entryId> reference identity with fingerprint fallback because agent.state.messages can diverge from getBranch().",
+      "importance": 65
+    },
+    {
+      "id": 5178,
+      "category": "ARCHITECTURE",
+      "content": "In packages/pi-plugin/src/tools/index.ts, registerMagicContextTools registers project-scoped tools but omits session-scoped tools (ctx_note, ctx_expand) when opts.sessionScopedToolsDisabled is true to prevent child subagents from writing orphaned state or expanding empty transcripts.",
+      "importance": 68
+    },
+    {
+      "id": 5189,
+      "category": "ARCHITECTURE",
+      "content": "Auto-search calls unifiedSearch with countRetrievals: false so hint lookups do not increment counters or promote memories.",
+      "importance": 55
+    },
+    {
+      "id": 5191,
+      "category": "ARCHITECTURE",
+      "content": "Compartment p1_embedding generation is best-effort and fire-and-forget to prevent blocking or failing historian publication.",
+      "importance": 60
+    },
+    {
+      "id": 5558,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/shared/sqlite.ts, the SQLite adapter dynamically imports bun:sqlite or node:sqlite using runtime string concatenation and /* @vite-ignore */ comments to avoid build-time resolution errors.",
+      "importance": 76
+    },
+    {
+      "id": 5562,
+      "category": "ARCHITECTURE",
+      "content": "Project-level configurations do not expand {env:VAR} or {file:path} tokens to prevent secret exfiltration.",
+      "importance": 80
+    },
+    {
+      "id": 5686,
+      "category": "ARCHITECTURE",
+      "content": "In packages/pi-plugin/src/index.ts, Pi's session_before_compact event handler returns { cancel: true } to cancel native compaction and yield control of compaction boundaries to Magic Context.",
+      "importance": 80
+    },
+    {
+      "id": 5695,
+      "category": "ARCHITECTURE",
+      "content": "Key-files injection uses project_key_files_version counters to invalidate active per-session caches across processes after key file modifications.",
+      "importance": 70
+    },
+    {
+      "id": 5696,
+      "category": "ARCHITECTURE",
+      "content": "Deferred native `appendCompaction()` markers are staged in `session_meta` and drain on the next materializing pass to update the `getBranch()` compacted view.",
+      "importance": 64
+    },
+    {
+      "id": 5698,
+      "category": "ARCHITECTURE",
+      "content": "DCP detection matches only on canonical package names to avoid false-positive path matches.",
+      "importance": 40
+    },
+    {
+      "id": 5741,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/tui/data/context-db.ts, the TUI data layer retrieves all data from the server plugin via RPC and performs no direct SQLite operations to avoid database lock contention.",
+      "importance": 70
+    },
+    {
+      "id": 5744,
+      "category": "ARCHITECTURE",
+      "content": "packages/e2e-tests/src/cache-analysis.ts extracts extractM0 and extractM1 at the text block level instead of the message level because same-role user messages are merged into a single message with multiple text blocks.",
+      "importance": 45
+    },
+    {
+      "id": 5746,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/event-handler.ts, internal child sessions (historian, dreamer, sidekick, and memory-migration) are identified by a 'magic-context-' title prefix to exempt them from system-prompt injection and the transform pipeline.",
+      "importance": 80
+    },
+    {
+      "id": 5793,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/emergency-drop.ts, emergency tool drop uses priorInputSample (persisted as last_emergency_input_sample in storage-meta-persisted.ts) as the idempotence latch to prevent repeated drops on the same input token count.",
+      "importance": 74
+    },
+    {
+      "id": 5822,
+      "category": "ARCHITECTURE",
+      "content": "The emergency tool drop identifies candidates using status='active' in the database instead of a scalar watermark to prevent premature exclusion of lower-tier tags.",
+      "importance": 64
+    },
+    {
+      "id": 5841,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/protected-tail-boundary.ts, the protected-tail token target N is capped at 0.40 * usable (MAX_USABLE_RATIO) to prevent deadlocks on models with small context sizes.",
+      "importance": 74
+    },
+    {
+      "id": 5862,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/storage-db.ts and storage-tags.ts, token_count, input_token_count, and reasoning_token_count are cached in the tags table to enable fast SQL sums for sidebar and boundary token calculations.",
+      "importance": 66
+    },
+    {
+      "id": 5899,
+      "category": "ARCHITECTURE",
+      "content": "packages/plugin/src/hooks/magic-context/compartment-runner-incremental.ts promotes emitted facts directly to project memory via promoteSessionFactsDurable, bypassing session_facts to avoid unnecessary compartment rebuilds.",
+      "importance": 70
+    },
+    {
+      "id": 5980,
+      "category": "ARCHITECTURE",
+      "content": "checkCompartmentTrigger primes the raw-message cache using either an in-memory messages tail (via primeInMemoryTailRawMessageCache) or a tail-only database read (via primeTailRawMessageCache) starting from lastCompartmentEnd to avoid full-session DB reads.",
+      "importance": 68
+    },
+    {
+      "id": 5990,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/compartment-trigger.ts, checkCompartmentTrigger evaluates the tail_size trigger using TC-chunked (summarizable) tokenEstimate (triggerBudget * 3 or chunkHasMore) rather than true-raw occupancy, preventing over-compartmentalization on low-pressure, tool-heavy sessions.",
+      "importance": 72
+    },
+    {
+      "id": 6030,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/storage-db.ts, healWedgedChannel2Claims rewinds Channel-2 claims older than 120s (CHANNEL2_CLAIM_TTL_MS) to 'pending' during boot recovery to prevent concurrent processes from stealing active claims.",
+      "importance": 72
+    },
+    {
+      "id": 6099,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/ctx-reduce-availability.ts, the availability of ctx_reduce is resolved from the tools map of the first user message and cached in memory to prevent system-prompt hash oscillation.",
+      "importance": 72
+    },
+    {
+      "id": 6129,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/memory/cosine-similarity.ts and storage-memory-embeddings.ts, embeddings are stored as SQLite BLOBs and scanned in memory via Float32Array cosine similarity to avoid sqlite-vec write-amplification and runtime compatibility issues.",
+      "importance": 80
+    },
+    {
+      "id": 6164,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/storage-db.ts and packages/plugin/src/features/magic-context/migrations.ts, unique index idx_workspace_member_unique on workspace_members(project_path) constrains each project to at most one workspace to prevent budget and provenance ambiguity.",
+      "importance": 70
+    },
+    {
+      "id": 6170,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/tools/ctx-memory/tools.ts and packages/pi-plugin/src/tools/ctx-memory.ts, memory update, archive, and merge operations execute under the target memory's resolved project identity instead of the active session's identity to ensure correct mutation logging and embedding routing.",
+      "importance": 74
+    },
+    {
+      "id": 6172,
+      "category": "ARCHITECTURE",
+      "content": "In packages/dashboard/src-tauri/src/db.rs, SQLite connections are opened without SQLITE_OPEN_CREATE to delegate database schema lifecycle to the plugin.",
+      "importance": 65
+    },
+    {
+      "id": 6212,
+      "category": "ARCHITECTURE",
+      "content": "External project-memory updates bump project_memory_epoch to force a hard M0 materialization, ensuring session context immediately reflects the updated memory store.",
+      "importance": 78
+    },
+    {
+      "id": 6213,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/compartment-runner-recomp.ts, context recompilation rebuilds the session's compartment structure from raw history but discards facts emitted by the historian to prevent re-promoting them into the curated project memory store.",
+      "importance": 75
+    },
+    {
+      "id": 6214,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/inject-compartments.ts, defer passes replay the cached compartment injection by trimming input messages to compartmentEndMessageId or reusing the cache if pruned, preventing mid-turn historian publications from invalidating the prompt-cache prefix.",
+      "importance": 78
+    },
+    {
+      "id": 6221,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/project-embedding-registry.ts, getChunkEmbeddingModelId includes chunk-window configurations in the chunk-specific model ID, so chunk-window updates do not invalidate memory or commit vectors which use only the provider identity.",
+      "importance": 70
+    },
+    {
+      "id": 6314,
+      "category": "ARCHITECTURE",
+      "content": "In packages/pi-plugin/src/subagent-runner.ts, Pi subagents run as spawned subprocesses terminated via SIGTERM, while OpenCode subagents run as host-side fibers terminated via step caps or session aborts.",
+      "importance": 65
+    },
+    {
+      "id": 6320,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/read-session-true-raw-tokens.ts, fenceBoundaryForToolArcs protects open tool arcs from compaction only when they occur at or after recentOpenArcCutoff, preventing abandoned tool calls from freezing compaction.",
+      "importance": 74
+    },
+    {
+      "id": 6384,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts, pending operations and heuristic cleanup bypass the compartment-running veto during forced materializations or hard M0 fold passes to execute drops directly during the unavoidable prompt-cache bust.",
+      "importance": 74
+    },
+    {
+      "id": 6385,
+      "category": "ARCHITECTURE",
+      "content": "In packages/dashboard/src-tauri/src/db.rs, dashboard cache health classification predicts expected cache_read as the previous step's cache_read plus expected growth (prev.cache_write, or prev.input + prev.output if zero) to calculate retention and assign severities.",
+      "importance": 58
+    },
+    {
+      "id": 6401,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/transform-decision-log.ts and packages/dashboard/src-tauri/src/db.rs, dashboard cache cause attribution associates cache events with the transform_decisions table via message_id (for OpenCode) or the deferred SessionEntry wrapper ID (for Pi) to avoid log-parsing latency.",
+      "importance": 65
+    },
+    {
+      "id": 6402,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/features/magic-context/tagger.ts, cache invalidation uses PRAGMA main.data_version instead of SQLite change counters to prevent same-connection writes from invalidating the in-memory tagger cache.",
+      "importance": 76
+    },
+    {
+      "id": 6434,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/transform.ts, tagger load-scoping derives the floor live from the first wire message ids on every pass instead of using a persisted watermark or flag, ensuring revert-safety without introducing stale state.",
+      "importance": 78
+    },
+    {
+      "id": 6442,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/apply-operations.ts, dropped tool calls within the RECENT_TOOL_SKELETON_WINDOW (20) truncate to a placeholder skeleton to prevent provider-side tool pairing mismatches, while older tool calls are fully removed from the transcript.",
+      "importance": 78
+    },
+    {
+      "id": 6443,
+      "category": "ARCHITECTURE",
+      "content": "In-session memory mutations queue to the memory_mutation_log and render in the M1 delta to provide cache-stable incremental updates without rebuilding the M0 block.",
+      "importance": 82
+    },
+    {
+      "id": 6550,
+      "category": "ARCHITECTURE",
+      "content": "Pi reasoning replay clears thinking fields and signatures on unredacted thinking content while skipping redacted blocks to maintain clean thinking logs.",
+      "importance": 65
+    },
+    {
+      "id": 6608,
+      "category": "ARCHITECTURE",
+      "content": "packages/plugin/src/features/magic-context/memory/embedding-openai.ts: embeddingModelsMatch matches model names only on exact matches or token boundaries (- or /) to allow version expansion and vendor prefix trimming while preventing wrong-dimension corruption.",
+      "importance": 68
+    },
+    {
+      "id": 6609,
+      "category": "ARCHITECTURE",
+      "content": "packages/plugin/src/tools/ctx-memory/tools.ts restricts the dreamer's cross-project memory merges to shared categories inside a workspace, while leaving cross-project merges outside workspaces unrestricted.",
+      "importance": 65
+    },
+    {
+      "id": 6644,
+      "category": "ARCHITECTURE",
+      "content": "packages/plugin/src/plugin/dream-timer.ts executes drainCommitBacklogForProject after releasing the git-sweep lease to prevent self-deadlock.",
+      "importance": 76
+    },
+    {
+      "id": 6660,
+      "category": "ARCHITECTURE",
+      "content": "Magic Context plans to migrate per-harness plugin transform and cache logic into a harness-agnostic Rust MC module (SUBC) communicating via IPC.",
+      "importance": 55
+    },
+    {
+      "id": 6728,
+      "category": "ARCHITECTURE",
+      "content": "packages/plugin/src/hooks/magic-context/transform.ts gates recordSessionProjectIdentity calls using an in-process recordedSessionProjectIdentity map to prevent per-pass SQLite writes.",
+      "importance": 70
+    },
+    {
+      "id": 6842,
+      "category": "ARCHITECTURE",
+      "content": "The plugin config hook must fail open (wrapped in try/catch) to prevent agent registration failures from disabling the core transform and compaction pipeline.",
+      "importance": 74
+    },
+    {
+      "id": 6851,
+      "category": "ARCHITECTURE",
+      "content": "OpenCode's legacy loader iterates Object.values(mod) and invokes every exported function as a plugin factory if the default export is a function; exporting the V1 object shape { id, server } bypasses this scan entirely.",
+      "importance": 80
+    },
+    {
+      "id": 6852,
+      "category": "ARCHITECTURE",
+      "content": "sendIgnoredMessage pins the last assistant turn's agent, model, and variant to prevent OpenCode's createUserMessage from recording default prompt-context and switching the active model on the next turn.",
+      "importance": 76
+    },
+    {
+      "id": 6898,
+      "category": "ARCHITECTURE",
+      "content": "Local embedding initialization in packages/plugin/src/features/magic-context/memory/embedding-local.ts imports @huggingface/transformers via a non-literal string to bypass Bun static analysis, and injects onnxruntime-web into globalThis[Symbol.for(\"onnxruntime\")] before the import to prevent native runtime load failures in Electron.",
+      "importance": 78
+    },
+    {
+      "id": 6899,
+      "category": "ARCHITECTURE",
+      "content": "At or above 95% context usage, transform execution blocks to wait for the force-started historian agent run to prevent prompt truncation or OOM crashes, while below 95% the historian runs in the background to avoid freezing the UI.",
+      "importance": 80
+    },
+    {
+      "id": 6953,
+      "category": "ARCHITECTURE",
+      "content": "The Dreamer V2 `classify-memories` task daily evaluates importance, scope, and shareability for each memory. The classification is written directly to the database to remain cache-neutral until the next non-classify materialization. Shareability check is fail-closed, scanning for sensitive text (secrets or personal paths) to enforce privacy regardless of the LLM classification, while memory importance score sorts the budget trim in the prompt.",
+      "importance": 90
+    },
+    {
+      "id": 6955,
+      "category": "ARCHITECTURE",
+      "content": "The memory merge handler structurally rejects merges where the source memories span multiple categories to prevent accidental cross-category data loss.",
+      "importance": 75
+    },
+    {
+      "id": 7034,
+      "category": "ARCHITECTURE",
+      "content": "Writing memory importance scores alters the prompt prefix XML bytes emitted by renderMemoryLineV2, making memory re-classification cache-destructive, whereas unrendered columns (scope, shareable) remain cache-neutral. The importance score sorts memories descending in memorySelectionOrder for budget trimming.",
+      "importance": 86
+    },
+    {
+      "id": 7035,
+      "category": "ARCHITECTURE",
+      "content": "In packages/plugin/src/hooks/magic-context/protected-tail-boundary.ts, resolveProtectedTailBoundary sets the boundary offset starting at lastCompartmentEndOrdinal + 1 to prevent tail starvation when no new compartments are published, and caps protectedTailStart to not exceed the newest meaningful user message on routine passes (usage < 80% and without emergencyTailScale) to prevent active prompt compaction mid-turn.",
+      "importance": 74
+    },
+    {
+      "id": 7153,
+      "category": "ARCHITECTURE",
+      "content": "Per-project dreamer settings are saved to the project's local `magic-context.jsonc` file and deep-merged over global config, rather than using a database override table.",
+      "importance": 72
+    },
+    {
+      "id": 7181,
+      "category": "ARCHITECTURE",
+      "content": "The recomp-historian prompt omits ALL extraction dimensions (facts, events, observations, primer-candidates) to structurally prevent re-emission during recompilation, replacing per-dimension gating flags.",
+      "importance": 72
+    },
+    {
+      "id": 7252,
+      "category": "ARCHITECTURE",
+      "content": "Synthetic todowrite injection runs after tagging (to protect synthetic parts from auto_drop_tool_age, ctx_reduce, and heuristic cleanup) and uses call IDs prefixed with a deterministic hash (mc_synthetic_todo_ followed by the first 16 hex characters of the state JSON's SHA-256 hash) to ensure byte-identical replays and prompt cache stability.",
+      "importance": 75
+    },
+    {
+      "id": 7254,
+      "category": "ARCHITECTURE",
+      "content": "Plugin auto-update uses npm install because the OpenCode plugin cache is npm-managed and package-lock based, and the auto-update checker retrieves the storage directory via getMagicContextStorageDir() since PluginInput does not provide it.",
+      "importance": 65
+    },
+    {
+      "id": 7260,
+      "category": "ARCHITECTURE",
+      "content": "Tool tag identity uses a composite key of tool_owner_message_id and tool callId to prevent collisions across turns, and the assignTag function recovers SQLITE_CONSTRAINT_UNIQUE by reading the existing tag from SQLite to prevent duplicate inserts from advancing the counter.",
+      "importance": 72
+    },
+    {
+      "id": 7262,
+      "category": "ARCHITECTURE",
+      "content": "Project identity and configurations are resolved dynamically on each call/pass per-directory (using session.directory or toolContext.directory in OpenCode, and ctx.cwd/resolveForProject in Pi) to support runtime project switching and prevent configuration bleed.",
+      "importance": 76
+    },
+    {
+      "id": 7325,
+      "category": "ARCHITECTURE",
+      "content": "Smart-note capability manifests are treated as advisory audit artifacts rather than security gates, with runtime SSRF and file denylists serving as the actual security boundary.",
+      "importance": 75
+    },
+    {
+      "id": 7327,
+      "category": "ARCHITECTURE",
+      "content": "The dashboard config editor uses `comment-json` to preserve comments and formatting when saving JSONC files.",
+      "importance": 55
+    },
+    {
+      "id": 7328,
+      "category": "ARCHITECTURE",
+      "content": "Dashboard SSRF guard resolves hosts, validates IPs, and pins reqwest connections to validated IPs via `.resolve_to_addrs` to prevent DNS-rebind.",
+      "importance": 80
+    },
+    {
+      "id": 7329,
+      "category": "ARCHITECTURE",
+      "content": "Dashboard file writes enforce security by rejecting symlinks via `symlink_metadata`, opening with `O_NOFOLLOW`, validating canonical-target containment, and writing atomically via temp-file rename.",
+      "importance": 82
+    },
+    {
+      "id": 7334,
+      "category": "ARCHITECTURE",
+      "content": "Fenced-block `.gitignore` convention (`# >>> cortexkit:<module>`) is used in `.cortexkit/.gitignore` to prevent multiple CortexKit modules from clobbering each other's ignore entries.",
+      "importance": 65
+    },
+    {
+      "id": 7357,
+      "category": "ARCHITECTURE",
+      "content": "On a refused or missing config migration, the loader reads the running harness's legacy config instead of falling back to schema defaults.",
+      "importance": 55
+    },
+    {
+      "id": 7359,
+      "category": "ARCHITECTURE",
+      "content": "Embedding provider identity includes the truncate parameter to ensure truncation changes trigger re-embedding.",
+      "importance": 52
+    },
+    {
+      "id": 7363,
+      "category": "ARCHITECTURE",
+      "content": "Config loads are marked as untrusted if literal {env:} or {file:} tokens are detected in the project configuration, preventing GC from reaping real vectors.",
+      "importance": 66
+    },
+    {
+      "id": 7364,
+      "category": "ARCHITECTURE",
+      "content": "Embedding provider identity conditionally includes the truncate parameter only when set, ensuring truncation changes trigger re-embedding without forcing a global re-embed for users without the setting.",
+      "importance": 58
+    },
+    {
+      "id": 7365,
+      "category": "ARCHITECTURE",
+      "content": "The shared ctx_memory tool does not thread lease state; lease-loss safety is instead enforced via the dreamer's synchronous first-beat and abort-on-loss mechanisms.",
+      "importance": 63
+    },
+    {
+      "id": 7370,
+      "category": "ARCHITECTURE",
+      "content": "To prevent sentinel errors from leaking into the TUI/logs on OpenCode 1.17.x, throw a normal Error that duck-types HttpServerResponse using plain-string TypeIds (~effect/http/HttpServerResponse and ~effect/ErrorReporter/ignore) to bypass the compiled binary's $bunfs resolution wall.",
+      "importance": 73
+    },
+    {
+      "id": 7371,
+      "category": "ARCHITECTURE",
+      "content": "The lease system declares a lease lost if the gap since the last beat exceeds the full TTL, preventing a stalled process from reclaiming a free lease on stale state.",
+      "importance": 62
+    },
+    {
+      "id": 7401,
+      "category": "ARCHITECTURE",
+      "content": "Older plugin instances fail closed when the shared database schema version exceeds their maximum supported schema version to prevent database corruption.",
+      "importance": 67
+    },
+    {
+      "id": 7404,
+      "category": "ARCHITECTURE",
+      "content": "OpenCode's transform pipeline proactively arms overflow recovery flag-only and resets the no-head escape count if the last measured input tokens exceed the current model's catalog limit (not trusted limit), ensuring compaction runs before sending the oversized request.",
+      "importance": 60
+    },
+    {
+      "id": 7405,
+      "category": "ARCHITECTURE",
+      "content": "Pi's forward-pressure floor (`applyForwardPressureFloor`) handles large-to-small model switches by comparing estimated tokens against the new model's context window, rendering a proactive arm unnecessary on the Pi side.",
+      "importance": 56
+    },
+    {
+      "id": 7417,
+      "category": "ARCHITECTURE",
+      "content": "OpenCode's transform pipeline triggers model-change resets and proactive overflow recovery when the persisted `lastObservedModelKey` differs from the outgoing model.",
+      "importance": 58
+    },
+    {
+      "id": 7555,
+      "category": "ARCHITECTURE",
+      "content": "When designing recurrence detection, candidate extraction, or frequency filters, avoid grouping or counting occurrences by session boundaries since magic-context runs in a single persistent session per project. Instead, use temporal intervals or message distance between events to identify distinct occurrences.",
+      "importance": 73
+    },
+    {
+      "id": 7577,
+      "category": "ARCHITECTURE",
+      "content": "The dashboard embedding Test Connection probe enforces a backend trust boundary that rejects token expansion for project-scoped configurations to prevent secret exfiltration.",
+      "importance": 70
+    },
+    {
+      "id": 7578,
+      "category": "ARCHITECTURE",
+      "content": "Pi always registers the ctx_memory tool in the main entry and relies on the per-call runtime guard to handle memory-off states, resolving the boot-vs-per-project configuration mismatch.",
+      "importance": 58
+    },
+    {
+      "id": 7614,
+      "category": "ARCHITECTURE",
+      "content": "The dashboard release (.github/workflows/dashboard-release.yml) uses a dedicated create-release job that creates the GitHub draft ONCE and passes its release_id to the build matrix (legs upload via releaseId, not tagName), so all 6 platforms land on one release with one merged latest.json. A full release = 25 assets (6 platforms x installers/sigs + latest.json); release-dashboard.sh gates on >=24 assets. The earlier per-leg releaseDraft+tagName design caused an arch-split race (x64 and arm64 on two separate drafts, x64-only updater manifest) on v0.8.3.",
+      "importance": 53
+    },
+    {
+      "id": 7634,
+      "category": "ARCHITECTURE",
+      "content": "Dashboard `--serve` mode uses fragment token authentication (`/#token=`) instead of query parameters to prevent token leakage via Referer headers, browser history, or server logs.",
+      "importance": 65
+    },
+    {
+      "id": 7635,
+      "category": "ARCHITECTURE",
+      "content": "Dashboard `--serve` mode drops the Host allowlist for unspecified wildcard binds (`0.0.0.0 --allow-remote`) to accommodate client-specific Host headers, relying instead on token authentication and same-origin Origin checks.",
+      "importance": 62
+    },
+    {
+      "id": 7638,
+      "category": "ARCHITECTURE",
+      "content": "OpenCode detection (`detectOpenCode`) uses dependency injection for filesystem, platform, and environment APIs to ensure hermetic unit testing without host leaks.",
+      "importance": 50
+    },
+    {
+      "id": 7688,
+      "category": "ARCHITECTURE",
+      "content": "Provider quirk = provider_requirement − serializer_healing (a per-path property), verified 2026-06-28 against current source. Three healing profiles: (1) Pi serializers (0.80.2, ~/Work/OSS/pi-mono/packages/ai/src/providers) heal empties UNIVERSALLY — drop empty text/thinking on all providers, auto-fill reasoning_content=\"\" via requiresReasoningContentOnAssistantMessages, and NEVER merge consecutive assistants; (2) OpenCode's AI-SDK path (ProviderTransform.message, 1.17.10, the path MC's experimental.chat.messages.transform uses) heals empties for anthropic+bedrock ONLY (exact model.api.npm equality, excludes google-vertex/anthropic); (3) OpenCode's separate V2 core runner (packages/core/src/session/runner/to-llm-message.ts) heals empties universally. @ai-sdk/anthropic 4.0.1 (latest, ~/Work/OSS/ai) groupIntoBlocks STILL merges consecutive assistants and emits thinking in source order (no reposition), so stripReasoningFromMergedAssistants stays required on OpenCode (which ships 3.0.82). Migration consequence: on the owned/llm-runner path the MC quirk-pass residual is ZERO if llm-runner heals like Pi (drop empties universally, auto-fill reasoning_content, do not merge assistants, preserve redacted+signatures) — Pi is the reference impl. Verified profiles table lives in docs/cache-policy/ck-message-field-inventory.md.",
+      "importance": 73
+    },
+    {
+      "id": 7697,
+      "category": "ARCHITECTURE",
+      "content": "MITM compaction design for Claude Code + Codex (settled + source-confirmed 2026-06-28). OpenCode/Pi rebuild the wire from their store EACH TURN, so store marker-injection drives LIVE compaction (plugin-path mechanism). Claude Code AND Codex do NOT: during a live session the wire is built from the IN-MEMORY conversation array; the on-disk store (~/.claude/projects/*.jsonl, ~/.codex/sessions/*.jsonl) is APPEND-ONLY write-through read ONLY at resume/startup. Verified three ways: (1) live PTY behavioral probe — set number 4471, edited disk to 9925 mid-session, model recalled 4471 (in-memory) on both; (2) binary recon — no session-file watch, watch/reload primitives target config/plugins/dev-server only; (3) Claude Code source ~/Work/OSS/claude-code (v1.0.0 ref): compaction = setMessages(old => getMessagesAfterCompactBoundary(old)) on the IN-MEMORY array; findLastCompactBoundaryIndex scans in-memory messages for a compact_boundary STREAMING-EVENT message (NOT the JSONL isCompactSummary entry); the only disk-session-read is loadConversationForResume, called ONLY at startup/--print/--resume. No file-watch, no signal/marker-triggered reload; the only force-reread lever is /resume (a session switch, not externally triggerable). CONSEQUENCE — the MITM live-compaction design is DUAL: (a) LIVE = in-memory VIRTUAL compaction marker held by the MITM daemon + request-rewrite of every intercepted outbound request to the compacted form (works because harness sends full history on the wire and we own the wire; this is what headroom ~/Work/OSS/headroom does in production); (b) RESTART PERSISTENCE = ALSO inject a real store marker (isCompactSummary / compacted+replacement_history) so a restart/resume loads from the compacted state instead of reverting to full history; (c) DISABLE native auto-compaction (DISABLE_AUTO_COMPACT / auto_compact_token_limit) so the harness does not compact on its own and fight the virtual boundary. So integration positions take different live mechanisms: plugin (OpenCode/Pi) = store marker-injection (re-read each turn); MITM (Claude Code/Codex) = in-memory virtual marker + request-rewrite, store marker only for restart persistence.",
+      "importance": 78
+    },
+    {
+      "id": 7716,
+      "category": "ARCHITECTURE",
+      "content": "ProviderBlock content kind in CK Message format represents opaque provider-native wire blocks (e.g., server-side tool calls) to ensure losslessness.",
+      "importance": 58
+    },
+    {
+      "id": 7717,
+      "category": "ARCHITECTURE",
+      "content": "provider_extras ordered bag at message and part level preserves unenumerated provider-specific metadata losslessly.",
+      "importance": 55
+    },
+    {
+      "id": 7720,
+      "category": "ARCHITECTURE",
+      "content": "The frozen clear-watermark is lineage-cumulative (survives episode boundaries) and must be WAL-durable and cross-episode-reproduced in the owned-leg implementation.",
+      "importance": 68
+    },
+    {
+      "id": 7721,
+      "category": "ARCHITECTURE",
+      "content": "Cache-stability is separable from breakpoint placement under the freeze discipline (clear-once-on-bust and replay-identical-on-defer), with breakpoint placement affecting only the token-budget tradeoff.",
+      "importance": 64
+    },
+    {
+      "id": 7724,
+      "category": "ARCHITECTURE",
+      "content": "CK Message specification (CK#1) uses a small fixed typed core for transform branching and a universal Opaque carrier for all other provider-native and harness-specific blocks.",
+      "importance": 66
+    },
+    {
+      "id": 7725,
+      "category": "ARCHITECTURE",
+      "content": "Opaque blocks carry verbatim source bytes for wire-family sources to ensure byte-identical cache replay without serialization-determinism overhead.",
+      "importance": 55
+    },
+    {
+      "id": 7726,
+      "category": "ARCHITECTURE",
+      "content": "Harness-sourced Opaque blocks achieve byte-stability via the harness-serializer-determinism contract over decoded CK messages.",
+      "importance": 53
+    },
+    {
+      "id": 7755,
+      "category": "ARCHITECTURE",
+      "content": "The cc/codex MITM interception module (CK spec #3) is a SEPARATE project driven by SUBC, not part of the MC Rust module. The MC module is CK-in/CK-out and origin-agnostic, so the MITM project consumes the MC module's transform() output without the MC module depending on it. MC module build sequencing: own-harness-leg first (llm-runner #2 provider-wire codec hands CK directly, zero MITM dependency), then the MITM leg, then the opencode/pi plugin harness-model codec LAST. HARD SEQUENCING CONSTRAINT (Ufuk, subc lane): do NOT touch the oc/pi plugin side (packages/plugin, packages/pi-plugin) AT ALL until there is a working end-to-end solution for BOTH the MITM leg (claude-code/codex) AND our own harness (llm-runner). The plugin integration is validated via SHADOW MODE: the OC plugin will run BOTH the inner OC transform AND the MC module transform in parallel and byte-compare them, proving the module perfectly matches OC's transform before any cutover. Dev-time reads of the plugin's installed deps to generate committed Rust fixtures (e.g. mc-tokenizer's vocab/golden generators reading packages/plugin's ai-tokenizer, like decay-curve's gen-golden.ts reading decay-curve.ts) are NOT \"touching the plugin\" — they modify no plugin code and the Rust tests are plugin-independent once the fixture is committed. Pure crates/mc-* module work (token estimator, tail-reduction selector, etc.) is unaffected by this constraint and proceeds autonomously on subc-migration.",
+      "importance": 82
+    },
+    {
+      "id": 7763,
+      "category": "ARCHITECTURE",
+      "content": "TUI and plugin run in separate isolated JS runners within the same PID, communicating via a localhost WebSocket/HTTP RPC bridge.",
+      "importance": 60
+    },
+    {
+      "id": 7790,
+      "category": "ARCHITECTURE",
+      "content": "The MC module opens exactly one SQLite store handle to avoid lease collisions, implementing all domain traits over a single connection.",
+      "importance": 68
+    },
+    {
+      "id": 7791,
+      "category": "ARCHITECTURE",
+      "content": "Spec #5 binds the cache-core using the boundary-presence contract (token-equality anchor, no content fingerprint).",
+      "importance": 55
+    },
+    {
+      "id": 7794,
+      "category": "ARCHITECTURE",
+      "content": "The boundary-absent watermark in the Rust module is a monotonic absolute ordinal rather than a positional index or message ID.",
+      "importance": 60
+    },
+    {
+      "id": 7795,
+      "category": "ARCHITECTURE",
+      "content": "The Slice 1 wire gate drives the production spine through the real classifier rather than using a test-only fixture frame.",
+      "importance": 50
+    },
+    {
+      "id": 7798,
+      "category": "ARCHITECTURE",
+      "content": "The Magic Context Rust module is structured in-repo under a root Cargo workspace in `crates/` (excluding `packages/dashboard/src-tauri` from the workspace members) to keep session-cwd tools functional.",
+      "importance": 52
+    },
+    {
+      "id": 7799,
+      "category": "ARCHITECTURE",
+      "content": "The Rust module workspace uses local path-deps to sibling checkouts (`../commons` and `../subconscious`) for co-development prior to crates.io publication.",
+      "importance": 48
+    },
+    {
+      "id": 7824,
+      "category": "ARCHITECTURE",
+      "content": "The transform wire request does not include `boundary_present`; the module computes it internally from authoritative durable state to ensure cache correctness.",
+      "importance": 58
+    },
+    {
+      "id": 7826,
+      "category": "ARCHITECTURE",
+      "content": "Reductions achieve cache stability through per-item byte-stability, where non-contiguous frozen reductions are safe because introducing or changing one always triggers a cache bust by construction.",
+      "importance": 65
+    },
+    {
+      "id": 7830,
+      "category": "ARCHITECTURE",
+      "content": "Magic Context reductions are monotonic-add and immutable-once-frozen; re-deciding a frozen target is prohibited to prevent prompt-cache invalidation.",
+      "importance": 72
+    },
+    {
+      "id": 7836,
+      "category": "ARCHITECTURE",
+      "content": "A signal rides the m1 delta if and only if it is a forward-only delta that does not mutate frozen m0 bytes.",
+      "importance": 62
+    },
+    {
+      "id": 7837,
+      "category": "ARCHITECTURE",
+      "content": "For memory-supersede routing, a memory is considered below the watermark if it is resident in the last rendered m0 memory-id manifest (renderedMemoryIds), not merely id <= maxMemoryId, to account for budget-trimmed memories.",
+      "importance": 63
+    },
+    {
+      "id": 7838,
+      "category": "ARCHITECTURE",
+      "content": "Active user memories are ordered by promoted_at ASC, id ASC to ensure byte-stability.",
+      "importance": 61
+    },
+    {
+      "id": 7839,
+      "category": "ARCHITECTURE",
+      "content": "Memory mutations are coalesced using latest-wins with terminal precedence (where archive outranks a later update) to ensure deterministic resolution.",
+      "importance": 63
+    },
+    {
+      "id": 7841,
+      "category": "ARCHITECTURE",
+      "content": "Workspace-union memory reads enforce a security boundary where foreign memories are visible only in shared categories.",
+      "importance": 66
+    },
+    {
+      "id": 7842,
+      "category": "ARCHITECTURE",
+      "content": "To prevent prompt-cache invalidation from mid-session store mutations, m1_content must be composed only on the bust arms (apply_once) and never on defer passes.",
+      "importance": 68
+    },
+    {
+      "id": 7843,
+      "category": "ARCHITECTURE",
+      "content": "The token budget for memory rendering must be frozen at bind time and never re-read per pass to ensure byte-stability.",
+      "importance": 64
+    },
+    {
+      "id": 7846,
+      "category": "ARCHITECTURE",
+      "content": "Content changes (like docs_hash) are tolerated as stale and deferred to the next natural HARD fold, whereas composition/structure changes (like workspace_fingerprint, upgrade_state, and project_memory_epoch) trigger an immediate HARD materialization.",
+      "importance": 64
+    },
+    {
+      "id": 7847,
+      "category": "ARCHITECTURE",
+      "content": "The ModuleHandler uses channel-keyed bindings (mapping route channels to session identities) to enforce session isolation and reject unbound or mismatched requests.",
+      "importance": 66
+    },
+    {
+      "id": 7848,
+      "category": "ARCHITECTURE",
+      "content": "The cheap m1 revision signal is a digest over the watermark triple (max_memory_id, max_memory_mutation_id, max_compartment_seq) to detect byte-affecting m1 changes without loading full rows.",
+      "importance": 55
+    },
+    {
+      "id": 7849,
+      "category": "ARCHITECTURE",
+      "content": "Workspace fingerprints are computed over members sorted by project_path ASC to ensure stable, cache-friendly workspace identity.",
+      "importance": 52
+    },
+    {
+      "id": 7850,
+      "category": "ARCHITECTURE",
+      "content": "The frozen expiry cutoff is pinned on ModuleMeta to ensure resume-determinism across process restarts.",
+      "importance": 56
+    },
+    {
+      "id": 7852,
+      "category": "ARCHITECTURE",
+      "content": "Every change to a live m1-rendered component must be caught by either the m1 digest or a HARD trigger to prevent changes from falling through both without bloating the per-pass gate.",
+      "importance": 68
+    },
+    {
+      "id": 7858,
+      "category": "ARCHITECTURE",
+      "content": "Pi subagent recursion protection is being migrated from process-level --no-extensions to entry-level MAGIC_CONTEXT_PI_SUBAGENT=1 env-guard, allowing extension-provided models and AFT tools to be available in children while preventing MC plugin re-entry — the Pi equivalent of OpenCode's magic-context- title-prefix exemption.",
+      "importance": 58
+    },
+    {
+      "id": 7872,
+      "category": "ARCHITECTURE",
+      "content": "Pass-through messages achieve cache-stability via Value-level cross-pass determinism (sorted BTreeMap keys) rather than raw byte-identity.",
+      "importance": 67
+    },
+    {
+      "id": 7873,
+      "category": "ARCHITECTURE",
+      "content": "Synthetic todo pairs must anchor their position at compose-time and replay verbatim in place on defers (relocating only on a content-change Replace) to prevent prompt-cache invalidation.",
+      "importance": 73
+    },
+    {
+      "id": 7874,
+      "category": "ARCHITECTURE",
+      "content": "The CK wire type hierarchy is defined in `mc-store` (re-exported by `mc-module`) to allow `ModuleMeta` to persist `FrozenSyntheticTodoPair` with typed `CkWireMessage` values.",
+      "importance": 46
+    },
+    {
+      "id": 7875,
+      "category": "ARCHITECTURE",
+      "content": "Historian producer client treats control units as terminal signals and StreamEnd as an unexpected error to ensure complete text assembly.",
+      "importance": 52
+    },
+    {
+      "id": 7876,
+      "category": "ARCHITECTURE",
+      "content": "MC Rust module integrates with llm-runner via subc-control and subc-transport path-deps to maintain an origin-agnostic boundary without a direct llm-runner Rust dependency.",
+      "importance": 62
+    },
+    {
+      "id": 7877,
+      "category": "ARCHITECTURE",
+      "content": "Historian reattach always re-drains from start (idempotent via CAS-gated publish and pure validation) to avoid data loss from exclusive-after-cursor replay.",
+      "importance": 64
+    },
+    {
+      "id": 7878,
+      "category": "ARCHITECTURE",
+      "content": "Historian producer abandons and refires paused runs (such as auth_required) to prevent blocking the active firing slot.",
+      "importance": 56
+    },
+    {
+      "id": 7893,
+      "category": "ARCHITECTURE",
+      "content": "The first compartment fold in a fresh session is triggered as a HARD fold when boundary_id is empty and compartments exist, minting the initial boundary so subsequent publishes can ride SOFT.",
+      "importance": 58
+    },
+    {
+      "id": 7908,
+      "category": "ARCHITECTURE",
+      "content": "The mint-absent guard in the transform pass asserts that any newly minted boundary (including reconcile-rematerialize) is present in the live array to prevent infinite HARD loops.",
+      "importance": 70
+    },
+    {
+      "id": 7925,
+      "category": "ARCHITECTURE",
+      "content": "LLMRUNNER system prompt conveyance contract: a single send carries the system prompt, and reattach never re-sends it.",
+      "importance": 60
+    },
+    {
+      "id": 7933,
+      "category": "ARCHITECTURE",
+      "content": "Project-tier configuration trust boundaries: `historian.model` and `fallback_models` are user-tier-only; `execute_threshold_percentage` can only raise the threshold; `memory.enabled` is allowed as a project-tier toggle.",
+      "importance": 68
+    },
+    {
+      "id": 7934,
+      "category": "ARCHITECTURE",
+      "content": "The Rust module uses `Arc<McStore>` and plain `tokio::spawn` because `subc-client-rs` runs requests via `tokio::spawn` without a `LocalSet`.",
+      "importance": 54
+    },
+    {
+      "id": 7935,
+      "category": "ARCHITECTURE",
+      "content": "An in-memory per-session single-flight latch prevents rapid passes from double-driving the same historian run during reattach.",
+      "importance": 47
+    },
+    {
+      "id": 7941,
+      "category": "ARCHITECTURE",
+      "content": "An in-memory per-session single-flight latch and a live session set prevent rapid passes and reattaches from double-driving the same historian run.",
+      "importance": 48
+    },
+    {
+      "id": 7942,
+      "category": "ARCHITECTURE",
+      "content": "Historian handler uses connect-before-fire() ordering to prevent connection failures from wedging the session.",
+      "importance": 45
+    },
+    {
+      "id": 7947,
+      "category": "ARCHITECTURE",
+      "content": "The MC Rust module's transform handler must pass through self-owned child sessions untouched (the mc-historian: session-id namespace returns identity: no m0/m1 injection, no store row, no historian evaluation). The served llm-runner routes EVERY session through the transform module, so without the exemption the historian producer's own request gets m0/m1 framing prepended ahead of its system prompt, collapsing the calibrated [system, user] shape and causing seed/template bleed; a transformed producer would also recursively trigger a historian on the historian. This is the Rust equivalent of the TS plugin's magic-context- title-prefix exemption for internal child sessions.",
+      "importance": 76
+    },
+    {
+      "id": 7956,
+      "category": "ARCHITECTURE",
+      "content": "The MC Rust module's autonomous historian is live-proven end-to-end on the real subc + broca spine: organic trigger fire → producer run (clean [system,user] shape, temp 0.1, reasoning-drained) → validate (contiguous from ordinal 1) → CAS publish → HARD fold minting the boundary → m0 composed on the wire with the compartment summary + cache breakpoint → raw covered messages dropped from the live array (verified by buried-anchor absence). The producer chain's key wire facts: broca SendParams needs nested model {provider,model} + generation {max_output_tokens, temperature}; producer output must extract only text blocks from the assembled AssistantMessage (reasoning excluded); ordinals are 1-based.",
+      "importance": 62
+    },
+    {
+      "id": 7968,
+      "category": "ARCHITECTURE",
+      "content": "CK message IDs (mids) must be revert-stable (same mid implies same content forever) to prevent upstream defeat of the boundary_present check.",
+      "importance": 74
+    },
+    {
+      "id": 7975,
+      "category": "ARCHITECTURE",
+      "content": "`ctx_reduce` commands are queued in a durable queue and drained atomically and idempotently during the pass commit transaction, ensuring parity between owned and unowned harnesses.",
+      "importance": 70
+    },
+    {
+      "id": 7976,
+      "category": "ARCHITECTURE",
+      "content": "TTL-hard materialization fires only on in-process-lifetime-observed idleness, not on the durable anchor (`last_committed_pass_at_ms`) alone.",
+      "importance": 58
+    },
+    {
+      "id": 7978,
+      "category": "ARCHITECTURE",
+      "content": "The MC transform is a pure function of durable state and the raw input array; it never consumes its own output, ensuring that client-side output discard (raw-superset) is safe and indistinguishable from steady state.",
+      "importance": 72
+    },
+    {
+      "id": 7997,
+      "category": "ARCHITECTURE",
+      "content": "`serializer_profile` is folded into the `render_config` identity so that a serializer profile flip triggers a HARD fold by construction, eliminating deferred-marker hazards.",
+      "importance": 64
+    },
+    {
+      "id": 8032,
+      "category": "ARCHITECTURE",
+      "content": "Wiring contract (3.2.1) pins first-seen message IDs unconditionally: belt-and-suspenders for Pi (guarding future responseId-backfill) and load-bearing for CC-MITM (which lacks native IDs).",
+      "importance": 57
+    },
+    {
+      "id": 8190,
+      "category": "ARCHITECTURE",
+      "content": "Project-identity resolution walks ancestors for `.git` before spawning git to avoid unnecessary process spawns in non-git directories.",
+      "importance": 46
+    },
+    {
+      "id": 8191,
+      "category": "ARCHITECTURE",
+      "content": "`/ctx-wrapup` uses a durable `wrapup_in_progress` marker to prevent concurrent recompilation or wrapup runs from interleaving.",
+      "importance": 65
+    },
+    {
+      "id": 8233,
+      "category": "ARCHITECTURE",
+      "content": "Project-identity resolution caches the last-known-good `git:` identity for a canonical directory to prevent mid-session flips to `dir:` during transient git cooldowns.",
+      "importance": 62
+    },
+    {
+      "id": 8234,
+      "category": "ARCHITECTURE",
+      "content": "Project-identity resolution walks ancestors using realpath to support symlinked checkout paths.",
+      "importance": 50
+    },
+    {
+      "id": 8235,
+      "category": "ARCHITECTURE",
+      "content": "Project smart notes from other sessions anchor `@msg N` only when the note's source session matches the current session.",
+      "importance": 55
+    },
+    {
+      "id": 8251,
+      "category": "ARCHITECTURE",
+      "content": "Block-level `provider_extras` are identity-bearing in the drift guard's block fingerprinting, while message-level fields (such as `origin`) are excluded.",
+      "importance": 52
+    },
+    {
+      "id": 8306,
+      "category": "ARCHITECTURE",
+      "content": "MCP facade session resolution for Claude Code uses a wrapper-minted instance token (`CK_INSTANCE_TOKEN` env / `x-ck-instance` header) queried via AIPROXY's `session.resolve` to support multiple concurrent sessions in the same project root.",
+      "importance": 61
+    },
+    {
+      "id": 8308,
+      "category": "ARCHITECTURE",
+      "content": "MCP facade is default-deny; tools must be explicitly enabled per-tool in `mcp.jsonc`.",
+      "importance": 64
+    },
+    {
+      "id": 8310,
+      "category": "ARCHITECTURE",
+      "content": "Non-additive memory mutations must append to the mutation log in the same fenced transaction to prevent cached m0/m1 from going silently stale.",
+      "importance": 65
+    },
+    {
+      "id": 8317,
+      "category": "ARCHITECTURE",
+      "content": "Layer-2 rewrite-safety eliminates the destructive nothing-survives arm: boundary-absent share-nothing arrays serve raw pass-through, arm `pending_rewrite` in ModuleMeta, and emit loud diagnostics, while truncation is restricted to prefix-preserving reverts.",
+      "importance": 68
+    },
+    {
+      "id": 8318,
+      "category": "ARCHITECTURE",
+      "content": "AIPROXY epoch-bumps on lineage switches (like `/clear` or native-compact), which MC receives as a fresh key with no prior state.",
+      "importance": 58
+    },
+    {
+      "id": 8329,
+      "category": "ARCHITECTURE",
+      "content": "Shared-fingerprint invariant: MC's boundary-absence basis and AIPROXY's switch-detection basis must agree on content matching by excluding all per-turn-churning fields (such as cache_control) from both fingerprint definitions.",
+      "importance": 66
+    },
+    {
+      "id": 8399,
+      "category": "ARCHITECTURE",
+      "content": "MCP facade scope-keying: memories are keyed on project_root, while compartments are keyed on the conversation_key (the resolved session_id).",
+      "importance": 60
+    },
+    {
+      "id": 8409,
+      "category": "ARCHITECTURE",
+      "content": "Channel 2 uses a per-claim token CAS to prevent slow senders from stale-confirming after boot healing rewinds a claim.",
+      "importance": 63
+    },
+    {
+      "id": 8416,
+      "category": "ARCHITECTURE",
+      "content": "The historian producer's child session ID is derived from the project slug, a hash of the session lineage, and the sequence (`mc-historian:<slug>:<lineage>:<seq>`) rather than the raw bound session key, preventing composite keys from flowing into its identity.",
+      "importance": 60
+    },
+    {
+      "id": 8477,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode route binds `shadow:<sid>` to prevent shadow state from poisoning the real lane, ensuring shadow rows are never promoted.",
+      "importance": 65
+    },
+    {
+      "id": 8478,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode compartment boundaries use flat CK block IDs (`mid#index`) and durable absolute ordinals to support coverage validation.",
+      "importance": 54
+    },
+    {
+      "id": 8479,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode state_sync uses the `publish_historian_chunk` fenced mold (rows, row_version bump, and sync-seq CAS in one transaction) to prevent races.",
+      "importance": 63
+    },
+    {
+      "id": 8485,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode ordinal source of truth is pinned to the canonical raw session order (`time_created ASC, id ASC`) to ensure stable coordinates across marker trims.",
+      "importance": 62
+    },
+    {
+      "id": 8486,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode state_sync scheduling keys on ACKed shadow state rather than TS-watermark advancement to prevent stale mirrors and cascade noise.",
+      "importance": 59
+    },
+    {
+      "id": 8487,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode operations require `shadow_generation` to prevent late commits from resurrecting wiped lineages after a reset.",
+      "importance": 61
+    },
+    {
+      "id": 8488,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode DeclaredTrimValidated requires four predicates (durable boundary identity, coverage-ordinal agreement, store-row agreement, and first-live-ordinal continuity) to prevent partially-valid declarations from suppressing fail-loud arms.",
+      "importance": 63
+    },
+    {
+      "id": 8489,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode arm is prohibited from touching `prepare_historian_fire` to prevent spawning producers or persisting no-fire diagnostics.",
+      "importance": 60
+    },
+    {
+      "id": 8496,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode cold-start rule: restarts with unknown ACK state trigger a reset-then-sync-then-resume sequence, prohibiting trust-based transforms.",
+      "importance": 62
+    },
+    {
+      "id": 8497,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode ordinal memoization is scoped to the composite key `{sid, generation}`.",
+      "importance": 52
+    },
+    {
+      "id": 8498,
+      "category": "ARCHITECTURE",
+      "content": "Shadow-mode continuity check (predicate 4) exempts system and synthetic rows to prevent false-fails on covered-system head re-emits.",
+      "importance": 58
+    },
+    {
+      "id": 8499,
+      "category": "ARCHITECTURE",
+      "content": "The Rust module's configuration cache is mtime-keyed and re-evaluated per pass, allowing overrides to take effect without restarting the daemon.",
+      "importance": 55
+    },
+    {
+      "id": 8509,
+      "category": "ARCHITECTURE",
+      "content": "Project-tier configuration trust boundaries: historian.model, fallback_models, and shadow_transform.enabled are user-tier-only; execute_threshold_percentage can only raise the threshold; memory.enabled is allowed as a project-tier toggle.",
+      "importance": 64
+    },
+    {
+      "id": 8564,
+      "category": "ARCHITECTURE",
+      "content": "CC-leg full parity is the ratified end-state (supersedes the fold-only scoping in the MC Rust module memory): Claude Code over ai-proxy gets the complete MC feature set — §N§ tagging with agent ctx_reduce, Channel 1/2 nudges, the full OpenCode guidance block AIPROXY-appended to CC's system (via session-aware guidance.get {bytes,hash}, read once per session at first turn), and the 5-tool MCP facade (ctx_reduce, ctx_search, ctx_memory, ctx_expand over module-persisted chunk transcripts, ctx_note in mc_notes). Gating contract: AIPROXY retires the prefix byte-splice for FULL-ARRAY APPLY of MC's output (Ufuk-confirmed; \"the proxy shouldn't have that much logic — cache stability is MC's job\"); MC flips tail_reclaim for claude-code-anthropic ONLY on AIPROXY's confirmed deployed prod SHA. Deploy-safety mechanism: guidance hash + serializer/tail_reclaim profile epoch + tagger feature epoch fold into the render_config identity, so every byte-affecting flip forces a coordinated HARD per session. Marker ownership: MC's canonical CK output carries NO cache_control; AIPROXY's codec places markers via shared llmr-provider plan_markers over the rendered array. Key Oracle pins: tag minting is first-observation (NOT bust-gated — matches OpenCode's tagger), tags are a build_output overlay (never frozen units, never mutate ingress projection/identity), drop-wins-over-tag, Channel-1 clear only stops future appends, ctx_expand transcripts persist inside the publish CAS transaction. Design doc: .alfonso/plans/cc-leg-parity-v1.md.",
+      "importance": 68
+    },
+    {
+      "id": 8596,
+      "category": "ARCHITECTURE",
+      "content": "The historian substance-floor bypass is generalized to `!tail_reclaim` profiles so folds fire at the normal trigger instead of the 95% emergency threshold.",
+      "importance": 48
+    },
+    {
+      "id": 8603,
+      "category": "ARCHITECTURE",
+      "content": "The MC Rust module self-coordinates rendered-prefix format changes: profile_render_epoch(profile) (crates/mc-module/src/lib.rs, currently PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC=1) folds into effective_render_config via M0ContentEpoch as an \"mpe{n}\" component OMITTED at epoch 0 — so epoch-0 profiles keep byte-identical render_config strings (no spurious folds) while a bumped profile takes exactly ONE self-coordinated transition HARD per session, independent of the consumer's static render_config string. Every future byte-affecting format flip (including TAGGER_FEATURE_EPOCH at the U1 flip) must use this same module-side fold; consumer-side epoch pins (ai-proxy cutover-1 render_config-v2) are a compatibility assert belt, never the fold trigger.",
+      "importance": 66
+    },
+    {
+      "id": 8629,
+      "category": "ARCHITECTURE",
+      "content": "CK-harness community plugin surface (settled room rm_b87dcabd 2026-07-10; plan finalized post-council at alfonso/.cortexkit/alfonso/plans/plugin-surface-v1.md): five hook classes with per-class contact surfaces enforced by construction — 1 catalog-shaping + 2 request-decoration (epoch-frozen at admission into RunConfig; model switch = new episode; class-2 blocks are fixed-slot typed envelopes), 3 tool-call intercept (rewrite-at-origin/replay-from-store; engine-native declarative artifacts only, pipeline = rewrites then denies on final form then fsync; denies mandatory fail-closed), 4 result-decoration (pure-of-durable-snapshot, decorate-once-persist, single-fsync), 5 observe (topic-scoped subscriber). History rewrite (compaction) is RESERVED — MC owns it, never offered. Plugin = subc module with hooks manifest section; trust ladder first-party/community-attested/unattested-denied; federation v1 NO; v1 ceiling = declarative hot-path artifacts only. MC-relevant pins: (a) PROJECTION SEPARABILITY (MC-flagged, folded as 1d acceptance criterion): class-4 decorations are one WAL record at storage but project as their OWN trailing flat block (distinct mid#index) so MC's whole-block reclaim can target self_superseding frames — without this the flag is dead on arrival; (b) self_superseding is FIRST-PARTY ONLY in v1 (community access needs typed frame provenance); MC's reclaim selector reads it from the manifest, never content-sniffs; (c) MC Channel-1 nudge = class-4 migration candidate (numbers ride segment_state schema), Channel-2 step-boundary synthetic user messages have NO CLASS and stay module-internal; (d) the harness-detected epoch law generalizes MC's module-side epoch self-fold; staged-canonical-bytes deferred-mutation queue where consuming a queued record IS a declared epoch bump; (e) combined status bar [CK: aft | alfonso | mc]: MC publishes segment state at pass-commit (free from CAS-committed state), cadence annotated \"as of the last transform pass\"; MC supplier spec due with AFT at slice 4.",
+      "importance": 63
+    },
+    {
+      "id": 8664,
+      "category": "ARCHITECTURE",
+      "content": "MC epoch contract with THALAMUS (locked 2026-07-10, both sides banked): mc-module status op exposes epochs {profile_epoch, tagger_epoch, memory_render_epoch} — THALAMUS pins ALL THREE at attach with a two-arm mismatch belt: STRUCTURAL incompat (status unreadable / required field absent / unparseable) → disable transform + loud; VALUE skew (present but != pinned) → observe-loud only, NO disable. The split rests on two MC commitments that must hold forever: (1) SELF-FOLD-COVERS-CONTENT — every epoch component (mre, mpe/profile, tagger) folds into the m0 content epoch module-side (fold_m0_content_epoch in compartment_coverage.rs, omitted-at-zero pattern), so a bump self-coordinates one HARD per session regardless of consumer pins; (2) EPOCHS-NEVER-CHANGE-WIRE-SHAPE — an epoch bump only changes rendered content bytes inside the existing response envelope/segmentation; anything touching the envelope, head/tail segmentation shape, or tail-mutation behavior MUST ride the wire-version/serializer-profile lane (#406 hard-require, tail_reclaim flip on confirmed deploy SHA), never an epoch bump alone. If a future change is ambiguous between the two lanes, route it through the profile/wire lane and tell THALAMUS before shipping. memory_render_epoch=1 = compact category-grouped #id: fact memory format (importance off the wire).",
+      "importance": 72
+    },
+    {
+      "id": 8771,
+      "category": "ARCHITECTURE",
+      "content": "Goose harness support: DECLINED (Ufuk, 2026-07-11) — issue #227 replied and closed as not-planned. Rationale: harness investments follow user-base size (Claude Code/Codex earn the MITM cost; Goose doesn't), and MC won't spend energy championing changes in a competitor's harness. Structural blocker: Goose has no conversation-visible extension point (MCP = tools only, hooks = observe/deny, platform extensions = compiled-in non-public map), so only a per-wire-family MITM proxy could work without upstream changes. The converged integration design is published as an appendix on #227 for anyone who wants to champion it upstream: (1) optional no-op-default async context-middleware seam at reply_parts.rs pre-provider boundary returning a provider-only projection, (2) per-session context-owner policy (Goose|External) covering all four native compaction paths (threshold auto-compact, tool-pair summarization, ContextLengthExceeded recovery, manual /compact). Revisit only if those land upstream. Reference facts if ever needed: durable key would be (instance_id, session_id, message_id); replace_conversation deletes+reinserts rows but preserves logical message ids; ACP forks copy message ids across sessions; ctx_* tools would work today via standard MCP config against shared storage (unsupported/undocumented).",
+      "importance": 40
+    },
+    {
+      "id": 8848,
+      "category": "ARCHITECTURE",
+      "content": "Cache-core replay-unification (canonical execute/defer replay pipeline + persist-before-publish/COW + serializer-accurate merged-assistant wire projection + F4 durable clear-set + F5/F7/F9 image-sentinel fixes) is DEFERRED to the full-Rust-thin-plugin cutover (Ufuk, 2026-07-12), NOT fixed in the TS plugin — the accurate fix would require reimplementing OpenCode's full 4-stage serializer in TS and tracking version drift across supported OpenCode >=1.15.0, throwaway work the Rust module's section-E codecs + healing.rs own in the right layer (per rule #6740). Two Oracle rounds (9 findings; #3 union-watermark + #8 F6/F7 already validated-closed, rest fold into the Rust lane) and full disposition are recorded in .alfonso/plans/cache-core-replay-unification.md. Residual accepted live risk: the shipped TS stripReasoningFromMergedAssistants models raw not wire topology and could THEORETICALLY emit text-before-thinking (Anthropic 400) in a [empty-sentinel-text, signed-reasoning] merge — never observed in practice; the Rust lane must run the Oracle's pinned wire-level fixture to prove/close it.",
+      "importance": 66
+    },
+    {
+      "id": 8858,
+      "category": "ARCHITECTURE",
+      "content": "Fleet end-state (Ufuk, 2026-07-12): TS plugins (OpenCode/Pi) become fully STATELESS adapters — zero TS-side state including TUI prefs, RPC port files, and dashboard-read telemetry; all of it routes TS <> subc <> MC module. The plugin-local RPC server (port files, bearer tokens, WS notification protocol) and the dashboard's direct SQLite reads of context.db are TRANSITIONAL surfaces (maintain, don't invest — same doctrine as rule #6740). The Cortex App subsumes the MC dashboard and reads via subc's management surface; subc has FEDERATION (users run subc on multiple machines; one Cortex App aggregates every federated machine's data over WAN), so MC module read-ops must be designed as WAN-servable subc ops, replacing dashboard db.rs SQL. MEMORY SYNC (settled with ENGRAM ses_0ad83017cffexe0g5N8UG0y3LZ + SUBC, 2026-07-12): rides ENGRAM — zero-knowledge cloud backup module (design frozen v3, not built; WAL increments + VACUUM INTO, per-device manifest chains, client-side encryption; today = backup/restore/single-writer-resume, fork-on-divergence). Engram grows the sync lane post-v1 (stage-2 per-lineage encrypted streams + seq cursors are the machinery); the FOREVER invariant is SINGLE-WRITER PER STREAM: each (account,device) publishes its own op stream, MC converges MERGE-ON-READ over N streams via terminal-state precedence — mutation-log ops become per-(account,device) ordered, so origin columns are the STREAM KEY, not just provenance. Merge is MC-side by construction (Engram content-blind). ORIGIN IDENTITY canonical: {origin_account = CKCRED account_id, origin_device = enrollment-minted device_pseudonym} — both 16-byte opaque, hex-encoded; pseudonym NOT pubkey (possession != identity). Routine device-key rotation PRESERVES the pseudonym (ROSTER_REKEY rebinds pubkey to same pseudonym), so the stream key is rotation-stable; only revoke+re-enroll mints a fresh pseudonym = new writer lineage (semantically correct for provenance). mc-store seed migration (opaque nullable origin columns) rides the NEXT schema cycle, not v0.32.1. TEAM MEMORY (premium): cross-account shared group key wrapping only the shareable subset (MC's share_categories/shareable classification is the subset seam), roster-adjacent user-level control plane, ENGRAM+CKCRED-owned with MC reviewer seat, post-stage-1 on Ufuk's roadmap.",
+      "importance": 81
+    },
+    {
+      "id": 8873,
+      "category": "ARCHITECTURE",
+      "content": "OpenCode emergency fail-closed at >=95% usage notifies the TUI and awaits client.session.abort to interrupt the fiber before the provider request is created.",
+      "importance": 62
+    },
+    {
+      "id": 8880,
+      "category": "ARCHITECTURE",
+      "content": "Emergency aborts require a provider-proven origin, >=95% context usage, and no fold materialized in the current pass.",
+      "importance": 63
+    },
+    {
+      "id": 8882,
+      "category": "ARCHITECTURE",
+      "content": "subc wire v1 FINAL — spec FROZEN at v7 @ 5a582f2b (subconscious docs/specs/subc-wire-v1-final.md; six blind Oracle rounds, GO 2026-07-13; in-place flip-day cutover, no dual codec): fixed 21-byte little-endian header `len u32 · ver u8(==2 exact, stale-binary tripwire) · ty u8 · flags u8 · channel u16 · epoch u32 · corr u64` (frozen 5-byte len+ver prefix unchanged; prefix-first reads normative in shared subc_transport::read_frame). epoch is PER-CHANNEL (epoch 0 = channel-0/control; slot retires at u32::MAX), daemon-assigned; validation per-frame, direction-agnostic, ENDPOINT-SIDE MANDATORY (daemon relay validation alone has snapshot/rebind TOCTOU); in-flight state keys on (channel,epoch,corr). RouteHandle{channel,epoch,+SDK-local connection token} is immutable and connection-bound; every route-scoped op takes the handle; control ops name routes as (channel,epoch); channel-0 corr = one monotonic allocator per request-originating endpoint, no reuse, echo-never-mint. on_bind = decision-only (NO route egress; handler state-install AT on_bind is the pinned convention — MC's); on_bound(RouteHandle) = traffic gate. Locally-timed-out route.open receiving late RouteOpen must GOODBYE the handle. flags: bit0 BINARY, bits1-2 PRIORITY, bit3 LAST, bits4-5 ADMISSION CLASS exclusive (00 normal, 01 EXPEDITE, 10 SHEDDABLE Push/StreamData-only, 11 decode-reject), bits6-7 reserved. MC flip-day obligations (frozen v7): (1) ck-mc = synchronized-restart participant, SDK-carried (subc-client-rs), rebuild + golden regen; on_bind verified zero-egress at source (lib.rs:3186), on_bound unused; (2) TS shadow lane = DELETE hand-rolled SubcShadowTransport (shadow-sender.ts, private HEADER_LEN=17) and migrate onto @cortexkit/subc-client at the flip (MC is the third TS consumer justifying the blessed shared client); shadow lane fail-open so not a hard synchronized participant. MC shadow-mirror lane NOT a SHEDDABLE consumer (Request-shaped). Build sequence: SUBC builds protocol/transport/clients (~3d) → seats build against pinned revs → flip-day per  runbook (roster from daemon live route table; THALAMUS first-class synchronized; batched with a natural OpenCode restart window).",
+      "importance": 79
+    },
+    {
+      "id": 5060,
+      "category": "CONSTRAINTS",
+      "content": "Anthropic auto-pairs tool_use/tool_result, so injecting only the tool_use part suffices.",
+      "importance": 72
+    },
+    {
+      "id": 5061,
+      "category": "CONSTRAINTS",
+      "content": "Anthropic occasionally returns 400 with empty-text content blocks on Magic-Context-mutated messages.",
+      "importance": 68
+    },
+    {
+      "id": 5062,
+      "category": "CONSTRAINTS",
+      "content": "Anthropic Opus streaming through Bun with thinking enabled can repeatedly drop SSE connections once historian prompts grow past roughly 65k input tokens.",
+      "importance": 78
+    },
+    {
+      "id": 5063,
+      "category": "CONSTRAINTS",
+      "content": "Anthropic prompt-cache writes for large mid-turn tool-use requests can take more than a few seconds to become readable even when the next cacheable prefix is byte-identical.",
+      "importance": 74
+    },
+    {
+      "id": 5064,
+      "category": "CONSTRAINTS",
+      "content": "Provider-side nonces such as Anthropic cch must not be treated as prompt-cache-busting content.",
+      "importance": 70
+    },
+    {
+      "id": 5065,
+      "category": "CONSTRAINTS",
+      "content": "Top-level discriminated unions / default OpenCode serialization drops property-level descriptions, so tool schemas must use normalizeToolArgSchemas.",
+      "importance": 68
+    },
+    {
+      "id": 5069,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode runs same-type hooks from multiple plugins sequentially.",
+      "importance": 58
+    },
+    {
+      "id": 5070,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode's tool.definition hook lacks session/agent context, so Magic Context cannot hide ctx_reduce only for subagents or compute per-session tool-schema size precisely.",
+      "importance": 70
+    },
+    {
+      "id": 5071,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode can still trigger native compaction after a provider context-overflow error even when compaction.auto=false, because its overflow path sets needsCompaction before Magic Context can recover.",
+      "importance": 72
+    },
+    {
+      "id": 5072,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode /fork replays historical messages into the new session and can poison session_meta with stale pressure state and model-limit mismatches.",
+      "importance": 70
+    },
+    {
+      "id": 5073,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode does not consume agent maxTokens, so historian.maxTokens has no effect.",
+      "importance": 60
+    },
+    {
+      "id": 5074,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode UI context-usage percentage can read higher than magic-context thresholds because it counts output, reasoning, and cache-write tokens while magic-context uses request-side input plus cache-read tokens.",
+      "importance": 65
+    },
+    {
+      "id": 5075,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode opencode.db does not store tool-result pairing as tool_use_id joins across messages.",
+      "importance": 70
+    },
+    {
+      "id": 5076,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode installs plugins through npm @npmcli/arborist; .npmrc policies such as min-release-age and before can block plugin upgrades.",
+      "importance": 68
+    },
+    {
+      "id": 5077,
+      "category": "CONSTRAINTS",
+      "content": "process.env.OPENCODE_CLIENT is undefined in the server process; never use it for client-type detection in server plugin code.",
+      "importance": 68
+    },
+    {
+      "id": 5081,
+      "category": "CONSTRAINTS",
+      "content": "MCP-prefixed tool names like mcp_Todowrite go through different capture paths than the registered \"todowrite\" tool ID.",
+      "importance": 70
+    },
+    {
+      "id": 5085,
+      "category": "CONSTRAINTS",
+      "content": "Pi --no-extensions disables discovered extensions but still loads explicit --extension <path> entries.",
+      "importance": 58
+    },
+    {
+      "id": 5087,
+      "category": "CONSTRAINTS",
+      "content": "GitHub Copilot upstream /models responses oscillate available-model counts between refreshes.",
+      "importance": 68
+    },
+    {
+      "id": 5088,
+      "category": "CONSTRAINTS",
+      "content": "Codex OAuth backend response.completed.usage.output_tokens under-reports emitted tokens by ~2.7x because it counts billable units excluding reasoning, so cross-provider token comparison requires calibration.",
+      "importance": 72
+    },
+    {
+      "id": 5089,
+      "category": "CONSTRAINTS",
+      "content": "Deepseek V4-Flash thinking mode is on by default at high reasoning effort; harness must set explicit temperature <0.2 because the provider default 1.0 introduces excessive extraction variance.",
+      "importance": 74
+    },
+    {
+      "id": 5098,
+      "category": "CONSTRAINTS",
+      "content": "SessionRunState concurrency is per-process only, so the same session can run concurrently from multiple OpenCode processes unless OpenCode adds a distributed session lease.",
+      "importance": 72
+    },
+    {
+      "id": 5164,
+      "category": "CONSTRAINTS",
+      "content": "Pi compaction boundary resolution must not cut at folded tool results (synth-user entries) to avoid provider-side tool pairing mismatches.",
+      "importance": 74
+    },
+    {
+      "id": 5201,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode plugin.trigger wraps every hook handler in Effect.promise, forcing a microtask hop per hook fire.",
+      "importance": 60
+    },
+    {
+      "id": 5204,
+      "category": "CONSTRAINTS",
+      "content": "Magic Context implements fallback_models in historian/dreamer/sidekick call paths with output validation because successful-but-empty or invalid model responses do not trigger OpenCode's throw-based fallback path.",
+      "importance": 70
+    },
+    {
+      "id": 5440,
+      "category": "CONSTRAINTS",
+      "content": "Pi todowrite capture uses tool_execution_start because tool_execution_end is fire-and-forget and can race the next pipeline pass; Pi todowrite args expose todos as {id, content, status}.",
+      "importance": 65
+    },
+    {
+      "id": 5563,
+      "category": "CONSTRAINTS",
+      "content": "Clack select prompts break under Bun in `curl | bash` installs, so `scripts/install.sh` requires Node >=20.12 and npx to execute the setup wizard.",
+      "importance": 65
+    },
+    {
+      "id": 5567,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode lacks a dedicated plugin shutdown hook, so the plugin uses the `event` hook with event type `server.instance.disposed` to dispose resources before process teardown.",
+      "importance": 72
+    },
+    {
+      "id": 5770,
+      "category": "CONSTRAINTS",
+      "content": "Channel 2 ceiling nudges deliver via the in-process client (input.client) on OpenCode >= 1.17.7, which coalesces promptAsync into the in-flight runner (anomalyco/opencode#28202 fixed). The old live-server-client + /session reachability probe workaround was removed; Channel 2 now also fires on plain TUI (previously disabled there because the probe 404'd), since plain TUI routes both TUI requests and input.client through the same Default-app worker (no runner split).",
+      "importance": 70
+    },
+    {
+      "id": 5876,
+      "category": "CONSTRAINTS",
+      "content": "BPE tokenizers exhibit degenerate performance (e.g., taking seconds to tokenize a few thousand tokens) when processing long strings of a single repeated character.",
+      "importance": 60
+    },
+    {
+      "id": 5898,
+      "category": "CONSTRAINTS",
+      "content": "Under stock OpenCode (messages-first hook ordering), same-turn system-prompt changes incur a one-pass lag because experimental.chat.messages.transform runs before system.transform; under OpenCode PR 19961 (system-first hook ordering), changes trigger drops and rematerialization in the same pass.",
+      "importance": 74
+    },
+    {
+      "id": 6131,
+      "category": "CONSTRAINTS",
+      "content": "`bun:sqlite` cannot load dynamic extensions, preventing the use of sqlite-vec.",
+      "importance": 70
+    },
+    {
+      "id": 6174,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode's empty-content filter is gated on `@ai-sdk/anthropic` and `@ai-sdk/amazon-bedrock`, meaning empty-text sentinels generated by `stripStructuralNoise` survive on other providers (like `@ai-sdk/github-copilot`) and can break tool-use adjacency.",
+      "importance": 74
+    },
+    {
+      "id": 6249,
+      "category": "CONSTRAINTS",
+      "content": "strip_reasoning_from_merged_assistants runs for the OpencodeAiSdk serializer profile because the AI SDK merges consecutive assistant messages and repositions thinking after text, which Anthropic Opus 4.7 rejects unless reasoning is stripped from all but the first assistant.",
+      "importance": 77
+    },
+    {
+      "id": 6272,
+      "category": "CONSTRAINTS",
+      "content": "SQLite statement binds must use spread positional arguments (stmt.run(a, b)) instead of the array form (stmt.run([a, b])) to prevent node:sqlite prepares from failing with named parameter errors on Pi and OpenCode Desktop.",
+      "importance": 82
+    },
+    {
+      "id": 6276,
+      "category": "CONSTRAINTS",
+      "content": "Anthropic auto-pairing requires tag-specific placeholders `[dropped §N§]` to prevent tool pairing mismatches, whereas non-Anthropic providers require the numberless `[dropped]` sentinel as a whole-message placeholder, and `...[truncated]` is reserved for argument value clamping.",
+      "importance": 76
+    },
+    {
+      "id": 6279,
+      "category": "CONSTRAINTS",
+      "content": "Pi extension install layouts vary (local dev paths, managed npm installs, or pnpm store), requiring runtime checks for onnxruntime-node to use layout-agnostic resolution from the plugin directory rather than hardcoded paths.",
+      "importance": 68
+    },
+    {
+      "id": 6301,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode in-process promptAsync calls hit a separate Effect memoMap and start duplicate runs instead of coalescing. The workaround routes calls via a live-server client (createOpencodeClient) to target the correct listener, enable Channel 2 nudges, and ensure message self-serialization.",
+      "importance": 82
+    },
+    {
+      "id": 6403,
+      "category": "CONSTRAINTS",
+      "content": "Pi AgentMessage objects do not carry stable per-message IDs; the stable entry.id is generated by the SessionEntry wrapper in the JSONL store, requiring deferred resolution via resolvePiStableId.",
+      "importance": 61
+    },
+    {
+      "id": 6404,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode's transform pass and assistant message generation are 1:1 at the LLM round-trip level, with each round-trip producing a distinct assistant message ID.",
+      "importance": 70
+    },
+    {
+      "id": 6419,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode 1.17.x has no mechanism to cancel `command.execute.before` other than throwing an error, which leaks sentinel errors into the TUI/logs.",
+      "importance": 68
+    },
+    {
+      "id": 6435,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode's `session.revert(...)` does not immediately delete messages; it sets `session.revert` and cleanup runs on the next prompt or shell before creating the next user message, emitting `message.removed` events.",
+      "importance": 76
+    },
+    {
+      "id": 6554,
+      "category": "CONSTRAINTS",
+      "content": "Pi serializers drop empty thinking parts and auto-fill reasoning_content if required by the provider.",
+      "importance": 65
+    },
+    {
+      "id": 6632,
+      "category": "CONSTRAINTS",
+      "content": "Pi provider streams construct AssistantMessage with a numeric timestamp at creation, ensuring persisted assistant SessionEntries with toolCall parts always carry a timestamp.",
+      "importance": 65
+    },
+    {
+      "id": 6643,
+      "category": "CONSTRAINTS",
+      "content": "bun:sqlite and node:sqlite return null (not undefined) when a query with .get() returns no row, so strict undefined checks on .get() results will fail.",
+      "importance": 72
+    },
+    {
+      "id": 6824,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode legacy plugin loader treats default function exports as legacy plugins, invoking every exported function in the entry module as a plugin factory, which throws errors if named helper functions are exported.",
+      "importance": 80
+    },
+    {
+      "id": 6843,
+      "category": "CONSTRAINTS",
+      "content": "In OpenCode Desktop multi-instance concurrent startup, the config hook can execute before module-level var assignments are evaluated, causing imported constants to resolve as undefined while hoisted functions are available.",
+      "importance": 78
+    },
+    {
+      "id": 6856,
+      "category": "CONSTRAINTS",
+      "content": "Restarting the OpenCode server terminates all active subagent, council, or oracle processes running under it.",
+      "importance": 68
+    },
+    {
+      "id": 6879,
+      "category": "CONSTRAINTS",
+      "content": "Background dreamer tasks must never force a prompt-cache bust; database mutations they perform are deferred and absorbed during subsequent materializations triggered by pressure or hard folds.",
+      "importance": 85
+    },
+    {
+      "id": 6901,
+      "category": "CONSTRAINTS",
+      "content": "Bun require.resolve throws a ResolveMessage object that is not an instanceof Error; checks on resolution failures must read the .code property directly to support both Node and Bun runtimes.",
+      "importance": 70
+    },
+    {
+      "id": 7042,
+      "category": "CONSTRAINTS",
+      "content": "The CLI package requires Node >=24.0.0, while Pi runs on Node 24 to match its shipped better-sqlite3 prebuild.",
+      "importance": 65
+    },
+    {
+      "id": 7043,
+      "category": "CONSTRAINTS",
+      "content": "GitHub constraints: recursive workflow triggers are suppressed for releases created with GITHUB_TOKEN (so Discord announcements cannot rely on release:published events); live job logs return 404 until completion; and issue bodies have a 64KB limit (so doctor --issue trims logs).",
+      "importance": 72
+    },
+    {
+      "id": 7044,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode Desktop constraints: first launch requires network access to fetch a matching better-sqlite3 prebuild; it runs on Electron 41.2.1 (native ABI 145) which can fail to load the plugin during @huggingface/transformers startup.",
+      "importance": 75
+    },
+    {
+      "id": 7045,
+      "category": "CONSTRAINTS",
+      "content": "Pi --print constraints: the mode can terminate fire-and-forget agent spawns before async promises resolve because agent.emit() is not awaited; historians on github-copilot/* models can hang indefinitely after message_end, so openai-codex/* must be used with explicit thinking_level.",
+      "importance": 78
+    },
+    {
+      "id": 7046,
+      "category": "CONSTRAINTS",
+      "content": "Pi lacks a tool.execute.after hook, session.deleted RPC API, programmatic API for other sessions' messages, and built-in subagent support (defaulting isSubagent=false); it stores sessions as JSONL at ~/.pi/agent/sessions/*.jsonl instead of SQLite.",
+      "importance": 85
+    },
+    {
+      "id": 7091,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode's session.delete lacks cross-process lease checks, requiring age-gated sweeps to safely clean up orphaned child sessions without terminating concurrent active runs.",
+      "importance": 82
+    },
+    {
+      "id": 7178,
+      "category": "CONSTRAINTS",
+      "content": "The embedding-ssrf.ts guard allows loopback and RFC1918 ranges for self-hosted models, making it unsuitable for untrusted code execution without a DNS-resolving fail-closed wrapper.",
+      "importance": 70
+    },
+    {
+      "id": 7237,
+      "category": "CONSTRAINTS",
+      "content": "Pi's read-only toolset for subagents is restricted to read, grep, find, ls, and ctx_search, omitting glob and aft_* tools.",
+      "importance": 50
+    },
+    {
+      "id": 7238,
+      "category": "CONSTRAINTS",
+      "content": "The historian's at_compartment attribute is interpreted by models as a 1-based compartment index rather than a message ordinal.",
+      "importance": 50
+    },
+    {
+      "id": 7253,
+      "category": "CONSTRAINTS",
+      "content": "Pi updates context usage only at the end of a completed assistant turn (message_end) whereas OpenCode updates per-step, but Pi's native getContextUsage().tokens provides a forward-aware token estimate of the current message array.",
+      "importance": 50
+    },
+    {
+      "id": 7358,
+      "category": "CONSTRAINTS",
+      "content": "google/antigravity-gemini-3.5-flash is an OpenCode-only provider key that Pi cannot resolve.",
+      "importance": 64
+    },
+    {
+      "id": 7372,
+      "category": "CONSTRAINTS",
+      "content": "In the compiled OpenCode binary, the embedded effect library is unreachable from an external plugin's module resolution, preventing static imports of effect/unstable/http.",
+      "importance": 71
+    },
+    {
+      "id": 7374,
+      "category": "CONSTRAINTS",
+      "content": "Pi subagents (historian/dreamer/sidekick/recomp) run WITH extension discovery ENABLED (--no-extensions was removed in v0.30.4). Recursion is prevented by an env-guard instead: the child env sets MAGIC_CONTEXT_PI_SUBAGENT=1 and the full Magic Context Pi entry (index.ts) no-ops before registering anything. This is the Pi equivalent of OpenCode's magic-context- title-prefix exemption. Because discovery is on, provider extensions (Antigravity, Anthropic OAuth — Channel B) AND the AFT extension now resolve in children. Every child also gets an explicit per-agent --tools allow-list (fail-closed to --no-tools for unknown agents). Pi's registry-build filter strips ALL non-listed built-ins and extension tools based on this list, so listing optional aft_* names is safe when AFT is absent and write-capable tools cannot leak into a locked agent.",
+      "importance": 75
+    },
+    {
+      "id": 7389,
+      "category": "CONSTRAINTS",
+      "content": "openai-auth's raw-WebSocket continuation trims function_call items from the suffix and chains via previous_response_id, which can orphan aborted tool calls that lack provider item identity.",
+      "importance": 67
+    },
+    {
+      "id": 7390,
+      "category": "CONSTRAINTS",
+      "content": "The bot account `@alfonso-magic-context` PAT lacks `workflow` scope and cannot trigger GitHub Actions workflow re-runs; workflow re-runs must be triggered using the user's `gh` auth.",
+      "importance": 60
+    },
+    {
+      "id": 7402,
+      "category": "CONSTRAINTS",
+      "content": "In OpenCode, the chat.message hook reliably fires before messages.transform on a model-switching turn, allowing the new model to be resolved before the prompt is transformed.",
+      "importance": 62
+    },
+    {
+      "id": 7403,
+      "category": "CONSTRAINTS",
+      "content": "`opencode --pure models` skips external plugins while preserving built-in auth.",
+      "importance": 45
+    },
+    {
+      "id": 7406,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode message model fields are role-asymmetric: USER messages nest the selected model under info.model.{providerID,modelID,variant}, while ASSISTANT messages carry it flat as info.providerID/info.modelID. The outgoing request resolves from the newest user message's nested model (lastUser.model). On a mid-session model switch the array ends with [..., OLD-model assistant, NEW user message], so reading the last assistant gives the OLD model while the request actually goes to the NEW one.",
+      "importance": 73
+    },
+    {
+      "id": 7623,
+      "category": "CONSTRAINTS",
+      "content": "AFT's Pi extension eagerly warms its watcher daemon on `pi --list-models` (causing macOS TCC prompts on non-interactive runs), whereas its OpenCode plugin lazy-spawns only when tools are executed.",
+      "importance": 48
+    },
+    {
+      "id": 7630,
+      "category": "CONSTRAINTS",
+      "content": "WebKitGTK bundled in the Linux AppImage fails EGL rendering on certain distributions (e.g., Manjaro, WSL2 Fedora), and env-var workarounds like WEBKIT_DISABLE_DMABUF_RENDERER=1 do not resolve the blank screen.",
+      "importance": 48
+    },
+    {
+      "id": 7639,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode Desktop ships no invocable CLI binary on any OS; its server runs as a JS sidecar inside Electron.",
+      "importance": 55
+    },
+    {
+      "id": 7640,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode Desktop's primary installation marker is the presence of the `opencode.settings` file in its Electron userData directory (appId `ai.opencode.desktop`, `ai.opencode.desktop.beta`, or `ai.opencode.desktop.dev`).",
+      "importance": 58
+    },
+    {
+      "id": 7651,
+      "category": "CONSTRAINTS",
+      "content": "The dashboard updater latest.json must use tag-pinned asset URLs (/releases/download/dashboard-v&lt;ver&gt;/...), NOT tauri-action's default /releases/latest/download/ URLs. This repo has two release trains (plugin v* and dashboard-v*); GitHub's \"latest release\" pointer usually belongs to the plugin train, which carries no dashboard assets, so /latest/ URLs 404 and Desktop auto-update breaks. The deploy-updater job in .github/workflows/dashboard-release.yml rewrites URLs to the tag and fails closed if any /latest/ survives.",
+      "importance": 72
+    },
+    {
+      "id": 7667,
+      "category": "CONSTRAINTS",
+      "content": "`dockur/windows` is unusable on Apple Silicon macOS hosts running Docker Desktop because `/dev/kvm` is not exposed, forcing slow software emulation.",
+      "importance": 40
+    },
+    {
+      "id": 7700,
+      "category": "CONSTRAINTS",
+      "content": "Claude Code delegates thinking-clearing to the provider via the Anthropic API's server-side context_management field (e.g., {edits: [{type: \"clear_thinking_20251015\", keep: \"all\"}]}).",
+      "importance": 58
+    },
+    {
+      "id": 7701,
+      "category": "CONSTRAINTS",
+      "content": "Claude Code supports ANTHROPIC_UNIX_SOCKET for Unix-socket transport overrides.",
+      "importance": 42
+    },
+    {
+      "id": 7718,
+      "category": "CONSTRAINTS",
+      "content": "Anthropic's moveToolUseBlocksToEnd reorders tool_use blocks at thinking boundaries, meaning clearing a reasoning signature can mutate block positions.",
+      "importance": 68
+    },
+    {
+      "id": 7719,
+      "category": "CONSTRAINTS",
+      "content": "Anthropic tool_call_id requires ^[a-zA-Z0-9_-]+$ (max 64 chars), while OpenAI tool_call_id can exceed 450 chars and contain pipe characters, requiring target-native aliasing on render.",
+      "importance": 65
+    },
+    {
+      "id": 7743,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode's loader registers the `@opentui/solid` transform for raw-TSX plugins, rewriting imports to the host's runtime and making local `@opentui` dependencies inert at runtime.",
+      "importance": 63
+    },
+    {
+      "id": 7744,
+      "category": "CONSTRAINTS",
+      "content": "OpenTUI 0.3.4 lacks the automatic JSX runtime (`jsxDEV`), requiring a Babel/Bun-plugin transform model, whereas OpenTUI 0.4.x ships a standard automatic runtime.",
+      "importance": 50
+    },
+    {
+      "id": 7764,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode server runner is a Bun context, allowing the use of `Bun.serve` for HTTP and WebSocket hosting, while Pi runs on Node.",
+      "importance": 52
+    },
+    {
+      "id": 7765,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode TUI lacks a native route-change event, requiring a client-side timer (e.g., 1s reading `api.route.current`) to detect session switches and re-scope the WebSocket connection.",
+      "importance": 62
+    },
+    {
+      "id": 7792,
+      "category": "CONSTRAINTS",
+      "content": "Opening multiple SQLite store handles under `open_sqlite` causes lease collisions and crashes due to the exclusive single-writer lease.",
+      "importance": 75
+    },
+    {
+      "id": 7793,
+      "category": "CONSTRAINTS",
+      "content": "The subc daemon rejects the HELLO handshake if the `SUBC_LAUNCH_NONCE` environment variable is missing or mismatched.",
+      "importance": 65
+    },
+    {
+      "id": 7796,
+      "category": "CONSTRAINTS",
+      "content": "cortexkit-store's epoch fence only rejects strictly-newer epoch writers, allowing equal-epoch writers to write, which requires an app-level row_version check inside fenced transactions.",
+      "importance": 72
+    },
+    {
+      "id": 7870,
+      "category": "CONSTRAINTS",
+      "content": "`llm-runner` session IDs are bound at route-open `BindIdentity` rather than in send parameters; each firing uses a dedicated command route and subscribe stream route, and fallback retries require opening a new session route.",
+      "importance": 66
+    },
+    {
+      "id": 7879,
+      "category": "CONSTRAINTS",
+      "content": "llm-runner replay is exclusive-after-cursor, making any advanced-but-unprocessed cursor a data-loss window.",
+      "importance": 70
+    },
+    {
+      "id": 7948,
+      "category": "CONSTRAINTS",
+      "content": "Flash-class historian models require ALL THREE calibration conditions together, each independently proven load-bearing on the live rig: the v8.7.3 prompt bytes, a clean [system, user] two-message request shape (system prompt at index 0, inputs in one user message), and sampling temperature 0.1. At provider-default temperature even a correctly-shaped request makes deepseek-v4-flash (the calibration model itself) echo the format template and regurgitate rotating-seed reference compartments verbatim as output; correct temperature under a collapsed shape fails the same way. Shape-alone and temp-alone were each tested in isolation and both bled.",
+      "importance": 85
+    },
+    {
+      "id": 8099,
+      "category": "CONSTRAINTS",
+      "content": "On Pi-only installs, the OpenCode database directory and file do not exist; `getWritableOpenCodeDb` throws if called, and shared compaction marker updates must be gated on the OpenCode harness.",
+      "importance": 66
+    },
+    {
+      "id": 8236,
+      "category": "CONSTRAINTS",
+      "content": "ONNX runtime load failures can trigger native aborts that terminate the host process, requiring the doctor probe to run the check in a subprocess.",
+      "importance": 72
+    },
+    {
+      "id": 8252,
+      "category": "CONSTRAINTS",
+      "content": "macOS syspolicyd CPU usage during git spawns can cause git-spawning tests to exceed 30s timeouts under high load.",
+      "importance": 48
+    },
+    {
+      "id": 8305,
+      "category": "CONSTRAINTS",
+      "content": "OpenTUI 0.4.x published-TUI-plugin break has TWO layers (both proven live via A/B on the plugin cache, 2026-07-07). Layer 1: the Solid transform (createSolidTransformPlugin in @opentui/solid scripts/solid-plugin.js) excludes all /node_modules/ paths, so an npm-published plugin's TSX never gets compiled — without runtime deps the import crashes (broke v0.31.1, deps restored in v0.31.2). Layer 2: WITH deps restored the import succeeds but JSX runs through the runtime jsx path where children/props are evaluated EAGERLY at element creation — signals/effects still fire but on-screen text freezes at first paint (v0.31.2 sidebar showed permanent zeros). Dev checkouts (file:// outside node_modules) get the compile transform and work, so dev-path testing can NEVER catch either layer; only a pack+prod-install check can. THE FIX: build-time precompile of src/tui TSX via @opentui/solid's transformSolidSource with moduleName/resolvePath mapping the 8 runtime specifiers (@opentui/core[,testing], @opentui/solid[,components,jsx-runtime,jsx-dev-runtime], solid-js[,store]) to the host's virtual ids 'opentui:runtime-module:'+encodeURIComponent(spec) — registered process-globally by ensureRuntimePluginSupport, resolve from any path, bind the host's single runtime instance. Bare-specifier compilation (own deps) FAILS: dual runtime instances, section vanishes. Keep @opentui/core+@opentui/solid+solid-js as runtime deps pinned to the host line (raw-TSX fallback for 0.3.x hosts). Durable host-side fix (OC agreed to push): OpenTUI includeRoots/sourceRoots allowlist option + OpenCode passing plugin roots; OC flags any release touching runtime-plugin-support/createRuntimePlugin/the virtual-id prefix.",
+      "importance": 67
+    },
+    {
+      "id": 8387,
+      "category": "CONSTRAINTS",
+      "content": "Node/Bun `os.homedir()` retrieves the OS user's home directory directly and ignores runtime `HOME` environment variable overrides, requiring `process.env.HOME || homedir()` for sandboxed test isolation.",
+      "importance": 52
+    },
+    {
+      "id": 8437,
+      "category": "CONSTRAINTS",
+      "content": "Pi converts `role:\"custom\"` to user only at LLM serialization (`convertToLlm`), leaving it distinguishable at context-pass time.",
+      "importance": 59
+    },
+    {
+      "id": 8501,
+      "category": "CONSTRAINTS",
+      "content": "Claude Code traffic can carry system-role messages inside the messages array rather than only at the head.",
+      "importance": 66
+    },
+    {
+      "id": 8540,
+      "category": "CONSTRAINTS",
+      "content": "A loaded Pi extension can start a turn in the print-mode child before stdin is read, causing the initial prompt to throw 'Agent is already processing'.",
+      "importance": 55
+    },
+    {
+      "id": 8546,
+      "category": "CONSTRAINTS",
+      "content": "Pi 0.80.3 TUI initializes ToolExecutionComponent with partial streaming args and never updates them with final args from tool_execution_start or message_end.",
+      "importance": 53
+    },
+    {
+      "id": 8586,
+      "category": "CONSTRAINTS",
+      "content": "Alfonso background-task completion notifications fire ~1s after the task's GATE declares completion, not when the child session goes idle. There is a normal ~30-60s debounce gate (status sweep + idle-confirm + snapshot) between a subagent going idle in the UI and completion being declared (guards against mid-turn false-completes). So a manual background_output pull right after seeing a child go idle can land INSIDE that window and read the result before the notification arrives — this is expected, not a delivery bug. Notification delivery is run-scoped (id: notify-<task>-r<started_at>) with no dedup suppression on distinct runs. AFK runs are safe: an unwatched task still wakes the parent ~1s after gate completion.",
+      "importance": 58
+    },
+    {
+      "id": 8597,
+      "category": "CONSTRAINTS",
+      "content": "Claude Code hard-stops at ~167k tokens (83.5% of the 200k window) when `DISABLE_COMPACT=1` due to output/thinking reservations.",
+      "importance": 52
+    },
+    {
+      "id": 8690,
+      "category": "CONSTRAINTS",
+      "content": "Pi session APIs (source-verified with Pi team 2026-07-10): getBranch(leafId) returns the FULL raw root→leaf path with compaction entries inline — it never applies the compaction cut. The cut is applied only by Pi's buildContextEntries()/buildSessionContext() at prompt-build time ([compaction, kept-from-firstKeptEntryId, post-compaction entries]). appendCompaction() just appends a compaction entry as the new leaf child (no deletion/rewrite of prior entries). Consequence: MC's readPiSessionMessages (getBranch-based) sees pre-marker raw history too. /clone (createBranchedSession) copies the full raw active path minus label entries, PRESERVING entry ids (only session id + label ids re-mint), so a clone's JSONL physically contains pre-marker raw entries and MC state can migrate 1:1 by entry id. Clone-time hook: session_start fires with reason:\"fork\" + previousSessionFile (source session id readable from that file's header). Any MC comment claiming appendCompaction \"trims getBranch()\" is wrong vocabulary — the branch never trims, only the context view does.",
+      "importance": 65
+    },
+    {
+      "id": 8700,
+      "category": "CONSTRAINTS",
+      "content": "Push-safety audit of subc-migration → origin/master (verified 2026-07-10, valid for that tree state): no secrets or private design docs are tracked on the branch (docs/cache-policy/, docs/specs/, .alfonso/* except release-notes, .cortexkit/ were never committed — zero commits touch them); real-session codec goldens (crates/mc-module/testdata/codec/*) are fully redacted ([redacted:text]); all other Rust goldens are synthetic (Acorn Suite corpus, already public via master's reference-seeds.generated.ts); the 64KB historian system prompt is already public on master; mc-tokenizer vocab derives from public npm ai-tokenizer. CI on master push is TS-only (no cargo jobs). The two DELIBERATE exposure items requiring Ufuk's judgment before any public push: (1) the entire MC Rust module + code comments naming the unreleased fleet (subconscious daemon, broca, thalamus CC gateway, MITM architecture) goes public; (2) root Cargo.toml path-deps reveal private sibling repo names (../commons, ../subconscious) and make the public Rust workspace unbuildable standalone. Re-run the goldens-redaction scan if new fixtures landed since.",
+      "importance": 68
+    },
+    {
+      "id": 8856,
+      "category": "CONSTRAINTS",
+      "content": "node:sqlite transaction objects do not natively support transaction mode variants (.immediate, .deferred, .exclusive), requiring custom wrapper attachment to match bun:sqlite behavior.",
+      "importance": 54
+    },
+    {
+      "id": 8874,
+      "category": "CONSTRAINTS",
+      "content": "OpenCode's empty assistant text parts are promoted to a single space when the same message carries signed reasoning, making them wire-visible.",
+      "importance": 59
+    },
+    {
+      "id": 8875,
+      "category": "CONSTRAINTS",
+      "content": "Opening a FIFO in a repository without O_NONBLOCK blocks the open call indefinitely, wedging any process-wide mutex wrapping it.",
+      "importance": 53
+    },
+    {
+      "id": 5113,
+      "category": "CONFIG_VALUES",
+      "content": "`execute_threshold_percentage` accepts values from 20 to 80 as a scalar or per-model map, rejecting values above 80 to preserve safety headroom below the emergency bands.",
+      "importance": 58
+    },
+    {
+      "id": 5115,
+      "category": "CONFIG_VALUES",
+      "content": "PROTECTED_TAIL_USER_TURNS defaults to 5 to protect the last 5 meaningful user turns from historian compacting.",
+      "importance": 55
+    },
+    {
+      "id": 5132,
+      "category": "CONFIG_VALUES",
+      "content": "Project memory taxonomy consists of exactly 5 categories: PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, and NAMING.",
+      "importance": 75
+    },
+    {
+      "id": 5669,
+      "category": "CONFIG_VALUES",
+      "content": "User-level magic-context.jsonc configuration expands {env:VAR} and {file:path} tokens before parsing.",
+      "importance": 58
+    },
+    {
+      "id": 5682,
+      "category": "CONFIG_VALUES",
+      "content": "The 3-day supply-chain release-age gate (bunfig.toml minimumReleaseAge=259200 + .npmrc min-release-age=3) was REMOVED (commit f1d30733) because it blocked pinning host-lockstep deps (e.g. @opentui 0.4.2 published same-day as the OpenCode 1.17.10 bump that required it). No release-age floor is enforced anymore; the root .npmrc was deleted and minimumReleaseAge stripped from all four bunfig.toml files (root + plugin + cli + pi-plugin), leaving only the [test] preload sections.",
+      "importance": 54
+    },
+    {
+      "id": 5683,
+      "category": "CONFIG_VALUES",
+      "content": "Magic Context writes logs to ${os.tmpdir()}/opencode/magic-context/magic-context.log for OpenCode and ${os.tmpdir()}/pi/magic-context/magic-context.log for Pi.",
+      "importance": 60
+    },
+    {
+      "id": 7039,
+      "category": "CONFIG_VALUES",
+      "content": "Magic Context loads project config from `&lt;project&gt;/.cortexkit/magic-context.jsonc`, overriding user config at `~/.config/cortexkit/magic-context.jsonc` (the shared, harness-agnostic location), validating against the `MagicContextConfig` schema. Legacy per-harness paths (`.opencode/`, `.pi/`) are migrated automatically.",
+      "importance": 67
+    },
+    {
+      "id": 7040,
+      "category": "CONFIG_VALUES",
+      "content": "The shared Magic Context SQLite database path is `<XDG_DATA_HOME>/cortexkit/magic-context/context.db` (defaulting to `~/.local/share/cortexkit/magic-context/context.db`); the OpenCode database path is `<XDG_DATA_HOME>/opencode/opencode.db` (defaulting to `~/.local/share/opencode/opencode.db`).",
+      "importance": 65
+    },
+    {
+      "id": 7337,
+      "category": "CONFIG_VALUES",
+      "content": "User config path: `~/.config/cortexkit/magic-context.jsonc` (resolving via `XDG_CONFIG_HOME` if set, falling back to `~/.config`).",
+      "importance": 46
+    },
+    {
+      "id": 7338,
+      "category": "CONFIG_VALUES",
+      "content": "Project config path: `<project>/.cortexkit/magic-context.jsonc` (primary; legacy bare-root `<project>/magic-context.jsonc` and `<project>/.opencode/magic-context.jsonc` are read as migration fallbacks when the cortexkit path is absent).",
+      "importance": 47
+    },
+    {
+      "id": 7339,
+      "category": "CONFIG_VALUES",
+      "content": "Project-local artifact directory: `<project>/.cortexkit/magic-context/`.",
+      "importance": 50
+    },
+    {
+      "id": 7348,
+      "category": "CONFIG_VALUES",
+      "content": "User embedding config: provider `openai-compatible`, model `qwen/qwen3-embedding-8b`, endpoint `https://openrouter.ai/api/v1`, api_key `{file:~/.config/openrouter.key}`.",
+      "importance": 25
+    },
+    {
+      "id": 7449,
+      "category": "CONFIG_VALUES",
+      "content": "Default TUI slot order: 170 (positioning Magic Context above AFT and MCP).",
+      "importance": 30
+    },
+    {
+      "id": 7505,
+      "category": "CONFIG_VALUES",
+      "content": "smart_drops default: false",
+      "importance": 42
+    },
+    {
+      "id": 7636,
+      "category": "CONFIG_VALUES",
+      "content": "Dashboard `--serve` default port: 9077.",
+      "importance": 35
+    },
+    {
+      "id": 7686,
+      "category": "CONFIG_VALUES",
+      "content": "The Vercel ai-sdk source is checked out locally at ~/Work/OSS/ai — inspect it directly (Glob/Grep/Read on the absolute path) for @ai-sdk/anthropic, @ai-sdk/openai, etc. behavior instead of using the librarian (librarian currently picks the wrong model and is less reliable).",
+      "importance": 30
+    },
+    {
+      "id": 7687,
+      "category": "CONFIG_VALUES",
+      "content": "Registered cross-project Alfonso peers (for OpenCode/Pi internals questions per project rule): OC = ses_22d43cb21ffeP7gd0iEX9qT7TM (dir ~/Work/OSS/opencode), PI = ses_13ae8f525ffeCnx9aTNmVDRBdR (dir ~/Work/OSS/pi-mono), AFT = ses_313660571ffeZTsf4koSJwk50Q (dir ~/Work/Projects/CortexKit/aft). The pi-mono source is also checked out locally at ~/Work/OSS/pi-mono and the OpenCode source at ~/Work/OSS/opencode for direct inspection.",
+      "importance": 28
+    },
+    {
+      "id": 7696,
+      "category": "CONFIG_VALUES",
+      "content": "MITM redirect recipes for the CLI harnesses (verified from headroom ~/Work/OSS/headroom, a shipping Rust+Python context-compression proxy that wraps claude/codex/cursor/aider/copilot). Claude Code: set ANTHROPIC_BASE_URL=http://host:port (plain HTTP /v1/messages). Codex: its /v1/responses model call is a WEBSOCKET by default (not HTTP) and ChatGPT-subscription auth routes through the built-in \"openai\" provider regardless of model_provider; the override that actually redirects it is the TOP-LEVEL `openai_base_url = \"http://127.0.0.1:port/v1\"` in ~/.codex/config.toml (NOT chatgpt_base_url, which only catches backend-api housekeeping), plus a `[model_providers.headroom]` table with base_url + `supports_websockets = true`. Codex built-in provider IDs (openai) cannot be overridden via -c model_providers.openai (errors); use a custom provider name. The MITM proxy must speak WebSocket for Codex (headroom has a WS relay + WS→HTTP fallback). Both CLIs store sessions as JSONL with a native compaction marker that shrinks the wire: Claude Code isCompactSummary entry (verified: resume dropped 87msg/2284KB → 5msg/162KB), Codex `compacted` entry with replacement_history (verified via token_count: last_input 231503 → 0 → 21545 right after the marker). pi-mono / opencode / ai-sdk also checked out under ~/Work/OSS.",
+      "importance": 45
+    },
+    {
+      "id": 7766,
+      "category": "CONFIG_VALUES",
+      "content": "WebSocket authentication timeout: 5s (`WS_AUTH_TIMEOUT_MS`).",
+      "importance": 30
+    },
+    {
+      "id": 7853,
+      "category": "CONFIG_VALUES",
+      "content": "MAGIC_CONTEXT_LOG_PATH: environment variable to override the default log path across TS and Rust loggers.",
+      "importance": 30
+    },
+    {
+      "id": 7919,
+      "category": "CONFIG_VALUES",
+      "content": "dreamer.inject_docs default: true",
+      "importance": 22
+    },
+    {
+      "id": 7943,
+      "category": "CONFIG_VALUES",
+      "content": "execute_threshold_percentage default: 65%, maximum cap: 80%",
+      "importance": 25
+    },
+    {
+      "id": 7969,
+      "category": "CONFIG_VALUES",
+      "content": "Historian backoff gate: 60s",
+      "importance": 42
+    },
+    {
+      "id": 7970,
+      "category": "CONFIG_VALUES",
+      "content": "Historian await-timeout recovery re-drain: 60s",
+      "importance": 42
+    },
+    {
+      "id": 7977,
+      "category": "CONFIG_VALUES",
+      "content": "cache_ttl default: 5m (consumed via `SessionMeta.cache_ttl`).",
+      "importance": 40
+    },
+    {
+      "id": 7994,
+      "category": "CONFIG_VALUES",
+      "content": "MAX_EMERGENCY_REQUEST_BUDGET: 1500s",
+      "importance": 45
+    },
+    {
+      "id": 7998,
+      "category": "CONFIG_VALUES",
+      "content": "`need_full_sync` response shape: status is \"need_full_sync\" and the `ck_messages` field is entirely absent (not an empty array).",
+      "importance": 64
+    },
+    {
+      "id": 8192,
+      "category": "CONFIG_VALUES",
+      "content": "Project-identity resolution fallback cooldown: 5m (for `.git`-present failures like timeouts or dubious ownership).",
+      "importance": 44
+    },
+    {
+      "id": 8203,
+      "category": "CONFIG_VALUES",
+      "content": "wrapup_in_progress lease TTL: 5m (renewed every 60s)",
+      "importance": 43
+    },
+    {
+      "id": 8311,
+      "category": "CONFIG_VALUES",
+      "content": "MCP facade shim on_bind field: BindIdentity.session",
+      "importance": 46
+    },
+    {
+      "id": 8312,
+      "category": "CONFIG_VALUES",
+      "content": "session.resolve end-to-end timeout: 2s",
+      "importance": 48
+    },
+    {
+      "id": 8313,
+      "category": "CONFIG_VALUES",
+      "content": "Unresolved session error message: \"session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation\"",
+      "importance": 43
+    },
+    {
+      "id": 8358,
+      "category": "CONFIG_VALUES",
+      "content": "todowrite.enabled: true (default; Pi-only configuration to disable the todo tool, command, and overlay)",
+      "importance": 42
+    },
+    {
+      "id": 8359,
+      "category": "CONFIG_VALUES",
+      "content": "todowrite.overlay: true (default; Pi-only configuration to toggle the editor todo widget overlay)",
+      "importance": 40
+    },
+    {
+      "id": 8392,
+      "category": "CONFIG_VALUES",
+      "content": "Pi coding agent directory override env var: PI_CODING_AGENT_DIR",
+      "importance": 45
+    },
+    {
+      "id": 8480,
+      "category": "CONFIG_VALUES",
+      "content": "historian.module_model: user-tier-only override that replaces the plugin-namespace chain entirely when present.",
+      "importance": 57
+    },
+    {
+      "id": 8481,
+      "category": "CONFIG_VALUES",
+      "content": "Prod historian module model: google/gemini-3.5-flash",
+      "importance": 48
+    },
+    {
+      "id": 8510,
+      "category": "CONFIG_VALUES",
+      "content": "shadow_transform.enabled default: false",
+      "importance": 45
+    },
+    {
+      "id": 8598,
+      "category": "CONFIG_VALUES",
+      "content": "Claude Code effective context limit: 167000 (for 200k models).",
+      "importance": 42
+    },
+    {
+      "id": 8599,
+      "category": "CONFIG_VALUES",
+      "content": "Historian minimum chunk tokens floor: 512.",
+      "importance": 38
+    },
+    {
+      "id": 5143,
+      "category": "NAMING",
+      "content": "Release notes must avoid internal implementation labels, review shorthand (such as 'V6' or 'v12'), and migration nicknames to ensure clarity for users.",
+      "importance": 50
+    },
+    {
+      "id": 5772,
+      "category": "NAMING",
+      "content": "The in-turn tool-output nudge is Channel 1, and the synthetic-user ceiling nudge is Channel 2.",
+      "importance": 45
+    },
+    {
+      "id": 7036,
+      "category": "NAMING",
+      "content": "Harness packages publish as @cortexkit/opencode-magic-context (plugin), @cortexkit/pi-magic-context (pi-plugin), and @cortexkit/magic-context (cli) with setup/doctor using npx @cortexkit/magic-context@latest; Pi package references use the @earendil-works scope (avoiding @mariozechner/* except in migration/help text) and the Pi repository is named github.com/earendil-works/pi-mono.",
+      "importance": 62
+    },
+    {
+      "id": 7037,
+      "category": "NAMING",
+      "content": "Use dreamer.user_memories and dreamer.pin_key_files configurations; avoid legacy experimental.user_memories, experimental.pin_key_files, or compaction_markers config blocks as compaction markers are mandatory and not configurable.",
+      "importance": 68
+    },
+    {
+      "id": 7038,
+      "category": "NAMING",
+      "content": "Use /ctx-* command names (avoiding /magic-* and /context-*) and the ctx_search tool for cross-session search (as there is no separate ctx_recall tool).",
+      "importance": 65
+    },
+    {
+      "id": 7291,
+      "category": "NAMING",
+      "content": "Use dreamer.user_memories configurations; avoid legacy experimental.user_memories or compaction_markers config blocks.",
+      "importance": 45
+    },
+    {
+      "id": 7825,
+      "category": "NAMING",
+      "content": "Synthetic IDs generated or stripped by the module reserve the `mc_*` namespace.",
+      "importance": 45
+    },
+    {
+      "id": 7907,
+      "category": "NAMING",
+      "content": "ChunkLine.message_id uses the flat block ID vocabulary (<mid>#<index> of the last covered block) to ensure boundary presence checks succeed.",
+      "importance": 55
+    },
+    {
+      "id": 8640,
+      "category": "NAMING",
+      "content": "Fleet renames (Ufuk-decided 2026-07-10): the ai-proxy module/project is now THALAMUS (peer name THALAMUS, session ses_0d9602e50ffe0yxsEU1JrCXRVx, module_id migrating ai-proxy→thalamus) and llm-runner is BROCA (peer LLMRUNNER, module_id llm-runner→broca). Supervised binaries carry a universal ck-* prefix for Activity Monitor grouping: MC's module binary is ck-mc (crate stays mc-module, module_id stays \"magic-context\" — pure exe rename, commit ce005177).",
+      "importance": 45
+    }
+  ]
+}
