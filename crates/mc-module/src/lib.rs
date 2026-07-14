@@ -210,6 +210,9 @@ const SESSION_UNRESOLVED_MESSAGE: &str =
     "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
 const SHADOW_SESSION_PREFIX: &str = mc_store::SHADOW_SESSION_PREFIX;
 const SHADOW_COMPARE_PREFIX_LIMIT: usize = 4096;
+const SHADOW_SEED_MAX_ID_BYTES: usize = 128;
+const SHADOW_SEED_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
+const SHADOW_SEED_MAX_PENDING: usize = 64;
 
 #[derive(Debug, Deserialize)]
 struct ShadowStateSyncWire {
@@ -217,6 +220,16 @@ struct ShadowStateSyncWire {
     session_id: Option<String>,
     shadow_generation: u64,
     expected_shadow_seq: u64,
+    #[serde(default)]
+    seed_id: Option<String>,
+    #[serde(default)]
+    seed_generation: Option<u64>,
+    #[serde(default)]
+    seed_batch_index: Option<usize>,
+    #[serde(default)]
+    seed_batch_total: Option<usize>,
+    #[serde(default)]
+    seed_complete: Option<bool>,
     #[serde(default)]
     seed_boundary_id: Option<String>,
     #[serde(default)]
@@ -241,6 +254,136 @@ struct ShadowResetWire {
     shadow_generation: Option<u64>,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingShadowSeed {
+    seed_id: String,
+    generation: u64,
+    expected_seq: u64,
+    total: usize,
+    next_index: usize,
+    digests: Vec<String>,
+    batches: Vec<ShadowStateSyncWire>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+enum ShadowSeedPhase {
+    Idle,
+    AwaitingSeed { generation: u64, expected_seq: u64 },
+    Collecting(PendingShadowSeed),
+    Applying { seed_id: String, bytes: usize },
+}
+
+#[derive(Debug)]
+struct CompletedShadowSeed {
+    seed_id: String,
+    final_digest: String,
+    generation: u64,
+    expected_seq: u64,
+    total: usize,
+    result: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ShadowSeedSession {
+    phase: ShadowSeedPhase,
+    completed: Option<CompletedShadowSeed>,
+}
+
+impl Default for ShadowSeedSession {
+    fn default() -> Self {
+        Self {
+            phase: ShadowSeedPhase::Idle,
+            completed: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ShadowSeedCoordinator {
+    sessions: HashMap<String, ShadowSeedSession>,
+    total_staged_bytes: usize,
+    pending_seed_count: usize,
+    max_staged_bytes: usize,
+    max_pending_seeds: usize,
+}
+
+impl Default for ShadowSeedCoordinator {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            total_staged_bytes: 0,
+            pending_seed_count: 0,
+            max_staged_bytes: SHADOW_SEED_MAX_STAGED_BYTES,
+            max_pending_seeds: SHADOW_SEED_MAX_PENDING,
+        }
+    }
+}
+
+impl ShadowSeedCoordinator {
+    fn phase_bytes(phase: &ShadowSeedPhase) -> usize {
+        match phase {
+            ShadowSeedPhase::Collecting(seed) => seed.bytes,
+            ShadowSeedPhase::Applying { bytes, .. } => *bytes,
+            ShadowSeedPhase::Idle | ShadowSeedPhase::AwaitingSeed { .. } => 0,
+        }
+    }
+
+    fn is_pending(phase: &ShadowSeedPhase) -> bool {
+        !matches!(phase, ShadowSeedPhase::Idle)
+    }
+
+    fn discard_pending(&mut self, session_id: &str) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        if Self::is_pending(&session.phase) {
+            self.pending_seed_count = self.pending_seed_count.saturating_sub(1);
+            self.total_staged_bytes = self
+                .total_staged_bytes
+                .saturating_sub(Self::phase_bytes(&session.phase));
+            session.phase = ShadowSeedPhase::Idle;
+        }
+    }
+
+    fn release_phase(&mut self, phase: &ShadowSeedPhase) {
+        if Self::is_pending(phase) {
+            self.pending_seed_count = self.pending_seed_count.saturating_sub(1);
+            self.total_staged_bytes = self
+                .total_staged_bytes
+                .saturating_sub(Self::phase_bytes(phase));
+        }
+    }
+
+    fn set_phase(&mut self, session_id: &str, phase: ShadowSeedPhase) {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .phase = phase;
+    }
+
+    fn evict(&mut self, session_id: &str) {
+        self.discard_pending(session_id);
+        self.sessions.remove(session_id);
+    }
+
+    fn arm_after_reset(&mut self, session_id: &str, generation: u64, expected_seq: u64) -> bool {
+        self.discard_pending(session_id);
+        let session = self.sessions.entry(session_id.to_string()).or_default();
+        session.completed = None;
+        if self.pending_seed_count >= self.max_pending_seeds {
+            session.phase = ShadowSeedPhase::Idle;
+            return false;
+        }
+        session.phase = ShadowSeedPhase::AwaitingSeed {
+            generation,
+            expected_seq,
+        };
+        self.pending_seed_count += 1;
+        true
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -604,6 +747,7 @@ pub struct McHandler {
     /// lock-free map) is appropriate because writes are rare (once per route open/close)
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
+    shadow_seeds: Mutex<ShadowSeedCoordinator>,
 }
 
 #[async_trait]
@@ -763,6 +907,7 @@ impl McHandler {
             #[cfg(test)]
             between_transform_and_prepare: Mutex::new(None),
             bindings: Mutex::new(HashMap::new()),
+            shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
         }
     }
 
@@ -813,6 +958,7 @@ impl McHandler {
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
             bindings: Mutex::new(HashMap::new()),
+            shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
         }
     }
 
@@ -820,19 +966,61 @@ impl McHandler {
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
     fn bind_route(&self, channel: u16, binding: SessionBinding) {
-        self.bindings
-            .lock()
-            .expect("bindings mutex")
-            .insert(channel, binding);
+        let replacement = {
+            let mut bindings = self.bindings.lock().expect("bindings mutex");
+            let previous = bindings.insert(channel, binding);
+            previous.and_then(|previous| {
+                let still_bound = bindings
+                    .values()
+                    .any(|candidate| candidate.session == previous.session);
+                (!still_bound).then_some(previous.session)
+            })
+        };
+        if let Some(session_id) = replacement {
+            self.shadow_seeds
+                .lock()
+                .expect("shadow seed mutex")
+                .evict(&session_id);
+        }
     }
 
-    /// Remove a route's binding (called from `on_route_gone`) so a reused channel can't
-    /// resolve a stale/wrong project, and the map doesn't leak entries.
-    fn unbind_route(&self, channel: u16) {
-        self.bindings
+    fn discard_shadow_seed(&self, session_id: &str) {
+        self.shadow_seeds
             .lock()
-            .expect("bindings mutex")
-            .remove(&channel);
+            .expect("shadow seed mutex")
+            .discard_pending(session_id);
+    }
+
+    fn shadow_seed_in_progress(&self, session_id: &str) -> bool {
+        self.shadow_seeds
+            .lock()
+            .expect("shadow seed mutex")
+            .sessions
+            .get(session_id)
+            .is_some_and(|state| ShadowSeedCoordinator::is_pending(&state.phase))
+    }
+
+    /// Remove a route and evict process-local session state after its final binding closes.
+    fn unbind_route(&self, channel: u16) {
+        let last_session_route = {
+            let mut bindings = self.bindings.lock().expect("bindings mutex");
+            bindings.remove(&channel).and_then(|binding| {
+                let still_bound = bindings
+                    .values()
+                    .any(|candidate| candidate.session == binding.session);
+                (!still_bound).then_some(binding.session)
+            })
+        };
+        if let Some(session) = last_session_route {
+            self.scheduler_observations
+                .lock()
+                .expect("scheduler observations mutex")
+                .remove(&session);
+            self.shadow_seeds
+                .lock()
+                .expect("shadow seed mutex")
+                .evict(&session);
+        }
     }
 
     /// Resolve the binding for a transform request on `channel`, FAIL-LOUD: the channel
@@ -2287,9 +2475,27 @@ impl McHandler {
     }
 
     fn handle_shadow_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
-        let parsed: ShadowStateSyncWire = match serde_json::from_value(request) {
+        const ENVELOPE_FIELDS: [&str; 5] = [
+            "seed_id",
+            "seed_generation",
+            "seed_batch_index",
+            "seed_batch_total",
+            "seed_complete",
+        ];
+        let envelope_fields_present = ENVELOPE_FIELDS
+            .iter()
+            .filter(|field| request.get(**field).is_some())
+            .count();
+        let parsed: ShadowStateSyncWire = match serde_json::from_value(request.clone()) {
             Ok(req) => req,
-            Err(e) => return invalid_params_error(e.to_string()),
+            Err(error) => {
+                if envelope_fields_present > 0 {
+                    if let Ok(binding) = self.shadow_binding(channel, None) {
+                        self.discard_shadow_seed(&binding.session);
+                    }
+                }
+                return invalid_params_error(error.to_string());
+            }
         };
         let binding = match self.shadow_binding(channel, parsed.session_id.as_deref()) {
             Ok(binding) => binding,
@@ -2299,6 +2505,412 @@ impl McHandler {
             Some(store) => Arc::clone(store),
             None => return store_unavailable_error(),
         };
+
+        if envelope_fields_present == 0 {
+            let awaiting_attempt = {
+                let seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+                match seeds
+                    .sessions
+                    .get(&binding.session)
+                    .map(|state| &state.phase)
+                {
+                    Some(ShadowSeedPhase::Collecting(_) | ShadowSeedPhase::Applying { .. }) => {
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_in_progress".to_string(),
+                            message: "a paged shadow seed is already in progress".to_string(),
+                        };
+                    }
+                    Some(ShadowSeedPhase::AwaitingSeed {
+                        generation,
+                        expected_seq,
+                    }) => Some((*generation, *expected_seq)),
+                    Some(ShadowSeedPhase::Idle) | None => None,
+                }
+            };
+            let outcome = self.apply_shadow_state_sync_wire(&binding, &store, parsed);
+            if let Some((generation, expected_seq)) = awaiting_attempt {
+                let mut seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+                let still_same_attempt =
+                    seeds.sessions.get(&binding.session).is_some_and(|state| {
+                        matches!(
+                            state.phase,
+                            ShadowSeedPhase::AwaitingSeed {
+                                generation: current_generation,
+                                expected_seq: current_seq,
+                            } if current_generation == generation && current_seq == expected_seq
+                        )
+                    });
+                if still_same_attempt {
+                    seeds.discard_pending(&binding.session);
+                }
+            }
+            return outcome;
+        }
+
+        if envelope_fields_present != ENVELOPE_FIELDS.len() {
+            self.discard_shadow_seed(&binding.session);
+            return invalid_params_error("seed envelope must be all-or-none");
+        }
+        let seed_id = parsed.seed_id.clone().unwrap_or_default();
+        let seed_generation = parsed.seed_generation.unwrap_or_default();
+        let batch_index = parsed.seed_batch_index.unwrap_or_default();
+        let batch_total = parsed.seed_batch_total.unwrap_or_default();
+        let seed_complete = parsed.seed_complete.unwrap_or(false);
+        if seed_id.is_empty() || seed_id.len() > SHADOW_SEED_MAX_ID_BYTES {
+            self.discard_shadow_seed(&binding.session);
+            return invalid_params_error(format!(
+                "seed_id must contain 1..={SHADOW_SEED_MAX_ID_BYTES} bytes"
+            ));
+        }
+        let digest = shadow_seed_content_digest(&request);
+        {
+            let seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+            if let Some(completed) = seeds
+                .sessions
+                .get(&binding.session)
+                .and_then(|state| state.completed.as_ref())
+                .filter(|completed| completed.seed_id == seed_id)
+            {
+                if completed.final_digest == digest {
+                    return HandlerOutcome::Response(completed.result.clone());
+                }
+                return HandlerOutcome::Error {
+                    code: "shadow_seed_digest_mismatch".to_string(),
+                    message: format!(
+                        "completed seed content changed (generation={}, seq={}, total={})",
+                        completed.generation, completed.expected_seq, completed.total
+                    ),
+                };
+            }
+        }
+        if parsed.shadow_generation != seed_generation {
+            self.discard_shadow_seed(&binding.session);
+            return HandlerOutcome::Error {
+                code: "shadow_seed_attempt_mismatch".to_string(),
+                message: "shadow_generation must match seed_generation".to_string(),
+            };
+        }
+        if batch_total == 0 || batch_index >= batch_total {
+            self.discard_shadow_seed(&binding.session);
+            return HandlerOutcome::Error {
+                code: "shadow_seed_protocol_mismatch".to_string(),
+                message: "seed batch index/total is invalid".to_string(),
+            };
+        }
+        if seed_complete != (batch_index + 1 == batch_total) {
+            self.discard_shadow_seed(&binding.session);
+            return HandlerOutcome::Error {
+                code: "shadow_seed_protocol_mismatch".to_string(),
+                message: "seed_complete disagrees with the final batch index".to_string(),
+            };
+        }
+        let scalar_tail_fields = [
+            "seed_boundary_id",
+            "workspace",
+            "last_todo_state",
+            "acked_watermarks",
+        ]
+        .iter()
+        .filter(|field| {
+            request
+                .as_object()
+                .is_some_and(|object| object.contains_key(**field))
+        })
+        .count();
+        if (!seed_complete && scalar_tail_fields != 0) || (seed_complete && scalar_tail_fields != 4)
+        {
+            self.discard_shadow_seed(&binding.session);
+            return HandlerOutcome::Error {
+                code: "shadow_seed_protocol_mismatch".to_string(),
+                message: "seed scalar tail must appear only and completely on the final batch"
+                    .to_string(),
+            };
+        }
+
+        let batch_bytes = match serde_json::to_vec(&request) {
+            Ok(bytes) => bytes.len(),
+            Err(error) => {
+                self.discard_shadow_seed(&binding.session);
+                return invalid_params_error(error.to_string());
+            }
+        };
+        // Batch zero is checked against durable metadata before the process-local state is
+        // touched. A stale retry therefore cannot evict or allocate another live attempt.
+        if batch_index == 0 {
+            let loaded = match store.load(&binding.session) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+            if loaded.meta.shadow_generation != seed_generation {
+                return HandlerOutcome::Error {
+                    code: "shadow_generation_mismatch".to_string(),
+                    message: format!(
+                        "seed_generation {seed_generation} did not match durable generation {}",
+                        loaded.meta.shadow_generation
+                    ),
+                };
+            }
+            if loaded.meta.shadow_seq != parsed.expected_shadow_seq {
+                return HandlerOutcome::Error {
+                    code: "shadow_seq_mismatch".to_string(),
+                    message: format!(
+                        "expected_shadow_seq {} did not match durable shadow_seq {}",
+                        parsed.expected_shadow_seq, loaded.meta.shadow_seq
+                    ),
+                };
+            }
+        }
+
+        enum StageAction {
+            Ack(usize),
+            Apply {
+                batches: Vec<ShadowStateSyncWire>,
+                seed_id: String,
+                final_digest: String,
+                generation: u64,
+                expected_seq: u64,
+                total: usize,
+            },
+        }
+
+        let action = {
+            let mut seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+            let phase = {
+                let state = seeds.sessions.entry(binding.session.clone()).or_default();
+                std::mem::replace(&mut state.phase, ShadowSeedPhase::Idle)
+            };
+            match phase {
+                ShadowSeedPhase::Idle => {
+                    seeds.set_phase(&binding.session, ShadowSeedPhase::Idle);
+                    return HandlerOutcome::Error {
+                        code: "shadow_seed_not_armed".to_string(),
+                        message: "paged shadow seeds require a committed shadow_reset".to_string(),
+                    };
+                }
+                applying @ ShadowSeedPhase::Applying { .. } => {
+                    seeds.set_phase(&binding.session, applying);
+                    return HandlerOutcome::Error {
+                        code: "shadow_seed_in_progress".to_string(),
+                        message: "the final shadow seed batch is being applied".to_string(),
+                    };
+                }
+                awaiting @ ShadowSeedPhase::AwaitingSeed {
+                    generation,
+                    expected_seq,
+                } => {
+                    if batch_index != 0
+                        || generation != seed_generation
+                        || expected_seq != parsed.expected_shadow_seq
+                    {
+                        seeds.release_phase(&awaiting);
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_attempt_mismatch".to_string(),
+                            message: "seed batch does not match the reset-armed attempt"
+                                .to_string(),
+                        };
+                    }
+                    if batch_bytes > seeds.max_staged_bytes
+                        || seeds
+                            .total_staged_bytes
+                            .checked_add(batch_bytes)
+                            .is_none_or(|bytes| bytes > seeds.max_staged_bytes)
+                    {
+                        seeds.release_phase(&awaiting);
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_buffer_overflow".to_string(),
+                            message: "shadow seed staging exceeded the handler-wide byte cap"
+                                .to_string(),
+                        };
+                    }
+                    seeds.total_staged_bytes += batch_bytes;
+                    if seed_complete {
+                        seeds.set_phase(
+                            &binding.session,
+                            ShadowSeedPhase::Applying {
+                                seed_id: seed_id.clone(),
+                                bytes: batch_bytes,
+                            },
+                        );
+                        StageAction::Apply {
+                            batches: vec![parsed],
+                            seed_id: seed_id.clone(),
+                            final_digest: digest,
+                            generation: seed_generation,
+                            expected_seq,
+                            total: batch_total,
+                        }
+                    } else {
+                        seeds.set_phase(
+                            &binding.session,
+                            ShadowSeedPhase::Collecting(PendingShadowSeed {
+                                seed_id: seed_id.clone(),
+                                generation: seed_generation,
+                                expected_seq,
+                                total: batch_total,
+                                next_index: 1,
+                                digests: vec![digest],
+                                batches: vec![parsed],
+                                bytes: batch_bytes,
+                            }),
+                        );
+                        StageAction::Ack(1)
+                    }
+                }
+                ShadowSeedPhase::Collecting(mut pending) => {
+                    if pending.seed_id != seed_id
+                        || pending.generation != seed_generation
+                        || pending.expected_seq != parsed.expected_shadow_seq
+                        || pending.total != batch_total
+                    {
+                        let discarded = ShadowSeedPhase::Collecting(pending);
+                        seeds.release_phase(&discarded);
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_attempt_mismatch".to_string(),
+                            message: "seed envelope changed during collection".to_string(),
+                        };
+                    }
+                    if batch_index < pending.next_index {
+                        let matches = pending
+                            .digests
+                            .get(batch_index)
+                            .is_some_and(|accepted| accepted == &digest);
+                        if matches {
+                            let next_index = pending.next_index;
+                            seeds.set_phase(&binding.session, ShadowSeedPhase::Collecting(pending));
+                            StageAction::Ack(next_index)
+                        } else {
+                            let discarded = ShadowSeedPhase::Collecting(pending);
+                            seeds.release_phase(&discarded);
+                            return HandlerOutcome::Error {
+                                code: "shadow_seed_digest_mismatch".to_string(),
+                                message: "redriven seed batch content changed".to_string(),
+                            };
+                        }
+                    } else if batch_index > pending.next_index {
+                        let discarded = ShadowSeedPhase::Collecting(pending);
+                        seeds.release_phase(&discarded);
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_order_mismatch".to_string(),
+                            message: "seed batches must arrive in strict index order".to_string(),
+                        };
+                    } else {
+                        let next_seed_bytes = pending.bytes.checked_add(batch_bytes);
+                        let next_total_bytes = seeds.total_staged_bytes.checked_add(batch_bytes);
+                        if next_seed_bytes.is_none_or(|bytes| bytes > seeds.max_staged_bytes)
+                            || next_total_bytes.is_none_or(|bytes| bytes > seeds.max_staged_bytes)
+                        {
+                            let discarded = ShadowSeedPhase::Collecting(pending);
+                            seeds.release_phase(&discarded);
+                            return HandlerOutcome::Error {
+                                code: "shadow_seed_buffer_overflow".to_string(),
+                                message: "shadow seed staging exceeded the handler-wide byte cap"
+                                    .to_string(),
+                            };
+                        }
+                        pending.bytes = next_seed_bytes.unwrap_or(usize::MAX);
+                        seeds.total_staged_bytes = next_total_bytes.unwrap_or(usize::MAX);
+                        pending.next_index += 1;
+                        pending.digests.push(digest.clone());
+                        pending.batches.push(parsed);
+                        if seed_complete {
+                            let bytes = pending.bytes;
+                            let batches = std::mem::take(&mut pending.batches);
+                            let generation = pending.generation;
+                            let expected_seq = pending.expected_seq;
+                            let total = pending.total;
+                            let completed_seed_id = pending.seed_id.clone();
+                            seeds.set_phase(
+                                &binding.session,
+                                ShadowSeedPhase::Applying {
+                                    seed_id: completed_seed_id.clone(),
+                                    bytes,
+                                },
+                            );
+                            StageAction::Apply {
+                                batches,
+                                seed_id: completed_seed_id,
+                                final_digest: digest,
+                                generation,
+                                expected_seq,
+                                total,
+                            }
+                        } else {
+                            let next_index = pending.next_index;
+                            seeds.set_phase(&binding.session, ShadowSeedPhase::Collecting(pending));
+                            StageAction::Ack(next_index)
+                        }
+                    }
+                }
+            }
+        };
+
+        match action {
+            StageAction::Ack(next_expected_index) => respond(json!({
+                "ok": true,
+                "staged": true,
+                "next_expected_index": next_expected_index,
+            })),
+            StageAction::Apply {
+                batches,
+                seed_id,
+                final_digest,
+                generation,
+                expected_seq,
+                total,
+            } => {
+                let assembled = assemble_shadow_seed(batches, generation, expected_seq);
+                let outcome = self.apply_shadow_state_sync_wire(&binding, &store, assembled);
+                let completed_result = match &outcome {
+                    HandlerOutcome::Response(bytes) => Some(bytes.clone()),
+                    HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
+                };
+                let mut seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+                let phase = {
+                    let state = seeds.sessions.entry(binding.session.clone()).or_default();
+                    std::mem::replace(&mut state.phase, ShadowSeedPhase::Idle)
+                };
+                match phase {
+                    ShadowSeedPhase::Applying {
+                        seed_id: applying_seed_id,
+                        bytes,
+                    } if applying_seed_id == seed_id => {
+                        seeds.release_phase(&ShadowSeedPhase::Applying {
+                            seed_id: applying_seed_id,
+                            bytes,
+                        });
+                        if let Some(result) = completed_result {
+                            seeds
+                                .sessions
+                                .entry(binding.session.clone())
+                                .or_default()
+                                .completed = Some(CompletedShadowSeed {
+                                seed_id,
+                                final_digest,
+                                generation,
+                                expected_seq,
+                                total,
+                                result,
+                            });
+                        }
+                    }
+                    current => seeds.set_phase(&binding.session, current),
+                }
+                outcome
+            }
+        }
+    }
+
+    fn apply_shadow_state_sync_wire(
+        &self,
+        binding: &SessionBinding,
+        store: &McStore,
+        parsed: ShadowStateSyncWire,
+    ) -> HandlerOutcome {
         let compartments: Vec<StoredCompartment> = parsed
             .compartments
             .into_iter()
@@ -2395,9 +3007,9 @@ impl McHandler {
                     message: format!("seed boundary {declared:?} rejected: {detail}"),
                 }
             }
-            Err(e) => HandlerOutcome::Error {
+            Err(error) => HandlerOutcome::Error {
                 code: "shadow_state_sync_failed".to_string(),
-                message: e.to_string(),
+                message: error.to_string(),
             },
         }
     }
@@ -2405,7 +3017,7 @@ impl McHandler {
     fn handle_shadow_reset_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         let parsed: ShadowResetWire = match serde_json::from_value(request) {
             Ok(req) => req,
-            Err(e) => return invalid_params_error(e.to_string()),
+            Err(error) => return invalid_params_error(error.to_string()),
         };
         let binding = match self.shadow_binding(channel, parsed.session_id.as_deref()) {
             Ok(binding) => binding,
@@ -2416,17 +3028,34 @@ impl McHandler {
             None => return store_unavailable_error(),
         };
         match store.reset_shadow_session(&binding.session, &shadow_project_path(&binding.session)) {
-            Ok(result) => respond(json!({
-                "ok": true,
-                "shadow_generation": result.shadow_generation,
-                "shadow_seq": result.shadow_seq,
-                "row_version": result.row_version,
-                "previous_shadow_generation": parsed.shadow_generation,
-                "reason": parsed.reason,
-            })),
-            Err(e) => HandlerOutcome::Error {
+            Ok(result) => {
+                let armed = self
+                    .shadow_seeds
+                    .lock()
+                    .expect("shadow seed mutex")
+                    .arm_after_reset(
+                        &binding.session,
+                        result.shadow_generation,
+                        result.shadow_seq,
+                    );
+                if !armed {
+                    return HandlerOutcome::Error {
+                        code: "shadow_seed_buffer_overflow".to_string(),
+                        message: "too many shadow seed attempts are already pending".to_string(),
+                    };
+                }
+                respond(json!({
+                    "ok": true,
+                    "shadow_generation": result.shadow_generation,
+                    "shadow_seq": result.shadow_seq,
+                    "row_version": result.row_version,
+                    "previous_shadow_generation": parsed.shadow_generation,
+                    "reason": parsed.reason,
+                }))
+            }
+            Err(error) => HandlerOutcome::Error {
                 code: "shadow_reset_failed".to_string(),
-                message: e.to_string(),
+                message: error.to_string(),
             },
         }
     }
@@ -2440,6 +3069,13 @@ impl McHandler {
             Ok(binding) => binding,
             Err(outcome) => return outcome,
         };
+        if self.shadow_seed_in_progress(&binding.session) {
+            return HandlerOutcome::Error {
+                code: "shadow_seed_in_progress".to_string(),
+                message: "shadow_transform is blocked until the seed commits or is discarded"
+                    .to_string(),
+            };
+        }
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
             None => return store_unavailable_error(),
@@ -3208,26 +3844,7 @@ impl ModuleHandler for McHandler {
     /// Drop the route's binding on teardown so a reused channel can't resolve a stale
     /// project and the map doesn't leak.
     async fn on_route_gone(&self, handle: &RouteHandle) {
-        let channel = handle.channel;
-        let gone_session = {
-            let bindings = self.bindings.lock().expect("bindings mutex");
-            bindings.get(&channel).map(|b| b.session.clone())
-        };
-        self.unbind_route(channel);
-        // Evict the scheduler observation when the session's LAST route closes —
-        // the map is otherwise unbounded across a long-lived daemon's session churn.
-        if let Some(session) = gone_session {
-            let still_bound = {
-                let bindings = self.bindings.lock().expect("bindings mutex");
-                bindings.values().any(|b| b.session == session)
-            };
-            if !still_bound {
-                self.scheduler_observations
-                    .lock()
-                    .expect("scheduler observations mutex")
-                    .remove(&session);
-            }
-        }
+        self.unbind_route(handle.channel);
     }
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
@@ -3362,6 +3979,60 @@ fn respond(value: Value) -> HandlerOutcome {
 
 fn guidance_bytes_for(text: &str, date_line: &str) -> String {
     format!("{text}\n{date_line}")
+}
+
+fn shadow_seed_content_digest(request: &Value) -> String {
+    let mut content = request.clone();
+    if let Some(object) = content.as_object_mut() {
+        for field in [
+            "shadow_generation",
+            "seed_id",
+            "seed_generation",
+            "expected_shadow_seq",
+            "seed_batch_index",
+            "seed_batch_total",
+            "seed_complete",
+        ] {
+            object.remove(field);
+        }
+    }
+    sha256_hex(canonical_value(&content).as_bytes())
+}
+
+fn assemble_shadow_seed(
+    mut batches: Vec<ShadowStateSyncWire>,
+    generation: u64,
+    expected_seq: u64,
+) -> ShadowStateSyncWire {
+    let mut final_batch = batches.pop().expect("final seed batch");
+    let mut compartments = Vec::new();
+    let mut memories = Vec::new();
+    let mut memory_mutations = Vec::new();
+    for mut batch in batches {
+        compartments.append(&mut batch.compartments);
+        memories.append(&mut batch.memories);
+        memory_mutations.append(&mut batch.memory_mutations);
+    }
+    compartments.append(&mut final_batch.compartments);
+    memories.append(&mut final_batch.memories);
+    memory_mutations.append(&mut final_batch.memory_mutations);
+    ShadowStateSyncWire {
+        session_id: final_batch.session_id,
+        shadow_generation: generation,
+        expected_shadow_seq: expected_seq,
+        seed_id: None,
+        seed_generation: None,
+        seed_batch_index: None,
+        seed_batch_total: None,
+        seed_complete: None,
+        seed_boundary_id: final_batch.seed_boundary_id,
+        compartments,
+        memories,
+        memory_mutations,
+        workspace: final_batch.workspace,
+        last_todo_state: final_batch.last_todo_state,
+        acked_watermarks: final_batch.acked_watermarks,
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -7878,12 +8549,18 @@ mod tests {
         method: String,
         shadow_generation: u64,
         expected_shadow_seq: u64,
+        seed_id: String,
+        seed_generation: u64,
+        seed_batch_index: usize,
+        seed_batch_total: usize,
+        seed_complete: bool,
         seed_boundary_id: Option<String>,
         compartments: Vec<StrictShadowCompartment>,
         memories: Vec<StrictShadowMemory>,
         memory_mutations: Vec<StrictShadowMemoryMutation>,
         workspace: Option<StrictShadowWorkspace>,
         last_todo_state: String,
+        acked_watermarks: StrictShadowWatermarks,
     }
 
     #[allow(dead_code)]
@@ -8166,6 +8843,58 @@ mod tests {
         })
     }
 
+    fn shadow_compartment(sequence: i64, content: &str) -> Value {
+        json!({
+            "sequence": sequence,
+            "start_message": sequence,
+            "end_message": sequence,
+            "start_message_id": format!("m{sequence}#0"),
+            "end_message_id": format!("m{sequence}#0"),
+            "title": format!("c{sequence}"),
+            "content": content,
+            "p1": format!("{content}-p1"),
+        })
+    }
+
+    fn paged_seed_batch(
+        session: &str,
+        seed_id: &str,
+        generation: u64,
+        expected_seq: u64,
+        index: usize,
+        total: usize,
+        compartments: Vec<Value>,
+    ) -> Value {
+        let complete = index + 1 == total;
+        let mut batch = json!({
+            "kind": "state_sync",
+            "session_id": session,
+            "shadow_generation": generation,
+            "expected_shadow_seq": expected_seq,
+            "seed_id": seed_id,
+            "seed_generation": generation,
+            "seed_batch_index": index,
+            "seed_batch_total": total,
+            "seed_complete": complete,
+            "compartments": compartments,
+            "memories": [],
+            "memory_mutations": [],
+        });
+        if complete {
+            let object = batch.as_object_mut().unwrap();
+            object.insert("seed_boundary_id".to_string(), Value::Null);
+            object.insert("workspace".to_string(), Value::Null);
+            object.insert("last_todo_state".to_string(), json!("[]"));
+            object.insert("acked_watermarks".to_string(), json!({ "complete": true }));
+        }
+        batch
+    }
+
+    fn seed_accounting(handler: &McHandler) -> (usize, usize) {
+        let seeds = handler.shadow_seeds.lock().expect("shadow seed mutex");
+        (seeds.total_staged_bytes, seeds.pending_seed_count)
+    }
+
     #[tokio::test]
     async fn shadow_dispatch_enforces_shadow_route_precedence() {
         let state = Arc::new(ProducerState::default());
@@ -8314,6 +9043,554 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paged_shadow_seed_is_atomic_idempotent_and_matches_single_shot() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:paged"));
+        handler.bind_route(9, binding(project.to_str().unwrap(), "shadow:paged"));
+        handler.bind_route(10, binding(project.to_str().unwrap(), "shadow:single"));
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:paged" }),
+            )
+            .await;
+
+        let first_batch = paged_seed_batch(
+            "shadow:paged",
+            "seed-a",
+            1,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "first")],
+        );
+        let first_ack = match handler.dispatch_value(8, first_batch.clone()).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected first batch outcome: {other:?}"),
+        };
+        assert_eq!(first_ack["staged"], true);
+        assert_eq!(first_ack["next_expected_index"], 1);
+        assert!(store.load_compartments("shadow:paged").unwrap().is_empty());
+        let accounting_after_first = seed_accounting(&handler);
+
+        let redrive = match handler.dispatch_value(8, first_batch).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected redrive outcome: {other:?}"),
+        };
+        assert_eq!(redrive["next_expected_index"], 1);
+        assert_eq!(seed_accounting(&handler), accounting_after_first);
+
+        let stale_zero = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:paged",
+                    "stale-seed",
+                    0,
+                    0,
+                    0,
+                    2,
+                    vec![shadow_compartment(9, "stale")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(stale_zero), "shadow_generation_mismatch");
+        assert_eq!(seed_accounting(&handler), accounting_after_first);
+        let future_zero = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:paged",
+                    "future-seed",
+                    2,
+                    0,
+                    0,
+                    2,
+                    vec![shadow_compartment(9, "future")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(future_zero), "shadow_generation_mismatch");
+        assert_eq!(seed_accounting(&handler), accounting_after_first);
+
+        let competing_transform = handler
+            .dispatch_value(
+                9,
+                shadow_transform_body("shadow:paged", 1, Vec::new(), true),
+            )
+            .await;
+        assert_eq!(error_code(competing_transform), "shadow_seed_in_progress");
+        assert!(store.load_compartments("shadow:paged").unwrap().is_empty());
+        let production = call_transform(&handler, vec![ck("prod-1", 1, "production")]).await;
+        assert!(production["action"].is_string());
+
+        let final_batch = paged_seed_batch(
+            "shadow:paged",
+            "seed-a",
+            1,
+            0,
+            1,
+            2,
+            vec![shadow_compartment(1, "second")],
+        );
+        let final_ack = match handler.dispatch_value(8, final_batch.clone()).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected final batch outcome: {other:?}"),
+        };
+        assert_eq!(final_ack["shadow_seq"], 1);
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let final_redrive = match handler.dispatch_value(8, final_batch).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected final redrive outcome: {other:?}"),
+        };
+        assert_eq!(final_redrive, final_ack);
+        let mut altered_index_redrive = paged_seed_batch(
+            "shadow:paged",
+            "seed-a",
+            1,
+            0,
+            1,
+            2,
+            vec![shadow_compartment(1, "second")],
+        );
+        altered_index_redrive["seed_batch_index"] = json!(0);
+        altered_index_redrive["seed_complete"] = json!(false);
+        let index_agnostic_redrive = match handler.dispatch_value(8, altered_index_redrive).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected index-agnostic redrive outcome: {other:?}"),
+        };
+        assert_eq!(index_agnostic_redrive, final_ack);
+
+        let _ = handler
+            .dispatch_value(
+                10,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:single" }),
+            )
+            .await;
+        let single_ack = handler
+            .dispatch_value(
+                10,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "shadow:single",
+                    "shadow_generation": 1,
+                    "expected_shadow_seq": 0,
+                    "compartments": [
+                        shadow_compartment(0, "first"),
+                        shadow_compartment(1, "second"),
+                    ],
+                    "last_todo_state": "[]",
+                    "acked_watermarks": { "complete": true },
+                }),
+            )
+            .await;
+        assert!(matches!(single_ack, HandlerOutcome::Response(_)));
+        assert_eq!(
+            store.load_compartments("shadow:paged").unwrap(),
+            store.load_compartments("shadow:single").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn paged_shadow_seed_rejects_protocol_and_digest_changes_without_leaking() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let partial = handler
+            .dispatch_value(
+                8,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "shadow:ses",
+                    "shadow_generation": 1,
+                    "expected_shadow_seq": 0,
+                    "seed_id": "partial",
+                }),
+            )
+            .await;
+        assert_eq!(error_code(partial), "invalid_params");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let first = paged_seed_batch(
+            "shadow:ses",
+            "digest-seed",
+            2,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "original")],
+        );
+        assert!(matches!(
+            handler.dispatch_value(8, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let changed = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "digest-seed",
+                    2,
+                    0,
+                    0,
+                    2,
+                    vec![shadow_compartment(0, "changed")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(changed), "shadow_seed_digest_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let mut scalar_on_intermediate = paged_seed_batch(
+            "shadow:ses",
+            "scalar-seed",
+            3,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "first")],
+        );
+        scalar_on_intermediate["last_todo_state"] = json!("not-final");
+        let scalar_error = handler.dispatch_value(8, scalar_on_intermediate).await;
+        assert_eq!(error_code(scalar_error), "shadow_seed_protocol_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let mut completion_mismatch = paged_seed_batch(
+            "shadow:ses",
+            "completion-seed",
+            4,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "first")],
+        );
+        completion_mismatch["seed_complete"] = json!(true);
+        let completion_error = handler.dispatch_value(8, completion_mismatch).await;
+        assert_eq!(
+            error_code(completion_error),
+            "shadow_seed_protocol_mismatch"
+        );
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let mut missing_final_scalar = paged_seed_batch(
+            "shadow:ses",
+            "missing-tail-seed",
+            5,
+            0,
+            0,
+            1,
+            vec![shadow_compartment(0, "only")],
+        );
+        missing_final_scalar
+            .as_object_mut()
+            .expect("seed body")
+            .remove("workspace");
+        let missing_tail = handler.dispatch_value(8, missing_final_scalar).await;
+        assert_eq!(error_code(missing_tail), "shadow_seed_protocol_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let first = paged_seed_batch(
+            "shadow:ses",
+            "gap-seed",
+            6,
+            0,
+            0,
+            3,
+            vec![shadow_compartment(0, "first")],
+        );
+        assert!(matches!(
+            handler.dispatch_value(8, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let gap = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "gap-seed",
+                    6,
+                    0,
+                    2,
+                    3,
+                    vec![shadow_compartment(2, "gap")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(gap), "shadow_seed_order_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+    }
+
+    #[test]
+    fn shadow_seed_pending_count_is_handler_wide_and_bounded() {
+        let mut seeds = ShadowSeedCoordinator {
+            max_pending_seeds: 1,
+            ..ShadowSeedCoordinator::default()
+        };
+        assert!(seeds.arm_after_reset("shadow:a", 1, 0));
+        assert!(!seeds.arm_after_reset("shadow:b", 1, 0));
+        assert_eq!(seeds.pending_seed_count, 1);
+        assert!(matches!(
+            seeds.sessions.get("shadow:a").map(|state| &state.phase),
+            Some(ShadowSeedPhase::AwaitingSeed { .. })
+        ));
+        assert!(matches!(
+            seeds.sessions.get("shadow:b").map(|state| &state.phase),
+            Some(ShadowSeedPhase::Idle)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shadow_seed_handler_wide_accounting_releases_every_non_apply_exit() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:a"));
+        handler.bind_route(9, binding(project.to_str().unwrap(), "shadow:b"));
+        let batch_a = paged_seed_batch(
+            "shadow:a",
+            "seed-a",
+            1,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, &"a".repeat(256))],
+        );
+        let batch_b = paged_seed_batch(
+            "shadow:b",
+            "seed-b",
+            1,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, &"b".repeat(256))],
+        );
+        let bytes_a = serde_json::to_vec(&batch_a).unwrap().len();
+        let bytes_b = serde_json::to_vec(&batch_b).unwrap().len();
+        {
+            let mut seeds = handler.shadow_seeds.lock().expect("shadow seed mutex");
+            seeds.max_staged_bytes = bytes_a + bytes_b - 1;
+            seeds.max_pending_seeds = 8;
+        }
+        for (channel, session) in [(8, "shadow:a"), (9, "shadow:b")] {
+            let outcome = handler
+                .dispatch_value(
+                    channel,
+                    json!({ "kind": "shadow_reset", "session_id": session }),
+                )
+                .await;
+            assert!(matches!(outcome, HandlerOutcome::Response(_)));
+        }
+        assert!(matches!(
+            handler.dispatch_value(8, batch_a).await,
+            HandlerOutcome::Response(_)
+        ));
+        let overflow = handler.dispatch_value(9, batch_b).await;
+        assert_eq!(error_code(overflow), "shadow_seed_buffer_overflow");
+        assert_eq!(seed_accounting(&handler).1, 1);
+        assert_eq!(seed_accounting(&handler).0, bytes_a);
+
+        handler.unbind_route(8);
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:rebind"));
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:rebind" }),
+            )
+            .await;
+        let rebind_batch = paged_seed_batch(
+            "shadow:rebind",
+            "rebind-seed",
+            1,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "rebind")],
+        );
+        assert!(matches!(
+            handler.dispatch_value(8, rebind_batch).await,
+            HandlerOutcome::Response(_)
+        ));
+        assert!(seed_accounting(&handler).0 > 0);
+        let reset = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:rebind" }),
+            )
+            .await;
+        assert!(matches!(reset, HandlerOutcome::Response(_)));
+        assert_eq!(seed_accounting(&handler), (0, 1));
+        let post_reset_batch = paged_seed_batch(
+            "shadow:rebind",
+            "post-reset-seed",
+            2,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "post-reset")],
+        );
+        assert!(matches!(
+            handler.dispatch_value(8, post_reset_batch).await,
+            HandlerOutcome::Response(_)
+        ));
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:replacement"));
+        assert_eq!(seed_accounting(&handler), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn paged_shadow_seed_uses_pinned_seq_and_restart_requires_fresh_reset() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&state), default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        assert!(matches!(
+            handler
+                .dispatch_value(
+                    8,
+                    paged_seed_batch(
+                        "shadow:ses",
+                        "pinned-seed",
+                        1,
+                        0,
+                        0,
+                        2,
+                        vec![shadow_compartment(0, "first")],
+                    ),
+                )
+                .await,
+            HandlerOutcome::Response(_)
+        ));
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: "shadow:ses",
+                shadow_project_path: "shadow:ses",
+                shadow_generation: 1,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: Value::Null,
+            })
+            .unwrap();
+        let final_after_advance = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "pinned-seed",
+                    1,
+                    0,
+                    1,
+                    2,
+                    vec![shadow_compartment(1, "second")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(final_after_advance), "shadow_seq_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+        assert!(store.load_compartments("shadow:ses").unwrap().is_empty());
+
+        let restarted = McHandler::with_producer_factory_and_config(
+            Arc::new(TestProducerFactory { state }),
+            default_test_config(),
+        );
+        restarted.store.set(Arc::clone(&store)).ok().unwrap();
+        restarted.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+        let stray_final = restarted
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "old-process-seed",
+                    1,
+                    1,
+                    1,
+                    2,
+                    vec![shadow_compartment(1, "never-apply")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(stray_final), "shadow_seed_not_armed");
+        assert!(store.load_compartments("shadow:ses").unwrap().is_empty());
+
+        let reset = match restarted
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected restart reset outcome: {other:?}"),
+        };
+        let fresh_generation = reset["shadow_generation"].as_u64().unwrap();
+        let fresh = restarted
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "fresh-process-seed",
+                    fresh_generation,
+                    0,
+                    0,
+                    1,
+                    vec![shadow_compartment(0, "fresh")],
+                ),
+            )
+            .await;
+        assert!(matches!(fresh, HandlerOutcome::Response(_)));
+        assert_eq!(store.load_compartments("shadow:ses").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn shadow_transform_calibrates_once_then_quarantines_without_duplicate_rows() {
         let state = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) =
@@ -8323,6 +9600,17 @@ mod tests {
             .dispatch_value(
                 8,
                 json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "shadow:ses",
+                    "shadow_generation": 1,
+                    "expected_shadow_seq": 0,
+                }),
             )
             .await;
 

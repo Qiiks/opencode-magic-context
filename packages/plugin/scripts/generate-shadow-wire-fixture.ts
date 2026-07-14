@@ -338,6 +338,7 @@ export async function generateShadowWireFixture(): Promise<string> {
             state,
             pass: preparedPass,
             force: true,
+            seedId: "shadow-wire-fixture-seed",
         });
         if (
             sync === null ||

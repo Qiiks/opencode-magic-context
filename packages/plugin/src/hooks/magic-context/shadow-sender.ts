@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
     AdmissionClass,
@@ -68,6 +68,8 @@ const RESEED_ATTEMPT_CAP = 5;
 const SHADOW_ORDINAL_PAGE_SIZE = 500;
 const SHADOW_SEED_YIELD_EVERY_COMPARTMENTS = 10;
 const SHADOW_SEED_BUDGET_MS = 30_000;
+const SHADOW_SEED_BATCH_MAX_BYTES = 512 * 1024;
+const MAX_FACADE_FRAME_BYTES = 1024 * 1024;
 
 const declaredTrimBySession = new Map<string, { markerKey: string; trim: ShadowDeclaredTrim }>();
 
@@ -218,14 +220,167 @@ interface ShadowStateSyncPayload {
     params: {
         shadow_generation: number;
         expected_shadow_seq: number;
-        seed_boundary_id: string | null;
+        seed_id?: string;
+        seed_generation?: number;
+        seed_batch_index?: number;
+        seed_batch_total?: number;
+        seed_complete?: boolean;
+        seed_boundary_id?: string | null;
         compartments: unknown[];
         memories: unknown[];
         memory_mutations: unknown[];
-        workspace: ShadowWorkspacePayload | null;
-        last_todo_state: string;
+        workspace?: ShadowWorkspacePayload | null;
+        last_todo_state?: string;
+        acked_watermarks?: ShadowWatermarks;
     };
     watermarks: ShadowWatermarks;
+    wireBatches?: ShadowStateSyncPayload[];
+}
+
+type ShadowSeedItem =
+    | { kind: "compartment"; value: unknown }
+    | { kind: "memory"; value: unknown }
+    | { kind: "memory_mutation"; value: unknown };
+
+function flatWireBodyBytes(payload: ShadowStateSyncPayload): number {
+    return Buffer.byteLength(JSON.stringify(toFlatWireBody(payload)));
+}
+
+function buildPagedSeedPayloads(args: {
+    shadowGeneration: number;
+    expectedShadowSeq: number;
+    seedId: string;
+    seedBoundaryId: string | null;
+    compartments: unknown[];
+    memories: unknown[];
+    memoryMutations: unknown[];
+    workspace: ShadowWorkspacePayload | null;
+    lastTodoState: string;
+    watermarks: ShadowWatermarks;
+}): ShadowStateSyncPayload[] {
+    const items: ShadowSeedItem[] = [
+        ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
+        ...args.memories.map((value) => ({ kind: "memory", value }) as const),
+        ...args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const),
+    ];
+    const makePayload = (input: {
+        index: number;
+        total: number;
+        complete: boolean;
+        compartments: unknown[];
+        memories: unknown[];
+        memoryMutations: unknown[];
+    }): ShadowStateSyncPayload => ({
+        method: "state_sync",
+        params: {
+            shadow_generation: args.shadowGeneration,
+            expected_shadow_seq: args.expectedShadowSeq,
+            seed_id: args.seedId,
+            seed_generation: args.shadowGeneration,
+            seed_batch_index: input.index,
+            seed_batch_total: input.total,
+            seed_complete: input.complete,
+            compartments: input.compartments,
+            memories: input.memories,
+            memory_mutations: input.memoryMutations,
+            ...(input.complete
+                ? {
+                      seed_boundary_id: args.seedBoundaryId,
+                      workspace: args.workspace,
+                      last_todo_state: args.lastTodoState,
+                      acked_watermarks: args.watermarks,
+                  }
+                : {}),
+        },
+        watermarks: args.watermarks,
+    });
+    const appendItem = (
+        batch: { compartments: unknown[]; memories: unknown[]; memoryMutations: unknown[] },
+        item: ShadowSeedItem,
+    ): void => {
+        if (item.kind === "compartment") batch.compartments.push(item.value);
+        else if (item.kind === "memory") batch.memories.push(item.value);
+        else batch.memoryMutations.push(item.value);
+    };
+
+    let assumedTotal = 1;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        const batches: ShadowStateSyncPayload[] = [];
+        let current = { compartments: [], memories: [], memoryMutations: [] } as {
+            compartments: unknown[];
+            memories: unknown[];
+            memoryMutations: unknown[];
+        };
+        for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+            const candidate = {
+                compartments: [...current.compartments],
+                memories: [...current.memories],
+                memoryMutations: [...current.memoryMutations],
+            };
+            appendItem(candidate, items[itemIndex]);
+            const complete = itemIndex + 1 === items.length;
+            const candidatePayload = makePayload({
+                index: batches.length,
+                total: assumedTotal,
+                complete,
+                ...candidate,
+            });
+            if (flatWireBodyBytes(candidatePayload) <= SHADOW_SEED_BATCH_MAX_BYTES) {
+                current = candidate;
+                continue;
+            }
+            const currentHasItems =
+                current.compartments.length > 0 ||
+                current.memories.length > 0 ||
+                current.memoryMutations.length > 0;
+            if (currentHasItems) {
+                batches.push(
+                    makePayload({
+                        index: batches.length,
+                        total: assumedTotal,
+                        complete: false,
+                        ...current,
+                    }),
+                );
+            }
+            current = { compartments: [], memories: [], memoryMutations: [] };
+            appendItem(current, items[itemIndex]);
+            const itemOnlyPayload = makePayload({
+                index: batches.length,
+                total: assumedTotal,
+                complete: false,
+                ...current,
+            });
+            if (flatWireBodyBytes(itemOnlyPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
+                throw new Error("shadow seed item exceeds the 512 KiB batch limit");
+            }
+            if (complete) {
+                const itemWithTailPayload = makePayload({
+                    index: batches.length,
+                    total: assumedTotal,
+                    complete: true,
+                    ...current,
+                });
+                if (flatWireBodyBytes(itemWithTailPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
+                    batches.push(itemOnlyPayload);
+                    current = { compartments: [], memories: [], memoryMutations: [] };
+                }
+            }
+        }
+        const finalPayload = makePayload({
+            index: batches.length,
+            total: assumedTotal,
+            complete: true,
+            ...current,
+        });
+        if (flatWireBodyBytes(finalPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
+            throw new Error("shadow seed scalar tail exceeds the 512 KiB batch limit");
+        }
+        batches.push(finalPayload);
+        if (batches.length === assumedTotal) return batches;
+        assumedTotal = batches.length;
+    }
+    throw new Error("shadow seed batch count did not stabilize");
 }
 
 function emptyCounters(): ShadowSenderCounters {
@@ -835,6 +990,7 @@ async function buildStateSyncPayload(args: {
     shouldAbortSeed?: () => boolean;
     beforeSerializeCompartment?: () => void;
     yieldEveryCompartments?: number;
+    seedId?: string;
 }): Promise<
     ShadowStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" | "seed_budget"
 > {
@@ -970,21 +1126,39 @@ async function buildStateSyncPayload(args: {
           }))
         : [];
     const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
-
+    const shadowGeneration = args.state.shadowGeneration;
+    const expectedShadowSeq = args.state.lastAckedSeq;
+    const seedBoundaryId =
+        args.state.seedPassPending && compartments.length > 0
+            ? (args.pass.declaredTrim?.flat_boundary_id ?? null)
+            : null;
+    if (args.force) {
+        const wireBatches = buildPagedSeedPayloads({
+            shadowGeneration,
+            expectedShadowSeq,
+            seedId: args.seedId ?? randomUUID(),
+            seedBoundaryId,
+            compartments,
+            memories,
+            memoryMutations,
+            workspace: workspace.workspace,
+            lastTodoState: sessionMeta.lastTodoState ?? "",
+            watermarks: currentWatermarks,
+        });
+        return { ...wireBatches[0], wireBatches };
+    }
     return {
         method: "state_sync",
         params: {
-            shadow_generation: args.state.shadowGeneration,
-            expected_shadow_seq: args.state.lastAckedSeq,
-            seed_boundary_id:
-                args.state.seedPassPending && compartments.length > 0
-                    ? (args.pass.declaredTrim?.flat_boundary_id ?? null)
-                    : null,
+            shadow_generation: shadowGeneration,
+            expected_shadow_seq: expectedShadowSeq,
+            seed_boundary_id: seedBoundaryId,
             compartments,
             memories,
             memory_mutations: memoryMutations,
             workspace: workspace.workspace,
             last_todo_state: sessionMeta.lastTodoState ?? "",
+            acked_watermarks: currentWatermarks,
         },
         watermarks: currentWatermarks,
     } satisfies ShadowStateSyncPayload;
@@ -1146,10 +1320,36 @@ export function createShadowSender(
         return state;
     };
 
-    const disableIfSeedBudgetExceeded = (sessionId: string, state: SessionQueueState): boolean => {
+    const remainingSeedBudgetMs = (state: SessionQueueState): number => {
         const activeElapsed =
             state.seedStartedAtMs === null ? 0 : Math.max(0, seedClock() - state.seedStartedAtMs);
-        if (state.seedBudgetSpentMs + activeElapsed <= seedBudgetMs) return false;
+        return seedBudgetMs - state.seedBudgetSpentMs - activeElapsed;
+    };
+
+    const markResetRequired = (
+        sessionId: string,
+        state: SessionQueueState,
+        reason: string,
+    ): void => {
+        transport.closeSession?.(sessionId);
+        state.initialized = false;
+        state.blockedUntilReset = true;
+        state.requireResetReason = reason;
+        state.lastAckedWatermarks = null;
+        state.seedPassPending = true;
+    };
+
+    const requireSeedBudget = (state: SessionQueueState): number => {
+        const remaining = remainingSeedBudgetMs(state);
+        if (remaining > 0) return remaining;
+        const error = new Error("shadow seed budget exhausted") as Error & { code?: string };
+        error.code = "shadow_seed_budget";
+        throw error;
+    };
+
+    const disableIfSeedBudgetExceeded = (sessionId: string, state: SessionQueueState): boolean => {
+        if (remainingSeedBudgetMs(state) > 0) return false;
+        markResetRequired(sessionId, state, "seed_budget");
         if (!state.skipped) {
             state.skipped = true;
             state.queue.length = 0;
@@ -1209,19 +1409,21 @@ export function createShadowSender(
     const callTransport = async (
         state: SessionQueueState,
         args: Parameters<ShadowTransport["call"]>[0],
+        timeoutCapMs = sendTimeoutMs,
     ): Promise<unknown> => {
         const controller = new AbortController();
+        const requestTimeoutMs = Math.max(1, Math.min(sendTimeoutMs, Math.floor(timeoutCapMs)));
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeout = new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
                 state.counters.send_timeouts += 1;
-                const error = new Error(`shadow send timeout after ${sendTimeoutMs}ms`) as Error & {
-                    code?: string;
-                };
+                const error = new Error(
+                    `shadow send timeout after ${requestTimeoutMs}ms`,
+                ) as Error & { code?: string };
                 error.code = "ETIMEDOUT";
                 controller.abort(error);
                 reject(error);
-            }, sendTimeoutMs);
+            }, requestTimeoutMs);
         });
         try {
             return await Promise.race([
@@ -1249,9 +1451,7 @@ export function createShadowSender(
                     disableIfSeedBudgetExceeded(sessionId, state);
                 } catch (error) {
                     state.counters.send_failures += 1;
-                    state.initialized = false;
-                    state.blockedUntilReset = true;
-                    state.requireResetReason ??= item.reason || "reset_retry";
+                    markResetRequired(sessionId, state, item.reason || "reset_retry");
                     sessionLog(sessionId, "shadow: reset failed (ignored):", error);
                 }
                 continue;
@@ -1296,12 +1496,17 @@ export function createShadowSender(
         args.state.seedStartedAtMs = seedClock();
         const projectRoot = args.projectRoot ?? process.cwd();
         const body = toFlatWireBody(buildShadowResetBody(args));
-        const response = await callTransport(args.state, {
-            sessionId: args.sessionId,
-            projectRoot,
-            method: "shadow_reset",
-            body,
-        });
+        const response = await callTransport(
+            args.state,
+            {
+                sessionId: args.sessionId,
+                projectRoot,
+                method: "shadow_reset",
+                body,
+            },
+            requireSeedBudget(args.state),
+        );
+        requireSeedBudget(args.state);
         args.state.shadowGeneration = numericAck(
             response,
             ["shadow_generation", "generation"],
@@ -1379,23 +1584,30 @@ export function createShadowSender(
                 memoCanonicalCount: state.idOrdinalMemoCanonicalCount,
             });
         } catch (error) {
+            if (state.seedPassPending)
+                markResetRequired(pass.sessionId, state, "seed_capture_failed");
             sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
             return;
         }
         if (!resolved.ok) {
             if (resolved.reason === "mismatch") {
                 state.counters.ordinal_mismatch += 1;
-                state.requireResetReason = "ordinal_mismatch";
-                state.blockedUntilReset = true;
                 state.idOrdinalMemo.clear();
-                await performReset({
-                    sessionId: pass.sessionId,
-                    state,
-                    reason: "ordinal_mismatch",
-                    projectRoot: pass.projectRoot,
-                });
+                if (state.seedPassPending) {
+                    markResetRequired(pass.sessionId, state, "ordinal_mismatch");
+                } else {
+                    await performReset({
+                        sessionId: pass.sessionId,
+                        state,
+                        reason: "ordinal_mismatch",
+                        projectRoot: pass.projectRoot,
+                    });
+                    if (!state.skipped) await processPass(state, pass);
+                }
             } else {
                 state.counters.ordinal_unresolved += 1;
+                if (state.seedPassPending)
+                    markResetRequired(pass.sessionId, state, "seed_ordinal_unresolved");
                 sessionLog(
                     pass.sessionId,
                     `shadow: pass skipped; unresolved ordinal for ${resolved.messageId ?? "unknown"}`,
@@ -1455,6 +1667,8 @@ export function createShadowSender(
                 yieldEveryCompartments: options.seedYieldEveryCompartments,
             });
         } catch (error) {
+            if (state.seedPassPending)
+                markResetRequired(pass.sessionId, state, "seed_capture_failed");
             sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
             return;
         }
@@ -1485,6 +1699,7 @@ export function createShadowSender(
                 }
                 syncPayload = fullSync;
             } catch (error) {
+                markResetRequired(pass.sessionId, state, "seed_capture_failed");
                 sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
                 return;
             }
@@ -1493,40 +1708,94 @@ export function createShadowSender(
             disableIfSeedBudgetExceeded(pass.sessionId, state);
             return;
         }
-        if (state.seedPassPending) {
-            if (disableIfSeedBudgetExceeded(pass.sessionId, state)) return;
-            state.seedStartedAtMs = null;
-            state.seedBudgetSpentMs = 0;
-        }
         if (syncPayload === "mismatch") {
             state.counters.ordinal_mismatch += 1;
-            state.requireResetReason = "ordinal_mismatch";
-            await performReset({
-                sessionId: pass.sessionId,
-                state,
-                reason: "ordinal_mismatch",
-                projectRoot: pass.projectRoot,
-            });
+            markResetRequired(pass.sessionId, state, "ordinal_mismatch");
             return;
         }
         if (syncPayload === "unresolved") {
             state.counters.ordinal_unresolved += 1;
+            if (state.seedPassPending)
+                markResetRequired(pass.sessionId, state, "seed_compartment_unresolved");
             sessionLog(
                 pass.sessionId,
                 "shadow: state sync skipped; compartment ordinal unresolved",
             );
             return;
         }
+        if (
+            syncPayload !== null &&
+            !syncPayload.wireBatches &&
+            flatWireBodyBytes(syncPayload) >= MAX_FACADE_FRAME_BYTES
+        ) {
+            await performReset({
+                sessionId: pass.sessionId,
+                state,
+                reason: "oversized_state_sync",
+                projectRoot: pass.projectRoot,
+            });
+            try {
+                const pagedSeed = await buildStateSyncPayload({
+                    state,
+                    pass: preparedPass,
+                    force: true,
+                    shouldAbortSeed: () => remainingSeedBudgetMs(state) <= 0,
+                    beforeSerializeCompartment: options.beforeSerializeCompartment,
+                    yieldEveryCompartments: options.seedYieldEveryCompartments,
+                });
+                if (
+                    pagedSeed === null ||
+                    pagedSeed === "m0_mutation" ||
+                    pagedSeed === "mismatch" ||
+                    pagedSeed === "unresolved"
+                ) {
+                    throw new Error(`forced paged seed failed: ${String(pagedSeed)}`);
+                }
+                if (pagedSeed === "seed_budget") {
+                    disableIfSeedBudgetExceeded(pass.sessionId, state);
+                    return;
+                }
+                syncPayload = pagedSeed;
+            } catch (error) {
+                markResetRequired(pass.sessionId, state, "seed_rebuild_failed");
+                throw error;
+            }
+        }
         if (syncPayload !== null) {
+            const wireBatches = syncPayload.wireBatches ?? [syncPayload];
+            const pagedSeed = syncPayload.wireBatches !== undefined;
             let response: unknown;
             try {
-                response = await callTransport(state, {
-                    sessionId: pass.sessionId,
-                    projectRoot: pass.projectRoot,
-                    method: "state_sync",
-                    body: toFlatWireBody(syncPayload),
-                });
+                for (let index = 0; index < wireBatches.length; index += 1) {
+                    const batch = wireBatches[index];
+                    const timeoutCap = pagedSeed ? requireSeedBudget(state) : sendTimeoutMs;
+                    response = await callTransport(
+                        state,
+                        {
+                            sessionId: pass.sessionId,
+                            projectRoot: pass.projectRoot,
+                            method: "state_sync",
+                            body: toFlatWireBody(batch),
+                        },
+                        timeoutCap,
+                    );
+                    if (pagedSeed) requireSeedBudget(state);
+                    if (index + 1 < wireBatches.length) continue;
+                    state.lastAckedSeq = numericAck(
+                        response,
+                        ["shadow_seq", "seq"],
+                        batch.params.expected_shadow_seq + 1,
+                    );
+                    state.lastAckedWatermarks = syncPayload.watermarks;
+                }
             } catch (error) {
+                if (pagedSeed) {
+                    markResetRequired(
+                        pass.sessionId,
+                        state,
+                        errorCode(error) ?? "seed_batch_failed",
+                    );
+                }
                 if (isSeedBoundaryReject(error) && beginReseed(state)) {
                     await performReset({
                         sessionId: pass.sessionId,
@@ -1540,12 +1809,10 @@ export function createShadowSender(
                 throw error;
             }
             if (state.skipped) return;
-            state.lastAckedSeq = numericAck(
-                response,
-                ["shadow_seq", "seq"],
-                syncPayload.params.expected_shadow_seq + 1,
-            );
-            state.lastAckedWatermarks = syncPayload.watermarks;
+            if (pagedSeed) {
+                state.seedStartedAtMs = null;
+                state.seedBudgetSpentMs = 0;
+            }
         }
 
         const transformBody = toFlatWireBody(
@@ -1779,10 +2046,14 @@ class SubcShadowTransport implements ShadowTransport {
 }
 
 export const __shadowSenderTest = {
+    MAX_FACADE_FRAME_BYTES,
+    SHADOW_SEED_BATCH_MAX_BYTES,
     SubcShadowTransport,
+    buildPagedSeedPayloads,
     buildShadowResetBody,
     buildShadowTransformBody,
     buildStateSyncPayload,
+    flatWireBodyBytes,
     createSessionQueueState,
     denormalizeShadowOutput,
     flatBlockIdForRawMessage,
