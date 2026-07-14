@@ -11,12 +11,18 @@ import { getAdapter, getInstalledAdapters } from "../adapters";
 import type { HarnessAdapter, HarnessKind } from "../adapters/types";
 import { log, selectMany, selectOne } from "./prompts";
 
-function parseHarnessFlag(argv: string[]): HarnessKind | null {
+type HarnessFlagResult =
+    | { kind: "absent" }
+    | { kind: "valid"; harness: HarnessKind }
+    | { kind: "invalid"; value: string | null };
+
+function parseHarnessFlag(argv: string[]): HarnessFlagResult {
     const idx = argv.indexOf("--harness");
-    if (idx === -1 || idx === argv.length - 1) return null;
+    if (idx === -1) return { kind: "absent" };
     const value = argv[idx + 1];
-    if (value === "opencode" || value === "pi") return value;
-    return null;
+    if (!value || value.startsWith("--")) return { kind: "invalid", value: null };
+    if (value === "opencode" || value === "pi") return { kind: "valid", harness: value };
+    return { kind: "invalid", value };
 }
 
 export interface ResolveOptions {
@@ -42,7 +48,14 @@ export async function resolveAdaptersForCommand(
     options: ResolveOptions,
 ): Promise<HarnessAdapter[]> {
     const flag = parseHarnessFlag(argv);
-    if (flag) return [getAdapter(flag)];
+    if (flag.kind === "valid") return [getAdapter(flag.harness)];
+    if (flag.kind === "invalid") {
+        throw new Error(
+            flag.value === null
+                ? "Missing value for --harness (expected opencode or pi)"
+                : `Invalid --harness value: ${flag.value} (expected opencode or pi)`,
+        );
+    }
 
     const installed = getInstalledAdapters();
 

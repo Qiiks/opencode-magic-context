@@ -83,10 +83,9 @@ describe("storage-meta", () => {
             //#then
             // 2 transactions: outer clearSession + nested clearIndexedMessages
             expect(db.transaction).toHaveBeenCalledTimes(2);
-            // 23 prepares: includes session_projects, primer_candidates, compartment_chunk_embeddings,
-            // v2 m0_mutation_log + compartment_events, subagent_invocations,
-            // historian_runs, legacy plugin_messages, and transform_decisions cleanup.
-            expect(db.prepare).toHaveBeenCalledTimes(23);
+            // 24 prepares: includes every session-scoped table plus the nested
+            // message-index and compression-depth cleanup statements.
+            expect(db.prepare).toHaveBeenCalledTimes(24);
         });
     });
 });

@@ -1,3 +1,4 @@
+import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { getPendingSmartNotes, type Note, type NoteCheckStatus } from "../storage-notes";
 import {
@@ -18,14 +19,32 @@ function toSmartNote(note: Note): SmartNoteCheckNote {
     };
 }
 
+export type SmartNoteCommitExpectation =
+    | {
+          kind: "source-revision";
+          noteId: number;
+          content: string;
+          surfaceCondition: string | null;
+          updatedAt: number;
+          checkStatus?: NoteCheckStatus;
+      }
+    | {
+          kind: "compiled-check";
+          noteId: number;
+          compiledCheck: string;
+          checkHash: string | null;
+          checkCompiledAt: number | null;
+      };
+
 export function commitSmartNoteState(
     db: Database,
     args: {
         phase: string;
+        expected: SmartNoteCommitExpectation;
         leaseHeld?: () => boolean;
         write: () => void;
     },
-): void {
+): boolean {
     // BEGIN IMMEDIATE, not a plain (deferred) transaction: the lease check reads
     // before the write, and a deferred read→write lock upgrade returns
     // SQLITE_BUSY immediately when another writer holds the lock — busy_timeout
@@ -34,14 +53,16 @@ export function commitSmartNoteState(
     // waits under busy_timeout like every other writer.
     db.exec("BEGIN IMMEDIATE");
     let leaseLost = false;
+    let committed = false;
     try {
         // State transitions surface notes or change future scheduling. The lease
-        // check must be inside the same write transaction so ownership cannot be
-        // lost between a pre-check and the durable update.
+        // check and compare-and-set guard share the write transaction so neither
+        // ownership nor the user's source state can change before the update.
         if (args.leaseHeld && !args.leaseHeld()) {
             leaseLost = true;
-        } else {
+        } else if (claimExpectedState(db, args.expected)) {
             args.write();
+            committed = true;
         }
         db.exec("COMMIT");
     } catch (error) {
@@ -55,6 +76,47 @@ export function commitSmartNoteState(
     if (leaseLost) {
         throw new Error(`Dream lease lost during smart-note ${args.phase} commit`);
     }
+    if (!committed) {
+        log(`[debug] smart note #${args.expected.noteId}: discarded stale ${args.phase} result`);
+    }
+    return committed;
+}
+
+function claimExpectedState(db: Database, expected: SmartNoteCommitExpectation): boolean {
+    if (expected.kind === "compiled-check") {
+        return (
+            db
+                .prepare(
+                    `UPDATE notes SET id = id
+                     WHERE id = ? AND type = 'smart' AND status = 'pending'
+                       AND check_status = 'compiled' AND compiled_check = ?
+                       AND check_hash IS ? AND check_compiled_at IS ?`,
+                )
+                .run(
+                    expected.noteId,
+                    expected.compiledCheck,
+                    expected.checkHash,
+                    expected.checkCompiledAt,
+                ).changes > 0
+        );
+    }
+    const statusClause = expected.checkStatus ? " AND check_status = ?" : "";
+    const params: Array<string | number | null> = [
+        expected.noteId,
+        expected.content,
+        expected.surfaceCondition,
+        expected.updatedAt,
+    ];
+    if (expected.checkStatus) params.push(expected.checkStatus);
+    return (
+        db
+            .prepare(
+                `UPDATE notes SET id = id
+                 WHERE id = ? AND type = 'smart' AND status = 'pending'
+                   AND content = ? AND surface_condition IS ? AND updated_at = ?${statusClause}`,
+            )
+            .run(...params).changes > 0
+    );
 }
 
 export function getDueCompiledSmartNoteChecks(

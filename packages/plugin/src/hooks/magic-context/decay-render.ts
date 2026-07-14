@@ -53,10 +53,16 @@ function formatDateRange(startDate?: string | null, endDate?: string | null): st
     return `${startDate}→${endDate}`;
 }
 
+function sanitizeCompartmentTitle(title: string): string {
+    // Historian-authored titles are untrusted: Cc, line-separator, and paragraph-
+    // separator runs must collapse or they can forge a visually multiline heading.
+    return escapeXmlContent(title.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " "));
+}
+
 function compartmentHeading(c: DecayRenderCompartment): string {
     const dateRange = formatDateRange(c.startDate, c.endDate);
     const dateSegment = dateRange ? ` · ${dateRange}` : "";
-    return `## ${c.startMessage}-${c.endMessage}${dateSegment} · ${c.title}`;
+    return `## ${c.startMessage}-${c.endMessage}${dateSegment} · ${sanitizeCompartmentTitle(c.title)}`;
 }
 
 function guardCompartmentBody(body: string): string {

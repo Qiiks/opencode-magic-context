@@ -389,10 +389,15 @@ async function showRecompDialog(api: TuiPluginApi, targetSessionId = getSessionI
         return false
     }
 
-    const count = await getCompartmentCount(sessionId)
+    const countResult = await getCompartmentCount(sessionId)
     // Ack only after the dialog is actually shown for the same active session;
     // route switches while the RPC detail load is in flight must leave it pending.
     if (getSessionId(api) !== sessionId) return false
+    if (!countResult.ok) {
+        showToast(api, { message: "Unable to load recomp details", variant: "error" })
+        return false
+    }
+    const count = countResult.count
 
     api.ui.dialog.replace(() => (
         <api.ui.DialogConfirm
@@ -407,8 +412,12 @@ async function showRecompDialog(api: TuiPluginApi, targetSessionId = getSessionI
                 "",
                 "Proceed?",
             ].join("\n")}
-            onConfirm={() => {
-                void requestRecomp(sessionId)
+            onConfirm={async () => {
+                const requested = await requestRecomp(sessionId)
+                if (!requested) {
+                    showToast(api, { message: "Recomp request failed", variant: "error" })
+                    return
+                }
                 kickRecompProgressRefresh()
                 showToast(api, { message: "Recomp requested — historian will start shortly", variant: "info" })
             }}
@@ -465,10 +474,14 @@ function showUpgradeDialog(
             <api.ui.DialogConfirm
                 title={title}
                 message={message}
-                onConfirm={() => {
-                    // Start the sidebar's recomp self-poll immediately — the RPC
-                    // call fires no message event, so without this the progress
-                    // bar wouldn't appear until the upgrade finished.
+                onConfirm={async () => {
+                    const started = await requestUpgrade(sessionId)
+                    if (!started) {
+                        showToast(api, { message: "Session upgrade request failed", variant: "error" })
+                        return
+                    }
+                    // The RPC call fires no message event, so start the sidebar's
+                    // progress poll only after the server accepts the request.
                     kickRecompProgressRefresh()
                     showToast(api, {
                         message: resume
@@ -476,15 +489,7 @@ function showUpgradeDialog(
                             : "Session upgrade started — running in the background",
                         variant: "info",
                     })
-                    // Dismiss the durable reminder ONLY after the upgrade request
-                    // actually started. If requestUpgrade() returns false (RPC /
-                    // server / db / auth failure, restart race), the session stays
-                    // legacy — dismissing first would set upgradeRemindedAt and
-                    // suppress all future reminders for a session that never
-                    // upgraded. (Resume prompts are staging-driven and unaffected.)
-                    void requestUpgrade(sessionId).then((started) => {
-                        if (started) void dismissUpgradeReminder(sessionId)
-                    })
+                    void dismissUpgradeReminder(sessionId)
                 }}
                 onCancel={() => {
                     // Explicit decline → set the durable stamp so we don't re-prompt
@@ -724,13 +729,21 @@ async function showStartupAnnouncement(api: TuiPluginApi): Promise<void> {
 }
 
 const tui: TuiPlugin = async (api, _options, meta) => {
-    // Initialize RPC client for server communication
     const directory = api.state.path.directory ?? ""
+    // A conflicted installation intentionally has no server. Gate before RPC
+    // discovery or socket startup so disabled installs perform no idle work.
+    const conflictResult = detectConflicts(directory)
+    if (conflictResult.hasConflict) {
+        showConflictDialog(api, directory, conflictResult.reasons, conflictResult.conflicts)
+        return
+    }
+
     initRpcClient(directory)
     await refreshToastDurationMs()
 
     // Register sidebar slot
-    api.slots.register(createSidebarContentSlot(api))
+    const sidebarSlot = createSidebarContentSlot(api)
+    api.slots.register(sidebarSlot)
 
     // Register TUI command palette entries (no slash field — slash commands
     // are registered server-side so there's only one /ctx-* registration).
@@ -759,7 +772,7 @@ const tui: TuiPlugin = async (api, _options, meta) => {
         // session; global (session-less) ones always apply. Returning false leaves
         // it unacked so a TUI on the right session (or a later switch back) still
         // gets it.
-        if (n.sessionId && requestedSessionId && n.sessionId !== requestedSessionId) {
+        if (n.sessionId !== undefined && n.sessionId !== requestedSessionId) {
             return false
         }
         if (n.type === "toast") {
@@ -825,15 +838,10 @@ const tui: TuiPlugin = async (api, _options, meta) => {
 
     // Clean up on dispose
     api.lifecycle.onDispose(() => {
+        sidebarSlot.dispose()
         stopNotificationSocket()
         closeRpc()
     })
-
-    const conflictResult = detectConflicts(directory)
-    if (conflictResult.hasConflict) {
-        showConflictDialog(api, directory, conflictResult.reasons, conflictResult.conflicts)
-        return
-    }
 
     // Show one-shot release announcement after conflict gate.
     // Fire-and-forget: if the server isn't ready or RPC fails, the next TUI

@@ -18,6 +18,8 @@ pub struct PiSessionMeta {
     pub first_message: String,
     pub session_name: Option<String>,
     pub parent_session_path: Option<String>,
+    #[serde(skip)]
+    pub has_usage_event: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +95,20 @@ pub fn scan_pi_session_dir() -> Vec<PiSessionMeta> {
         return Vec::new();
     };
     scan_pi_session_dir_at(&root)
+}
+
+pub fn scan_pi_cache_session_dir() -> Vec<PiSessionMeta> {
+    let Some(root) = pi_sessions_root() else {
+        return Vec::new();
+    };
+    scan_pi_cache_session_dir_at(&root)
+}
+
+fn scan_pi_cache_session_dir_at(root: &Path) -> Vec<PiSessionMeta> {
+    scan_pi_session_dir_at(root)
+        .into_iter()
+        .filter(|meta| meta.has_usage_event)
+        .collect()
 }
 
 pub fn scan_pi_session_dir_at(root: &Path) -> Vec<PiSessionMeta> {
@@ -183,6 +199,7 @@ fn read_pi_session_meta_uncached(path: &Path, mtime: SystemTime) -> Option<PiSes
     let mut first_message = String::new();
     let mut session_name = None;
     let mut last_activity_line = None;
+    let mut has_usage_event = false;
 
     for line in lines.map_while(Result::ok) {
         if json_string_field_is(&line, "type", "session_info") {
@@ -204,12 +221,18 @@ fn read_pi_session_meta_uncached(path: &Path, mtime: SystemTime) -> Option<PiSes
         if !is_user && !is_assistant {
             continue;
         }
-        if first_message.is_empty() && is_user {
+        if (first_message.is_empty() && is_user) || (!has_usage_event && is_assistant) {
             if let Some(entry) = parse_json_line(&line) {
                 if let Some(message) = entry.get("message") {
-                    let text = normalize_title(&extract_text_content(message));
-                    if !text.is_empty() {
-                        first_message = text;
+                    if first_message.is_empty() && is_user {
+                        let text = normalize_title(&extract_text_content(message));
+                        if !text.is_empty() {
+                            first_message = text;
+                        }
+                    }
+                    if !has_usage_event && is_assistant {
+                        has_usage_event =
+                            extract_usage(message).is_some_and(|usage| usage.total > 0);
                     }
                 }
             }
@@ -245,6 +268,7 @@ fn read_pi_session_meta_uncached(path: &Path, mtime: SystemTime) -> Option<PiSes
             .get("parentSession")
             .and_then(Value::as_str)
             .map(ToString::to_string),
+        has_usage_event,
     })
 }
 
@@ -595,6 +619,7 @@ mod tests {
 
         let metas = scan_pi_session_dir();
         assert_eq!(metas.len(), 1);
+        assert_eq!(scan_pi_cache_session_dir_at(dir.path()).len(), 1);
         assert_eq!(metas[0].session_id, "s1");
         assert_eq!(metas[0].cwd, "/tmp/proj");
         assert_eq!(metas[0].message_count, 2);
@@ -604,6 +629,22 @@ mod tests {
         let detail = read_pi_session_detail(&path).unwrap();
         assert_eq!(detail.messages.len(), 2);
         assert_eq!(detail.messages[1].usage.as_ref().unwrap().total, 20);
+    }
+
+    #[test]
+    fn eventless_session_is_excluded_only_from_cache_discovery() {
+        clear_caches_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        fixture_path(
+            &dir,
+            r#"{"type":"session","id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/proj"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"hello"}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":"no accounting"}}
+"#,
+        );
+
+        assert_eq!(scan_pi_session_dir_at(dir.path()).len(), 1);
+        assert!(scan_pi_cache_session_dir_at(dir.path()).is_empty());
     }
 
     #[test]

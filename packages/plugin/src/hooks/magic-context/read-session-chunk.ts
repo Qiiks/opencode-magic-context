@@ -19,9 +19,17 @@ import {
     type SessionChunkLine,
 } from "./read-session-formatting";
 import {
+    countRawSessionMessageOrdinalsFromDb,
+    countStoredRawSessionMessagesFromDb,
     type RawMessage,
+    type RawMessageOrdinalAnchor,
+    type RawMessageOrdinalEntry,
+    type RawMessageParts,
     readRawSessionMessageByIdFromDb,
     readRawSessionMessageIdOrdinalsFromDb,
+    readRawSessionMessageOrdinalPageFromDb,
+    readRawSessionMessagePageFromDb,
+    readRawSessionMessagePartsByIdFromDb,
     readRawSessionMessagesFromDb,
     readRawSessionTailFromDb,
 } from "./read-session-raw";
@@ -99,10 +107,18 @@ let activeAbsoluteCountCache: Map<string, number> | null = null;
  */
 export interface RawMessageProvider {
     readMessages(): RawMessage[];
+    readMessagePage?: (afterOrdinal: number, limit: number, finalWatermark: number) => RawMessage[];
     readMessageById?: (messageId: string) => RawMessage | null;
+    readMessagePartsById?: (messageId: string) => RawMessageParts | null;
     readMessageIdOrdinals?: () => Map<string, number>;
+    readMessageOrdinalPage?: (
+        after: RawMessageOrdinalAnchor | null,
+        limit: number,
+    ) => RawMessageOrdinalEntry[];
     /** Optional fast count path; falls back to readMessages().length. */
     getMessageCount?: () => number;
+    /** Stored row count including compaction summaries, used for ordinal drift detection. */
+    getStoredMessageCount?: () => number;
 }
 
 const sessionProviders = new Map<string, RawMessageProvider>();
@@ -218,6 +234,43 @@ export function readRawSessionMessages(sessionId: string): RawMessage[] {
     return readRawSessionMessagesFromSource(sessionId);
 }
 
+export function readRawSessionMessagePage(
+    sessionId: string,
+    afterOrdinal: number,
+    limit: number,
+    finalWatermark: number,
+): RawMessage[] {
+    const provider = sessionProviders.get(sessionId);
+    if (provider?.readMessagePage) {
+        return provider.readMessagePage(afterOrdinal, limit, finalWatermark);
+    }
+    if (provider) {
+        return provider
+            .readMessages()
+            .filter(
+                (message) => message.ordinal > afterOrdinal && message.ordinal <= finalWatermark,
+            )
+            .slice(0, limit);
+    }
+    if (!openCodeDbExists()) return [];
+    return withReadOnlySessionDb((db) =>
+        readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, finalWatermark),
+    );
+}
+
+export function getRawSessionMessageOrdinalCount(sessionId: string): number {
+    const provider = sessionProviders.get(sessionId);
+    if (provider) {
+        if (provider.getMessageCount) return provider.getMessageCount();
+        return provider.readMessages().length;
+    }
+    if (!openCodeDbExists()) return 0;
+    return withReadOnlySessionDb((db) => countRawSessionMessageOrdinalsFromDb(db, sessionId));
+}
+
+readRawSessionMessages.readPage = readRawSessionMessagePage;
+readRawSessionMessages.getCount = getRawSessionMessageOrdinalCount;
+
 /**
  * Prime the active raw-message cache with a TAIL-ONLY read (only messages
  * at/after the last compartment boundary), so subsequent
@@ -304,6 +357,48 @@ export function primeInMemoryTailRawMessageCache(args: {
     return true;
 }
 
+export function readRawSessionMessageOrdinalPage(
+    sessionId: string,
+    after: RawMessageOrdinalAnchor | null,
+    limit: number,
+): RawMessageOrdinalEntry[] {
+    const provider = sessionProviders.get(sessionId);
+    if (provider?.readMessageOrdinalPage) return provider.readMessageOrdinalPage(after, limit);
+    if (provider) {
+        const rows = provider
+            .readMessages()
+            .map((message) => ({
+                id: message.id,
+                timeCreated: message.createdAt ?? message.ordinal,
+                contributesOrdinal: true,
+                hasValidInfo: true,
+            }))
+            .filter(
+                (row) =>
+                    !after ||
+                    row.timeCreated > after.timeCreated ||
+                    (row.timeCreated === after.timeCreated && row.id > after.id),
+            )
+            .sort(
+                (left, right) =>
+                    left.timeCreated - right.timeCreated || left.id.localeCompare(right.id),
+            );
+        return rows.slice(0, Math.max(1, Math.floor(limit)));
+    }
+    if (!openCodeDbExists()) return [];
+    return withReadOnlySessionDb((db) =>
+        readRawSessionMessageOrdinalPageFromDb(db, sessionId, after, limit),
+    );
+}
+
+export function getRawSessionStoredMessageCount(sessionId: string): number {
+    const provider = sessionProviders.get(sessionId);
+    if (provider?.getStoredMessageCount) return provider.getStoredMessageCount();
+    if (provider) return provider.readMessages().length;
+    if (!openCodeDbExists()) return 0;
+    return withReadOnlySessionDb((db) => countStoredRawSessionMessagesFromDb(db, sessionId));
+}
+
 export function readRawSessionMessageIdOrdinals(sessionId: string): Map<string, number> {
     const provider = sessionProviders.get(sessionId);
     if (provider?.readMessageIdOrdinals) return provider.readMessageIdOrdinals();
@@ -312,6 +407,22 @@ export function readRawSessionMessageIdOrdinals(sessionId: string): Map<string, 
     }
     if (!openCodeDbExists()) return new Map();
     return withReadOnlySessionDb((db) => readRawSessionMessageIdOrdinalsFromDb(db, sessionId));
+}
+
+export function readRawSessionMessagePartsById(
+    sessionId: string,
+    messageId: string,
+): RawMessageParts | null {
+    const provider = sessionProviders.get(sessionId);
+    if (provider?.readMessagePartsById) return provider.readMessagePartsById(messageId);
+    if (provider?.readMessageById) return provider.readMessageById(messageId);
+    if (provider) {
+        return provider.readMessages().find((message) => message.id === messageId) ?? null;
+    }
+    if (!openCodeDbExists()) return null;
+    return withReadOnlySessionDb((db) =>
+        readRawSessionMessagePartsByIdFromDb(db, sessionId, messageId),
+    );
 }
 
 export function readRawSessionMessageById(sessionId: string, messageId: string): RawMessage | null {

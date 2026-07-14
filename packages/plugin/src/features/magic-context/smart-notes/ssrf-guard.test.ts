@@ -1,8 +1,11 @@
 import { describe, expect, mock, test } from "bun:test";
+import * as https from "node:https";
 
 import {
     createPinnedLookup,
+    createSmartNoteRequestAgent,
     guardedSmartNoteHttpGet,
+    requestValidatedAddress,
     type SmartNoteResolver,
     validateSmartNoteHttpUrl,
 } from "./ssrf-guard";
@@ -49,23 +52,43 @@ describe("smart-note SSRF guard", () => {
         }
     });
 
-    test("blocks IPv4-mapped and private IPv6 ranges", async () => {
-        for (const host of [
-            "[::1]",
-            "[::ffff:127.0.0.1]",
-            "[fe80::1]",
-            "[fc00::1]",
-            "[fd00:ec2::254]",
-            "[ff02::1]",
-            "[2001:db8::1]",
+    test("rejects every IPv6 DNS answer before address classification", async () => {
+        for (const address of [
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "64:ff9b::a00:5",
+            "2001:4860:abcd::a00:5",
+            "3fff::1",
+            "::ffff:127.0.0.1",
+            "fe80::1",
+            "fc00::1",
+            "fd00:ec2::254",
+            "ff02::1",
+            "2001:db8::1",
         ]) {
-            await expect(validateSmartNoteHttpUrl(`https://${host}/`, { signal })).rejects.toThrow(
-                /non-global|internal/i,
-            );
+            await expect(
+                validateSmartNoteHttpUrl("https://ipv6-only.example.test/", {
+                    signal,
+                    resolver: resolver([{ address, family: 6 }]),
+                }),
+            ).rejects.toBeInstanceOf(SmartNoteNetworkError);
         }
     });
 
-    test("rejects DNS answers with any private address", async () => {
+    test("allows a dual-stack host and pins only its public IPv4 answer", async () => {
+        const validated = await validateSmartNoteHttpUrl("https://dual-stack.example.test/", {
+            signal,
+            resolver: resolver([
+                { address: "93.184.216.34", family: 4 },
+                { address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 },
+            ]),
+        });
+
+        expect(validated.addresses).toEqual([
+            { address: "93.184.216.34", family: 4, classification: "global" },
+        ]);
+    });
+
+    test("rejects DNS answers with any private IPv4 address", async () => {
         await expect(
             validateSmartNoteHttpUrl("https://example.test/", {
                 signal,
@@ -77,18 +100,15 @@ describe("smart-note SSRF guard", () => {
         ).rejects.toThrow(/non-global|internal/i);
     });
 
-    test("allows public DNS answers and preserves all validated candidates", async () => {
+    test("allows public IPv4 DNS answers and preserves all validated candidates", async () => {
         const validated = await validateSmartNoteHttpUrl("https://example.test/path", {
             signal,
             resolver: resolver([
                 { address: "93.184.216.34", family: 4 },
-                { address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 },
+                { address: "1.1.1.1", family: 4 },
             ]),
         });
-        expect(validated.addresses.map((a) => a.address)).toEqual([
-            "93.184.216.34",
-            "2606:2800:220:1:248:1893:25c8:1946",
-        ]);
+        expect(validated.addresses.map((a) => a.address)).toEqual(["93.184.216.34", "1.1.1.1"]);
     });
 
     test("stops after a terminal per-target failure", async () => {
@@ -183,7 +203,7 @@ describe("createPinnedLookup", () => {
     });
 
     test("returns the legacy 3-arg form when all is not requested", () => {
-        const hook = createPinnedLookup({ address: "2606:2800:220:1::1", family: 6 });
+        const hook = createPinnedLookup({ address: "1.1.1.1", family: 4 });
         let addr: unknown;
         let fam: unknown;
         hook("example.test", {}, (err, address, family) => {
@@ -191,8 +211,8 @@ describe("createPinnedLookup", () => {
             addr = address;
             fam = family;
         });
-        expect(addr).toBe("2606:2800:220:1::1");
-        expect(fam).toBe(6);
+        expect(addr).toBe("1.1.1.1");
+        expect(fam).toBe(4);
     });
 
     test("pins to the validated IP without re-querying DNS", () => {
@@ -203,5 +223,35 @@ describe("createPinnedLookup", () => {
             received = addresses;
         });
         expect(received).toEqual([{ address: "203.0.113.7", family: 4 }]);
+    });
+});
+
+describe("guarded HTTPS request agent", () => {
+    test("does not use a pre-seeded keep-alive global agent", async () => {
+        const originalCreateConnection = https.globalAgent.createConnection;
+        const globalCreateConnection = mock(originalCreateConnection.bind(https.globalAgent));
+        https.globalAgent.createConnection = globalCreateConnection;
+        try {
+            const dedicated = createSmartNoteRequestAgent();
+            expect(dedicated).not.toBe(https.globalAgent);
+            expect(dedicated.keepAlive).toBe(false);
+            expect(dedicated.maxSockets).toBe(1);
+            dedicated.destroy();
+
+            await expect(
+                requestValidatedAddress(
+                    {
+                        url: new URL("https://example.test:1/"),
+                        hostname: "example.test",
+                        addresses: [],
+                    },
+                    { address: "127.0.0.1", family: 4, classification: "global" },
+                    { signal, timeoutMs: 100, bodyLimitBytes: 1024 },
+                ),
+            ).rejects.toBeInstanceOf(SmartNoteNetworkError);
+            expect(globalCreateConnection).not.toHaveBeenCalled();
+        } finally {
+            https.globalAgent.createConnection = originalCreateConnection;
+        }
     });
 });

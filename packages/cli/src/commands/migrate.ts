@@ -1,11 +1,11 @@
 import { randomBytes } from "node:crypto";
 import { unlinkSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
-import { Database } from "@magic-context/core/shared/sqlite";
 import { writeFileAtomic } from "../lib/atomic-write";
+import { openExistingContextDatabase, openExistingDatabase } from "../lib/database-access";
+import { getOpenCodeDatabasePath, projectPathToPiSessionSlug } from "../lib/migration-paths";
 import { getPiSessionsRoot } from "../lib/paths";
 
 export interface MigrateOpenCodeSessionToPiOptions {
@@ -32,6 +32,7 @@ export interface MigrateOpenCodeSessionToPiOptions {
     maxMessages?: number;
     dryRun?: boolean;
     opencodeDbPath?: string;
+    cortexkitDbPath?: string;
     piSessionsRoot?: string;
     provider?: string;
     modelId?: string;
@@ -167,9 +168,10 @@ const DEFAULT_PROVIDER = "openai-codex";
 const DEFAULT_MODEL = "gpt-5.5";
 const MIGRATION_COMPACTION_SUMMARY =
     "Magic Context compacted prior conversation. See <session-history> block for the structured summary.";
+const PART_LOOKUP_CHUNK_SIZE = 900;
 
 function defaultOpenCodeDbPath(): string {
-    return join(homedir(), ".local", "share", "opencode", "opencode.db");
+    return getOpenCodeDatabasePath();
 }
 
 function defaultCortexkitDbPath(): string {
@@ -188,8 +190,11 @@ function stmt<T>(db: DatabaseLike, sql: string): StatementLike<T> {
     return db.prepare(sql) as unknown as StatementLike<T>;
 }
 
-export function projectPathToPiDirSlug(projectPath: string): string {
-    return `--${projectPath.replace(/^\/+|\/+$/g, "").replaceAll("/", "-")}--`;
+export function projectPathToPiDirSlug(
+    projectPath: string,
+    platform: NodeJS.Platform = process.platform,
+): string {
+    return projectPathToPiSessionSlug(projectPath, platform);
 }
 
 export function formatPiFilenameTimestamp(date: Date): string {
@@ -567,34 +572,58 @@ function buildPiEntries(params: {
 }
 
 function fetchRows(db: DatabaseLike, sessionId: string, maxMessages: number | undefined) {
-    const session = stmt<OpenCodeSessionRow>(
-        db,
-        "SELECT id, title, directory, path, time_created FROM session WHERE id = ?",
-    ).get(sessionId);
-    if (!session) throw new Error(`OpenCode session not found: ${sessionId}`);
-
-    const sourceMessageCount =
-        stmt<{ count: number }>(
+    db.exec("PRAGMA busy_timeout=5000");
+    db.exec("BEGIN DEFERRED");
+    try {
+        const session = stmt<OpenCodeSessionRow>(
             db,
-            "SELECT COUNT(*) AS count FROM message WHERE session_id = ?",
-        ).get(sessionId)?.count ?? 0;
+            "SELECT id, title, directory, path, time_created FROM session WHERE id = ?",
+        ).get(sessionId);
+        if (!session) throw new Error(`OpenCode session not found: ${sessionId}`);
 
-    const limitClause = maxMessages ? "LIMIT ?" : "";
-    const params = maxMessages ? [sessionId, maxMessages] : [sessionId];
-    const newestFirst = stmt<OpenCodeMessageRow>(
-        db,
-        `SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created DESC, id DESC ${limitClause}`,
-    ).all(...params);
-    const messages = newestFirst.reverse();
-    const ids = messages.map((row) => row.id);
-    const parts = ids.length
-        ? stmt<OpenCodePartRow>(
-              db,
-              `SELECT id, message_id, time_created, data FROM part WHERE message_id IN (${ids.map(() => "?").join(",")}) ORDER BY time_created, id`,
-          ).all(...ids)
-        : [];
+        const sourceMessageCount =
+            stmt<{ count: number }>(
+                db,
+                "SELECT COUNT(*) AS count FROM message WHERE session_id = ?",
+            ).get(sessionId)?.count ?? 0;
 
-    return { session, sourceMessageCount, messages, parts };
+        const limitClause = maxMessages ? "LIMIT ?" : "";
+        const params = maxMessages ? [sessionId, maxMessages] : [sessionId];
+        const newestFirst = stmt<OpenCodeMessageRow>(
+            db,
+            `SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created DESC, id DESC ${limitClause}`,
+        ).all(...params);
+        const messages = newestFirst.reverse();
+        const ids = messages.map((row) => row.id);
+        const parts: OpenCodePartRow[] = [];
+        // Keep every lookup inside this deferred transaction while bounding each
+        // IN list below SQLite's conservative 999-variable configurations.
+        for (let offset = 0; offset < ids.length; offset += PART_LOOKUP_CHUNK_SIZE) {
+            const chunk = ids.slice(offset, offset + PART_LOOKUP_CHUNK_SIZE);
+            parts.push(
+                ...stmt<OpenCodePartRow>(
+                    db,
+                    `SELECT id, message_id, time_created, data FROM part WHERE message_id IN (${chunk.map(() => "?").join(",")})`,
+                ).all(...chunk),
+            );
+        }
+        parts.sort((left, right) => {
+            if (left.time_created !== right.time_created) {
+                return left.time_created - right.time_created;
+            }
+            return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+        });
+
+        db.exec("COMMIT");
+        return { session, sourceMessageCount, messages, parts };
+    } catch (error) {
+        try {
+            db.exec("ROLLBACK");
+        } catch {
+            // Preserve the read failure if the transaction already closed.
+        }
+        throw error;
+    }
 }
 
 /**
@@ -899,7 +928,10 @@ export function migrateOpenCodeSessionToPi(
     const opencodeDbPath = opts.opencodeDbPath ?? defaultOpenCodeDbPath();
     const piSessionsRoot = opts.piSessionsRoot ?? defaultPiSessionsRoot();
     const ownsDb = !opts.db;
-    const db = opts.db ?? new Database(opencodeDbPath, { readonly: true });
+    const db = opts.db ?? openExistingDatabase(opencodeDbPath, { readonly: true });
+    if (db === null) {
+        throw new Error(`OpenCode database not found at ${opencodeDbPath}; nothing to migrate.`);
+    }
 
     // Cortexkit DB: when not provided explicitly, open the canonical
     // shared DB read-write (we'll INSERT into compartments + session_facts).
@@ -911,15 +943,13 @@ export function migrateOpenCodeSessionToPi(
     } else if (opts.cortexkitDb !== undefined) {
         cortexkitDb = opts.cortexkitDb;
     } else {
-        try {
-            cortexkitDb = new Database(defaultCortexkitDbPath());
-            ownsCortexkitDb = true;
-        } catch {
-            // If the cortexkit DB doesn't exist yet (Magic Context never
-            // loaded on this machine), skip the copy gracefully — the
-            // migration still produces a usable Pi JSONL.
-            cortexkitDb = null;
-        }
+        const cortexkitDbPath = opts.cortexkitDbPath ?? defaultCortexkitDbPath();
+        cortexkitDb = openExistingContextDatabase(cortexkitDbPath, {
+            readonly: Boolean(opts.dryRun),
+        });
+        ownsCortexkitDb = cortexkitDb !== null;
+        // If Magic Context has never created context.db, skip the state copy;
+        // opening a missing path must not fabricate an empty database.
     }
 
     try {

@@ -137,11 +137,15 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
         transaction<F extends (...args: any[]) => any>(fn: F): F {
             // biome-ignore lint/suspicious/noExplicitAny: faithful pass-through of this/args to fn.
             const self = this as any;
-            const wrapped = function (this: unknown, ...args: unknown[]): unknown {
+            const execute = (
+                mode: "" | "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE",
+                receiver: unknown,
+                args: unknown[],
+            ) => {
                 const nested = self.isTransaction === true;
-                self.exec(nested ? `SAVEPOINT ${SAVEPOINT}` : "BEGIN");
+                self.exec(nested ? `SAVEPOINT ${SAVEPOINT}` : `BEGIN${mode ? ` ${mode}` : ""}`);
                 try {
-                    const result = fn.apply(this, args);
+                    const result = fn.apply(receiver, args);
                     self.exec(nested ? `RELEASE ${SAVEPOINT}` : "COMMIT");
                     return result;
                 } catch (error) {
@@ -156,6 +160,21 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
                     }
                     throw error;
                 }
+            };
+            const wrapped = function (this: unknown, ...args: unknown[]): unknown {
+                return execute("", this, args);
+            };
+            wrapped.default = function (this: unknown, ...args: unknown[]): unknown {
+                return execute("", this, args);
+            };
+            wrapped.deferred = function (this: unknown, ...args: unknown[]): unknown {
+                return execute("DEFERRED", this, args);
+            };
+            wrapped.immediate = function (this: unknown, ...args: unknown[]): unknown {
+                return execute("IMMEDIATE", this, args);
+            };
+            wrapped.exclusive = function (this: unknown, ...args: unknown[]): unknown {
+                return execute("EXCLUSIVE", this, args);
             };
             return wrapped as unknown as F;
         }

@@ -1,12 +1,25 @@
 import type { Database } from "../../shared/sqlite";
 
-export interface RawMessage {
-    ordinal: number;
+export interface RawMessageParts {
     id: string;
     role: string;
     parts: unknown[];
     createdAt?: number | null;
     version?: string | number | null;
+}
+
+export interface RawMessage extends RawMessageParts {
+    ordinal: number;
+}
+
+export interface RawMessageOrdinalAnchor {
+    timeCreated: number;
+    id: string;
+}
+
+export interface RawMessageOrdinalEntry extends RawMessageOrdinalAnchor {
+    contributesOrdinal: boolean;
+    hasValidInfo: boolean;
 }
 
 interface RawMessageRow {
@@ -124,6 +137,102 @@ export function readRawSessionMessagesFromDb(db: Database, sessionId: string): R
     });
 }
 
+interface PagedRawMessageRow extends RawMessageRow {
+    ordinal: number;
+}
+
+/**
+ * Read one bounded page from the canonical raw-message ordinal space. Message
+ * and part JSON parsing is limited to the requested page so background FTS work
+ * cannot monopolize the event loop by hydrating an entire long session.
+ */
+export function readRawSessionMessagePageFromDb(
+    db: Database,
+    sessionId: string,
+    afterOrdinal: number,
+    limit: number,
+    finalWatermark = Number.MAX_SAFE_INTEGER,
+): RawMessage[] {
+    const remaining = Math.max(0, Math.floor(finalWatermark) - Math.floor(afterOrdinal));
+    const pageSize = Math.min(Math.max(1, Math.floor(limit)), remaining);
+    if (pageSize === 0) return [];
+
+    const messageRows = db
+        .prepare(
+            `SELECT id, data, time_created, time_updated
+             FROM message
+             WHERE session_id = ?
+               AND NOT (
+                   CASE WHEN json_valid(data) = 1
+                        THEN COALESCE(json_extract(data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(data) = 1
+                            THEN COALESCE(json_extract(data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )
+             ORDER BY time_created ASC, id ASC
+             LIMIT ? OFFSET ?`,
+        )
+        .all(sessionId, pageSize, Math.max(0, Math.floor(afterOrdinal)))
+        .filter(isRawMessageRow)
+        .map(
+            (row, index): PagedRawMessageRow => ({
+                ...row,
+                ordinal: Math.floor(afterOrdinal) + index + 1,
+            }),
+        );
+
+    if (messageRows.length === 0) return [];
+
+    const placeholders = messageRows.map(() => "?").join(", ");
+    const partRows = db
+        .prepare(
+            `SELECT message_id, data, time_updated
+             FROM part
+             WHERE session_id = ? AND message_id IN (${placeholders})
+             ORDER BY time_created ASC, id ASC`,
+        )
+        .all(sessionId, ...messageRows.map((row) => row.id))
+        .filter(isRawPartRow);
+    const partsByMessageId = new Map<string, unknown[]>();
+    for (const part of partRows) {
+        const list = partsByMessageId.get(part.message_id) ?? [];
+        list.push(attachRawPartVersion(parseJsonUnknown(part.data), part.time_updated));
+        partsByMessageId.set(part.message_id, list);
+    }
+
+    return messageRows.map((row) => {
+        const info = parseJsonRecord(row.data);
+        return {
+            ordinal: row.ordinal,
+            id: row.id,
+            role: typeof info?.role === "string" ? info.role : "unknown",
+            parts: partsByMessageId.get(row.id) ?? [],
+            createdAt: row.time_created ?? null,
+            version: row.time_updated ?? null,
+        };
+    });
+}
+
+export function countRawSessionMessageOrdinalsFromDb(db: Database, sessionId: string): number {
+    const row = db
+        .prepare(
+            `SELECT COUNT(*) AS count
+             FROM message
+             WHERE session_id = ?
+               AND NOT (
+                   CASE WHEN json_valid(data) = 1
+                        THEN COALESCE(json_extract(data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(data) = 1
+                            THEN COALESCE(json_extract(data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )`,
+        )
+        .get(sessionId) as { count?: number } | null;
+    return typeof row?.count === "number" ? row.count : 0;
+}
+
 /**
  * Read the canonical raw-message ordinal space without loading or parsing part rows.
  * Keep the ordering, summary predicate, and malformed-message behavior identical to
@@ -139,14 +248,66 @@ export function readRawSessionMessageIdOrdinalsFromDb(
         )
         .all(sessionId)
         .filter(isRawMessageRow);
-    const filtered = messageRows.filter(
-        (row) => !isRawCompactionSummaryInfo(parseJsonRecord(row.data)),
-    );
     const ordinalById = new Map<string, number>();
-    filtered.forEach((row, index) => {
-        if (parseJsonRecord(row.data)) ordinalById.set(row.id, index + 1);
-    });
+    let ordinal = 0;
+    for (const row of messageRows) {
+        const info = parseJsonRecord(row.data);
+        if (isRawCompactionSummaryInfo(info)) continue;
+        ordinal += 1;
+        if (info) ordinalById.set(row.id, ordinal);
+    }
     return ordinalById;
+}
+
+/** Read a keyset page used to incrementally maintain shadow message ordinals. */
+export function readRawSessionMessageOrdinalPageFromDb(
+    db: Database,
+    sessionId: string,
+    after: RawMessageOrdinalAnchor | null,
+    limit: number,
+): RawMessageOrdinalEntry[] {
+    const pageSize = Math.max(1, Math.floor(limit));
+    const rows = (
+        after
+            ? db
+                  .prepare(
+                      `SELECT id, data, time_created
+                       FROM message
+                       WHERE session_id = ?
+                         AND (time_created, id) > (?, ?)
+                       ORDER BY time_created ASC, id ASC
+                       LIMIT ?`,
+                  )
+                  .all(sessionId, after.timeCreated, after.id, pageSize)
+            : db
+                  .prepare(
+                      `SELECT id, data, time_created
+                       FROM message
+                       WHERE session_id = ?
+                       ORDER BY time_created ASC, id ASC
+                       LIMIT ?`,
+                  )
+                  .all(sessionId, pageSize)
+    ).filter(isRawMessageRow);
+
+    return rows.flatMap((row) => {
+        if (typeof row.time_created !== "number") return [];
+        const info = parseJsonRecord(row.data);
+        return {
+            id: row.id,
+            timeCreated: row.time_created,
+            contributesOrdinal: !isRawCompactionSummaryInfo(info),
+            hasValidInfo: info !== null,
+        };
+    });
+}
+
+/** Count stored rows without inspecting message JSON, allowing the session-id index to answer it. */
+export function countStoredRawSessionMessagesFromDb(db: Database, sessionId: string): number {
+    const row = db
+        .prepare("SELECT COUNT(*) AS count FROM message WHERE session_id = ?")
+        .get(sessionId) as { count?: number } | null;
+    return typeof row?.count === "number" ? row.count : 0;
 }
 
 interface AnchorRow {
@@ -393,6 +554,37 @@ export function buildInMemoryTailRawMessages(args: {
     }
 
     return { messages: out, absoluteMessageCount: Math.max(0, ord - 1), anchorFound };
+}
+
+export function readRawSessionMessagePartsByIdFromDb(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+): RawMessageParts | null {
+    const row = db
+        .prepare(
+            "SELECT id, data, time_created, time_updated FROM message WHERE session_id = ? AND id = ?",
+        )
+        .get(sessionId, messageId) as RawMessageRow | null;
+    if (!row || !isRawMessageRow(row) || typeof row.time_created !== "number") return null;
+
+    const info = parseJsonRecord(row.data);
+    if (!info || isRawCompactionSummaryInfo(info)) return null;
+    const partRows = db
+        .prepare(
+            "SELECT message_id, data, time_updated FROM part WHERE session_id = ? AND message_id = ? ORDER BY time_created ASC, id ASC",
+        )
+        .all(sessionId, messageId)
+        .filter(isRawPartRow);
+    return {
+        id: row.id,
+        role: typeof info.role === "string" ? info.role : "unknown",
+        parts: partRows.map((part) =>
+            attachRawPartVersion(parseJsonUnknown(part.data), part.time_updated),
+        ),
+        createdAt: row.time_created,
+        version: row.time_updated ?? null,
+    };
 }
 
 export function readRawSessionMessageByIdFromDb(

@@ -358,6 +358,7 @@ pub const SHADOW_SESSION_PREFIX: &str = "shadow:";
 const NO_ROW: i64 = -1;
 const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
 const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
+const MAX_REDUCE_COMMAND_LEDGER_ROWS_PER_SESSION: i64 = 512;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -722,6 +723,21 @@ const MIGRATIONS: &[Migration] = &[
         // from forgeable tag syntax.
         statements: "
         ALTER TABLE mc_tags ADD COLUMN source_bytes BLOB NOT NULL DEFAULT X'';
+    ",
+    },
+    Migration {
+        version: 16,
+        // Command ids survive queue consumption so a response-loss retry cannot reapply a
+        // ctx_reduce request after its original drops have drained.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_reduce_command_ledger (
+            session_id   TEXT NOT NULL,
+            command_id   TEXT NOT NULL,
+            queued_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (session_id, command_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_reduce_command_ledger_session_newest
+            ON mc_reduce_command_ledger(session_id, queued_at_ms DESC, command_id DESC);
     ",
     },
 ];
@@ -1290,6 +1306,12 @@ pub struct PendingAgentDrop {
     pub queued_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendOutcome {
+    pub queued: u64,
+    pub duplicate: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagMintInput {
     pub block_id: String,
@@ -1342,10 +1364,20 @@ pub struct StoredCompartment {
     pub created_at: i64,
 }
 
-/// A project memory row projected for rendering into the prompt. The store keeps the
-/// full original schema; this struct carries only the columns the render, the budget
-/// trim (drop lowest-importance when over budget), and the supersede/correction logic
-/// actually read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryRevision {
+    pub project_paths: Vec<String>,
+    pub max_memory_id: i64,
+    pub mutation_cursor: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRenderSnapshot {
+    pub memories: Vec<StoredMemory>,
+    pub revision: MemoryRevision,
+}
+
+/// A project memory row projected for rendering into the prompt.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredMemory {
     pub id: i64,
@@ -1625,7 +1657,6 @@ pub struct ShadowDivergenceRow {
     pub created_at_ms: i64,
 }
 
-/// CAS / serialization errors layered over `cortexkit-store`.
 #[derive(Debug)]
 pub enum McStoreError {
     Store(StoreError),
@@ -1636,6 +1667,9 @@ pub enum McStoreError {
         found: u64,
     },
     Serde(String),
+    MemoryDuplicateContent {
+        id: i64,
+    },
 }
 
 impl std::fmt::Display for McStoreError {
@@ -1646,6 +1680,9 @@ impl std::fmt::Display for McStoreError {
                 write!(f, "cas conflict: expected {expected:?}, found {found}")
             }
             McStoreError::Serde(e) => write!(f, "serde: {e}"),
+            McStoreError::MemoryDuplicateContent { id } => {
+                write!(f, "memory content already exists as ID {id}")
+            }
         }
     }
 }
@@ -1692,6 +1729,12 @@ impl From<StoreError> for ShadowStateSyncError {
 /// Outcome of the fenced commit txn: either the new row_version, or a CAS conflict
 /// carrying the version observed on disk. Modeled as a return value (not an error)
 /// so a conflicting pass commits an empty txn and the caller re-loads cleanly.
+enum MemoryMutationOutcome {
+    NotFound,
+    Applied(Box<Option<StoredMemoryFull>>),
+    Duplicate(i64),
+}
+
 enum CommitOutcome {
     Committed(u64),
     CasConflict(u64),
@@ -1966,22 +2009,76 @@ impl McStore {
         target_ids: &[String],
         queued_at_ms: i64,
     ) -> Result<usize, McStoreError> {
-        let mut inserted = 0usize;
-        self.inner.with_conn_fenced(|tx| {
+        let outcome = self.append_pending_agent_drops_with_command(
+            session_id,
+            None,
+            target_ids,
+            queued_at_ms,
+        )?;
+        Ok(outcome.queued as usize)
+    }
+
+    /// Append ctx_reduce drops and, when supplied, durably record the command that requested
+    /// them. A repeated command is acknowledged without touching pending queue rows.
+    pub fn append_pending_agent_drops_with_command(
+        &self,
+        session_id: &str,
+        command_id: Option<&str>,
+        target_ids: &[String],
+        queued_at_ms: i64,
+    ) -> Result<AppendOutcome, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            if let Some(command_id) = command_id {
+                let recorded = tx.execute(
+                    "INSERT OR IGNORE INTO mc_reduce_command_ledger
+                         (session_id, command_id, queued_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![session_id, command_id, queued_at_ms],
+                )?;
+                if recorded == 0 {
+                    return Ok(AppendOutcome {
+                        queued: 0,
+                        duplicate: true,
+                    });
+                }
+            }
+
+            let mut queued = 0u64;
             for target_id in target_ids {
                 let target_id = target_id.trim();
                 if target_id.is_empty() {
                     continue;
                 }
-                inserted += tx.execute(
+                queued += tx.execute(
                     "INSERT OR IGNORE INTO pending_agent_drops (session_id, target_id, queued_at)
                      VALUES (?1, ?2, ?3)",
                     params![session_id, target_id, queued_at_ms],
+                )? as u64;
+            }
+
+            if command_id.is_some() {
+                // Command ids break timestamp ties so pruning is stable even when several
+                // requests arrive within the same millisecond.
+                tx.execute(
+                    "DELETE FROM mc_reduce_command_ledger
+                     WHERE session_id = ?1
+                       AND command_id NOT IN (
+                           SELECT command_id
+                           FROM mc_reduce_command_ledger
+                           WHERE session_id = ?1
+                           ORDER BY queued_at_ms DESC, command_id DESC
+                           LIMIT ?2
+                       )",
+                    params![session_id, MAX_REDUCE_COMMAND_LEDGER_ROWS_PER_SESSION],
                 )?;
             }
-            Ok(())
+
+            Ok(AppendOutcome {
+                queued,
+                duplicate: false,
+            })
         })?;
-        Ok(inserted)
+        Ok(outcome)
     }
 
     /// Load queued ctx_reduce drops in the deterministic drain order.
@@ -2167,7 +2264,7 @@ impl McStore {
         core: &CoreState,
         meta: &ModuleMeta,
     ) -> Result<u64, McStoreError> {
-        self.commit_with_consumed_drops(session_id, expected, core, meta, &[])
+        self.commit_with_consumed_drops(session_id, expected, core, meta, &[], None)
     }
 
     /// Commit cache state and delete consumed ctx_reduce queue rows in one fenced tx.
@@ -2178,6 +2275,7 @@ impl McStore {
         core: &CoreState,
         meta: &ModuleMeta,
         consumed_drop_ids: &[i64],
+        memory_revision: Option<&MemoryRevision>,
     ) -> Result<u64, McStoreError> {
         let core_json =
             serde_json::to_string(core).map_err(|e| McStoreError::Serde(e.to_string()))?;
@@ -2200,6 +2298,41 @@ impl McStore {
             if !cas_ok {
                 // Empty txn (commits nothing); the caller re-loads and re-steps.
                 return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+            }
+            if let Some(revision) = memory_revision.filter(|value| !value.project_paths.is_empty()) {
+                let shadow = revision
+                    .project_paths
+                    .iter()
+                    .any(|path| is_shadow_project_path(path));
+                let memory_table = if shadow { "shadow_memories" } else { "mc_memories" };
+                let mutation_table = if shadow {
+                    "shadow_memory_mutation_log"
+                } else {
+                    "mc_memory_mutation_log"
+                };
+                let path_column = if shadow {
+                    "shadow_project_path"
+                } else {
+                    "project_path"
+                };
+                let placeholders = std::iter::repeat_n("?", revision.project_paths.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let current_memory: i64 = tx.query_row(
+                    &format!("SELECT COALESCE(MAX(id), 0) FROM {memory_table} WHERE {path_column} IN ({placeholders})"),
+                    rusqlite::params_from_iter(revision.project_paths.iter()),
+                    |row| row.get(0),
+                )?;
+                let current_mutation: i64 = tx.query_row(
+                    &format!("SELECT COALESCE(MAX(id), 0) FROM {mutation_table} WHERE {path_column} IN ({placeholders})"),
+                    rusqlite::params_from_iter(revision.project_paths.iter()),
+                    |row| row.get(0),
+                )?;
+                if current_memory != revision.max_memory_id
+                    || current_mutation != revision.mutation_cursor
+                {
+                    return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+                }
             }
 
             // INSERT-or-UPDATE in the same fenced txn (bootstrap has no row to UPDATE).
@@ -2397,6 +2530,10 @@ impl McStore {
             )?;
             tx.execute(
                 "DELETE FROM pending_agent_drops WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_reduce_command_ledger WHERE session_id = ?1",
                 params![session_id],
             )?;
             tx.execute(
@@ -2998,21 +3135,39 @@ impl McStore {
         Ok(memory_id)
     }
 
-    /// Replace a memory's content and append the cache-visible mutation-log row in the
-    /// SAME fenced transaction. Change detection for non-additive edits reads the
-    /// append-only mutation-log watermark, so splitting the row update from the log append
-    /// could leave readers serving stale cached memory content.
+    /// Replace an owned primary memory's content and append its cache-visible mutation in
+    /// the same fenced transaction. Shared workspace visibility is read-only for primary
+    /// agents, so project ownership and lifecycle are rechecked after the transaction begins.
     pub fn update_memory_content(
         &self,
+        project_path: &str,
         id: i64,
         content: &str,
         now_ms: i64,
     ) -> Result<Option<StoredMemoryFull>, McStoreError> {
-        let row = self.inner.with_conn_fenced(|tx| {
+        let outcome = self.inner.with_conn_fenced(|tx| {
             let Some(memory) = load_memory_full_tx(tx, id)? else {
-                return Ok(None);
+                return Ok(MemoryMutationOutcome::NotFound);
             };
+            if memory.project_path != project_path
+                || memory.superseded_by_memory_id.is_some()
+                || !matches!(memory.status.as_str(), "active" | "permanent")
+            {
+                return Ok(MemoryMutationOutcome::NotFound);
+            }
             let normalized_hash = compute_normalized_memory_hash(content);
+            let duplicate_id = tx
+                .query_row(
+                    "SELECT id FROM mc_memories
+                      WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
+                      LIMIT 1",
+                    params![project_path, memory.category, normalized_hash],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(duplicate_id) = duplicate_id.filter(|duplicate_id| *duplicate_id != id) {
+                return Ok(MemoryMutationOutcome::Duplicate(duplicate_id));
+            }
             tx.execute(
                 "UPDATE mc_memories
                     SET content = ?1,
@@ -3035,98 +3190,198 @@ impl McStore {
                     queued_at: now_ms,
                 },
             )?;
-            load_memory_full_tx(tx, id)
+            Ok(MemoryMutationOutcome::Applied(Box::new(
+                load_memory_full_tx(tx, id)?,
+            )))
         })?;
-        Ok(row)
+        match outcome {
+            MemoryMutationOutcome::NotFound => Ok(None),
+            MemoryMutationOutcome::Applied(row) => Ok(*row),
+            MemoryMutationOutcome::Duplicate(id) => {
+                Err(McStoreError::MemoryDuplicateContent { id })
+            }
+        }
     }
 
-    /// Archive a memory and append the terminal mutation-log row in the SAME fenced
-    /// transaction. See [`Self::update_memory_content`] for why the log row is inseparable
-    /// from non-additive row mutations.
+    /// Archive one owned memory. Project ownership and lifecycle are checked inside the
+    /// fenced transaction; an already archived row remains an idempotent success.
     pub fn archive_memory(
         &self,
+        project_path: &str,
         id: i64,
         reason: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredMemoryFull>, McStoreError> {
-        let row = self.inner.with_conn_fenced(|tx| {
-            let Some(memory) = load_memory_full_tx(tx, id)? else {
-                return Ok(None);
-            };
-            let trimmed_reason = reason.map(str::trim).filter(|s| !s.is_empty());
-            if let Some(reason) = trimmed_reason {
-                let metadata_json = merge_archive_reason(memory.metadata_json.as_deref(), reason);
-                tx.execute(
-                    "UPDATE mc_memories
-                        SET status = 'archived', metadata_json = ?1, updated_at = ?2
-                      WHERE id = ?3",
-                    params![metadata_json, now_ms, id],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE mc_memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
-                    params![now_ms, id],
-                )?;
-            }
-            append_memory_mutation_tx(
-                tx,
-                MemoryMutationAppend {
-                    project_path: &memory.project_path,
-                    mutation_type: "archive",
-                    target_memory_id: id,
-                    superseded_by_id: None,
-                    category: None,
-                    new_content: None,
-                    queued_at: now_ms,
-                },
-            )?;
-            load_memory_full_tx(tx, id)
-        })?;
-        Ok(row)
+        let Some(_) = self.archive_memories(project_path, &[id], reason, now_ms)? else {
+            return Ok(None);
+        };
+        self.get_memory_full(id)
     }
 
-    /// Merge source memories into an existing target. The target update, merge lineage,
-    /// each source supersede marker, and one mutation-log row per affected memory are
-    /// written in a single fenced transaction so cache invalidation and lineage stay in
-    /// sync.
+    /// Validate and archive an entire owned batch in one fenced transaction.
+    pub fn archive_memories(
+        &self,
+        project_path: &str,
+        ids: &[i64],
+        reason: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Option<Vec<i64>>, McStoreError> {
+        self.inner
+            .with_conn_fenced(|tx| {
+                let mut memories = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let Some(memory) = load_memory_full_tx(tx, *id)? else {
+                        return Ok(None);
+                    };
+                    if memory.project_path != project_path
+                        || memory.superseded_by_memory_id.is_some()
+                        || !matches!(memory.status.as_str(), "active" | "permanent" | "archived")
+                    {
+                        return Ok(None);
+                    }
+                    memories.push(memory);
+                }
+
+                let trimmed_reason = reason.map(str::trim).filter(|value| !value.is_empty());
+                let mut archived = Vec::new();
+                for memory in memories {
+                    if memory.status == "archived" {
+                        continue;
+                    }
+                    if let Some(reason) = trimmed_reason {
+                        let metadata_json =
+                            merge_archive_reason(memory.metadata_json.as_deref(), reason);
+                        tx.execute(
+                            "UPDATE mc_memories
+                                SET status = 'archived', metadata_json = ?1, updated_at = ?2
+                              WHERE id = ?3",
+                            params![metadata_json, now_ms, memory.id],
+                        )?;
+                    } else {
+                        tx.execute(
+                            "UPDATE mc_memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
+                            params![now_ms, memory.id],
+                        )?;
+                    }
+                    append_memory_mutation_tx(
+                        tx,
+                        MemoryMutationAppend {
+                            project_path: &memory.project_path,
+                            mutation_type: "archive",
+                            target_memory_id: memory.id,
+                            superseded_by_id: None,
+                            category: None,
+                            new_content: None,
+                            queued_at: now_ms,
+                        },
+                    )?;
+                    archived.push(memory.id);
+                }
+                Ok(Some(archived))
+            })
+            .map_err(McStoreError::from)
+    }
+
+    /// Merge owned primary source memories into an owned primary target in one fenced
+    /// transaction. Ownership, lifecycle, disjointness, and category equality are rechecked
+    /// while locked so concurrent merges cannot rewrite an established lineage.
     pub fn merge_memories(
         &self,
+        project_path: &str,
         target_id: i64,
         source_ids: &[i64],
         merged_content: &str,
         now_ms: i64,
     ) -> Result<Option<StoredMemoryFull>, McStoreError> {
-        let row = self.inner.with_conn_fenced(|tx| {
+        let outcome = self.inner.with_conn_fenced(|tx| {
             let Some(target) = load_memory_full_tx(tx, target_id)? else {
-                return Ok(None);
+                return Ok(MemoryMutationOutcome::NotFound);
             };
+            if target.project_path != project_path
+                || target.superseded_by_memory_id.is_some()
+                || !matches!(target.status.as_str(), "active" | "permanent")
+            {
+                return Ok(MemoryMutationOutcome::NotFound);
+            }
+
             let mut unique_sources: Vec<i64> = source_ids.to_vec();
             unique_sources.sort_unstable();
             unique_sources.dedup();
+            if unique_sources.is_empty()
+                || unique_sources.len() != source_ids.len()
+                || unique_sources.binary_search(&target_id).is_ok()
+            {
+                return Ok(MemoryMutationOutcome::NotFound);
+            }
 
-            let mut source_rows = Vec::new();
+            let mut source_rows = Vec::with_capacity(unique_sources.len());
             for source_id in unique_sources {
-                if source_id == target_id {
-                    continue;
-                }
                 let Some(source) = load_memory_full_tx(tx, source_id)? else {
-                    return Ok(None);
+                    return Ok(MemoryMutationOutcome::NotFound);
                 };
+                if source.project_path != project_path
+                    || source.category != target.category
+                    || source.superseded_by_memory_id.is_some()
+                    || !matches!(source.status.as_str(), "active" | "permanent")
+                {
+                    return Ok(MemoryMutationOutcome::NotFound);
+                }
                 source_rows.push(source);
+            }
+
+            let normalized_hash = compute_normalized_memory_hash(merged_content);
+            let duplicate_id = tx
+                .query_row(
+                    "SELECT id FROM mc_memories
+                      WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
+                      LIMIT 1",
+                    params![project_path, target.category, normalized_hash],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(duplicate_id) =
+                duplicate_id.filter(|duplicate_id| *duplicate_id != target_id)
+            {
+                return Ok(MemoryMutationOutcome::Duplicate(duplicate_id));
             }
 
             let mut affected = Vec::with_capacity(source_rows.len() + 1);
             affected.push(target.clone());
             affected.extend(source_rows.iter().cloned());
             let merged_from = merged_from_json(&affected);
-            let seen_count: i64 = affected.iter().map(|m| m.seen_count.max(0)).sum();
-            let retrieval_count: i64 = affected.iter().map(|m| m.retrieval_count.max(0)).sum();
-            let merged_status = if affected.iter().any(|m| m.status == "permanent") {
+            let seen_count: i64 = affected.iter().map(|memory| memory.seen_count.max(0)).sum();
+            let retrieval_count: i64 = affected
+                .iter()
+                .map(|memory| memory.retrieval_count.max(0))
+                .sum();
+            let merged_status = if affected.iter().any(|memory| memory.status == "permanent") {
                 "permanent"
             } else {
                 "active"
             };
-            let normalized_hash = compute_normalized_memory_hash(merged_content);
+
+            for source in &source_rows {
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET status = 'archived',
+                            superseded_by_memory_id = ?1,
+                            updated_at = ?2
+                      WHERE id = ?3",
+                    params![target_id, now_ms, source.id],
+                )?;
+                append_memory_mutation_tx(
+                    tx,
+                    MemoryMutationAppend {
+                        project_path: &source.project_path,
+                        mutation_type: "superseded",
+                        target_memory_id: source.id,
+                        superseded_by_id: Some(target_id),
+                        category: None,
+                        new_content: None,
+                        queued_at: now_ms,
+                    },
+                )?;
+            }
 
             tx.execute(
                 "UPDATE mc_memories
@@ -3164,32 +3419,17 @@ impl McStore {
                 },
             )?;
 
-            for source in &source_rows {
-                tx.execute(
-                    "UPDATE mc_memories
-                        SET status = 'archived',
-                            superseded_by_memory_id = ?1,
-                            updated_at = ?2
-                      WHERE id = ?3",
-                    params![target_id, now_ms, source.id],
-                )?;
-                append_memory_mutation_tx(
-                    tx,
-                    MemoryMutationAppend {
-                        project_path: &source.project_path,
-                        mutation_type: "superseded",
-                        target_memory_id: source.id,
-                        superseded_by_id: Some(target_id),
-                        category: None,
-                        new_content: None,
-                        queued_at: now_ms,
-                    },
-                )?;
-            }
-
-            load_memory_full_tx(tx, target_id)
+            Ok(MemoryMutationOutcome::Applied(Box::new(
+                load_memory_full_tx(tx, target_id)?,
+            )))
         })?;
-        Ok(row)
+        match outcome {
+            MemoryMutationOutcome::NotFound => Ok(None),
+            MemoryMutationOutcome::Applied(row) => Ok(*row),
+            MemoryMutationOutcome::Duplicate(id) => {
+                Err(McStoreError::MemoryDuplicateContent { id })
+            }
+        }
     }
 
     /// Publish a validated historian chunk in one CAS-gated transaction. The publish
@@ -3680,6 +3920,105 @@ impl McStore {
         Ok(rows)
     }
 
+    /// Load rendered memory rows and both source watermarks from one SQLite read snapshot.
+    pub fn load_memory_render_snapshot(
+        &self,
+        project_path: &str,
+        membership: Option<&WorkspaceMembership>,
+        now_ms: i64,
+    ) -> Result<MemoryRenderSnapshot, McStoreError> {
+        let project_paths = membership
+            .map(|value| value.union_identities.clone())
+            .unwrap_or_else(|| vec![project_path.to_string()]);
+        let shadow = is_shadow_project_path(project_path);
+        let table = if shadow {
+            "shadow_memories"
+        } else {
+            "mc_memories"
+        };
+        let path_column = if shadow {
+            "shadow_project_path"
+        } else {
+            "project_path"
+        };
+        let mutation_table = if shadow {
+            "shadow_memory_mutation_log"
+        } else {
+            "mc_memory_mutation_log"
+        };
+        let snapshot = self.inner.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let (visibility, mut binds) = if let Some(membership) = membership {
+                workspace_union_memory_visibility_filter_for_column(membership, path_column)
+            } else {
+                (format!("{path_column} = ?"), vec![rusqlite::types::Value::from(project_path.to_string())])
+            };
+            let sql = format!(
+                "SELECT id, {path_column}, category, content, importance, status, expires_at,
+                        superseded_by_memory_id, updated_at
+                   FROM {table}
+                  WHERE ({visibility})
+                    AND status IN ('active', 'permanent')
+                    AND (expires_at IS NULL OR expires_at > ?)
+                  ORDER BY COALESCE(importance, 50) DESC, id ASC"
+            );
+            binds.push(rusqlite::types::Value::from(now_ms));
+            let mut stmt = tx.prepare(&sql)?;
+            let memories = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    Ok(StoredMemory {
+                        id: row.get(0)?,
+                        project_path: row.get(1)?,
+                        category: row.get(2)?,
+                        content: row.get(3)?,
+                        importance: row.get(4)?,
+                        status: row.get(5)?,
+                        expires_at: row.get(6)?,
+                        superseded_by_memory_id: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+
+            let placeholders = std::iter::repeat_n("?", project_paths.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let max_memory_id = if project_paths.is_empty() {
+                0
+            } else {
+                tx.query_row(
+                    &format!(
+                        "SELECT COALESCE(MAX(id), 0) FROM {table} WHERE {path_column} IN ({placeholders})"
+                    ),
+                    rusqlite::params_from_iter(project_paths.iter()),
+                    |row| row.get(0),
+                )?
+            };
+            let mutation_cursor = if project_paths.is_empty() {
+                0
+            } else {
+                tx.query_row(
+                    &format!(
+                        "SELECT COALESCE(MAX(id), 0) FROM {mutation_table} WHERE {path_column} IN ({placeholders})"
+                    ),
+                    rusqlite::params_from_iter(project_paths.iter()),
+                    |row| row.get(0),
+                )?
+            };
+            tx.commit()?;
+            Ok(MemoryRenderSnapshot {
+                memories,
+                revision: MemoryRevision {
+                    project_paths: project_paths.clone(),
+                    max_memory_id,
+                    mutation_cursor,
+                },
+            })
+        })?;
+        Ok(snapshot)
+    }
+
     /// Search active/permanent memory content visible to `project_path` with a literal,
     /// case-insensitive SQL LIKE. Workspace visibility is built by the same helper used by
     /// [`Self::load_workspace_union_memories`], keeping search and render on one boundary.
@@ -3704,8 +4043,10 @@ impl McStore {
                    FROM mc_memories
                   WHERE ({sharing})
                     AND status IN ('active', 'permanent')
+                    AND (expires_at IS NULL OR expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000)
                     AND LOWER(content) LIKE ? ESCAPE '\\'
-                  ORDER BY updated_at DESC, id ASC"
+                  ORDER BY updated_at DESC, id ASC
+                  LIMIT 100"
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut all_binds = binds.clone();
@@ -3749,7 +4090,8 @@ impl McStore {
                       OR LOWER(COALESCE(p2, '')) LIKE ?2 ESCAPE '\\'
                       OR LOWER(COALESCE(p3, '')) LIKE ?2 ESCAPE '\\'
                       OR LOWER(COALESCE(p4, '')) LIKE ?2 ESCAPE '\\')
-                  ORDER BY sequence DESC",
+                  ORDER BY sequence DESC
+                  LIMIT 100",
             )?;
             let mapped = stmt
                 .query_map(params![session_id, pattern], |r| {
@@ -3848,7 +4190,8 @@ impl McStore {
         offset: usize,
     ) -> Result<Vec<StoredNote>, McStoreError> {
         let limit = limit.clamp(1, 100) as i64;
-        let offset = offset as i64;
+        let offset = i64::try_from(offset)
+            .map_err(|_| McStoreError::Serde("note offset exceeds i64".to_string()))?;
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, project_path, session_id, content, status, surface_condition,
@@ -3943,7 +4286,8 @@ impl McStore {
                   WHERE project_path = ?1 AND session_id = ?2
                     AND (LOWER(content) LIKE ?3 ESCAPE '\\'
                       OR LOWER(COALESCE(surface_condition, '')) LIKE ?3 ESCAPE '\\')
-                  ORDER BY updated_at_ms DESC, id DESC",
+                  ORDER BY updated_at_ms DESC, id DESC
+                  LIMIT 100",
             )?;
             let mapped = stmt
                 .query_map(params![project_path, session_id, pattern], |r| {
@@ -4939,6 +5283,26 @@ mod tests {
         }
     }
 
+    fn command_ledger_ids(store: &McStore, session_id: &str) -> Vec<String> {
+        store
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT command_id
+                     FROM mc_reduce_command_ledger
+                     WHERE session_id = ?1
+                     ORDER BY queued_at_ms ASC, command_id ASC",
+                )?;
+                let rows = statement.query_map(params![session_id], |row| row.get(0))?;
+                let mut command_ids = Vec::new();
+                for row in rows {
+                    command_ids.push(row?);
+                }
+                Ok(command_ids)
+            })
+            .unwrap()
+    }
+
     fn insert_input<'a>(
         project_path: &'a str,
         category: &'a str,
@@ -5020,6 +5384,33 @@ mod tests {
     }
 
     #[test]
+    fn cache_commit_rejects_an_advanced_memory_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "old", 1))
+            .unwrap();
+        let snapshot = store.load_memory_render_snapshot(project, None, 2).unwrap();
+        store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "new", 3))
+            .unwrap();
+
+        let error = store
+            .commit_with_consumed_drops(
+                "ses",
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+                &[],
+                Some(&snapshot.revision),
+            )
+            .unwrap_err();
+        assert!(matches!(error, McStoreError::CasConflict { .. }));
+        assert!(store.load("ses").unwrap().row_version.is_none());
+    }
+
+    #[test]
     fn pending_agent_drops_delete_only_inside_successful_commit_tx() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -5036,7 +5427,7 @@ mod tests {
         let core = CoreState::default();
         let meta = ModuleMeta::default();
         let conflict =
-            store.commit_with_consumed_drops("ses", Some(99), &core, &meta, &[queued[0].id]);
+            store.commit_with_consumed_drops("ses", Some(99), &core, &meta, &[queued[0].id], None);
         assert!(matches!(conflict, Err(McStoreError::CasConflict { .. })));
         assert_eq!(
             store.load_pending_agent_drops("ses").unwrap().len(),
@@ -5045,9 +5436,210 @@ mod tests {
         );
 
         store
-            .commit_with_consumed_drops("ses", None, &core, &meta, &[queued[0].id])
+            .commit_with_consumed_drops("ses", None, &core, &meta, &[queued[0].id], None)
             .unwrap();
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        assert!(command_ledger_ids(&store, "ses").is_empty());
+    }
+
+    #[test]
+    fn command_id_duplicate_is_recognized_while_drops_are_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let target_ids = vec!["a#0".to_string()];
+
+        let first = store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .unwrap();
+        assert_eq!(
+            first,
+            AppendOutcome {
+                queued: 1,
+                duplicate: false,
+            }
+        );
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+
+        let retry = store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2)
+            .unwrap();
+        assert_eq!(
+            retry,
+            AppendOutcome {
+                queued: 0,
+                duplicate: true,
+            }
+        );
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
+        assert_eq!(command_ledger_ids(&store, "ses"), vec!["tool-use-1"]);
+    }
+
+    #[test]
+    fn command_id_duplicate_survives_consumption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let target_ids = vec!["a#0".to_string()];
+        store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .unwrap();
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+        store
+            .commit_with_consumed_drops(
+                "ses",
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+                &[pending[0].id],
+                None,
+            )
+            .unwrap();
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        let retry = store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2)
+            .unwrap();
+        assert_eq!(
+            retry,
+            AppendOutcome {
+                queued: 0,
+                duplicate: true,
+            }
+        );
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn different_command_id_requeues_after_consumption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let target_ids = vec!["a#0".to_string()];
+        store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .unwrap();
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+        store
+            .commit_with_consumed_drops(
+                "ses",
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+                &[pending[0].id],
+                None,
+            )
+            .unwrap();
+
+        let next = store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-2"), &target_ids, 2)
+            .unwrap();
+        assert_eq!(
+            next,
+            AppendOutcome {
+                queued: 1,
+                duplicate: false,
+            }
+        );
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_command_append_rolls_back_ledger_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_pending_agent_drop
+                     BEFORE INSERT ON pending_agent_drops
+                     BEGIN
+                         SELECT RAISE(ABORT, 'forced pending append failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let target_ids = vec!["a#0".to_string()];
+
+        assert!(store
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .is_err());
+        assert!(command_ledger_ids(&store, "ses").is_empty());
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_pending_agent_drop")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2)
+                .unwrap(),
+            AppendOutcome {
+                queued: 1,
+                duplicate: false,
+            }
+        );
+    }
+
+    #[test]
+    fn command_id_ledger_retains_the_newest_512_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let target_ids = vec!["a#0".to_string()];
+
+        for queued_at_ms in 0..513i64 {
+            let command_id = format!("command-{queued_at_ms:03}");
+            let outcome = store
+                .append_pending_agent_drops_with_command(
+                    "ses",
+                    Some(&command_id),
+                    &target_ids,
+                    queued_at_ms,
+                )
+                .unwrap();
+            assert!(!outcome.duplicate);
+        }
+
+        let command_ids = command_ledger_ids(&store, "ses");
+        assert_eq!(command_ids.len(), 512);
+        assert_eq!(command_ids.first().map(String::as_str), Some("command-001"));
+        assert_eq!(command_ids.last().map(String::as_str), Some("command-512"));
+        assert!(!command_ids.iter().any(|id| id == "command-000"));
+
+        let pruned_retry = store
+            .append_pending_agent_drops_with_command("ses", Some("command-000"), &target_ids, 513)
+            .unwrap();
+        assert!(!pruned_retry.duplicate);
+    }
+
+    #[test]
+    fn reset_shadow_session_clears_command_ledger_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let session_id = "shadow:cleanup";
+        let target_ids = vec!["a#0".to_string()];
+        store
+            .append_pending_agent_drops_with_command(session_id, Some("tool-use-1"), &target_ids, 1)
+            .unwrap();
+        store.reset_shadow_session(session_id, session_id).unwrap();
+
+        assert_eq!(
+            store
+                .append_pending_agent_drops_with_command(
+                    session_id,
+                    Some("tool-use-1"),
+                    &target_ids,
+                    2,
+                )
+                .unwrap(),
+            AppendOutcome {
+                queued: 1,
+                duplicate: false,
+            }
+        );
     }
 
     #[test]
@@ -5627,7 +6219,10 @@ mod tests {
             .max_memory_mutation_id(&[project.to_string()])
             .unwrap();
 
-        let updated = store.update_memory_content(id, "new", 2).unwrap().unwrap();
+        let updated = store
+            .update_memory_content(project, id, "new", 2)
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.content, "new");
         let after = store
             .max_memory_mutation_id(&[project.to_string()])
@@ -5655,7 +6250,7 @@ mod tests {
             .unwrap();
 
         let archived = store
-            .archive_memory(id, Some("obsolete"), 2)
+            .archive_memory(project, id, Some("obsolete"), 2)
             .unwrap()
             .unwrap();
         assert_eq!(archived.status, "archived");
@@ -5688,7 +6283,7 @@ mod tests {
             .unwrap();
 
         let merged = store
-            .merge_memories(target, &[source], "merged content", 2)
+            .merge_memories(project, target, &[source], "merged content", 2)
             .unwrap()
             .unwrap();
         assert_eq!(merged.content, "merged content");
@@ -6617,6 +7212,76 @@ mod shadow_tests {
                 found: 1
             }
         ));
+    }
+
+    #[test]
+    fn assembled_paged_seed_without_reset_retains_omitted_compartments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "shadow:reset-required";
+        let initial = vec![comp(0, 0, "first#0"), comp(1, 1, "stale#0")];
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                compartments: &initial,
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+
+        // A completed paged seed reaches the store as one assembled request. Omitting
+        // the existing sequence-1 compartment here preserves it unless reset ran first.
+        let replacement = vec![comp(0, 0, "replacement#0")];
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 0,
+                expected_shadow_seq: 1,
+                seed_boundary_id: None,
+                compartments: &replacement,
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .load_compartments(session)
+                .unwrap()
+                .iter()
+                .map(|compartment| compartment.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "state_sync upserts and cannot prove completeness without a prior reset"
+        );
+
+        store.reset_shadow_session(session, session).unwrap();
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 1,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                compartments: &replacement,
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+        assert_eq!(store.load_compartments(session).unwrap().len(), 1);
     }
 
     #[test]

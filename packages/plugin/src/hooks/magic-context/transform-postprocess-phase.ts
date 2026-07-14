@@ -221,11 +221,68 @@ export interface PostTransformPhaseResult {
     explicitMaterializedSuccessfully: boolean;
     deferredMaterializedSuccessfully: boolean;
     materialized: boolean;
+    /** True only when this pass consumed newly folded historian history. */
+    historianFoldMaterializedThisPass: boolean;
     materializeReason: string | null;
     droppedTokens: number;
+    emergencyReclaimedTokens: number;
     droppedCount: number;
     emergency: boolean;
     bustedThisPass: boolean;
+}
+
+export interface ConfirmedAbortClient {
+    session?: {
+        abort?: (input: {
+            path: { id: string };
+            throwOnError: true;
+        }) => Promise<{ data?: boolean; error?: unknown }>;
+    };
+}
+
+export async function abortSessionFailClosed(
+    client: ConfirmedAbortClient,
+    sessionId: string,
+): Promise<void> {
+    if (typeof client.session?.abort !== "function") {
+        throw new Error("OpenCode session.abort is unavailable");
+    }
+    const result = await client.session.abort({
+        path: { id: sessionId },
+        throwOnError: true,
+    });
+    if (result.data !== true) {
+        throw new Error(
+            `OpenCode session.abort was not confirmed: ${JSON.stringify(result.error ?? result.data)}`,
+        );
+    }
+}
+
+export interface EmergencyFailClosedDecision {
+    shouldAbort: boolean;
+    reason: "below-emergency-band" | "provider-overflow-abort" | "proceed";
+}
+
+export function evaluateEmergencyFailClosed(input: {
+    usagePercentage: number;
+    emergencyRecoveryArmed: boolean;
+    emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null;
+    foldMaterializedThisPass: boolean;
+}): EmergencyFailClosedDecision {
+    if (input.usagePercentage < 95) {
+        return { shouldAbort: false, reason: "below-emergency-band" };
+    }
+    // Inside messages.transform, only the provider's own rejection proves that
+    // this turn shape overflows. Local numeric estimates remain telemetry until
+    // module-side accounting can reproduce provider-accurate framing.
+    const shouldAbort =
+        input.emergencyRecoveryArmed &&
+        input.emergencyRecoveryOrigin === "provider_overflow" &&
+        !input.foldMaterializedThisPass;
+    return {
+        shouldAbort,
+        reason: shouldAbort ? "provider-overflow-abort" : "proceed",
+    };
 }
 
 export function finalizeMessageRepresentation(
@@ -463,6 +520,7 @@ export async function runPostTransformPhase(
     let heuristicOrReasoningDidMutate = false;
     let droppedCount = 0;
     const droppedTokens = 0;
+    let emergencyReclaimedTokens = 0;
     let emergency = false;
     let m0RematerializedThisPass = false;
     let m0MaterializeReason: string | null = null;
@@ -564,6 +622,7 @@ export async function runPostTransformPhase(
                 cleanup.droppedInjections +
                 cleanup.mutatedTextTags;
             emergency ||= cleanup.emergencyDroppedTools > 0;
+            emergencyReclaimedTokens += cleanup.emergencyReclaimedTokens;
             const t7 = performance.now();
             // Typed reasoning clearing is canonical-Anthropic-only. clearOldReasoning
             // rewrites a reasoning part's `thinking`/`text` to "[cleared]"; only
@@ -1396,8 +1455,10 @@ export async function runPostTransformPhase(
         explicitMaterializedSuccessfully,
         deferredMaterializedSuccessfully,
         materialized,
+        historianFoldMaterializedThisPass: historyWasConsumedThisPass,
         materializeReason,
         droppedTokens,
+        emergencyReclaimedTokens,
         droppedCount,
         emergency,
         bustedThisPass,

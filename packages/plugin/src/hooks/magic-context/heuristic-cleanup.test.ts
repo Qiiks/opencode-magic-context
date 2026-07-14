@@ -2,6 +2,10 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { getTagsBySession, insertTag } from "../../features/magic-context/storage";
+import {
+    clearEmergencyDropSample,
+    getEmergencyInputSample,
+} from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import type { MessageLike, TagTarget } from "./tag-messages";
@@ -216,6 +220,50 @@ describe("applyHeuristicCleanup", () => {
             expect(
                 tags.filter((t) => t.status === "dropped").every((t) => t.dropMode === "full"),
             ).toBe(true);
+        });
+
+        it("#then clears the sample latch after abort so the retry drops more", () => {
+            for (let i = 1; i <= 10; i++) {
+                insertTag(db, SESSION, `abort-call-${i}`, "tool", 4000, i, 0, "bash");
+            }
+            const targets = new Map<number, TagTarget>();
+            for (let i = 1; i <= 10; i++) {
+                targets.set(
+                    i,
+                    makeTarget({
+                        parts: [
+                            {
+                                type: "tool",
+                                tool: "bash",
+                                state: { output: "x".repeat(4000), status: "completed" },
+                            },
+                        ],
+                    }),
+                );
+            }
+            const emergency = { currentTotalInputTokens: 10_000, ceilingTokens: 10_000 };
+
+            const first = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
+                protectedTags: 0,
+                emergency,
+            });
+            expect(first.emergencyDroppedTools).toBeGreaterThan(0);
+            expect(getEmergencyInputSample(db, SESSION)).toBe(10_000);
+
+            const latched = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
+                protectedTags: 0,
+                emergency,
+            });
+            expect(latched.emergencyDroppedTools).toBe(0);
+
+            // A confirmed fail-closed abort cannot produce the fresh provider
+            // sample the latch normally waits for, so the abort path releases it.
+            clearEmergencyDropSample(db, SESSION);
+            const retry = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
+                protectedTags: 0,
+                emergency,
+            });
+            expect(retry.emergencyDroppedTools).toBeGreaterThan(0);
         });
 
         it("#then is a no-op when already under target (reclaim <= 0)", () => {

@@ -26,6 +26,8 @@ let nextNotificationId = 1;
 export interface NotificationSink {
     /** The TUI's active session at connect time (its hello scope). */
     sessionId?: string;
+    /** Protocol 2 clients use strict session scoping; absent means legacy behavior. */
+    protocol?: number;
     /** Deliver one notification over this sink's live socket. */
     send: (notification: RpcNotification) => void;
 }
@@ -48,23 +50,19 @@ export function registerNotificationSink(sink: NotificationSink): () => void {
     };
 }
 
-/** Whether a given notification may be delivered to a given sink. A global
- *  notification (no sessionId) reaches every sink; a session-scoped one reaches
- *  only sinks for that session (or session-less sinks). Mirrors the drain filter
- *  from the sink's perspective. */
+/** Whether a notification may be delivered to a sink. Protocol 2 makes a
+ * session-less socket global-only; legacy sockets retain broad compatibility. */
 function notificationMatchesSink(notification: RpcNotification, sink: NotificationSink): boolean {
-    return (
-        notification.sessionId === undefined ||
-        sink.sessionId === undefined ||
-        notification.sessionId === sink.sessionId
-    );
+    if (notification.sessionId === undefined) return true;
+    if (sink.sessionId !== undefined) return notification.sessionId === sink.sessionId;
+    return sink.protocol !== 2;
 }
 
 /** Push a notification to the TUI. Fans out to any live WS sink immediately and
  *  also enqueues it so a TUI that is momentarily disconnected (reconnecting, or
  *  not yet connected) still receives it on its next hello via the backlog drain.
  *  At-least-once: a live push that the socket drops is re-delivered from the
- *  queue on reconnect (pruned only when the client acks via `lastReceivedId`). */
+ *  queue on reconnect (pruned only when the client acknowledges it). */
 export function pushNotification(
     type: string,
     payload: Record<string, unknown>,
@@ -83,28 +81,38 @@ export function pushNotification(
             // unregister it, and the queue backlog re-delivers on reconnect.
         }
     }
-    // Cap queue size to prevent unbounded growth if a TUI is not draining.
-    // Session-FAIR eviction: a naive `slice(-50)` drops the globally-oldest
-    // items, so a noisy session could evict ANOTHER session's single unseen
-    // notification. Instead, always retain each session's newest item, then
-    // fill the rest of the budget with the newest overall — no session can
-    // starve another's pending dialog out of the window.
+    // Keep a strict global bound. Reserve the newest item for at most 25 recently
+    // active scopes, then evict the oldest unreserved item. This protects a quiet
+    // session from one noisy peer without allowing one item per session to grow
+    // the queue without limit.
     if (queue.length > 100) {
-        const newestPerSession = new Map<string | undefined, number>();
-        for (const n of queue) {
-            const prev = newestPerSession.get(n.sessionId);
-            if (prev === undefined || n.id > prev) {
-                newestPerSession.set(n.sessionId, n.id);
-            }
+        const reservedIds = new Set<number>();
+        const reservedScopes = new Set<string>();
+        for (let i = queue.length - 1; i >= 0 && reservedScopes.size < 25; i -= 1) {
+            const candidate = queue[i];
+            const scope = candidate.sessionId ?? "\0global";
+            if (reservedScopes.has(scope)) continue;
+            reservedScopes.add(scope);
+            reservedIds.add(candidate.id);
         }
-        const mustKeep = new Set(newestPerSession.values());
-        const byNewest = [...queue].sort((a, b) => b.id - a.id);
-        const kept: RpcNotification[] = [];
-        for (const n of byNewest) {
-            if (kept.length < 50 || mustKeep.has(n.id)) kept.push(n);
-        }
-        queue = kept.sort((a, b) => a.id - b.id);
+        const evictionIndex = queue.findIndex((candidate) => !reservedIds.has(candidate.id));
+        queue.splice(evictionIndex >= 0 ? evictionIndex : 0, 1);
     }
+}
+
+export function acknowledgeNotifications(ids: readonly number[]): void {
+    const acknowledged = new Set(ids.filter((id) => Number.isSafeInteger(id) && id > 0));
+    if (acknowledged.size === 0) return;
+    // Exact removal preserves an earlier notification when a later handler finishes
+    // first or the earlier handler declines to consume its notification.
+    queue = queue.filter((notification) => !acknowledged.has(notification.id));
+}
+
+/** Reset process-local state to simulate a fresh server module in protocol tests. */
+export function __resetNotificationStateForTests(): void {
+    queue = [];
+    nextNotificationId = 1;
+    sinks.clear();
 }
 
 export interface DrainNotificationsOptions {
@@ -133,8 +141,8 @@ function cursor(value: number | undefined): number {
  *  behavior.
  *
  *  Delivery is at-least-once (non-destructive return + prune-on-ack): a returned
- *  notification stays queued until a later call acks it via the matching scope's
- *  cursor, so a dropped WS socket re-delivers unhandled backlog on reconnect. */
+ *  notification stays queued until an exact acknowledgement or a legacy cursor
+ *  removes it, so a dropped WS socket re-delivers unhandled backlog on reconnect. */
 export function drainNotifications(
     lastReceivedId = 0,
     sessionId?: string,
@@ -200,14 +208,15 @@ export function drainNotifications(
  *  Pass `sessionId` (preferred) to ask whether a TUI is connected FOR THAT
  *  SESSION — this is what producers (`/ctx-status`, `/ctx-recomp`, the upgrade
  *  reminder) must use to decide dialog-vs-message, so a TUI on a different
- *  session in the same process does not misroute their delivery. A session-less
- *  sink (legacy/global) counts for any session query. Omit `sessionId` only for
- *  callers with no session context; they get "any sink connected". */
+ *  session in the same process does not misroute their delivery. A modern
+ *  session-less sink is global-only; a legacy sink retains broad compatibility.
+ *  Omit `sessionId` only for callers with no session context. */
 export function isTuiConnected(sessionId?: string): boolean {
     if (sinks.size === 0) return false;
     if (sessionId === undefined) return true;
     for (const sink of sinks) {
-        if (sink.sessionId === undefined || sink.sessionId === sessionId) return true;
+        if (sink.sessionId === sessionId) return true;
+        if (sink.sessionId === undefined && sink.protocol !== 2) return true;
     }
     return false;
 }

@@ -56,6 +56,8 @@ export function isSaneLimit(limit: number | undefined): limit is number {
 
 interface CachedModelMetadata {
     limit?: number;
+    /** Provider-enforced prompt cap. Undefined when only a combined context window is known. */
+    inputLimit?: number;
 }
 
 /**
@@ -90,10 +92,20 @@ function loadPersistedApiCacheOnce(): void {
     persistSeedLoaded = true;
     try {
         const raw = readFileSync(persistFilePath(), "utf-8");
-        const obj = JSON.parse(raw) as Record<string, number>;
+        const obj = JSON.parse(raw) as Record<
+            string,
+            number | { limit?: number; inputLimit?: number }
+        >;
         const map = new Map<string, CachedModelMetadata>();
-        for (const [key, limit] of Object.entries(obj)) {
-            if (isSaneLimit(limit)) map.set(key, { limit });
+        for (const [key, persisted] of Object.entries(obj)) {
+            const limit = typeof persisted === "number" ? persisted : persisted.limit;
+            const inputLimit = typeof persisted === "number" ? undefined : persisted.inputLimit;
+            if (isSaneLimit(limit)) {
+                map.set(key, {
+                    limit,
+                    inputLimit: isSaneLimit(inputLimit) ? inputLimit : undefined,
+                });
+            }
         }
         if (map.size > 0) {
             apiCache = map;
@@ -112,9 +124,14 @@ function loadPersistedApiCacheOnce(): void {
  *  never sees a torn file (the exact failure mode we're eliminating). */
 function persistApiCache(): void {
     if (!apiCache) return;
-    const obj: Record<string, number> = {};
+    const obj: Record<string, CachedModelMetadata> = {};
     for (const [key, value] of apiCache) {
-        if (isSaneLimit(value.limit)) obj[key] = value.limit;
+        if (isSaneLimit(value.limit)) {
+            obj[key] = {
+                limit: value.limit,
+                inputLimit: isSaneLimit(value.inputLimit) ? value.inputLimit : undefined,
+            };
+        }
     }
     try {
         const dir = getMagicContextStorageDir();
@@ -157,6 +174,7 @@ function setCachedModelMetadata(
         | undefined,
 ): void {
     const limit = resolveLimit(model?.limit);
+    const inputLimit = model?.limit?.input;
 
     // Only cache plausible limits. A value outside [20k, 3M] is garbage (torn
     // read / unconfigured default) and must never enter the cache or get
@@ -165,7 +183,10 @@ function setCachedModelMetadata(
         return;
     }
 
-    const value: CachedModelMetadata = { limit };
+    const value: CachedModelMetadata = {
+        limit,
+        inputLimit: isSaneLimit(inputLimit) ? inputLimit : undefined,
+    };
     cache.set(key, value);
 
     // OpenCode creates derived model IDs from experimental.modes
@@ -330,6 +351,23 @@ export function getSdkContextLimit(providerID: string, modelID: string): number 
     loadPersistedApiCacheOnce();
     const fromApi = lookupLimitWithTagFallback(apiCache, providerID, modelID);
     return isSaneLimit(fromApi) ? fromApi : undefined;
+}
+
+/**
+ * Return only a provider-declared input cap. A combined context window is useful
+ * for scheduling but is not safe as a fail-closed prompt boundary.
+ */
+export function getSdkInputLimit(providerID: string, modelID: string): number | undefined {
+    loadPersistedApiCacheOnce();
+    if (!apiCache) return undefined;
+    const direct = apiCache.get(`${providerID}/${modelID}`)?.inputLimit;
+    if (isSaneLimit(direct)) return direct;
+    const colon = modelID.indexOf(":");
+    if (colon > 0) {
+        const tagless = apiCache.get(`${providerID}/${modelID.slice(0, colon)}`)?.inputLimit;
+        if (isSaneLimit(tagless)) return tagless;
+    }
+    return undefined;
 }
 
 /**

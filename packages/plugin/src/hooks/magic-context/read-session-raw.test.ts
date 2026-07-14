@@ -4,7 +4,9 @@ import { describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
+    countRawSessionMessageOrdinalsFromDb,
     readRawSessionMessageIdOrdinalsFromDb,
+    readRawSessionMessagePageFromDb,
     readRawSessionMessagesFromDb,
 } from "./read-session-raw";
 
@@ -83,6 +85,17 @@ describe("raw session message id ordinals", () => {
                 ["m-weird", 3],
                 ["m-tool-result", 5],
             ]);
+
+            const firstPage = readRawSessionMessagePageFromDb(db, "session", 0, 2, 5);
+            const secondPage = readRawSessionMessagePageFromDb(db, "session", 2, 3, 5);
+            expect([...firstPage, ...secondPage].map(({ id, ordinal }) => [id, ordinal])).toEqual([
+                ["m-user", 1],
+                ["m-assistant", 2],
+                ["m-weird", 3],
+                ["m-malformed", 4],
+                ["m-tool-result", 5],
+            ]);
+            expect(countRawSessionMessageOrdinalsFromDb(db, "session")).toBe(5);
         } finally {
             closeQuietly(db);
         }

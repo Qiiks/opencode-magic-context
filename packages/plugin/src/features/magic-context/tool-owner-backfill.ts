@@ -248,7 +248,8 @@ function acquireSessionLease(db: Database, sessionId: string, now: number): bool
     const result = db
         .prepare(
             `INSERT INTO tool_owner_backfill_state(session_id, status, started_at, lease_expires_at)
-             VALUES (?, 'running', ?, ?)
+             SELECT ?, 'running', ?, ?
+             WHERE EXISTS (SELECT 1 FROM tags WHERE session_id = ?)
              ON CONFLICT(session_id) DO UPDATE SET
                  status = 'running',
                  started_at = excluded.started_at,
@@ -258,7 +259,7 @@ function acquireSessionLease(db: Database, sessionId: string, now: number): bool
                 OR (tool_owner_backfill_state.status = 'running'
                     AND tool_owner_backfill_state.lease_expires_at < ?)`,
         )
-        .run(sessionId, now, expiresAt, now);
+        .run(sessionId, now, expiresAt, sessionId, now);
     return (result.changes ?? 0) === 1;
 }
 
@@ -288,15 +289,18 @@ function markSessionPendingRetry(db: Database, sessionId: string): void {
 }
 
 function markSessionSkipped(db: Database, sessionId: string, now: number, reason: string): void {
+    // Lease acquisition creates the row. An update-only terminal transition keeps
+    // clearSession authoritative if it removes that row while backfill is in flight.
     db.prepare(
-        `INSERT INTO tool_owner_backfill_state(session_id, status, completed_at, last_error)
-         VALUES (?, 'skipped', ?, ?)
-         ON CONFLICT(session_id) DO UPDATE SET
-             status = 'skipped',
-             completed_at = excluded.completed_at,
-             last_error = excluded.last_error,
-             lease_expires_at = NULL`,
-    ).run(sessionId, now, reason);
+        `UPDATE tool_owner_backfill_state
+         SET status = 'skipped', completed_at = ?, last_error = ?, lease_expires_at = NULL
+         WHERE session_id = ? AND status = 'running'`,
+    ).run(now, reason, sessionId);
+}
+
+/** Test-only hook for the clear-versus-terminal-transition race. */
+export function _markSessionSkippedForTests(db: Database, sessionId: string): void {
+    markSessionSkipped(db, sessionId, Date.now(), "test_no_matches");
 }
 
 function markSessionErrored(db: Database, sessionId: string, error: unknown): void {
@@ -464,7 +468,7 @@ function applyOwnersForSession(
             const result = updateRowStmt.run(ownerId, orphan.id);
             rowsUpdated += result.changes ?? 0;
         }
-    })();
+    }).immediate();
 
     const rowsLeftNull = (
         db

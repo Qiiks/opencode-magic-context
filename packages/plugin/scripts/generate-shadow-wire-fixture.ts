@@ -119,7 +119,7 @@ function fixtureMessages(): MessageLike[] {
     ];
 }
 
-export function generateShadowWireFixture(): string {
+export async function generateShadowWireFixture(): Promise<string> {
     const tempRoot = mkdtempSync(join(tmpdir(), "shadow-wire-fixture-"));
     const originalDataHome = process.env.XDG_DATA_HOME;
     const originalCacheHome = process.env.XDG_CACHE_HOME;
@@ -321,7 +321,7 @@ export function generateShadowWireFixture(): string {
             },
             declaredTrimBefore: declaredTrim,
         };
-        const resolved = __shadowSenderTest.resolveOrdinalsForShadow({
+        const resolved = await __shadowSenderTest.resolveOrdinalsForShadow({
             sessionId: SESSION_ID,
             messages: inputMessages,
             generation: state.shadowGeneration,
@@ -334,16 +334,18 @@ export function generateShadowWireFixture(): string {
             annotatedInput: resolved.annotatedInput,
             declaredTrim,
         };
-        const sync = __shadowSenderTest.buildStateSyncPayload({
+        const sync = await __shadowSenderTest.buildStateSyncPayload({
             state,
             pass: preparedPass,
             force: true,
+            seedId: "shadow-wire-fixture-seed",
         });
         if (
             sync === null ||
             sync === "m0_mutation" ||
             sync === "mismatch" ||
-            sync === "unresolved"
+            sync === "unresolved" ||
+            sync === "seed_budget"
         ) {
             throw new Error(`fixture state sync failed: ${String(sync)}`);
         }
@@ -370,10 +372,10 @@ export function generateShadowWireFixture(): string {
     }
 }
 
-export function writeShadowWireFixture(): void {
-    const bytes = generateShadowWireFixture();
+export async function writeShadowWireFixture(): Promise<void> {
+    const bytes = await generateShadowWireFixture();
     mkdirSync(dirname(SHADOW_WIRE_FIXTURE_PATH), { recursive: true });
     writeFileSync(SHADOW_WIRE_FIXTURE_PATH, bytes);
 }
 
-if (import.meta.main) writeShadowWireFixture();
+if (import.meta.main) await writeShadowWireFixture();

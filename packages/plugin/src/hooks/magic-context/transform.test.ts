@@ -37,7 +37,12 @@ import {
     updateSessionMeta,
     updateTagStatus,
 } from "../../features/magic-context/storage";
+import {
+    getEmergencyInputSample,
+    setEmergencyDropSample,
+} from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
+import { recordToolDefinition } from "../../features/magic-context/tool-definition-tokens";
 import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
@@ -2343,7 +2348,7 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         liveModel: { providerID: string; modelID: string },
         usage: { percentage: number; inputTokens: number },
     ) {
-        const abort = mock(async () => ({}));
+        const abort = mock(async () => ({ data: true }));
         const prompt = mock(async () => ({}));
         const liveModelBySession = new Map([[sessionId, liveModel]]);
         const transform = createTransform({
@@ -2417,7 +2422,7 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         });
         await seedNewModelLimit(272_000);
 
-        const { transform } = makeTransform(db, "ses-shrink", NEW_MODEL, {
+        const { transform, abort } = makeTransform(db, "ses-shrink", NEW_MODEL, {
             percentage: 58,
             inputTokens: 300_000,
         });
@@ -2430,6 +2435,42 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         expect(overflow.needsEmergencyRecovery).toBe(true);
         // Flag-only: no catalog/auth limit pinned into detected_context_limit.
         expect(overflow.detectedContextLimit).toBe(0);
+        expect(overflow.emergencyRecoveryOrigin).toBe("proactive_model_shrink");
+        expect(abort).not.toHaveBeenCalled();
+    });
+
+    it("does not abort a stale proactive arm after restart zeroed the input sample", async () => {
+        useTempDataHome("transform-shrink-switch-stale-restart-");
+        const sessionId = "ses-stale-proactive";
+        createOpenCodeDbForTransform(sessionId, [{ id: "m-raw-1", role: "user", text: "recent" }]);
+        const db = openDatabase();
+        recordOverflowDetected(db, sessionId, undefined, NEW_KEY, "proactive_model_shrink");
+
+        const { transform, abort } = makeTransform(db, sessionId, NEW_MODEL, {
+            percentage: 0,
+            inputTokens: 0,
+        });
+        await transform(
+            {},
+            {
+                messages: [
+                    {
+                        info: {
+                            id: "m-user-restart",
+                            role: "user",
+                            sessionID: sessionId,
+                            model: NEW_MODEL,
+                        },
+                        parts: [{ type: "text", text: "continue" }],
+                    },
+                ],
+            },
+        );
+
+        expect(getOverflowState(db, sessionId).emergencyRecoveryOrigin).toBe(
+            "proactive_model_shrink",
+        );
+        expect(abort).not.toHaveBeenCalled();
     });
 
     it("does not arm on a normal SAME-model turn whose input fits the model", async () => {
@@ -2590,7 +2631,7 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
 });
 
 describe("createTransform historian failure handling", () => {
-    it("lets an armed empty-head emergency proceed after the bounded no-head escape", async () => {
+    it("fails closed until the bounded no-head escape lowers synthetic pressure", async () => {
         useTempDataHome("transform-empty-head-escape-");
         createOpenCodeDbForTransform("ses-empty-head-escape", [
             { id: "m-raw-1", role: "user", text: "recent 1" },
@@ -2601,7 +2642,7 @@ describe("createTransform historian failure handling", () => {
         incrementHistorianFailure(db, "ses-empty-head-escape", "historian failed");
         recordOverflowDetected(db, "ses-empty-head-escape", 8_000);
 
-        const abort = mock(async () => ({}));
+        const abort = mock(async () => ({ data: true }));
         const prompt = mock(async () => ({}));
         const transform = createTransform({
             tagger: createTagger(),
@@ -2647,7 +2688,7 @@ describe("createTransform historian failure handling", () => {
         );
     });
 
-    it("does not permanently abort a genuinely >=95% armed empty head", async () => {
+    it("keeps failing closed at real >=95% pressure after the no-head escape", async () => {
         useTempDataHome("transform-empty-head-escape-95-");
         createOpenCodeDbForTransform("ses-empty-head-escape-95", [
             { id: "m-raw-1", role: "user", text: "recent 1" },
@@ -2658,7 +2699,7 @@ describe("createTransform historian failure handling", () => {
         incrementHistorianFailure(db, "ses-empty-head-escape-95", "historian failed");
         recordOverflowDetected(db, "ses-empty-head-escape-95", 8_000);
 
-        const abort = mock(async () => ({}));
+        const abort = mock(async () => ({ data: true }));
         const transform = createTransform({
             tagger: createTagger(),
             scheduler: { shouldExecute: mock(() => "defer" as const) },
@@ -2699,13 +2740,13 @@ describe("createTransform historian failure handling", () => {
         }
         await new Promise((resolve) => setTimeout(resolve, 0));
 
-        expect(abort).toHaveBeenCalledTimes(2);
+        expect(abort).toHaveBeenCalledTimes(3);
         expect(
             loadProtectedTailMeta(db, "ses-empty-head-escape-95").recoveryNoEligibleHeadCount,
         ).toBe(2);
     });
 
-    it("aborts at 95% and only sends the emergency notification once per failure count", async () => {
+    it("does not abort solely because historian failures exist at 95%", async () => {
         useTempDataHome("transform-historian-emergency-");
         createOpenCodeDbForTransform("ses-emergency", [
             { id: "m-raw-1", role: "user", text: "recent 1" },
@@ -2785,13 +2826,115 @@ describe("createTransform historian failure handling", () => {
                     (input.body?.parts?.[0]?.text ?? "").includes("Context Emergency"),
             );
 
-        expect(abort).toHaveBeenCalledTimes(3);
-        expect(emergencyNotifications).toHaveLength(2);
-        expect(emergencyNotifications[0]?.body?.parts?.[0]?.text).toContain("96.0%");
-        expect(emergencyNotifications[0]?.body?.parts?.[0]?.text).toContain(
-            "429 rate limit from historian provider",
+        expect(abort).not.toHaveBeenCalled();
+        expect(emergencyNotifications).toHaveLength(0);
+    });
+
+    it("notifies before awaiting self-abort for provider-proven overflow", async () => {
+        useTempDataHome("transform-fail-closed-order-");
+        const sessionId = "ses-fail-closed-order";
+        createOpenCodeDbForTransform(sessionId, [{ id: "m-raw-1", role: "user", text: "recent" }]);
+        await refreshModelLimitsFromApi({
+            config: {
+                providers: async () => ({
+                    data: {
+                        providers: [
+                            {
+                                id: "test-provider",
+                                models: { "emergency-100k": { limit: { input: 100_000 } } },
+                            },
+                        ],
+                    },
+                }),
+            },
+        });
+        recordToolDefinition("test-provider", "emergency-100k", "build", "read", "Read a file", {
+            type: "object",
+        });
+        const db = openDatabase();
+        updateSessionMeta(db, sessionId, { systemPromptTokens: 110_000 });
+        recordOverflowDetected(db, sessionId, 100_000, "test-provider/emergency-100k");
+        setEmergencyDropSample(db, sessionId, 110_000);
+        const order: string[] = [];
+        const prompt = mock(async () => {
+            order.push("notify");
+            return {};
+        });
+        const abort = mock(async () => {
+            order.push("abort");
+            return { data: true };
+        });
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp", title: "Emergency" } })),
+                prompt,
+                abort,
+            },
+        } as unknown as PluginContext["client"];
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: mock(() => "defer" as const) },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    {
+                        usage: { percentage: 110, inputTokens: 110_000 },
+                        updatedAt: Date.now(),
+                    },
+                ],
+            ]),
+            db,
+            historyRefreshSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set<string>(),
+            lastHeuristicsTurnId: new Map<string, string>(),
+            clearReasoningAge: 50,
+            protectedTags: 0,
+            client,
+            directory: "/tmp",
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "test-provider", modelID: "emergency-100k" }],
+            ]),
+            getModelKey: () => "test-provider/emergency-100k",
+            getNotificationParams: () => ({
+                agent: "build",
+                providerId: "test-provider",
+                modelId: "emergency-100k",
+                variant: "high",
+            }),
+        });
+
+        await transform(
+            {},
+            {
+                messages: [
+                    {
+                        info: {
+                            id: "m-user",
+                            role: "user",
+                            sessionID: sessionId,
+                            model: {
+                                providerID: "test-provider",
+                                modelID: "emergency-100k",
+                            },
+                        },
+                        parts: [{ type: "text", text: "continue" }],
+                    },
+                ],
+            },
         );
-        expect(emergencyNotifications[1]?.body?.parts?.[0]?.text).toContain("503 overloaded");
+
+        expect(order).toEqual(["notify", "abort"]);
+        expect(abort).toHaveBeenCalledWith({
+            path: { id: sessionId },
+            throwOnError: true,
+        });
+        expect(getEmergencyInputSample(db, sessionId)).toBe(0);
+        const notificationInput = prompt.mock.calls[0]?.[0] as {
+            body?: { parts?: Array<{ text?: string }> };
+        };
+        expect(notificationInput.body?.parts?.[0]?.text).toBe(
+            "Context full — /ctx-flush or /clear to continue.",
+        );
     });
 
     it("starts historian recovery on the first transform pass after restart and clears failure state on success", async () => {

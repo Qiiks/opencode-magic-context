@@ -619,6 +619,7 @@ pub struct HistorianFireRequest<'a> {
     pub validate_options: ValidateOptions,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
+    pub completion_now_ms: fn() -> i64,
 }
 
 pub struct HistorianReattachRequest<'a> {
@@ -633,6 +634,7 @@ pub struct HistorianReattachRequest<'a> {
     pub publication_floor_ordinal: u64,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
+    pub completion_now_ms: fn() -> i64,
 }
 
 /// Session-id prefix for the module's own producer (child) sessions. The transform
@@ -708,19 +710,19 @@ pub fn historian_producer_session_id(
         .collect();
     let slug = slug.trim_matches('-');
     let slug = if slug.is_empty() { "project" } else { slug };
-    let lineage = fnv1a_hex8(session_id);
+    let lineage = fnv1a_hex16(session_id);
     format!("mc-historian:{slug}:{lineage}:{firing_seq}")
 }
 
-/// FNV-1a 64-bit, rendered as the first 8 hex chars — enough to separate the
-/// handful of concurrent lineages a project realistically carries.
-fn fnv1a_hex8(input: &str) -> String {
+/// FNV-1a 64-bit rendered in full so producer sessions retain the hash's
+/// collision resistance across adversarially chosen lineage keys.
+fn fnv1a_hex16(input: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    format!("{hash:016x}")[..8].to_string()
+    format!("{hash:016x}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,6 +815,17 @@ fn decide_producer_failure(
         failure_backoff_at_ms: default_failure_backoff_at_ms,
         detail_prefix: None,
     }
+}
+
+pub(crate) fn completion_failure_backoff_at_ms(
+    started_at_ms: i64,
+    configured_backoff_at_ms: i64,
+    completed_at_ms: i64,
+) -> i64 {
+    let cooldown_ms = configured_backoff_at_ms
+        .saturating_sub(started_at_ms)
+        .max(0);
+    completed_at_ms.saturating_add(cooldown_ms)
 }
 
 fn classified_backoff_at_ms(
@@ -909,14 +922,20 @@ where
         {
             Ok(handle) => handle,
             Err(err) => {
+                let completed_at_ms = (request.completion_now_ms)();
+                let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                    request.now_ms,
+                    request.failure_backoff_at_ms,
+                    completed_at_ms,
+                );
                 let decision = decide_producer_failure(
                     &err,
                     model,
                     &request.model_chain[index + 1..],
                     &mut auth_blocked_providers,
                     &mut all_failures_permanent,
-                    request.now_ms,
-                    request.failure_backoff_at_ms,
+                    completed_at_ms,
+                    failure_backoff_at_ms,
                 );
                 persist_historian_state(
                     request.store,
@@ -952,14 +971,15 @@ where
                         let detail = format!(
                             "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
                         );
+                        let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                            request.now_ms,
+                            request.failure_backoff_at_ms,
+                            (request.completion_now_ms)(),
+                        );
                         persist_historian_state(
                             request.store,
                             request.session_id,
-                            abandon_with_detail(
-                                &awaiting,
-                                request.failure_backoff_at_ms,
-                                Some(detail),
-                            ),
+                            abandon_with_detail(&awaiting, failure_backoff_at_ms, Some(detail)),
                         )?;
                         producer.close().await;
                         return Err(HistorianDriveError::Producer(recovery_err));
@@ -968,14 +988,20 @@ where
             }
             Err(err) => {
                 let _ = producer.cancel(&handle.run_id).await;
+                let completed_at_ms = (request.completion_now_ms)();
+                let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                    request.now_ms,
+                    request.failure_backoff_at_ms,
+                    completed_at_ms,
+                );
                 let decision = decide_producer_failure(
                     &err,
                     model,
                     &request.model_chain[index + 1..],
                     &mut auth_blocked_providers,
                     &mut all_failures_permanent,
-                    request.now_ms,
-                    request.failure_backoff_at_ms,
+                    completed_at_ms,
+                    failure_backoff_at_ms,
                 );
                 persist_historian_state(
                     request.store,
@@ -1012,10 +1038,23 @@ where
             prior_compartments: request.prior_compartments,
             validate_options: request.validate_options,
             created_at_ms: request.now_ms,
+            failure_started_at_ms: request.now_ms,
             failure_backoff_at_ms: request.failure_backoff_at_ms,
+            completion_now_ms: request.completion_now_ms,
         });
         producer.close().await;
-        let row_version = publish_result?;
+        let row_version = match publish_result {
+            Ok(row_version) => row_version,
+            Err(HistorianDriveError::Validation(err)) => {
+                // Validation rejection is model-local output failure. Exhaust the
+                // configured fallback chain before returning the final rejection.
+                if has_eligible_model(&request.model_chain[index + 1..], &auth_blocked_providers) {
+                    continue;
+                }
+                return Err(HistorianDriveError::Validation(err));
+            }
+            Err(err) => return Err(err),
+        };
         return Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
             row_version,
             producer_session_id,
@@ -1059,11 +1098,12 @@ where
     let state = match producer.status(&producer_run_id).await {
         Ok(state) => state,
         Err(_) => {
-            abandon_current_state(
-                request.store,
-                request.session_id,
+            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                request.now_ms,
                 request.failure_backoff_at_ms,
-            )?;
+                (request.completion_now_ms)(),
+            );
+            abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
             producer.close().await;
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
@@ -1072,11 +1112,12 @@ where
     match state {
         RunState::Terminal | RunState::Active => {}
         RunState::Missing { .. } => {
-            abandon_current_state(
-                request.store,
-                request.session_id,
+            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                request.now_ms,
                 request.failure_backoff_at_ms,
-            )?;
+                (request.completion_now_ms)(),
+            );
+            abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
             producer.close().await;
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
@@ -1098,17 +1139,23 @@ where
                 }
                 _ => None,
             };
+            let completed_at_ms = (request.completion_now_ms)();
+            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                request.now_ms,
+                request.failure_backoff_at_ms,
+                completed_at_ms,
+            );
             let backoff_at_ms =
                 err.classification()
-                    .map_or(request.failure_backoff_at_ms, |classification| {
+                    .map_or(failure_backoff_at_ms, |classification| {
                         if classification.class == ErrorClass::Transient {
                             classified_backoff_at_ms(
-                                request.now_ms,
-                                request.failure_backoff_at_ms,
+                                completed_at_ms,
+                                failure_backoff_at_ms,
                                 classification,
                             )
                         } else {
-                            request.failure_backoff_at_ms
+                            failure_backoff_at_ms
                         }
                     });
             abandon_current_state_with_detail(
@@ -1139,7 +1186,9 @@ where
         prior_compartments: request.prior_compartments,
         validate_options: request.validate_options,
         created_at_ms: request.now_ms,
+        failure_started_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
+        completion_now_ms: request.completion_now_ms,
     });
     producer.close().await;
     let row_version = publish_result?;
@@ -1163,7 +1212,9 @@ struct PublishOutputRequest<'a> {
     prior_compartments: &'a [StoredCompartmentRange],
     validate_options: ValidateOptions,
     created_at_ms: i64,
+    failure_started_at_ms: i64,
     failure_backoff_at_ms: i64,
+    completion_now_ms: fn() -> i64,
 }
 
 fn publish_output_from_awaiting(
@@ -1181,19 +1232,35 @@ fn publish_output_from_awaiting(
         prior_compartments,
         validate_options,
         created_at_ms,
+        failure_started_at_ms,
         failure_backoff_at_ms,
+        completion_now_ms,
     } = request;
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
 
-    let validated = match validate_historian_output(
-        &output.text,
-        validation_chunk,
-        prior_compartments,
-        validate_options,
-    ) {
+    let validation_result = if output.length_capped {
+        Err(HistorianValidationError {
+            message:
+                "Historian output hit the length cap; refusing a potentially partial document."
+                    .to_string(),
+        })
+    } else {
+        validate_historian_output(
+            &output.text,
+            validation_chunk,
+            prior_compartments,
+            validate_options,
+        )
+    };
+    let validated = match validation_result {
         Ok(validated) => validated,
         Err(err) => {
+            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                failure_started_at_ms,
+                failure_backoff_at_ms,
+                completion_now_ms(),
+            );
             let cap_hint = if output.length_capped {
                 " [output hit the length cap: raise the output budget or shrink the chunk]"
             } else {
@@ -1376,6 +1443,7 @@ mod tests {
             project_path: "git:proj",
             project_directory: "/nonexistent-docs",
             history_budget_tokens: 60_000.0,
+            memory_enabled: true,
             now_ms: 0,
             execute_threshold_percentage: 65.0,
             smart_drops: false,
@@ -1433,14 +1501,17 @@ mod tests {
                 ChunkLine {
                     ordinal: 2,
                     message_id: "m2#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 3,
                     message_id: "m3#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 4,
                     message_id: "m4#0".into(),
+                    anchorable: true,
                 },
             ],
             present_ordinals: vec![1, 2, 3, 4],
@@ -1561,6 +1632,23 @@ mod tests {
     }
 
     #[test]
+    fn full_lineage_hash_separates_keys_that_collided_at_32_bits() {
+        let first = historian_producer_session_id("proj", "lineage-ZiDxmBSjhQbv", 2);
+        let second = historian_producer_session_id("proj", "lineage-OPeZDtvlh9LD", 2);
+
+        assert_ne!(first, second);
+        let first_hash = first.split(':').nth(2).expect("hash segment");
+        let second_hash = second.split(':').nth(2).expect("hash segment");
+        assert_eq!(first_hash.len(), 16);
+        assert_eq!(second_hash.len(), 16);
+        assert_eq!(
+            &first_hash[..8],
+            &second_hash[..8],
+            "the regression keys collided under the former 32-bit prefix"
+        );
+    }
+
+    #[test]
     fn producer_session_ids_are_lineage_scoped_under_one_project() {
         // A parent conversation and a concurrent subagent lineage (composite key
         // with the U+241F delimiter) share the project slug and can reach the
@@ -1607,6 +1695,7 @@ mod tests {
             validate_options: validate_options(),
             now_ms: 123,
             failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
         }
     }
 
@@ -1627,6 +1716,7 @@ mod tests {
             publication_floor_ordinal: 4,
             now_ms: 123,
             failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
         }
     }
 
@@ -2142,6 +2232,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_lineages_reattach_and_publish_in_isolated_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let left_lineage = "lineage-ZiDxmBSjhQbv";
+        let right_lineage = "lineage-OPeZDtvlh9LD";
+        let left_producer_session = historian_producer_session_id("proj", left_lineage, 1);
+        let right_producer_session = historian_producer_session_id("proj", right_lineage, 1);
+        assert_ne!(left_producer_session, right_producer_session);
+
+        for (lineage, producer_session, run_id) in [
+            (left_lineage, left_producer_session.as_str(), "run-left"),
+            (right_lineage, right_producer_session.as_str(), "run-right"),
+        ] {
+            store
+                .replace_compartments(lineage, &[comp(1, 1, 1, "m1", "C1 summary")])
+                .unwrap();
+            let fired =
+                match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap() {
+                    FireOutcome::Fired(state) => state,
+                    FireOutcome::Busy(_) => unreachable!(),
+                };
+            let awaiting =
+                producer_started(&fired, producer_session.to_string(), run_id.to_string()).unwrap();
+            store
+                .commit(
+                    lineage,
+                    None,
+                    &CoreState::default(),
+                    &ModuleMeta {
+                        historian: awaiting,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut left_producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Ok(producer_output(historian_xml("left summary"))));
+        let mut right_producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Ok(producer_output(historian_xml("right summary"))));
+        let left_request = HistorianReattachRequest {
+            store: &store,
+            session_id: left_lineage,
+            project_path: "git:proj",
+            observed_chunk_fingerprint: "fp",
+            validation_chunk: &chunk,
+            chunk_transcript: "U: left transcript",
+            prior_compartments: &prior,
+            validate_options: validate_options(),
+            publication_floor_ordinal: 4,
+            now_ms: 123,
+            failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
+        };
+        let right_request = HistorianReattachRequest {
+            store: &store,
+            session_id: right_lineage,
+            project_path: "git:proj",
+            observed_chunk_fingerprint: "fp",
+            validation_chunk: &chunk,
+            chunk_transcript: "U: right transcript",
+            prior_compartments: &prior,
+            validate_options: validate_options(),
+            publication_floor_ordinal: 4,
+            now_ms: 123,
+            failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
+        };
+
+        let (left, right) = tokio::join!(
+            reattach_historian_producer(&mut left_producer, left_request),
+            reattach_historian_producer(&mut right_producer, right_request),
+        );
+
+        assert!(matches!(
+            left.unwrap(),
+            HistorianReattachOutcome::Published(_)
+        ));
+        assert!(matches!(
+            right.unwrap(),
+            HistorianReattachOutcome::Published(_)
+        ));
+        assert_eq!(left_producer.observed_sessions, vec![left_producer_session]);
+        assert_eq!(
+            right_producer.observed_sessions,
+            vec![right_producer_session]
+        );
+        let left_tail = store
+            .load_compartments(left_lineage)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let right_tail = store
+            .load_compartments(right_lineage)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(left_tail.p1.as_deref(), Some("left summary"));
+        assert_eq!(right_tail.p1.as_deref(), Some("right summary"));
+    }
+
+    #[tokio::test]
     async fn reattach_redrains_full_run_from_start() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -2330,6 +2526,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn length_capped_closed_output_is_rejected_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut capped = producer_output(historian_xml("closed but incomplete summary"));
+        capped.length_capped = true;
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-cap")))
+            .with_output(Ok(capped));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Validation(_)));
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert!(state
+            .last_failure
+            .as_deref()
+            .is_some_and(|detail| detail.contains("length cap")));
+    }
+
+    #[tokio::test]
     async fn truncated_output_validation_reject_records_cap_hint() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -2501,6 +2728,7 @@ mod tests {
             publication_floor_ordinal: 4,
             now_ms: 123,
             failure_backoff_at_ms: 999,
+            completion_now_ms: || 123,
         };
         let err = reattach_historian_producer(&mut producer, request)
             .await
@@ -2553,6 +2781,154 @@ mod tests {
         assert_eq!(state.state, HistorianPhase::Idle);
     }
 
+    #[tokio::test]
+    async fn validation_rejection_advances_to_valid_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-invalid")))
+            .with_output(Ok(producer_output("not historian xml".to_string())))
+            .with_start(Ok(run_handle("run-valid")))
+            .with_output(Ok(producer_output(historian_xml("fallback summary"))));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .expect("a valid fallback must publish after primary validation rejection");
+
+        let HistorianDriveOutcome::Completed(success) = outcome else {
+            panic!("expected completed fallback run");
+        };
+        assert_eq!(success.model, "other/model-b");
+        assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(
+            store
+                .load_historian_assembly_snapshot("ses")
+                .unwrap()
+                .compartments
+                .len(),
+            2
+        );
+    }
+
+    fn completion_after_long_model_run() -> i64 {
+        120_000
+    }
+
+    #[tokio::test]
+    async fn all_validation_rejections_preserve_final_error_and_start_cooldown_at_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-invalid-a")))
+            .with_output(Ok(producer_output("not historian xml".to_string())))
+            .with_start(Ok(run_handle("run-invalid-b")))
+            .with_output(Ok(producer_output("<output/>".to_string())));
+        let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+        request.now_ms = 0;
+        request.failure_backoff_at_ms = HISTORIAN_FAILURE_BACKOFF_MS;
+        request.completion_now_ms = completion_after_long_model_run;
+
+        let err = run_historian_firing(&mut producer, request)
+            .await
+            .expect_err("the final validation rejection must be returned");
+        let HistorianDriveError::Validation(final_error) = err else {
+            panic!("expected final validation error");
+        };
+        let state = store.load("ses").unwrap().meta.historian;
+
+        assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(
+            state.last_failure.as_deref(),
+            Some(format!("validate rejected: {final_error}").as_str()),
+        );
+        assert_eq!(state.failure_backoff_at_ms, Some(180_000));
+        assert!(
+            completion_after_long_model_run() < state.failure_backoff_at_ms.unwrap(),
+            "a model run longer than the cooldown must not leave immediate refire eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn narrative_gap_rejection_preserves_boundary_for_next_run() {
+        use crate::historian_validate::ChunkLine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = HistorianChunk {
+            start_index: 2,
+            end_index: 9,
+            lines: (2..=9)
+                .map(|ordinal| ChunkLine {
+                    ordinal,
+                    message_id: format!("m{ordinal}#0"),
+                    anchorable: true,
+                })
+                .collect(),
+            present_ordinals: (1..=9).collect(),
+            tool_only_ranges: vec![],
+        };
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let rejected_output = r#"<output><compartments>
+<compartment start="2" end="2" title="first" episode_type="feature" importance="50"><p1>first</p1><p2>first</p2><p3>first</p3><p4 /></compartment>
+<compartment start="8" end="9" title="second" episode_type="feature" importance="50"><p1>second</p1><p2>second</p2><p3>second</p3><p4 /></compartment>
+</compartments><meta><unprocessed_from>10</unprocessed_from></meta></output>"#;
+        let mut rejected_request = fire_request(&store, "messages 2-9", &models, &chunk, &prior);
+        rejected_request.to_ordinal = 9;
+        let mut rejecting_producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-gap")))
+            .with_output(Ok(producer_output(rejected_output.to_string())));
+
+        let error = run_historian_firing(&mut rejecting_producer, rejected_request)
+            .await
+            .expect_err("a five-message narrative gap must reject");
+        assert!(matches!(error, HistorianDriveError::Validation(_)));
+        let after_rejection = store.load_historian_assembly_snapshot("ses").unwrap();
+        assert_eq!(after_rejection.compartments.len(), 1);
+        assert_eq!(after_rejection.compartments[0].end_message, 1);
+        assert_eq!(
+            store.load("ses").unwrap().meta.publication_floor_ordinal,
+            None
+        );
+
+        // A later firing starts from the unchanged compartment boundary and can cover
+        // every rejected ordinal, including the former gap at 3..=7.
+        let accepted_output = r#"<output><compartments>
+<compartment start="2" end="9" title="re-read" episode_type="feature" importance="50"><p1>all messages re-read</p1><p2>re-read</p2><p3>re-read</p3><p4 /></compartment>
+</compartments><meta><unprocessed_from>10</unprocessed_from></meta></output>"#;
+        let mut retry_request = fire_request(&store, "messages 2-9", &models, &chunk, &prior);
+        retry_request.to_ordinal = 9;
+        retry_request.now_ms = 1_000;
+        let mut accepting_producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-reread")))
+            .with_output(Ok(producer_output(accepted_output.to_string())));
+        let outcome = run_historian_firing(&mut accepting_producer, retry_request)
+            .await
+            .expect("the same ordinals remain publishable on the next run");
+
+        assert!(matches!(outcome, HistorianDriveOutcome::Completed(_)));
+        let after_retry = store.load_historian_assembly_snapshot("ses").unwrap();
+        assert_eq!(after_retry.compartments.len(), 2);
+        assert_eq!(after_retry.compartments[1].start_message, 2);
+        assert_eq!(after_retry.compartments[1].end_message, 9);
+        assert_eq!(
+            store.load("ses").unwrap().meta.publication_floor_ordinal,
+            Some(10)
+        );
+    }
+
     /// The seam-close proof: a real historian output is parsed + validated by the
     /// validation module, and the resulting `ValidatedChunk` drives the publish
     /// path end to end. This is the capstone that both parallel units are correct
@@ -2590,14 +2966,17 @@ mod tests {
                 ChunkLine {
                     ordinal: 2,
                     message_id: "m2#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 3,
                     message_id: "m3#0".into(),
+                    anchorable: true,
                 },
                 ChunkLine {
                     ordinal: 4,
                     message_id: "m4#0".into(),
+                    anchorable: true,
                 },
             ],
             present_ordinals: vec![1, 2, 3, 4],

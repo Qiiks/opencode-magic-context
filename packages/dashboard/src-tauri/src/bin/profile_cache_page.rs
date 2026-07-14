@@ -7,7 +7,7 @@
 //!   cargo run --release --bin profile_cache_page -- --repeat  # adds a warm second pass
 //!
 //! Sequence mirrored from CacheDiagnostics.tsx onMount + one reconcile tick:
-//!   1. get_session_cache_stats_from_db(50, false)   — the session list
+//!   1. get_session_cache_stats_from_db(50, false, true, None) — the session list
 //!   2. per recent session (top 10 + managed filter): get_session_cache_events(harness, sid, 60)
 //!   3. one reconcile tick: stats re-list + incremental event fetches (since=lastSeen)
 //!
@@ -33,14 +33,14 @@ fn run_pass(label: &str) {
 
     // Step 1: session list (the page's first await).
     let t = Instant::now();
-    let stats = db::get_session_cache_stats_from_db(CACHE_STATS_FETCH_LIMIT, false);
+    let stats = db::get_session_cache_stats_from_db(CACHE_STATS_FETCH_LIMIT, false, true, None);
     println!(
         "[1] get_session_cache_stats_from_db(50, managed-only): {:8.1}ms  ({} sessions)",
         ms(t),
         stats.len()
     );
 
-    // Managed filter + top-N, mirroring recentSessionRows with hideSubagents=false.
+    // Managed filter + top-N, mirroring recentSessionRows with hideSubagents=true.
     let recent: Vec<_> = stats
         .iter()
         .filter(|s| !matches!(s.harness, Harness::ClaudeCode | Harness::Codex) || s.managed)
@@ -70,7 +70,7 @@ fn run_pass(label: &str) {
     // Step 3: one reconcile tick (what the 1s loop pays every second).
     let t_tick = Instant::now();
     let t = Instant::now();
-    let _stats2 = db::get_session_cache_stats_from_db(CACHE_STATS_FETCH_LIMIT, false);
+    let _stats2 = db::get_session_cache_stats_from_db(CACHE_STATS_FETCH_LIMIT, false, true, None);
     println!("[3] tick: stats re-list: {:8.1}ms", ms(t));
     for (harness, sid, anchor) in &last_seen {
         let t = Instant::now();
@@ -106,7 +106,7 @@ fn profile_stats_components() {
         );
 
         let t = Instant::now();
-        let pi = pi_sessions::scan_pi_session_dir();
+        let pi = pi_sessions::scan_pi_cache_session_dir();
         println!(
             "[c] pi metadata:            {:8.1}ms ({} rows)",
             ms(t),
@@ -129,10 +129,29 @@ fn profile_stats_components() {
             codex.len()
         );
 
+        for harness in [
+            Harness::Opencode,
+            Harness::Pi,
+            Harness::ClaudeCode,
+            Harness::Codex,
+        ] {
+            let t = Instant::now();
+            let stats = db::get_session_cache_stats_from_db(
+                CACHE_STATS_FETCH_LIMIT,
+                false,
+                true,
+                Some(harness),
+            );
+            println!(
+                "[c] assembled {harness:?}: {:8.1}ms ({} rows)",
+                ms(t),
+                stats.len()
+            );
+        }
         let t = Instant::now();
-        let stats = db::get_session_cache_stats_from_db(CACHE_STATS_FETCH_LIMIT, false);
+        let stats = db::get_session_cache_stats_from_db(CACHE_STATS_FETCH_LIMIT, false, true, None);
         println!(
-            "[c] assembled list:         {:8.1}ms ({} rows)",
+            "[c] assembled all:         {:8.1}ms ({} rows)",
             ms(t),
             stats.len()
         );

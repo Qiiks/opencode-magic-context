@@ -40,11 +40,10 @@ function createSidebarController(initialPrefs) {
   let lastPersistedCollapsed = initialPrefs.collapsed;
   let lastApplied = JSON.stringify(initialPrefs);
 
-  // Watcher lives for the process lifetime — intentionally never disposed.
   // Collapse echo guard: lastPersistedCollapsed advances only once our own
   // write lands, so a watcher echo of the value we just wrote is rejected by
   // the `!==` check and cannot revert a user click.
-  watchTuiPreferences(() => {
+  const stopWatchingPreferences = watchTuiPreferences(() => {
     void (async () => {
       const next = resolveMagicContextPrefs(await readTuiPreferencesFile());
       const serialized = JSON.stringify(next);
@@ -69,7 +68,8 @@ function createSidebarController(initialPrefs) {
   return {
     prefs,
     collapsed,
-    toggleCollapsed
+    toggleCollapsed,
+    dispose: stopWatchingPreferences
   };
 }
 function compactTokens(value) {
@@ -524,6 +524,8 @@ const SidebarContent = props => {
   let recompSawPhase = false;
   let recompPollCount = 0;
   let recompConsecutiveAbsent = 0;
+  let recompSessionId = null;
+  let snapshotRequestSequence = 0;
   const RECOMP_PROBE_MAX = 12; // ~15s for the server's "Starting…" to land
   // After we've SEEN an active phase, a momentarily absent snapshot is almost
   // always transient — the server's sticky cache serves a pre-recomp snapshot
@@ -539,12 +541,13 @@ const SidebarContent = props => {
   const refresh = () => {
     const sid = props.sessionID();
     if (!sid) return;
+    const sequence = ++snapshotRequestSequence;
     const directory = props.api.state.path.directory ?? "";
     void loadSidebarSnapshot(sid, directory).then(data => {
       // Guard against a session switch while this load was in flight:
       // painting session A's snapshot into the now-active session B shows
       // the wrong session's numbers until B's own refresh resolves.
-      if (props.sessionID() !== sid) return;
+      if (props.sessionID() !== sid || sequence !== snapshotRequestSequence) return;
       setSnapshot(data);
       try {
         props.api.renderer.requestRender();
@@ -557,10 +560,15 @@ const SidebarContent = props => {
       const phase = data?.recompProgress?.phase;
       if ((phase === "recomp" || phase === "migration") && !recompActive) {
         kickRecompPoll();
+      } else if (recompActive && recompSessionId === sid) {
+        scheduleRecompTick();
       }
     }).catch(() => {
-      // one-shot refresh failure is non-fatal; the recomp loop (if any)
-      // has its own resilient retry.
+      // A one-shot refresh failure is non-fatal. If it superseded a fast
+      // poll request, keep that poll moving for the captured session.
+      if (recompActive && recompSessionId === sid && props.sessionID() === sid) {
+        scheduleRecompTick();
+      }
     });
   };
   const scheduleRefresh = () => {
@@ -570,25 +578,33 @@ const SidebarContent = props => {
       refresh();
     }, REFRESH_DEBOUNCE_MS);
   };
+  const stopRecompPoll = () => {
+    recompActive = false;
+    recompSessionId = null;
+    snapshotRequestSequence += 1;
+    if (recompPollTimer) clearTimeout(recompPollTimer);
+    recompPollTimer = undefined;
+  };
   const scheduleRecompTick = () => {
     if (!recompActive) return;
     if (recompPollTimer) clearTimeout(recompPollTimer);
     recompPollTimer = setTimeout(recompTick, RECOMP_POLL_MS);
   };
   function recompTick() {
-    if (!recompActive) return;
+    const sid = recompSessionId;
+    if (!recompActive || !sid || props.sessionID() !== sid) {
+      stopRecompPoll();
+      return;
+    }
     recompPollCount += 1;
     if (recompPollCount > RECOMP_MAX_POLLS) {
-      recompActive = false;
+      stopRecompPoll();
       return;
     }
-    const sid = props.sessionID();
-    if (!sid) {
-      recompActive = false;
-      return;
-    }
+    const sequence = ++snapshotRequestSequence;
     const directory = props.api.state.path.directory ?? "";
     void loadSidebarSnapshot(sid, directory).then(data => {
+      if (!recompActive || recompSessionId !== sid || props.sessionID() !== sid || sequence !== snapshotRequestSequence) return;
       const phase = data?.recompProgress?.phase;
       // While a recomp is known-active, a transient snapshot that lost
       // recompProgress (sticky cache / busy-DB empty) must NOT wipe the
@@ -613,14 +629,14 @@ const SidebarContent = props => {
         // Terminal state rendered — stop. The server keeps "done"/
         // "skipped" for a grace window and "failed" until the next run,
         // so the outcome stays visible without further polling.
-        recompActive = false;
+        stopRecompPoll();
       } else {
         // Phase absent this poll.
         recompConsecutiveAbsent += 1;
         if (!recompSawPhase) {
           // Still waiting for the server's first "Starting…".
           if (recompPollCount < RECOMP_PROBE_MAX) scheduleRecompTick();else {
-            recompActive = false;
+            stopRecompPoll();
           }
         } else if (recompConsecutiveAbsent < RECOMP_ABSENT_GIVEUP) {
           // Seen it active — absent is almost certainly the sticky
@@ -630,13 +646,13 @@ const SidebarContent = props => {
           scheduleRecompTick();
         } else {
           // Long continuous absence — the entry is genuinely gone.
-          recompActive = false;
+          stopRecompPoll();
         }
       }
-    }).catch(err => {
-      // CRITICAL: a failed/slow fetch must NOT kill the loop — keep
-      // polling while active so we still catch the terminal state.
-      scheduleRecompTick();
+    }).catch(() => {
+      // A failed fetch must not kill the loop, but a response from a
+      // superseded session or sequence must not restart it either.
+      if (recompActive && recompSessionId === sid && props.sessionID() === sid && sequence === snapshotRequestSequence) scheduleRecompTick();
     });
   }
 
@@ -644,8 +660,12 @@ const SidebarContent = props => {
   // first detects an active recomp). The server emits an immediate "Starting…"
   // entry; the probe window covers the brief RPC race before it lands.
   function kickRecompPoll() {
-    if (recompActive) return; // already running
+    const sid = props.sessionID();
+    if (!sid) return;
+    if (recompActive && recompSessionId === sid) return;
+    stopRecompPoll();
     recompActive = true;
+    recompSessionId = sid;
     recompSawPhase = false;
     recompPollCount = 0;
     recompConsecutiveAbsent = 0;
@@ -654,13 +674,14 @@ const SidebarContent = props => {
   activeRecompPollKick = kickRecompPoll;
   onCleanup(() => {
     if (refreshTimer) clearTimeout(refreshTimer);
-    if (recompPollTimer) clearTimeout(recompPollTimer);
-    recompActive = false;
+    stopRecompPoll();
     if (activeRecompPollKick === kickRecompPoll) activeRecompPollKick = null;
   });
 
   // Refresh on session change
   createEffect(on(props.sessionID, () => {
+    stopRecompPoll();
+    setSnapshot(null);
     refresh();
   }));
 
@@ -1035,6 +1056,7 @@ export function createSidebarContentSlot(api) {
   const effectiveOrder = computeEffectiveOrder(seedRoot, PLUGIN_KEY, DEFAULT_SLOT_ORDER);
   return {
     order: effectiveOrder,
+    dispose: controller.dispose,
     slots: {
       sidebar_content: (ctx, value) => {
         const theme = createMemo(() => ctx.theme.current);

@@ -4,7 +4,12 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { MagicContextRpcClient } from "./rpc-client";
-import { drainNotifications, isTuiConnected, pushNotification } from "./rpc-notifications";
+import {
+    __resetNotificationStateForTests,
+    drainNotifications,
+    isTuiConnected,
+    pushNotification,
+} from "./rpc-notifications";
 import { MagicContextRpcServer } from "./rpc-server";
 import { parseRpcPortFile, type RpcPortFileRecord, rpcPortDir, rpcPortFilePath } from "./rpc-utils";
 
@@ -20,6 +25,7 @@ afterEach(async () => {
     for (const server of servers.splice(0)) {
         await server.close();
     }
+    __resetNotificationStateForTests();
     for (const dir of tempDirs.splice(0)) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -51,10 +57,23 @@ function writePortFileForPid(
     port: number,
     pid: number,
     startedAt: number,
-): void {
-    const portFile = rpcPortFilePath(storageDir, directory, pid);
+    instanceId?: string,
+    token?: string,
+): string {
+    const portFile = rpcPortFilePath(storageDir, directory, pid, instanceId);
     mkdirSync(dirname(portFile), { recursive: true });
-    writeFileSync(portFile, JSON.stringify({ port, pid, started_at: startedAt }), "utf-8");
+    writeFileSync(
+        portFile,
+        JSON.stringify({
+            port,
+            pid,
+            started_at: startedAt,
+            instance_id: instanceId,
+            token,
+        }),
+        "utf-8",
+    );
+    return portFile;
 }
 
 function readNewestPortRecord(storageDir: string, directory: string): RpcPortFileRecord | null {
@@ -79,8 +98,16 @@ async function waitFor(condition: () => boolean, label: string, timeoutMs = 2_00
     throw new Error(`Timed out waiting for ${label}`);
 }
 
-async function openSocket(port: number, token: string): Promise<WebSocket> {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
+async function openSocket(
+    port: number,
+    token: string,
+    legacyQueryAuth = false,
+): Promise<WebSocket> {
+    const ws = legacyQueryAuth
+        ? new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`)
+        : new WebSocket(`ws://127.0.0.1:${port}/ws`, {
+              headers: { Authorization: `Bearer ${token}` },
+          });
     await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("socket open timed out")), 2_000);
         ws.addEventListener(
@@ -129,11 +156,14 @@ function waitForJsonMessage<T extends { type?: string }>(
     });
 }
 
-async function startRpcServer(handler: (method: string) => Response | object): Promise<TestServer> {
+async function startRpcServer(
+    handler: (method: string) => Response | object,
+    health: { pid: number; instanceId?: string } = { pid: process.pid },
+): Promise<TestServer> {
     const server = createServer(async (req, res) => {
         if (req.method === "GET" && req.url === "/health") {
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ok: true }));
+            res.end(JSON.stringify({ ok: true, pid: health.pid, instance_id: health.instanceId }));
             return;
         }
 
@@ -238,6 +268,31 @@ describe("MagicContextRpcClient", () => {
         }
     });
 
+    test("accepts a frozen v0.32 websocket upgrade with query-token auth", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-ws-v032";
+        const server = new MagicContextRpcServer(storageDir, directory);
+        const port = await server.start();
+        const record = readNewestPortRecord(storageDir, directory);
+        expect(typeof record?.token).toBe("string");
+
+        const ws = await openSocket(port, record?.token ?? "", true);
+        try {
+            const helloAck = waitForJsonMessage(ws, (message) => message.type === "hello-ack");
+            ws.send(
+                JSON.stringify({
+                    type: "hello",
+                    token: record?.token,
+                    sessionId: "ses_v032",
+                }),
+            );
+            expect((await helloAck).type).toBe("hello-ack");
+        } finally {
+            ws.close();
+            server.stop();
+        }
+    });
+
     test("websocket upgrade rejects missing bearer token before a socket is created", async () => {
         const storageDir = makeTempDir();
         const directory = "/repo-ws-auth";
@@ -300,6 +355,52 @@ describe("MagicContextRpcClient", () => {
         }
     });
 
+    test("accepts legacy cursor acknowledgements during protocol skew", async () => {
+        __resetNotificationStateForTests();
+        const storageDir = makeTempDir();
+        const directory = "/repo-legacy-ack";
+        const server = new MagicContextRpcServer(storageDir, directory);
+        const port = await server.start();
+        const record = readNewestPortRecord(storageDir, directory);
+        expect(typeof record?.token).toBe("string");
+
+        pushNotification("legacy-one", { ok: true }, "ses_legacy");
+        pushNotification("legacy-two", { ok: true }, "ses_legacy");
+        const queued = drainNotifications(0, "ses_legacy", { sessionOnly: true });
+        expect(queued).toHaveLength(2);
+
+        const ws = await openSocket(port, record?.token ?? "");
+        try {
+            const helloAck = waitForJsonMessage<{
+                type?: string;
+                instanceId?: string;
+            }>(ws, (message) => message.type === "hello-ack");
+            ws.send(
+                JSON.stringify({
+                    type: "hello",
+                    token: record?.token,
+                    sessionId: "ses_legacy",
+                }),
+            );
+            expect((await helloAck).instanceId).toBe(record?.instance_id);
+
+            ws.send(
+                JSON.stringify({
+                    type: "ack",
+                    cursor: queued[0].id,
+                    sessionId: "ses_legacy",
+                }),
+            );
+            await waitFor(() => {
+                const pending = drainNotifications(0, "ses_legacy", { sessionOnly: true });
+                return pending.length === 1 && pending[0].id === queued[1].id;
+            }, "legacy cursor acknowledgement pruning");
+        } finally {
+            ws.close();
+            server.stop();
+        }
+    });
+
     test("same-process servers keep distinct port files during overlap", async () => {
         const storageDir = makeTempDir();
         const directory = "/repo-port-collision";
@@ -319,7 +420,9 @@ describe("MagicContextRpcClient", () => {
             expect(remaining?.port).toBe(secondPort);
 
             const client = new MagicContextRpcClient(storageDir, directory);
-            expect((await client.resolveEndpoint())?.port).toBe(secondPort);
+            const endpoint = await client.resolveEndpoint();
+            expect(endpoint?.port).toBe(secondPort);
+            expect(endpoint?.instanceId).toBe(remaining?.instance_id);
         } finally {
             first.stop();
             second.stop();
@@ -367,5 +470,106 @@ describe("MagicContextRpcClient", () => {
 
         const client = new MagicContextRpcClient(storageDir, directory);
         expect(await client.call<{ value: string }>("value")).toEqual({ value: "live" });
+    });
+
+    test("discovers a frozen v0.32 health response without an instance id", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-v032-health";
+        const legacy = await startRpcServer(() => ({ value: "legacy" }), {
+            pid: process.pid,
+        });
+        writePortFileForPid(
+            storageDir,
+            directory,
+            legacy.port,
+            process.pid,
+            Date.now(),
+            "new-client-record",
+        );
+
+        const client = new MagicContextRpcClient(storageDir, directory);
+        expect(await client.call<{ value: string }>("value")).toEqual({ value: "legacy" });
+    });
+
+    test("prefers this process and validates every discovery candidate identity", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-affinity";
+        const foreign = await startRpcServer(() => ({ value: "foreign" }), {
+            pid: process.ppid,
+            instanceId: "foreign",
+        });
+        const unrelated = await startRpcServer(() => ({ value: "unrelated" }), {
+            pid: process.pid,
+            instanceId: "different-service",
+        });
+        const local = await startRpcServer(() => ({ value: "local" }), {
+            pid: process.pid,
+            instanceId: "local-healthy",
+        });
+
+        writePortFileForPid(
+            storageDir,
+            directory,
+            foreign.port,
+            process.ppid,
+            Date.now() + 20_000,
+            "foreign",
+        );
+        writePortFileForPid(
+            storageDir,
+            directory,
+            unrelated.port,
+            process.pid,
+            Date.now() + 10_000,
+            "local-stale",
+        );
+        writePortFileForPid(
+            storageDir,
+            directory,
+            local.port,
+            process.pid,
+            Date.now(),
+            "local-healthy",
+        );
+
+        const client = new MagicContextRpcClient(storageDir, directory);
+        expect(await client.call<{ value: string }>("value")).toEqual({ value: "local" });
+    });
+
+    test("resets discovery after a 401 response", async () => {
+        const storageDir = makeTempDir();
+        const directory = "/repo-reauth";
+        let unauthorizedRecord = "";
+        const unauthorized = await startRpcServer(
+            () => {
+                rmSync(unauthorizedRecord, { force: true });
+                return new Response("stale token", { status: 401 });
+            },
+            { pid: process.pid, instanceId: "unauthorized" },
+        );
+        const healthy = await startRpcServer(() => ({ value: "healthy" }), {
+            pid: process.pid,
+            instanceId: "healthy",
+        });
+        unauthorizedRecord = writePortFileForPid(
+            storageDir,
+            directory,
+            unauthorized.port,
+            process.pid,
+            Date.now() + 10_000,
+            "unauthorized",
+            "stale",
+        );
+        writePortFileForPid(
+            storageDir,
+            directory,
+            healthy.port,
+            process.pid,
+            Date.now(),
+            "healthy",
+        );
+
+        const client = new MagicContextRpcClient(storageDir, directory);
+        expect(await client.call<{ value: string }>("value")).toEqual({ value: "healthy" });
     });
 });

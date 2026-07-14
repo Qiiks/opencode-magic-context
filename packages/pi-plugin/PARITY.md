@@ -278,6 +278,25 @@ bytes unchanged.
 
 ---
 
+## 9c. Emergency overflow termination follows each host's control surface
+
+**OpenCode:** after the ≥95% historian attempt and emergency tool drops, it
+aborts only when recovery was armed by a provider's own context-overflow rejection
+and no historian fold materialized reclaim this pass. The TypeScript final-wire
+estimate remains telemetry because it cannot reproduce provider framing; numeric
+gating is deferred to module-side Rust accounting. Proactive model-shrink recovery
+never aborts before the provider has rejected the turn. On a provider-proven abort,
+OpenCode sends the actionable `/ctx-flush` or `/clear` notification and then awaits
+`session.abort()`, interrupting the run before a guaranteed repeat rejection.
+
+**Pi:** the context extension API has no turn-abort primitive. At ≥95%, Pi sends
+the same loud actionable notification, waits briefly for any in-flight historian,
+and applies its existing emergency drops, but must return the best-effort reduced
+context to Pi. Magic Context intentionally does not invent an abort mechanism
+outside Pi's extension API.
+
+---
+
 ## 10. Cleared reasoning: Pi EMPTIES (drops signature); OpenCode writes `[cleared]`→sentinel, gated
 
 When Magic Context clears an aged reasoning/thinking block, the two harnesses use

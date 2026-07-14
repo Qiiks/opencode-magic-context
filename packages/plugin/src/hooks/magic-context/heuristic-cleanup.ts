@@ -13,7 +13,11 @@ import {
 import type { TagEntry } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared";
 import { applyCavemanCleanup, type CavemanCleanupConfig } from "./caveman-cleanup";
-import { type EmergencyDropTag, planEmergencyDrop } from "./emergency-drop";
+import {
+    type EmergencyDropTag,
+    estimateEmergencyDropReclaimTokens,
+    planEmergencyDrop,
+} from "./emergency-drop";
 import { stripSystemInjection } from "./system-injection-stripper";
 import type { MessageLike, TagTarget } from "./tag-messages";
 import { stripTagPrefix } from "./tag-part-guards";
@@ -59,6 +63,7 @@ export function applyHeuristicCleanup(
     deduplicatedTools: number;
     droppedInjections: number;
     emergencyDroppedTools: number;
+    emergencyReclaimedTokens: number;
     compressedTextTags: number;
     mutatedTextTags: number;
 } {
@@ -78,6 +83,7 @@ export function applyHeuristicCleanup(
 
     let droppedTools = 0;
     let emergencyDroppedTools = 0;
+    let emergencyReclaimedTokens = 0;
     let deduplicatedTools = 0;
     let droppedInjections = 0;
 
@@ -125,6 +131,7 @@ export function applyHeuristicCleanup(
                         updateTagDropMode(db, sessionId, tag.tagNumber, "full");
                         droppedTools++;
                         emergencyDroppedTools++;
+                        emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(tag);
                     }
                 }
                 // Latch the usage sample on any ACTING pass — even if zero tags
@@ -272,6 +279,7 @@ export function applyHeuristicCleanup(
         deduplicatedTools,
         droppedInjections,
         emergencyDroppedTools,
+        emergencyReclaimedTokens,
         compressedTextTags,
         mutatedTextTags,
     };

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { open, realpath } from "node:fs/promises";
+import { type FileHandle, lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -106,28 +106,72 @@ async function guardedReadFile(
     fileLimitBytes: number,
 ): Promise<string | null> {
     throwIfAborted(signal);
+    const body = guardedReadFileBody(projectRoot, repoRelativePath, signal, fileLimitBytes);
+    let onAbort: (() => void) | undefined;
+    const abort = new Promise<never>((_, reject) => {
+        onAbort = () => reject(abortError(signal));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+        return await Promise.race([body, abort]);
+    } finally {
+        if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+}
+
+async function guardedReadFileBody(
+    projectRoot: string,
+    repoRelativePath: string,
+    signal: AbortSignal,
+    fileLimitBytes: number,
+): Promise<string | null> {
     const normalized = normalizeRepoPath(repoRelativePath);
     if (!normalized || isSecretDeniedPath(normalized)) return null;
 
     const rootReal = await realpath(projectRoot).catch(() => null);
+    throwIfAborted(signal);
     if (!rootReal) return null;
     const target = path.resolve(rootReal, normalized);
     if (!isPathInside(rootReal, target)) return null;
 
     const parentReal = await realpath(path.dirname(target)).catch(() => null);
+    throwIfAborted(signal);
     if (!parentReal || !isPathInside(rootReal, parentReal)) return null;
 
-    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
-    const handle = await open(target, fsConstants.O_RDONLY | noFollow).catch((error) => {
+    // A parent directory may be a symlink, so policy must be re-applied to the
+    // canonical path rather than trusting only the caller's lexical spelling.
+    const canonicalTarget = path.join(parentReal, path.basename(target));
+    const canonicalRelative = normalizeRepoPath(path.relative(rootReal, canonicalTarget));
+    if (
+        !canonicalRelative ||
+        !isPathInside(rootReal, canonicalTarget) ||
+        isSecretDeniedPath(canonicalRelative)
+    ) {
+        return null;
+    }
+
+    const targetStat = await lstat(canonicalTarget).catch((error) => {
         if (isNoFollowOrMissing(error)) return null;
         throw error;
     });
+    throwIfAborted(signal);
+    if (!targetStat?.isFile() || targetStat.size > fileLimitBytes) return null;
+
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    const nonBlock = typeof fsConstants.O_NONBLOCK === "number" ? fsConstants.O_NONBLOCK : 0;
+    const openPromise = open(canonicalTarget, fsConstants.O_RDONLY | noFollow | nonBlock).catch(
+        (error) => {
+            if (isNoFollowOrMissing(error)) return null;
+            throw error;
+        },
+    );
+    const handle = await closeLateOpenOnAbort(openPromise, signal);
     if (!handle) return null;
     try {
         throwIfAborted(signal);
         const stat = await handle.stat();
-        if (!stat.isFile()) return null;
-        if (stat.size > fileLimitBytes) return null;
+        if (!stat.isFile() || stat.size > fileLimitBytes) return null;
         const buffer = Buffer.alloc(stat.size);
         const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
         throwIfAborted(signal);
@@ -135,6 +179,22 @@ async function guardedReadFile(
     } finally {
         await handle.close().catch(() => {});
     }
+}
+
+async function closeLateOpenOnAbort(
+    openPromise: Promise<FileHandle | null>,
+    signal: AbortSignal,
+): Promise<FileHandle | null> {
+    const handle = await openPromise;
+    if (!signal.aborted) return handle;
+    if (handle) void handle.close().catch(() => {});
+    throw abortError(signal);
+}
+
+function abortError(signal: AbortSignal): SmartNoteNetworkError {
+    return signal.reason instanceof SmartNoteNetworkError
+        ? signal.reason
+        : new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted");
 }
 
 function isPathInside(root: string, target: string): boolean {

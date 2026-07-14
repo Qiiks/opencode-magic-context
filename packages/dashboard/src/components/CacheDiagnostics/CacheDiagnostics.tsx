@@ -138,6 +138,15 @@ export default function CacheDiagnostics() {
   // ≤N events; cards aggregate over that window and the chart shows the selected
   // session's window.
   const windowSize = () => timelineLimit();
+  const loadSessionRows = () => {
+    const harness = harnessFilter();
+    return getSessionCacheStatsFromDb(
+      CACHE_STATS_FETCH_LIMIT,
+      showUnmanagedSessions(),
+      hideSubagents(),
+      harness === "all" ? undefined : harness,
+    );
+  };
 
   const applySessionMeta = (sessions: CacheSessionStats[]) => {
     cachedSessions = sessions;
@@ -209,10 +218,7 @@ export default function CacheDiagnostics() {
   // recent session (full load if new, incremental if its activity advanced,
   // skip if unchanged), and evict windows that fell out of the recent set.
   const reconcile = async () => {
-    const sessions = await getSessionCacheStatsFromDb(
-      CACHE_STATS_FETCH_LIMIT,
-      showUnmanagedSessions(),
-    );
+    const sessions = await loadSessionRows();
     applySessionMeta(sessions);
     const recent = recentSessionRows(sessions);
     const recentKeys = new Set(recent.map((s) => windowKey(s.harness, s.session_id)));
@@ -267,10 +273,7 @@ export default function CacheDiagnostics() {
     // Cold start: list sessions, load each recent session's full window, and
     // default the selection to the most-recent non-subagent session.
     try {
-      const sessions = await getSessionCacheStatsFromDb(
-        CACHE_STATS_FETCH_LIMIT,
-        showUnmanagedSessions(),
-      );
+      const sessions = await loadSessionRows();
       applySessionMeta(sessions);
       const recent = recentSessionRows(sessions);
       if (!cachedSelectedSession) {
@@ -548,6 +551,7 @@ export default function CacheDiagnostics() {
                 const top = filteredStats()[0];
                 selectSession(top ? { harness: top.harness, sessionId: top.session_id } : null);
               }
+              void reconcile();
             }}
             placeholder="Harness"
             options={[
@@ -572,7 +576,10 @@ export default function CacheDiagnostics() {
             type="button"
             class={`btn ${!hideSubagents() ? "primary" : ""}`}
             style={{ padding: "6px 10px" }}
-            onClick={() => setHideSubagents(!hideSubagents())}
+            onClick={() => {
+              setHideSubagents(!hideSubagents());
+              void reconcile();
+            }}
           >
             {hideSubagents() ? "Show subagents" : "Hide subagents"}
           </button>

@@ -18,6 +18,7 @@ type NonRetryableRpcError = Error & { [NON_RETRYABLE_RPC_ERROR]: true };
 export class MagicContextRpcClient {
     private port: number | null = null;
     private token: string | null = null;
+    private instanceId: string | null = null;
     private portDir: string;
     private legacyPortFilePath: string;
     private healthChecked = false;
@@ -62,7 +63,7 @@ export class MagicContextRpcClient {
                 if (!response.ok) {
                     const text = await response.text();
                     const error = new Error(`RPC ${method} failed (${response.status}): ${text}`);
-                    if (response.status >= 500) {
+                    if (response.status === 401 || response.status >= 500) {
                         lastError = error;
                         this.reset();
                         continue;
@@ -101,52 +102,47 @@ export class MagicContextRpcClient {
      *  channel). Reuses the same health-checked port-file discovery as `call`,
      *  so the WS client and the HTTP client always agree on which server instance
      *  (and token) to use. Returns null when no live server is found. */
-    async resolveEndpoint(): Promise<{ port: number; token: string | null } | null> {
+    async resolveEndpoint(): Promise<{
+        port: number;
+        token: string | null;
+        instanceId: string | null;
+    } | null> {
         try {
-            const port = await this.resolvePort();
+            // The socket owns reconnect backoff, so endpoint discovery performs one
+            // filesystem/health pass instead of nesting the HTTP client's retries.
+            const port = await this.resolvePort(1);
             if (port === null) return null;
-            return { port, token: this.token };
+            return { port, token: this.token, instanceId: this.instanceId };
         } catch {
             return null;
         }
     }
 
-    private async resolvePort(): Promise<number | null> {
+    private async resolvePort(maxAttempts = MAX_RETRIES): Promise<number | null> {
         if (this.port && this.healthChecked) {
             return this.port;
         }
 
-        if (this.port) {
-            const alive = await this.healthCheck(this.port);
-            if (alive) {
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            for (const record of this.readPortFiles()) {
+                if (!(await this.healthCheck(record))) continue;
+                this.port = record.port;
+                this.token = record.token ?? null;
+                this.instanceId = record.instance_id ?? null;
                 this.healthChecked = true;
-                return this.port;
-            }
-            this.port = null;
-            this.healthChecked = false;
-        }
-
-        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            const record = this.readPortFile();
-            if (record) {
-                const alive = await this.healthCheck(record.port);
-                if (alive) {
-                    this.port = record.port;
-                    this.token = record.token ?? null;
-                    this.healthChecked = true;
-                    return record.port;
-                }
+                return record.port;
             }
 
-            if (attempt < MAX_RETRIES - 1) {
-                await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+            this.reset();
+            if (attempt < maxAttempts - 1) {
+                await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
             }
         }
 
         return null;
     }
 
-    private readPortFile(): RpcPortFileRecord | null {
+    private readPortFiles(): RpcPortFileRecord[] {
         const records: RpcPortFileRecord[] = [];
 
         try {
@@ -160,26 +156,38 @@ export class MagicContextRpcClient {
             // Directory may not exist yet. Fall back to the legacy file below.
         }
 
-        if (records.length > 0) {
-            records.sort((a, b) => b.started_at - a.started_at);
-            return records[0];
+        try {
+            const legacy = parseRpcPortFile(readFileSync(this.legacyPortFilePath, "utf-8"));
+            if (legacy && (!legacy.pid || isPidAlive(legacy.pid))) records.push(legacy);
+        } catch {
+            // Legacy discovery is optional.
         }
 
-        try {
-            const record = parseRpcPortFile(readFileSync(this.legacyPortFilePath, "utf-8"));
-            if (record?.pid && !isPidAlive(record.pid)) return null;
-            return record;
-        } catch {
-            return null;
-        }
+        // A TUI and its server plugin normally share a process. Prefer that exact
+        // process before considering another live OpenCode instance for the project.
+        records.sort((a, b) => {
+            const aLocal = a.pid === process.pid ? 1 : 0;
+            const bLocal = b.pid === process.pid ? 1 : 0;
+            return bLocal - aLocal || b.started_at - a.started_at;
+        });
+        return records;
     }
 
-    private async healthCheck(port: number): Promise<boolean> {
+    private async healthCheck(record: RpcPortFileRecord): Promise<boolean> {
         try {
-            const response = await this.fetchWithTimeout(`http://127.0.0.1:${port}/health`, {
+            const response = await this.fetchWithTimeout(`http://127.0.0.1:${record.port}/health`, {
                 method: "GET",
             });
-            return response.ok;
+            if (!response.ok) return false;
+            const body = (await response.json()) as { pid?: unknown; instance_id?: unknown };
+            if (body.pid !== record.pid) return false;
+            // v0.32 health responses predate instance ids. A missing id is the
+            // one-release discovery bridge; an id that is present must still match.
+            return (
+                body.instance_id === undefined ||
+                record.instance_id === undefined ||
+                body.instance_id === record.instance_id
+            );
         } catch {
             return false;
         }
@@ -198,6 +206,7 @@ export class MagicContextRpcClient {
     reset(): void {
         this.port = null;
         this.token = null;
+        this.instanceId = null;
         this.healthChecked = false;
     }
 }

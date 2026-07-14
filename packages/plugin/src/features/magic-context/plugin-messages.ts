@@ -138,7 +138,7 @@ export function consumeMessages(
     const query = `SELECT * FROM plugin_messages WHERE ${conditions.join(" AND ")} ORDER BY created_at ASC`;
 
     // Atomic read+mark: transaction prevents TUI and server from consuming the same messages
-    const messages = db.transaction(() => {
+    const consumeTransaction = db.transaction(() => {
         const rows = db.prepare(query).all(...params);
         const result = rows.filter(isPluginMessageRow).map(toPluginMessage);
 
@@ -150,7 +150,8 @@ export function consumeMessages(
         }
 
         return result;
-    })();
+    });
+    const messages = consumeTransaction.immediate();
 
     // Periodic cleanup of old messages (outside transaction — non-critical)
     db.prepare("DELETE FROM plugin_messages WHERE created_at < ?").run(now - CLEANUP_THRESHOLD_MS);

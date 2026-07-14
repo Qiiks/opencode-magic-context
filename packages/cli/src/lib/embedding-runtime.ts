@@ -65,7 +65,7 @@ interface OnnxRuntimeLoadProbeChildResult {
 }
 
 function runOnnxRuntimeNodeLoadProbeChild(packageDir: string): OnnxRuntimeLoadProbeChildResult {
-    return spawnSync("node", ["-e", ONNX_RUNTIME_NODE_LOAD_PROBE_SCRIPT], {
+    return spawnSync(process.execPath, ["-e", ONNX_RUNTIME_NODE_LOAD_PROBE_SCRIPT], {
         encoding: "utf8",
         env: { ...process.env, [ONNX_LOAD_PROBE_PACKAGE_DIR_ENV]: packageDir },
         stdio: ["ignore", "pipe", "pipe"],

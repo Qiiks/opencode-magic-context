@@ -1,15 +1,16 @@
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { stringify as stringifyJsonc } from "comment-json";
 import { writeFileAtomic } from "../lib/atomic-write";
+import { readJsoncConfig, readJsoncConfigForUpdate } from "../lib/jsonc-config";
 import {
     getMagicContextLogPath,
     getPiAgentConfigDir,
     getPiUserConfigPath,
     getPiUserExtensionsPath,
 } from "../lib/paths";
-import { detectPiBinary, PI_PACKAGE_SOURCE } from "../lib/pi-helpers";
+import { detectPiBinary, PI_PACKAGE_SOURCE, runPiCommand } from "../lib/pi-helpers";
+import { isPiMagicContextPackageEntry } from "../lib/pi-package-entry";
 import type {
     HarnessAdapter,
     HarnessConfigPaths,
@@ -33,7 +34,7 @@ export class PiAdapter implements HarnessAdapter {
         const settings = readPiSettings();
         if (!settings) return false;
         const packages = (settings.packages ?? []) as unknown[];
-        return packages.some((entry) => matchesPiPackage(entry));
+        return packages.some((entry) => isPiMagicContextPackageEntry(entry));
     }
 
     getConfigPaths(): HarnessConfigPaths {
@@ -49,12 +50,12 @@ export class PiAdapter implements HarnessAdapter {
     async ensurePluginEntry(): Promise<PluginEntryResult> {
         const settingsPath = getPiUserExtensionsPath();
         try {
-            const settings = readPiSettings() ?? {};
+            const settings = readPiSettingsForUpdate();
             const packages = Array.isArray(settings.packages)
                 ? (settings.packages as unknown[])
                 : [];
 
-            const idx = packages.findIndex((entry) => matchesPiPackage(entry));
+            const idx = packages.findIndex((entry) => isPiMagicContextPackageEntry(entry));
             if (idx === -1) {
                 packages.push(PI_PACKAGE_SOURCE);
                 settings.packages = packages;
@@ -85,8 +86,8 @@ export class PiAdapter implements HarnessAdapter {
     async removePluginEntry(): Promise<PluginEntryResult> {
         const settingsPath = getPiUserExtensionsPath();
         try {
-            const settings = readPiSettings();
-            if (!settings || !Array.isArray(settings.packages)) {
+            const settings = readPiSettingsForUpdate();
+            if (!Array.isArray(settings.packages)) {
                 return {
                     ok: true,
                     action: "already_present",
@@ -96,7 +97,7 @@ export class PiAdapter implements HarnessAdapter {
             }
             const before = settings.packages.length;
             settings.packages = settings.packages.filter(
-                (entry: unknown) => !matchesPiPackage(entry),
+                (entry: unknown) => !isPiMagicContextPackageEntry(entry),
             );
             if (settings.packages.length === before) {
                 return {
@@ -144,11 +145,8 @@ export class PiAdapter implements HarnessAdapter {
         const piBin = detectPiBinary();
         if (!piBin) return null;
         try {
-            const output = execFileSync(piBin.path, ["list"], {
-                encoding: "utf-8",
-                stdio: ["ignore", "pipe", "ignore"],
-                timeout: 5000,
-            });
+            const output = runPiCommand(piBin.path, ["list"], 5000);
+            if (output === null) return null;
             // Pi's `list` output line shape varies; look for our package name
             // followed by a version number. Conservative — return null on
             // parse failure rather than risk wrong output.
@@ -170,15 +168,14 @@ interface PiSettingsLike {
 }
 
 function readPiSettings(): PiSettingsLike | null {
-    const settingsPath = getPiUserExtensionsPath();
-    if (!existsSync(settingsPath)) return null;
-    try {
-        const raw = readFileSync(settingsPath, "utf-8");
-        const parsed = parseJsonc(raw) as PiSettingsLike | null;
-        return parsed;
-    } catch {
-        return null;
-    }
+    const result = readJsoncConfig(getPiUserExtensionsPath());
+    return result.kind === "parsed" ? (result.value as PiSettingsLike) : null;
+}
+
+function readPiSettingsForUpdate(): PiSettingsLike {
+    // Missing settings may be created, but malformed settings must propagate to
+    // mutation callers so they can abort without replacing user data.
+    return readJsoncConfigForUpdate(getPiUserExtensionsPath()) as PiSettingsLike;
 }
 
 function writePiSettings(settings: PiSettingsLike): void {
@@ -186,33 +183,6 @@ function writePiSettings(settings: PiSettingsLike): void {
     ensureDir(settingsPath);
     const text = stringifyJsonc(settings, null, 2);
     writeFileAtomic(settingsPath, `${text}\n`);
-}
-
-/**
- * Match a Pi packages array entry against our plugin source.
- *
- * Pi `packages` entries are sources like:
- *   - "npm:@cortexkit/pi-magic-context"
- *   - "npm:@cortexkit/pi-magic-context@1.0.0"
- *   - { name: "@cortexkit/pi-magic-context", source: "npm:..." }
- *   - "file:/path/to/local/dev"
- *
- * We accept anything that resolves to our package name. Local file paths
- * are intentionally NOT considered the same entry — a user installing the
- * published plugin while pointing at a local dev checkout is two separate
- * entries by design (so dev installs don't get silently overridden).
- */
-function matchesPiPackage(entry: unknown): boolean {
-    if (typeof entry === "string") {
-        if (entry.startsWith("file:")) return false;
-        return entry.includes(PLUGIN_NAME);
-    }
-    if (entry !== null && typeof entry === "object") {
-        const obj = entry as { name?: unknown; source?: unknown };
-        if (typeof obj.name === "string" && obj.name === PLUGIN_NAME) return true;
-        if (typeof obj.source === "string") return matchesPiPackage(obj.source);
-    }
-    return false;
 }
 
 function ensureDir(filePath: string): void {

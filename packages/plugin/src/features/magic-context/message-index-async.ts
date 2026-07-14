@@ -4,8 +4,10 @@ import type { Database } from "../../shared/sqlite";
 import {
     clearIndexedMessages,
     getLastIndexedOrdinal,
+    getMessageIndexReconciliationStartOrdinal,
     indexMessagesAfterOrdinal,
     indexSingleMessage,
+    isMessageIndexReconciledThrough,
     markMessageIndexDirty,
 } from "./message-index";
 
@@ -65,6 +67,7 @@ function isDatabaseLockedError(error: unknown): boolean {
  */
 
 const INCREMENTAL_DEBOUNCE_MS = 100;
+const RECONCILIATION_BATCH_SIZE = 100;
 
 const reconciledSessions = new Set<string>();
 const reconciliationScheduledSessions = new Set<string>();
@@ -73,7 +76,15 @@ const incrementalTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const pendingIncrementalKeys = new Set<string>();
 const completedIncrementalKeys = new Set<string>();
 
-type ReadMessages = (sessionId: string) => RawMessage[];
+type ReadMessages = ((sessionId: string) => RawMessage[]) & {
+    readPage?: (
+        sessionId: string,
+        afterOrdinal: number,
+        limit: number,
+        finalWatermark: number,
+    ) => RawMessage[];
+    getCount?: (sessionId: string) => number;
+};
 type ReadSingleMessage = (sessionId: string, messageId: string) => RawMessage | null;
 type IncrementalMessageSource = ReadSingleMessage | RawMessage;
 
@@ -85,6 +96,10 @@ function defer(fn: () => void): void {
         return;
     }
     setTimeout(fn, 0);
+}
+
+function yieldToEventLoop(): Promise<void> {
+    return new Promise((resolve) => defer(resolve));
 }
 
 function runWithSessionLock(
@@ -129,27 +144,44 @@ async function reconcileSessionIndex(
     sessionId: string,
     readMessages: ReadMessages,
 ): Promise<void> {
-    await runWithSessionLock(sessionId, () => {
-        if (reconciledSessions.has(sessionId)) {
-            return;
+    await runWithSessionLock(sessionId, async () => {
+        if (reconciledSessions.has(sessionId)) return;
+
+        let fallbackSnapshot: RawMessage[] | null = null;
+        const finalWatermark = readMessages.getCount
+            ? readMessages.getCount(sessionId)
+            : (fallbackSnapshot = readMessages(sessionId)).length;
+        let cursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
+
+        while (cursor < finalWatermark) {
+            const pageEnd = Math.min(finalWatermark, cursor + RECONCILIATION_BATCH_SIZE);
+            const messages = readMessages.readPage
+                ? readMessages.readPage(
+                      sessionId,
+                      cursor,
+                      RECONCILIATION_BATCH_SIZE,
+                      finalWatermark,
+                  )
+                : (fallbackSnapshot ?? []).filter(
+                      (message) => message.ordinal > cursor && message.ordinal <= pageEnd,
+                  );
+
+            indexMessagesAfterOrdinal(db, sessionId, messages, cursor, pageEnd);
+            const nextCursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
+            if (nextCursor <= cursor) break;
+            cursor = nextCursor;
+
+            if (cursor < finalWatermark) {
+                // One bounded page is the maximum synchronous work per event-loop
+                // turn. The timer-backed await lets host I/O run before the next
+                // source read and writer transaction.
+                await yieldToEventLoop();
+            }
         }
 
-        const messages = readMessages(sessionId);
-        if (messages.length === 0) {
-            clearIndexedMessages(db, sessionId);
+        if (isMessageIndexReconciledThrough(db, sessionId, finalWatermark)) {
             reconciledSessions.add(sessionId);
-            return;
         }
-
-        let lastIndexedOrdinal = getLastIndexedOrdinal(db, sessionId);
-        if (lastIndexedOrdinal > messages.length) {
-            clearIndexedMessages(db, sessionId);
-            lastIndexedOrdinal = 0;
-        }
-
-        const watermark = Math.min(lastIndexedOrdinal, messages.length);
-        indexMessagesAfterOrdinal(db, sessionId, messages, watermark, messages.length);
-        reconciledSessions.add(sessionId);
     });
 }
 
@@ -192,23 +224,39 @@ export function scheduleIncrementalIndex(
     const timer = setTimeout(() => {
         incrementalTimers.delete(key);
         pendingIncrementalKeys.add(key);
-        let attemptedOrdinal: number | null = null;
         void runWithSessionLock(sessionId, () => {
             const message =
                 typeof messageSource === "function"
                     ? messageSource(sessionId, messageId)
                     : messageSource;
             if (!message) return;
-            attemptedOrdinal = message.ordinal;
+
+            const currentWatermark = getLastIndexedOrdinal(db, sessionId);
+            if (
+                message.ordinal <= currentWatermark &&
+                isMessageIndexReconciledThrough(db, sessionId, currentWatermark)
+            ) {
+                completedIncrementalKeys.add(key);
+                return;
+            }
+
+            // Persist the earliest possibly missing ordinal before the risky FTS
+            // write. A crash after this point leaves a durable reconciliation
+            // floor; if the marker itself fails, clearing the local latch below
+            // ensures a later reconciliation tries the source again.
+            const wasReconciled = reconciledSessions.delete(sessionId);
+            markMessageIndexDirty(
+                db,
+                sessionId,
+                Math.min(message.ordinal, getLastIndexedOrdinal(db, sessionId) + 1),
+            );
             indexSingleMessage(db, sessionId, message);
+            if (wasReconciled && isMessageIndexReconciledThrough(db, sessionId, message.ordinal)) {
+                reconciledSessions.add(sessionId);
+            }
             completedIncrementalKeys.add(key);
         })
             .catch((error) => {
-                markMessageIndexDirty(
-                    db,
-                    sessionId,
-                    attemptedOrdinal ?? getLastIndexedOrdinal(db, sessionId) + 1,
-                );
                 reconciledSessions.delete(sessionId);
                 logIndexingError(sessionId, `incremental index for ${messageId}`, error);
             })
@@ -235,12 +283,12 @@ export function scheduleClearAndReindex(
     defer(() => {
         void runWithSessionLock(sessionId, () => {
             clearIndexedMessages(db, sessionId);
-            const messages = readMessages(sessionId);
-            indexMessagesAfterOrdinal(db, sessionId, messages, 0, messages.length);
-            reconciledSessions.add(sessionId);
-        }).catch((error) => {
-            logIndexingError(sessionId, "clear and reindex", error);
-        });
+        })
+            .then(() => reconcileSessionIndex(db, sessionId, readMessages))
+            .catch((error) => {
+                reconciledSessions.delete(sessionId);
+                logIndexingError(sessionId, "clear and reindex", error);
+            });
     });
 }
 

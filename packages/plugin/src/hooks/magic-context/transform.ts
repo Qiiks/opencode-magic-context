@@ -66,8 +66,8 @@ import {
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
+import { estimateFinalWireInputTokens, estimateMessageTokens } from "./final-wire-token-estimate";
 import type { LiveModelBySession } from "./hook-handlers";
-import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
 import {
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
@@ -83,7 +83,6 @@ import {
 } from "./protected-tail-boundary";
 import { readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
-import { estimateTokens } from "./read-session-formatting";
 import { extractInMemoryMessageViews } from "./read-session-raw";
 import { sendIgnoredMessage } from "./send-session-notification";
 import { modelAcceptsEmptyContent } from "./sentinel";
@@ -109,7 +108,11 @@ import {
     type TagTarget,
     tagMessages,
 } from "./transform-operations";
-import { runPostTransformPhase } from "./transform-postprocess-phase";
+import {
+    abortSessionFailClosed,
+    evaluateEmergencyFailClosed,
+    runPostTransformPhase,
+} from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
 
 // Per-session message token cache. Keyed by message ID, value is the token
@@ -424,7 +427,6 @@ export interface TransformDeps {
 
 export function createTransform(deps: TransformDeps) {
     const loadedSessions = new Set<string>();
-    const lastEmergencyNotificationCount = new Map<string, number>();
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
@@ -711,6 +713,8 @@ export function createTransform(deps: TransformDeps) {
 
         let recoveryNoHeadEscapeActive = false;
         let emergencyRecoveryArmed = false;
+        let emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null = null;
+        let usagePercentageSynthetic = false;
 
         // Overflow-triggered emergency recovery: if a prior provider response
         // included a context-overflow error, the event handler persisted
@@ -774,7 +778,13 @@ export function createTransform(deps: TransformDeps) {
                     // Flag-only arm: undefined reportedLimit sets
                     // needs_emergency_recovery WITHOUT writing
                     // detected_context_limit.
-                    recordOverflowDetected(db, sessionId, undefined, armModelKey);
+                    recordOverflowDetected(
+                        db,
+                        sessionId,
+                        undefined,
+                        armModelKey,
+                        "proactive_model_shrink",
+                    );
                     // recordOverflowDetected does NOT reset the no-eligible-head
                     // count. A stale count from the prior model would make
                     // noHeadEscape (below) suppress the bump we just armed, so
@@ -784,6 +794,7 @@ export function createTransform(deps: TransformDeps) {
 
                 const overflowState = getOverflowState(db, sessionId);
                 emergencyRecoveryArmed = overflowState.needsEmergencyRecovery;
+                emergencyRecoveryOrigin = overflowState.emergencyRecoveryOrigin;
                 if (contextUsageEarly.percentage < 80 && !overflowState.needsEmergencyRecovery) {
                     resetProtectedTailNoEligibleHead(db, sessionId);
                 }
@@ -805,6 +816,7 @@ export function createTransform(deps: TransformDeps) {
                         ...contextUsageEarly,
                         percentage: 95,
                     };
+                    usagePercentageSynthetic = true;
                 } else if (recoveryNoHeadEscapeActive && deps.client) {
                     void sendIgnoredMessage(
                         deps.client,
@@ -969,10 +981,6 @@ export function createTransform(deps: TransformDeps) {
         const consumingDeferredEarly =
             canConsumeDeferredEarly && deferredHistoryWasPendingAtPassStart;
         const isCacheBusting = historyRefreshExplicitBeforePrepare || consumingDeferredEarly;
-        if (historianFailureState.failureCount === 0) {
-            lastEmergencyNotificationCount.delete(sessionId);
-        }
-
         const notificationParams = deps.getNotificationParams?.(sessionId) ?? {};
         const boundaryContextLimit =
             resolvedContextLimit && resolvedContextLimit > 0
@@ -1104,34 +1112,6 @@ export function createTransform(deps: TransformDeps) {
         ) {
             skipCompartmentAwaitForThisPass = true;
             const emergencyPercentage = contextUsageEarly.percentage.toFixed(1);
-            const abortingClient = deps.client as
-                | {
-                      session?: { abort?: (input: { path: { id: string } }) => Promise<unknown> };
-                  }
-                | undefined;
-            if (typeof abortingClient?.session?.abort === "function") {
-                void abortingClient.session
-                    .abort({ path: { id: sessionId } })
-                    .catch((error: unknown) => {
-                        sessionLog(
-                            sessionId,
-                            "transform: emergency abort failed:",
-                            getErrorMessage(error),
-                        );
-                    });
-            }
-
-            const lastNotifiedCount = lastEmergencyNotificationCount.get(sessionId) ?? 0;
-            if (deps.client && historianFailureState.failureCount > lastNotifiedCount) {
-                lastEmergencyNotificationCount.set(sessionId, historianFailureState.failureCount);
-                void sendIgnoredMessage(
-                    deps.client,
-                    sessionId,
-                    `⚠️ Context Emergency — Context is at ${emergencyPercentage}% and historian has failed ${historianFailureState.failureCount} times (last error: ${truncateHistorianEmergencyError(historianFailureState.lastError)}). Aborting this message to prevent context overflow. Historian will retry automatically. If this persists, change your historian model in magic-context.jsonc and restart OpenCode.`,
-                    notificationParams,
-                );
-            }
-
             const recoveryStarted = startRecoveryRun();
             // If recovery can't start because there is no eligible pre-tail
             // history to compact, the runner no-op that normally counts this
@@ -1153,7 +1133,7 @@ export function createTransform(deps: TransformDeps) {
             }
             sessionLog(
                 sessionId,
-                `EMERGENCY: aborting session at ${emergencyPercentage}%, historian failures: ${historianFailureState.failureCount}`,
+                `EMERGENCY: historian recovery requested at ${emergencyPercentage}%, failures: ${historianFailureState.failureCount}`,
             );
         } else if (
             fullFeatureMode &&
@@ -1791,6 +1771,67 @@ export function createTransform(deps: TransformDeps) {
                 hardSignals: m0HardSignals,
             },
         });
+        // Fresh-tokenize only in the emergency band. This estimate is telemetry,
+        // never an abort gate: provider-accurate accounting is deferred to the
+        // module-side implementation.
+        const finalWireEstimate =
+            contextUsage.percentage >= 95
+                ? estimateFinalWireInputTokens({
+                      messages,
+                      systemPromptTokens: sessionMeta.systemPromptTokens,
+                      providerID: modelForBudget?.providerID,
+                      modelID: modelForBudget?.modelID,
+                      agentName: notificationParams.agent,
+                  })
+                : undefined;
+        if (finalWireEstimate) {
+            sessionLog(
+                sessionId,
+                `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"}`,
+            );
+        }
+        const emergencyFailClosed = evaluateEmergencyFailClosed({
+            usagePercentage: contextUsage.percentage,
+            emergencyRecoveryArmed,
+            emergencyRecoveryOrigin,
+            foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
+        });
+        if (emergencyFailClosed.shouldAbort) {
+            if (!deps.client) {
+                throw new Error("Cannot fail closed: OpenCode client is unavailable");
+            }
+            // The notice must finish before self-abort: OpenCode detaches the hook
+            // effect on interruption, so an unawaited notification is lost exactly
+            // when the user most needs recovery instructions.
+            await sendIgnoredMessage(
+                deps.client,
+                sessionId,
+                "Context full — /ctx-flush or /clear to continue.",
+                notificationParams,
+            );
+            try {
+                // Returning any message array still creates a provider request.
+                // Await and validate self-abort so only a confirmed interruption
+                // can return normally from this already-unsendable branch.
+                await abortSessionFailClosed(deps.client, sessionId);
+            } catch (error) {
+                sessionLog(
+                    sessionId,
+                    "transform: emergency fail-closed abort failed; refusing to return a sendable prompt:",
+                    getErrorMessage(error),
+                );
+                throw error;
+            }
+            // The abort prevents a fresh provider usage sample. Release the
+            // stale-sample latch so the retry can reclaim additional tools.
+            clearEmergencyDropSample(db, sessionId);
+            sessionLog(
+                sessionId,
+                `EMERGENCY: fail-closed (reason=${emergencyFailClosed.reason}, recoveryOrigin=${emergencyRecoveryOrigin ?? "unknown"}, finalEstimate=${finalWireEstimate?.tokens ?? "unavailable"}, estimateTrusted=${finalWireEstimate?.trusted ?? false}, syntheticUsage=${usagePercentageSynthetic})`,
+            );
+            return;
+        }
+
         if (postTransformResult.bustedThisPass) {
             recordPendingTransformDecision(sessionId, {
                 tsMs: Date.now(),
@@ -1885,122 +1926,10 @@ export function createTransform(deps: TransformDeps) {
                     continue;
                 }
             }
-            let conv = 0;
-            let tool = 0;
-            for (const part of message.parts) {
-                if (!part || typeof part !== "object") continue;
-                const p = part as {
-                    type?: string;
-                    text?: string;
-                    thinking?: string;
-                    signature?: string;
-                    data?: string;
-                    ignored?: boolean;
-                    state?: { input?: unknown; output?: unknown };
-                    args?: unknown;
-                    input?: unknown;
-                    content?: unknown;
-                    mime?: string;
-                    metadata?: { anthropic?: { signature?: string } };
-                };
-                if (p.ignored) continue;
-                switch (p.type) {
-                    case "text": {
-                        if (typeof p.text === "string") {
-                            conv += estimateTokens(p.text);
-                        }
-                        break;
-                    }
-                    case "reasoning": {
-                        // OpenCode's internal representation of reasoning.
-                        // Content is in `text`, signature is in metadata.
-                        if (typeof p.text === "string") conv += estimateTokens(p.text);
-                        const sig = p.metadata?.anthropic?.signature;
-                        if (typeof sig === "string") conv += estimateTokens(sig);
-                        break;
-                    }
-                    case "thinking": {
-                        // Anthropic wire-format thinking part. Content is in
-                        // `thinking`, signature is in `signature`. Typical
-                        // signature ~3,500 chars / ~600 tokens per block.
-                        if (typeof p.thinking === "string") conv += estimateTokens(p.thinking);
-                        if (typeof p.signature === "string") conv += estimateTokens(p.signature);
-                        break;
-                    }
-                    case "redacted_thinking": {
-                        // Redacted thinking: opaque `data` blob, billed as input.
-                        if (typeof p.data === "string") conv += estimateTokens(p.data);
-                        break;
-                    }
-                    case "file": {
-                        // Images: Anthropic bills by visual tokens using
-                        // (width × height) / 750. Parse PNG/JPEG/WebP/GIF
-                        // headers from the data URL to get real dimensions
-                        // instead of over-estimating from base64 char length.
-                        // https://docs.claude.com/en/build-with-claude/vision
-                        if (typeof p.mime === "string" && p.mime.startsWith("image/")) {
-                            const url =
-                                typeof (p as { url?: unknown }).url === "string"
-                                    ? (p as { url: string }).url
-                                    : undefined;
-                            if (url?.startsWith("data:")) {
-                                conv += estimateImageTokensFromDataUrl(url);
-                            } else {
-                                conv += 1200; // fallback for non-data-url refs
-                            }
-                        }
-                        break;
-                    }
-                    case "tool": {
-                        // OpenCode format: { state: { input, output } }
-                        if (p.state && typeof p.state === "object") {
-                            if (p.state.input !== undefined) {
-                                const s =
-                                    typeof p.state.input === "string"
-                                        ? p.state.input
-                                        : JSON.stringify(p.state.input);
-                                if (s) tool += estimateTokens(s);
-                            }
-                            if (p.state.output !== undefined) {
-                                const s =
-                                    typeof p.state.output === "string"
-                                        ? p.state.output
-                                        : JSON.stringify(p.state.output);
-                                if (s) tool += estimateTokens(s);
-                            }
-                        }
-                        break;
-                    }
-                    case "tool-invocation": {
-                        if (p.args !== undefined) {
-                            const s = typeof p.args === "string" ? p.args : JSON.stringify(p.args);
-                            if (s) tool += estimateTokens(s);
-                        }
-                        break;
-                    }
-                    case "tool_use": {
-                        if (p.input !== undefined) {
-                            const s =
-                                typeof p.input === "string" ? p.input : JSON.stringify(p.input);
-                            if (s) tool += estimateTokens(s);
-                        }
-                        break;
-                    }
-                    case "tool_result": {
-                        if (p.content !== undefined) {
-                            const s =
-                                typeof p.content === "string"
-                                    ? p.content
-                                    : JSON.stringify(p.content);
-                            if (s) tool += estimateTokens(s);
-                        }
-                        break;
-                    }
-                }
-            }
-            if (mid) msgTokens.set(mid, { conversation: conv, toolCall: tool });
-            conversationTokens += conv;
-            toolCallTokens += tool;
+            const estimated = estimateMessageTokens(message);
+            if (mid) msgTokens.set(mid, estimated);
+            conversationTokens += estimated.conversation;
+            toolCallTokens += estimated.toolCall;
         }
         try {
             updateSessionMeta(db, sessionId, { conversationTokens, toolCallTokens });
@@ -2244,13 +2173,4 @@ export function resolveHistoryBudgetTokens(
                 100) *
             historyBudgetPercentage,
     );
-}
-
-function truncateHistorianEmergencyError(error: string | null): string {
-    const normalized = (error ?? "unknown error").replace(/\s+/g, " ").trim();
-    if (normalized.length <= 100) {
-        return normalized;
-    }
-
-    return `${normalized.slice(0, 100)}…`;
 }

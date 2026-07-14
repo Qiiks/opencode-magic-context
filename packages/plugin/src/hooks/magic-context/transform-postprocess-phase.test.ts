@@ -21,6 +21,7 @@ import {
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { registerActiveCompartmentRun } from "./compartment-runner";
+import { estimateMessageTokens } from "./final-wire-token-estimate";
 import { injectM0M1, type M0HardSignals } from "./inject-compartments";
 import type { MessageLike, TagTarget, ThinkingLikePart } from "./tag-messages";
 import {
@@ -31,8 +32,10 @@ import {
 } from "./tool-drop-target";
 import { applyFlushedStatuses } from "./transform-operations";
 import {
+    abortSessionFailClosed,
     checkM0MutationDriftAndSignal,
     clearPendingCompactionMarkerAfterSuccessfulDrain,
+    evaluateEmergencyFailClosed,
     finalizeMessageRepresentation,
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
@@ -394,6 +397,80 @@ describe("deferred compaction marker CAS drain", () => {
     });
 });
 
+describe("emergency fail-closed decision", () => {
+    it("aborts provider-proven overflow in the emergency band when no fold landed", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 95,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+            }),
+        ).toEqual({ shouldAbort: true, reason: "provider-overflow-abort" });
+    });
+
+    it("allows provider-proven recovery when a historian fold materialized this pass", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 108,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: true,
+            }),
+        ).toEqual({ shouldAbort: false, reason: "proceed" });
+    });
+
+    it("never aborts proactive model-shrink recovery", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 112,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "proactive_model_shrink",
+                foldMaterializedThisPass: false,
+            }),
+        ).toEqual({ shouldAbort: false, reason: "proceed" });
+    });
+
+    it("does not abort below the emergency band", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 94.9,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+            }),
+        ).toEqual({ shouldAbort: false, reason: "below-emergency-band" });
+    });
+});
+
+describe("confirmed emergency abort", () => {
+    it("rejects an SDK error response instead of accepting a failed abort", async () => {
+        await expect(
+            abortSessionFailClosed(
+                {
+                    session: {
+                        abort: async () => ({ error: { status: 500 } }),
+                    },
+                },
+                "ses-abort-error",
+            ),
+        ).rejects.toThrow("was not confirmed");
+    });
+
+    it("rejects data false instead of returning a sendable prompt", async () => {
+        await expect(
+            abortSessionFailClosed(
+                {
+                    session: {
+                        abort: async () => ({ data: false }),
+                    },
+                },
+                "ses-abort-false",
+            ),
+        ).rejects.toThrow("was not confirmed");
+    });
+});
+
 describe("postprocess emergency drop accounting", () => {
     it("plans emergency floor from tags that remain active after pending ops", async () => {
         db = new Database(":memory:");
@@ -458,6 +535,36 @@ describe("postprocess emergency drop accounting", () => {
             [3, "active"],
             [4, "active"],
         ]);
+        const finalMessageTokens = messages.reduce((total, message) => {
+            const estimate = estimateMessageTokens(message);
+            return total + estimate.conversation + estimate.toolCall;
+        }, 0);
+        expect(finalMessageTokens).toBeGreaterThan(0);
+    });
+
+    it("reports estimated tokens reclaimed by successful emergency tool drops", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-postprocess-reclaim";
+        const messages = [1, 2, 3, 4].map((tag) => makeToolMessage(`tool-${tag}`));
+        const targets = new Map<number, TagTarget>();
+        for (let tag = 1; tag <= 4; tag++) {
+            insertTag(db, sessionId, `tool-${tag}`, "tool", 8000, tag, 0, "bash");
+            targets.set(tag, makeDropTarget(messages[tag - 1]!));
+        }
+
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+                contextUsage: { percentage: 110, inputTokens: 20_000 },
+                emergencyCeilingTokens: 10_000,
+                currentTurnId: "turn-reclaim",
+            }),
+        );
+
+        expect(result.emergencyReclaimedTokens).toBeGreaterThan(0);
+        expect(result.emergency).toBe(true);
     });
 });
 

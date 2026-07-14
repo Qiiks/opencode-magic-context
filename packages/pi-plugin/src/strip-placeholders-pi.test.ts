@@ -43,6 +43,25 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 		}
 	});
 
+	it("does not recognize the stripped-image marker as a dropped sentinel", () => {
+		const db = createTestDb();
+		try {
+			const marker = assistantMessage("[image stripped]", 2);
+			const messages = [userMessage("keep", 1), marker];
+			const result = stripPiDroppedPlaceholderMessages({
+				db,
+				sessionId: "ses-image-marker",
+				messages,
+				isCacheBusting: true,
+			});
+
+			expect(result).toEqual({ removed: 0, discovered: 0 });
+			expect(messages).toContain(marker);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("replays persisted stripping on defer passes without discovering new ids", () => {
 		const db = createTestDb();
 		try {

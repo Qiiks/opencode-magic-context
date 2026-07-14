@@ -9,7 +9,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::boundary::BoundaryResolution;
-use crate::ck_wire::{block_id, CkIngressMessage, CkKind, FlatBlock};
+use crate::ck_wire::{CkIngressMessage, CkKind, FlatBlock};
 use crate::historian::{compute_chunk_fingerprint, ChunkSnapshotItem, HistorianFireRequest};
 use crate::historian_prompt::{
     build_compartment_agent_prompt, build_reference_blocks_from_stored,
@@ -55,11 +55,11 @@ pub struct HistorianBuiltChunk {
 struct MessageMeta {
     ordinal: u64,
     message_id: String,
+    anchorable: bool,
 }
 
 #[derive(Debug, Clone)]
 struct FlatMessage<'a> {
-    mid: &'a str,
     ordinal: u64,
     role: &'a str,
     blocks: Vec<&'a FlatBlock>,
@@ -121,10 +121,17 @@ impl Builder {
     }
 
     fn push_message(&mut self, message: &FlatMessage<'_>) -> bool {
+        let last_block_id = last_block_id(message);
         let meta = MessageMeta {
             ordinal: message.ordinal,
-            message_id: last_block_id(message),
+            message_id: last_block_id.clone().unwrap_or_default(),
+            anchorable: last_block_id.is_some(),
         };
+
+        if message.role == "system" {
+            self.pending_noise_meta.push(meta);
+            return true;
+        }
 
         if message.role == "tool" && !has_text_parts(message) {
             let summaries = extract_tool_result_summaries(message, &self.tool_call_summaries);
@@ -278,6 +285,7 @@ impl Builder {
             .extend(block.meta.iter().map(|meta| ChunkLine {
                 ordinal: meta.ordinal,
                 message_id: meta.message_id.clone(),
+                anchorable: meta.anchorable,
             }));
         self.lines.push(block_text);
         self.total_tokens += block_tokens;
@@ -329,25 +337,16 @@ pub fn build_historian_chunk(
         if message.ordinal < start {
             continue;
         }
-        // System-role content is pinned prompt material, so it never enters
-        // chunk text. Its ordinal still enters line metadata when present in
-        // the claimed range. Consumer legs may retire other ordinal numbers
-        // permanently, so validation compares against the sparse live set
-        // instead of requiring integer contiguity. Feeding system messages
-        // through as zero-block messages reuses the empty-message path instead
-        // of leaving a silent coverage gap.
+        // System-role content is pinned prompt material, so Builder records it
+        // as metadata-only. Its real flat blocks remain available to identify an
+        // anchor when the ordinal is absorbed into a later narrative line.
         let flat_message = FlatMessage {
-            mid: message.mid.as_str(),
             ordinal: message.ordinal,
             role,
-            blocks: if role == "system" {
-                Vec::new()
-            } else {
-                blocks_by_mid
-                    .get(message.mid.as_str())
-                    .cloned()
-                    .unwrap_or_default()
-            },
+            blocks: blocks_by_mid
+                .get(message.mid.as_str())
+                .cloned()
+                .unwrap_or_default(),
         };
         if !builder.push_message(&flat_message) {
             break;
@@ -465,6 +464,7 @@ impl AssembledHistorianFiring {
             validate_options: self.validate_options,
             now_ms: self.now_ms,
             failure_backoff_at_ms: self.failure_backoff_at_ms,
+            completion_now_ms: crate::now_ms,
         }
     }
 }
@@ -662,12 +662,8 @@ fn grouped_blocks_by_mid(blocks: &[FlatBlock]) -> BTreeMap<&str, Vec<&FlatBlock>
     grouped
 }
 
-fn last_block_id(message: &FlatMessage<'_>) -> String {
-    message
-        .blocks
-        .last()
-        .map(|block| block.id.clone())
-        .unwrap_or_else(|| block_id(message.mid, 0))
+fn last_block_id(message: &FlatMessage<'_>) -> Option<String> {
+    message.blocks.last().map(|block| block.id.clone())
 }
 
 fn text_parts(message: &FlatMessage<'_>) -> Vec<String> {
@@ -1099,13 +1095,19 @@ mod tests {
     fn chunk_uses_flat_block_ids_and_covers_system_ordinals_without_their_text() {
         let messages = vec![
             msg("u1", 1, "user", vec![text("hello")]),
-            msg("sys", 2, "system", vec![text("identity")]),
+            msg(
+                "sys",
+                2,
+                "system",
+                vec![text("identity"), text("second pinned block")],
+            ),
             msg("a3", 3, "assistant", vec![text("done")]),
         ];
         let built = project_and_build(&messages, 1, 1_000, 4);
         // System CONTENT stays out of the chunk text (pinned prompt material,
         // not conversation)...
         assert!(!built.text.contains("identity"));
+        assert!(!built.text.contains("second pinned block"));
         assert!(built.text.contains("U: hello"));
         assert!(built.text.contains("A: done"));
         assert_eq!(built.chunk.start_index, 1);
@@ -1115,6 +1117,8 @@ mod tests {
         let ordinals: Vec<u64> = built.chunk.lines.iter().map(|line| line.ordinal).collect();
         assert_eq!(ordinals, vec![1, 2, 3]);
         assert_eq!(built.chunk.lines[0].message_id, "u1#0");
+        assert_eq!(built.chunk.lines[1].message_id, "sys#1");
+        assert!(built.chunk.lines[1].anchorable);
         assert_eq!(built.end_message_id, "a3#0");
         assert!(
             crate::historian_validate::validate_chunk_coverage(&built.chunk).is_none(),
@@ -1174,7 +1178,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert_eq!(built.chunk.lines[0].message_id, "empty1#0");
+        assert_eq!(built.chunk.lines[0].message_id, "");
+        assert!(!built.chunk.lines[0].anchorable);
+    }
+
+    #[test]
+    fn filtered_noise_adjacent_to_boundary_does_not_create_validation_gap() {
+        let messages = vec![
+            msg("u1", 1, "user", vec![text("first arc")]),
+            msg(
+                "noise2",
+                2,
+                "user",
+                vec![text("<!-- OMO_INTERNAL_INITIATOR -->")],
+            ),
+            msg("empty3", 3, "assistant", vec![]),
+            msg("a4", 4, "assistant", vec![text("second arc")]),
+        ];
+        let built = project_and_build(&messages, 1, 1_000, 5);
+        assert_eq!(
+            built
+                .chunk
+                .lines
+                .iter()
+                .map(|line| line.ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(built.text.contains("[2-4] A: second arc"));
+
+        let output = r#"<output><compartments>
+<compartment start="1" end="1" title="first" episode_type="feature" importance="50"><p1>first</p1><p2>first</p2><p3>first</p3><p4 /></compartment>
+<compartment start="2" end="4" title="second" episode_type="feature" importance="50"><p1>second</p1><p2>second</p2><p3>second</p3><p4 /></compartment>
+</compartments><meta><unprocessed_from>5</unprocessed_from></meta></output>"#;
+        crate::historian_validate::validate_historian_output(
+            output,
+            &built.chunk,
+            &[],
+            ValidateOptions {
+                in_emergency: true,
+                ..ValidateOptions::default()
+            },
+        )
+        .expect("filtered ordinals ride adjacent metadata and cannot open a gap");
     }
 
     #[test]

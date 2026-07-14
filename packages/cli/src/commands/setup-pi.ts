@@ -1,13 +1,14 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { stringify as stringifyJsonc } from "comment-json";
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
     hasUserConfigLocationMigrationRefusal,
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
 import { runDreamerSetup } from "../lib/dreamer-setup";
+import { assertJsoncConfigsParseable, readJsoncConfigForUpdate } from "../lib/jsonc-config";
 import { pickModel } from "../lib/model-picker";
 import { getPiAgentConfigDir, getPiUserConfigPath, getPiUserExtensionsPath } from "../lib/paths";
 import {
@@ -71,16 +72,6 @@ async function getDefaultPrompts(): Promise<PromptIO> {
     return promptIO;
 }
 
-function readJsonc(path: string): Record<string, unknown> | null {
-    try {
-        return parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>;
-    } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn(`Could not parse ${path}: ${message}`);
-        return null;
-    }
-}
-
 function compactObject<T extends Record<string, unknown>>(obj: T): T {
     for (const key of Object.keys(obj)) {
         if (obj[key] === undefined) delete obj[key];
@@ -113,11 +104,8 @@ export function writePiSettingsPackage(
     settingsPath: string,
     packageSource = PI_PACKAGE_SOURCE,
 ): boolean {
+    const settings = readJsoncConfigForUpdate(settingsPath);
     ensureDir(dirname(settingsPath));
-
-    const settings: Record<string, unknown> = existsSync(settingsPath)
-        ? (readJsonc(settingsPath) ?? {})
-        : {};
     const packages = Array.isArray(settings.packages) ? settings.packages : [];
 
     const hasPackage = hasPiMagicContextPackage(packages);
@@ -142,10 +130,8 @@ export function writeMagicContextConfig(
         embedding: EmbeddingChoice;
     },
 ): void {
+    const config = readJsoncConfigForUpdate(configPath);
     ensureDir(dirname(configPath));
-    const config: Record<string, unknown> = existsSync(configPath)
-        ? (readJsonc(configPath) ?? {})
-        : {};
 
     if (!config.$schema) {
         config.$schema =
@@ -253,8 +239,8 @@ export async function runSetup(options: RunSetupOptions = {}): Promise<number> {
         prompts.log.message(
             "Install Pi first, then rerun setup. If Pi is installed in a custom location, add it to PATH.",
         );
-        prompts.outro("Setup skipped");
-        return 0;
+        prompts.outro("Setup stopped — install Pi and try again");
+        return 1;
     }
 
     const version = env.getPiVersion(pi.path);
@@ -288,20 +274,20 @@ export async function runSetup(options: RunSetupOptions = {}): Promise<number> {
 
     const settingsPath = env.paths.getPiUserExtensionsPath();
     const configPath = env.paths.getPiUserConfigPath();
+    if (!dryRun) {
+        try {
+            // Validate every target before the wizard performs its first write.
+            assertJsoncConfigsParseable([settingsPath, configPath]);
+        } catch (error) {
+            prompts.log.error(error instanceof Error ? error.message : String(error));
+            prompts.outro("Setup stopped — fix the malformed config and rerun setup.");
+            return 1;
+        }
+    }
     const configurePi = await prompts.confirm("Configure Pi to load Magic Context?", true);
     if (configurePi) {
         if (dryRun) {
             prompts.log.message(`[dry-run] would add ${PI_PACKAGE_SOURCE} to ${settingsPath}`);
-        } else {
-            const packageAdded = writePiSettingsPackage(settingsPath);
-            prompts.log.success(
-                packageAdded
-                    ? `Added ${PI_PACKAGE_SOURCE} to ${settingsPath}`
-                    : `Magic Context package already present in ${settingsPath}`,
-            );
-            prompts.log.message(
-                "This mirrors `pi install npm:@cortexkit/pi-magic-context` without running installs during setup verification.",
-            );
         }
     } else {
         prompts.log.warn(
@@ -357,6 +343,17 @@ export async function runSetup(options: RunSetupOptions = {}): Promise<number> {
     if (dryRun) {
         prompts.log.message(`[dry-run] would write Magic Context config to ${configPath}`);
     } else {
+        if (configurePi) {
+            const packageAdded = writePiSettingsPackage(settingsPath);
+            prompts.log.success(
+                packageAdded
+                    ? `Added ${PI_PACKAGE_SOURCE} to ${settingsPath}`
+                    : `Magic Context package already present in ${settingsPath}`,
+            );
+            prompts.log.message(
+                "This mirrors `pi install npm:@cortexkit/pi-magic-context` without running installs during setup verification.",
+            );
+        }
         writeMagicContextConfig(configPath, {
             historianModel,
             historianThinkingLevel,

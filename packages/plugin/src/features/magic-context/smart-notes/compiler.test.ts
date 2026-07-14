@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createSmartNoteCapabilities, type SmartNoteCapabilityApi } from "./capabilities";
-import { manifestAdvisoryWarnings } from "./compiler";
+import {
+    manifestAdvisoryWarnings,
+    normalizeCompiledCheck,
+    normalizeCron,
+    normalizeManifest,
+    parseCompilerOutput,
+} from "./compiler";
 import { runCompiledSmartNoteCheck } from "./sandbox-runner";
 
 const fakeCap: SmartNoteCapabilityApi = {
@@ -93,5 +99,29 @@ describe("smart-note compiler runtime boundary", () => {
 
         const result = await runCompiledSmartNoteCheck({ compiledCheck, capabilities: fakeCap });
         expect(result).toEqual({ ok: true, result: { met: true } });
+    });
+});
+
+describe("smart-note compiler output bounds", () => {
+    test("rejects impossible cron expressions within the scheduling ceiling", () => {
+        const startedAt = performance.now();
+        expect(() => normalizeCron("0 0 31 2 *")).toThrow(/scheduling ceiling/);
+        expect(performance.now() - startedAt).toBeLessThan(50);
+    });
+
+    test("bounds compiler output, source, manifest entries, and cron length", () => {
+        expect(() => parseCompilerOutput("x".repeat(128 * 1024 + 1))).toThrow(/128 KiB/);
+        expect(() =>
+            normalizeCompiledCheck(
+                `function check() { return { met: false }; }/*${"x".repeat(64 * 1024)}*/`,
+            ),
+        ).toThrow(/64 KiB/);
+        expect(
+            normalizeManifest({
+                capabilities: [],
+                signals: Array.from({ length: 100 }, (_, index) => `signal-${index}`),
+            }).signals,
+        ).toHaveLength(64);
+        expect(() => normalizeCron("*".repeat(257))).toThrow(/256 characters/);
     });
 });

@@ -20,7 +20,7 @@
  * V1 is OpenCode-only. Pi sessions are JSONL (a different re-home mechanism).
  */
 
-import { copyFileSync, existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path, { join } from "node:path";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
@@ -32,7 +32,12 @@ import {
 import { bumpProjectMemoryEpoch } from "@magic-context/core/features/magic-context/storage-project-state";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
-import { Database } from "@magic-context/core/shared/sqlite";
+import {
+    backupDatabaseSnapshot,
+    openExistingContextDatabase,
+    openExistingDatabase,
+} from "../lib/database-access";
+import { getOpenCodeDatabasePath } from "../lib/migration-paths";
 import { promptIO } from "../lib/prompts";
 
 type DatabaseLike = Pick<DatabaseType, "prepare" | "close" | "exec">;
@@ -399,7 +404,7 @@ export function applyMigrateSession(
 // ── CLI wrapper ─────────────────────────────────────────────────────────────
 
 function defaultOpenCodeDbPath(): string {
-    return join(homedir(), ".local", "share", "opencode", "opencode.db");
+    return getOpenCodeDatabasePath();
 }
 function defaultContextDbPath(): string {
     return join(getMagicContextStorageDir(), "context.db");
@@ -505,22 +510,31 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
 
     const opencodeDbPath = defaultOpenCodeDbPath();
     const contextDbPath = defaultContextDbPath();
-    const dbReadonly = dryRun ? { readonly: true } : undefined;
-    const opencodeDb = new Database(opencodeDbPath, dbReadonly);
-    const contextDb = new Database(contextDbPath, dbReadonly);
-    // This CLI opens context.db directly (bypassing initializeDatabase), so the
-    // pragmas the plugin normally sets are absent. foreign_keys=ON is REQUIRED:
-    // the collision-merge path (rekeyMemoryRowWithCollisionMerge) relies on
-    // memory_embeddings FK-cascading when a source memory row is deleted — without
-    // it, deletes leave ORPHANED embedding rows. busy_timeout avoids instant-fail
-    // if a plugin process touches the shared DB during the move.
+    let opencodeDb: DatabaseLike | null = null;
+    let contextDb: DatabaseLike | null = null;
     try {
-        contextDb.exec("PRAGMA foreign_keys=ON");
-        contextDb.exec("PRAGMA busy_timeout=5000");
-    } catch {
-        // best-effort; the move's own transactions are the real safety net
-    }
-    try {
+        opencodeDb = openExistingDatabase(opencodeDbPath, { readonly: dryRun });
+        if (opencodeDb === null) {
+            throw new Error(
+                `OpenCode database not found at ${opencodeDbPath}; nothing to migrate.`,
+            );
+        }
+        contextDb = openExistingContextDatabase(contextDbPath, { readonly: dryRun });
+        if (contextDb === null) {
+            throw new Error(
+                `Magic Context database not found at ${contextDbPath}; nothing to migrate.`,
+            );
+        }
+
+        // The collision-merge path relies on foreign-key cascades when source
+        // memories are deleted. These pragmas must be enabled before planning or writing.
+        try {
+            opencodeDb.exec("PRAGMA busy_timeout=5000");
+            contextDb.exec("PRAGMA foreign_keys=ON");
+            contextDb.exec("PRAGMA busy_timeout=5000");
+        } catch {
+            // Best-effort; the move's own transactions remain the final safety net.
+        }
         const deps = realDeps(opencodeDb, contextDb);
         const plan = planMigrateSession(sessionId, expandedTo, deps);
 
@@ -588,23 +602,33 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
             return 0;
         }
 
-        if (!skipConfirm) {
-            const ok = await promptIO.confirm(
-                "This edits opencode.db + context.db directly. Is OpenCode (TUI / Desktop / serve) fully stopped?",
-                false,
-            );
-            if (!ok) {
-                promptIO.log.warn("Aborted. Stop OpenCode, then re-run.");
-                return 1;
-            }
+        const ok = await promptIO.confirm(
+            "This edits opencode.db + context.db directly. Is OpenCode (TUI / Desktop / serve) fully stopped?",
+            false,
+        );
+        if (!ok) {
+            promptIO.log.warn("Aborted. Stop OpenCode, then re-run.");
+            return 1;
         }
 
-        // Auto-backup both DBs before any write.
+        // Checkpoint committed WAL pages, prove both files can be write-locked,
+        // and snapshot them through SQLite while the locks prevent new writers.
+        opencodeDb.exec("PRAGMA wal_checkpoint(FULL)");
+        contextDb.exec("PRAGMA wal_checkpoint(FULL)");
+        opencodeDb.exec("BEGIN IMMEDIATE");
+        let contextLocked = false;
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
         const ocBackup = `${opencodeDbPath}.bak-${stamp}`;
         const ctxBackup = `${contextDbPath}.bak-${stamp}`;
-        copyFileSync(opencodeDbPath, ocBackup);
-        copyFileSync(contextDbPath, ctxBackup);
+        try {
+            contextDb.exec("BEGIN IMMEDIATE");
+            contextLocked = true;
+            await backupDatabaseSnapshot(opencodeDb as DatabaseType, ocBackup);
+            await backupDatabaseSnapshot(contextDb as DatabaseType, ctxBackup);
+        } finally {
+            if (contextLocked) contextDb.exec("ROLLBACK");
+            opencodeDb.exec("ROLLBACK");
+        }
         promptIO.log.info(`Backed up: ${ocBackup}`);
         promptIO.log.info(`Backed up: ${ctxBackup}`);
 
@@ -632,7 +656,7 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
         console.error(error instanceof Error ? error.message : String(error));
         return 1;
     } finally {
-        opencodeDb.close();
-        contextDb.close();
+        opencodeDb?.close();
+        contextDb?.close();
     }
 }

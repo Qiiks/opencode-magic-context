@@ -1886,6 +1886,36 @@ const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 51,
+        description: "version tool-owner backfill state and repair legacy NULL session metadata",
+        up(db: Database): void {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS tool_owner_backfill_state (
+                    session_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'skipped')),
+                    started_at INTEGER,
+                    lease_expires_at INTEGER,
+                    completed_at INTEGER,
+                    last_error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_tool_owner_backfill_state_status
+                    ON tool_owner_backfill_state(status);
+            `);
+            // v5 used to swallow every UPDATE failure. Re-run the heal so
+            // databases that recorded v5 after a transient failure are repaired.
+            healAllNullColumns(db);
+        },
+    },
+    {
+        version: 52,
+        description: "persist emergency recovery origin",
+        up(db: Database): void {
+            if (tableExists(db, "session_meta")) {
+                ensureColumn(db, "session_meta", "emergency_recovery_origin", "TEXT DEFAULT ''");
+            }
+        },
+    },
 ];
 
 /**
@@ -1918,16 +1948,10 @@ function getCurrentVersion(db: Database): number {
 
 /**
  * Detect the specific case where a sibling process already committed the
- * same `schema_migrations` row we're about to insert. Two OpenCode/Pi
- * instances starting concurrently can both read `MAX(version)=N` before
- * either commits. The first commits v(N+1); the second's transaction body
- * runs `migration.up()` (a no-op now that the schema change already
- * landed), then hits PRIMARY KEY conflict on the
- * `INSERT INTO schema_migrations` row.
- *
- * Without this guard the plugin fail-closes and the second instance
- * refuses to start. With it, we recognize "sibling beat us to it",
- * re-read the version, and continue from the next pending migration.
+ * same `schema_migrations` row we're about to insert. BEGIN IMMEDIATE now
+ * prevents this race for supported adapters by serializing before the version
+ * read. Keep this narrow guard as a secondary backstop for legacy or unusual
+ * transaction adapters that do not honor the requested begin mode.
  *
  * Important: only PRIMARY KEY conflicts on `schema_migrations` are
  * swallowed. Any other failure (CREATE TABLE, ALTER TABLE, data heal,
@@ -1961,75 +1985,71 @@ export function isSiblingMigrationConflict(db: Database, error: unknown, version
  * Each migration runs in its own transaction — if it fails, only that migration rolls back.
  * Already-applied migrations are skipped.
  *
- * Multi-instance race tolerance: when two plugin processes start against
- * the same shared DB, both can read the same MAX(version) before either
- * commits. The first wins; the second's INSERT into schema_migrations
- * fails with a PRIMARY KEY conflict. We catch that specific case and
- * resume from the next pending migration. All other migration errors
- * still fail-close per the existing contract.
+ * Migration application re-reads the persisted version under BEGIN IMMEDIATE
+ * before choosing one migration. Concurrent starters therefore serialize before
+ * taking a read snapshot: one applies the migration and the waiter observes the
+ * advanced version instead of failing a deferred read-to-write lock upgrade.
  */
 export function runMigrations(db: Database): void {
     ensureMigrationsTable(db);
 
-    let currentVersion = getCurrentVersion(db);
-    let pendingMigrations = MIGRATIONS.filter((m) => m.version > currentVersion);
-
-    if (pendingMigrations.length === 0) {
-        return;
-    }
-
-    log(
-        `[migrations] current schema version: ${currentVersion}, applying ${pendingMigrations.length} migration(s)`,
-    );
-
-    let migrationIndex = 0;
-    while (migrationIndex < pendingMigrations.length) {
-        const migration = pendingMigrations[migrationIndex];
+    let loggedPlan = false;
+    while (true) {
+        let migration: Migration | undefined;
+        let currentVersion = 0;
         try {
-            db.transaction(() => {
-                migration.up(db);
-                db.prepare(
-                    "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
-                ).run(migration.version, migration.description, Date.now());
-            })();
+            const applied = db
+                .transaction(() => {
+                    currentVersion = getCurrentVersion(db);
+                    migration = MIGRATIONS.find((candidate) => candidate.version > currentVersion);
+                    if (!migration) return false;
+
+                    if (!loggedPlan) {
+                        const pendingCount = MIGRATIONS.filter(
+                            (candidate) => candidate.version > currentVersion,
+                        ).length;
+                        log(
+                            `[migrations] current schema version: ${currentVersion}, applying ${pendingCount} migration(s)`,
+                        );
+                        loggedPlan = true;
+                    }
+
+                    migration.up(db);
+                    db.prepare(
+                        "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
+                    ).run(migration.version, migration.description, Date.now());
+                    return true;
+                })
+                .immediate();
+
+            if (!applied || !migration) break;
             log(`[migrations] applied v${migration.version}: ${migration.description}`);
-            migrationIndex += 1;
         } catch (error) {
-            if (isSiblingMigrationConflict(db, error, migration.version)) {
-                // Sibling process committed this version between our
-                // MAX(version) read and our INSERT. Re-read the version
-                // and rebuild the pending list — the sibling may have
-                // applied multiple migrations while we were preparing
-                // this one.
+            if (migration && isSiblingMigrationConflict(db, error, migration.version)) {
+                // BEGIN IMMEDIATE prevents the normal race, but retain the narrow
+                // PK-conflict tolerance for unusual SQLite adapters or callers.
                 log(
                     `[migrations] v${migration.version} already applied by sibling instance — resuming with re-read version`,
                 );
                 const reReadVersion = getCurrentVersion(db);
-                if (reReadVersion <= currentVersion) {
-                    // Defensive: sibling-conflict shape detected but
-                    // version didn't actually advance. Treat as a real
-                    // failure to avoid an infinite loop on a malformed
-                    // error.
-                    log(
-                        `[migrations] FAILED v${migration.version}: sibling-conflict shape but version not advanced (${reReadVersion} <= ${currentVersion}) — failing closed`,
-                    );
-                    throw new Error(
-                        `Migration v${migration.version} failed: sibling conflict reported but version did not advance. Database may need manual repair.`,
-                    );
-                }
-                currentVersion = reReadVersion;
-                pendingMigrations = MIGRATIONS.filter((m) => m.version > currentVersion);
-                migrationIndex = 0;
-                continue;
+                if (reReadVersion > currentVersion) continue;
+                throw new Error(
+                    `Migration v${migration.version} failed: sibling conflict reported but version did not advance. Database may need manual repair.`,
+                );
             }
+
+            const version = migration?.version ?? currentVersion + 1;
+            const description = migration?.description ?? "acquire migration write lock";
             log(
-                `[migrations] FAILED v${migration.version}: ${migration.description} — ${error instanceof Error ? error.message : String(error)}`,
+                `[migrations] FAILED v${version}: ${description} — ${error instanceof Error ? error.message : String(error)}`,
             );
             throw new Error(
-                `Migration v${migration.version} failed: ${error instanceof Error ? error.message : String(error)}. Database may need manual repair.`,
+                `Migration v${version} failed: ${error instanceof Error ? error.message : String(error)}. Database may need manual repair.`,
             );
         }
     }
 
-    log(`[migrations] schema version now: ${MIGRATIONS[MIGRATIONS.length - 1].version}`);
+    if (loggedPlan) {
+        log(`[migrations] schema version now: ${MIGRATIONS[MIGRATIONS.length - 1].version}`);
+    }
 }

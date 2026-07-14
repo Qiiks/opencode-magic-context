@@ -15,9 +15,11 @@ function deps(
     existing: Set<string>,
     platform: NodeJS.Platform = "darwin",
     onPath: (b: string) => string | null = () => null,
+    executable: Set<string> = existing,
 ): DetectDeps {
     return {
         exists: (p) => existing.has(p),
+        isExecutable: (p) => executable.has(p),
         home: HOME,
         platform,
         env: {
@@ -51,8 +53,18 @@ describe("detectOpenCode", () => {
     });
 
     it("reports cli when a bare opencode is on PATH", () => {
-        const result = detectOpenCode(deps(new Set(), "linux", () => "/somewhere/opencode"));
+        const pathBinary = "/somewhere/opencode";
+        const result = detectOpenCode(deps(new Set([pathBinary]), "linux", () => pathBinary));
         expect(result).toEqual({ kind: "cli", binary: "/somewhere/opencode" });
+    });
+
+    it("skips a non-executable stock binary and keeps searching PATH", () => {
+        const stock = join(HOME, ".opencode", "bin", "opencode");
+        const pathBinary = "/somewhere/opencode";
+        const result = detectOpenCode(
+            deps(new Set([stock, pathBinary]), "linux", () => pathBinary, new Set([pathBinary])),
+        );
+        expect(result).toEqual({ kind: "cli", binary: pathBinary });
     });
 
     it("reports desktop when a channel's opencode.settings marker exists", () => {

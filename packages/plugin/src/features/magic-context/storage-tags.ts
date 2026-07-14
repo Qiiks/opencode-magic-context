@@ -1336,7 +1336,7 @@ export function deleteTagsByMessageId(
     sessionId: string,
     messageId: string,
 ): number[] {
-    return db.transaction(() => {
+    const deleteTransaction = db.transaction(() => {
         const escapedMessageId = escapeLikePattern(messageId);
         const textPartPattern = `${escapedMessageId}:p%`;
         const filePartPattern = `${escapedMessageId}:file%`;
@@ -1370,7 +1370,8 @@ export function deleteTagsByMessageId(
         // De-duplicate — a tag could in theory match both predicates.
         const merged = new Set<number>([...messageScopedTags, ...ownerScopedTagNumbers]);
         return Array.from(merged).sort((a, b) => a - b);
-    })();
+    });
+    return deleteTransaction.immediate();
 }
 
 const getOwnerScopedToolTagNumbersStatements = new WeakMap<Database, PreparedStatement>();

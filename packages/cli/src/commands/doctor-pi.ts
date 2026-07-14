@@ -17,17 +17,18 @@ import {
 import {
     type ContextDatabase,
     closeDatabase,
-    isDatabasePersisted,
     openDatabase,
 } from "@magic-context/core/features/magic-context/storage";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
     hasUserConfigLocationMigrationRefusal,
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
+import { openExistingContextDatabase } from "../lib/database-access";
 import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
     checkLocalEmbeddingRuntimeByResolution,
@@ -50,6 +51,7 @@ import {
 } from "../lib/pi-helpers";
 import {
     describePiPackageEntry,
+    getPiMagicContextPackageSpecifier,
     hasPiMagicContextPackage,
     isPiMagicContextPackageEntry,
 } from "../lib/pi-package-entry";
@@ -94,8 +96,8 @@ interface DoctorDeps {
     getLatestNpmVersion: () => string | null;
     selfVersion: () => string;
     probeEmbeddingEndpoint: typeof probeEmbeddingEndpoint;
+    openExistingContextDatabase: typeof openExistingContextDatabase;
     openDatabase: typeof openDatabase;
-    isDatabasePersisted: typeof isDatabasePersisted;
     closeDatabase: typeof closeDatabase;
     now: () => Date;
     execFileSync: typeof execFileSync;
@@ -119,8 +121,8 @@ const DEFAULT_DEPS: DoctorDeps = {
     getLatestNpmVersion: () => getLatestNpmVersion(PACKAGE_NAME),
     selfVersion,
     probeEmbeddingEndpoint,
+    openExistingContextDatabase,
     openDatabase,
-    isDatabasePersisted,
     closeDatabase,
     now: () => new Date(),
     execFileSync,
@@ -346,7 +348,17 @@ function countTable(db: ContextDatabase, table: string): number | null {
     }
 }
 
-function cacheRoots(): string[] {
+function pinnedVersionFromPackageSpecifier(specifier: string | null): string | null {
+    if (!specifier) return null;
+    const normalized = specifier.replace(/^npm:/, "");
+    const slash = normalized.indexOf("/");
+    const versionAt = normalized.indexOf("@", slash + 1);
+    if (versionAt < 0) return null;
+    const version = normalized.slice(versionAt + 1);
+    return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) ? version : null;
+}
+
+function cacheRoots(cwd: string): string[] {
     const home = process.env.HOME?.trim();
     const cacheHome = process.env.XDG_CACHE_HOME || join(home || homedir(), ".cache");
     const piCacheRoot = getPiCacheRoot();
@@ -356,11 +368,14 @@ function cacheRoots(): string[] {
         join(cacheHome, "pi", "extensions"),
         join(cacheHome, "pi", "packages"),
         join(getPiAgentConfigDir(), "cache", "extensions"),
+        join(getPiAgentConfigDir(), "npm", "node_modules", PACKAGE_NAME),
+        join(cwd, ".pi", "npm", "node_modules", PACKAGE_NAME),
     ];
 }
 
 function findPiMagicContextCacheDirs(
-    self: string,
+    cwd: string,
+    expectedVersion: string | null,
     force = false,
 ): Array<{ path: string; version?: string }> {
     const found = new Map<string, { path: string; version?: string }>();
@@ -383,8 +398,10 @@ function findPiMagicContextCacheDirs(
                 };
                 const name = typeof pkg.name === "string" ? pkg.name : "";
                 const version = typeof pkg.version === "string" ? pkg.version : undefined;
-                if (name === PACKAGE_NAME || path.includes("pi-magic-context")) {
-                    if (force || !version || version !== self) found.set(path, { path, version });
+                if (name === PACKAGE_NAME) {
+                    if (force || !version || (expectedVersion && version !== expectedVersion)) {
+                        found.set(path, { path, version });
+                    }
                 }
             } catch {
                 if (path.includes("pi-magic-context")) found.set(path, { path });
@@ -400,7 +417,7 @@ function findPiMagicContextCacheDirs(
         for (const entry of entries) visit(join(path, entry), depth - 1);
     };
 
-    for (const root of cacheRoots()) visit(root, 5);
+    for (const root of cacheRoots(cwd)) visit(root, 5);
     return [...found.values()];
 }
 
@@ -410,6 +427,7 @@ async function runHealthChecks(options: {
     deps: DoctorDeps;
     quiet?: boolean;
     configMigrationWarnings?: readonly string[];
+    force?: boolean;
 }): Promise<HealthReport> {
     const results: CheckResult[] = [];
     const userConfigMigrationRefused = hasUserConfigLocationMigrationRefusal(
@@ -427,11 +445,11 @@ async function runHealthChecks(options: {
         add(results, "fail", "Pi binary not found on PATH or at ~/.pi/bin/pi");
     } else {
         const version = options.deps.getPiVersion(pi.path);
-        add(
-            results,
-            "pass",
-            version ? `Pi ${version} detected at ${pi.path}` : `Pi detected at ${pi.path}`,
-        );
+        if (version === null) {
+            add(results, "fail", `Pi CLI was found at ${pi.path} but could not be executed`);
+        } else {
+            add(results, "pass", `Pi ${version} detected at ${pi.path}`);
+        }
         const compare = compareSemver(version, MIN_PI_VERSION);
         if (compare !== null && compare < 0) {
             add(
@@ -467,7 +485,7 @@ async function runHealthChecks(options: {
     const settingsPath = getPiUserExtensionsPath();
     let packages: unknown[] = [];
     if (!existsSync(settingsPath)) {
-        add(results, "warn", `Pi settings not found at ${settingsPath}`);
+        add(results, "fail", `Pi settings not found at ${settingsPath}`);
         repairPlan.addPackageEntry = true;
     } else {
         const parsed = readJsonc(settingsPath);
@@ -479,7 +497,7 @@ async function runHealthChecks(options: {
             if (hasPiMagicContextPackage(packages)) {
                 add(results, "pass", `${PI_PACKAGE_SOURCE} is registered in packages[]`);
             } else {
-                add(results, "warn", `${PI_PACKAGE_SOURCE} is missing from packages[]`);
+                add(results, "fail", `${PI_PACKAGE_SOURCE} is missing from packages[]`);
                 repairPlan.addPackageEntry = true;
             }
         }
@@ -563,53 +581,43 @@ async function runHealthChecks(options: {
             `Shared context DB not found yet at ${dbPath}; runtime will create it`,
         );
 
-    let db: ContextDatabase | null = null;
-    try {
-        db = options.deps.openDatabase();
-        if (!db) {
-            // openDatabase() returns null on the schema fence (shared DB newer
-            // than this binary supports). Report and skip DB-dependent checks;
-            // the embedding checks below do not need the DB handle.
+    if (existedBeforeOpen) {
+        let db: ContextDatabase | null = null;
+        try {
+            // Doctor must observe the installed runtime's schema without migrating it.
+            // The existing-only readonly helper applies the schema fence before queries.
+            db = options.deps.openExistingContextDatabase(dbPath, { readonly: true });
+            if (!db) {
+                add(results, "fail", `Shared context DB no longer exists at ${dbPath}`);
+            } else {
+                add(results, "pass", "Opened the shared DB read-only with a supported schema");
+
+                const integrity = db.prepare("PRAGMA integrity_check").get() as {
+                    integrity_check?: unknown;
+                };
+                if (integrity?.integrity_check === "ok")
+                    add(results, "pass", "SQLite integrity_check: ok");
+                else
+                    add(
+                        results,
+                        "fail",
+                        `SQLite integrity_check: ${String(integrity?.integrity_check ?? "unknown")}`,
+                    );
+
+                const counts = ROW_COUNT_TABLES.map(
+                    (table) => `${table}=${countTable(db as ContextDatabase, table) ?? "n/a"}`,
+                ).join(", ");
+                add(results, "info", `Shared DB row counts: ${counts}`);
+            }
+        } catch (error) {
             add(
                 results,
                 "fail",
-                "openDatabase() returned no handle; the shared DB schema is newer than this binary supports (upgrade Magic Context)",
+                `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}`,
             );
-        } else {
-            if (options.deps.isDatabasePersisted(db))
-                add(results, "pass", "openDatabase() opened the shared DB");
-            else
-                add(
-                    results,
-                    "fail",
-                    "openDatabase() fell back to an in-memory DB; shared DB is broken or unwritable",
-                );
-
-            const integrity = db.prepare("PRAGMA integrity_check").get() as {
-                integrity_check?: unknown;
-            };
-            if (integrity?.integrity_check === "ok")
-                add(results, "pass", "SQLite integrity_check: ok");
-            else
-                add(
-                    results,
-                    "fail",
-                    `SQLite integrity_check: ${String(integrity?.integrity_check ?? "unknown")}`,
-                );
-
-            const counts = ROW_COUNT_TABLES.map(
-                (table) => `${table}=${countTable(db as ContextDatabase, table) ?? "n/a"}`,
-            ).join(", ");
-            add(results, "info", `Shared DB row counts: ${counts}`);
+        } finally {
+            db?.close();
         }
-    } catch (error) {
-        add(
-            results,
-            "fail",
-            `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}`,
-        );
-    } finally {
-        options.deps.closeDatabase();
     }
 
     // Read user config (tokens expand) and project config (tokens stay literal —
@@ -688,6 +696,7 @@ async function runHealthChecks(options: {
         // throws on every embedding (#128). Layout-agnostic resolution from the
         // installed plugin dir; stays silent if no plugin dir can be inspected.
         let runtimeReported = false;
+        let runtimeUnverifiedReason = "no installed plugin tree found to inspect";
         for (const pluginDir of piPluginDirCandidates(packages, options.cwd)) {
             const runtime = checkLocalEmbeddingRuntimeByResolution(pluginDir);
             if (runtime.state === "ok") {
@@ -704,9 +713,14 @@ async function runHealthChecks(options: {
                 runtimeReported = true;
                 break;
             }
+            if (runtime.state === "unknown") runtimeUnverifiedReason = runtime.reason;
         }
         if (!runtimeReported) {
-            add(results, "pass", `Embedding provider: ${loadedConfig.config.embedding.provider}`);
+            add(
+                results,
+                "warn",
+                `Embedding provider ${loadedConfig.config.embedding.provider}: native runtime unverified (${runtimeUnverifiedReason})`,
+            );
         }
     }
 
@@ -734,7 +748,15 @@ async function runHealthChecks(options: {
         add(results, "info", "No other Pi extensions listed in settings.json");
     }
 
-    const staleCaches = findPiMagicContextCacheDirs(self, false);
+    const configuredEntry = packages.find(isPiMagicContextPackageEntry);
+    const configuredSpecifier = getPiMagicContextPackageSpecifier(configuredEntry);
+    const expectedPluginVersion =
+        pinnedVersionFromPackageSpecifier(configuredSpecifier) ?? latest ?? null;
+    const staleCaches = findPiMagicContextCacheDirs(
+        options.cwd,
+        expectedPluginVersion,
+        options.force === true,
+    );
     if (staleCaches.length > 0) {
         repairPlan.clearCachePaths = staleCaches.map((entry) => entry.path);
         add(
@@ -1010,6 +1032,7 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
         prompts,
         deps,
         configMigrationWarnings,
+        force: options.force,
     });
     console.log("");
     prompts.log.message(`Summary: PASS ${first.pass} / WARN ${first.warn} / FAIL ${first.fail}`);
@@ -1025,6 +1048,7 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
             prompts,
             deps,
             configMigrationWarnings,
+            force: false,
         });
         console.log("");
         prompts.log.message(

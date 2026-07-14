@@ -59,7 +59,9 @@ use mc_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest};
+use subc_client_rs::{
+    async_trait, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle,
+};
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use config::{ConfigCache, McModuleConfig};
@@ -135,10 +137,11 @@ pub const DEFAULT_MODULE_ID: &str = "magic-context";
 /// safety fold.
 /// Bumps when the shared project-memory render changes. Epoch 1 is the compact,
 /// category-grouped `#id: fact` format and applies to every serializer profile.
-pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 1;
+pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 2;
 /// Bumps when the shared compartment render changes. Epoch 1 replaces rendered
-/// `<compartment>` elements with markdown headings in m0 and m1.
-pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 1;
+/// `<compartment>` elements with markdown headings in m0 and m1; epoch 2 sanitizes
+/// historian-authored titles before placing them inside the session-history wrapper.
+pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
 /// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages.
@@ -207,6 +210,9 @@ const SESSION_UNRESOLVED_MESSAGE: &str =
     "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
 const SHADOW_SESSION_PREFIX: &str = mc_store::SHADOW_SESSION_PREFIX;
 const SHADOW_COMPARE_PREFIX_LIMIT: usize = 4096;
+const SHADOW_SEED_MAX_ID_BYTES: usize = 128;
+const SHADOW_SEED_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
+const SHADOW_SEED_MAX_PENDING: usize = 64;
 
 #[derive(Debug, Deserialize)]
 struct ShadowStateSyncWire {
@@ -214,6 +220,16 @@ struct ShadowStateSyncWire {
     session_id: Option<String>,
     shadow_generation: u64,
     expected_shadow_seq: u64,
+    #[serde(default)]
+    seed_id: Option<String>,
+    #[serde(default)]
+    seed_generation: Option<u64>,
+    #[serde(default)]
+    seed_batch_index: Option<usize>,
+    #[serde(default)]
+    seed_batch_total: Option<usize>,
+    #[serde(default)]
+    seed_complete: Option<bool>,
     #[serde(default)]
     seed_boundary_id: Option<String>,
     #[serde(default)]
@@ -238,6 +254,136 @@ struct ShadowResetWire {
     shadow_generation: Option<u64>,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingShadowSeed {
+    seed_id: String,
+    generation: u64,
+    expected_seq: u64,
+    total: usize,
+    next_index: usize,
+    digests: Vec<String>,
+    batches: Vec<ShadowStateSyncWire>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+enum ShadowSeedPhase {
+    Idle,
+    AwaitingSeed { generation: u64, expected_seq: u64 },
+    Collecting(PendingShadowSeed),
+    Applying { seed_id: String, bytes: usize },
+}
+
+#[derive(Debug)]
+struct CompletedShadowSeed {
+    seed_id: String,
+    final_digest: String,
+    generation: u64,
+    expected_seq: u64,
+    total: usize,
+    result: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ShadowSeedSession {
+    phase: ShadowSeedPhase,
+    completed: Option<CompletedShadowSeed>,
+}
+
+impl Default for ShadowSeedSession {
+    fn default() -> Self {
+        Self {
+            phase: ShadowSeedPhase::Idle,
+            completed: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ShadowSeedCoordinator {
+    sessions: HashMap<String, ShadowSeedSession>,
+    total_staged_bytes: usize,
+    pending_seed_count: usize,
+    max_staged_bytes: usize,
+    max_pending_seeds: usize,
+}
+
+impl Default for ShadowSeedCoordinator {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            total_staged_bytes: 0,
+            pending_seed_count: 0,
+            max_staged_bytes: SHADOW_SEED_MAX_STAGED_BYTES,
+            max_pending_seeds: SHADOW_SEED_MAX_PENDING,
+        }
+    }
+}
+
+impl ShadowSeedCoordinator {
+    fn phase_bytes(phase: &ShadowSeedPhase) -> usize {
+        match phase {
+            ShadowSeedPhase::Collecting(seed) => seed.bytes,
+            ShadowSeedPhase::Applying { bytes, .. } => *bytes,
+            ShadowSeedPhase::Idle | ShadowSeedPhase::AwaitingSeed { .. } => 0,
+        }
+    }
+
+    fn is_pending(phase: &ShadowSeedPhase) -> bool {
+        !matches!(phase, ShadowSeedPhase::Idle)
+    }
+
+    fn discard_pending(&mut self, session_id: &str) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        if Self::is_pending(&session.phase) {
+            self.pending_seed_count = self.pending_seed_count.saturating_sub(1);
+            self.total_staged_bytes = self
+                .total_staged_bytes
+                .saturating_sub(Self::phase_bytes(&session.phase));
+            session.phase = ShadowSeedPhase::Idle;
+        }
+    }
+
+    fn release_phase(&mut self, phase: &ShadowSeedPhase) {
+        if Self::is_pending(phase) {
+            self.pending_seed_count = self.pending_seed_count.saturating_sub(1);
+            self.total_staged_bytes = self
+                .total_staged_bytes
+                .saturating_sub(Self::phase_bytes(phase));
+        }
+    }
+
+    fn set_phase(&mut self, session_id: &str, phase: ShadowSeedPhase) {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .phase = phase;
+    }
+
+    fn evict(&mut self, session_id: &str) {
+        self.discard_pending(session_id);
+        self.sessions.remove(session_id);
+    }
+
+    fn arm_after_reset(&mut self, session_id: &str, generation: u64, expected_seq: u64) -> bool {
+        self.discard_pending(session_id);
+        let session = self.sessions.entry(session_id.to_string()).or_default();
+        session.completed = None;
+        if self.pending_seed_count >= self.max_pending_seeds {
+            session.phase = ShadowSeedPhase::Idle;
+            return false;
+        }
+        session.phase = ShadowSeedPhase::AwaitingSeed {
+            generation,
+            expected_seq,
+        };
+        self.pending_seed_count += 1;
+        true
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -470,6 +616,7 @@ struct ShadowReportInput {
 struct FacadeScope {
     memory_project_path: String,
     conversation_key: String,
+    memory_enabled: bool,
 }
 
 fn default_cache_ttl() -> String {
@@ -573,7 +720,7 @@ impl ShadowMemoryMutationWire {
 }
 
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
-/// and the per-route session bindings (channel → {project, session}).
+/// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
     store: OnceLock<Arc<McStore>>,
     producer_factory: Arc<dyn HistorianProducerFactory>,
@@ -595,9 +742,12 @@ pub struct McHandler {
     #[cfg(test)]
     between_transform_and_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Route channel → its session binding. Populated at `on_bind`, removed at
-    /// `on_route_gone`. A `Mutex<HashMap>` (not a lock-free map) because writes are
-    /// rare (once per route open/close) and reads are one cheap lookup per transform.
+    /// `on_route_gone`. The SDK validates the route handle's epoch before dispatching a
+    /// request, so a channel key cannot resolve a stale route. A `Mutex<HashMap>` (not a
+    /// lock-free map) is appropriate because writes are rare (once per route open/close)
+    /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
+    shadow_seeds: Mutex<ShadowSeedCoordinator>,
 }
 
 #[async_trait]
@@ -757,6 +907,7 @@ impl McHandler {
             #[cfg(test)]
             between_transform_and_prepare: Mutex::new(None),
             bindings: Mutex::new(HashMap::new()),
+            shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
         }
     }
 
@@ -807,6 +958,7 @@ impl McHandler {
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
             bindings: Mutex::new(HashMap::new()),
+            shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
         }
     }
 
@@ -814,19 +966,61 @@ impl McHandler {
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
     fn bind_route(&self, channel: u16, binding: SessionBinding) {
-        self.bindings
-            .lock()
-            .expect("bindings mutex")
-            .insert(channel, binding);
+        let replacement = {
+            let mut bindings = self.bindings.lock().expect("bindings mutex");
+            let previous = bindings.insert(channel, binding);
+            previous.and_then(|previous| {
+                let still_bound = bindings
+                    .values()
+                    .any(|candidate| candidate.session == previous.session);
+                (!still_bound).then_some(previous.session)
+            })
+        };
+        if let Some(session_id) = replacement {
+            self.shadow_seeds
+                .lock()
+                .expect("shadow seed mutex")
+                .evict(&session_id);
+        }
     }
 
-    /// Remove a route's binding (called from `on_route_gone`) so a reused channel can't
-    /// resolve a stale/wrong project, and the map doesn't leak entries.
-    fn unbind_route(&self, channel: u16) {
-        self.bindings
+    fn discard_shadow_seed(&self, session_id: &str) {
+        self.shadow_seeds
             .lock()
-            .expect("bindings mutex")
-            .remove(&channel);
+            .expect("shadow seed mutex")
+            .discard_pending(session_id);
+    }
+
+    fn shadow_seed_in_progress(&self, session_id: &str) -> bool {
+        self.shadow_seeds
+            .lock()
+            .expect("shadow seed mutex")
+            .sessions
+            .get(session_id)
+            .is_some_and(|state| ShadowSeedCoordinator::is_pending(&state.phase))
+    }
+
+    /// Remove a route and evict process-local session state after its final binding closes.
+    fn unbind_route(&self, channel: u16) {
+        let last_session_route = {
+            let mut bindings = self.bindings.lock().expect("bindings mutex");
+            bindings.remove(&channel).and_then(|binding| {
+                let still_bound = bindings
+                    .values()
+                    .any(|candidate| candidate.session == binding.session);
+                (!still_bound).then_some(binding.session)
+            })
+        };
+        if let Some(session) = last_session_route {
+            self.scheduler_observations
+                .lock()
+                .expect("scheduler observations mutex")
+                .remove(&session);
+            self.shadow_seeds
+                .lock()
+                .expect("shadow seed mutex")
+                .evict(&session);
+        }
     }
 
     /// Resolve the binding for a transform request on `channel`, FAIL-LOUD: the channel
@@ -1303,6 +1497,7 @@ impl McHandler {
                                 publication_floor_ordinal: range.to_ordinal,
                                 now_ms: now,
                                 failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
+                                completion_now_ms: now_ms,
                             },
                         )
                         .await
@@ -1670,7 +1865,8 @@ impl McHandler {
             live_guard,
         } = task;
         let _guard = live_guard;
-        let failure_backoff_at_ms = firing.failure_backoff_at_ms;
+        let failure_started_at_ms = firing.now_ms;
+        let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
         match factory.connect(&project_root).await {
             Ok(mut producer) => {
                 let request =
@@ -1678,6 +1874,11 @@ impl McHandler {
                 run_historian_firing(&mut *producer, request).await
             }
             Err(err) => {
+                let failure_backoff_at_ms = historian::completion_failure_backoff_at_ms(
+                    failure_started_at_ms,
+                    configured_failure_backoff_at_ms,
+                    now_ms(),
+                );
                 record_historian_connect_failure(
                     &store,
                     &session_id,
@@ -1784,12 +1985,65 @@ impl McHandler {
                 message: "ctx_reduce is not accepted on shadow:<real_session> routes".to_string(),
             };
         }
-        let drop_ids = drop_ids_from_command(&request);
-        if drop_ids.is_empty() {
+        let command_id = match command_id_from_agent_drops_request(&request) {
+            Ok(command_id) => command_id,
+            Err(message) => {
+                return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message,
+                }
+            }
+        };
+        let mut drop_ids = drop_ids_from_command(&request);
+        // Raw-string form ("1-3", "§1§,99"): canonicalize server-side with the same
+        // parser the MCP facade uses, so range/§ syntax is owned here and consumers
+        // (the thalamus response-tee) never re-implement it. Tag numbers that don't
+        // resolve to a known tag are skipped: the tee replays what the model said,
+        // and the model can name stale or foreign numbers.
+        if let Some(raw) = request.get("drop").and_then(Value::as_str) {
+            let numbers = match parse_tag_range_string(raw) {
+                Ok(numbers) => numbers,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "bad_request".to_string(),
+                        message: format!("invalid drop range syntax: {error}"),
+                    }
+                }
+            };
+            let tags = match store.load_tags_for_session(session_id) {
+                Ok(tags) => tags,
+                Err(e) => {
+                    return HandlerOutcome::Error {
+                        code: "store_write_failed".to_string(),
+                        message: e.to_string(),
+                    }
+                }
+            };
+            let by_number = tags
+                .iter()
+                .map(|row| (row.tag_number, &row.block_id))
+                .collect::<HashMap<_, _>>();
+            for number in numbers {
+                if let Some(block_id) = by_number.get(&(number as i64)) {
+                    drop_ids.push((*block_id).clone());
+                }
+            }
+            drop_ids.sort();
+            drop_ids.dedup();
+        }
+        if drop_ids.is_empty() && command_id.is_none() {
             return respond(json!({ "ok": true, "queued": 0 }));
         }
-        match store.append_pending_agent_drops(session_id, &drop_ids, now_ms()) {
-            Ok(queued) => respond(json!({ "ok": true, "queued": queued })),
+        match store.append_pending_agent_drops_with_command(
+            session_id,
+            command_id.as_deref(),
+            &drop_ids,
+            now_ms(),
+        ) {
+            Ok(outcome) if outcome.duplicate => {
+                respond(json!({ "ok": true, "queued": 0, "duplicate": true }))
+            }
+            Ok(outcome) => respond(json!({ "ok": true, "queued": outcome.queued })),
             Err(e) => HandlerOutcome::Error {
                 code: "store_write_failed".to_string(),
                 message: e.to_string(),
@@ -2033,6 +2287,7 @@ impl McHandler {
                 project_path: &project_path,
                 project_directory: &project_path,
                 history_budget_tokens: binding.history_budget_tokens,
+                memory_enabled: binding.config.memory_enabled,
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
                 smart_drops: binding.config.smart_drops,
@@ -2220,9 +2475,27 @@ impl McHandler {
     }
 
     fn handle_shadow_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
-        let parsed: ShadowStateSyncWire = match serde_json::from_value(request) {
+        const ENVELOPE_FIELDS: [&str; 5] = [
+            "seed_id",
+            "seed_generation",
+            "seed_batch_index",
+            "seed_batch_total",
+            "seed_complete",
+        ];
+        let envelope_fields_present = ENVELOPE_FIELDS
+            .iter()
+            .filter(|field| request.get(**field).is_some())
+            .count();
+        let parsed: ShadowStateSyncWire = match serde_json::from_value(request.clone()) {
             Ok(req) => req,
-            Err(e) => return invalid_params_error(e.to_string()),
+            Err(error) => {
+                if envelope_fields_present > 0 {
+                    if let Ok(binding) = self.shadow_binding(channel, None) {
+                        self.discard_shadow_seed(&binding.session);
+                    }
+                }
+                return invalid_params_error(error.to_string());
+            }
         };
         let binding = match self.shadow_binding(channel, parsed.session_id.as_deref()) {
             Ok(binding) => binding,
@@ -2232,6 +2505,412 @@ impl McHandler {
             Some(store) => Arc::clone(store),
             None => return store_unavailable_error(),
         };
+
+        if envelope_fields_present == 0 {
+            let awaiting_attempt = {
+                let seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+                match seeds
+                    .sessions
+                    .get(&binding.session)
+                    .map(|state| &state.phase)
+                {
+                    Some(ShadowSeedPhase::Collecting(_) | ShadowSeedPhase::Applying { .. }) => {
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_in_progress".to_string(),
+                            message: "a paged shadow seed is already in progress".to_string(),
+                        };
+                    }
+                    Some(ShadowSeedPhase::AwaitingSeed {
+                        generation,
+                        expected_seq,
+                    }) => Some((*generation, *expected_seq)),
+                    Some(ShadowSeedPhase::Idle) | None => None,
+                }
+            };
+            let outcome = self.apply_shadow_state_sync_wire(&binding, &store, parsed);
+            if let Some((generation, expected_seq)) = awaiting_attempt {
+                let mut seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+                let still_same_attempt =
+                    seeds.sessions.get(&binding.session).is_some_and(|state| {
+                        matches!(
+                            state.phase,
+                            ShadowSeedPhase::AwaitingSeed {
+                                generation: current_generation,
+                                expected_seq: current_seq,
+                            } if current_generation == generation && current_seq == expected_seq
+                        )
+                    });
+                if still_same_attempt {
+                    seeds.discard_pending(&binding.session);
+                }
+            }
+            return outcome;
+        }
+
+        if envelope_fields_present != ENVELOPE_FIELDS.len() {
+            self.discard_shadow_seed(&binding.session);
+            return invalid_params_error("seed envelope must be all-or-none");
+        }
+        let seed_id = parsed.seed_id.clone().unwrap_or_default();
+        let seed_generation = parsed.seed_generation.unwrap_or_default();
+        let batch_index = parsed.seed_batch_index.unwrap_or_default();
+        let batch_total = parsed.seed_batch_total.unwrap_or_default();
+        let seed_complete = parsed.seed_complete.unwrap_or(false);
+        if seed_id.is_empty() || seed_id.len() > SHADOW_SEED_MAX_ID_BYTES {
+            self.discard_shadow_seed(&binding.session);
+            return invalid_params_error(format!(
+                "seed_id must contain 1..={SHADOW_SEED_MAX_ID_BYTES} bytes"
+            ));
+        }
+        let digest = shadow_seed_content_digest(&request);
+        {
+            let seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+            if let Some(completed) = seeds
+                .sessions
+                .get(&binding.session)
+                .and_then(|state| state.completed.as_ref())
+                .filter(|completed| completed.seed_id == seed_id)
+            {
+                if completed.final_digest == digest {
+                    return HandlerOutcome::Response(completed.result.clone());
+                }
+                return HandlerOutcome::Error {
+                    code: "shadow_seed_digest_mismatch".to_string(),
+                    message: format!(
+                        "completed seed content changed (generation={}, seq={}, total={})",
+                        completed.generation, completed.expected_seq, completed.total
+                    ),
+                };
+            }
+        }
+        if parsed.shadow_generation != seed_generation {
+            self.discard_shadow_seed(&binding.session);
+            return HandlerOutcome::Error {
+                code: "shadow_seed_attempt_mismatch".to_string(),
+                message: "shadow_generation must match seed_generation".to_string(),
+            };
+        }
+        if batch_total == 0 || batch_index >= batch_total {
+            self.discard_shadow_seed(&binding.session);
+            return HandlerOutcome::Error {
+                code: "shadow_seed_protocol_mismatch".to_string(),
+                message: "seed batch index/total is invalid".to_string(),
+            };
+        }
+        if seed_complete != (batch_index + 1 == batch_total) {
+            self.discard_shadow_seed(&binding.session);
+            return HandlerOutcome::Error {
+                code: "shadow_seed_protocol_mismatch".to_string(),
+                message: "seed_complete disagrees with the final batch index".to_string(),
+            };
+        }
+        let scalar_tail_fields = [
+            "seed_boundary_id",
+            "workspace",
+            "last_todo_state",
+            "acked_watermarks",
+        ]
+        .iter()
+        .filter(|field| {
+            request
+                .as_object()
+                .is_some_and(|object| object.contains_key(**field))
+        })
+        .count();
+        if (!seed_complete && scalar_tail_fields != 0) || (seed_complete && scalar_tail_fields != 4)
+        {
+            self.discard_shadow_seed(&binding.session);
+            return HandlerOutcome::Error {
+                code: "shadow_seed_protocol_mismatch".to_string(),
+                message: "seed scalar tail must appear only and completely on the final batch"
+                    .to_string(),
+            };
+        }
+
+        let batch_bytes = match serde_json::to_vec(&request) {
+            Ok(bytes) => bytes.len(),
+            Err(error) => {
+                self.discard_shadow_seed(&binding.session);
+                return invalid_params_error(error.to_string());
+            }
+        };
+        // Batch zero is checked against durable metadata before the process-local state is
+        // touched. A stale retry therefore cannot evict or allocate another live attempt.
+        if batch_index == 0 {
+            let loaded = match store.load(&binding.session) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+            if loaded.meta.shadow_generation != seed_generation {
+                return HandlerOutcome::Error {
+                    code: "shadow_generation_mismatch".to_string(),
+                    message: format!(
+                        "seed_generation {seed_generation} did not match durable generation {}",
+                        loaded.meta.shadow_generation
+                    ),
+                };
+            }
+            if loaded.meta.shadow_seq != parsed.expected_shadow_seq {
+                return HandlerOutcome::Error {
+                    code: "shadow_seq_mismatch".to_string(),
+                    message: format!(
+                        "expected_shadow_seq {} did not match durable shadow_seq {}",
+                        parsed.expected_shadow_seq, loaded.meta.shadow_seq
+                    ),
+                };
+            }
+        }
+
+        enum StageAction {
+            Ack(usize),
+            Apply {
+                batches: Vec<ShadowStateSyncWire>,
+                seed_id: String,
+                final_digest: String,
+                generation: u64,
+                expected_seq: u64,
+                total: usize,
+            },
+        }
+
+        let action = {
+            let mut seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+            let phase = {
+                let state = seeds.sessions.entry(binding.session.clone()).or_default();
+                std::mem::replace(&mut state.phase, ShadowSeedPhase::Idle)
+            };
+            match phase {
+                ShadowSeedPhase::Idle => {
+                    seeds.set_phase(&binding.session, ShadowSeedPhase::Idle);
+                    return HandlerOutcome::Error {
+                        code: "shadow_seed_not_armed".to_string(),
+                        message: "paged shadow seeds require a committed shadow_reset".to_string(),
+                    };
+                }
+                applying @ ShadowSeedPhase::Applying { .. } => {
+                    seeds.set_phase(&binding.session, applying);
+                    return HandlerOutcome::Error {
+                        code: "shadow_seed_in_progress".to_string(),
+                        message: "the final shadow seed batch is being applied".to_string(),
+                    };
+                }
+                awaiting @ ShadowSeedPhase::AwaitingSeed {
+                    generation,
+                    expected_seq,
+                } => {
+                    if batch_index != 0
+                        || generation != seed_generation
+                        || expected_seq != parsed.expected_shadow_seq
+                    {
+                        seeds.release_phase(&awaiting);
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_attempt_mismatch".to_string(),
+                            message: "seed batch does not match the reset-armed attempt"
+                                .to_string(),
+                        };
+                    }
+                    if batch_bytes > seeds.max_staged_bytes
+                        || seeds
+                            .total_staged_bytes
+                            .checked_add(batch_bytes)
+                            .is_none_or(|bytes| bytes > seeds.max_staged_bytes)
+                    {
+                        seeds.release_phase(&awaiting);
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_buffer_overflow".to_string(),
+                            message: "shadow seed staging exceeded the handler-wide byte cap"
+                                .to_string(),
+                        };
+                    }
+                    seeds.total_staged_bytes += batch_bytes;
+                    if seed_complete {
+                        seeds.set_phase(
+                            &binding.session,
+                            ShadowSeedPhase::Applying {
+                                seed_id: seed_id.clone(),
+                                bytes: batch_bytes,
+                            },
+                        );
+                        StageAction::Apply {
+                            batches: vec![parsed],
+                            seed_id: seed_id.clone(),
+                            final_digest: digest,
+                            generation: seed_generation,
+                            expected_seq,
+                            total: batch_total,
+                        }
+                    } else {
+                        seeds.set_phase(
+                            &binding.session,
+                            ShadowSeedPhase::Collecting(PendingShadowSeed {
+                                seed_id: seed_id.clone(),
+                                generation: seed_generation,
+                                expected_seq,
+                                total: batch_total,
+                                next_index: 1,
+                                digests: vec![digest],
+                                batches: vec![parsed],
+                                bytes: batch_bytes,
+                            }),
+                        );
+                        StageAction::Ack(1)
+                    }
+                }
+                ShadowSeedPhase::Collecting(mut pending) => {
+                    if pending.seed_id != seed_id
+                        || pending.generation != seed_generation
+                        || pending.expected_seq != parsed.expected_shadow_seq
+                        || pending.total != batch_total
+                    {
+                        let discarded = ShadowSeedPhase::Collecting(pending);
+                        seeds.release_phase(&discarded);
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_attempt_mismatch".to_string(),
+                            message: "seed envelope changed during collection".to_string(),
+                        };
+                    }
+                    if batch_index < pending.next_index {
+                        let matches = pending
+                            .digests
+                            .get(batch_index)
+                            .is_some_and(|accepted| accepted == &digest);
+                        if matches {
+                            let next_index = pending.next_index;
+                            seeds.set_phase(&binding.session, ShadowSeedPhase::Collecting(pending));
+                            StageAction::Ack(next_index)
+                        } else {
+                            let discarded = ShadowSeedPhase::Collecting(pending);
+                            seeds.release_phase(&discarded);
+                            return HandlerOutcome::Error {
+                                code: "shadow_seed_digest_mismatch".to_string(),
+                                message: "redriven seed batch content changed".to_string(),
+                            };
+                        }
+                    } else if batch_index > pending.next_index {
+                        let discarded = ShadowSeedPhase::Collecting(pending);
+                        seeds.release_phase(&discarded);
+                        return HandlerOutcome::Error {
+                            code: "shadow_seed_order_mismatch".to_string(),
+                            message: "seed batches must arrive in strict index order".to_string(),
+                        };
+                    } else {
+                        let next_seed_bytes = pending.bytes.checked_add(batch_bytes);
+                        let next_total_bytes = seeds.total_staged_bytes.checked_add(batch_bytes);
+                        if next_seed_bytes.is_none_or(|bytes| bytes > seeds.max_staged_bytes)
+                            || next_total_bytes.is_none_or(|bytes| bytes > seeds.max_staged_bytes)
+                        {
+                            let discarded = ShadowSeedPhase::Collecting(pending);
+                            seeds.release_phase(&discarded);
+                            return HandlerOutcome::Error {
+                                code: "shadow_seed_buffer_overflow".to_string(),
+                                message: "shadow seed staging exceeded the handler-wide byte cap"
+                                    .to_string(),
+                            };
+                        }
+                        pending.bytes = next_seed_bytes.unwrap_or(usize::MAX);
+                        seeds.total_staged_bytes = next_total_bytes.unwrap_or(usize::MAX);
+                        pending.next_index += 1;
+                        pending.digests.push(digest.clone());
+                        pending.batches.push(parsed);
+                        if seed_complete {
+                            let bytes = pending.bytes;
+                            let batches = std::mem::take(&mut pending.batches);
+                            let generation = pending.generation;
+                            let expected_seq = pending.expected_seq;
+                            let total = pending.total;
+                            let completed_seed_id = pending.seed_id.clone();
+                            seeds.set_phase(
+                                &binding.session,
+                                ShadowSeedPhase::Applying {
+                                    seed_id: completed_seed_id.clone(),
+                                    bytes,
+                                },
+                            );
+                            StageAction::Apply {
+                                batches,
+                                seed_id: completed_seed_id,
+                                final_digest: digest,
+                                generation,
+                                expected_seq,
+                                total,
+                            }
+                        } else {
+                            let next_index = pending.next_index;
+                            seeds.set_phase(&binding.session, ShadowSeedPhase::Collecting(pending));
+                            StageAction::Ack(next_index)
+                        }
+                    }
+                }
+            }
+        };
+
+        match action {
+            StageAction::Ack(next_expected_index) => respond(json!({
+                "ok": true,
+                "staged": true,
+                "next_expected_index": next_expected_index,
+            })),
+            StageAction::Apply {
+                batches,
+                seed_id,
+                final_digest,
+                generation,
+                expected_seq,
+                total,
+            } => {
+                let assembled = assemble_shadow_seed(batches, generation, expected_seq);
+                let outcome = self.apply_shadow_state_sync_wire(&binding, &store, assembled);
+                let completed_result = match &outcome {
+                    HandlerOutcome::Response(bytes) => Some(bytes.clone()),
+                    HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
+                };
+                let mut seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
+                let phase = {
+                    let state = seeds.sessions.entry(binding.session.clone()).or_default();
+                    std::mem::replace(&mut state.phase, ShadowSeedPhase::Idle)
+                };
+                match phase {
+                    ShadowSeedPhase::Applying {
+                        seed_id: applying_seed_id,
+                        bytes,
+                    } if applying_seed_id == seed_id => {
+                        seeds.release_phase(&ShadowSeedPhase::Applying {
+                            seed_id: applying_seed_id,
+                            bytes,
+                        });
+                        if let Some(result) = completed_result {
+                            seeds
+                                .sessions
+                                .entry(binding.session.clone())
+                                .or_default()
+                                .completed = Some(CompletedShadowSeed {
+                                seed_id,
+                                final_digest,
+                                generation,
+                                expected_seq,
+                                total,
+                                result,
+                            });
+                        }
+                    }
+                    current => seeds.set_phase(&binding.session, current),
+                }
+                outcome
+            }
+        }
+    }
+
+    fn apply_shadow_state_sync_wire(
+        &self,
+        binding: &SessionBinding,
+        store: &McStore,
+        parsed: ShadowStateSyncWire,
+    ) -> HandlerOutcome {
         let compartments: Vec<StoredCompartment> = parsed
             .compartments
             .into_iter()
@@ -2328,9 +3007,9 @@ impl McHandler {
                     message: format!("seed boundary {declared:?} rejected: {detail}"),
                 }
             }
-            Err(e) => HandlerOutcome::Error {
+            Err(error) => HandlerOutcome::Error {
                 code: "shadow_state_sync_failed".to_string(),
-                message: e.to_string(),
+                message: error.to_string(),
             },
         }
     }
@@ -2338,7 +3017,7 @@ impl McHandler {
     fn handle_shadow_reset_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         let parsed: ShadowResetWire = match serde_json::from_value(request) {
             Ok(req) => req,
-            Err(e) => return invalid_params_error(e.to_string()),
+            Err(error) => return invalid_params_error(error.to_string()),
         };
         let binding = match self.shadow_binding(channel, parsed.session_id.as_deref()) {
             Ok(binding) => binding,
@@ -2349,17 +3028,34 @@ impl McHandler {
             None => return store_unavailable_error(),
         };
         match store.reset_shadow_session(&binding.session, &shadow_project_path(&binding.session)) {
-            Ok(result) => respond(json!({
-                "ok": true,
-                "shadow_generation": result.shadow_generation,
-                "shadow_seq": result.shadow_seq,
-                "row_version": result.row_version,
-                "previous_shadow_generation": parsed.shadow_generation,
-                "reason": parsed.reason,
-            })),
-            Err(e) => HandlerOutcome::Error {
+            Ok(result) => {
+                let armed = self
+                    .shadow_seeds
+                    .lock()
+                    .expect("shadow seed mutex")
+                    .arm_after_reset(
+                        &binding.session,
+                        result.shadow_generation,
+                        result.shadow_seq,
+                    );
+                if !armed {
+                    return HandlerOutcome::Error {
+                        code: "shadow_seed_buffer_overflow".to_string(),
+                        message: "too many shadow seed attempts are already pending".to_string(),
+                    };
+                }
+                respond(json!({
+                    "ok": true,
+                    "shadow_generation": result.shadow_generation,
+                    "shadow_seq": result.shadow_seq,
+                    "row_version": result.row_version,
+                    "previous_shadow_generation": parsed.shadow_generation,
+                    "reason": parsed.reason,
+                }))
+            }
+            Err(error) => HandlerOutcome::Error {
                 code: "shadow_reset_failed".to_string(),
-                message: e.to_string(),
+                message: error.to_string(),
             },
         }
     }
@@ -2373,6 +3069,13 @@ impl McHandler {
             Ok(binding) => binding,
             Err(outcome) => return outcome,
         };
+        if self.shadow_seed_in_progress(&binding.session) {
+            return HandlerOutcome::Error {
+                code: "shadow_seed_in_progress".to_string(),
+                message: "shadow_transform is blocked until the seed commits or is discarded"
+                    .to_string(),
+            };
+        }
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
             None => return store_unavailable_error(),
@@ -2474,6 +3177,7 @@ impl McHandler {
                 .pass_inputs
                 .history_budget_tokens
                 .unwrap_or(binding.history_budget_tokens),
+            memory_enabled: binding.config.memory_enabled,
             now_ms: parsed.pass_inputs.now_ms,
             execute_threshold_percentage: parsed.pass_inputs.effective_execute_threshold,
             smart_drops: binding.config.smart_drops,
@@ -2623,6 +3327,7 @@ impl McHandler {
             Ok(Some(resolved)) => Ok(FacadeScope {
                 memory_project_path: binding.project_root.to_string_lossy().to_string(),
                 conversation_key: resolved.session_id,
+                memory_enabled: binding.config.memory_enabled,
             }),
             Ok(None) => Err(session_unresolved_error()),
             Err(SessionResolveError::Timeout) => Err(HandlerOutcome::Error {
@@ -2721,10 +3426,19 @@ impl McHandler {
         let Some(action) = string_arg(args, "action") else {
             return invalid_params_error("ctx_memory requires an action");
         };
+        if let Err(error) = validate_memory_id_arguments(args)
+            .and_then(|_| validate_string_cap(args, "content", MAX_MEMORY_CONTENT_BYTES))
+            .and_then(|_| validate_string_cap(args, "reason", MAX_SHORT_FIELD_BYTES))
+        {
+            return tool_error_result(format!("Error: {error}."));
+        }
         let facade_scope = match self.resolve_facade_scope(channel).await {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
+        if !facade_scope.memory_enabled {
+            return tool_error_result("Error: memory is disabled for this project.".to_string());
+        }
         let store = match self.store.get() {
             Some(store) => store,
             None => return store_unavailable_error(),
@@ -2738,6 +3452,12 @@ impl McHandler {
                         "Error: 'category' is required when action is 'write'.",
                     );
                 };
+                if !MEMORY_CATEGORIES.contains(&category) {
+                    return tool_error_result(format!(
+                        "Error: category must be one of {}.",
+                        MEMORY_CATEGORIES.join(", ")
+                    ));
+                }
                 let Some(content) = non_empty_string_arg(args, "content") else {
                     return tool_error_result(
                         "Error: 'content' is required when action is 'write'.",
@@ -2790,14 +3510,16 @@ impl McHandler {
                     );
                 }
                 let reason = string_arg(args, "reason");
-                let mut archived = Vec::new();
-                for id in ids {
-                    match memory_tool::archive_memory(store, memory_project, id, reason, now_ms()) {
-                        Ok(true) => archived.push(id),
-                        Ok(false) => {}
-                        Err(error) => return tool_error_result(format!("Error: {error}")),
-                    }
-                }
+                let archived = match memory_tool::archive_memories(
+                    store,
+                    memory_project,
+                    &ids,
+                    reason,
+                    now_ms(),
+                ) {
+                    Ok(archived) => archived,
+                    Err(error) => return tool_error_result(format!("Error: {error}")),
+                };
                 if archived.is_empty() {
                     mcp_text_result("No active memories needed archiving.".to_string(), false)
                 } else {
@@ -2849,6 +3571,9 @@ impl McHandler {
         let Some(query) = non_empty_string_arg(args, "query") else {
             return tool_error_result("Error: 'query' is required for ctx_search.");
         };
+        if let Err(error) = validate_string_cap(args, "query", MAX_QUERY_BYTES) {
+            return tool_error_result(format!("Error: {error}."));
+        }
         let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
         let facade_scope = match self.resolve_facade_scope(channel).await {
             Ok(scope) => scope,
@@ -2866,6 +3591,7 @@ impl McHandler {
             conversation_key,
             query,
             limit,
+            facade_scope.memory_enabled,
         ) {
             Ok(results) => {
                 let rendered = results
@@ -2952,6 +3678,16 @@ impl McHandler {
         let Some(args) = facade_arguments(request) else {
             return invalid_params_error("ctx_note arguments must be an object");
         };
+        if let Err(error) = validate_string_cap(args, "content", MAX_NOTE_CONTENT_BYTES)
+            .and_then(|_| validate_string_cap(args, "surface_condition", MAX_SHORT_FIELD_BYTES))
+        {
+            return tool_error_result(format!("Error: {error}."));
+        }
+        if args.get("surface_condition").is_some() {
+            return tool_error_result(
+                "Error: smart notes are not supported on this surface.".to_string(),
+            );
+        }
         let facade_scope = match self.resolve_facade_scope(channel).await {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
@@ -2999,8 +3735,11 @@ impl McHandler {
             "read" => {
                 let limit = usize_arg(args, "limit").unwrap_or(25).clamp(1, 100);
                 let offset = usize_arg(args, "offset").unwrap_or(0);
+                if i64::try_from(offset).is_err() {
+                    return tool_error_result("Error: 'offset' is too large.".to_string());
+                }
                 match store.read_notes(project, session, limit, offset) {
-                    Ok(notes) => mcp_text_result(render_notes(notes, offset), false),
+                    Ok(notes) => mcp_text_result(render_notes(notes, offset, limit), false),
                     Err(error) => tool_error_result(format!("Error: {error}")),
                 }
             }
@@ -3086,7 +3825,7 @@ impl ModuleHandler for McHandler {
     async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
         let config = self.effective_config(&req.identity.project_root);
         self.bind_route(
-            req.route_channel,
+            req.handle.channel,
             SessionBinding {
                 project_root: req.identity.project_root.clone(),
                 harness: req.identity.harness.clone(),
@@ -3104,31 +3843,17 @@ impl ModuleHandler for McHandler {
 
     /// Drop the route's binding on teardown so a reused channel can't resolve a stale
     /// project and the map doesn't leak.
-    async fn on_route_gone(&self, channel: u16) {
-        let gone_session = {
-            let bindings = self.bindings.lock().expect("bindings mutex");
-            bindings.get(&channel).map(|b| b.session.clone())
-        };
-        self.unbind_route(channel);
-        // Evict the scheduler observation when the session's LAST route closes —
-        // the map is otherwise unbounded across a long-lived daemon's session churn.
-        if let Some(session) = gone_session {
-            let still_bound = {
-                let bindings = self.bindings.lock().expect("bindings mutex");
-                bindings.values().any(|b| b.session == session)
-            };
-            if !still_bound {
-                self.scheduler_observations
-                    .lock()
-                    .expect("scheduler observations mutex")
-                    .remove(&session);
-            }
-        }
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        self.unbind_route(handle.channel);
     }
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        if body.len() > MAX_FACADE_FRAME_BYTES {
+            return invalid_params_error("request body exceeds the 1 MiB limit");
+        }
         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-        self.dispatch_value(ctx.channel(), request).await
+        self.dispatch_value(ctx.route_handle().channel, request)
+            .await
     }
 }
 
@@ -3256,6 +3981,60 @@ fn guidance_bytes_for(text: &str, date_line: &str) -> String {
     format!("{text}\n{date_line}")
 }
 
+fn shadow_seed_content_digest(request: &Value) -> String {
+    let mut content = request.clone();
+    if let Some(object) = content.as_object_mut() {
+        for field in [
+            "shadow_generation",
+            "seed_id",
+            "seed_generation",
+            "expected_shadow_seq",
+            "seed_batch_index",
+            "seed_batch_total",
+            "seed_complete",
+        ] {
+            object.remove(field);
+        }
+    }
+    sha256_hex(canonical_value(&content).as_bytes())
+}
+
+fn assemble_shadow_seed(
+    mut batches: Vec<ShadowStateSyncWire>,
+    generation: u64,
+    expected_seq: u64,
+) -> ShadowStateSyncWire {
+    let mut final_batch = batches.pop().expect("final seed batch");
+    let mut compartments = Vec::new();
+    let mut memories = Vec::new();
+    let mut memory_mutations = Vec::new();
+    for mut batch in batches {
+        compartments.append(&mut batch.compartments);
+        memories.append(&mut batch.memories);
+        memory_mutations.append(&mut batch.memory_mutations);
+    }
+    compartments.append(&mut final_batch.compartments);
+    memories.append(&mut final_batch.memories);
+    memory_mutations.append(&mut final_batch.memory_mutations);
+    ShadowStateSyncWire {
+        session_id: final_batch.session_id,
+        shadow_generation: generation,
+        expected_shadow_seq: expected_seq,
+        seed_id: None,
+        seed_generation: None,
+        seed_batch_index: None,
+        seed_batch_total: None,
+        seed_complete: None,
+        seed_boundary_id: final_batch.seed_boundary_id,
+        compartments,
+        memories,
+        memory_mutations,
+        workspace: final_batch.workspace,
+        last_todo_state: final_batch.last_todo_state,
+        acked_watermarks: final_batch.acked_watermarks,
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
@@ -3293,6 +4072,70 @@ fn store_unavailable_error() -> HandlerOutcome {
     }
 }
 
+const MAX_FACADE_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_AGENT_DROPS_COMMAND_ID_BYTES: usize = 128;
+const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_NOTE_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_SHORT_FIELD_BYTES: usize = 4 * 1024;
+const MAX_QUERY_BYTES: usize = 1024;
+const MAX_MEMORY_IDS: usize = 100;
+const CTX_EXPAND_BYTE_BUDGET: usize = 15_000 * 4;
+/// Accepted write categories — the canonical V2 taxonomy, single-sourced from the
+/// renderer's category order so the facade and the render path never disagree.
+use crate::memory_render::MEMORY_CATEGORY_ORDER as MEMORY_CATEGORIES;
+
+fn validate_string_cap(
+    args: &Map<String, Value>,
+    key: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    if let Some(value) = args.get(key).and_then(Value::as_str) {
+        if value.len() > max_bytes {
+            return Err(format!("'{key}' exceeds the {max_bytes}-byte limit"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_memory_id_arguments(args: &Map<String, Value>) -> Result<(), String> {
+    for key in ["id", "target_id"] {
+        if let Some(value) = args.get(key) {
+            if value.as_i64().is_none_or(|id| id <= 0) {
+                return Err(format!("'{key}' must be a positive 64-bit integer"));
+            }
+        }
+    }
+    for key in ["ids", "source_ids"] {
+        if let Some(value) = args.get(key) {
+            let Some(values) = value.as_array() else {
+                return Err(format!(
+                    "'{key}' must be an array of positive 64-bit integers"
+                ));
+            };
+            if values.len() > MAX_MEMORY_IDS {
+                return Err(format!("'{key}' exceeds the {MAX_MEMORY_IDS}-item limit"));
+            }
+            if values
+                .iter()
+                .any(|value| value.as_i64().is_none_or(|id| id <= 0))
+            {
+                return Err(format!(
+                    "'{key}' must contain only positive 64-bit integers"
+                ));
+            }
+        }
+    }
+    if let (Some(target), Some(sources)) = (
+        args.get("target_id").and_then(Value::as_i64),
+        args.get("source_ids").and_then(Value::as_array),
+    ) {
+        if sources.iter().any(|source| source.as_i64() == Some(target)) {
+            return Err("merge target must not appear in source_ids".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn facade_arguments(request: &Value) -> Option<&Map<String, Value>> {
     request.get("arguments")?.as_object()
 }
@@ -3317,6 +4160,19 @@ fn usize_arg(args: &Map<String, Value>, key: &str) -> Option<usize> {
         .and_then(|value| usize::try_from(value).ok())
 }
 
+fn truncate_expand_output(mut output: String) -> String {
+    if output.len() <= CTX_EXPAND_BYTE_BUDGET {
+        return output;
+    }
+    let mut boundary = CTX_EXPAND_BYTE_BUDGET;
+    while !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.truncate(boundary);
+    output.push_str("\n\n[truncated at the ~15,000-token ctx_expand budget]");
+    output
+}
+
 fn render_message_expand(row: StoredChunkTranscript, message: i64) -> String {
     let mut lines = vec![
         format!(
@@ -3333,7 +4189,7 @@ fn render_message_expand(row: StoredChunkTranscript, message: i64) -> String {
     lines.push(row.transcript.unwrap_or_else(|| {
         "[no longer recoverable: transcript bytes could not be decompressed]".to_string()
     }));
-    lines.join("\n")
+    truncate_expand_output(lines.join("\n"))
 }
 
 fn render_range_expand(
@@ -3374,10 +4230,10 @@ fn render_range_expand(
             ),
         }
     }
-    lines.join("\n")
+    truncate_expand_output(lines.join("\n"))
 }
 
-fn render_notes(notes: Vec<StoredNote>, offset: usize) -> String {
+fn render_notes(notes: Vec<StoredNote>, offset: usize, limit: usize) -> String {
     if notes.is_empty() {
         return "## Notes\n\nNo active session notes.".to_string();
     }
@@ -3400,25 +4256,27 @@ fn render_notes(notes: Vec<StoredNote>, offset: usize) -> String {
             note.id, note.content, anchor, condition
         ));
     }
-    if notes.len() == 25 {
-        lines.push(String::new());
-        lines.push(format!(
-            "Showing {} notes (newest first). For older notes: ctx_note(action=\"read\", offset={}).",
-            notes.len(),
-            offset + notes.len()
-        ));
+    if notes.len() == limit {
+        if let Some(next_offset) = offset.checked_add(notes.len()) {
+            lines.push(String::new());
+            lines.push(format!(
+                "Showing {} notes (newest first). For older notes: ctx_note(action=\"read\", offset={next_offset}).",
+                notes.len()
+            ));
+        }
     }
     lines.push(String::new());
     lines.push("To dismiss a stale note: ctx_note(action=\"dismiss\", note_id=N)".to_string());
     lines.join("\n")
 }
 
+// The facade never panics on agent input; an absent or malformed id stays a typed tool error.
 fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
     if let Some(id) = i64_arg(args, "id") {
         return Some(id);
     }
     let ids = memory_ids(args, action);
-    (ids.len() == 1).then_some(ids[0])
+    ids.first().copied().filter(|_| ids.len() == 1)
 }
 
 fn memory_ids(args: &Map<String, Value>, _action: &str) -> Vec<i64> {
@@ -3459,13 +4317,8 @@ fn merge_ids(args: &Map<String, Value>) -> Option<(i64, Vec<i64>)> {
 }
 
 fn dedup_i64s(ids: Vec<i64>) -> Vec<i64> {
-    let mut deduped = Vec::new();
-    for id in ids {
-        if !deduped.contains(&id) {
-            deduped.push(id);
-        }
-    }
-    deduped
+    let mut seen = HashSet::with_capacity(ids.len());
+    ids.into_iter().filter(|id| seen.insert(*id)).collect()
 }
 
 fn join_i64s(ids: &[i64]) -> String {
@@ -3511,7 +4364,12 @@ fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
                     "Invalid range \"{part}\": start ({start}) must be <= end ({end})"
                 ));
             }
-            let range_size = end - start + 1;
+            // Endpoints are positive and i64-bounded, but keep the size calculation
+            // checked so malformed facade input can never wrap before the allocation guard.
+            let range_size = end
+                .checked_sub(start)
+                .and_then(|difference| difference.checked_add(1))
+                .ok_or_else(|| format!("Invalid range \"{part}\": size overflow"))?;
             if range_size > MAX_RANGE_ELEMENTS {
                 return Err(format!(
                     "Range \"{part}\" exceeds maximum size of {MAX_RANGE_ELEMENTS} elements (got {range_size})"
@@ -3537,8 +4395,16 @@ fn parse_tag_integer(raw: &str) -> Result<u64, String> {
     if raw.is_empty() || !raw.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(format!("Invalid integer: \"{raw}\""));
     }
-    raw.parse::<u64>()
-        .map_err(|_| format!("Invalid integer: \"{raw}\""))
+    let value = raw
+        .parse::<u64>()
+        .map_err(|_| format!("Invalid integer: \"{raw}\""))?;
+    if value == 0 || value > i64::MAX as u64 {
+        return Err(format!(
+            "Invalid integer: \"{raw}\" (tag numbers must be between 1 and {})",
+            i64::MAX
+        ));
+    }
+    Ok(value)
 }
 
 fn format_tag_numbers(ids: &[i64]) -> String {
@@ -3620,6 +4486,25 @@ fn drop_ids_from_command(request: &Value) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+fn command_id_from_agent_drops_request(request: &Value) -> Result<Option<String>, String> {
+    let Some(value) = request.get("command_id") else {
+        return Ok(None);
+    };
+    let Some(command_id) = value.as_str() else {
+        return Err("'command_id' must be a string".to_string());
+    };
+    let command_id = command_id.trim();
+    if command_id.is_empty() {
+        return Err("'command_id' must not be empty".to_string());
+    }
+    if command_id.len() > MAX_AGENT_DROPS_COMMAND_ID_BYTES {
+        return Err(format!(
+            "'command_id' exceeds the {MAX_AGENT_DROPS_COMMAND_ID_BYTES}-byte limit"
+        ));
+    }
+    Ok(Some(command_id.to_string()))
 }
 
 fn is_shadow_session(session_id: &str) -> bool {
@@ -4351,10 +5236,11 @@ fn ctx_memory_schema() -> Value {
             },
             "category": {
                 "type": "string",
-                "description": "Memory category for a new memory, such as ARCHITECTURE, CONSTRAINTS, DECISIONS, PREFERENCES, or WORKFLOW. Required for write."
+                "description": "Memory category for a new memory: one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, or NAMING. Required for write."
             },
             "content": {
                 "type": "string",
+                "maxLength": 65536,
                 "description": "Standalone memory text. Required for write, update, and merge."
             },
             "id": {
@@ -4364,6 +5250,7 @@ fn ctx_memory_schema() -> Value {
             },
             "ids": {
                 "type": "array",
+                "maxItems": 100,
                 "items": { "type": "integer", "minimum": 1 },
                 "description": "Memory ids. For update provide exactly one. For archive provide one or more. For merge, the first id is kept and updated, and the remaining ids are superseded."
             },
@@ -4374,11 +5261,13 @@ fn ctx_memory_schema() -> Value {
             },
             "source_ids": {
                 "type": "array",
+                "maxItems": 100,
                 "items": { "type": "integer", "minimum": 1 },
                 "description": "Merge form: memory ids to supersede into target_id."
             },
             "reason": {
                 "type": "string",
+                "maxLength": 4096,
                 "description": "Optional short reason for archive."
             }
         },
@@ -4393,6 +5282,7 @@ fn ctx_search_schema() -> Value {
         "properties": {
             "query": {
                 "type": "string",
+                "maxLength": 1024,
                 "description": "Literal keyword or phrase to find in memories and summarized history."
             },
             "limit": {
@@ -4425,11 +5315,11 @@ fn ctx_note_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "action": { "type": "string", "enum": ["write", "read", "update", "dismiss"], "description": "Operation to perform. Defaults to write when content is provided, otherwise read." },
-            "content": { "type": "string", "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
+            "content": { "type": "string", "maxLength": 65536, "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
             "note_id": { "type": "integer", "minimum": 1, "description": "Note id for update or dismiss." },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Maximum active notes to return." },
             "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes." },
-            "surface_condition": { "type": "string", "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." }
+            "surface_condition": { "type": "string", "maxLength": 4096, "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." }
         }
     })
 }
@@ -4522,6 +5412,7 @@ mod tests {
     use mc_core::CoreState;
     use mc_store::{
         HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, StoredCompartment,
+        TagMintInput,
     };
     use tokio::sync::Notify;
 
@@ -4554,7 +5445,7 @@ mod tests {
 
     #[test]
     fn profile_render_epoch_is_profile_specific_and_zero_for_unchanged_profiles() {
-        assert_eq!(MEMORY_RENDER_FORMAT_EPOCH, 1);
+        assert_eq!(MEMORY_RENDER_FORMAT_EPOCH, 2);
         assert_eq!(
             profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic),
             PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
@@ -5506,8 +6397,14 @@ mod tests {
         assert_eq!(status["row_version"], Value::Null);
         assert_eq!(status["historian"]["last_no_fire"], Value::Null);
         assert_eq!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 1);
-        assert_eq!(status["epochs"]["memory_render_epoch"], json!(1));
-        assert_eq!(status["epochs"]["compartment_render_epoch"], json!(1));
+        assert_eq!(
+            status["epochs"]["memory_render_epoch"],
+            json!(MEMORY_RENDER_FORMAT_EPOCH)
+        );
+        assert_eq!(
+            status["epochs"]["compartment_render_epoch"],
+            json!(COMPARTMENT_RENDER_FORMAT_EPOCH)
+        );
         assert_eq!(status["epochs"]["profile_epoch"], json!(1));
         assert_eq!(
             status["epochs"]["tagger_epoch"],
@@ -5696,7 +6593,16 @@ mod tests {
             )
             .await,
         );
-        assert!(write.contains("Surface condition recorded"));
+        assert!(write.contains("smart notes are not supported"));
+        let write = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "write", "content": "remember the lattice"}),
+            )
+            .await,
+        );
+        assert!(write.contains("Saved session note"));
         let read = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
         assert!(read.contains("remember the lattice"));
         let hits =
@@ -6065,6 +6971,14 @@ mod tests {
         assert_eq!(error_code(reduce), "tagging_inactive");
     }
 
+    #[test]
+    fn ctx_reduce_range_parser_rejects_unbounded_and_oversized_ranges() {
+        assert!(parse_tag_range_string("0-18446744073709551615").is_err());
+        assert!(parse_tag_range_string("5-3").is_err());
+        assert_eq!(parse_tag_range_string("3-5,8").unwrap(), vec![3, 4, 5, 8]);
+        assert!(parse_tag_range_string("1-1001").is_err());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn facade_ctx_reduce_parses_ranges_resolves_tags_and_dedups_queue() {
         crate::healing::set_tagging_enabled_for_tests(Some(true));
@@ -6105,6 +7019,21 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Invalid range syntax"));
+
+        let unbounded = tool_body(
+            call_facade_on_channel(
+                &handler,
+                8,
+                "ctx_reduce",
+                json!({ "drop": "0-18446744073709551615" }),
+            )
+            .await,
+        );
+        assert_eq!(unbounded["isError"], json!(true));
+        assert!(unbounded["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid range syntax"));
         crate::healing::set_tagging_enabled_for_tests(None);
     }
 
@@ -6131,6 +7060,88 @@ mod tests {
         assert_eq!(error_code(rejected), "reduce_unavailable_for_profile");
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
         crate::healing::set_tagging_enabled_for_tests(None);
+    }
+
+    #[test]
+    fn expand_output_is_bounded_to_the_typescript_token_budget() {
+        let output = truncate_expand_output("x".repeat(CTX_EXPAND_BYTE_BUDGET * 2));
+        assert!(output.len() <= CTX_EXPAND_BYTE_BUDGET + 64);
+        assert!(output.contains("~15,000-token ctx_expand budget"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_never_panics_on_malformed_memory_arguments() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[(
+            "token",
+            FakeResolve::Hit("opaque-own-conversation".to_string()),
+        )]);
+        let (handler, _store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/repo", "token"));
+
+        let malformed = [
+            json!({ "action": "update", "content": "edited" }),
+            json!({ "action": "update", "ids": [], "content": "edited" }),
+            json!({ "action": "update", "ids": ["x"], "content": "edited" }),
+            json!({ "action": "update", "id": -1, "content": "edited" }),
+            json!({ "action": "update", "id": u64::MAX, "content": "edited" }),
+            json!({ "action": "archive" }),
+            json!({ "action": "archive", "ids": [] }),
+            json!({ "action": "archive", "ids": ["x"] }),
+            json!({ "action": "archive", "id": -1 }),
+            json!({ "action": "archive", "id": u64::MAX }),
+            json!({ "action": "merge", "content": "merged" }),
+            json!({ "action": "merge", "ids": [], "content": "merged" }),
+            json!({ "action": "merge", "ids": ["x"], "content": "merged" }),
+            json!({ "action": "merge", "ids": [-1, -2], "content": "merged" }),
+            json!({ "action": "merge", "ids": [u64::MAX, 1], "content": "merged" }),
+        ];
+
+        for arguments in malformed {
+            let outcome = call_facade(&handler, "ctx_memory", arguments.clone()).await;
+            assert!(
+                tool_is_error(outcome),
+                "malformed arguments must return a typed tool error: {arguments}"
+            );
+        }
+        let oversized = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "x".repeat(MAX_MEMORY_CONTENT_BYTES + 1),
+            }),
+        )
+        .await;
+        assert!(tool_is_error(oversized));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_disabled_rejects_mutation_and_excludes_memory_search() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
+        let mut config = default_test_config();
+        config.memory_enabled = false;
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, config, resolver);
+        let mut disabled_binding = binding("/repo", "token");
+        disabled_binding.config.memory_enabled = false;
+        handler.bind_route(7, disabled_binding);
+        insert_memory(&store, "/repo", "CONSTRAINTS", "hidden needle", 1);
+
+        assert!(tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({"action": "write", "category": "CONSTRAINTS", "content": "blocked"}),
+            )
+            .await
+        ));
+        let results =
+            tool_json_array(call_facade(&handler, "ctx_search", json!({"query": "needle"})).await);
+        assert!(results.iter().all(|result| result["source"] != "memory"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6185,7 +7196,7 @@ mod tests {
         let shared_target = insert_memory(&store, foreign, "CONSTRAINTS", "shared target", 1);
         let shared_source = insert_memory(&store, foreign, "CONSTRAINTS", "shared source", 1);
 
-        assert!(!tool_is_error(
+        assert!(tool_is_error(
             call_facade(
                 &handler,
                 "ctx_memory",
@@ -6193,7 +7204,7 @@ mod tests {
             )
             .await
         ));
-        assert!(!tool_is_error(
+        assert!(tool_is_error(
             call_facade(
                 &handler,
                 "ctx_memory",
@@ -6201,7 +7212,7 @@ mod tests {
             )
             .await
         ));
-        assert!(!tool_is_error(
+        assert!(tool_is_error(
             call_facade(
                 &handler,
                 "ctx_memory",
@@ -6215,7 +7226,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .superseded_by_memory_id,
-            Some(shared_target)
+            None
         );
 
         let cross_target = insert_memory(&store, own, "CONSTRAINTS", "constraint", 1);
@@ -6421,6 +7432,21 @@ mod tests {
         }
     }
 
+    fn queue_drop_command_with_id(handler: &McHandler, target_id: &str, command_id: &str) -> Value {
+        match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "kind": "ctx_reduce",
+                "session_id": "ses",
+                "drop_ids": [target_id],
+                "command_id": command_id,
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        }
+    }
+
     fn historian_output_for_prompt(prompt: &str) -> String {
         let (start, end) = prompt_ordinal_range(prompt).unwrap_or((1, 3));
         historian_output(start, end, "autonomous summary")
@@ -6595,12 +7621,38 @@ mod tests {
         assert!(m0_text(&second).contains("autonomous summary"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn ctx_reduce_command_appends_and_transform_drains_queue() {
+    #[test]
+    fn ctx_reduce_without_command_id_keeps_drop_ids_response() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
-        let queued = queue_drop_command(&handler, "a#0");
-        assert_eq!(queued["queued"].as_u64(), Some(1));
+
+        let first = queue_drop_command(&handler, "a#0");
+        assert_eq!(first, json!({ "ok": true, "queued": 1 }));
+        let repeat = queue_drop_command(&handler, "a#0");
+        assert_eq!(repeat, json!({ "ok": true, "queued": 0 }));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ctx_reduce_command_id_is_idempotent_while_drops_are_pending() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let first = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        assert_eq!(first, json!({ "ok": true, "queued": 1 }));
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+
+        let retry = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_command_id_survives_transform_drain() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let queued = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        assert_eq!(queued, json!({ "ok": true, "queued": 1 }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
 
         let response = call_transform(&handler, vec![ck("a", 1, "drop me")]).await;
@@ -6608,6 +7660,152 @@ mod tests {
             .unwrap()
             .contains("[dropped]"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        let retry = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        let new_request = queue_drop_command_with_id(&handler, "a#0", "tool-use-2");
+        assert_eq!(new_request, json!({ "ok": true, "queued": 1 }));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ctx_reduce_command_rejects_empty_and_oversized_command_ids() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        for command_id in [json!(""), json!(" \t "), json!("x".repeat(129))] {
+            let outcome = handler.handle_agent_drops_value(
+                7,
+                json!({
+                    "method": "agent_drops.append",
+                    "session_id": "ses",
+                    "drop_ids": ["a#0"],
+                    "command_id": command_id,
+                }),
+            );
+            assert_eq!(error_code(outcome), "bad_request");
+        }
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_command_raw_drop_string_canonicalizes_server_side() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .mint_or_get_tags(
+                "ses",
+                &[
+                    TagMintInput {
+                        block_id: "a#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 10,
+                        source_bytes: b"one".to_vec(),
+                    },
+                    TagMintInput {
+                        block_id: "b#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 10,
+                        source_bytes: b"two".to_vec(),
+                    },
+                ],
+                1_000,
+            )
+            .unwrap();
+
+        // Range syntax plus an unknown tag number: known tags queue, the unknown
+        // number is skipped (the tee replays whatever the model said).
+        let response = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "§1§-2, 99",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(response, json!({ "ok": true, "queued": 2 }));
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+        assert_eq!(pending.len(), 2);
+
+        // Re-sending the same raw string is idempotent (structural INSERT OR IGNORE).
+        let repeat = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1-2",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(repeat, json!({ "ok": true, "queued": 0 }));
+
+        // Malformed range syntax is a typed bad_request, nothing partially queued.
+        match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "3-1",
+            }),
+        ) {
+            HandlerOutcome::Error { code, .. } => assert_eq!(code, "bad_request"),
+            other => panic!("expected bad_request, got: {other:?}"),
+        }
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ctx_reduce_command_id_works_with_raw_drop_string() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .mint_or_get_tags(
+                "ses",
+                &[TagMintInput {
+                    block_id: "a#0".to_string(),
+                    kind: "tool_result".to_string(),
+                    token_count: 10,
+                    source_bytes: b"one".to_vec(),
+                }],
+                1_000,
+            )
+            .unwrap();
+
+        let first = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1-3",
+                "command_id": " tool-use-raw ",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(first, json!({ "ok": true, "queued": 1 }));
+
+        let retry = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1-3",
+                "command_id": "tool-use-raw",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6757,6 +7955,7 @@ mod tests {
                 project_path: &baseline_project_path,
                 project_directory: &baseline_project_path,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+                memory_enabled: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
@@ -7317,6 +8516,7 @@ mod tests {
                 project_path: &project_path_string,
                 project_directory: &project_path_string,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+                memory_enabled: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
@@ -7349,12 +8549,18 @@ mod tests {
         method: String,
         shadow_generation: u64,
         expected_shadow_seq: u64,
+        seed_id: String,
+        seed_generation: u64,
+        seed_batch_index: usize,
+        seed_batch_total: usize,
+        seed_complete: bool,
         seed_boundary_id: Option<String>,
         compartments: Vec<StrictShadowCompartment>,
         memories: Vec<StrictShadowMemory>,
         memory_mutations: Vec<StrictShadowMemoryMutation>,
         workspace: Option<StrictShadowWorkspace>,
         last_todo_state: String,
+        acked_watermarks: StrictShadowWatermarks,
     }
 
     #[allow(dead_code)]
@@ -7637,6 +8843,58 @@ mod tests {
         })
     }
 
+    fn shadow_compartment(sequence: i64, content: &str) -> Value {
+        json!({
+            "sequence": sequence,
+            "start_message": sequence,
+            "end_message": sequence,
+            "start_message_id": format!("m{sequence}#0"),
+            "end_message_id": format!("m{sequence}#0"),
+            "title": format!("c{sequence}"),
+            "content": content,
+            "p1": format!("{content}-p1"),
+        })
+    }
+
+    fn paged_seed_batch(
+        session: &str,
+        seed_id: &str,
+        generation: u64,
+        expected_seq: u64,
+        index: usize,
+        total: usize,
+        compartments: Vec<Value>,
+    ) -> Value {
+        let complete = index + 1 == total;
+        let mut batch = json!({
+            "kind": "state_sync",
+            "session_id": session,
+            "shadow_generation": generation,
+            "expected_shadow_seq": expected_seq,
+            "seed_id": seed_id,
+            "seed_generation": generation,
+            "seed_batch_index": index,
+            "seed_batch_total": total,
+            "seed_complete": complete,
+            "compartments": compartments,
+            "memories": [],
+            "memory_mutations": [],
+        });
+        if complete {
+            let object = batch.as_object_mut().unwrap();
+            object.insert("seed_boundary_id".to_string(), Value::Null);
+            object.insert("workspace".to_string(), Value::Null);
+            object.insert("last_todo_state".to_string(), json!("[]"));
+            object.insert("acked_watermarks".to_string(), json!({ "complete": true }));
+        }
+        batch
+    }
+
+    fn seed_accounting(handler: &McHandler) -> (usize, usize) {
+        let seeds = handler.shadow_seeds.lock().expect("shadow seed mutex");
+        (seeds.total_staged_bytes, seeds.pending_seed_count)
+    }
+
     #[tokio::test]
     async fn shadow_dispatch_enforces_shadow_route_precedence() {
         let state = Arc::new(ProducerState::default());
@@ -7759,6 +9017,7 @@ mod tests {
                 now_ms: 0,
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
+                memory_enabled: true,
             },
             |_| 0,
         )
@@ -7784,6 +9043,554 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paged_shadow_seed_is_atomic_idempotent_and_matches_single_shot() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:paged"));
+        handler.bind_route(9, binding(project.to_str().unwrap(), "shadow:paged"));
+        handler.bind_route(10, binding(project.to_str().unwrap(), "shadow:single"));
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:paged" }),
+            )
+            .await;
+
+        let first_batch = paged_seed_batch(
+            "shadow:paged",
+            "seed-a",
+            1,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "first")],
+        );
+        let first_ack = match handler.dispatch_value(8, first_batch.clone()).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected first batch outcome: {other:?}"),
+        };
+        assert_eq!(first_ack["staged"], true);
+        assert_eq!(first_ack["next_expected_index"], 1);
+        assert!(store.load_compartments("shadow:paged").unwrap().is_empty());
+        let accounting_after_first = seed_accounting(&handler);
+
+        let redrive = match handler.dispatch_value(8, first_batch).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected redrive outcome: {other:?}"),
+        };
+        assert_eq!(redrive["next_expected_index"], 1);
+        assert_eq!(seed_accounting(&handler), accounting_after_first);
+
+        let stale_zero = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:paged",
+                    "stale-seed",
+                    0,
+                    0,
+                    0,
+                    2,
+                    vec![shadow_compartment(9, "stale")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(stale_zero), "shadow_generation_mismatch");
+        assert_eq!(seed_accounting(&handler), accounting_after_first);
+        let future_zero = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:paged",
+                    "future-seed",
+                    2,
+                    0,
+                    0,
+                    2,
+                    vec![shadow_compartment(9, "future")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(future_zero), "shadow_generation_mismatch");
+        assert_eq!(seed_accounting(&handler), accounting_after_first);
+
+        let competing_transform = handler
+            .dispatch_value(
+                9,
+                shadow_transform_body("shadow:paged", 1, Vec::new(), true),
+            )
+            .await;
+        assert_eq!(error_code(competing_transform), "shadow_seed_in_progress");
+        assert!(store.load_compartments("shadow:paged").unwrap().is_empty());
+        let production = call_transform(&handler, vec![ck("prod-1", 1, "production")]).await;
+        assert!(production["action"].is_string());
+
+        let final_batch = paged_seed_batch(
+            "shadow:paged",
+            "seed-a",
+            1,
+            0,
+            1,
+            2,
+            vec![shadow_compartment(1, "second")],
+        );
+        let final_ack = match handler.dispatch_value(8, final_batch.clone()).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected final batch outcome: {other:?}"),
+        };
+        assert_eq!(final_ack["shadow_seq"], 1);
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let final_redrive = match handler.dispatch_value(8, final_batch).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected final redrive outcome: {other:?}"),
+        };
+        assert_eq!(final_redrive, final_ack);
+        let mut altered_index_redrive = paged_seed_batch(
+            "shadow:paged",
+            "seed-a",
+            1,
+            0,
+            1,
+            2,
+            vec![shadow_compartment(1, "second")],
+        );
+        altered_index_redrive["seed_batch_index"] = json!(0);
+        altered_index_redrive["seed_complete"] = json!(false);
+        let index_agnostic_redrive = match handler.dispatch_value(8, altered_index_redrive).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected index-agnostic redrive outcome: {other:?}"),
+        };
+        assert_eq!(index_agnostic_redrive, final_ack);
+
+        let _ = handler
+            .dispatch_value(
+                10,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:single" }),
+            )
+            .await;
+        let single_ack = handler
+            .dispatch_value(
+                10,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "shadow:single",
+                    "shadow_generation": 1,
+                    "expected_shadow_seq": 0,
+                    "compartments": [
+                        shadow_compartment(0, "first"),
+                        shadow_compartment(1, "second"),
+                    ],
+                    "last_todo_state": "[]",
+                    "acked_watermarks": { "complete": true },
+                }),
+            )
+            .await;
+        assert!(matches!(single_ack, HandlerOutcome::Response(_)));
+        assert_eq!(
+            store.load_compartments("shadow:paged").unwrap(),
+            store.load_compartments("shadow:single").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn paged_shadow_seed_rejects_protocol_and_digest_changes_without_leaking() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let partial = handler
+            .dispatch_value(
+                8,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "shadow:ses",
+                    "shadow_generation": 1,
+                    "expected_shadow_seq": 0,
+                    "seed_id": "partial",
+                }),
+            )
+            .await;
+        assert_eq!(error_code(partial), "invalid_params");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let first = paged_seed_batch(
+            "shadow:ses",
+            "digest-seed",
+            2,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "original")],
+        );
+        assert!(matches!(
+            handler.dispatch_value(8, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let changed = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "digest-seed",
+                    2,
+                    0,
+                    0,
+                    2,
+                    vec![shadow_compartment(0, "changed")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(changed), "shadow_seed_digest_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let mut scalar_on_intermediate = paged_seed_batch(
+            "shadow:ses",
+            "scalar-seed",
+            3,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "first")],
+        );
+        scalar_on_intermediate["last_todo_state"] = json!("not-final");
+        let scalar_error = handler.dispatch_value(8, scalar_on_intermediate).await;
+        assert_eq!(error_code(scalar_error), "shadow_seed_protocol_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let mut completion_mismatch = paged_seed_batch(
+            "shadow:ses",
+            "completion-seed",
+            4,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "first")],
+        );
+        completion_mismatch["seed_complete"] = json!(true);
+        let completion_error = handler.dispatch_value(8, completion_mismatch).await;
+        assert_eq!(
+            error_code(completion_error),
+            "shadow_seed_protocol_mismatch"
+        );
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let mut missing_final_scalar = paged_seed_batch(
+            "shadow:ses",
+            "missing-tail-seed",
+            5,
+            0,
+            0,
+            1,
+            vec![shadow_compartment(0, "only")],
+        );
+        missing_final_scalar
+            .as_object_mut()
+            .expect("seed body")
+            .remove("workspace");
+        let missing_tail = handler.dispatch_value(8, missing_final_scalar).await;
+        assert_eq!(error_code(missing_tail), "shadow_seed_protocol_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let first = paged_seed_batch(
+            "shadow:ses",
+            "gap-seed",
+            6,
+            0,
+            0,
+            3,
+            vec![shadow_compartment(0, "first")],
+        );
+        assert!(matches!(
+            handler.dispatch_value(8, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let gap = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "gap-seed",
+                    6,
+                    0,
+                    2,
+                    3,
+                    vec![shadow_compartment(2, "gap")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(gap), "shadow_seed_order_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+    }
+
+    #[test]
+    fn shadow_seed_pending_count_is_handler_wide_and_bounded() {
+        let mut seeds = ShadowSeedCoordinator {
+            max_pending_seeds: 1,
+            ..ShadowSeedCoordinator::default()
+        };
+        assert!(seeds.arm_after_reset("shadow:a", 1, 0));
+        assert!(!seeds.arm_after_reset("shadow:b", 1, 0));
+        assert_eq!(seeds.pending_seed_count, 1);
+        assert!(matches!(
+            seeds.sessions.get("shadow:a").map(|state| &state.phase),
+            Some(ShadowSeedPhase::AwaitingSeed { .. })
+        ));
+        assert!(matches!(
+            seeds.sessions.get("shadow:b").map(|state| &state.phase),
+            Some(ShadowSeedPhase::Idle)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shadow_seed_handler_wide_accounting_releases_every_non_apply_exit() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:a"));
+        handler.bind_route(9, binding(project.to_str().unwrap(), "shadow:b"));
+        let batch_a = paged_seed_batch(
+            "shadow:a",
+            "seed-a",
+            1,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, &"a".repeat(256))],
+        );
+        let batch_b = paged_seed_batch(
+            "shadow:b",
+            "seed-b",
+            1,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, &"b".repeat(256))],
+        );
+        let bytes_a = serde_json::to_vec(&batch_a).unwrap().len();
+        let bytes_b = serde_json::to_vec(&batch_b).unwrap().len();
+        {
+            let mut seeds = handler.shadow_seeds.lock().expect("shadow seed mutex");
+            seeds.max_staged_bytes = bytes_a + bytes_b - 1;
+            seeds.max_pending_seeds = 8;
+        }
+        for (channel, session) in [(8, "shadow:a"), (9, "shadow:b")] {
+            let outcome = handler
+                .dispatch_value(
+                    channel,
+                    json!({ "kind": "shadow_reset", "session_id": session }),
+                )
+                .await;
+            assert!(matches!(outcome, HandlerOutcome::Response(_)));
+        }
+        assert!(matches!(
+            handler.dispatch_value(8, batch_a).await,
+            HandlerOutcome::Response(_)
+        ));
+        let overflow = handler.dispatch_value(9, batch_b).await;
+        assert_eq!(error_code(overflow), "shadow_seed_buffer_overflow");
+        assert_eq!(seed_accounting(&handler).1, 1);
+        assert_eq!(seed_accounting(&handler).0, bytes_a);
+
+        handler.unbind_route(8);
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:rebind"));
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:rebind" }),
+            )
+            .await;
+        let rebind_batch = paged_seed_batch(
+            "shadow:rebind",
+            "rebind-seed",
+            1,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "rebind")],
+        );
+        assert!(matches!(
+            handler.dispatch_value(8, rebind_batch).await,
+            HandlerOutcome::Response(_)
+        ));
+        assert!(seed_accounting(&handler).0 > 0);
+        let reset = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:rebind" }),
+            )
+            .await;
+        assert!(matches!(reset, HandlerOutcome::Response(_)));
+        assert_eq!(seed_accounting(&handler), (0, 1));
+        let post_reset_batch = paged_seed_batch(
+            "shadow:rebind",
+            "post-reset-seed",
+            2,
+            0,
+            0,
+            2,
+            vec![shadow_compartment(0, "post-reset")],
+        );
+        assert!(matches!(
+            handler.dispatch_value(8, post_reset_batch).await,
+            HandlerOutcome::Response(_)
+        ));
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:replacement"));
+        assert_eq!(seed_accounting(&handler), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn paged_shadow_seed_uses_pinned_seq_and_restart_requires_fresh_reset() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&state), default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        assert!(matches!(
+            handler
+                .dispatch_value(
+                    8,
+                    paged_seed_batch(
+                        "shadow:ses",
+                        "pinned-seed",
+                        1,
+                        0,
+                        0,
+                        2,
+                        vec![shadow_compartment(0, "first")],
+                    ),
+                )
+                .await,
+            HandlerOutcome::Response(_)
+        ));
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: "shadow:ses",
+                shadow_project_path: "shadow:ses",
+                shadow_generation: 1,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: Value::Null,
+            })
+            .unwrap();
+        let final_after_advance = handler
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "pinned-seed",
+                    1,
+                    0,
+                    1,
+                    2,
+                    vec![shadow_compartment(1, "second")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(final_after_advance), "shadow_seq_mismatch");
+        assert_eq!(seed_accounting(&handler), (0, 0));
+        assert!(store.load_compartments("shadow:ses").unwrap().is_empty());
+
+        let restarted = McHandler::with_producer_factory_and_config(
+            Arc::new(TestProducerFactory { state }),
+            default_test_config(),
+        );
+        restarted.store.set(Arc::clone(&store)).ok().unwrap();
+        restarted.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+        let stray_final = restarted
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "old-process-seed",
+                    1,
+                    1,
+                    1,
+                    2,
+                    vec![shadow_compartment(1, "never-apply")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(stray_final), "shadow_seed_not_armed");
+        assert!(store.load_compartments("shadow:ses").unwrap().is_empty());
+
+        let reset = match restarted
+            .dispatch_value(
+                8,
+                json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected restart reset outcome: {other:?}"),
+        };
+        let fresh_generation = reset["shadow_generation"].as_u64().unwrap();
+        let fresh = restarted
+            .dispatch_value(
+                8,
+                paged_seed_batch(
+                    "shadow:ses",
+                    "fresh-process-seed",
+                    fresh_generation,
+                    0,
+                    0,
+                    1,
+                    vec![shadow_compartment(0, "fresh")],
+                ),
+            )
+            .await;
+        assert!(matches!(fresh, HandlerOutcome::Response(_)));
+        assert_eq!(store.load_compartments("shadow:ses").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn shadow_transform_calibrates_once_then_quarantines_without_duplicate_rows() {
         let state = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) =
@@ -7793,6 +9600,17 @@ mod tests {
             .dispatch_value(
                 8,
                 json!({ "kind": "shadow_reset", "session_id": "shadow:ses" }),
+            )
+            .await;
+        let _ = handler
+            .dispatch_value(
+                8,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "shadow:ses",
+                    "shadow_generation": 1,
+                    "expected_shadow_seq": 0,
+                }),
             )
             .await;
 

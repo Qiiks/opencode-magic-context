@@ -40,6 +40,7 @@ function createTestDb(): Database {
             detected_context_limit INTEGER NOT NULL DEFAULT 0,
             detected_context_limit_model_key TEXT,
             needs_emergency_recovery INTEGER NOT NULL DEFAULT 0,
+            emergency_recovery_origin TEXT NOT NULL DEFAULT '',
             harness TEXT NOT NULL DEFAULT 'opencode'
         )
     `);
@@ -60,6 +61,7 @@ describe("recordDetectedContextLimit", () => {
         const state = getOverflowState(db, "ses_subagent_1");
         expect(state.detectedContextLimit).toBe(120_000);
         expect(state.needsEmergencyRecovery).toBe(false);
+        expect(state.emergencyRecoveryOrigin).toBeNull();
     });
 
     it("is a no-op when reportedLimit is zero or negative", () => {
@@ -90,6 +92,7 @@ describe("recordDetectedContextLimit", () => {
         const state = getOverflowState(db, "ses_mixed");
         expect(state.detectedContextLimit).toBe(80_000); // updated
         expect(state.needsEmergencyRecovery).toBe(true); // preserved
+        expect(state.emergencyRecoveryOrigin).toBe("provider_overflow");
     });
 
     it("keys detected limits by model when a model key is known", () => {
@@ -114,6 +117,33 @@ describe("recordDetectedContextLimit", () => {
         );
     });
 
+    it("persists proactive model-shrink origin without a detected limit", () => {
+        recordOverflowDetected(
+            db,
+            "ses_proactive",
+            undefined,
+            "openai/smaller",
+            "proactive_model_shrink",
+        );
+
+        expect(getOverflowState(db, "ses_proactive")).toMatchObject({
+            detectedContextLimit: 0,
+            needsEmergencyRecovery: true,
+            emergencyRecoveryOrigin: "proactive_model_shrink",
+        });
+    });
+
+    it("treats a legacy armed row with a detected limit as provider-proven", () => {
+        ensureSessionMetaRow(db, "ses_legacy_provider");
+        db.prepare(
+            "UPDATE session_meta SET detected_context_limit = 64000, needs_emergency_recovery = 1, emergency_recovery_origin = '' WHERE session_id = ?",
+        ).run("ses_legacy_provider");
+
+        expect(getOverflowState(db, "ses_legacy_provider").emergencyRecoveryOrigin).toBe(
+            "provider_overflow",
+        );
+    });
+
     it("clears cache-regression sentinels when a real overflow limit is recorded", () => {
         ensureSessionMetaRow(db, "ses_overflow_clears_alert");
         db.prepare(
@@ -132,6 +162,9 @@ describe("recordDetectedContextLimit", () => {
         };
         expect(row.observed_safe_input_tokens).toBe(0);
         expect(row.cache_alert_sent).toBe(0);
+        expect(getOverflowState(db, "ses_overflow_clears_alert").emergencyRecoveryOrigin).toBe(
+            "provider_overflow",
+        );
     });
 
     it("can be cleared via clearEmergencyRecovery without touching the limit", () => {
@@ -143,5 +176,6 @@ describe("recordDetectedContextLimit", () => {
         const after = getOverflowState(db, "ses_clear_recovery");
         expect(after.detectedContextLimit).toBe(128_000); // preserved
         expect(after.needsEmergencyRecovery).toBe(false); // cleared
+        expect(after.emergencyRecoveryOrigin).toBeNull();
     });
 });

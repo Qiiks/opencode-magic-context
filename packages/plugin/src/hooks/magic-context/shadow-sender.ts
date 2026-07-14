@@ -1,7 +1,17 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import net from "node:net";
+import { createHmac, randomUUID } from "node:crypto";
 import { join } from "node:path";
+import {
+    AdmissionClass,
+    type BindIdentity,
+    isConsumerReconnectTransient,
+    Priority,
+    type RouteHandle,
+    type RouteTarget,
+    SocketClosedError,
+    SocketTimeoutError,
+    StaleRouteHandleError,
+    SubcClient,
+} from "@cortexkit/subc-client";
 import { getCompartmentsByEndMessageId } from "../../features/magic-context/compartment-storage";
 import {
     getMaxMemoryIdForProjects,
@@ -31,8 +41,16 @@ import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
-import { readRawSessionMessageById, readRawSessionMessageIdOrdinals } from "./read-session-chunk";
-import { isRawCompactionSummaryInfo, type RawMessage } from "./read-session-raw";
+import {
+    getRawSessionStoredMessageCount,
+    readRawSessionMessageOrdinalPage,
+    readRawSessionMessagePartsById,
+} from "./read-session-chunk";
+import {
+    isRawCompactionSummaryInfo,
+    type RawMessageOrdinalAnchor,
+    type RawMessageParts,
+} from "./read-session-raw";
 import type { MessageLike, TagNormalizationTarget } from "./tag-messages";
 import { formatDate } from "./temporal-awareness";
 
@@ -40,22 +58,18 @@ const DEFAULT_MODULE_ID = "magic-context";
 function getDefaultConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
-const SUBC_HEADER_LEN = 17;
-const SUBC_PROTOCOL_VERSION = 1;
-const FRAME_REQUEST = 0;
-const FRAME_RESPONSE = 1;
-const FRAME_ERROR = 5;
-const PRIORITY_BACKGROUND_FLAGS = 2 << 1;
-const AUTH_CLIENT_DOMAIN = "subc-client-v1";
-const AUTH_SERVER_DOMAIN = "subc-server-v1";
-const NONCE_LEN = 32;
-const PROOF_LEN = 32;
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
-const REQUEST_TIMEOUT_MS = 5_000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
+const SHADOW_SEND_TIMEOUT_MS = 15_000;
+const SHADOW_QUEUE_MAX_DEPTH = 2;
 const RESEED_COOLDOWN_MS = 30 * 60 * 1_000;
 const RESEED_ATTEMPT_CAP = 5;
+const SHADOW_ORDINAL_PAGE_SIZE = 500;
+const SHADOW_SEED_YIELD_EVERY_COMPARTMENTS = 10;
+const SHADOW_SEED_BUDGET_MS = 30_000;
+const SHADOW_SEED_BATCH_MAX_BYTES = 512 * 1024;
+const MAX_FACADE_FRAME_BYTES = 1024 * 1024;
 
 const declaredTrimBySession = new Map<string, { markerKey: string; trim: ShadowDeclaredTrim }>();
 
@@ -111,6 +125,7 @@ export interface ShadowTransport {
         projectRoot: string;
         method: "shadow_reset" | "state_sync" | "shadow_transform";
         body: unknown;
+        signal?: AbortSignal;
     }): Promise<unknown>;
     closeSession?(sessionId: string): void;
 }
@@ -120,12 +135,14 @@ export interface ShadowSender {
     resetSession(sessionId: string, reason: string): void;
     clearSession(sessionId: string): void;
     getStats(sessionId: string): Readonly<ShadowSenderCounters>;
+    getQueueDepth(sessionId: string): number;
 }
 
 interface ShadowSenderCounters {
     enqueued: number;
     dropped_oldest: number;
     send_failures: number;
+    send_timeouts: number;
     connection_skips: number;
     ordinal_unresolved: number;
     ordinal_mismatch: number;
@@ -133,6 +150,7 @@ interface ShadowSenderCounters {
     generation_rejects: number;
     resets_sent: number;
     transforms_sent: number;
+    seed_budget_exceeded: number;
 }
 
 interface SessionQueueState {
@@ -144,6 +162,9 @@ interface SessionQueueState {
     lastAckedWatermarks: ShadowWatermarks | null;
     idOrdinalMemoGeneration: number;
     idOrdinalMemo: Map<string, number>;
+    idOrdinalMemoAnchor: RawMessageOrdinalAnchor | null;
+    idOrdinalMemoStoredCount: number | null;
+    idOrdinalMemoCanonicalCount: number;
     requireResetReason: string | null;
     blockedUntilReset: boolean;
     seedPassPending: boolean;
@@ -151,6 +172,8 @@ interface SessionQueueState {
     reseedAttempts: number;
     lastReseedAttemptMs: number | null;
     reseedAwaitingSuccess: boolean;
+    seedStartedAtMs: number | null;
+    seedBudgetSpentMs: number;
     counters: ShadowSenderCounters;
 }
 
@@ -197,30 +220,167 @@ interface ShadowStateSyncPayload {
     params: {
         shadow_generation: number;
         expected_shadow_seq: number;
-        seed_boundary_id: string | null;
+        seed_id?: string;
+        seed_generation?: number;
+        seed_batch_index?: number;
+        seed_batch_total?: number;
+        seed_complete?: boolean;
+        seed_boundary_id?: string | null;
         compartments: unknown[];
         memories: unknown[];
         memory_mutations: unknown[];
-        workspace: ShadowWorkspacePayload | null;
-        last_todo_state: string;
+        workspace?: ShadowWorkspacePayload | null;
+        last_todo_state?: string;
+        acked_watermarks?: ShadowWatermarks;
     };
     watermarks: ShadowWatermarks;
+    wireBatches?: ShadowStateSyncPayload[];
 }
 
-interface ConnectionInfo {
-    schema: number;
-    endpoints: Array<{ host: string; port: number }>;
-    key: number[];
-    daemon_id: number[];
-    pid: number;
-    daemon_ver: string;
+type ShadowSeedItem =
+    | { kind: "compartment"; value: unknown }
+    | { kind: "memory"; value: unknown }
+    | { kind: "memory_mutation"; value: unknown };
+
+function flatWireBodyBytes(payload: ShadowStateSyncPayload): number {
+    return Buffer.byteLength(JSON.stringify(toFlatWireBody(payload)));
 }
 
-interface SubcFrame {
-    type: number;
-    channel: number;
-    corr: number;
-    body: Buffer;
+function buildPagedSeedPayloads(args: {
+    shadowGeneration: number;
+    expectedShadowSeq: number;
+    seedId: string;
+    seedBoundaryId: string | null;
+    compartments: unknown[];
+    memories: unknown[];
+    memoryMutations: unknown[];
+    workspace: ShadowWorkspacePayload | null;
+    lastTodoState: string;
+    watermarks: ShadowWatermarks;
+}): ShadowStateSyncPayload[] {
+    const items: ShadowSeedItem[] = [
+        ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
+        ...args.memories.map((value) => ({ kind: "memory", value }) as const),
+        ...args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const),
+    ];
+    const makePayload = (input: {
+        index: number;
+        total: number;
+        complete: boolean;
+        compartments: unknown[];
+        memories: unknown[];
+        memoryMutations: unknown[];
+    }): ShadowStateSyncPayload => ({
+        method: "state_sync",
+        params: {
+            shadow_generation: args.shadowGeneration,
+            expected_shadow_seq: args.expectedShadowSeq,
+            seed_id: args.seedId,
+            seed_generation: args.shadowGeneration,
+            seed_batch_index: input.index,
+            seed_batch_total: input.total,
+            seed_complete: input.complete,
+            compartments: input.compartments,
+            memories: input.memories,
+            memory_mutations: input.memoryMutations,
+            ...(input.complete
+                ? {
+                      seed_boundary_id: args.seedBoundaryId,
+                      workspace: args.workspace,
+                      last_todo_state: args.lastTodoState,
+                      acked_watermarks: args.watermarks,
+                  }
+                : {}),
+        },
+        watermarks: args.watermarks,
+    });
+    const appendItem = (
+        batch: { compartments: unknown[]; memories: unknown[]; memoryMutations: unknown[] },
+        item: ShadowSeedItem,
+    ): void => {
+        if (item.kind === "compartment") batch.compartments.push(item.value);
+        else if (item.kind === "memory") batch.memories.push(item.value);
+        else batch.memoryMutations.push(item.value);
+    };
+
+    let assumedTotal = 1;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        const batches: ShadowStateSyncPayload[] = [];
+        let current = { compartments: [], memories: [], memoryMutations: [] } as {
+            compartments: unknown[];
+            memories: unknown[];
+            memoryMutations: unknown[];
+        };
+        for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+            const candidate = {
+                compartments: [...current.compartments],
+                memories: [...current.memories],
+                memoryMutations: [...current.memoryMutations],
+            };
+            appendItem(candidate, items[itemIndex]);
+            const complete = itemIndex + 1 === items.length;
+            const candidatePayload = makePayload({
+                index: batches.length,
+                total: assumedTotal,
+                complete,
+                ...candidate,
+            });
+            if (flatWireBodyBytes(candidatePayload) <= SHADOW_SEED_BATCH_MAX_BYTES) {
+                current = candidate;
+                continue;
+            }
+            const currentHasItems =
+                current.compartments.length > 0 ||
+                current.memories.length > 0 ||
+                current.memoryMutations.length > 0;
+            if (currentHasItems) {
+                batches.push(
+                    makePayload({
+                        index: batches.length,
+                        total: assumedTotal,
+                        complete: false,
+                        ...current,
+                    }),
+                );
+            }
+            current = { compartments: [], memories: [], memoryMutations: [] };
+            appendItem(current, items[itemIndex]);
+            const itemOnlyPayload = makePayload({
+                index: batches.length,
+                total: assumedTotal,
+                complete: false,
+                ...current,
+            });
+            if (flatWireBodyBytes(itemOnlyPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
+                throw new Error("shadow seed item exceeds the 512 KiB batch limit");
+            }
+            if (complete) {
+                const itemWithTailPayload = makePayload({
+                    index: batches.length,
+                    total: assumedTotal,
+                    complete: true,
+                    ...current,
+                });
+                if (flatWireBodyBytes(itemWithTailPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
+                    batches.push(itemOnlyPayload);
+                    current = { compartments: [], memories: [], memoryMutations: [] };
+                }
+            }
+        }
+        const finalPayload = makePayload({
+            index: batches.length,
+            total: assumedTotal,
+            complete: true,
+            ...current,
+        });
+        if (flatWireBodyBytes(finalPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
+            throw new Error("shadow seed scalar tail exceeds the 512 KiB batch limit");
+        }
+        batches.push(finalPayload);
+        if (batches.length === assumedTotal) return batches;
+        assumedTotal = batches.length;
+    }
+    throw new Error("shadow seed batch count did not stabilize");
 }
 
 function emptyCounters(): ShadowSenderCounters {
@@ -228,6 +388,7 @@ function emptyCounters(): ShadowSenderCounters {
         enqueued: 0,
         dropped_oldest: 0,
         send_failures: 0,
+        send_timeouts: 0,
         connection_skips: 0,
         ordinal_unresolved: 0,
         ordinal_mismatch: 0,
@@ -235,6 +396,7 @@ function emptyCounters(): ShadowSenderCounters {
         generation_rejects: 0,
         resets_sent: 0,
         transforms_sent: 0,
+        seed_budget_exceeded: 0,
     };
 }
 
@@ -248,6 +410,9 @@ function createSessionQueueState(): SessionQueueState {
         lastAckedWatermarks: null,
         idOrdinalMemoGeneration: 0,
         idOrdinalMemo: new Map(),
+        idOrdinalMemoAnchor: null,
+        idOrdinalMemoStoredCount: null,
+        idOrdinalMemoCanonicalCount: 0,
         requireResetReason: "cold_start",
         blockedUntilReset: false,
         seedPassPending: false,
@@ -255,12 +420,18 @@ function createSessionQueueState(): SessionQueueState {
         reseedAttempts: 0,
         lastReseedAttemptMs: null,
         reseedAwaitingSuccess: false,
+        seedStartedAtMs: null,
+        seedBudgetSpentMs: 0,
         counters: emptyCounters(),
     };
 }
 
 function cloneJson<T>(value: T): T {
     return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function yieldToEventLoop(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function stableHash(value: string): string {
@@ -406,33 +577,81 @@ export function denormalizeShadowOutput(args: {
     return { ts_output: tsOutput, normalizations };
 }
 
-export function resolveOrdinalsForShadow(args: {
+export async function resolveOrdinalsForShadow(args: {
     sessionId: string;
     messages: MessageLike[];
     generation: number;
     memoGeneration: number;
     memo: Map<string, number>;
-}):
+    memoAnchor?: RawMessageOrdinalAnchor | null;
+    memoStoredCount?: number | null;
+    memoCanonicalCount?: number;
+}): Promise<
     | {
           ok: true;
           annotatedInput: unknown[];
           memoGeneration: number;
+          memoAnchor: RawMessageOrdinalAnchor | null;
+          memoStoredCount: number;
+          memoCanonicalCount: number;
           normalizations: ShadowNormalizationRecord[];
       }
-    | { ok: false; reason: "unresolved" | "mismatch"; messageId?: string } {
+    | { ok: false; reason: "unresolved" | "mismatch"; messageId?: string }
+> {
     const memo = args.memo;
-    if (args.memoGeneration !== args.generation) {
+    const generationChanged = args.memoGeneration !== args.generation;
+    if (generationChanged) memo.clear();
+
+    let anchor = generationChanged ? null : (args.memoAnchor ?? null);
+    let storedCount = generationChanged ? null : (args.memoStoredCount ?? null);
+    let canonicalCount = generationChanged ? 0 : (args.memoCanonicalCount ?? 0);
+    const priming = storedCount === null;
+    if (priming) {
         memo.clear();
+        anchor = null;
+        canonicalCount = 0;
     }
 
-    // Shadow enqueue runs after the transform's raw-message cache scope has ended.
-    // Read only message ids and metadata here; part rows are not needed for ordinals.
-    const ordinalById = readRawSessionMessageIdOrdinals(args.sessionId);
+    const newEntries: Array<ReturnType<typeof readRawSessionMessageOrdinalPage>[number]> = [];
+    let pageAnchor = anchor;
+    while (true) {
+        const page = readRawSessionMessageOrdinalPage(
+            args.sessionId,
+            pageAnchor,
+            SHADOW_ORDINAL_PAGE_SIZE,
+        );
+        if (page.length === 0) break;
+        newEntries.push(...page);
+        const last = page[page.length - 1];
+        pageAnchor = { timeCreated: last.timeCreated, id: last.id };
+        if (page.length < SHADOW_ORDINAL_PAGE_SIZE) break;
+        await yieldToEventLoop();
+    }
+
+    const currentStoredCount = getRawSessionStoredMessageCount(args.sessionId);
+    const expectedStoredCount = (storedCount ?? 0) + newEntries.length;
+    if (currentStoredCount !== expectedStoredCount) {
+        memo.clear();
+        return { ok: false, reason: "mismatch" };
+    }
+
+    for (const entry of newEntries) {
+        if (!entry.contributesOrdinal) continue;
+        canonicalCount += 1;
+        if (!entry.hasValidInfo) continue;
+        const prior = memo.get(entry.id);
+        if (prior !== undefined && prior !== canonicalCount) {
+            memo.clear();
+            return { ok: false, reason: "mismatch", messageId: entry.id };
+        }
+        memo.set(entry.id, canonicalCount);
+    }
+    anchor = pageAnchor;
+    storedCount = currentStoredCount;
+
     const normalizations: ShadowNormalizationRecord[] = [];
     const visibleMessages = args.messages.filter((message) => {
         if (!isRawCompactionSummaryInfo(message.info)) return true;
-        // Summary rows delimit OpenCode compaction but intentionally have no raw
-        // ordinal, so both comparison lanes omit them from the ordinal space.
         normalizations.push({
             kind: "summary_message",
             message_id: getMessageId(message),
@@ -451,29 +670,18 @@ export function resolveOrdinalsForShadow(args: {
     for (let index = 0; index < annotated.length; index += 1) {
         const messageId = getMessageId(visibleMessages[index]);
         if (!messageId) return { ok: false, reason: "unresolved" };
-        const ordinal = ordinalById.get(messageId);
-        if (ordinal === undefined && firstUnresolvedId === undefined) {
-            firstUnresolvedId = messageId;
-        }
+        const ordinal = memo.get(messageId);
+        if (ordinal === undefined && firstUnresolvedId === undefined) firstUnresolvedId = messageId;
         resolved[index] = ordinal;
     }
 
-    // OpenCode persists assistant rows at step/turn completion while the transform
-    // runs mid-turn, so the newest wire message(s) routinely have no DB row yet.
-    // Those live-tail messages are always a contiguous SUFFIX of the wire array in
-    // canonical order, so their eventual ordinals are exactly "last persisted + n".
-    // Assign those provisionally instead of skipping the pass — otherwise every
-    // ACTIVE pass (the ones the byte-compare exists for) starves. If interleaved
-    // persistence ever lands a different real ordinal, the memo drift check below
-    // reports "mismatch" on the next pass and the caller's shadow_reset self-heals.
+    // OpenCode can persist the live assistant suffix after this snapshot is captured.
+    // Provisional suffix ordinals keep active passes flowing; when those rows appear,
+    // the incremental reader verifies that their persisted ordinals agree.
     let suffixStart = annotated.length;
-    while (suffixStart > 0 && resolved[suffixStart - 1] === undefined) {
-        suffixStart -= 1;
-    }
+    while (suffixStart > 0 && resolved[suffixStart - 1] === undefined) suffixStart -= 1;
     for (let index = 0; index < suffixStart; index += 1) {
         if (resolved[index] === undefined) {
-            // A hole BEFORE a resolved message is not the live tail (deleted or
-            // foreign id) — keep the fail-skip so we never fabricate history.
             return { ok: false, reason: "unresolved", messageId: firstUnresolvedId };
         }
     }
@@ -499,13 +707,17 @@ export function resolveOrdinalsForShadow(args: {
         ok: true,
         annotatedInput: annotated,
         memoGeneration: args.generation,
+        memoAnchor: anchor,
+        memoStoredCount: storedCount,
+        memoCanonicalCount: canonicalCount,
         normalizations,
     };
 }
 
 function ordinalForMessageId(args: {
-    raw: RawMessage | null;
+    raw: RawMessageParts | null;
     messageId: string;
+    declaredOrdinal: number;
     generation: number;
     state: SessionQueueState;
 }): number | null | "mismatch" {
@@ -513,14 +725,14 @@ function ordinalForMessageId(args: {
         args.state.idOrdinalMemo.clear();
         args.state.idOrdinalMemoGeneration = args.generation;
     }
-    if (!args.raw) return null;
+    if (!args.raw || args.raw.id !== args.messageId || args.declaredOrdinal < 1) return null;
     const prior = args.state.idOrdinalMemo.get(args.messageId);
-    if (prior !== undefined && prior !== args.raw.ordinal) return "mismatch";
-    args.state.idOrdinalMemo.set(args.messageId, args.raw.ordinal);
-    return args.raw.ordinal;
+    if (prior !== undefined && prior !== args.declaredOrdinal) return "mismatch";
+    args.state.idOrdinalMemo.set(args.messageId, args.declaredOrdinal);
+    return args.declaredOrdinal;
 }
 
-function flatBlockCountForRawMessage(message: RawMessage | undefined): number {
+function flatBlockCountForRawMessage(message: RawMessageParts | undefined): number {
     if (!message) return 1;
     let count = 0;
     for (const part of message.parts) {
@@ -567,7 +779,7 @@ function flatBlockCountForRawMessage(message: RawMessage | undefined): number {
 
 export function flatBlockIdForRawMessage(
     messageId: string,
-    raw: RawMessage | undefined,
+    raw: RawMessageParts | undefined,
     edge: "start" | "end",
 ): string {
     const blockIndex = edge === "start" ? 0 : flatBlockCountForRawMessage(raw) - 1;
@@ -586,7 +798,7 @@ export function resolveDeclaredTrimForShadow(args: {
     const cached = declaredTrimBySession.get(args.sessionId);
     if (cached?.markerKey === markerKey) return cached.trim;
 
-    const boundaryRaw = readRawSessionMessageById(args.sessionId, targetEndMessageId);
+    const boundaryRaw = readRawSessionMessagePartsById(args.sessionId, targetEndMessageId);
     if (!boundaryRaw) return null;
     const compartments = getCompartmentsByEndMessageId(args.db, args.sessionId, targetEndMessageId);
     const boundaryCompartment = compartments.find(
@@ -711,7 +923,7 @@ function watermarksEqual(left: ShadowWatermarks | null, right: ShadowWatermarks)
 
 function serializeCompartment(args: {
     compartment: ReturnType<typeof getCompartments>[number];
-    readRawById: (messageId: string) => RawMessage | null;
+    readRawById: (messageId: string) => RawMessageParts | null;
     state: SessionQueueState;
 }): unknown | null | "mismatch" {
     const startRaw = args.readRawById(args.compartment.startMessageId);
@@ -719,12 +931,14 @@ function serializeCompartment(args: {
     const startOrdinal = ordinalForMessageId({
         raw: startRaw,
         messageId: args.compartment.startMessageId,
+        declaredOrdinal: args.compartment.startMessage,
         generation: args.state.shadowGeneration,
         state: args.state,
     });
     const endOrdinal = ordinalForMessageId({
         raw: endRaw,
         messageId: args.compartment.endMessageId,
+        declaredOrdinal: args.compartment.endMessage,
         generation: args.state.shadowGeneration,
         state: args.state,
     });
@@ -767,13 +981,19 @@ function serializeCompartment(args: {
     };
 }
 
-function buildStateSyncPayload(args: {
+async function buildStateSyncPayload(args: {
     state: SessionQueueState;
     pass: Pick<ShadowTransformPass, "db" | "sessionId" | "projectPath" | "passInputs"> & {
         declaredTrim?: ShadowDeclaredTrim | null;
     };
     force: boolean;
-}): ShadowStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" {
+    shouldAbortSeed?: () => boolean;
+    beforeSerializeCompartment?: () => void;
+    yieldEveryCompartments?: number;
+    seedId?: string;
+}): Promise<
+    ShadowStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" | "seed_budget"
+> {
     const workspace = resolveShadowWorkspaceContext(args.pass.db, args.pass.projectPath);
     const currentWatermarks = loadWatermarks({
         db: args.pass.db,
@@ -809,16 +1029,23 @@ function buildStateSyncPayload(args: {
           });
     // State sync needs only compartment boundary messages. Cache point reads within
     // this payload so adjacent compartments sharing a boundary read it once.
-    const rawById = new Map<string, RawMessage | null>();
-    const readRawById = (messageId: string): RawMessage | null => {
+    const rawById = new Map<string, RawMessageParts | null>();
+    const readRawById = (messageId: string): RawMessageParts | null => {
         if (!rawById.has(messageId)) {
-            rawById.set(messageId, readRawSessionMessageById(args.pass.sessionId, messageId));
+            rawById.set(messageId, readRawSessionMessagePartsById(args.pass.sessionId, messageId));
         }
         return rawById.get(messageId) ?? null;
     };
     const compartments: unknown[] = [];
+    const yieldEvery = Math.max(
+        1,
+        args.yieldEveryCompartments ?? SHADOW_SEED_YIELD_EVERY_COMPARTMENTS,
+    );
+    let serializedCount = 0;
     for (const compartment of getCompartments(args.pass.db, args.pass.sessionId)) {
         if (compartment.sequence <= acked.compartment_sequence) continue;
+        args.beforeSerializeCompartment?.();
+        if (args.shouldAbortSeed?.()) return "seed_budget";
         const serialized = serializeCompartment({
             compartment,
             readRawById,
@@ -827,6 +1054,11 @@ function buildStateSyncPayload(args: {
         if (serialized === "mismatch") return "mismatch";
         if (serialized === null) return "unresolved";
         compartments.push(serialized);
+        serializedCount += 1;
+        if (serializedCount % yieldEvery === 0) {
+            await yieldToEventLoop();
+            if (args.shouldAbortSeed?.()) return "seed_budget";
+        }
     }
 
     const allMemories = args.pass.projectPath
@@ -894,21 +1126,39 @@ function buildStateSyncPayload(args: {
           }))
         : [];
     const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
-
+    const shadowGeneration = args.state.shadowGeneration;
+    const expectedShadowSeq = args.state.lastAckedSeq;
+    const seedBoundaryId =
+        args.state.seedPassPending && compartments.length > 0
+            ? (args.pass.declaredTrim?.flat_boundary_id ?? null)
+            : null;
+    if (args.force) {
+        const wireBatches = buildPagedSeedPayloads({
+            shadowGeneration,
+            expectedShadowSeq,
+            seedId: args.seedId ?? randomUUID(),
+            seedBoundaryId,
+            compartments,
+            memories,
+            memoryMutations,
+            workspace: workspace.workspace,
+            lastTodoState: sessionMeta.lastTodoState ?? "",
+            watermarks: currentWatermarks,
+        });
+        return { ...wireBatches[0], wireBatches };
+    }
     return {
         method: "state_sync",
         params: {
-            shadow_generation: args.state.shadowGeneration,
-            expected_shadow_seq: args.state.lastAckedSeq,
-            seed_boundary_id:
-                args.state.seedPassPending && compartments.length > 0
-                    ? (args.pass.declaredTrim?.flat_boundary_id ?? null)
-                    : null,
+            shadow_generation: shadowGeneration,
+            expected_shadow_seq: expectedShadowSeq,
+            seed_boundary_id: seedBoundaryId,
             compartments,
             memories,
             memory_mutations: memoryMutations,
             workspace: workspace.workspace,
             last_todo_state: sessionMeta.lastTodoState ?? "",
+            acked_watermarks: currentWatermarks,
         },
         watermarks: currentWatermarks,
     } satisfies ShadowStateSyncPayload;
@@ -930,28 +1180,25 @@ function numericAck(response: unknown, keys: string[], fallback: number): number
 }
 
 function errorCode(error: unknown): string | null {
-    if (isRecord(error) && typeof error.code === "string") return error.code;
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        if (typeof current.code === "string") return current.code;
+        current = current.cause;
+    }
     return null;
 }
 
 function isPeerReject(error: unknown): boolean {
     const code = errorCode(error);
-    if (
+    return (
         code === "stale_generation" ||
         code === "shadow_generation_mismatch" ||
         code === "shadow_seq_mismatch" ||
         code === "seq_mismatch" ||
         code === "cas_mismatch" ||
         code === "state_cas_reject"
-    ) {
-        return true;
-    }
-    const text = error instanceof Error ? error.message : String(error);
-    return (
-        text.includes("generation") ||
-        text.includes("shadow_seq") ||
-        text.includes("seq mismatch") ||
-        text.includes("CAS")
     );
 }
 
@@ -960,10 +1207,25 @@ function isSeedBoundaryReject(error: unknown): boolean {
 }
 
 function isConnectionFailure(error: unknown): boolean {
+    if (
+        error instanceof SocketClosedError ||
+        error instanceof SocketTimeoutError ||
+        error instanceof StaleRouteHandleError ||
+        isConsumerReconnectTransient(error)
+    ) {
+        return true;
+    }
     const code = errorCode(error);
-    if (code === "ENOENT" || code === "ECONNREFUSED" || code === "ECONNRESET") return true;
-    const text = error instanceof Error ? error.message : String(error);
-    return text.includes("backoff") || text.includes("connection") || text.includes("ECONN");
+    return (
+        code === "ENOENT" ||
+        code === "ECONNREFUSED" ||
+        code === "ECONNRESET" ||
+        code === "EPIPE" ||
+        code === "ETIMEDOUT" ||
+        code === "request_deadline" ||
+        code === "route_closed" ||
+        code === "SUBC_CONNECTION_BACKOFF"
+    );
 }
 
 /**
@@ -1029,12 +1291,23 @@ export function createShadowSender(
         now?: () => number;
         reseedCooldownMs?: number;
         reseedAttemptCap?: number;
+        sendTimeoutMs?: number;
+        queueMaxDepth?: number;
+        seedBudgetMs?: number;
+        seedClock?: () => number;
+        beforeSerializeCompartment?: () => void;
+        seedYieldEveryCompartments?: number;
+        onSeedBudgetExceeded?: (message: string) => void;
     } = {},
 ): ShadowSender {
     const transport = options.transport ?? new SubcShadowTransport();
     const now = options.now ?? Date.now;
     const reseedCooldownMs = options.reseedCooldownMs ?? RESEED_COOLDOWN_MS;
     const reseedAttemptCap = options.reseedAttemptCap ?? RESEED_ATTEMPT_CAP;
+    const sendTimeoutMs = Math.max(1, options.sendTimeoutMs ?? SHADOW_SEND_TIMEOUT_MS);
+    const queueMaxDepth = Math.max(1, options.queueMaxDepth ?? SHADOW_QUEUE_MAX_DEPTH);
+    const seedBudgetMs = Math.max(1, options.seedBudgetMs ?? SHADOW_SEED_BUDGET_MS);
+    const seedClock = options.seedClock ?? (() => performance.now());
     const sessions = new Map<string, SessionQueueState>();
     const subagentSessions = new Set<string>();
 
@@ -1047,36 +1320,119 @@ export function createShadowSender(
         return state;
     };
 
+    const remainingSeedBudgetMs = (state: SessionQueueState): number => {
+        const activeElapsed =
+            state.seedStartedAtMs === null ? 0 : Math.max(0, seedClock() - state.seedStartedAtMs);
+        return seedBudgetMs - state.seedBudgetSpentMs - activeElapsed;
+    };
+
+    const markResetRequired = (
+        sessionId: string,
+        state: SessionQueueState,
+        reason: string,
+    ): void => {
+        transport.closeSession?.(sessionId);
+        state.initialized = false;
+        state.blockedUntilReset = true;
+        state.requireResetReason = reason;
+        state.lastAckedWatermarks = null;
+        state.seedPassPending = true;
+    };
+
+    const requireSeedBudget = (state: SessionQueueState): number => {
+        const remaining = remainingSeedBudgetMs(state);
+        if (remaining > 0) return remaining;
+        const error = new Error("shadow seed budget exhausted") as Error & { code?: string };
+        error.code = "shadow_seed_budget";
+        throw error;
+    };
+
+    const disableIfSeedBudgetExceeded = (sessionId: string, state: SessionQueueState): boolean => {
+        if (remainingSeedBudgetMs(state) > 0) return false;
+        markResetRequired(sessionId, state, "seed_budget");
+        if (!state.skipped) {
+            state.skipped = true;
+            state.queue.length = 0;
+            state.counters.seed_budget_exceeded += 1;
+            const message = "shadow: seed budget exceeded, lane disabled for session";
+            sessionLog(sessionId, message);
+            options.onSeedBudgetExceeded?.(message);
+        }
+        return true;
+    };
+
+    const pauseSeedBudget = (state: SessionQueueState): void => {
+        if (state.seedStartedAtMs === null) return;
+        state.seedBudgetSpentMs += Math.max(0, seedClock() - state.seedStartedAtMs);
+        state.seedStartedAtMs = null;
+    };
+
     const schedule = (sessionId: string): void => {
         const state = getState(sessionId);
         if (state.running) return;
         state.running = true;
         void runQueue(sessionId, state).finally(() => {
             state.running = false;
-            if (state.queue.length > 0) schedule(sessionId);
+            if (!state.skipped && state.queue.length > 0) schedule(sessionId);
         });
     };
 
     const pushWork = (sessionId: string, work: ShadowWorkItem): void => {
         const state = getState(sessionId);
+        if (state.skipped) return;
+        let dropped = 0;
         if (work.kind === "pass") {
             state.counters.enqueued += 1;
-            let dropped = 0;
+            // A queued pass is also the pending state-sync/seed unit: its large
+            // payload is built only after dequeue. Superseding the whole pass here
+            // guarantees that a stalled send can retain at most one newer snapshot.
             for (let index = state.queue.length - 1; index >= 0; index -= 1) {
                 if (state.queue[index]?.kind !== "pass") continue;
                 state.queue.splice(index, 1);
                 dropped += 1;
             }
-            if (dropped > 0) {
-                state.counters.dropped_oldest += dropped;
-                sessionLog(
-                    sessionId,
-                    `shadow: dropped ${dropped} stale queued pass${dropped === 1 ? "" : "es"}`,
-                );
-            }
         }
         state.queue.push(work);
+        while (state.queue.length > queueMaxDepth) {
+            const oldestNonEssential = state.queue.findIndex(
+                (item, index) => item.kind === "pass" && index < state.queue.length - 1,
+            );
+            state.queue.splice(oldestNonEssential >= 0 ? oldestNonEssential : 0, 1);
+            dropped += 1;
+        }
+        // Shadow comparison is best-effort instrumentation. A counter is enough
+        // to diagnose pressure without turning each dropped pass into log traffic.
+        state.counters.dropped_oldest += dropped;
         schedule(sessionId);
+    };
+
+    const callTransport = async (
+        state: SessionQueueState,
+        args: Parameters<ShadowTransport["call"]>[0],
+        timeoutCapMs = sendTimeoutMs,
+    ): Promise<unknown> => {
+        const controller = new AbortController();
+        const requestTimeoutMs = Math.max(1, Math.min(sendTimeoutMs, Math.floor(timeoutCapMs)));
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+                state.counters.send_timeouts += 1;
+                const error = new Error(
+                    `shadow send timeout after ${requestTimeoutMs}ms`,
+                ) as Error & { code?: string };
+                error.code = "ETIMEDOUT";
+                controller.abort(error);
+                reject(error);
+            }, requestTimeoutMs);
+        });
+        try {
+            return await Promise.race([
+                transport.call({ ...args, signal: controller.signal }),
+                timeout,
+            ]);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
     };
 
     const runQueue = async (sessionId: string, state: SessionQueueState): Promise<void> => {
@@ -1091,11 +1447,11 @@ export function createShadowSender(
                         reason: item.reason,
                         projectRoot: item.projectRoot,
                     });
+                    pauseSeedBudget(state);
+                    disableIfSeedBudgetExceeded(sessionId, state);
                 } catch (error) {
                     state.counters.send_failures += 1;
-                    state.initialized = false;
-                    state.blockedUntilReset = true;
-                    state.requireResetReason ??= item.reason || "reset_retry";
+                    markResetRequired(sessionId, state, item.reason || "reset_retry");
                     sessionLog(sessionId, "shadow: reset failed (ignored):", error);
                 }
                 continue;
@@ -1115,9 +1471,18 @@ export function createShadowSender(
                     state.counters.connection_skips += 1;
                     state.initialized = false;
                     state.requireResetReason = "route_reopen";
+                    if (state.reseedAwaitingSuccess) {
+                        // A transport failure did not establish a fresh lineage, so it
+                        // must not consume the reseed cooldown or attempt allowance.
+                        state.reseedAttempts = Math.max(0, state.reseedAttempts - 1);
+                        state.lastReseedAttemptMs = null;
+                        state.reseedAwaitingSuccess = false;
+                    }
                 }
                 sessionLog(sessionId, "shadow: send failed (ignored):", error);
             }
+            pauseSeedBudget(state);
+            disableIfSeedBudgetExceeded(sessionId, state);
         }
     };
 
@@ -1127,14 +1492,21 @@ export function createShadowSender(
         reason: string;
         projectRoot?: string;
     }): Promise<void> => {
+        args.state.seedBudgetSpentMs = 0;
+        args.state.seedStartedAtMs = seedClock();
         const projectRoot = args.projectRoot ?? process.cwd();
         const body = toFlatWireBody(buildShadowResetBody(args));
-        const response = await transport.call({
-            sessionId: args.sessionId,
-            projectRoot,
-            method: "shadow_reset",
-            body,
-        });
+        const response = await callTransport(
+            args.state,
+            {
+                sessionId: args.sessionId,
+                projectRoot,
+                method: "shadow_reset",
+                body,
+            },
+            requireSeedBudget(args.state),
+        );
+        requireSeedBudget(args.state);
         args.state.shadowGeneration = numericAck(
             response,
             ["shadow_generation", "generation"],
@@ -1144,6 +1516,9 @@ export function createShadowSender(
         args.state.lastAckedWatermarks = null;
         args.state.idOrdinalMemo.clear();
         args.state.idOrdinalMemoGeneration = args.state.shadowGeneration;
+        args.state.idOrdinalMemoAnchor = null;
+        args.state.idOrdinalMemoStoredCount = null;
+        args.state.idOrdinalMemoCanonicalCount = 0;
         clearDeclaredTrimForSession(args.sessionId);
         args.state.initialized = true;
         args.state.blockedUntilReset = false;
@@ -1179,6 +1554,9 @@ export function createShadowSender(
         pass: ShadowTransformPass,
     ): Promise<void> => {
         if (state.skipped) return;
+        if (state.seedPassPending && state.seedStartedAtMs === null) {
+            state.seedStartedAtMs = seedClock();
+        }
         if (state.blockedUntilReset && !state.requireResetReason) {
             state.requireResetReason = "unknown_block";
         }
@@ -1191,34 +1569,45 @@ export function createShadowSender(
             });
         }
         if (state.skipped || state.blockedUntilReset) return;
+        if (disableIfSeedBudgetExceeded(pass.sessionId, state)) return;
 
-        let resolved: ReturnType<typeof resolveOrdinalsForShadow>;
+        let resolved: Awaited<ReturnType<typeof resolveOrdinalsForShadow>>;
         try {
-            resolved = resolveOrdinalsForShadow({
+            resolved = await resolveOrdinalsForShadow({
                 sessionId: pass.sessionId,
                 messages: pass.inputMessages,
                 generation: state.shadowGeneration,
                 memoGeneration: state.idOrdinalMemoGeneration,
                 memo: state.idOrdinalMemo,
+                memoAnchor: state.idOrdinalMemoAnchor,
+                memoStoredCount: state.idOrdinalMemoStoredCount,
+                memoCanonicalCount: state.idOrdinalMemoCanonicalCount,
             });
         } catch (error) {
+            if (state.seedPassPending)
+                markResetRequired(pass.sessionId, state, "seed_capture_failed");
             sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
             return;
         }
         if (!resolved.ok) {
             if (resolved.reason === "mismatch") {
                 state.counters.ordinal_mismatch += 1;
-                state.requireResetReason = "ordinal_mismatch";
-                state.blockedUntilReset = true;
                 state.idOrdinalMemo.clear();
-                await performReset({
-                    sessionId: pass.sessionId,
-                    state,
-                    reason: "ordinal_mismatch",
-                    projectRoot: pass.projectRoot,
-                });
+                if (state.seedPassPending) {
+                    markResetRequired(pass.sessionId, state, "ordinal_mismatch");
+                } else {
+                    await performReset({
+                        sessionId: pass.sessionId,
+                        state,
+                        reason: "ordinal_mismatch",
+                        projectRoot: pass.projectRoot,
+                    });
+                    if (!state.skipped) await processPass(state, pass);
+                }
             } else {
                 state.counters.ordinal_unresolved += 1;
+                if (state.seedPassPending)
+                    markResetRequired(pass.sessionId, state, "seed_ordinal_unresolved");
                 sessionLog(
                     pass.sessionId,
                     `shadow: pass skipped; unresolved ordinal for ${resolved.messageId ?? "unknown"}`,
@@ -1227,9 +1616,13 @@ export function createShadowSender(
             return;
         }
         state.idOrdinalMemoGeneration = resolved.memoGeneration;
+        state.idOrdinalMemoAnchor = resolved.memoAnchor;
+        state.idOrdinalMemoStoredCount = resolved.memoStoredCount;
+        state.idOrdinalMemoCanonicalCount = resolved.memoCanonicalCount;
+        if (disableIfSeedBudgetExceeded(pass.sessionId, state)) return;
 
         let preparedPass: PreparedShadowPass;
-        let syncPayload: ReturnType<typeof buildStateSyncPayload>;
+        let syncPayload: Awaited<ReturnType<typeof buildStateSyncPayload>>;
         try {
             const declaredTrim = resolveDeclaredTrimForShadow({
                 db: pass.db,
@@ -1258,12 +1651,24 @@ export function createShadowSender(
                     },
                 },
             };
-            syncPayload = buildStateSyncPayload({
+            syncPayload = await buildStateSyncPayload({
                 state,
                 pass: preparedPass,
                 force: state.lastAckedWatermarks === null,
+                shouldAbortSeed: state.seedPassPending
+                    ? () =>
+                          state.seedBudgetSpentMs +
+                              (state.seedStartedAtMs === null
+                                  ? 0
+                                  : Math.max(0, seedClock() - state.seedStartedAtMs)) >
+                          seedBudgetMs
+                    : undefined,
+                beforeSerializeCompartment: options.beforeSerializeCompartment,
+                yieldEveryCompartments: options.seedYieldEveryCompartments,
             });
         } catch (error) {
+            if (state.seedPassPending)
+                markResetRequired(pass.sessionId, state, "seed_capture_failed");
             sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
             return;
         }
@@ -1276,45 +1681,121 @@ export function createShadowSender(
                 projectRoot: pass.projectRoot,
             });
             try {
-                const fullSync = buildStateSyncPayload({ state, pass: preparedPass, force: true });
+                const fullSync = await buildStateSyncPayload({
+                    state,
+                    pass: preparedPass,
+                    force: true,
+                    shouldAbortSeed: () =>
+                        state.seedBudgetSpentMs +
+                            (state.seedStartedAtMs === null
+                                ? 0
+                                : Math.max(0, seedClock() - state.seedStartedAtMs)) >
+                        seedBudgetMs,
+                    beforeSerializeCompartment: options.beforeSerializeCompartment,
+                    yieldEveryCompartments: options.seedYieldEveryCompartments,
+                });
                 if (fullSync === "m0_mutation") {
                     throw new Error("forced state sync unexpectedly requested another m0 reset");
                 }
                 syncPayload = fullSync;
             } catch (error) {
+                markResetRequired(pass.sessionId, state, "seed_capture_failed");
                 sessionLog(pass.sessionId, "shadow: capture failed (ignored):", error);
                 return;
             }
         }
+        if (syncPayload === "seed_budget") {
+            disableIfSeedBudgetExceeded(pass.sessionId, state);
+            return;
+        }
         if (syncPayload === "mismatch") {
             state.counters.ordinal_mismatch += 1;
-            state.requireResetReason = "ordinal_mismatch";
-            await performReset({
-                sessionId: pass.sessionId,
-                state,
-                reason: "ordinal_mismatch",
-                projectRoot: pass.projectRoot,
-            });
+            markResetRequired(pass.sessionId, state, "ordinal_mismatch");
             return;
         }
         if (syncPayload === "unresolved") {
             state.counters.ordinal_unresolved += 1;
+            if (state.seedPassPending)
+                markResetRequired(pass.sessionId, state, "seed_compartment_unresolved");
             sessionLog(
                 pass.sessionId,
                 "shadow: state sync skipped; compartment ordinal unresolved",
             );
             return;
         }
+        if (
+            syncPayload !== null &&
+            !syncPayload.wireBatches &&
+            flatWireBodyBytes(syncPayload) >= MAX_FACADE_FRAME_BYTES
+        ) {
+            await performReset({
+                sessionId: pass.sessionId,
+                state,
+                reason: "oversized_state_sync",
+                projectRoot: pass.projectRoot,
+            });
+            try {
+                const pagedSeed = await buildStateSyncPayload({
+                    state,
+                    pass: preparedPass,
+                    force: true,
+                    shouldAbortSeed: () => remainingSeedBudgetMs(state) <= 0,
+                    beforeSerializeCompartment: options.beforeSerializeCompartment,
+                    yieldEveryCompartments: options.seedYieldEveryCompartments,
+                });
+                if (
+                    pagedSeed === null ||
+                    pagedSeed === "m0_mutation" ||
+                    pagedSeed === "mismatch" ||
+                    pagedSeed === "unresolved"
+                ) {
+                    throw new Error(`forced paged seed failed: ${String(pagedSeed)}`);
+                }
+                if (pagedSeed === "seed_budget") {
+                    disableIfSeedBudgetExceeded(pass.sessionId, state);
+                    return;
+                }
+                syncPayload = pagedSeed;
+            } catch (error) {
+                markResetRequired(pass.sessionId, state, "seed_rebuild_failed");
+                throw error;
+            }
+        }
         if (syncPayload !== null) {
+            const wireBatches = syncPayload.wireBatches ?? [syncPayload];
+            const pagedSeed = syncPayload.wireBatches !== undefined;
             let response: unknown;
             try {
-                response = await transport.call({
-                    sessionId: pass.sessionId,
-                    projectRoot: pass.projectRoot,
-                    method: "state_sync",
-                    body: toFlatWireBody(syncPayload),
-                });
+                for (let index = 0; index < wireBatches.length; index += 1) {
+                    const batch = wireBatches[index];
+                    const timeoutCap = pagedSeed ? requireSeedBudget(state) : sendTimeoutMs;
+                    response = await callTransport(
+                        state,
+                        {
+                            sessionId: pass.sessionId,
+                            projectRoot: pass.projectRoot,
+                            method: "state_sync",
+                            body: toFlatWireBody(batch),
+                        },
+                        timeoutCap,
+                    );
+                    if (pagedSeed) requireSeedBudget(state);
+                    if (index + 1 < wireBatches.length) continue;
+                    state.lastAckedSeq = numericAck(
+                        response,
+                        ["shadow_seq", "seq"],
+                        batch.params.expected_shadow_seq + 1,
+                    );
+                    state.lastAckedWatermarks = syncPayload.watermarks;
+                }
             } catch (error) {
+                if (pagedSeed) {
+                    markResetRequired(
+                        pass.sessionId,
+                        state,
+                        errorCode(error) ?? "seed_batch_failed",
+                    );
+                }
                 if (isSeedBoundaryReject(error) && beginReseed(state)) {
                     await performReset({
                         sessionId: pass.sessionId,
@@ -1328,18 +1809,16 @@ export function createShadowSender(
                 throw error;
             }
             if (state.skipped) return;
-            state.lastAckedSeq = numericAck(
-                response,
-                ["shadow_seq", "seq"],
-                syncPayload.params.expected_shadow_seq + 1,
-            );
-            state.lastAckedWatermarks = syncPayload.watermarks;
+            if (pagedSeed) {
+                state.seedStartedAtMs = null;
+                state.seedBudgetSpentMs = 0;
+            }
         }
 
         const transformBody = toFlatWireBody(
             buildShadowTransformBody({ pass: preparedPass, state }),
         );
-        const response = await transport.call({
+        const response = await callTransport(state, {
             sessionId: pass.sessionId,
             projectRoot: pass.projectRoot,
             method: "shadow_transform",
@@ -1406,25 +1885,27 @@ export function createShadowSender(
         getStats(sessionId: string): Readonly<ShadowSenderCounters> {
             return { ...getState(sessionId).counters };
         },
+        getQueueDepth(sessionId: string): number {
+            return getState(sessionId).queue.length;
+        },
     };
 }
 
 class SubcShadowTransport implements ShadowTransport {
-    private connectionFile: string;
-    private moduleId: string;
-    private socket: net.Socket | null = null;
-    private reader: SocketReader | null = null;
-    private nextCorr = 1;
-    private routes = new Map<string, number>();
-    private pending = Promise.resolve();
+    private readonly connectionFile: string;
+    private readonly moduleId: string;
+    private readonly requestTimeoutMs: number;
+    private client: SubcClient | null = null;
+    private routes = new Map<string, RouteHandle>();
+    private activeSession: string | null = null;
     private nextProbeMs = 0;
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
-    private requestTimeoutMs: number;
+    private connectionGeneration = 0;
 
     constructor(
         connectionFile?: string,
         moduleId = DEFAULT_MODULE_ID,
-        requestTimeoutMs = REQUEST_TIMEOUT_MS,
+        requestTimeoutMs = SHADOW_SEND_TIMEOUT_MS,
     ) {
         this.connectionFile = connectionFile ?? getDefaultConnectionFile();
         this.moduleId = moduleId;
@@ -1436,79 +1917,118 @@ class SubcShadowTransport implements ShadowTransport {
         projectRoot: string;
         method: "shadow_reset" | "state_sync" | "shadow_transform";
         body: unknown;
+        signal?: AbortSignal;
     }): Promise<unknown> {
-        const run = async (): Promise<unknown> => {
-            const route = await this.ensureRoute(args.sessionId, args.projectRoot);
-            return await this.unaryJson(route, args.body);
-        };
-        const next = this.pending.then(run, run);
-        this.pending = next.then(
-            () => undefined,
-            () => undefined,
-        );
-        return next;
+        // Each waiting closure would retain its complete shadow payload. Rejecting
+        // concurrent best-effort work keeps transport memory bounded.
+        if (this.activeSession !== null) {
+            const error = new Error("shadow transport busy; work dropped") as Error & {
+                code?: string;
+            };
+            error.code = "EBUSY";
+            throw error;
+        }
+        if (args.signal?.aborted) throw args.signal.reason;
+
+        this.activeSession = args.sessionId;
+        const onAbort = () => this.invalidateConnection();
+        args.signal?.addEventListener("abort", onAbort, { once: true });
+        try {
+            const { client, route } = await this.ensureRoute(args.sessionId, args.projectRoot);
+            if (args.signal?.aborted) throw args.signal.reason;
+            return await client.request(route, args.body, {
+                priority: Priority.Background,
+                admissionClass: AdmissionClass.Normal,
+                timeoutMs: this.requestTimeoutMs,
+            });
+        } catch (error) {
+            if (isConnectionFailure(error)) this.invalidateConnection();
+            throw error;
+        } finally {
+            args.signal?.removeEventListener("abort", onAbort);
+            this.activeSession = null;
+        }
     }
 
     closeSession(sessionId: string): void {
+        const route = this.routes.get(sessionId);
         this.routes.delete(sessionId);
-    }
-
-    private async ensureRoute(sessionId: string, projectRoot: string): Promise<number> {
-        const existing = this.routes.get(sessionId);
-        if (existing !== undefined) return existing;
-        await this.ensureConnected();
-        const body: Record<string, unknown> = {
-            op: "route.open",
-            // mc-module registers a ToolProvider role in its manifest (see
-            // crates/mc-module/src/lib.rs manifest()); it does NOT provide a
-            // management surface. Opening with the wrong kind makes the daemon
-            // reject every route with target_unavailable.
-            target: { kind: "tool_provider", module_id: this.moduleId },
-            identity: {
-                project_root: projectRoot,
-                harness: getHarness(),
-                session: `shadow:${sessionId}`,
-            },
-        };
-        const moduleId = process.env.SUBC_MODULE_ID;
-        const launchNonce = process.env.SUBC_LAUNCH_NONCE;
-        if (moduleId && launchNonce) {
-            body.consumer_identity = { module_id: moduleId, launch_nonce: launchNonce };
+        const client = this.client;
+        if (route && client) {
+            void client.closeRoute(route).catch((error: unknown) => {
+                if (this.client === client && isConnectionFailure(error)) {
+                    this.invalidateConnection(client);
+                }
+            });
+            return;
         }
-        const response = await this.unaryJson(0, body);
-        const ack = extractAckValue(response);
-        const route = ack.route_channel;
-        if (typeof route !== "number")
-            throw new Error("connection route.open missing route_channel");
-        this.routes.set(sessionId, route);
-        return route;
+        if (this.activeSession === sessionId) this.invalidateConnection(client);
     }
 
-    private async ensureConnected(): Promise<void> {
-        if (this.socket && !this.socket.destroyed && this.reader) return;
+    private async ensureRoute(
+        sessionId: string,
+        projectRoot: string,
+    ): Promise<{ client: SubcClient; route: RouteHandle }> {
+        const existing = this.routes.get(sessionId);
+        const client = await this.ensureConnected();
+        if (existing) return { client, route: existing };
+
+        const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };
+        const identity: BindIdentity = {
+            project_root: projectRoot,
+            harness: getHarness(),
+            session: `shadow:${sessionId}`,
+        };
+        const route = await client.routeOpen(target, identity);
+        if (this.client !== client) {
+            await client.closeRoute(route).catch(() => undefined);
+            const error = new Error(
+                "subc connection changed while opening shadow route",
+            ) as Error & {
+                code?: string;
+            };
+            error.code = "ECONNRESET";
+            throw error;
+        }
+        this.routes.set(sessionId, route);
+        return { client, route };
+    }
+
+    private async ensureConnected(): Promise<SubcClient> {
+        if (this.client) return this.client;
         const now = Date.now();
         if (now < this.nextProbeMs) {
-            throw new Error(`connection backoff active until ${this.nextProbeMs}`);
+            const error = new Error(
+                `subc connection backoff active until ${this.nextProbeMs}`,
+            ) as Error & {
+                code?: string;
+            };
+            error.code = "SUBC_CONNECTION_BACKOFF";
+            throw error;
         }
-        let candidate: net.Socket | null = null;
+
+        const generation = this.connectionGeneration;
+        let candidate: SubcClient | null = null;
         try {
-            const conn = readConnectionInfo(this.connectionFile);
-            const endpoint = conn.endpoints[0];
-            if (!endpoint) throw new Error("connection file has no endpoint");
-            candidate = await connectTcp(endpoint.host, endpoint.port, HANDSHAKE_TIMEOUT_MS);
-            const reader = new SocketReader(candidate);
-            await authenticateSubcClient(candidate, reader, conn, HANDSHAKE_TIMEOUT_MS);
-            const socket = candidate;
-            this.socket = socket;
-            this.reader = reader;
+            candidate = await SubcClient.connect({
+                connectionFile: this.connectionFile,
+                handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
+            });
+            if (generation !== this.connectionGeneration) {
+                candidate.close();
+                const error = new Error("subc connection attempt was superseded") as Error & {
+                    code?: string;
+                };
+                error.code = "ECONNRESET";
+                throw error;
+            }
+            this.client = candidate;
             this.routes.clear();
             this.backoffMs = CONNECT_BACKOFF_INITIAL_MS;
             this.nextProbeMs = 0;
-            socket.once("close", () => {
-                if (this.socket === socket) this.invalidateConnection(socket);
-            });
+            return candidate;
         } catch (error) {
-            candidate?.destroy();
+            candidate?.close();
             this.invalidateConnection();
             this.nextProbeMs = Date.now() + this.backoffMs;
             this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
@@ -1516,255 +2036,24 @@ class SubcShadowTransport implements ShadowTransport {
         }
     }
 
-    private invalidateConnection(socket: net.Socket | null = this.socket): void {
-        if (socket && this.socket && socket !== this.socket) return;
-        this.socket = null;
-        this.reader = null;
+    private invalidateConnection(client: SubcClient | null = this.client): void {
+        if (client && this.client && client !== this.client) return;
+        this.connectionGeneration += 1;
+        this.client = null;
         this.routes.clear();
-        socket?.destroy();
-    }
-
-    private async unaryJson(channel: number, body: unknown): Promise<unknown> {
-        await this.ensureConnected();
-        const socket = this.socket;
-        const reader = this.reader;
-        if (!socket || !reader) throw new Error("connection unavailable");
-        const corr = this.nextCorr++;
-        try {
-            await writeFrame(socket, {
-                type: FRAME_REQUEST,
-                channel,
-                corr,
-                body: Buffer.from(JSON.stringify(body)),
-            });
-            const frame = await readTerminalFor(reader, channel, corr, this.requestTimeoutMs);
-            if (frame.type === FRAME_ERROR) {
-                throw parseErrorBody(frame.body);
-            }
-            if (frame.type !== FRAME_RESPONSE) {
-                throw new Error(`unexpected subc frame type ${frame.type}`);
-            }
-            if (frame.body.length === 0) return null;
-            return JSON.parse(frame.body.toString("utf8"));
-        } catch (error) {
-            // A timeout or malformed/error frame can leave unread bytes buffered.
-            // Reusing that stream would make the next response start mid-frame.
-            this.invalidateConnection(socket);
-            throw error;
-        }
-    }
-}
-
-function readConnectionInfo(path: string): ConnectionInfo {
-    if (!existsSync(path)) throw new Error(`connection file not found: ${path}`);
-    try {
-        const mode = statSync(path).mode & 0o777;
-        if ((mode & 0o077) !== 0)
-            throw new Error(`connection file has insecure mode ${mode.toString(8)}`);
-    } catch (error) {
-        if (error instanceof Error && error.message.includes("insecure")) throw error;
-    }
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as ConnectionInfo;
-    if (parsed.schema !== 1) throw new Error(`unsupported connection schema ${parsed.schema}`);
-    if (!Array.isArray(parsed.endpoints) || parsed.endpoints.length === 0) {
-        throw new Error("connection file has no endpoints");
-    }
-    if (!Array.isArray(parsed.key) || parsed.key.length < 32)
-        throw new Error("connection key too short");
-    return parsed;
-}
-
-function connectTcp(host: string, port: number, timeoutMs: number): Promise<net.Socket> {
-    return new Promise((resolve, reject) => {
-        const socket = net.createConnection({ host, port });
-        const timer = setTimeout(() => {
-            socket.destroy();
-            reject(new Error("connection timeout"));
-        }, timeoutMs);
-        socket.once("connect", () => {
-            clearTimeout(timer);
-            resolve(socket);
-        });
-        socket.once("error", (error) => {
-            clearTimeout(timer);
-            reject(error);
-        });
-    });
-}
-
-class SocketReader {
-    private chunks: Buffer[] = [];
-    private buffered = 0;
-    private waiters: Array<() => void> = [];
-    private closed = false;
-
-    constructor(socket: net.Socket) {
-        socket.on("data", (chunk) => {
-            this.chunks.push(Buffer.from(chunk));
-            this.buffered += chunk.length;
-            this.flushWaiters();
-        });
-        socket.on("close", () => {
-            this.closed = true;
-            this.flushWaiters();
-        });
-        socket.on("error", () => {
-            this.closed = true;
-            this.flushWaiters();
-        });
-    }
-
-    async readExact(length: number, timeoutMs: number): Promise<Buffer> {
-        const deadline = Date.now() + timeoutMs;
-        while (this.buffered < length) {
-            if (this.closed) throw new Error("connection closed");
-            const remaining = deadline - Date.now();
-            if (remaining <= 0) throw new Error("read timeout");
-            await new Promise<void>((resolve, reject) => {
-                const timer = setTimeout(() => {
-                    this.waiters = this.waiters.filter((waiter) => waiter !== onReady);
-                    reject(new Error("read timeout"));
-                }, remaining);
-                const onReady = () => {
-                    clearTimeout(timer);
-                    resolve();
-                };
-                this.waiters.push(onReady);
-            });
-        }
-        const out = Buffer.allocUnsafe(length);
-        let offset = 0;
-        while (offset < length) {
-            const first = this.chunks[0];
-            const take = Math.min(first.length, length - offset);
-            first.copy(out, offset, 0, take);
-            offset += take;
-            if (take === first.length) this.chunks.shift();
-            else this.chunks[0] = first.subarray(take);
-            this.buffered -= take;
-        }
-        return out;
-    }
-
-    private flushWaiters(): void {
-        const waiters = this.waiters.splice(0);
-        for (const waiter of waiters) waiter();
-    }
-}
-
-async function writeAuthMessage(socket: net.Socket, value: unknown): Promise<void> {
-    const json = Buffer.from(JSON.stringify(value));
-    const len = Buffer.allocUnsafe(4);
-    len.writeUInt32LE(json.length, 0);
-    socket.write(Buffer.concat([len, json]));
-}
-
-async function readAuthMessage(reader: SocketReader, timeoutMs: number): Promise<unknown> {
-    const lenBytes = await reader.readExact(4, timeoutMs);
-    const len = lenBytes.readUInt32LE(0);
-    const body = await reader.readExact(len, timeoutMs);
-    return JSON.parse(body.toString("utf8"));
-}
-
-function proof(
-    key: Buffer,
-    domain: string,
-    clientNonce: Buffer,
-    serverNonce: Buffer,
-    daemonId: Buffer,
-): Buffer {
-    return createHmac("sha256", key)
-        .update(domain)
-        .update(clientNonce)
-        .update(serverNonce)
-        .update(daemonId)
-        .digest();
-}
-
-async function authenticateSubcClient(
-    socket: net.Socket,
-    reader: SocketReader,
-    conn: ConnectionInfo,
-    timeoutMs: number,
-): Promise<void> {
-    const key = Buffer.from(conn.key);
-    const clientNonce = randomBytes(NONCE_LEN);
-    await writeAuthMessage(socket, { client_nonce: [...clientNonce], role: "client" });
-    const serverProof = (await readAuthMessage(reader, timeoutMs)) as Record<string, unknown>;
-    const serverNonce = Buffer.from((serverProof.server_nonce as number[]) ?? []);
-    const daemonId = Buffer.from((serverProof.daemon_id as number[]) ?? []);
-    const serverProofBytes = Buffer.from((serverProof.server_proof as number[]) ?? []);
-    const expected = proof(key, AUTH_SERVER_DOMAIN, clientNonce, serverNonce, daemonId);
-    if (
-        daemonId.length !== conn.daemon_id.length ||
-        !timingSafeEqual(daemonId, Buffer.from(conn.daemon_id)) ||
-        serverProofBytes.length !== PROOF_LEN ||
-        !timingSafeEqual(serverProofBytes, expected)
-    ) {
-        throw new Error("invalid subc server proof");
-    }
-    const clientAuth = proof(key, AUTH_CLIENT_DOMAIN, clientNonce, serverNonce, daemonId);
-    await writeAuthMessage(socket, { client_auth: [...clientAuth] });
-}
-
-async function writeFrame(socket: net.Socket, frame: SubcFrame): Promise<void> {
-    const header = Buffer.allocUnsafe(SUBC_HEADER_LEN);
-    header.writeUInt32LE(frame.body.length, 0);
-    header.writeUInt8(SUBC_PROTOCOL_VERSION, 4);
-    header.writeUInt8(frame.type, 5);
-    header.writeUInt8(PRIORITY_BACKGROUND_FLAGS, 6);
-    header.writeUInt16LE(frame.channel, 7);
-    header.writeBigUInt64LE(BigInt(frame.corr), 9);
-    socket.write(Buffer.concat([header, frame.body]));
-}
-
-async function readFrame(reader: SocketReader, timeoutMs: number): Promise<SubcFrame> {
-    const header = await reader.readExact(SUBC_HEADER_LEN, timeoutMs);
-    const len = header.readUInt32LE(0);
-    const version = header.readUInt8(4);
-    if (version !== SUBC_PROTOCOL_VERSION)
-        throw new Error(`unsupported subc frame version ${version}`);
-    const type = header.readUInt8(5);
-    const channel = header.readUInt16LE(7);
-    const corr = Number(header.readBigUInt64LE(9));
-    const body = len > 0 ? await reader.readExact(len, timeoutMs) : Buffer.alloc(0);
-    return { type, channel, corr, body };
-}
-
-async function readTerminalFor(
-    reader: SocketReader,
-    channel: number,
-    corr: number,
-    timeoutMs: number,
-): Promise<SubcFrame> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) throw new Error("subc request timeout");
-        const frame = await readFrame(reader, remaining);
-        if (frame.channel === channel && frame.corr === corr) return frame;
-    }
-}
-
-function parseErrorBody(body: Buffer): Error & { code?: string } {
-    try {
-        const parsed = JSON.parse(body.toString("utf8")) as { code?: string; message?: string };
-        const error = new Error(
-            `${parsed.code ?? "subc_error"}: ${parsed.message ?? "unknown"}`,
-        ) as Error & { code?: string };
-        if (typeof parsed.code === "string") error.code = parsed.code;
-        return error;
-    } catch {
-        return new Error(body.toString("utf8") || "subc_error") as Error & { code?: string };
+        client?.close();
     }
 }
 
 export const __shadowSenderTest = {
-    SocketReader,
+    MAX_FACADE_FRAME_BYTES,
+    SHADOW_SEED_BATCH_MAX_BYTES,
     SubcShadowTransport,
+    buildPagedSeedPayloads,
     buildShadowResetBody,
     buildShadowTransformBody,
     buildStateSyncPayload,
+    flatWireBodyBytes,
     createSessionQueueState,
     denormalizeShadowOutput,
     flatBlockIdForRawMessage,

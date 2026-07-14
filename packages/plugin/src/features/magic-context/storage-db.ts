@@ -44,7 +44,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 50;
+export const LATEST_SUPPORTED_VERSION = 52;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -920,6 +920,17 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       pi_stable_id_scheme INTEGER
     );
 
+    CREATE TABLE IF NOT EXISTS tool_owner_backfill_state (
+      session_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'skipped')),
+      started_at INTEGER,
+      lease_expires_at INTEGER,
+      completed_at INTEGER,
+      last_error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_tool_owner_backfill_state_status
+      ON tool_owner_backfill_state(status);
+
     CREATE TABLE IF NOT EXISTS subagent_invocations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
@@ -1219,11 +1230,11 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // when parseReportedLimit() extracts a number; cleared on model switch.
     ensureColumn(db, "session_meta", "detected_context_limit", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "detected_context_limit_model_key", "TEXT");
-    // True when the current session has hit an unrecovered context overflow
-    // and needs the emergency recovery path (block at 95%, abort current
-    // request, fire historian + aggressive drops) on its next transform pass.
-    // Cleared once recovery succeeds.
+    // True when the session needs emergency recovery after either a provider
+    // overflow or proactive model shrink. The persisted origin distinguishes
+    // provider-proven abort eligibility from best-effort proactive recovery.
     ensureColumn(db, "session_meta", "needs_emergency_recovery", "INTEGER DEFAULT 0");
+    ensureColumn(db, "session_meta", "emergency_recovery_origin", "TEXT DEFAULT ''");
     // Deferred compaction-marker drain (plan v6). Intentionally NO DEFAULT
     // clause — absence is SQL NULL, presence is a JSON blob. Reader must
     // filter `IS NOT NULL AND != ''`. This column MUST NOT be added to
@@ -1398,13 +1409,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         ON transform_decisions(session_id, harness);
     `);
 
-    // NULL-column healing runs as migration v5 (one-shot at schema upgrade).
-    // Previously it ran on every plugin startup — each heal function issued
-    // ~25 no-op UPDATE statements (one per column) against session_meta,
-    // acquiring a write lock each time for zero rows on healed DBs. Moving
-    // the heal into the versioned migration system means it runs exactly
-    // once on affected DBs (v4 → v5 upgrade) and never again.
-    // See features/magic-context/migrations.ts.
+    // NULL-column healing runs in migration v5 and again in v51 to repair
+    // databases where the old v5 healer swallowed a transient write error.
+    // It stays out of the startup path so healed databases do not issue dozens
+    // of no-op UPDATE statements on every launch.
 
     // Plugin v0.16+ — `harness` column on every session-scoped table.
     // SQLite ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT physically backfills

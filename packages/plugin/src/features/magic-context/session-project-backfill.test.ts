@@ -136,7 +136,7 @@ describe("runSessionProjectBackfill", () => {
             },
         );
 
-        expect(result.status).toBe("completed");
+        expect(result.status).toBe("retry_pending");
         expect(result.unmappedSessions).toBe(2);
         expect(result.backfilledSessions).toBe(1);
         expect(result.skippedDeadDirectories).toBe(1);
@@ -243,7 +243,7 @@ describe("runSessionProjectBackfill", () => {
             },
         );
 
-        expect(result.status).toBe("completed");
+        expect(result.status).toBe("retry_pending");
         expect(result.unmappedSessions).toBe(1);
         expect(result.backfilledSessions).toBe(0);
         expect(result.skippedEmptyDirectories).toBe(1);
@@ -274,9 +274,78 @@ describe("runSessionProjectBackfill", () => {
 
         expect(result.status).toBe("completed");
         expect(result.backfilledSessions).toBe(11);
-        expect(leaseExpirations).toHaveLength(1);
-        expect(leaseExpirations[0]).toBe(8000 + 10 * 60 * 1000);
+        expect(leaseExpirations.length).toBeGreaterThan(1);
+        expect(leaseExpirations.every((expiration) => expiration > 7000)).toBe(true);
         expect(_getSessionProjectBackfillState(db)?.status).toBe("completed");
+    });
+
+    it("pages discovery and yields while processing many sessions in one directory", async () => {
+        const db = createDb();
+        const directory = makeTempDir("session-project-backfill-shared-");
+        const sessions = Array.from({ length: 205 }, (_, index) => ({
+            sessionId: `ses-page-${String(index).padStart(3, "0")}`,
+            directory,
+        }));
+        const pageCalls: Array<{ after: string | null; limit: number }> = [];
+        let yields = 0;
+
+        const result = await runSessionProjectBackfill(
+            db,
+            async (afterSessionId, limit) => {
+                pageCalls.push({ after: afterSessionId, limit });
+                const start =
+                    afterSessionId === null
+                        ? 0
+                        : sessions.findIndex((session) => session.sessionId === afterSessionId) + 1;
+                return sessions.slice(start, start + limit);
+            },
+            {
+                resolveIdentity: () => "git:shared-page",
+                yieldFn: () =>
+                    new Promise((resolve) =>
+                        setTimeout(() => {
+                            yields += 1;
+                            resolve();
+                        }, 0),
+                    ),
+            },
+        );
+
+        expect(result.status).toBe("completed");
+        expect(result.totalSessions).toBe(205);
+        expect(result.backfilledSessions).toBe(205);
+        expect(pageCalls.map((call) => call.limit)).toEqual([100, 100, 100]);
+        expect(yields).toBeGreaterThanOrEqual(8);
+    });
+
+    it("cannot complete a lease after another holder takes ownership", async () => {
+        const db = createDb();
+        const directory = makeTempDir("session-project-backfill-fence-");
+        const sessions = Array.from({ length: 30 }, (_, index) => ({
+            sessionId: `ses-fence-${index}`,
+            directory,
+        }));
+        let replacedHolder = false;
+
+        const result = await runSessionProjectBackfill(db, sessions, {
+            holderId: "holder-old",
+            resolveIdentity: () => "git:fenced",
+            yieldFn: async () => {
+                if (replacedHolder) return;
+                replacedHolder = true;
+                db.prepare(
+                    `UPDATE session_project_backfill_state
+                     SET holder_id = 'holder-new', lease_expires_at = 999999999
+                     WHERE harness = 'opencode'`,
+                ).run();
+            },
+        });
+
+        expect(result.status).toBe("lost_lease");
+        expect(_getSessionProjectBackfillState(db)).toMatchObject({
+            status: "running",
+            holder_id: "holder-new",
+        });
     });
 
     it("uses the default resolver seam for a git-shaped directory", async () => {

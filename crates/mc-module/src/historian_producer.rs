@@ -505,13 +505,24 @@ impl From<serde_json::Error> for HistorianProducerError {
     }
 }
 
+/// The daemon-assigned identity of an open consumer route.
+///
+/// This raw client cannot construct `subc_client_rs::RouteHandle` because that type also
+/// fences SDK-managed connections. It retains the serializable wire identity needed to
+/// stamp every data-plane frame and reject stale replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenedRoute {
+    channel: u16,
+    epoch: u32,
+}
+
 pub struct HistorianProducer {
     config: HistorianProducerConfig,
     stream: TcpStream,
     next_corr: u64,
     session_id: Option<String>,
-    command_route: Option<u16>,
-    subscribe_route: Option<u16>,
+    command_route: Option<OpenedRoute>,
+    subscribe_route: Option<OpenedRoute>,
 }
 
 impl HistorianProducer {
@@ -686,7 +697,7 @@ impl HistorianProducer {
         }
     }
 
-    async fn ensure_command_route(&mut self) -> Result<u16, HistorianProducerError> {
+    async fn ensure_command_route(&mut self) -> Result<OpenedRoute, HistorianProducerError> {
         if let Some(route) = self.command_route {
             return Ok(route);
         }
@@ -695,7 +706,7 @@ impl HistorianProducer {
         Ok(route)
     }
 
-    async fn ensure_subscribe_route(&mut self) -> Result<u16, HistorianProducerError> {
+    async fn ensure_subscribe_route(&mut self) -> Result<OpenedRoute, HistorianProducerError> {
         if let Some(route) = self.subscribe_route {
             return Ok(route);
         }
@@ -704,7 +715,7 @@ impl HistorianProducer {
         Ok(route)
     }
 
-    async fn open_bound_route(&mut self) -> Result<u16, HistorianProducerError> {
+    async fn open_bound_route(&mut self) -> Result<OpenedRoute, HistorianProducerError> {
         let session = self
             .session_id
             .clone()
@@ -723,15 +734,30 @@ impl HistorianProducer {
         };
         let corr = self.next_corr();
         let body = serde_json::to_vec(&request)?;
-        self.write_frame(FrameType::Request, 0, corr, body).await?;
+        self.write_frame(FrameType::Request, 0, 0, corr, body)
+            .await?;
         let frame = self
-            .read_terminal_for(0, corr, self.config.request_timeout)
+            .read_terminal_for(
+                OpenedRoute {
+                    channel: 0,
+                    epoch: 0,
+                },
+                corr,
+                self.config.request_timeout,
+            )
             .await?;
         match frame.header.ty {
             FrameType::Response => {
                 let response: ClientControlResponse = serde_json::from_slice(&frame.body)?;
-                if let ClientControlResponse::RouteOpen { route_channel } = response {
-                    Ok(route_channel)
+                if let ClientControlResponse::RouteOpen {
+                    route_channel,
+                    route_epoch,
+                } = response
+                {
+                    Ok(OpenedRoute {
+                        channel: route_channel,
+                        epoch: route_epoch,
+                    })
                 } else {
                     Err(HistorianProducerError::UnexpectedControlResponse)
                 }
@@ -743,12 +769,12 @@ impl HistorianProducer {
 
     async fn unary_json(
         &mut self,
-        channel: u16,
+        route: OpenedRoute,
         body: Value,
     ) -> Result<Value, HistorianProducerError> {
-        let corr = self.send_request(channel, body).await?;
+        let corr = self.send_request(route, body).await?;
         let frame = self
-            .read_terminal_for(channel, corr, self.config.request_timeout)
+            .read_terminal_for(route, corr, self.config.request_timeout)
             .await?;
         match frame.header.ty {
             FrameType::Response => Ok(serde_json::from_slice(&frame.body)?),
@@ -760,19 +786,19 @@ impl HistorianProducer {
 
     async fn send_request(
         &mut self,
-        channel: u16,
+        route: OpenedRoute,
         body: Value,
     ) -> Result<u64, HistorianProducerError> {
         let corr = self.next_corr();
         let bytes = serde_json::to_vec(&body)?;
-        self.write_frame(FrameType::Request, channel, corr, bytes)
+        self.write_frame(FrameType::Request, route.channel, route.epoch, corr, bytes)
             .await?;
         Ok(corr)
     }
 
     async fn drain_subscribe(
         &mut self,
-        channel: u16,
+        route: OpenedRoute,
         corr: u64,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError> {
@@ -783,7 +809,10 @@ impl HistorianProducer {
             let Some(frame) = read_frame(&mut self.stream).await? else {
                 return Err(HistorianProducerError::UnexpectedStreamEnd);
             };
-            if frame.header.channel != channel || frame.header.corr != corr {
+            if frame.header.channel != route.channel
+                || frame.header.epoch != route.epoch
+                || frame.header.corr != corr
+            {
                 continue;
             }
             match frame.header.ty {
@@ -852,7 +881,7 @@ impl HistorianProducer {
 
     async fn read_terminal_for(
         &mut self,
-        channel: u16,
+        route: OpenedRoute,
         corr: u64,
         timeout: Duration,
     ) -> Result<Frame, HistorianProducerError> {
@@ -861,7 +890,10 @@ impl HistorianProducer {
                 let Some(frame) = read_frame(&mut self.stream).await? else {
                     return Err(HistorianProducerError::UnexpectedStreamEnd);
                 };
-                if frame.header.channel == channel && frame.header.corr == corr {
+                if frame.header.channel == route.channel
+                    && frame.header.epoch == route.epoch
+                    && frame.header.corr == corr
+                {
                     return Ok(frame);
                 }
             }
@@ -877,6 +909,7 @@ impl HistorianProducer {
         &mut self,
         ty: FrameType,
         channel: u16,
+        epoch: u32,
         corr: u64,
         body: Vec<u8>,
     ) -> Result<(), HistorianProducerError> {
@@ -884,6 +917,7 @@ impl HistorianProducer {
             ty,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            epoch,
             corr,
             body,
         )?;
@@ -891,11 +925,12 @@ impl HistorianProducer {
         Ok(())
     }
 
-    async fn send_goodbye(&mut self, channel: u16) -> Result<(), HistorianProducerError> {
+    async fn send_goodbye(&mut self, route: OpenedRoute) -> Result<(), HistorianProducerError> {
         let frame = Frame::build(
             FrameType::Goodbye,
             Flags::new(false, Priority::Interactive, false),
-            channel,
+            route.channel,
+            route.epoch,
             0,
             Vec::new(),
         )?;
@@ -988,6 +1023,9 @@ fn unit_run_id(unit: &Value) -> Option<&str> {
 /// template/seed prose. Flat `text`/`content` fields are kept as a fallback for
 /// simpler unit shapes.
 fn unit_text(unit: &Value) -> Option<String> {
+    if !unit_type(unit).is_some_and(|ty| ty.eq_ignore_ascii_case("assistant_message")) {
+        return None;
+    }
     if let Some(blocks) = unit
         .get("message")
         .and_then(|m| m.get("content"))
@@ -1300,9 +1338,11 @@ mod tests {
                             send_response_frame(
                                 &mut stream,
                                 frame.header.channel,
+                                frame.header.epoch,
                                 frame.header.corr,
                                 serde_json::to_vec(&ClientControlResponse::RouteOpen {
                                     route_channel: route,
+                                    route_epoch: 1,
                                 })
                                 .unwrap(),
                             )
@@ -1317,6 +1357,7 @@ mod tests {
                                 send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
+                                    frame.header.epoch,
                                     frame.header.corr,
                                     serde_json::to_vec(&send_response).unwrap(),
                                 )
@@ -1328,6 +1369,7 @@ mod tests {
                                     send_stream_data(
                                         &mut stream,
                                         frame.header.channel,
+                                        frame.header.epoch,
                                         frame.header.corr,
                                         event,
                                     )
@@ -1336,6 +1378,7 @@ mod tests {
                                 send_stream_end(
                                     &mut stream,
                                     frame.header.channel,
+                                    frame.header.epoch,
                                     frame.header.corr,
                                 )
                                 .await;
@@ -1344,6 +1387,7 @@ mod tests {
                                 send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
+                                    frame.header.epoch,
                                     frame.header.corr,
                                     serde_json::to_vec(
                                         &json!({"state":"terminal","run_id":"run-1","head":"h"}),
@@ -1356,6 +1400,7 @@ mod tests {
                                 send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
+                                    frame.header.epoch,
                                     frame.header.corr,
                                     serde_json::to_vec(&json!({"ack":true})).unwrap(),
                                 )
@@ -1378,11 +1423,18 @@ mod tests {
         }
     }
 
-    async fn send_response_frame(stream: &mut TcpStream, channel: u16, corr: u64, body: Vec<u8>) {
+    async fn send_response_frame(
+        stream: &mut TcpStream,
+        channel: u16,
+        epoch: u32,
+        corr: u64,
+        body: Vec<u8>,
+    ) {
         let frame = Frame::build(
             FrameType::Response,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            epoch,
             corr,
             body,
         )
@@ -1390,11 +1442,18 @@ mod tests {
         write_frame(stream, &frame).await.unwrap();
     }
 
-    async fn send_stream_data(stream: &mut TcpStream, channel: u16, corr: u64, event: Value) {
+    async fn send_stream_data(
+        stream: &mut TcpStream,
+        channel: u16,
+        epoch: u32,
+        corr: u64,
+        event: Value,
+    ) {
         let frame = Frame::build(
             FrameType::StreamData,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            epoch,
             corr,
             serde_json::to_vec(&event).unwrap(),
         )
@@ -1402,11 +1461,12 @@ mod tests {
         write_frame(stream, &frame).await.unwrap();
     }
 
-    async fn send_stream_end(stream: &mut TcpStream, channel: u16, corr: u64) {
+    async fn send_stream_end(stream: &mut TcpStream, channel: u16, epoch: u32, corr: u64) {
         let frame = Frame::build(
             FrameType::StreamEnd,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            epoch,
             corr,
             Vec::new(),
         )
@@ -1494,6 +1554,22 @@ mod tests {
             log.sends[0].get("system").is_none(),
             "empty system must be omitted, not sent as \"\""
         );
+    }
+
+    #[test]
+    fn unit_text_collects_only_assistant_message_units() {
+        let leaked = json!({
+            "type": "example_replay",
+            "message": {"content": [{"type": "text", "text": "seed output"}]},
+            "text": "flat seed output"
+        });
+        let assistant = json!({
+            "type": "assistant_message",
+            "message": {"content": [{"type": "text", "text": "real output"}]}
+        });
+
+        assert_eq!(unit_text(&leaked), None);
+        assert_eq!(unit_text(&assistant).as_deref(), Some("real output"));
     }
 
     #[tokio::test]

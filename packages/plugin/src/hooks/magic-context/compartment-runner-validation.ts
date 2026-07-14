@@ -14,15 +14,13 @@ const MIN_RECOMP_CHUNK_TOKEN_BUDGET = 20;
  *
  * Historian frequently skips tool-only blocks — blocks whose visible chunk content
  * is TC: lines with no narrative text. That's a safe skip: no durable signal is lost.
- * When we know (from the chunk's `toolOnlyRanges`) that a gap falls entirely within
- * one of those tool-only ranges, we heal it regardless of size. This catches the common
- * failure case of a 16–30+ message debug/build-test tool chain that historian correctly
- * identified as pure noise.
+ * When the chunk's `toolOnlyRanges` proves that the whole gap is tool-only, heal it
+ * regardless of size.
  *
- * For gaps not covered by tool-only ranges, we still apply a small safety net (≤15
- * messages) for edge cases like boundary noise or dropped placeholders. Larger
- * non-tool-only gaps likely indicate historian dropped real narrative and should
- * fail validation to trigger a repair retry.
+ * Never absorb an unclassified gap. Production replay with the lowest-calibration
+ * historian showed contiguous narrative coverage, so there is no model-quality need
+ * for a size-based escape hatch. Rejecting instead preserves the prior boundary; the
+ * runner then re-reads the same raw messages on its repair attempt or next run.
  *
  * Mutates the compartments array in place.
  */
@@ -30,8 +28,6 @@ function healCompartmentGaps(
     compartments: Array<{ startMessage: number; endMessage: number }>,
     toolOnlyRanges: ReadonlyArray<{ start: number; end: number }> = [],
 ): void {
-    const SAFETY_HEAL_GAP = 15;
-
     for (let i = 1; i < compartments.length; i++) {
         const prev = compartments[i - 1];
         const curr = compartments[i];
@@ -41,15 +37,12 @@ function healCompartmentGaps(
 
         if (gapSize <= 0) continue;
 
-        // Heal if gap is fully within a single tool-only range (any size — the skipped
-        // messages were TC-only noise, no narrative lost).
+        // Tool-only noise is the only gap class that is safe to absorb.
         const fullyInsideToolOnly = toolOnlyRanges.some(
             (range) => range.start <= gapStart && range.end >= gapEnd,
         );
 
-        // Or heal small gaps as a safety net for edge cases (boundary noise,
-        // dropped placeholders, or rare sub-threshold non-tool skips).
-        if (fullyInsideToolOnly || gapSize <= SAFETY_HEAL_GAP) {
+        if (fullyInsideToolOnly) {
             prev.endMessage = gapEnd;
         }
     }
@@ -76,9 +69,8 @@ export function validateHistorianOutput(
         };
     }
 
-    // Heal gaps between compartments by expanding the previous compartment's endMessage.
-    // Tool-only ranges heal at any size (historian legitimately skipped pure tool noise);
-    // other small gaps heal up to a conservative safety limit.
+    // Heal only proven tool-only gaps. Narrative gaps reject before publication, so
+    // the runner keeps its prior boundary and re-reads those raw messages.
     healCompartmentGaps(parsed.compartments, chunk.toolOnlyRanges);
 
     const mapped = mapParsedCompartmentsToChunk(parsed.compartments, chunk, sequenceOffset);

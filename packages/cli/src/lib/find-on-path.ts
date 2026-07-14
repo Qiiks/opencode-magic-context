@@ -46,13 +46,13 @@ export function findOnPath(binary: string): string | null {
         if (!dir) continue; // empty PATH segments (rare but valid)
         for (const candidate of candidates) {
             const fullPath = join(dir, candidate);
-            if (isExecutable(fullPath, isWindows)) return fullPath;
+            if (isExecutableFile(fullPath, isWindows)) return fullPath;
         }
     }
     return null;
 }
 
-function isExecutable(path: string, isWindows: boolean): boolean {
+export function isExecutableFile(path: string, isWindows = process.platform === "win32"): boolean {
     try {
         if (!existsSync(path)) return false;
         // statSync follows symlinks by default — important because wrapper

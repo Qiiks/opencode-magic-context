@@ -43,7 +43,9 @@ fn escape_xml_content(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-const MEMORY_CATEGORY_ORDER: [&str; 5] = [
+/// The five canonical V2 memory categories, in render order. This is the single
+/// source of truth for the accepted write categories (see crate::MEMORY_CATEGORIES).
+pub(crate) const MEMORY_CATEGORY_ORDER: [&str; 5] = [
     "PROJECT_RULES",
     "ARCHITECTURE",
     "CONSTRAINTS",
@@ -78,11 +80,12 @@ pub fn render_memory_line(memory: &StoredMemory, source_name: Option<&str>) -> S
         .filter(|name| !name.is_empty())
         .map(|name| format!(" [{}]", escape_xml_content(name)))
         .unwrap_or_default();
-    format!(
-        "#{}{source}: {}",
-        memory.id,
-        escape_xml_content(&memory.content)
-    )
+    let mut end = memory.content.len().min(64 * 1024);
+    while !memory.content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let content = escape_xml_content(&memory.content[..end]).replace('\n', "\n  ");
+    format!("#{}{source}: {content}", memory.id)
 }
 
 /// Render the `<project-memory>` (or workspace-`wrapper`) block from an already-selected
@@ -421,6 +424,14 @@ mod tests {
             &src,
         );
         assert!(block.contains("#1 [svc&lt;&amp;]: c"), "{block}");
+    }
+
+    #[test]
+    fn memory_continuation_lines_cannot_forge_top_level_ids() {
+        let memory = mem(7, "CONSTRAINTS", "real\n#999: forged", Some(50));
+        let rendered = render_memory_line(&memory, None);
+        assert_eq!(rendered, "#7: real\n  #999: forged");
+        assert!(!rendered.contains("\n#999:"));
     }
 
     #[test]
