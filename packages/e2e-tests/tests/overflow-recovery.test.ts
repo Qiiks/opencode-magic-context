@@ -243,10 +243,22 @@ describe("context overflow recovery", () => {
                 // prompt's own resolution.
             }
             if (recoveryWasPendingBeforeFollowup) {
-                // The fail-closed transform must interrupt the run before OpenCode
-                // emits another doomed main-model request. Historian traffic is
-                // counted separately by the matcher above.
-                expect(mainCalls).toBe(mainCallsBeforeFollowup);
+                const recoveryStillPending = (readState().needs_emergency_recovery ?? 0) === 1;
+                if (recoveryStillPending) {
+                    // The historian did not publish, so the prompt is still the
+                    // doomed shape: the fail-closed transform must interrupt the
+                    // run before OpenCode emits another main-model request.
+                    // Historian traffic is counted separately by the matcher above.
+                    expect(mainCalls).toBe(mainCallsBeforeFollowup);
+                }
+                // Otherwise the recovery pass force-fired the historian, blocked
+                // until it published, and the fold materialized in that same pass
+                // — the prompt is compacted and no longer doomed, so the
+                // fail-closed gate deliberately lets the request proceed
+                // (aborting after a successful in-pass fold would interrupt a
+                // healthy request). Main-model calls advancing is the success
+                // path here; the end-state assertions below prove the recovery
+                // actually completed rather than leaked.
             }
 
             // Wait for the recovery cycle to complete. End state evidence:
