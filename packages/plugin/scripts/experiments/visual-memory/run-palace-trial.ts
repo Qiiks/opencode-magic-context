@@ -486,8 +486,48 @@ function responseUsage(payload: unknown): TokenUsage | undefined {
     };
 }
 
-async function callOpenRouter(apiKey: string, model: string, messages: ChatMessage[]): Promise<Completion> {
-    const response = await fetch(OPENROUTER_ENDPOINT, {
+const OLLAMA_CLOUD_PREFIX = "ollama-cloud/";
+const OLLAMA_CLOUD_ENDPOINT = "https://ollama.com/v1/chat/completions";
+
+// Lazy, cached per-provider key resolution so an all-ollama run needs no OpenRouter
+// key and vice versa. OpenRouter key: ~/.config/openrouter.key. Ollama-cloud key:
+// OpenCode's auth.json ("ollama-cloud".key), the same credential OpenCode uses.
+const keyCache = new Map<string, string>();
+function resolveOpenRouterKey(): string {
+    const cached = keyCache.get("openrouter");
+    if (cached !== undefined) return cached;
+    const key = readFileSync(join(homedir(), ".config", "openrouter.key"), "utf8").trim();
+    if (!key) throw new Error("OpenRouter key is empty: ~/.config/openrouter.key");
+    keyCache.set("openrouter", key);
+    return key;
+}
+function resolveOllamaCloudKey(): string {
+    const cached = keyCache.get("ollama-cloud");
+    if (cached !== undefined) return cached;
+    // OpenCode's auth.json lives under XDG data (~/.local/share/opencode), with the
+    // legacy ~/.config/opencode path as a fallback. Read whichever exists.
+    const authCandidates = [
+        join(homedir(), ".local", "share", "opencode", "auth.json"),
+        join(homedir(), ".config", "opencode", "auth.json"),
+    ];
+    const authPath = authCandidates.find(existsSync);
+    if (!authPath) throw new Error(`opencode auth.json not found (looked in ${authCandidates.join(", ")})`);
+    const auth = JSON.parse(readFileSync(authPath, "utf8")) as Record<string, { key?: string }>;
+    const key = auth["ollama-cloud"]?.key?.trim();
+    if (!key) throw new Error(`ollama-cloud key not found in ${authPath}`);
+    keyCache.set("ollama-cloud", key);
+    return key;
+}
+
+async function callChatCompletions(
+    endpoint: string,
+    apiKey: string,
+    label: string,
+    model: string,
+    messages: ChatMessage[],
+    extraBody: Record<string, unknown>,
+): Promise<Completion> {
+    const response = await fetch(endpoint, {
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -495,21 +535,39 @@ async function callOpenRouter(apiKey: string, model: string, messages: ChatMessa
             messages,
             temperature: 0.1,
             max_tokens: MAX_OUTPUT_TOKENS,
-            ...(model === "google/gemini-3.5-flash" ? {} : { reasoning: { enabled: false } }),
+            ...extraBody,
         }),
         signal: AbortSignal.timeout(10 * 60 * 1_000),
     });
     const text = await response.text();
-    if (!response.ok) throw new Error(`OpenRouter ${response.status}: ${text.replace(/\s+/g, " ").slice(0, 500)}`);
+    if (!response.ok) throw new Error(`${label} ${response.status}: ${text.replace(/\s+/g, " ").slice(0, 500)}`);
     let payload: unknown;
     try {
         payload = JSON.parse(text);
     } catch (error) {
-        throw new Error(`OpenRouter returned non-JSON: ${errorMessage(error)}`);
+        throw new Error(`${label} returned non-JSON: ${errorMessage(error)}`);
     }
     const content = responseContent(payload);
-    if (!content) throw new Error("OpenRouter response has no assistant text");
+    if (!content) throw new Error(`${label} response has no assistant text`);
     return { content, usage: responseUsage(payload) };
+}
+
+// Dispatch by model-id prefix: `ollama-cloud/<name>` -> ollama.com; anything else -> OpenRouter.
+async function callModel(model: string, messages: ChatMessage[]): Promise<Completion> {
+    if (model.startsWith(OLLAMA_CLOUD_PREFIX)) {
+        const bareModel = model.slice(OLLAMA_CLOUD_PREFIX.length);
+        return callChatCompletions(
+            OLLAMA_CLOUD_ENDPOINT,
+            resolveOllamaCloudKey(),
+            "ollama-cloud",
+            bareModel,
+            messages,
+            {},
+        );
+    }
+    return callChatCompletions(OPENROUTER_ENDPOINT, resolveOpenRouterKey(), "OpenRouter", model, messages, {
+        ...(model === "google/gemini-3.5-flash" ? {} : { reasoning: { enabled: false } }),
+    });
 }
 
 function safeName(value: string): string {
@@ -529,7 +587,6 @@ function promptPath(value: string): string {
 }
 
 async function runCategory(args: {
-    apiKey: string;
     model: string;
     systemPrompt: string;
     category: Category;
@@ -545,7 +602,7 @@ async function runCategory(args: {
     const rawPath = join(args.outputDir, `raw-${args.category.toLowerCase()}.xml`);
     let raw: string;
     try {
-        const completion = await callOpenRouter(args.apiKey, args.model, baseMessages);
+        const completion = await callModel(args.model, baseMessages);
         raw = completion.content;
         if (completion.usage) usage.push(completion.usage);
     } catch (error) {
@@ -566,7 +623,7 @@ async function runCategory(args: {
 
     writeFileSync(rawPath.replace(/\.xml$/, ".attempt-1.xml"), raw);
     try {
-        const completion = await callOpenRouter(args.apiKey, args.model, [
+        const completion = await callModel(args.model, [
             ...baseMessages,
             {
                 role: "user",
@@ -697,7 +754,6 @@ function renderPalaceCell(args: {
 
 async function runCell(args: {
     corpus: PalaceCorpus;
-    apiKey: string;
     model: string;
     promptPath: string;
 }): Promise<CellResult> {
@@ -711,7 +767,6 @@ async function runCell(args: {
         if (memories.length === 0) continue;
         categoryRuns.push(
             await runCategory({
-                apiKey: args.apiKey,
                 model: args.model,
                 systemPrompt: prompt,
                 category,
@@ -948,15 +1003,13 @@ async function main(): Promise<void> {
         return;
     }
     if (args.models.length === 0 || args.prompts.length === 0) usage();
-    const apiKey = readFileSync(join(homedir(), ".config", "openrouter.key"), "utf8").trim();
-    if (!apiKey) throw new Error("OpenRouter key is empty: ~/.config/openrouter.key");
     const corpus = readCorpus();
     const results: CellResult[] = [];
     for (const requestedPrompt of args.prompts) {
         const candidatePrompt = promptPath(requestedPrompt);
         for (const model of args.models) {
             console.log(`running ${model} × ${basename(candidatePrompt)}`);
-            results.push(await runCell({ corpus, apiKey, model, promptPath: candidatePrompt }));
+            results.push(await runCell({ corpus, model, promptPath: candidatePrompt }));
         }
     }
     writeReport(results);
