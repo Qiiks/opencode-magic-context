@@ -5,7 +5,7 @@
     "": {},
     "packages/cli": {
       "name": "@cortexkit/magic-context",
-      "version": "0.30.2",
+      "version": "0.31.5",
       "bin": {
         "magic-context": "dist/index.js",
       },
@@ -67,7 +67,7 @@
     },
     "packages/pi-plugin": {
       "name": "@cortexkit/pi-magic-context",
-      "version": "0.30.2",
+      "version": "0.31.5",
       "dependencies": {
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
@@ -93,9 +93,9 @@
     },
     "packages/plugin": {
       "name": "@cortexkit/opencode-magic-context",
-      "version": "0.30.2",
+      "version": "0.31.5",
       "dependencies": {
-        "@cortexkit/subc-client": "0.4.0",
+        "@cortexkit/subc-client": "0.4.1",
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
         "@opencode-ai/plugin": "^1.17.11",
@@ -340,7 +340,7 @@
 
     "@cortexkit/pi-magic-context": ["@cortexkit/pi-magic-context@workspace:packages/pi-plugin"],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.4.0", "", {}, "sha512-MhZ2p4HDzVW2y83GM76Ep95H1X5+3duj4SSKIxI/ucK8sjDzvEDUEqL5XeHKNQOcZqAy/+cfwsbku9HbClftxg=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.4.1", "", {}, "sha512-kHLx5L/iefnbR/fiETQsCGGCegoQ/rcr70J7r/RfPakci6G1lEcTcK5V67o6WGWs4IOizkCM2tPa4ew8cp1tzA=="],
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
 
