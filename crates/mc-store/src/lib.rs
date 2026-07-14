@@ -7215,6 +7215,76 @@ mod shadow_tests {
     }
 
     #[test]
+    fn assembled_paged_seed_without_reset_retains_omitted_compartments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "shadow:reset-required";
+        let initial = vec![comp(0, 0, "first#0"), comp(1, 1, "stale#0")];
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                compartments: &initial,
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+
+        // A completed paged seed reaches the store as one assembled request. Omitting
+        // the existing sequence-1 compartment here preserves it unless reset ran first.
+        let replacement = vec![comp(0, 0, "replacement#0")];
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 0,
+                expected_shadow_seq: 1,
+                seed_boundary_id: None,
+                compartments: &replacement,
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .load_compartments(session)
+                .unwrap()
+                .iter()
+                .map(|compartment| compartment.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "state_sync upserts and cannot prove completeness without a prior reset"
+        );
+
+        store.reset_shadow_session(session, session).unwrap();
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 1,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                compartments: &replacement,
+                memories: &[],
+                memory_mutations: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+        assert_eq!(store.load_compartments(session).unwrap().len(), 1);
+    }
+
+    #[test]
     fn shadow_seed_boundary_mismatch_rejects_without_partial_writes() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
