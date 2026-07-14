@@ -27,7 +27,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const CORPUS_PATH = join(HERE, "corpus", "palace-corpus.json");
 const TRIALS_DIR = join(HERE, "trials");
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-const MAX_OUTPUT_TOKENS = 16_384;
+// Thinking models (deepseek-v4-pro, qwen3.5 on ollama-cloud) spend a large share of
+// the budget on reasoning before emitting content; 16k starved the big categories
+// into empty-content responses. 32k matches the historian producer's budget.
+const MAX_OUTPUT_TOKENS = 32_768;
 const ANCHOR_FIDELITY_FLOOR = 85;
 
 const CATEGORY_ORDER = [
@@ -570,11 +573,12 @@ async function callModel(model: string, messages: ChatMessage[]): Promise<Comple
     });
 }
 
-function safeName(value: string): string {
-    return value
-        .replace(extname(value), "")
-        .replace(/[^A-Za-z0-9._-]+/g, "-")
-        .replace(/^-+|-+$/g, "") || "unnamed";
+// Extension-stripping is for prompt FILE names only. Model ids must keep their
+// dots and suffixes verbatim: stripping extname collapsed glm-5.1 and glm-5.2
+// into the same trial directory and truncated kimi-k2.7-code to kimi-k2.
+function safeName(value: string, opts?: { stripExtension?: boolean }): string {
+    const base = opts?.stripExtension ? value.replace(extname(value), "") : value;
+    return base.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unnamed";
 }
 
 function promptPath(value: string): string {
@@ -758,7 +762,7 @@ async function runCell(args: {
     promptPath: string;
 }): Promise<CellResult> {
     const prompt = readFileSync(args.promptPath, "utf8");
-    const directory = join(TRIALS_DIR, `${safeName(basename(args.promptPath))}__${safeName(args.model)}`);
+    const directory = join(TRIALS_DIR, `${safeName(basename(args.promptPath), { stripExtension: true })}__${safeName(args.model)}`);
     mkdirSync(directory, { recursive: true });
     const importanceById = new Map(args.corpus.memories.map((memory) => [memory.id, memory.importance]));
     const categoryRuns: CategoryRun[] = [];
