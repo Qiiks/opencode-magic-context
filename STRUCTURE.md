@@ -132,21 +132,21 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/hooks/magic-context/todo-view.ts`: Build the deterministic synthetic todowrite tool part and compute its hash-based `call_id`.
 - `src/hooks/magic-context/supersession-reclaim.ts`: Select superseded spent control-plane tool outputs (oldest todowrite, ctx_reduce, zero-value meta calls) and older edit/write calls for the same file under the `smart_drops` configuration flag.
 - `src/hooks/magic-context/edit-marker.ts`: Implement `edit_marker` mode to compress superseded edits, keeping the `filePath` and a region-hint prefix while dropping the bulky output content.
-- `src/hooks/magic-context/shadow-sender.ts`: Mirror finalized transform passes, inputs, and decisions to the Rust module over the subc protocol using the `@cortexkit/subc-client` library (wire v2 protocol via `SubcClient` and `RouteHandle`) under the `shadow_transform` configuration flag.
+- `src/hooks/magic-context/shadow-sender.ts`: Mirror finalized transform passes, inputs, and decisions to the Rust module over the subc protocol using the `@cortexkit/subc-client` library (wire v2 protocol via `SubcClient` and `RouteHandle`) under the `shadow_transform` configuration flag. Pages large cold-start state_sync seeds into batches under 512KiB to stay under transport limits.
 - `src/hooks/magic-context/inject-compartments.ts`: m[0]/m[1] history layout — `renderM0`/`renderM1`/`materializeM0`/`mustMaterialize` (mirrored in Pi's `inject-compartments-pi.ts`).
 - `src/hooks/magic-context/decay-curve.ts`: Council-validated deterministic tier-decay math (half-life, log-cost tier boundaries, budget pressure).
 - `src/hooks/magic-context/decay-render.ts`: Shared OpenCode+Pi compartment renderer built on the decay curve (replaces the removed LLM compressor).
 - `src/hooks/magic-context/compartment-runner-incremental.ts`: v2 historian publish path — bounded reference blocks, tiered/scored compartments, faithful per-chunk facts, discard-last, events + `p1_embedding` on publish.
 - `src/hooks/magic-context/wrapup-orchestrator.ts`: Orchestrate the manual `/ctx-wrapup` history compaction loop across sequential token-capped chunks.
 - `src/hooks/magic-context/reference-retrieval.ts` (+ `reference-seeds.generated.ts`): 4 rotating seed compartments + last-6 recency references for the historian prompt.
-- `src/hooks/magic-context/historian-prompt.generated.ts`: Generated v8.7.3 historian system prompt (source: `.alfonso/.../historian-prompt-v8.7.3.md`; re-exported via `compartment-prompt.ts`).
+- `src/hooks/magic-context/historian-prompt.generated.ts`: Generated v8.7.4 historian system prompt (source: `src/hooks/magic-context/historian-prompt.source.md`; re-exported via `compartment-prompt.ts`).
 - `src/features/magic-context/memory/memory-migration.ts`: `/ctx-session-upgrade` 9-cat→5-cat memory re-eval (active-only, permanent-safe, epoch-bumping).
 - `src/features/magic-context/memory/project-identity.ts`: Resolve stable project identities (`git:<sha>` or fallback `dir:<md5-12>`) using git root commits or directory hashes, caching directory fallbacks, and utilizing a cooldown period for transient git errors.
 - `src/features/magic-context/storage-db.ts`: Create durable storage; run versioned migrations; resolve runtime SQLite backend.
 - `src/features/magic-context/storage-clone.ts`: Implement transaction-locked session state copy helpers for clone forks.
 - `src/features/magic-context/storage-schema-helpers.ts`: Implement schema-mutation and NULL-healing helpers to avoid dependency cycles between database creation and migrations.
 - `src/features/magic-context/storage-meta-persisted.ts`: Read and write per-session persisted scalars and JSON blobs.
-- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v50 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
+- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v52 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
 - `src/features/magic-context/message-index.ts`: FTS-backed raw-message index for `ctx_search`.
 - `src/features/magic-context/search.ts`: Unified retrieval over memories, raw messages, git commits, and session/smart notes.
 - `src/features/magic-context/session-project-storage.ts`: Persist session-to-project bindings and repair mis-scoped compartment chunk embeddings.
@@ -166,7 +166,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `crates/mc-module/src/injection.rs`: Builds the `m0`/`m1` structures and injects synthetic message parts in Rust.
 - `crates/mc-module/src/boundary.rs`: Resolves the boundary between compactable history and the protected tail in Rust.
 - `crates/mc-module/src/session_resolver.rs`: Resolves incoming MCP facade requests to their backing project and session.
-- `crates/mc-module/src/lib.rs`: Route subc client requests, implement MCP tool facade routing (supporting `agent_drops.append` queue drops with server-side range parsing and command-id idempotency checks), serve prompt guidance, and manage durable pass tracing for transform passes.
+- `crates/mc-module/src/lib.rs`: Route subc client requests, implement MCP tool facade routing (supporting `agent_drops.append` queue drops with server-side range parsing and command-id idempotency checks), serve prompt guidance, manage durable pass tracing for transform passes, and reassemble paged shadow state-sync seeds.
 - `crates/mc-module/src/historian_producer.rs`: Implement the Rust subc historian producer client using the wire v2 protocol with `OpenedRoute` targeting (channel and epoch routing).
 - `crates/mc-store/src/lib.rs`: Define durable session schemas and migrations (including the `mc_reduce_command_ledger` table in migration 16 for idempotency), handle metadata, and run CAS transitions.
 - `crates/mc-module/src/codec/`: Decode harness-specific JSON messages (OpenCode, Pi) into canonical `CkIngressMessage` values and encode them back using harness model codecs.
