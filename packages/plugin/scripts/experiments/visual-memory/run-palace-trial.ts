@@ -858,7 +858,11 @@ async function runCell(args: {
         } catch (error) {
             const message = errorMessage(error);
             addValidatorFailure(failures, message);
-            renderError = `validator: ${message}`;
+            // Dev-only escape hatch for eyeball passes: render the near-miss manifest
+            // anyway while keeping the failure in metrics so the verdict stays honest.
+            if (process.env.PALACE_RENDER_DESPITE_VALIDATOR !== "1") {
+                renderError = `validator: ${message}`;
+            }
         }
         if (!renderError) {
             const rendered = renderPalaceCell({ corpus: args.corpus, specs, outputDir: directory });
