@@ -7019,48 +7019,58 @@ mod tests {
     fn newest_tag_block_set_isolates_protected_and_applied_pending_rows() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        // The protected set is the newest 20 ACTIVE tags as exact block ids — a
-        // fixture with contiguous one-tag-per-ordinal numbering could pass under
-        // a (forbidden) numeric-threshold or ordinal-cutoff implementation. Force
-        // the distinction: non-contiguous tag numbers, two tags on ONE ordinal
-        // (m24 carries a message tag and a second same-ordinal block), a
-        // stale-provenance row (source bytes no longer match the live carrier),
-        // and a frozen row — all of which must be excluded from slots exactly.
-        let mut messages = (1..=25)
+        // The protected set is the newest 20 ACTIVE tags as exact block ids.
+        // This fixture is built so every cheaper implementation class fails at
+        // the rank-20 boundary itself, not just at the extremes:
+        //   - ACTIVE numbers have holes: m23#0 is stale-provenance and three
+        //     "ghost" rows hold the TOP numbers (26-28) for blocks absent from
+        //     the array, so any numeric-threshold cutoff (from the active max
+        //     or the global max) lands on the wrong rows.
+        //   - Ordinal 24 carries TWO tagged blocks (m24#0, m24#1), so
+        //     one-block-per-ordinal counting shifts the boundary by one.
+        // Active numbers: {1..22, 24, 25} (24 rows). Newest 20 by number:
+        // {5..22, 24, 25} — the boundary pair is number 5 (rank 20, protected)
+        // vs number 4 (rank 21, applied), and both carry pending drops.
+        let mut messages = (1..=24)
             .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
             .collect::<Vec<_>>();
-        // Second block on ordinal 24 so block-count != ordinal-count.
         messages[23] = two_block_item("m24", 24, "text 24", "attachment 24");
 
-        let mut tags = Vec::new();
-        let mut tag_time = 0;
-        for ordinal in 1..=25 {
-            // Gap the numbering: mint in two batches later so numbers are sparse.
-            tags.push(TagMintInput {
+        let mut tags = (1..=24)
+            .map(|ordinal| TagMintInput {
                 block_id: format!("m{ordinal}#0"),
                 kind: "message".to_string(),
                 token_count: 1,
                 source_bytes: if ordinal == 23 {
-                    // Stale provenance: the stored bytes do not match the live
-                    // carrier, so this row must NOT occupy a protected slot.
+                    // Stale provenance: stored bytes no longer match the live
+                    // carrier, so this row must not occupy a protected slot.
                     b"text from a previous life".to_vec()
                 } else {
                     format!("text {ordinal}").into_bytes()
                 },
-            });
-            tag_time += 1;
-        }
+            })
+            .collect::<Vec<_>>();
         tags.push(TagMintInput {
             block_id: "m24#1".to_string(),
             kind: "message".to_string(),
             token_count: 1,
             source_bytes: b"attachment 24".to_vec(),
         });
+        for ghost in 1..=3 {
+            tags.push(TagMintInput {
+                block_id: format!("ghost{ghost}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: b"ghost".to_vec(),
+            });
+        }
+        store.mint_or_get_tags("protected", &tags, 1).unwrap();
         store
-            .mint_or_get_tags("protected", &tags, tag_time)
-            .unwrap();
-        store
-            .append_pending_agent_drops("protected", &["m1#0".to_string(), "m25#0".to_string()], 99)
+            .append_pending_agent_drops(
+                "protected",
+                &["m4#0".to_string(), "m5#0".to_string(), "m24#1".to_string()],
+                99,
+            )
             .unwrap();
 
         let response = run(
@@ -7070,16 +7080,86 @@ mod tests {
         );
         assert_eq!(response.action, "HARD");
         let loaded = store.load("protected").unwrap();
-        // 26 tag rows minted; m23#0 is stale-provenance (excluded). 25 active
-        // rows remain; the newest 20 by tag number include m25#0 and m24#1 and
-        // reach back past m24#0... down to the 20th-newest, which still covers
-        // m6#0. m1#0 (oldest) is far outside the protected set: it applies.
-        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), Some("[dropped]"));
-        // m25#0 is the newest active tag: protected, so its pending row stays.
-        assert_eq!(frozen_red_payload(&loaded.core, "m25#0"), None);
-        let pending = store.load_pending_agent_drops("protected").unwrap();
+        // Rank 21 (number 4) is just outside the protected set: applied.
+        assert_eq!(frozen_red_payload(&loaded.core, "m4#0"), Some("[dropped]"));
+        // Rank 20 (number 5) is the last protected slot: retained. Under a
+        // threshold cutoff (active-max 25 - 20, or global-max 28 - 20) or
+        // one-per-ordinal counting this row loses protection and applies.
+        assert_eq!(frozen_red_payload(&loaded.core, "m5#0"), None);
+        // The second block on ordinal 24 is itself active and protected; an
+        // implementation that counts one block per ordinal applies this drop.
+        assert_eq!(frozen_red_payload(&loaded.core, "m24#1"), None);
+        let mut retained = store
+            .load_pending_agent_drops("protected")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.target_id)
+            .collect::<Vec<_>>();
+        retained.sort();
+        assert_eq!(retained, vec!["m24#1".to_string(), "m5#0".to_string()]);
+    }
+
+    #[test]
+    fn frozen_row_does_not_consume_a_protection_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // 21 tagged live blocks, numbers 1..21. m21#0 is frozen by an earlier
+        // active pass, so the ACTIVE set is exactly m1..m20 — all 20 fit the
+        // protected window and the oldest row's pending drop must be retained.
+        // If frozen rows still consumed slots, m21 would take one, m1 would
+        // fall to rank 21, and its drop would apply.
+        let messages = (1..=21)
+            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
+            .collect::<Vec<_>>();
+        let tags = (1..=21)
+            .map(|ordinal| TagMintInput {
+                block_id: format!("m{ordinal}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: format!("text {ordinal}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        store.mint_or_get_tags("slot-free", &tags, 1).unwrap();
+
+        // Pass 1 bootstraps, then the freeze is seeded directly in durable state
+        // (selection itself refuses to reduce a protected newest tag, so a
+        // pre-existing freeze — e.g. from an earlier phase with more tags — is
+        // the realistic way a high-ranked block arrives already frozen).
+        let request = active_cc_req("slot-free", "cfg0", messages);
+        run(&store, &request, &spine());
+        let seeded = store.load("slot-free").unwrap();
+        let mut core = seeded.core.clone();
+        core.frozen_units
+            .push(red_unit("m21#0", "drop", "[dropped]"));
+        store
+            .commit("slot-free", seeded.row_version, &core, &seeded.meta)
+            .unwrap();
+        assert_eq!(
+            frozen_red_payload(&store.load("slot-free").unwrap().core, "m21#0"),
+            Some("[dropped]"),
+            "precondition: m21#0 frozen before the tested pass"
+        );
+
+        // Pass 2 (tested): a render-config change forces a producing HARD so the
+        // pending row is genuinely selected against the protected set — a defer
+        // pass would retain it regardless and prove nothing.
+        store
+            .append_pending_agent_drops("slot-free", &["m1#0".to_string()], 99)
+            .unwrap();
+        let producing = active_cc_req(
+            "slot-free",
+            "cfg1",
+            (1..=21)
+                .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
+                .collect::<Vec<_>>(),
+        );
+        let tested = run(&store, &producing, &spine());
+        assert_eq!(tested.action, "HARD", "tested pass must produce");
+        let loaded = store.load("slot-free").unwrap();
+        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), None);
+        let pending = store.load_pending_agent_drops("slot-free").unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].target_id, "m25#0");
+        assert_eq!(pending[0].target_id, "m1#0");
     }
 
     #[test]
