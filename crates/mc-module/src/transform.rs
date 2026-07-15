@@ -2503,21 +2503,16 @@ fn apply_tag_overlay_to_message(
             continue;
         }
         if !is_reduced(block) {
+            let target = &mut message.content[block.block_index];
+            let mut block_changed = false;
             if let Some(kind) = taggable_kind(block) {
                 if let Some(tag_number) = overlay.tag_by_block_id.get(&block.id) {
-                    let target = &mut message.content[block.block_index];
-                    if apply_tag_prefix_to_block(
+                    block_changed |= apply_tag_prefix_to_block(
                         ingress.ck.role.as_str(),
                         target,
                         kind,
                         *tag_number,
-                    ) {
-                        // The prefix edits the typed kind in place, but Serialize
-                        // prefers the block's retained ingress bytes; without this
-                        // clear the tag never reaches the wire.
-                        target.mark_modified();
-                        modified = true;
-                    }
+                    );
                 } else {
                     debug_assert!(
                         false,
@@ -2527,11 +2522,16 @@ fn apply_tag_overlay_to_message(
                 }
             }
             if let Some(reminder) = overlay.channel1_by_block_id.get(&block.id) {
-                let target = &mut message.content[block.block_index];
-                if append_channel1_to_block(target, reminder) {
-                    target.mark_modified();
-                    modified = true;
-                }
+                block_changed |= append_channel1_to_block(target, reminder);
+            }
+            if block_changed {
+                // Overlay edits mutate the typed kind in place, but Serialize
+                // prefers a block's retained ingress bytes for lossless
+                // pass-through — an uncleared block silently serializes its
+                // pre-mutation form and the edit never reaches the wire. One
+                // clear site covers every overlay mutator.
+                target.mark_modified();
+                modified = true;
             }
         }
     }
@@ -3318,11 +3318,17 @@ mod tests {
             ],
         );
         // The live drive paused ~434s between beats, so the second pass classified
-        // HARD via the idle-TTL trigger (default cache_ttl 5m). Reproduce that class:
-        // run beat 2 past the TTL rather than at the frozen test clock.
+        // HARD via the idle-TTL trigger (default cache_ttl 5m). The TTL predicate
+        // needs an observed prior response time to arm — without it the pass stays
+        // SOFT-class and this fixture would not cover the drive's actual shape.
         let mut ttl_ctx = pctx("git:proj", "/nonexistent-docs", 434_000);
+        ttl_ctx.observed_last_response_at_ms = Some(1);
         ttl_ctx.injected_reductions = spine().to_vec();
         let second = transform(&s, &beat2, &ttl_ctx).unwrap();
+        assert_eq!(
+            second.action, "HARD",
+            "idle-TTL fold must fire past cache_ttl"
+        );
         assert_eq!(second.surface_state, SurfaceState::Active);
         let joined = serde_json::to_string(&second.ck_messages).unwrap();
         assert!(
@@ -3332,6 +3338,201 @@ mod tests {
         assert!(
             joined.contains("\u{a7}7\u{a7}"),
             "new user turn missing its tag: {joined}"
+        );
+    }
+
+    /// Wire-deserialized tool-result ingress message. `output_json` is the raw
+    /// CkToolOutput JSON so each output variant (text / error_text / content) can
+    /// be exercised with retained pass-through bytes on the block.
+    fn wire_tool_result(id: &str, ordinal: u64, output_json: Value) -> CkIngressMessage {
+        let ck: CkWireMessage = serde_json::from_value(json!({
+            "role": "user",
+            "content": [{ "kind": {
+                "type": "tool_result",
+                "id": format!("call_{id}"),
+                "tool_name": "probe",
+                "provider_executed": false,
+                "output": output_json,
+            }}],
+            "meta": { "harness_id": id },
+        }))
+        .unwrap();
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck,
+        }
+    }
+
+    /// Wire-deserialized assistant tool-call message pairing a later tool result.
+    fn wire_tool_call(id: &str, ordinal: u64, call_id: &str) -> CkIngressMessage {
+        let ck: CkWireMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [{ "kind": {
+                "type": "tool_call",
+                "id": call_id,
+                "name": "probe",
+                "input": {},
+            }}],
+            "meta": { "harness_id": id },
+        }))
+        .unwrap();
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck,
+        }
+    }
+
+    /// Drive one session to the second active pass (tags emitting) over the given
+    /// tail and return the serialized output for byte-level assertions.
+    fn second_active_pass_json(session: &str, messages: Vec<CkIngressMessage>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let req = active_cc_req(session, "cfg0", messages);
+        let transition = run(&s, &req, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        let second = run(&s, &req, &spine());
+        assert_eq!(second.surface_state, SurfaceState::Active);
+        serde_json::to_string(&second.ck_messages).unwrap()
+    }
+
+    /// Every tool-result output variant the overlay can prefix must survive
+    /// serialization when the fixture arrives through wire deserialization
+    /// (retained pass-through bytes on the block). Each case fails if the
+    /// overlay stops clearing the mutated block's retained bytes.
+    #[test]
+    fn wire_tool_result_text_variant_tags_survive_serialization() {
+        let joined = second_active_pass_json(
+            "wire-tr-text",
+            vec![
+                wire_tool_call("a1", 1, "call_t1"),
+                wire_tool_result(
+                    "t1",
+                    2,
+                    json!({ "kind": { "type": "text", "text": "plain output" } }),
+                ),
+            ],
+        );
+        assert!(
+            joined.contains("\u{a7}1\u{a7} plain output"),
+            "text output lost its tag: {joined}"
+        );
+    }
+
+    #[test]
+    fn wire_tool_result_error_text_variant_tags_survive_serialization() {
+        let joined = second_active_pass_json(
+            "wire-tr-err",
+            vec![
+                wire_tool_call("a1", 1, "call_t1"),
+                wire_tool_result(
+                    "t1",
+                    2,
+                    json!({ "kind": { "type": "error_text", "text": "boom" } }),
+                ),
+            ],
+        );
+        assert!(
+            joined.contains("\u{a7}1\u{a7} boom"),
+            "error_text output lost its tag: {joined}"
+        );
+    }
+
+    #[test]
+    fn wire_tool_result_content_variant_tags_survive_serialization() {
+        let joined = second_active_pass_json(
+            "wire-tr-content",
+            vec![
+                wire_tool_call("a1", 1, "call_t1"),
+                wire_tool_result(
+                    "t1",
+                    2,
+                    json!({ "kind": { "type": "content", "blocks": [
+                        { "kind": { "type": "text", "text": "nested text" } },
+                    ]}}),
+                ),
+            ],
+        );
+        assert!(
+            joined.contains("\u{a7}1\u{a7} nested text"),
+            "content-variant output lost its tag: {joined}"
+        );
+    }
+
+    #[test]
+    fn wire_channel1_append_survives_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![
+            wire_tool_call("a1", 1, "call_t1"),
+            wire_tool_result(
+                "t1",
+                2,
+                json!({ "kind": { "type": "text", "text": "tool output" } }),
+            ),
+        ];
+        let req = active_cc_req("wire-ch1", "cfg0", messages);
+        let transition = run(&s, &req, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        run(&s, &req, &spine());
+        s.append_channel1_nudge("wire-ch1", "t1#0", "reminder: reduce spent outputs", 5)
+            .unwrap();
+        // Ingress always carries the ORIGINAL bytes (tags exist only on the
+        // provider wire; raw ingress bytes are identity), so the same request
+        // replays and the append rides the shared overlay clear site.
+        let third = run(&s, &req, &spine());
+        let joined = serde_json::to_string(&third.ck_messages).unwrap();
+        assert!(
+            joined.contains("reminder: reduce spent outputs"),
+            "channel-1 append lost on wire-deserialized block: {joined}"
+        );
+    }
+
+    /// Mixed-message canary: a mutated block must canonicalize while its untouched
+    /// sibling keeps its retained pass-through bytes VERBATIM — including unknown
+    /// fields serde would drop — and message-level provenance survives.
+    #[test]
+    fn overlay_canonicalizes_only_the_mutated_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let ck: CkWireMessage = serde_json::from_value(json!({
+            "role": "user",
+            "content": [
+                { "kind": { "type": "text", "text": "taggable prompt" } },
+                { "kind": { "type": "opaque", "source": "provider", "kind": "server_tool",
+                    "raw": { "some": "provider-native" } },
+                  "sentinel_unknown_field": "must-survive-verbatim" },
+            ],
+            "provider_extras": { "anthropic": { "probe": "message-provenance" } },
+            "meta": { "harness_id": "mixed-0" },
+        }))
+        .unwrap();
+        let item = CkIngressMessage {
+            mid: "mixed-0".to_string(),
+            ordinal: 0,
+            ck,
+        };
+        let req = active_cc_req("wire-mixed", "cfg0", vec![item]);
+        let transition = run(&s, &req, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        let second = run(&s, &req, &spine());
+        let joined = serde_json::to_string(&second.ck_messages).unwrap();
+        assert!(
+            joined.contains("\u{a7}1\u{a7} taggable prompt"),
+            "mutated block missing its tag: {joined}"
+        );
+        assert!(
+            joined.contains("sentinel_unknown_field"),
+            "untouched sibling lost retained unknown field: {joined}"
+        );
+        assert!(
+            joined.contains("must-survive-verbatim"),
+            "untouched sibling bytes not verbatim: {joined}"
+        );
+        assert!(
+            joined.contains("message-provenance"),
+            "message provenance lost: {joined}"
         );
     }
 

@@ -70,15 +70,23 @@ impl RealSessionResolver {
         }
     }
 
+    /// The management route this resolver opens. Split out so a local test can
+    /// pin the runtime target's exact module id: the gateway registers as
+    /// "thalamus", and a stale id here kills every stateful facade tool call
+    /// at route-open.
+    fn route_target(&self) -> RouteTarget {
+        RouteTarget::ManagementSurface {
+            module_id: self.module_id.clone(),
+        }
+    }
+
     async fn resolve_once(
         &self,
         project_root: &Path,
         harness: &str,
         instance_token: &str,
     ) -> Result<Option<ResolvedSession>, SessionResolveError> {
-        let target = RouteTarget::ManagementSurface {
-            module_id: self.module_id.clone(),
-        };
+        let target = self.route_target();
         let identity = BindIdentity {
             project_root: project_root.to_path_buf(),
             harness: harness.to_string(),
@@ -236,6 +244,19 @@ mod tests {
         assert_eq!(
             parse_resolve_response(&json!({"session_id": null})).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn real_resolver_routes_to_the_thalamus_management_surface() {
+        let resolver = RealSessionResolver::new(PathBuf::from("/nonexistent"));
+        // Pin the exact runtime module id: the gateway registers as "thalamus";
+        // any other id (e.g. the retired "ai-proxy") fails every facade call.
+        assert_eq!(
+            resolver.route_target(),
+            RouteTarget::ManagementSurface {
+                module_id: "thalamus".to_string(),
+            }
         );
     }
 }
