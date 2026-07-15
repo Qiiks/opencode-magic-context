@@ -213,7 +213,12 @@ impl CkWireBlock {
         }
     }
 
-    fn mark_modified(&mut self) {
+    /// Drop the retained ingress bytes so serialization reflects an in-place
+    /// mutation of the typed content. Every mutator that edits `kind` through a
+    /// live block MUST call this: `Serialize` prefers `original` for lossless
+    /// pass-through, so an uncleared block silently serializes its pre-mutation
+    /// bytes and the edit never reaches the wire.
+    pub fn mark_modified(&mut self) {
         self.original = None;
     }
 }

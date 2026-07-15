@@ -2505,12 +2505,19 @@ fn apply_tag_overlay_to_message(
         if !is_reduced(block) {
             if let Some(kind) = taggable_kind(block) {
                 if let Some(tag_number) = overlay.tag_by_block_id.get(&block.id) {
-                    modified |= apply_tag_prefix_to_block(
+                    let target = &mut message.content[block.block_index];
+                    if apply_tag_prefix_to_block(
                         ingress.ck.role.as_str(),
-                        &mut message.content[block.block_index],
+                        target,
                         kind,
                         *tag_number,
-                    );
+                    ) {
+                        // The prefix edits the typed kind in place, but Serialize
+                        // prefers the block's retained ingress bytes; without this
+                        // clear the tag never reaches the wire.
+                        target.mark_modified();
+                        modified = true;
+                    }
                 } else {
                     debug_assert!(
                         false,
@@ -2520,8 +2527,11 @@ fn apply_tag_overlay_to_message(
                 }
             }
             if let Some(reminder) = overlay.channel1_by_block_id.get(&block.id) {
-                modified |=
-                    append_channel1_to_block(&mut message.content[block.block_index], reminder);
+                let target = &mut message.content[block.block_index];
+                if append_channel1_to_block(target, reminder) {
+                    target.mark_modified();
+                    modified = true;
+                }
             }
         }
     }
@@ -3243,6 +3253,86 @@ mod tests {
         absent_value.as_object_mut().unwrap().remove("tool_present");
         let absent: TransformRequest = serde_json::from_value(absent_value).unwrap();
         (absent, explicit)
+    }
+
+    /// Build an ingress message THROUGH WIRE DESERIALIZATION, the way real traffic
+    /// arrives. Deserialized messages retain `original` pass-through bytes on the
+    /// message AND every block; typed-constructor fixtures (`from_parts`/`bare`)
+    /// don't, which is exactly how an output-overlay bug can hide from a fixture
+    /// while dropping bytes on the wire.
+    fn wire_item(role: &str, id: &str, ordinal: u64, texts: &[&str]) -> CkIngressMessage {
+        let content: Vec<Value> = texts
+            .iter()
+            .map(|text| json!({ "kind": { "type": "text", "text": text } }))
+            .collect();
+        let ck: CkWireMessage = serde_json::from_value(json!({
+            "role": role,
+            "content": content,
+            "meta": { "harness_id": id },
+        }))
+        .unwrap();
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck,
+        }
+    }
+
+    /// Mirror of the first live rig drive's beat shape: a CC session whose first
+    /// user message carries several text blocks (system-reminder wrappers around
+    /// the prompt), followed by an assistant reply and a fresh user turn — all
+    /// built through wire deserialization so blocks retain pass-through bytes.
+    /// The drive observed zero tag prefixes on the second active pass.
+    #[test]
+    fn rig_shape_second_active_pass_tags_wire_deserialized_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mb = wire_item(
+            "user",
+            "ccm-0",
+            0,
+            &[
+                "<system-reminder>\ncontext block\n</system-reminder>\n\n",
+                "You are in a test drive. Reply with exactly: BEAT1-OK.",
+                "<system-reminder>\nagents\n</system-reminder>",
+                "<system-reminder>\nskills\n</system-reminder>\n",
+                "You are in a test drive. Reply with exactly: BEAT1-OK.",
+            ],
+        );
+        let beat1 = active_cc_req("rig", "cfg0", vec![mb.clone()]);
+        let transition = run(&s, &beat1, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+
+        let beat2 = active_cc_req(
+            "rig",
+            "cfg0",
+            vec![
+                mb,
+                wire_item("assistant", "ccm-1", 1, &["BEAT1-OK"]),
+                wire_item(
+                    "user",
+                    "ccm-2",
+                    2,
+                    &["Call the ctx_search tool exactly once."],
+                ),
+            ],
+        );
+        // The live drive paused ~434s between beats, so the second pass classified
+        // HARD via the idle-TTL trigger (default cache_ttl 5m). Reproduce that class:
+        // run beat 2 past the TTL rather than at the frozen test clock.
+        let mut ttl_ctx = pctx("git:proj", "/nonexistent-docs", 434_000);
+        ttl_ctx.injected_reductions = spine().to_vec();
+        let second = transform(&s, &beat2, &ttl_ctx).unwrap();
+        assert_eq!(second.surface_state, SurfaceState::Active);
+        let joined = serde_json::to_string(&second.ck_messages).unwrap();
+        assert!(
+            joined.contains("\u{a7}1\u{a7}"),
+            "second active pass emitted no tag prefixes: {joined}"
+        );
+        assert!(
+            joined.contains("\u{a7}7\u{a7}"),
+            "new user turn missing its tag: {joined}"
+        );
     }
 
     fn two_block_item(id: &str, ordinal: u64, first: &str, second: &str) -> CkIngressMessage {
