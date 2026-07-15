@@ -44,16 +44,17 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
 use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
-    HistorianPhase, InsertMemoryInput, McStore, NoteInput, ShadowDivergenceRecord,
-    ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest,
-    ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StoredChunkTranscript, StoredCompartment,
+    validate_state_import_compartments, HistorianPhase, InsertMemoryInput, McStore, NoteInput,
+    ShadowDivergenceRecord, ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError,
+    ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError,
+    StateImportPreflight, StateImportValidationError, StoredChunkTranscript, StoredCompartment,
     StoredMemoryMutation, StoredNote,
 };
 use serde::{Deserialize, Serialize};
@@ -209,6 +210,10 @@ const SHADOW_COMPARE_PREFIX_LIMIT: usize = 4096;
 const SHADOW_SEED_MAX_ID_BYTES: usize = 128;
 const SHADOW_SEED_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const SHADOW_SEED_MAX_PENDING: usize = 64;
+const STATE_IMPORT_MAX_ID_BYTES: usize = 128;
+const STATE_IMPORT_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
+const STATE_IMPORT_MAX_PENDING: usize = 64;
+const STATE_IMPORT_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Deserialize)]
 struct ShadowStateSyncWire {
@@ -250,6 +255,64 @@ struct ShadowResetWire {
     shadow_generation: Option<u64>,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StateImportWire {
+    v: u64,
+    session_id: String,
+    import_id: String,
+    batch_seq: usize,
+    batch_count: usize,
+    compartments: Vec<StateImportCompartmentWire>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StateImportCompartmentWire {
+    seq: i64,
+    start_message: i64,
+    end_message: i64,
+    end_message_id: String,
+    title: String,
+    p1: String,
+    #[serde(default)]
+    p2: Option<String>,
+    #[serde(default)]
+    p3: Option<String>,
+    #[serde(default)]
+    p4: Option<String>,
+    #[serde(default = "default_importance")]
+    importance: i32,
+    #[serde(default)]
+    episode_type: Option<String>,
+    #[serde(default)]
+    start_date: Option<String>,
+    #[serde(default)]
+    end_date: Option<String>,
+}
+
+impl StateImportCompartmentWire {
+    fn into_stored(self, created_at: i64) -> StoredCompartment {
+        StoredCompartment {
+            sequence: self.seq,
+            start_message: self.start_message,
+            end_message: self.end_message,
+            end_message_id: self.end_message_id,
+            start_date: self.start_date,
+            end_date: self.end_date,
+            title: self.title,
+            content: self.p1.clone(),
+            p1: Some(self.p1),
+            p2: self.p2,
+            p3: self.p3,
+            p4: self.p4,
+            importance: self.importance,
+            episode_type: self.episode_type,
+            legacy: 0,
+            created_at,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -379,6 +442,308 @@ impl ShadowSeedCoordinator {
         };
         self.pending_seed_count += 1;
         true
+    }
+}
+
+#[derive(Debug)]
+struct PendingStateImport {
+    import_id: String,
+    batch_count: usize,
+    next_seq: usize,
+    digests: Vec<String>,
+    compartments: Vec<StoredCompartment>,
+    bytes: usize,
+    last_activity: Instant,
+}
+
+#[derive(Debug)]
+enum StateImportPhase {
+    Collecting(PendingStateImport),
+    Applying { import_id: String, bytes: usize },
+}
+
+#[derive(Debug)]
+struct StateImportCoordinator {
+    sessions: HashMap<String, StateImportPhase>,
+    total_staged_bytes: usize,
+    pending_import_count: usize,
+    max_staged_bytes: usize,
+    max_pending_imports: usize,
+    stale_after: Duration,
+}
+
+impl Default for StateImportCoordinator {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            total_staged_bytes: 0,
+            pending_import_count: 0,
+            max_staged_bytes: STATE_IMPORT_MAX_STAGED_BYTES,
+            max_pending_imports: STATE_IMPORT_MAX_PENDING,
+            stale_after: STATE_IMPORT_STALE_AFTER,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StateImportStageOutcome {
+    Staged(usize),
+    Apply {
+        import_id: String,
+        compartments: Vec<StoredCompartment>,
+    },
+}
+
+#[derive(Debug)]
+enum StateImportStageError {
+    Protocol {
+        code: &'static str,
+        message: &'static str,
+    },
+    Validation(StateImportValidationError),
+}
+
+impl StateImportCoordinator {
+    fn phase_bytes(phase: &StateImportPhase) -> usize {
+        match phase {
+            StateImportPhase::Collecting(pending) => pending.bytes,
+            StateImportPhase::Applying { bytes, .. } => *bytes,
+        }
+    }
+
+    fn discard(&mut self, session_id: &str) {
+        if let Some(phase) = self.sessions.remove(session_id) {
+            self.pending_import_count = self.pending_import_count.saturating_sub(1);
+            self.total_staged_bytes = self
+                .total_staged_bytes
+                .saturating_sub(Self::phase_bytes(&phase));
+        }
+    }
+
+    fn evict_stale(&mut self, now: Instant) {
+        let stale = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, phase)| match phase {
+                StateImportPhase::Collecting(pending)
+                    if now.saturating_duration_since(pending.last_activity) >= self.stale_after =>
+                {
+                    Some(session_id.clone())
+                }
+                StateImportPhase::Collecting(_) | StateImportPhase::Applying { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        for session_id in stale {
+            self.discard(&session_id);
+        }
+    }
+
+    fn complete(&mut self, session_id: &str, import_id: &str) {
+        if self.sessions.get(session_id).is_some_and(|phase| {
+            matches!(
+                phase,
+                StateImportPhase::Applying {
+                    import_id: active,
+                    ..
+                } if active == import_id
+            )
+        }) {
+            self.discard(session_id);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage(
+        &mut self,
+        session_id: &str,
+        import_id: String,
+        batch_seq: usize,
+        batch_count: usize,
+        batch_digest: String,
+        batch_bytes: usize,
+        compartments: Vec<StoredCompartment>,
+        now: Instant,
+    ) -> Result<StateImportStageOutcome, StateImportStageError> {
+        self.evict_stale(now);
+        let phase = self.sessions.remove(session_id);
+        match phase {
+            Some(StateImportPhase::Applying {
+                import_id: active,
+                bytes,
+            }) => {
+                self.sessions.insert(
+                    session_id.to_string(),
+                    StateImportPhase::Applying {
+                        import_id: active,
+                        bytes,
+                    },
+                );
+                Err(StateImportStageError::Protocol {
+                    code: "state_import_in_progress",
+                    message: "the final state import batch is being applied",
+                })
+            }
+            Some(StateImportPhase::Collecting(mut pending)) => {
+                if pending.import_id != import_id || pending.batch_count != batch_count {
+                    self.total_staged_bytes = self.total_staged_bytes.saturating_sub(pending.bytes);
+                    self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_attempt_mismatch",
+                        message: "the import id or batch count changed during staging",
+                    });
+                }
+                if batch_seq < pending.next_seq {
+                    let matches = pending
+                        .digests
+                        .get(batch_seq)
+                        .is_some_and(|accepted| accepted == &batch_digest);
+                    let staged = pending.compartments.len();
+                    if matches {
+                        pending.last_activity = now;
+                        self.sessions.insert(
+                            session_id.to_string(),
+                            StateImportPhase::Collecting(pending),
+                        );
+                        return Ok(StateImportStageOutcome::Staged(staged));
+                    }
+                    self.total_staged_bytes = self.total_staged_bytes.saturating_sub(pending.bytes);
+                    self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_digest_mismatch",
+                        message: "a redriven state import batch changed content",
+                    });
+                }
+                if batch_seq > pending.next_seq {
+                    self.total_staged_bytes = self.total_staged_bytes.saturating_sub(pending.bytes);
+                    self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                    return Err(StateImportStageError::Protocol {
+                        code: "batch_seq_mismatch",
+                        message: "state import batches must arrive contiguously",
+                    });
+                }
+                if let Some(previous) = pending.compartments.last() {
+                    if let Some(current) = compartments.first() {
+                        if current.sequence <= previous.sequence {
+                            self.total_staged_bytes =
+                                self.total_staged_bytes.saturating_sub(pending.bytes);
+                            self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                            return Err(StateImportStageError::Validation(
+                                StateImportValidationError::SeqNotIncreasing {
+                                    previous: previous.sequence,
+                                    current: current.sequence,
+                                },
+                            ));
+                        }
+                        if current.start_message <= previous.end_message {
+                            self.total_staged_bytes =
+                                self.total_staged_bytes.saturating_sub(pending.bytes);
+                            self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                            return Err(StateImportStageError::Validation(
+                                StateImportValidationError::RangesOverlap {
+                                    previous: previous.sequence,
+                                    current: current.sequence,
+                                },
+                            ));
+                        }
+                    }
+                }
+                let next_bytes = pending.bytes.checked_add(batch_bytes);
+                let next_total = self.total_staged_bytes.checked_add(batch_bytes);
+                if next_bytes.is_none_or(|bytes| bytes > self.max_staged_bytes)
+                    || next_total.is_none_or(|bytes| bytes > self.max_staged_bytes)
+                {
+                    self.total_staged_bytes = self.total_staged_bytes.saturating_sub(pending.bytes);
+                    self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_buffer_overflow",
+                        message: "state import staging exceeded the handler-wide byte cap",
+                    });
+                }
+                pending.bytes = next_bytes.unwrap_or(usize::MAX);
+                self.total_staged_bytes = next_total.unwrap_or(usize::MAX);
+                pending.next_seq += 1;
+                pending.digests.push(batch_digest);
+                pending.compartments.extend(compartments);
+                pending.last_activity = now;
+                let staged = pending.compartments.len();
+                if batch_seq + 1 == batch_count {
+                    let bytes = pending.bytes;
+                    let compartments = pending.compartments;
+                    self.sessions.insert(
+                        session_id.to_string(),
+                        StateImportPhase::Applying {
+                            import_id: import_id.clone(),
+                            bytes,
+                        },
+                    );
+                    Ok(StateImportStageOutcome::Apply {
+                        import_id,
+                        compartments,
+                    })
+                } else {
+                    self.sessions.insert(
+                        session_id.to_string(),
+                        StateImportPhase::Collecting(pending),
+                    );
+                    Ok(StateImportStageOutcome::Staged(staged))
+                }
+            }
+            None => {
+                if batch_seq != 0 {
+                    return Err(StateImportStageError::Protocol {
+                        code: "batch_seq_mismatch",
+                        message: "the first state import batch must have batch_seq 0",
+                    });
+                }
+                if self.pending_import_count >= self.max_pending_imports {
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_capacity",
+                        message: "too many state imports are already pending",
+                    });
+                }
+                if batch_bytes > self.max_staged_bytes
+                    || self
+                        .total_staged_bytes
+                        .checked_add(batch_bytes)
+                        .is_none_or(|bytes| bytes > self.max_staged_bytes)
+                {
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_buffer_overflow",
+                        message: "state import staging exceeded the handler-wide byte cap",
+                    });
+                }
+                self.pending_import_count += 1;
+                self.total_staged_bytes += batch_bytes;
+                let staged = compartments.len();
+                if batch_count == 1 {
+                    self.sessions.insert(
+                        session_id.to_string(),
+                        StateImportPhase::Applying {
+                            import_id: import_id.clone(),
+                            bytes: batch_bytes,
+                        },
+                    );
+                    Ok(StateImportStageOutcome::Apply {
+                        import_id,
+                        compartments,
+                    })
+                } else {
+                    self.sessions.insert(
+                        session_id.to_string(),
+                        StateImportPhase::Collecting(PendingStateImport {
+                            import_id,
+                            batch_count,
+                            next_seq: 1,
+                            digests: vec![batch_digest],
+                            compartments,
+                            bytes: batch_bytes,
+                            last_activity: now,
+                        }),
+                    );
+                    Ok(StateImportStageOutcome::Staged(staged))
+                }
+            }
+        }
     }
 }
 
@@ -744,6 +1109,7 @@ pub struct McHandler {
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
     shadow_seeds: Mutex<ShadowSeedCoordinator>,
+    state_imports: Mutex<StateImportCoordinator>,
 }
 
 #[async_trait]
@@ -904,6 +1270,7 @@ impl McHandler {
             between_transform_and_prepare: Mutex::new(None),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
+            state_imports: Mutex::new(StateImportCoordinator::default()),
         }
     }
 
@@ -955,6 +1322,7 @@ impl McHandler {
             between_transform_and_prepare: Mutex::new(None),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
+            state_imports: Mutex::new(StateImportCoordinator::default()),
         }
     }
 
@@ -977,6 +1345,10 @@ impl McHandler {
                 .lock()
                 .expect("shadow seed mutex")
                 .evict(&session_id);
+            self.state_imports
+                .lock()
+                .expect("state import mutex")
+                .discard(&session_id);
         }
     }
 
@@ -1016,6 +1388,10 @@ impl McHandler {
                 .lock()
                 .expect("shadow seed mutex")
                 .evict(&session);
+            self.state_imports
+                .lock()
+                .expect("state import mutex")
+                .discard(&session);
         }
     }
 
@@ -1941,6 +2317,198 @@ impl McHandler {
                 Err(e) => eprintln!("mc-module: historian firing failed for {session_id}: {e}"),
             }
         });
+    }
+
+    fn handle_state_import_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let raw_session_id = request
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let batch_bytes = match serde_json::to_vec(&request) {
+            Ok(bytes) if bytes.len() <= MAX_FACADE_FRAME_BYTES => bytes.len(),
+            Ok(_) => {
+                if let Some(session_id) = raw_session_id.as_deref() {
+                    self.state_imports
+                        .lock()
+                        .expect("state import mutex")
+                        .discard(session_id);
+                }
+                return invalid_params_error("request body exceeds the 1 MiB limit");
+            }
+            Err(error) => return invalid_params_error(error.to_string()),
+        };
+        let parsed: StateImportWire = match serde_json::from_value(request.clone()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                if let Some(session_id) = raw_session_id.as_deref() {
+                    self.state_imports
+                        .lock()
+                        .expect("state import mutex")
+                        .discard(session_id);
+                }
+                return invalid_params_error(error.to_string());
+            }
+        };
+        let discard = |handler: &McHandler| {
+            handler
+                .state_imports
+                .lock()
+                .expect("state import mutex")
+                .discard(&parsed.session_id);
+        };
+        if parsed.v != 1 {
+            discard(self);
+            return HandlerOutcome::Error {
+                code: "state_import_version".to_string(),
+                message: "state_import requires v=1".to_string(),
+            };
+        }
+        if parsed.session_id.trim().is_empty() {
+            discard(self);
+            return invalid_params_error("state_import requires a nonempty session_id");
+        }
+        if parsed.import_id.is_empty() || parsed.import_id.len() > STATE_IMPORT_MAX_ID_BYTES {
+            discard(self);
+            return invalid_params_error(format!(
+                "import_id must contain 1..={STATE_IMPORT_MAX_ID_BYTES} bytes"
+            ));
+        }
+        if parsed.batch_count == 0 || parsed.batch_seq >= parsed.batch_count {
+            discard(self);
+            return HandlerOutcome::Error {
+                code: "batch_seq_mismatch".to_string(),
+                message: "batch_seq must be inside a nonempty batch_count".to_string(),
+            };
+        }
+
+        let binding = match self.resolve_binding(channel, &parsed.session_id) {
+            Ok(binding) => binding,
+            Err(BindingError::Unbound) => {
+                discard(self);
+                return HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: "state_import on a channel with no session binding".to_string(),
+                };
+            }
+            Err(BindingError::SessionMismatch) => {
+                discard(self);
+                return HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                };
+            }
+        };
+        if is_shadow_session(&binding.session) {
+            discard(self);
+            return HandlerOutcome::Error {
+                code: "non_shadow_op_on_shadow_binding".to_string(),
+                message: "state_import is not accepted on shadow routes".to_string(),
+            };
+        }
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => {
+                discard(self);
+                return store_unavailable_error();
+            }
+        };
+        match store.preflight_state_import(&parsed.session_id, &parsed.import_id) {
+            Ok(StateImportPreflight::Duplicate { imported }) => {
+                discard(self);
+                return respond(json!({
+                    "ok": true,
+                    "imported": imported,
+                    "duplicate": true,
+                }));
+            }
+            Ok(StateImportPreflight::Ready) => {}
+            Err(StateImportError::SessionNotEmpty) => {
+                discard(self);
+                return HandlerOutcome::Error {
+                    code: "session_not_empty".to_string(),
+                    message: "state_import only accepts a session with no durable state"
+                        .to_string(),
+                };
+            }
+            Err(error) => {
+                discard(self);
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                };
+            }
+        }
+
+        let created_at = now_ms();
+        let compartments = parsed
+            .compartments
+            .into_iter()
+            .map(|compartment| compartment.into_stored(created_at))
+            .collect::<Vec<_>>();
+        if let Err(error) = validate_state_import_compartments(&compartments) {
+            discard(self);
+            return state_import_validation_error(error);
+        }
+        let digest = sha256_hex(canonical_value(&request).as_bytes());
+        let action = self
+            .state_imports
+            .lock()
+            .expect("state import mutex")
+            .stage(
+                &parsed.session_id,
+                parsed.import_id,
+                parsed.batch_seq,
+                parsed.batch_count,
+                digest,
+                batch_bytes,
+                compartments,
+                Instant::now(),
+            );
+        match action {
+            Ok(StateImportStageOutcome::Staged(staged)) => {
+                respond(json!({ "ok": true, "staged": staged }))
+            }
+            Ok(StateImportStageOutcome::Apply {
+                import_id,
+                compartments,
+            }) => {
+                let outcome = store.commit_state_import(
+                    &parsed.session_id,
+                    &import_id,
+                    &compartments,
+                    created_at,
+                );
+                self.state_imports
+                    .lock()
+                    .expect("state import mutex")
+                    .complete(&parsed.session_id, &import_id);
+                match outcome {
+                    Ok(result) => respond(json!({
+                        "ok": true,
+                        "imported": result.imported,
+                        "duplicate": result.duplicate,
+                    })),
+                    Err(StateImportError::SessionNotEmpty) => HandlerOutcome::Error {
+                        code: "session_not_empty".to_string(),
+                        message: "state_import only accepts a session with no durable state"
+                            .to_string(),
+                    },
+                    Err(StateImportError::Validation(error)) => {
+                        state_import_validation_error(error)
+                    }
+                    Err(StateImportError::Store(error)) => HandlerOutcome::Error {
+                        code: "store_write_failed".to_string(),
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Err(StateImportStageError::Validation(error)) => state_import_validation_error(error),
+            Err(StateImportStageError::Protocol { code, message }) => HandlerOutcome::Error {
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+        }
     }
 
     fn handle_agent_drops_value(&self, channel: u16, request: Value) -> HandlerOutcome {
@@ -3823,6 +4391,7 @@ impl McHandler {
                 "state_sync" => self.handle_shadow_state_sync_value(channel, request),
                 "shadow_transform" => self.handle_shadow_transform_value(channel, request).await,
                 "shadow_reset" => self.handle_shadow_reset_value(channel, request),
+                "state_import" => self.handle_state_import_value(channel, request),
                 "agent_drops.append" => self.handle_agent_drops_value(channel, request),
                 // Explicit wire-debugging echo. Opt-in only: echoing every
                 // unrecognized body would silently swallow misrouted requests
@@ -3898,6 +4467,13 @@ fn unknown_serializer_profile_error() -> HandlerOutcome {
     HandlerOutcome::Error {
         code: "unknown_serializer_profile".to_string(),
         message: "missing or unknown serializer_profile".to_string(),
+    }
+}
+
+fn state_import_validation_error(error: StateImportValidationError) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: error.code().to_string(),
+        message: error.to_string(),
     }
 }
 
@@ -5895,6 +6471,40 @@ mod tests {
         }
     }
 
+    fn imported_compartment(
+        seq: i64,
+        start_message: i64,
+        end_message: i64,
+        end_message_id: &str,
+        p1: &str,
+    ) -> Value {
+        json!({
+            "seq": seq,
+            "start_message": start_message,
+            "end_message": end_message,
+            "end_message_id": end_message_id,
+            "title": format!("Imported {seq}"),
+            "p1": p1,
+        })
+    }
+
+    fn state_import_request(
+        import_id: &str,
+        batch_seq: usize,
+        batch_count: usize,
+        compartments: Vec<Value>,
+    ) -> Value {
+        json!({
+            "kind": "state_import",
+            "v": 1,
+            "session_id": "ses",
+            "import_id": import_id,
+            "batch_seq": batch_seq,
+            "batch_count": batch_count,
+            "compartments": compartments,
+        })
+    }
+
     fn big_messages_from(start_ordinal: u64) -> Vec<CkIngressMessage> {
         (0..80)
             .map(|idx| {
@@ -7496,6 +8106,272 @@ mod tests {
         let second = call_transform(&handler, messages).await;
         assert_eq!(second["action"], "HARD");
         assert!(m0_text(&second).contains("autonomous summary"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_two_batches_bootstrap_hard_folds_and_mints_tail_anchor() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let staged = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "bundle-a",
+                0,
+                2,
+                vec![imported_compartment(10, 1, 10, "m10#0", "summary one")],
+            ),
+        )
+        .await;
+        assert_eq!(staged, json!({ "ok": true, "staged": 1 }));
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+
+        let committed = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "bundle-a",
+                1,
+                2,
+                vec![imported_compartment(20, 11, 20, "m20#0", "summary two")],
+            ),
+        )
+        .await;
+        assert_eq!(
+            committed,
+            json!({ "ok": true, "imported": 2, "duplicate": false })
+        );
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 2);
+        assert!(store.has_compartments("ses").unwrap());
+        let before_fold = store.load("ses").unwrap();
+        assert!(before_fold.core.boundary_id.is_empty());
+        assert!(before_fold.row_version.is_none());
+
+        let response =
+            call_transform_request(&handler, request_with_usage(big_messages(), 1_000, 50_000))
+                .await;
+        assert_eq!(response["action"], "HARD");
+        assert_eq!(response["boundary_id"], "m20#0");
+        let after_fold = store.load("ses").unwrap();
+        assert_eq!(after_fold.core.boundary_id, "m20#0");
+        assert!(after_fold.row_version.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_refuses_nonempty_session_without_writes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let bootstrap = store.load("ses").unwrap();
+        store
+            .commit("ses", None, &bootstrap.core, &bootstrap.meta)
+            .unwrap();
+        let before = store.load("ses").unwrap().row_version;
+
+        let outcome = handler
+            .dispatch_value(
+                7,
+                state_import_request(
+                    "bundle-a",
+                    0,
+                    1,
+                    vec![imported_compartment(1, 1, 1, "m1#0", "summary")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(outcome), "session_not_empty");
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_id_is_durable_and_wins_before_nonempty_check() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let request = state_import_request(
+            "bundle-a",
+            0,
+            1,
+            vec![imported_compartment(1, 1, 1, "m1#0", "summary")],
+        );
+        let first = call_dispatch_request(&handler, request.clone()).await;
+        assert_eq!(
+            first,
+            json!({ "ok": true, "imported": 1, "duplicate": false })
+        );
+
+        let bootstrap = store.load("ses").unwrap();
+        let row_version = store
+            .commit("ses", None, &bootstrap.core, &bootstrap.meta)
+            .unwrap();
+        let duplicate = call_dispatch_request(&handler, request).await;
+        assert_eq!(
+            duplicate,
+            json!({ "ok": true, "imported": 1, "duplicate": true })
+        );
+        assert_eq!(store.load("ses").unwrap().row_version, Some(row_version));
+
+        let different = handler
+            .dispatch_value(
+                7,
+                state_import_request(
+                    "bundle-b",
+                    0,
+                    1,
+                    vec![imported_compartment(1, 1, 1, "m1#0", "other")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(different), "session_not_empty");
+        assert_eq!(store.load("ses").unwrap().row_version, Some(row_version));
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].content,
+            "summary"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_batch_gap_and_staleness_evict_partial_attempts() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let staged = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "gap",
+                0,
+                3,
+                vec![imported_compartment(1, 1, 1, "m1#0", "first")],
+            ),
+        )
+        .await;
+        assert_eq!(staged["staged"], 1);
+        let gap = handler
+            .dispatch_value(
+                7,
+                state_import_request(
+                    "gap",
+                    2,
+                    3,
+                    vec![imported_compartment(3, 3, 3, "m3#0", "third")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(gap), "batch_seq_mismatch");
+
+        let restaged = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "stale",
+                0,
+                2,
+                vec![imported_compartment(1, 1, 1, "m1#0", "first")],
+            ),
+        )
+        .await;
+        assert_eq!(restaged["staged"], 1, "gap rejection released the session");
+        handler
+            .state_imports
+            .lock()
+            .expect("state import mutex")
+            .stale_after = Duration::ZERO;
+        let imported = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "fresh",
+                0,
+                1,
+                vec![imported_compartment(5, 1, 5, "m5#0", "replacement")],
+            ),
+        )
+        .await;
+        assert_eq!(
+            imported,
+            json!({ "ok": true, "imported": 1, "duplicate": false })
+        );
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].content,
+            "replacement"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_structural_rejections_name_rules_and_leave_session_empty() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let cases = vec![
+            (
+                "overlap",
+                vec![
+                    imported_compartment(1, 1, 5, "m5#0", "first"),
+                    imported_compartment(2, 5, 8, "m8#0", "second"),
+                ],
+                "ranges_overlap",
+            ),
+            (
+                "seq",
+                vec![
+                    imported_compartment(2, 1, 2, "m2#0", "first"),
+                    imported_compartment(1, 3, 4, "m4#0", "second"),
+                ],
+                "seq_not_increasing",
+            ),
+            (
+                "empty-p1",
+                vec![imported_compartment(1, 1, 1, "m1#0", "   ")],
+                "p1_empty",
+            ),
+            (
+                "bad-id",
+                vec![imported_compartment(1, 1, 1, "m1", "summary")],
+                "end_message_id_invalid",
+            ),
+            (
+                "bad-range",
+                vec![imported_compartment(1, 2, 1, "m1#0", "summary")],
+                "range_invalid",
+            ),
+        ];
+        for (import_id, compartments, expected_code) in cases {
+            let outcome = handler
+                .dispatch_value(7, state_import_request(import_id, 0, 1, compartments))
+                .await;
+            assert_eq!(error_code(outcome), expected_code, "{import_id}");
+            assert!(store.load_compartments("ses").unwrap().is_empty());
+            assert!(store.load("ses").unwrap().row_version.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_p1_only_shape_defaults_and_renders() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let imported = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "legacy-p1-only",
+                0,
+                1,
+                vec![imported_compartment(
+                    1,
+                    1,
+                    10,
+                    "m10#0",
+                    "P1-ONLY-IMPORTED-SUMMARY",
+                )],
+            ),
+        )
+        .await;
+        assert_eq!(imported["imported"], 1);
+        let row = &store.load_compartments("ses").unwrap()[0];
+        assert_eq!(row.p1.as_deref(), Some("P1-ONLY-IMPORTED-SUMMARY"));
+        assert_eq!(row.p2, None);
+        assert_eq!(row.p3, None);
+        assert_eq!(row.p4, None);
+        assert_eq!(row.importance, 50);
+
+        let response =
+            call_transform_request(&handler, request_with_usage(big_messages(), 1_000, 50_000))
+                .await;
+        assert_eq!(response["action"], "HARD");
+        assert!(m0_text(&response).contains("P1-ONLY-IMPORTED-SUMMARY"));
     }
 
     #[tokio::test(flavor = "current_thread")]

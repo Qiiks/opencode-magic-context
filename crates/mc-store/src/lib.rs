@@ -739,6 +739,20 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_reduce_command_ledger(session_id, queued_at_ms DESC, command_id DESC);
     ",
     },
+    Migration {
+        version: 17,
+        // A completed import id is part of the session lineage. Keeping the acknowledgement
+        // durable makes an outcome-unknown retry harmless even after the imported session has
+        // advanced through later transform passes.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_state_imports (
+            session_id      TEXT PRIMARY KEY,
+            import_id       TEXT NOT NULL,
+            imported_count  INTEGER NOT NULL,
+            completed_at_ms INTEGER NOT NULL
+        );
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1594,6 +1608,46 @@ pub struct ShadowStateSyncResult {
     pub row_version: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateImportResult {
+    pub imported: usize,
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateImportPreflight {
+    Ready,
+    Duplicate { imported: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateImportValidationError {
+    SeqNotIncreasing { previous: i64, current: i64 },
+    RangeInvalid { sequence: i64 },
+    RangesOverlap { previous: i64, current: i64 },
+    P1Empty { sequence: i64 },
+    EndMessageIdInvalid { sequence: i64 },
+}
+
+impl StateImportValidationError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::SeqNotIncreasing { .. } => "seq_not_increasing",
+            Self::RangeInvalid { .. } => "range_invalid",
+            Self::RangesOverlap { .. } => "ranges_overlap",
+            Self::P1Empty { .. } => "p1_empty",
+            Self::EndMessageIdInvalid { .. } => "end_message_id_invalid",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum StateImportError {
+    Store(McStoreError),
+    SessionNotEmpty,
+    Validation(StateImportValidationError),
+}
+
 #[derive(Debug)]
 pub enum ShadowStateSyncError {
     Store(McStoreError),
@@ -1694,6 +1748,60 @@ impl From<StoreError> for McStoreError {
     }
 }
 
+impl std::fmt::Display for StateImportValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SeqNotIncreasing { previous, current } => write!(
+                f,
+                "compartment seq must be strictly increasing: {current} followed {previous}"
+            ),
+            Self::RangeInvalid { sequence } => {
+                write!(
+                    f,
+                    "compartment {sequence} has start_message after end_message"
+                )
+            }
+            Self::RangesOverlap { previous, current } => write!(
+                f,
+                "compartment {current} overlaps or precedes compartment {previous}"
+            ),
+            Self::P1Empty { sequence } => {
+                write!(f, "compartment {sequence} has an empty p1")
+            }
+            Self::EndMessageIdInvalid { sequence } => write!(
+                f,
+                "compartment {sequence} end_message_id is not a parseable mid#idx"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StateImportValidationError {}
+
+impl std::fmt::Display for StateImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "store: {error}"),
+            Self::SessionNotEmpty => write!(f, "session already has durable state"),
+            Self::Validation(error) => write!(f, "{}: {error}", error.code()),
+        }
+    }
+}
+
+impl std::error::Error for StateImportError {}
+
+impl From<McStoreError> for StateImportError {
+    fn from(error: McStoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<StoreError> for StateImportError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(McStoreError::Store(error))
+    }
+}
+
 impl std::fmt::Display for ShadowStateSyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1755,6 +1863,13 @@ enum TruncateTxnOutcome {
     Serde(String),
 }
 
+enum StateImportTxnOutcome {
+    Imported(usize),
+    Duplicate(usize),
+    SessionNotEmpty,
+    Validation(StateImportValidationError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedSeedBoundary {
     boundary_id: String,
@@ -1769,6 +1884,71 @@ fn split_flat_block_id(id: &str) -> Option<(&str, u64)> {
         return None;
     }
     Some((mid, index.parse().ok()?))
+}
+
+pub fn validate_state_import_compartments(
+    compartments: &[StoredCompartment],
+) -> Result<(), StateImportValidationError> {
+    let mut previous: Option<&StoredCompartment> = None;
+    for compartment in compartments {
+        if compartment.start_message > compartment.end_message {
+            return Err(StateImportValidationError::RangeInvalid {
+                sequence: compartment.sequence,
+            });
+        }
+        if compartment
+            .p1
+            .as_deref()
+            .is_none_or(|p1| p1.trim().is_empty())
+        {
+            return Err(StateImportValidationError::P1Empty {
+                sequence: compartment.sequence,
+            });
+        }
+        if split_flat_block_id(&compartment.end_message_id).is_none() {
+            return Err(StateImportValidationError::EndMessageIdInvalid {
+                sequence: compartment.sequence,
+            });
+        }
+        if let Some(previous) = previous {
+            if compartment.sequence <= previous.sequence {
+                return Err(StateImportValidationError::SeqNotIncreasing {
+                    previous: previous.sequence,
+                    current: compartment.sequence,
+                });
+            }
+            if compartment.start_message <= previous.end_message {
+                return Err(StateImportValidationError::RangesOverlap {
+                    previous: previous.sequence,
+                    current: compartment.sequence,
+                });
+            }
+        }
+        previous = Some(compartment);
+    }
+    Ok(())
+}
+
+fn session_has_durable_state(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> rusqlite::Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM mc_cache_state WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_compartments WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_tags WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM pending_agent_drops WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_reduce_command_ledger WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_channel1_appends WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_pass_trace WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_chunk_transcripts WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_notes WHERE session_id = ?1
+         )",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 fn validated_seed_boundary(
@@ -2237,13 +2417,109 @@ impl McStore {
         })?)
     }
 
+    /// Check whether an import attempt may begin without staging anything durably.
+    /// The final commit repeats these predicates inside its fenced transaction.
+    pub fn preflight_state_import(
+        &self,
+        session_id: &str,
+        import_id: &str,
+    ) -> Result<StateImportPreflight, StateImportError> {
+        let status = self.inner.with_conn(|conn| {
+            let completed = conn
+                .query_row(
+                    "SELECT import_id, imported_count FROM mc_state_imports WHERE session_id = ?1",
+                    params![session_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let nonempty = session_has_durable_state(conn, session_id)?;
+            Ok((completed, nonempty))
+        })?;
+        match status {
+            (Some((completed_id, imported)), _) if completed_id == import_id => {
+                Ok(StateImportPreflight::Duplicate {
+                    imported: imported.max(0) as usize,
+                })
+            }
+            (Some(_), _) | (None, true) => Err(StateImportError::SessionNotEmpty),
+            (None, false) => Ok(StateImportPreflight::Ready),
+        }
+    }
+
+    /// Atomically seed compartments into a never-used real-session key and record the
+    /// completed import id. No cache row is created: the normal first transform observes
+    /// the compartments with an empty boundary and performs the bootstrap HARD fold that
+    /// mints the live boundary anchor.
+    pub fn commit_state_import(
+        &self,
+        session_id: &str,
+        import_id: &str,
+        compartments: &[StoredCompartment],
+        completed_at_ms: i64,
+    ) -> Result<StateImportResult, StateImportError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let completed = tx
+                .query_row(
+                    "SELECT import_id, imported_count FROM mc_state_imports WHERE session_id = ?1",
+                    params![session_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            if let Some((completed_id, imported)) = completed {
+                if completed_id == import_id {
+                    return Ok(StateImportTxnOutcome::Duplicate(imported.max(0) as usize));
+                }
+                return Ok(StateImportTxnOutcome::SessionNotEmpty);
+            }
+
+            // This is the fresh-row form of the cache-state CAS. The predicate and all
+            // compartment writes share one fenced transaction, so a racing bootstrap
+            // cannot slip state between the emptiness check and the imported rows.
+            if session_has_durable_state(tx, session_id)? {
+                return Ok(StateImportTxnOutcome::SessionNotEmpty);
+            }
+            if let Err(error) = validate_state_import_compartments(compartments) {
+                return Ok(StateImportTxnOutcome::Validation(error));
+            }
+
+            for compartment in compartments {
+                insert_compartment_tx(tx, session_id, compartment.sequence, compartment)?;
+            }
+            tx.execute(
+                "INSERT INTO mc_state_imports
+                     (session_id, import_id, imported_count, completed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    session_id,
+                    import_id,
+                    compartments.len() as i64,
+                    completed_at_ms
+                ],
+            )?;
+            Ok(StateImportTxnOutcome::Imported(compartments.len()))
+        })?;
+
+        match outcome {
+            StateImportTxnOutcome::Imported(imported) => Ok(StateImportResult {
+                imported,
+                duplicate: false,
+            }),
+            StateImportTxnOutcome::Duplicate(imported) => Ok(StateImportResult {
+                imported,
+                duplicate: true,
+            }),
+            StateImportTxnOutcome::SessionNotEmpty => Err(StateImportError::SessionNotEmpty),
+            StateImportTxnOutcome::Validation(error) => Err(StateImportError::Validation(error)),
+        }
+    }
+
     /// Commit new state under the row_version CAS, inside the epoch-fenced txn.
     ///
     /// `expected` is the row_version from [`load`] (`None` = expect no row → INSERT).
     /// On success the row_version is bumped by one. A `CasConflict` means a
     /// concurrent writer won; the caller re-loads and re-steps. Call ONLY when
     /// durable state changed — a pure SoftPlus replay must skip the commit entirely
-    /// so a defer pass performs no write.
+    /// so the no-write-on-defer guarantee holds.
     pub fn commit(
         &self,
         session_id: &str,
@@ -5759,6 +6035,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_has_table.as_deref(), Some("mc_pass_trace"));
+        let fresh_has_import_table = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mc_state_imports'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(fresh_has_import_table.as_deref(), Some("mc_state_imports"));
 
         let migrated_dir = tempfile::tempdir().unwrap();
         let path = migrated_dir.path().join("store.db");
@@ -5825,6 +6113,21 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_has_table.as_deref(), Some("mc_pass_trace"));
+        let migrated_has_import_table = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mc_state_imports'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(
+            migrated_has_import_table.as_deref(),
+            Some("mc_state_imports")
+        );
         let migrated_date_columns = migrated
             .inner
             .with_conn(|conn| {
@@ -5885,6 +6188,151 @@ mod tests {
         let _first = McStore::open(&d).unwrap();
         // Second live handle on the same database must be rejected (single-writer).
         assert!(McStore::open(&d).is_err());
+    }
+
+    fn import_compartment(
+        sequence: i64,
+        start_message: i64,
+        end_message: i64,
+        end_message_id: &str,
+        p1: &str,
+    ) -> StoredCompartment {
+        StoredCompartment {
+            sequence,
+            start_message,
+            end_message,
+            end_message_id: end_message_id.to_string(),
+            title: format!("imported {sequence}"),
+            content: p1.to_string(),
+            p1: Some(p1.to_string()),
+            importance: 50,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn state_import_is_atomic_bootstrap_only_and_durably_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let compartments = vec![
+            import_compartment(4, 1, 4, "m4#0", "first"),
+            import_compartment(9, 5, 9, "m9#0", "second"),
+        ];
+
+        assert_eq!(
+            store.preflight_state_import("fresh", "bundle-a").unwrap(),
+            StateImportPreflight::Ready
+        );
+        let imported = store
+            .commit_state_import("fresh", "bundle-a", &compartments, 123)
+            .unwrap();
+        assert_eq!(
+            imported,
+            StateImportResult {
+                imported: 2,
+                duplicate: false
+            }
+        );
+        assert_eq!(store.load_compartments("fresh").unwrap(), compartments);
+        let loaded = store.load("fresh").unwrap();
+        assert!(loaded.core.boundary_id.is_empty());
+        assert!(
+            loaded.row_version.is_none(),
+            "import leaves bootstrap INSERT to transform"
+        );
+
+        let malformed_retry = vec![import_compartment(1, 3, 2, "bad", "")];
+        let duplicate = store
+            .commit_state_import("fresh", "bundle-a", &malformed_retry, 999)
+            .unwrap();
+        assert_eq!(
+            duplicate,
+            StateImportResult {
+                imported: 2,
+                duplicate: true
+            }
+        );
+        assert!(store.load("fresh").unwrap().row_version.is_none());
+        assert!(matches!(
+            store.commit_state_import("fresh", "bundle-b", &compartments, 999),
+            Err(StateImportError::SessionNotEmpty)
+        ));
+        assert_eq!(store.load_compartments("fresh").unwrap(), compartments);
+
+        store
+            .commit("used", None, &CoreState::default(), &ModuleMeta::default())
+            .unwrap();
+        assert!(matches!(
+            store.commit_state_import("used", "bundle-c", &compartments, 999),
+            Err(StateImportError::SessionNotEmpty)
+        ));
+        assert!(store.load_compartments("used").unwrap().is_empty());
+    }
+
+    #[test]
+    fn state_import_preflight_rejects_each_session_owned_state_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+        let cache = store.load("cache").unwrap();
+        store
+            .commit("cache", None, &cache.core, &cache.meta)
+            .unwrap();
+        store
+            .replace_compartments(
+                "compartments",
+                &[import_compartment(1, 1, 1, "m1#0", "summary")],
+            )
+            .unwrap();
+        store
+            .mint_or_get_tags(
+                "tags",
+                &[TagMintInput {
+                    block_id: "m1#0".to_string(),
+                    kind: "message".to_string(),
+                    token_count: 1,
+                    source_bytes: b"source".to_vec(),
+                }],
+                1,
+            )
+            .unwrap();
+        store
+            .append_pending_agent_drops("pending", &["m1#0".to_string()], 1)
+            .unwrap();
+        store
+            .append_pending_agent_drops_with_command("ledger", Some("command"), &[], 1)
+            .unwrap();
+
+        for session_id in ["cache", "compartments", "tags", "pending", "ledger"] {
+            assert!(matches!(
+                store.preflight_state_import(session_id, "bundle"),
+                Err(StateImportError::SessionNotEmpty)
+            ));
+            assert!(matches!(
+                store.commit_state_import(session_id, "bundle", &[], 2),
+                Err(StateImportError::SessionNotEmpty)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejected_state_import_validation_leaves_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let invalid = vec![import_compartment(1, 3, 2, "m2#0", "bad")];
+
+        let error = store
+            .commit_state_import("fresh", "bundle-a", &invalid, 123)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StateImportError::Validation(StateImportValidationError::RangeInvalid { .. })
+        ));
+        assert!(store.load_compartments("fresh").unwrap().is_empty());
+        assert_eq!(
+            store.preflight_state_import("fresh", "bundle-a").unwrap(),
+            StateImportPreflight::Ready
+        );
     }
 
     #[test]
