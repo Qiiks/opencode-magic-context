@@ -144,6 +144,9 @@ function parseArgs(argv = process.argv.slice(2)): Args {
                 args.prompts.push(...splitValues(value));
                 index++;
                 break;
+            case "--think":
+                setOllamaThink(argv[++i] ?? "");
+                break;
             case "--rebuild-corpus":
                 args.rebuildCorpus = true;
                 break;
@@ -522,6 +525,56 @@ function resolveOllamaCloudKey(): string {
     return key;
 }
 
+// Ollama's native /api/chat honors think (false | "low" | "medium" | "high"),
+// which the OpenAI-compat endpoint does not expose reliably. Bounding thinking
+// matters: on the biggest categories unbounded thinking consumed the entire
+// output budget before any content, returning empty assistant text. The level
+// is a CLI knob (--think) so cells can A/B quality against thinking budget.
+const THINK_LEVELS = new Set(["false", "low", "medium", "high"]);
+let ollamaThink: false | string = "low";
+
+function setOllamaThink(value: string): void {
+    if (!THINK_LEVELS.has(value)) {
+        throw new Error(`--think must be one of ${[...THINK_LEVELS].join(", ")}`);
+    }
+    ollamaThink = value === "false" ? false : value;
+}
+
+async function callOllamaNativeChat(model: string, messages: ChatMessage[]): Promise<Completion> {
+    const response = await fetch("https://ollama.com/api/chat", {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${resolveOllamaCloudKey()}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            model,
+            messages,
+            think: ollamaThink,
+            stream: false,
+            options: { temperature: 0.1, num_predict: MAX_OUTPUT_TOKENS },
+        }),
+        signal: AbortSignal.timeout(10 * 60 * 1_000),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+        throw new Error(`ollama-cloud ${response.status}: ${text.replace(/\s+/g, " ").slice(0, 500)}`);
+    }
+    const payload = JSON.parse(text) as {
+        message?: { content?: string };
+        prompt_eval_count?: number;
+        eval_count?: number;
+    };
+    const content = payload.message?.content?.trim();
+    if (!content) throw new Error("ollama-cloud response has no assistant text");
+    const promptTokens = payload.prompt_eval_count ?? 0;
+    const completionTokens = payload.eval_count ?? 0;
+    return {
+        content,
+        usage: { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens },
+    };
+}
+
 async function callChatCompletions(
     endpoint: string,
     apiKey: string,
@@ -559,14 +612,7 @@ async function callChatCompletions(
 async function callModel(model: string, messages: ChatMessage[]): Promise<Completion> {
     if (model.startsWith(OLLAMA_CLOUD_PREFIX)) {
         const bareModel = model.slice(OLLAMA_CLOUD_PREFIX.length);
-        return callChatCompletions(
-            OLLAMA_CLOUD_ENDPOINT,
-            resolveOllamaCloudKey(),
-            "ollama-cloud",
-            bareModel,
-            messages,
-            {},
-        );
+        return callOllamaNativeChat(bareModel, messages);
     }
     return callChatCompletions(OPENROUTER_ENDPOINT, resolveOpenRouterKey(), "OpenRouter", model, messages, {
         ...(model === "google/gemini-3.5-flash" ? {} : { reasoning: { enabled: false } }),
