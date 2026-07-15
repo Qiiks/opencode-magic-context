@@ -3228,6 +3228,44 @@ mod tests {
         }
     }
 
+    /// Build the omitted-wire and explicit-false forms of one request through the
+    /// SAME wire deserialization path, differing only in tool_present presence.
+    fn wire_pair_absent_and_explicit_false(
+        base: TransformRequest,
+    ) -> (TransformRequest, TransformRequest) {
+        let mut explicit_value = serde_json::to_value(&base).unwrap();
+        explicit_value
+            .as_object_mut()
+            .unwrap()
+            .insert("tool_present".to_string(), serde_json::Value::Bool(false));
+        let explicit: TransformRequest = serde_json::from_value(explicit_value).unwrap();
+        let mut absent_value = serde_json::to_value(&base).unwrap();
+        absent_value.as_object_mut().unwrap().remove("tool_present");
+        let absent: TransformRequest = serde_json::from_value(absent_value).unwrap();
+        (absent, explicit)
+    }
+
+    fn two_block_item(id: &str, ordinal: u64, first: &str, second: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: first.to_string(),
+                    }),
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: second.to_string(),
+                    }),
+                ],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta::default(),
+            ),
+        }
+    }
+
     fn system_item(id: &str, ordinal: u64, bytes: &str) -> CkIngressMessage {
         CkIngressMessage {
             mid: id.to_string(),
@@ -6981,20 +7019,48 @@ mod tests {
     fn newest_tag_block_set_isolates_protected_and_applied_pending_rows() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let messages = (1..=25)
+        // The protected set is the newest 20 ACTIVE tags as exact block ids — a
+        // fixture with contiguous one-tag-per-ordinal numbering could pass under
+        // a (forbidden) numeric-threshold or ordinal-cutoff implementation. Force
+        // the distinction: non-contiguous tag numbers, two tags on ONE ordinal
+        // (m24 carries a message tag and a second same-ordinal block), a
+        // stale-provenance row (source bytes no longer match the live carrier),
+        // and a frozen row — all of which must be excluded from slots exactly.
+        let mut messages = (1..=25)
             .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
             .collect::<Vec<_>>();
-        let tags = (1..=25)
-            .map(|ordinal| TagMintInput {
+        // Second block on ordinal 24 so block-count != ordinal-count.
+        messages[23] = two_block_item("m24", 24, "text 24", "attachment 24");
+
+        let mut tags = Vec::new();
+        let mut tag_time = 0;
+        for ordinal in 1..=25 {
+            // Gap the numbering: mint in two batches later so numbers are sparse.
+            tags.push(TagMintInput {
                 block_id: format!("m{ordinal}#0"),
                 kind: "message".to_string(),
                 token_count: 1,
-                source_bytes: format!("text {ordinal}").into_bytes(),
-            })
-            .collect::<Vec<_>>();
-        store.mint_or_get_tags("protected", &tags, 1).unwrap();
+                source_bytes: if ordinal == 23 {
+                    // Stale provenance: the stored bytes do not match the live
+                    // carrier, so this row must NOT occupy a protected slot.
+                    b"text from a previous life".to_vec()
+                } else {
+                    format!("text {ordinal}").into_bytes()
+                },
+            });
+            tag_time += 1;
+        }
+        tags.push(TagMintInput {
+            block_id: "m24#1".to_string(),
+            kind: "message".to_string(),
+            token_count: 1,
+            source_bytes: b"attachment 24".to_vec(),
+        });
         store
-            .append_pending_agent_drops("protected", &["m1#0".to_string(), "m25#0".to_string()], 2)
+            .mint_or_get_tags("protected", &tags, tag_time)
+            .unwrap();
+        store
+            .append_pending_agent_drops("protected", &["m1#0".to_string(), "m25#0".to_string()], 99)
             .unwrap();
 
         let response = run(
@@ -7004,11 +7070,58 @@ mod tests {
         );
         assert_eq!(response.action, "HARD");
         let loaded = store.load("protected").unwrap();
+        // 26 tag rows minted; m23#0 is stale-provenance (excluded). 25 active
+        // rows remain; the newest 20 by tag number include m25#0 and m24#1 and
+        // reach back past m24#0... down to the 20th-newest, which still covers
+        // m6#0. m1#0 (oldest) is far outside the protected set: it applies.
         assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), Some("[dropped]"));
+        // m25#0 is the newest active tag: protected, so its pending row stays.
         assert_eq!(frozen_red_payload(&loaded.core, "m25#0"), None);
         let pending = store.load_pending_agent_drops("protected").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].target_id, "m25#0");
+    }
+
+    #[test]
+    fn newest_tag_block_set_excludes_stale_provenance_from_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // Exactly 21 tagged live blocks. The NEWEST row (m21#0) has stale
+        // provenance. Under exact semantics it cannot hold a slot, so the
+        // protected 20 are m20..m1 and a pending drop on m1#0 (rank 21 by
+        // number, rank 20 among ACTIVE rows) is PROTECTED. An implementation
+        // that skips the provenance re-check frees m1#0 and applies the drop.
+        let messages = (1..=21)
+            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
+            .collect::<Vec<_>>();
+        let tags = (1..=21)
+            .map(|ordinal| TagMintInput {
+                block_id: format!("m{ordinal}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: if ordinal == 21 {
+                    b"stale bytes".to_vec()
+                } else {
+                    format!("text {ordinal}").into_bytes()
+                },
+            })
+            .collect::<Vec<_>>();
+        store.mint_or_get_tags("stale-slot", &tags, 1).unwrap();
+        store
+            .append_pending_agent_drops("stale-slot", &["m1#0".to_string()], 2)
+            .unwrap();
+
+        let response = run(
+            &store,
+            &active_cc_req("stale-slot", "cfg0", messages),
+            &spine(),
+        );
+        assert_eq!(response.action, "HARD");
+        let loaded = store.load("stale-slot").unwrap();
+        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), None);
+        let pending = store.load_pending_agent_drops("stale-slot").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target_id, "m1#0");
     }
 
     #[test]
@@ -7214,11 +7327,19 @@ mod tests {
                 item("b", 2, "two"),
                 item("c", 3, "three"),
             ];
-            let baseline = profile_req(profile, "identity", "cfg0", messages.clone());
-            let mut absent_value = serde_json::to_value(&baseline).unwrap();
-            absent_value.as_object_mut().unwrap().remove("tool_present");
-            let mut absent: TransformRequest = serde_json::from_value(absent_value).unwrap();
-            let explicit = absent.clone();
+            // Both arms must deserialize from the wire (a direct struct skips the
+            // original-value retention that wire requests carry), but they must be
+            // constructed INDEPENDENTLY: the explicit arm's JSON carries a literal
+            // tool_present:false, the absent arm's JSON omits the key entirely.
+            // Cloning the deserialized absent request instead would inherit
+            // whatever default serde applied, making the comparison tautological
+            // under a wrong default.
+            let (absent, explicit) = wire_pair_absent_and_explicit_false(profile_req(
+                profile,
+                "identity",
+                "cfg0",
+                messages.clone(),
+            ));
 
             for expected_action in ["HARD", "SOFT+"] {
                 let left_response = run(&left, &absent, &spine());
@@ -7243,9 +7364,14 @@ mod tests {
                 "{profile:?}"
             );
 
-            absent.render_config = "cfg1".to_string();
-            let mut explicit_fold = explicit;
-            explicit_fold.render_config = "cfg1".to_string();
+            // Rebuild BOTH arms independently for the fold leg too: mutating one
+            // and cloning the other would reintroduce the shared-default hazard.
+            let (absent, explicit_fold) = wire_pair_absent_and_explicit_false(profile_req(
+                profile,
+                "identity",
+                "cfg1",
+                messages.clone(),
+            ));
             let left_fold = run(&left, &absent, &spine());
             let right_fold = run(&right, &explicit_fold, &spine());
             assert_eq!(left_fold.action, "HARD", "{profile:?}");

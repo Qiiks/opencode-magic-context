@@ -7247,23 +7247,38 @@ mod tests {
 
         let inactive = call_transform_request(&handler, request.clone()).await;
         assert_eq!(inactive["surface_state"], "inactive");
-        assert!(inactive["row_version"].is_u64());
+        let v_inactive = inactive["row_version"].as_u64().expect("row_version u64");
 
         request["tool_present"] = json!(true);
         let on_transition = call_transform_request(&handler, request.clone()).await;
         assert_eq!(on_transition["surface_state"], "transition");
-        assert!(on_transition["row_version"].is_u64());
+        let v_on = on_transition["row_version"]
+            .as_u64()
+            .expect("row_version u64");
+        // The surface flip rides a committing HARD, so the version must advance.
+        assert!(v_on > v_inactive, "flip-on HARD must bump row_version");
+
         let active = call_transform_request(&handler, request.clone()).await;
         assert_eq!(active["surface_state"], "active");
-        assert!(active["row_version"].is_u64());
+        let v_active = active["row_version"].as_u64().expect("row_version u64");
+        // Steady-state replay commits nothing: equal versions are legitimate,
+        // regression (a lower version) never is.
+        assert!(v_active >= v_on, "row_version must be nondecreasing");
 
         request["tool_present"] = json!(false);
         let off_transition = call_transform_request(&handler, request.clone()).await;
         assert_eq!(off_transition["surface_state"], "transition");
-        assert!(off_transition["row_version"].is_u64());
+        let v_off = off_transition["row_version"]
+            .as_u64()
+            .expect("row_version u64");
+        assert!(v_off > v_active, "flip-off HARD must bump row_version");
+
         let inactive_again = call_transform_request(&handler, request).await;
         assert_eq!(inactive_again["surface_state"], "inactive");
-        assert!(inactive_again["row_version"].is_u64());
+        let v_final = inactive_again["row_version"]
+            .as_u64()
+            .expect("row_version u64");
+        assert!(v_final >= v_off, "row_version must be nondecreasing");
     }
 
     async fn call_transform_with_usage(
