@@ -650,6 +650,15 @@ pub fn completion_wait_budget() -> Duration {
     Duration::from_secs(660)
 }
 
+/// Maximum producer rounds driven by one explicit session wrapup.
+pub const MAX_WRAPUP_ROUNDS: usize = 5;
+
+/// Per-round wrapup wait bound. A timed-out producer keeps running under the normal
+/// historian guard so durable recovery remains identical to an incremental firing.
+pub fn wrapup_round_wait_budget() -> Duration {
+    Duration::from_secs(600)
+}
+
 /// The transform-call deadline a consumer sets, VERBATIM, for requests to this module —
 /// margin included, no consumer-side arithmetic on top (adding local margin would
 /// double-count and drift the number per consumer; this module owns the margin).
