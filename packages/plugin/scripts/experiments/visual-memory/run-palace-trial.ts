@@ -145,7 +145,9 @@ function parseArgs(argv = process.argv.slice(2)): Args {
                 index++;
                 break;
             case "--think":
-                setOllamaThink(argv[++i] ?? "");
+                if (!value) usage();
+                setOllamaThink(value);
+                index++;
                 break;
             case "--rebuild-corpus":
                 args.rebuildCorpus = true;
