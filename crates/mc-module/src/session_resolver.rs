@@ -15,12 +15,12 @@ use subc_client_rs::{
 };
 use subc_protocol::{BindIdentity, RouteTarget};
 
-const DEFAULT_AI_PROXY_MODULE_ID: &str = "ai-proxy";
+const DEFAULT_THALAMUS_MODULE_ID: &str = "thalamus";
 const SESSION_RESOLVE_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSession {
-    /// Opaque composite conversation key returned by ai-proxy. Callers must not parse it;
+    /// Opaque composite conversation key returned by the thalamus gateway. Callers must not parse it;
     /// the instance token is only the lookup input.
     pub session_id: String,
     pub last_traffic_ms: i64,
@@ -66,7 +66,7 @@ impl RealSessionResolver {
     pub fn new(connection_file: PathBuf) -> Self {
         Self {
             connection_file,
-            module_id: DEFAULT_AI_PROXY_MODULE_ID.to_string(),
+            module_id: DEFAULT_THALAMUS_MODULE_ID.to_string(),
         }
     }
 
@@ -150,6 +150,10 @@ impl SessionResolver for MissingSessionResolver {
 fn consumer_options() -> ConsumerOptions {
     ConsumerOptions {
         handshake_timeout: SESSION_RESOLVE_DEADLINE,
+        // Channel-0 calls share the resolve deadline: session.resolve is the only
+        // call this consumer makes, and a facade tool call must fail fast rather
+        // than outlive its MCP request.
+        call_timeout: SESSION_RESOLVE_DEADLINE,
         reconnect_backoff: RetryBackoff {
             base: Duration::from_millis(25),
             cap: Duration::from_millis(50),

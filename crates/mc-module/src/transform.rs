@@ -3645,7 +3645,7 @@ mod tests {
 
     /// Cross-repo drift pin for the shared CK wire fixture. Three parties ride
     /// this exact byte shape (llm-runner produces it, this module parses it,
-    /// ai-proxy produces it), and each repo vendors its own copy — so a
+    /// the thalamus gateway produces it), and each repo vendors its own copy — so a
     /// one-sided regeneration would leave every repo locally green while the
     /// wire silently drifts. Each repo pins the fixture's sha256; a regen
     /// fails the pin everywhere until each consumer deliberately re-vendors

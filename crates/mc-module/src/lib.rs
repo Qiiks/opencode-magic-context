@@ -127,7 +127,7 @@ pub enum BindingError {
 /// Canonical module id (overridable via `SUBC_MODULE_ID_ENV` at boot).
 pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
-/// Render-config epoch members, co-owned with byte-splice-consumer codecs (ai-proxy).
+/// Render-config epoch members, co-owned with the byte-splice consumer (thalamus gateway).
 /// Consumers fold these into the opaque render_config string they populate per
 /// request; the module compares render_config as opaque bytes against durable state
 /// and forces a HARD fold on any change. Bumping an epoch here is therefore the
@@ -1615,7 +1615,7 @@ impl McHandler {
 
     /// Return the channel binding without comparing a request session. MCP facade routes
     /// bind the `session` slot to an instance token, not to the durable conversation key;
-    /// facade handlers must resolve that token through ai-proxy before touching the store.
+    /// facade handlers must resolve that token through the thalamus gateway before touching the store.
     fn facade_binding(&self, channel: u16) -> Result<SessionBinding, BindingError> {
         self.bindings
             .lock()
@@ -5807,7 +5807,7 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
             sub_supervises: false,
         }],
         consumes: vec![ConsumerRole::ServiceClient {
-            of: vec!["ai-proxy".to_string()],
+            of: vec!["thalamus".to_string()],
         }],
         scheduled_tasks: Vec::new(),
         bindings: Bindings {
@@ -5918,7 +5918,7 @@ mod tests {
         assert_eq!(
             m.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["ai-proxy".to_string()]
+                of: vec!["thalamus".to_string()]
             }]
         );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
@@ -6041,7 +6041,7 @@ mod tests {
                 match outcome {
                     HandlerOutcome::Response(bytes) => {
                         // Optional: dump the raw TransformResponse bytes per pass so a
-                        // consumer (e.g. ai-proxy's plan_outcome harness) can consume the
+                        // consumer (e.g. the gateway plan_outcome harness) can consume the
                         // module's EXACT returned bytes (MC_REPLAY_OUT_DIR=<dir>).
                         if let Ok(out_dir) = std::env::var("MC_REPLAY_OUT_DIR") {
                             let _ = std::fs::create_dir_all(&out_dir);
