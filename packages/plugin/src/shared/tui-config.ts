@@ -62,8 +62,8 @@ function writeTuiConfigAtomic(configPath: string, config: Record<string, unknown
     renameSync(tmpPath, configPath);
 }
 
-function resolveTuiConfigPath(): string {
-    const configDir = getOpenCodeConfigPaths({ binary: "opencode" }).configDir;
+function resolveTuiConfigPath(configDirOverride?: string): string {
+    const configDir = configDirOverride ?? getOpenCodeConfigPaths({ binary: "opencode" }).configDir;
     const jsoncPath = join(configDir, "tui.jsonc");
     const jsonPath = join(configDir, "tui.json");
 
@@ -80,12 +80,12 @@ function resolveTuiConfigPath(): string {
 }
 
 /**
- * Ensure tui.json has the magic-context TUI plugin entry.
- * Creates tui.json if it doesn't exist. Silently skips if already present.
+ * Ensure the selected TUI config has the magic-context plugin entry.
+ * Creates tui.jsonc if neither TUI config exists. Silently skips if already present.
  */
-export function ensureTuiPluginEntry(): boolean {
+export function ensureTuiPluginEntry(options: { configDir?: string } = {}): boolean {
     try {
-        const configPath = resolveTuiConfigPath();
+        const configPath = resolveTuiConfigPath(options.configDir);
 
         let config: Record<string, unknown> = {};
         if (existsSync(configPath)) {
