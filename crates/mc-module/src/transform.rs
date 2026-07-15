@@ -2550,7 +2550,18 @@ fn apply_tag_prefix_to_block(
         (ck_wire::CkKind::Text { text }, TaggableKind::Message)
             if role == "user" || role == "assistant" =>
         {
-            let next = prepend_tag(tag_number, text);
+            // Models imitate the tag notation they see in history, prefixing
+            // their own replies with §N§ copies. Strip well-formed LEADING
+            // prefixes from assistant text before applying the official tag
+            // (display-only: mint provenance still hashes the verbatim ingress
+            // bytes). Leading-only on purpose — mid-prose references like
+            // "I dropped §12§" are meaningful model-authored content.
+            let base = if role == "assistant" {
+                strip_leading_tag_imitations(text)
+            } else {
+                text.as_str()
+            };
+            let next = prepend_tag(tag_number, base);
             if *text != next {
                 *text = next;
                 return true;
@@ -2640,6 +2651,26 @@ fn prepend_tag(tag_number: i64, value: &str) -> String {
 /// block's tag-like user content.
 fn strip_tag_prefix(value: &str, tag_number: i64) -> &str {
     value.strip_prefix(&tag_prefix(tag_number)).unwrap_or(value)
+}
+
+/// Strip a run of well-formed `§N§ `-shaped prefixes from the head of assistant
+/// text. Deterministic over ingress bytes, so the wire replays byte-identically
+/// on every pass.
+fn strip_leading_tag_imitations(value: &str) -> &str {
+    let mut rest = value;
+    loop {
+        let Some(after_open) = rest.strip_prefix('\u{a7}') else {
+            return rest;
+        };
+        let digits = after_open.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return rest;
+        }
+        let Some(after_close) = after_open[digits..].strip_prefix('\u{a7}') else {
+            return rest;
+        };
+        rest = after_close.trim_start_matches(' ');
+    }
 }
 
 fn maybe_append_channel1_nudge(
@@ -3533,6 +3564,48 @@ mod tests {
         assert!(
             joined.contains("message-provenance"),
             "message provenance lost: {joined}"
+        );
+    }
+
+    /// Models copy the tag notation they see in history onto their own replies.
+    /// The overlay must strip those imitation prefixes on assistant text (leading
+    /// only — mid-prose references stay verbatim) on ACTIVE passes, while false
+    /// passes serve the ingress bytes untouched.
+    #[test]
+    fn assistant_tag_imitation_prefixes_strip_on_active_passes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![
+            wire_item("user", "ccm-0", 0, &["say BEAT3-OK"]),
+            wire_item(
+                "assistant",
+                "ccm-1",
+                1,
+                &["\u{a7}39\u{a7} \u{a7}39\u{a7} BEAT3-OK, and earlier I dropped \u{a7}12\u{a7}."],
+            ),
+        ];
+        let req = active_cc_req("imitation", "cfg0", messages.clone());
+        let transition = run(&s, &req, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        let second = run(&s, &req, &spine());
+        let joined = serde_json::to_string(&second.ck_messages).unwrap();
+        assert!(
+            joined.contains("\u{a7}2\u{a7} BEAT3-OK, and earlier I dropped \u{a7}12\u{a7}."),
+            "imitation prefixes must strip, official tag applies, mid-prose reference survives: {joined}"
+        );
+        assert!(
+            !joined.contains("\u{a7}39\u{a7}"),
+            "model-authored leading prefixes must not reach the wire on active passes: {joined}"
+        );
+
+        // False pass on the same session: ingress bytes verbatim (no strip, no tags).
+        let mut inactive = cc_req("imitation", "cfg0", messages);
+        inactive.tool_present = false;
+        let off = run(&s, &inactive, &spine());
+        let joined_off = serde_json::to_string(&off.ck_messages).unwrap();
+        assert!(
+            joined_off.contains("\u{a7}39\u{a7} \u{a7}39\u{a7} BEAT3-OK"),
+            "false passes must serve model-authored bytes verbatim: {joined_off}"
         );
     }
 
