@@ -358,7 +358,6 @@ pub const SHADOW_SESSION_PREFIX: &str = "shadow:";
 const NO_ROW: i64 = -1;
 const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
 const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
-const MAX_REDUCE_COMMAND_LEDGER_ROWS_PER_SESSION: i64 = 512;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1238,10 +1237,12 @@ pub struct ModuleMeta {
     #[serde(default)]
     pub last_usage: Option<ModuleUsage>,
     /// The most recent serializer profile observed on this durable conversation key.
-    /// Facade tools resolve an instance token to a conversation key, then use this frozen
-    /// session fact to apply per-profile feature gates without trusting tool-call args.
     #[serde(default)]
     pub last_serializer_profile: String,
+    /// The request-local reduction surface state committed with the rendered identity.
+    /// Missing legacy metadata is false, which preserves the dormant render path.
+    #[serde(default)]
+    pub cc_u1_active: bool,
     /// Reclaimable-token amount at the last Channel-1 append or suppression reset.
     #[serde(default)]
     pub channel1_last_nudge_undropped: i64,
@@ -2056,22 +2057,8 @@ impl McStore {
                 )? as u64;
             }
 
-            if command_id.is_some() {
-                // Command ids break timestamp ties so pruning is stable even when several
-                // requests arrive within the same millisecond.
-                tx.execute(
-                    "DELETE FROM mc_reduce_command_ledger
-                     WHERE session_id = ?1
-                       AND command_id NOT IN (
-                           SELECT command_id
-                           FROM mc_reduce_command_ledger
-                           WHERE session_id = ?1
-                           ORDER BY queued_at_ms DESC, command_id DESC
-                           LIMIT ?2
-                       )",
-                    params![session_id, MAX_REDUCE_COMMAND_LEDGER_ROWS_PER_SESSION],
-                )?;
-            }
+            // Command ids are lineage-durable. Pruning would make an old outcome-unknown
+            // retry destructive again, so rows leave only with real lineage teardown.
 
             Ok(AppendOutcome {
                 queued,
@@ -5585,7 +5572,7 @@ mod tests {
     }
 
     #[test]
-    fn command_id_ledger_retains_the_newest_512_commands() {
+    fn command_id_ledger_retains_rows_past_512_commands() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let target_ids = vec!["a#0".to_string()];
@@ -5604,15 +5591,14 @@ mod tests {
         }
 
         let command_ids = command_ledger_ids(&store, "ses");
-        assert_eq!(command_ids.len(), 512);
-        assert_eq!(command_ids.first().map(String::as_str), Some("command-001"));
+        assert_eq!(command_ids.len(), 513);
+        assert_eq!(command_ids.first().map(String::as_str), Some("command-000"));
         assert_eq!(command_ids.last().map(String::as_str), Some("command-512"));
-        assert!(!command_ids.iter().any(|id| id == "command-000"));
 
-        let pruned_retry = store
+        let oldest_retry = store
             .append_pending_agent_drops_with_command("ses", Some("command-000"), &target_ids, 513)
             .unwrap();
-        assert!(!pruned_retry.duplicate);
+        assert!(oldest_retry.duplicate);
     }
 
     #[test]

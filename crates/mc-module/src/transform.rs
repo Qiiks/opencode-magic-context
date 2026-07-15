@@ -31,7 +31,7 @@ use crate::selection::{
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
     Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, ModuleMeta,
-    ModuleUsage, PendingRewriteState, StoredCompartment, TagMintInput,
+    ModuleUsage, PendingAgentDrop, PendingRewriteState, StoredCompartment, TagMintInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -184,6 +184,10 @@ pub struct TransformRequest {
     pub serializer_profile: String,
     pub session_id: String,
     pub render_config: String,
+    /// Whether this request advertises the canonical reduction tool. Missing input is
+    /// deliberately false so older callers stay on the dormant byte path.
+    #[serde(default)]
+    pub tool_present: bool,
     /// Caller-owned identity for the full raw array. The module treats it as opaque and
     /// only echoes it on success-shaped responses so consumers can validate cached bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,6 +219,8 @@ struct TransformRequestWire {
     serializer_profile: Option<String>,
     session_id: String,
     render_config: String,
+    #[serde(default)]
+    tool_present: bool,
     #[serde(default)]
     full_array_fingerprint: Option<String>,
     #[serde(default)]
@@ -248,6 +254,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             serializer_profile: wire.serializer_profile.unwrap_or_default(),
             session_id: wire.session_id,
             render_config: wire.render_config,
+            tool_present: wire.tool_present,
             full_array_fingerprint: wire.full_array_fingerprint,
             messages,
             tail_delta: wire.tail_delta,
@@ -292,6 +299,15 @@ pub enum ServedFrom {
     DaemonLkg,
 }
 
+/// The coherent request-local reduction surface state reported to the forwarding layer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceState {
+    Inactive,
+    Transition,
+    Active,
+}
+
 /// A transform pass result. Diagnostics remain alongside the CK array, but the response
 /// messages themselves are bare CK messages: no request-only `mid` or `ordinal` sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -305,6 +321,7 @@ pub struct TransformResponse {
     pub reconcile_pending: bool,
     pub version: u64,
     pub row_version: u64,
+    pub surface_state: SurfaceState,
     pub committed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_ordinal: Option<u64>,
@@ -337,6 +354,7 @@ impl TransformResponse {
             reconcile_pending: false,
             version: 0,
             row_version: 0,
+            surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
             historian: None,
@@ -357,6 +375,7 @@ impl TransformResponse {
             reconcile_pending: false,
             version: 0,
             row_version: 0,
+            surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
             historian: None,
@@ -668,11 +687,21 @@ fn apply_once(
     }
 
     let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
+    let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
     let loaded = store.load(&req.session_id)?;
+    let surface_transition = serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic)
+        && loaded.meta.cc_u1_active != cc_u1_active;
+    let surface_state = if surface_transition {
+        SurfaceState::Transition
+    } else if cc_u1_active {
+        SurfaceState::Active
+    } else {
+        SurfaceState::Inactive
+    };
 
     // Every module-owned byte-affecting epoch is folded before activation decisions. The
     // tagger is active only after its non-zero epoch is present in the session's committed
-    // render identity, so an established pre-flip session cannot acquire tags before the
+    // render identity, so an established dormant session cannot acquire tags before the
     // coordinating cache-breaking HARD fold has committed.
     let memory_render_epoch = if crate::MEMORY_RENDER_FORMAT_EPOCH != 0 {
         format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH)
@@ -689,11 +718,10 @@ fn apply_once(
         .filter(|epoch| *epoch != 0)
         .map(|epoch| format!("mpe{epoch}"))
         .unwrap_or_default();
-    let tagger_feature_epoch = serializer_profile
-        .map(crate::tagger_feature_epoch)
-        .filter(|epoch| *epoch != 0)
-        .map(|epoch| format!("tfe{epoch}"))
-        .unwrap_or_default();
+    let tagger_feature_epoch = match crate::tagger_feature_epoch(cc_u1_active) {
+        0 => String::new(),
+        epoch => format!("tfe{epoch}"),
+    };
     let effective_render_config = fold_m0_content_epoch(
         &req.render_config,
         &M0ContentEpoch {
@@ -706,11 +734,19 @@ fn apply_once(
             tagger_feature_epoch: tagger_feature_epoch.clone(),
         },
     );
-    let tagging_active = !tagger_feature_epoch.is_empty()
-        && loaded.meta.initialized
-        && loaded.meta.last_render_config == effective_render_config;
-    let tag_rows = if tagging_active {
-        mint_tags_for_projection(store, &req.session_id, &projection, ctx.now_ms)?;
+    let tagging_active = cc_u1_active && loaded.meta.cc_u1_active;
+    let tag_rows = if cc_u1_active {
+        // Prior rows must be visible on the activation transition so protected pending
+        // drops are classified against the same durable tag history as steady passes.
+        if tagging_active {
+            mint_tags_for_projection(
+                store,
+                &req.session_id,
+                &projection,
+                &loaded.core,
+                ctx.now_ms,
+            )?;
+        }
         store.load_tags_for_session(&req.session_id)?
     } else {
         Vec::new()
@@ -776,6 +812,7 @@ fn apply_once(
                 false,
                 trim_mismatch,
                 passthrough_overlay.as_ref(),
+                surface_state,
             ));
         }
 
@@ -816,6 +853,7 @@ fn apply_once(
             true,
             trim_mismatch,
             passthrough_overlay.as_ref(),
+            surface_state,
         ));
     }
 
@@ -908,12 +946,11 @@ fn apply_once(
     };
     let hard_fold_requested =
         first_fold_due || scheduler_outcome.idle_ttl_fired || system_absorb_hard_due;
-    // Tail mutations are disabled wholesale for profiles whose consumer keeps tail
-    // bytes verbatim (byte-splice legs): mutating a tail the consumer discards would
-    // freeze reclaims that never reached the real context. The producer gate is the
-    // single choke point for selection AND agent-drop consumption, so one AND covers
-    // both; todo capture/advance and the watermark stamps are gated separately below.
-    let tail_reclaim_enabled = serializer_profile.is_none_or(healing::tail_reclaim);
+    // Profile defaults remain conservative, while the request-local tool signal enables
+    // full-array tail reclaim for the Claude Code profile. A false request therefore
+    // retains the exact pre-capability behavior without changing the global profile table.
+    let tail_reclaim_enabled =
+        serializer_profile.is_none_or(|profile| healing::tail_reclaim(profile) || cc_u1_active);
     let producer_gate = tail_reclaim_enabled
         && producer_gate(
             scheduler_outcome.pass,
@@ -928,12 +965,21 @@ fn apply_once(
         PassClass::Defer
     };
     let tail_for_selection = tail_sel_items(&live, loaded.meta.coverage_ordinal);
+    let protected_block_ids = if cc_u1_active {
+        newest_active_tag_block_ids(&loaded.core, &loaded.meta, &projection, &tag_rows)
+    } else {
+        HashSet::new()
+    };
     let selected_reductions = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
-        let agent_drop_ids = pending_agent_drops
-            .iter()
-            .map(|drop| drop.target_id.clone())
-            .collect::<Vec<_>>();
+        let agent_drop_ids = if cc_u1_active {
+            pending_agent_drops
+                .iter()
+                .map(|drop| drop.target_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         select_reductions(
             &tail_for_selection,
             &frozen,
@@ -952,6 +998,7 @@ fn apply_once(
                 prior_input_sample: loaded.meta.last_emergency_input_sample,
                 has_prior_drop: loaded.meta.has_prior_emergency_drop,
                 agent_drop_ids,
+                protected_block_ids: protected_block_ids.clone(),
             },
             &SelectionConfig {
                 smart_drops: ctx.smart_drops,
@@ -966,9 +1013,6 @@ fn apply_once(
     } else {
         ctx.injected_reductions.clone()
     };
-    let selected_reductions =
-        numbered_drop_placeholders_for_new_freezes(&loaded.core, &selected_reductions, &tag_rows);
-
     // Fail-loud monotonicity guard, BEFORE classify and on EVERY pass: a frozen
     // reduction target re-supplied with different bytes breaks the immutable contract,
     // and the set-membership trigger would silently skip it (already frozen) and serve
@@ -1015,7 +1059,8 @@ fn apply_once(
         }
     }
     apply_ingress_meta(&mut meta, req, &projection);
-    if !tagger_feature_epoch.is_empty() {
+    meta.cc_u1_active = cc_u1_active;
+    if cc_u1_active {
         meta.last_serializer_profile = req.serializer_profile.clone();
     }
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
@@ -1402,35 +1447,27 @@ fn apply_once(
         &projection,
         req,
         tagging_active.then_some(&tag_overlay),
+        tail_reclaim_enabled,
     )?;
 
     // Build the output before committing so a missing synthetic-todo anchor cannot
-    // persist an unusable frozen pair. Only commit when core or meta changed;
-    // otherwise reuse the previous row version without writing.
-    let changed = core != loaded.core || meta != loaded.meta;
-    let row_version = if changed {
+    // persist an unusable frozen pair. Pending rows are classified from the final plan:
+    // live unfrozen targets remain durable, while applied or retired targets are consumed.
+    let consumed_drop_ids = consumed_pending_drop_ids(
+        &pending_agent_drops,
+        &loaded.core,
+        &core,
+        &projection,
+        meta.coverage_ordinal,
+    );
+    let state_changed = core != loaded.core || meta != loaded.meta;
+    if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
-        let consumed_drop_ids = if is_bust_pass && producer_gate {
-            pending_agent_drops
-                .iter()
-                .map(|drop| drop.id)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        if consumed_drop_ids.is_empty() {
-            if let Some(revision) = commit_memory_revision.as_ref() {
-                store.commit_with_consumed_drops(
-                    &req.session_id,
-                    commit_expected,
-                    &core,
-                    &meta,
-                    &[],
-                    Some(revision),
-                )?
-            } else {
-                store.commit(&req.session_id, commit_expected, &core, &meta)?
-            }
+    }
+    let commit_required = state_changed || !consumed_drop_ids.is_empty();
+    let row_version = if commit_required {
+        if consumed_drop_ids.is_empty() && commit_memory_revision.is_none() {
+            store.commit(&req.session_id, commit_expected, &core, &meta)?
         } else {
             store.commit_with_consumed_drops(
                 &req.session_id,
@@ -1459,7 +1496,8 @@ fn apply_once(
             reconcile_pending: core.reconcile_pending,
             version: core.version,
             row_version,
-            committed: changed,
+            surface_state,
+            committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
             historian: None,
             ck_messages: Some(ck_messages),
@@ -1751,32 +1789,34 @@ fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Add a durable tag reference only while a new drop payload is being frozen. Existing
-/// frozen units remain authoritative and replay byte-identically.
-fn numbered_drop_placeholders_for_new_freezes(
-    core: &CoreState,
-    reductions: &[ReductionDecision],
-    tag_rows: &[McTagRow],
-) -> Vec<ReductionDecision> {
-    let frozen = frozen_red_targets(core);
-    let tag_by_block = tag_rows
+/// Return only queue rows whose target was frozen by this plan or is no longer a live,
+/// unfrozen tail block. Every other row remains durable for a later eligible pass.
+fn consumed_pending_drop_ids(
+    pending: &[PendingAgentDrop],
+    loaded_core: &CoreState,
+    final_core: &CoreState,
+    projection: &FlatProjection,
+    final_coverage: Option<u64>,
+) -> Vec<i64> {
+    let frozen_before = frozen_red_targets(loaded_core);
+    let frozen_after = frozen_red_targets(final_core);
+    let live_tail = projection
+        .blocks
         .iter()
-        .map(|row| (row.block_id.as_str(), row.tag_number))
-        .collect::<HashMap<_, _>>();
-    reductions
+        .filter(|block| !block.synthetic && is_tail(block.ordinal, final_coverage))
+        .map(|block| block.id.as_str())
+        .collect::<HashSet<_>>();
+
+    pending
         .iter()
-        .map(|reduction| {
-            let mut reduction = reduction.clone();
-            if reduction.kind == "drop"
-                && reduction.payload == "[dropped]"
-                && !frozen.contains(&reduction.target_id)
-            {
-                if let Some(tag_number) = tag_by_block.get(reduction.target_id.as_str()) {
-                    reduction.payload = format!("[dropped §{tag_number}§]");
-                }
-            }
-            reduction
+        .filter(|drop| {
+            let applied =
+                !frozen_before.contains(&drop.target_id) && frozen_after.contains(&drop.target_id);
+            let obsolete = frozen_before.contains(&drop.target_id)
+                || (!applied && !live_tail.contains(drop.target_id.as_str()));
+            applied || obsolete
         })
+        .map(|drop| drop.id)
         .collect()
 }
 
@@ -2201,6 +2241,7 @@ fn pending_passthrough_result(
     committed: bool,
     trim_mismatch: Option<TrimMismatch>,
     tag_overlay: Option<&TagOverlayState>,
+    surface_state: SurfaceState,
 ) -> TransformWithProjection {
     let blocks_by_mid = projection_blocks_by_mid(&projection);
     let mut response = TransformResponse::passthrough(
@@ -2223,6 +2264,7 @@ fn pending_passthrough_result(
         req.full_array_fingerprint.clone(),
     );
     response.row_version = row_version;
+    response.surface_state = surface_state;
     response.committed = committed;
     TransformWithProjection {
         projection,
@@ -2319,11 +2361,14 @@ fn mint_tags_for_projection(
     store: &McStore,
     session_id: &str,
     projection: &FlatProjection,
+    core: &CoreState,
     now_ms: i64,
 ) -> Result<(), TransformError> {
+    let frozen = frozen_red_targets(core);
     let inputs = projection
         .blocks
         .iter()
+        .filter(|block| !frozen.contains(&block.id))
         .filter_map(|block| {
             let (kind, source) = taggable_source(block)?;
             Some(TagMintInput {
@@ -2371,6 +2416,51 @@ fn taggable_source(block: &FlatBlock) -> Option<(TaggableKind, &str)> {
 
 fn taggable_kind(block: &FlatBlock) -> Option<TaggableKind> {
     taggable_source(block).map(|(kind, _)| kind)
+}
+
+/// Compute the newest protected tags as exact block ids over the current canonical tail.
+/// Stored provenance must still match the live carrier before a row can occupy a slot.
+fn newest_active_tag_block_ids(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    tag_rows: &[McTagRow],
+) -> HashSet<String> {
+    const PROTECTED_TAG_COUNT: usize = 20;
+
+    let block_by_id = projection
+        .blocks
+        .iter()
+        .map(|block| (block.id.as_str(), block))
+        .collect::<HashMap<_, _>>();
+    let mut active = tag_rows
+        .iter()
+        .filter(|row| {
+            let Some(block) = block_by_id.get(row.block_id.as_str()) else {
+                return false;
+            };
+            if !is_tail(block.ordinal, meta.coverage_ordinal)
+                || frozen_red_payload(core, block.id()).is_some()
+            {
+                return false;
+            }
+            let Some((kind, source)) = taggable_source(block) else {
+                return false;
+            };
+            row.kind == kind.as_store_kind() && row.source_bytes == source.as_bytes()
+        })
+        .collect::<Vec<_>>();
+    active.sort_by(|left, right| {
+        right
+            .tag_number
+            .cmp(&left.tag_number)
+            .then_with(|| right.block_id.cmp(&left.block_id))
+    });
+    active
+        .into_iter()
+        .take(PROTECTED_TAG_COUNT)
+        .map(|row| row.block_id.clone())
+        .collect()
 }
 
 fn tag_overlay_state(tag_rows: &[McTagRow], appends: &[Channel1AppendRow]) -> TagOverlayState {
@@ -2834,6 +2924,7 @@ fn build_output(
     projection: &FlatProjection,
     req: &TransformRequest,
     tag_overlay: Option<&TagOverlayState>,
+    synthetic_todo_enabled: bool,
 ) -> Result<Vec<CkWireMessage>, TransformError> {
     let mut out = Vec::with_capacity(4 + req.messages.len());
     if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m0") {
@@ -2855,10 +2946,11 @@ fn build_output(
     // exact failure the position-freeze design prevents. (A None anchor also never
     // relocates on a bust: reanchor_kept_synthetic_todo_if_folded early-returns on None, so
     // the pair stays right after m0/m1 for its whole life until a Replace or Clear.)
-    if meta
-        .synthetic_todo
-        .as_ref()
-        .is_some_and(|pair| pair.anchor_mid.is_none())
+    if synthetic_todo_enabled
+        && meta
+            .synthetic_todo
+            .as_ref()
+            .is_some_and(|pair| pair.anchor_mid.is_none())
     {
         push_synthetic_todo_pair(&mut out, meta);
     }
@@ -2893,8 +2985,21 @@ fn build_output(
                 rebuilt.mark_modified();
                 for block in blocks {
                     if let Some(payload) = reduced.get(&block.block_index) {
-                        rebuilt.content[block.block_index] =
-                            reduced_block(&block.wire, payload, block.file_path.as_deref());
+                        // Canonical frozen bytes never carry a tag number. The egress clone
+                        // may add the target's live number, while legacy numbered payloads
+                        // remain byte-identical because only exact `[dropped]` is overlaid.
+                        let display_payload = (*payload == "[dropped]")
+                            .then(|| {
+                                tag_overlay
+                                    .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
+                                    .map(|tag_number| format!("[dropped §{tag_number}§]"))
+                            })
+                            .flatten();
+                        rebuilt.content[block.block_index] = reduced_block(
+                            &block.wire,
+                            display_payload.as_deref().unwrap_or(payload),
+                            block.file_path.as_deref(),
+                        );
                     }
                 }
             }
@@ -2909,11 +3014,12 @@ fn build_output(
         };
         out.push(rendered);
 
-        if meta
-            .synthetic_todo
-            .as_ref()
-            .and_then(|pair| pair.anchor_mid.as_deref())
-            == Some(msg.mid.as_str())
+        if synthetic_todo_enabled
+            && meta
+                .synthetic_todo
+                .as_ref()
+                .and_then(|pair| pair.anchor_mid.as_deref())
+                == Some(msg.mid.as_str())
         {
             push_synthetic_todo_pair(&mut out, meta);
             inserted_synthetic_todo = true;
@@ -2925,10 +3031,12 @@ fn build_output(
     // (a bust folds the anchor via reanchor_kept_synthetic_todo_if_folded, so reaching
     // here means the anchor vanished on a defer = a revert/drift invariant violation).
     // The None-anchor case was already emitted before the loop, so it is not re-checked.
-    if let Some(pair) = &meta.synthetic_todo {
-        if pair.anchor_mid.is_some() && !inserted_synthetic_todo {
-            let mid = pair.anchor_mid.clone().unwrap_or_default();
-            return Err(TransformError::SyntheticTodoAnchorMissing(mid));
+    if synthetic_todo_enabled {
+        if let Some(pair) = &meta.synthetic_todo {
+            if pair.anchor_mid.is_some() && !inserted_synthetic_todo {
+                let mid = pair.anchor_mid.clone().unwrap_or_default();
+                return Err(TransformError::SyntheticTodoAnchorMissing(mid));
+            }
         }
     }
     if serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic) {
@@ -3085,11 +3193,8 @@ mod tests {
         .unwrap()
     }
 
-    fn with_tagging_enabled<T>(f: impl FnOnce() -> T) -> T {
-        crate::healing::set_tagging_enabled_for_tests(Some(true));
-        let out = f();
-        crate::healing::set_tagging_enabled_for_tests(None);
-        out
+    fn run_active_surface_test<T>(f: impl FnOnce() -> T) -> T {
+        f()
     }
 
     fn text_message(id: &str, text: &str) -> CkWireMessage {
@@ -3192,6 +3297,7 @@ mod tests {
             serializer_profile: "owned-llmrunner".to_string(),
             session_id: session.to_string(),
             render_config: cfg.to_string(),
+            tool_present: false,
             full_array_fingerprint: None,
             messages,
             tail_delta: None,
@@ -3834,7 +3940,7 @@ mod tests {
     fn agent_drop_ids_freeze_add_only_through_flat_ids() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        let request = req("agent-drop", "cfg0", vec![item("a", 1, "drop me")]);
+        let request = active_cc_req("agent-drop", "cfg0", vec![item("a", 1, "drop me")]);
         s.append_pending_agent_drops("agent-drop", &["a#0".to_string()], 1)
             .unwrap();
         let r = run(&s, &request, &spine());
@@ -6320,6 +6426,7 @@ mod tests {
         assert!(meta.last_recut.is_none());
         assert_eq!(meta.historian.expected_revert_epoch, 0);
         assert!(meta.synthetic_todo.is_none());
+        assert!(!meta.cc_u1_active);
         assert!(meta.initialized);
     }
 
@@ -6388,7 +6495,7 @@ mod tests {
     fn tagger_flip_hards_before_committed_identity_can_render_tags() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        let request = req("flip", "cfg0", vec![item("m1", 1, "hello")]);
+        let mut request = cc_req("flip", "cfg0", vec![item("m1", 1, "hello")]);
 
         let before_flip = run(&s, &request, &spine());
         assert_eq!(before_flip.action, "HARD");
@@ -6400,7 +6507,7 @@ mod tests {
             .last_render_config
             .contains("tfe:"));
 
-        crate::healing::set_tagging_enabled_for_tests(Some(true));
+        request.tool_present = true;
         let transition = run(&s, &request, &spine());
         assert_eq!(transition.action, "HARD");
         assert_eq!(tail_bytes(&transition, "m1"), "hello");
@@ -6416,37 +6523,6 @@ mod tests {
         assert_eq!(after_commit.action, "SOFT+");
         assert_eq!(tail_bytes(&after_commit, "m1"), "§1§ hello");
         assert_eq!(s.load_tags_for_session("flip").unwrap().len(), 1);
-        crate::healing::set_tagging_enabled_for_tests(None);
-    }
-
-    #[test]
-    fn drop_placeholder_uses_tag_number_only_for_new_tagged_freezes() {
-        let tagged = reduce("tagged#0", "drop", "[dropped]");
-        let untagged = reduce("untagged#0", "drop", "[dropped]");
-        let rows = vec![McTagRow {
-            tag_number: 7,
-            block_id: "tagged#0".to_string(),
-            kind: "message".to_string(),
-            token_count: 1,
-            created_at_ms: 10,
-            source_bytes: b"source".to_vec(),
-        }];
-
-        let numbered = numbered_drop_placeholders_for_new_freezes(
-            &CoreState::default(),
-            &[tagged.clone(), untagged],
-            &rows,
-        );
-        assert_eq!(numbered[0].payload, "[dropped §7§]");
-        assert_eq!(numbered[1].payload, "[dropped]");
-
-        let frozen = CoreState {
-            frozen_units: vec![red_unit("tagged#0", "drop", "[dropped]")],
-            ..Default::default()
-        };
-        let replay = numbered_drop_placeholders_for_new_freezes(&frozen, &[tagged], &rows);
-        assert_eq!(replay[0].payload, "[dropped]");
-        assert_eq!(frozen_red_payload(&frozen, "tagged#0"), Some("[dropped]"));
     }
 
     #[test]
@@ -6481,7 +6557,7 @@ mod tests {
 
     #[test]
     fn mint_scope_matches_overlay_scope_and_captures_exact_source() {
-        with_tagging_enabled(|| {
+        run_active_surface_test(|| {
             let content_text = ck_wire::ResultBlock {
                 kind: ck_wire::ResultBlockKind::Text {
                     text: "  content §9§".to_string(),
@@ -6545,7 +6621,7 @@ mod tests {
                     ck_wire::CkOutputKind::Content { blocks: Vec::new() },
                 ),
             ];
-            let request = req("scope", "cfg0", messages.clone());
+            let request = active_cc_req("scope", "cfg0", messages.clone());
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
             run(&s, &request, &spine());
@@ -6576,7 +6652,7 @@ mod tests {
 
     #[test]
     fn tag_minting_is_deterministic_monotonic_and_survives_rejected_pass() {
-        with_tagging_enabled(|| {
+        run_active_surface_test(|| {
             let messages = vec![
                 item("m1", 1, "hello"),
                 assistant_tool_call("call", 2, "c1"),
@@ -6584,9 +6660,17 @@ mod tests {
             ];
             let dir_a = tempfile::tempdir().unwrap();
             let store_a = store(dir_a.path());
-            run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
+            run(
+                &store_a,
+                &active_cc_req("mint", "cfg0", messages.clone()),
+                &spine(),
+            );
             assert!(store_a.load_tags_for_session("mint").unwrap().is_empty());
-            run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
+            run(
+                &store_a,
+                &active_cc_req("mint", "cfg0", messages.clone()),
+                &spine(),
+            );
             let first = store_a.load_tags_for_session("mint").unwrap();
             assert_eq!(
                 first
@@ -6595,23 +6679,31 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![(1, "m1#0", "message"), (2, "result#0", "tool_result")]
             );
-            run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
+            run(
+                &store_a,
+                &active_cc_req("mint", "cfg0", messages.clone()),
+                &spine(),
+            );
             assert_eq!(store_a.load_tags_for_session("mint").unwrap(), first);
 
             let dir_b = tempfile::tempdir().unwrap();
             let store_b = store(dir_b.path());
-            run(&store_b, &req("mint", "cfg0", messages.clone()), &spine());
-            run(&store_b, &req("mint", "cfg0", messages), &spine());
+            run(
+                &store_b,
+                &active_cc_req("mint", "cfg0", messages.clone()),
+                &spine(),
+            );
+            run(&store_b, &active_cc_req("mint", "cfg0", messages), &spine());
             assert_eq!(store_b.load_tags_for_session("mint").unwrap(), first);
 
             let dir_c = tempfile::tempdir().unwrap();
             let store_c = store(dir_c.path());
-            let stable = req("reject", "cfg0", vec![item("m1", 1, "old")]);
+            let stable = active_cc_req("reject", "cfg0", vec![item("m1", 1, "old")]);
             run(&store_c, &stable, &spine());
             run(&store_c, &stable, &spine());
             let err = transform(
                 &store_c,
-                &req(
+                &active_cc_req(
                     "reject",
                     "cfg0",
                     vec![item("m1", 1, "changed identity"), item("m2", 2, "new")],
@@ -6632,10 +6724,10 @@ mod tests {
 
     #[test]
     fn tag_overlay_replays_stably_and_new_tail_gets_next_number() {
-        with_tagging_enabled(|| {
+        run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
-            let first_req = req("stable", "cfg0", vec![item("m1", 1, "alpha")]);
+            let first_req = active_cc_req("stable", "cfg0", vec![item("m1", 1, "alpha")]);
             let transition = run(&s, &first_req, &spine());
             assert_eq!(tail_bytes(&transition, "m1"), "alpha");
             let first = run(&s, &first_req, &spine());
@@ -6645,7 +6737,7 @@ mod tests {
 
             let extended = run(
                 &s,
-                &req(
+                &active_cc_req(
                     "stable",
                     "cfg0",
                     vec![item("m1", 1, "alpha"), item("m2", 2, "beta")],
@@ -6659,12 +6751,12 @@ mod tests {
 
     #[test]
     fn reduced_block_renders_placeholder_without_tag_prefix() {
-        with_tagging_enabled(|| {
+        run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
             s.replace_compartments("drop-tag", &[comp(1, 1, 1, "a", "SUMMARY")])
                 .unwrap();
-            let request = req(
+            let request = active_cc_req(
                 "drop-tag",
                 "cfg0",
                 vec![
@@ -6686,7 +6778,7 @@ mod tests {
 
     #[test]
     fn channel1_nudge_replays_and_suppresses_refire() {
-        with_tagging_enabled(|| {
+        run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
             let huge = "word ".repeat(20_000);
@@ -6696,7 +6788,7 @@ mod tests {
                 assistant_tool_call("call2", 3, "c2"),
                 tool_result("result2", 4, "c2", &huge),
             ];
-            let request = with_usage(req("nudge", "cfg0", messages.clone()), 900, 1024);
+            let request = with_usage(active_cc_req("nudge", "cfg0", messages.clone()), 900, 1024);
             run(&s, &request, &spine());
             let first = run(&s, &request, &spine());
             let first_result = tail_bytes(&first, "result2").to_string();
@@ -6716,13 +6808,379 @@ mod tests {
             extended_messages.push(tool_result("result3", 6, "c3", &huge));
             let suppressed = run(
                 &s,
-                &with_usage(req("nudge", "cfg0", extended_messages), 900, 1024),
+                &with_usage(active_cc_req("nudge", "cfg0", extended_messages), 900, 1024),
                 &spine(),
             );
             assert!(tail_bytes(&suppressed, "result2").contains("<system-reminder>"));
             assert!(!tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
         });
+    }
+
+    #[test]
+    fn subc_reversibility_false_pass_has_no_tag_bytes_in_any_durable_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .replace_compartments("false-bytes", &[comp(1, 1, 1, "a", "summary")])
+            .unwrap();
+        let request = cc_req(
+            "false-bytes",
+            "cfg0",
+            vec![item("a", 1, "covered"), item("b", 2, "live")],
+        );
+
+        let response = run(&store, &request, &spine());
+        let loaded = store.load("false-bytes").unwrap();
+        let compartments = store.load_compartments("false-bytes").unwrap();
+        assert!(!compartments.is_empty());
+        for durable_or_output in [
+            serde_json::to_string(&request).unwrap(),
+            serde_json::to_string(&response).unwrap(),
+            serde_json::to_string(&loaded.core).unwrap(),
+            serde_json::to_string(&loaded.meta).unwrap(),
+            format!("{compartments:?}"),
+        ] {
+            assert!(!durable_or_output.contains('§'), "{durable_or_output}");
+        }
+        assert!(store
+            .load_tags_for_session("false-bytes")
+            .unwrap()
+            .is_empty());
+        assert_eq!(response.surface_state, SurfaceState::Inactive);
+    }
+
+    #[test]
+    fn subc_reversibility_surface_flip_coordinates_exactly_one_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![item("m1", 1, "hello")];
+        let mut inactive = cc_req("surface-flip", "profile␟tf0␟gno-reduce", messages.clone());
+        let initial = run(&store, &inactive, &spine());
+        assert_eq!(initial.action, "HARD");
+        assert_eq!(initial.surface_state, SurfaceState::Inactive);
+
+        let active = active_cc_req("surface-flip", "profile␟tf1␟gfull", messages.clone());
+        let on_transition = run(&store, &active, &spine());
+        assert_eq!(on_transition.action, "HARD");
+        assert_eq!(on_transition.surface_state, SurfaceState::Transition);
+        let on_config = store.load("surface-flip").unwrap().meta.last_render_config;
+        assert!(on_config.contains("tf1"));
+        assert!(on_config.contains("gfull"));
+        assert!(on_config.contains("tfe:4:tfe1"));
+        let on_steady = run(&store, &active, &spine());
+        assert_ne!(on_steady.action, "HARD");
+        assert_eq!(on_steady.surface_state, SurfaceState::Active);
+
+        inactive.render_config = "profile␟tf0␟gno-reduce".to_string();
+        let off_transition = run(&store, &inactive, &spine());
+        assert_eq!(off_transition.action, "HARD");
+        assert_eq!(off_transition.surface_state, SurfaceState::Transition);
+        let off_config = store.load("surface-flip").unwrap().meta.last_render_config;
+        assert!(off_config.contains("tf0"));
+        assert!(off_config.contains("gno-reduce"));
+        assert!(!off_config.contains("tfe:"));
+        let off_steady = run(&store, &inactive, &spine());
+        assert_ne!(off_steady.action, "HARD");
+        assert_eq!(off_steady.surface_state, SurfaceState::Inactive);
+
+        assert!(active.tool_present && !inactive.tool_present);
+    }
+
+    #[test]
+    fn subc_reversibility_pending_drop_survives_an_entire_false_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = (1..=30)
+            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, "old live content"))
+            .collect::<Vec<_>>();
+        let mut inactive = cc_req("false-window", "cfg0", messages.clone());
+        run(&store, &inactive, &spine());
+        store
+            .append_pending_agent_drops("false-window", &["m1#0".to_string()], 1)
+            .unwrap();
+
+        for pass in 1..=4 {
+            inactive.render_config = format!("cfg{pass}");
+            let response = run(&store, &with_usage(inactive.clone(), 99, 100), &spine());
+            assert_eq!(response.action, "HARD");
+            assert_eq!(
+                frozen_red_payload(&store.load("false-window").unwrap().core, "m1#0"),
+                None
+            );
+            assert_eq!(
+                store
+                    .load_pending_agent_drops("false-window")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        let active = active_cc_req("false-window", &inactive.render_config, messages);
+        let applied = run(&store, &active, &spine());
+        assert_eq!(applied.action, "HARD");
+        assert_eq!(
+            frozen_red_payload(&store.load("false-window").unwrap().core, "m1#0"),
+            Some("[dropped]")
+        );
+        assert!(store
+            .load_pending_agent_drops("false-window")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn subc_reversibility_true_reduction_stays_canonical_after_false_flip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .replace_compartments("canonical-flip", &[comp(1, 1, 1, "a", "summary")])
+            .unwrap();
+        let active = active_cc_req(
+            "canonical-flip",
+            "cfg0",
+            vec![item("a", 1, "covered"), item("m1", 2, "drop me")],
+        );
+        run(&store, &active, &spine());
+        run(&store, &active, &spine());
+        let reduced = run(&store, &active, &[reduce("m1#0", "drop", "[dropped]")]);
+        assert_eq!(tail_bytes(&reduced, "m1"), "[dropped §2§]");
+        assert_eq!(
+            frozen_red_payload(&store.load("canonical-flip").unwrap().core, "m1#0"),
+            Some("[dropped]")
+        );
+
+        let inactive = cc_req(
+            "canonical-flip",
+            "cfg0",
+            vec![item("a", 1, "covered"), item("m1", 2, "drop me")],
+        );
+        let transition = run(&store, &inactive, &spine());
+        assert_eq!(transition.action, "HARD");
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        assert_eq!(tail_bytes(&transition, "m1"), "[dropped]");
+        let loaded = store.load("canonical-flip").unwrap();
+        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), Some("[dropped]"));
+        assert!(loaded
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:m1#0"));
+    }
+
+    #[test]
+    fn newest_tag_block_set_isolates_protected_and_applied_pending_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = (1..=25)
+            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
+            .collect::<Vec<_>>();
+        let tags = (1..=25)
+            .map(|ordinal| TagMintInput {
+                block_id: format!("m{ordinal}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: format!("text {ordinal}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        store.mint_or_get_tags("protected", &tags, 1).unwrap();
+        store
+            .append_pending_agent_drops("protected", &["m1#0".to_string(), "m25#0".to_string()], 2)
+            .unwrap();
+
+        let response = run(
+            &store,
+            &active_cc_req("protected", "cfg0", messages),
+            &spine(),
+        );
+        assert_eq!(response.action, "HARD");
+        let loaded = store.load("protected").unwrap();
+        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), Some("[dropped]"));
+        assert_eq!(frozen_red_payload(&loaded.core, "m25#0"), None);
+        let pending = store.load_pending_agent_drops("protected").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target_id, "m25#0");
+    }
+
+    #[test]
+    fn dormant_forced_hard_retains_pending_then_active_hard_applies_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![item("a", 1, "drop me")];
+        let inactive = cc_req("dormant-hard", "cfg0", messages.clone());
+        run(&store, &inactive, &spine());
+        store
+            .append_pending_agent_drops("dormant-hard", &["a#0".to_string()], 1)
+            .unwrap();
+        let forced = cc_req("dormant-hard", "cfg1", messages.clone());
+        let dormant = run(&store, &forced, &spine());
+        assert_eq!(dormant.action, "HARD");
+        assert_eq!(
+            frozen_red_payload(&store.load("dormant-hard").unwrap().core, "a#0"),
+            None
+        );
+        assert_eq!(
+            store
+                .load_pending_agent_drops("dormant-hard")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let active = run(
+            &store,
+            &active_cc_req("dormant-hard", "cfg1", messages),
+            &spine(),
+        );
+        assert_eq!(active.action, "HARD");
+        assert_eq!(
+            frozen_red_payload(&store.load("dormant-hard").unwrap().core, "a#0"),
+            Some("[dropped]")
+        );
+        assert!(store
+            .load_pending_agent_drops("dormant-hard")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn obsolete_pending_row_commits_consumption_without_core_or_meta_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request = cc_req("consume-only", "cfg0", vec![item("live", 1, "hello")]);
+        run(&store, &request, &spine());
+        store
+            .append_pending_agent_drops("consume-only", &["gone#0".to_string()], 1)
+            .unwrap();
+        let before = store.load("consume-only").unwrap();
+
+        let response = run(&store, &request, &spine());
+        let after = store.load("consume-only").unwrap();
+        assert_eq!(response.action, "SOFT+");
+        assert!(response.committed);
+        assert_eq!(after.core, before.core);
+        assert_eq!(after.meta, before.meta);
+        assert_eq!(
+            after.row_version,
+            before.row_version.map(|version| version + 1)
+        );
+        assert!(store
+            .load_pending_agent_drops("consume-only")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn mixed_legacy_numbered_and_new_canonical_freezes_replay_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .replace_compartments("mixed-freezes", &[comp(1, 1, 1, "a", "summary")])
+            .unwrap();
+        let request = active_cc_req(
+            "mixed-freezes",
+            "cfg0",
+            vec![
+                item("a", 1, "covered"),
+                item("m1", 2, "legacy"),
+                item("m2", 3, "new"),
+            ],
+        );
+        run(&store, &request, &spine());
+        run(&store, &request, &spine());
+
+        let mut loaded = store.load("mixed-freezes").unwrap();
+        loaded
+            .core
+            .frozen_units
+            .push(red_unit("m1#0", "drop", "[dropped §7§]"));
+        store
+            .commit(
+                "mixed-freezes",
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
+
+        let response = run(&store, &request, &[reduce("m2#0", "drop", "[dropped]")]);
+        assert_eq!(tail_bytes(&response, "m1"), "[dropped §7§]");
+        assert_eq!(tail_bytes(&response, "m2"), "[dropped §3§]");
+        let durable = store.load("mixed-freezes").unwrap().core;
+        assert_eq!(frozen_red_payload(&durable, "m1#0"), Some("[dropped §7§]"));
+        assert_eq!(frozen_red_payload(&durable, "m2#0"), Some("[dropped]"));
+    }
+
+    #[test]
+    fn absent_tool_matches_explicit_false_across_profile_pass_matrix() {
+        for profile in [
+            SerializerProfile::ClaudeCodeAnthropic,
+            SerializerProfile::OwnedBroca,
+            SerializerProfile::Pi,
+            SerializerProfile::OpencodeAiSdk,
+        ] {
+            let left_dir = tempfile::tempdir().unwrap();
+            let right_dir = tempfile::tempdir().unwrap();
+            let left = store(left_dir.path());
+            let right = store(right_dir.path());
+            let initial = vec![comp(1, 1, 1, "a", "first")];
+            left.replace_compartments("identity", &initial).unwrap();
+            right.replace_compartments("identity", &initial).unwrap();
+            let messages = vec![
+                item("a", 1, "one"),
+                item("b", 2, "two"),
+                item("c", 3, "three"),
+            ];
+            let baseline = profile_req(profile, "identity", "cfg0", messages.clone());
+            let mut absent_value = serde_json::to_value(&baseline).unwrap();
+            absent_value.as_object_mut().unwrap().remove("tool_present");
+            let mut absent: TransformRequest = serde_json::from_value(absent_value).unwrap();
+            let explicit = absent.clone();
+
+            for expected_action in ["HARD", "SOFT+"] {
+                let left_response = run(&left, &absent, &spine());
+                let right_response = run(&right, &explicit, &spine());
+                assert_eq!(left_response.action, expected_action, "{profile:?}");
+                assert_eq!(
+                    serde_json::to_value(left_response).unwrap(),
+                    serde_json::to_value(right_response).unwrap(),
+                    "{profile:?}"
+                );
+            }
+
+            let extended = vec![comp(1, 1, 1, "a", "first"), comp(2, 2, 2, "b", "second")];
+            left.replace_compartments("identity", &extended).unwrap();
+            right.replace_compartments("identity", &extended).unwrap();
+            let left_soft = run(&left, &absent, &spine());
+            let right_soft = run(&right, &explicit, &spine());
+            assert_eq!(left_soft.action, "SOFT", "{profile:?}");
+            assert_eq!(
+                serde_json::to_value(left_soft).unwrap(),
+                serde_json::to_value(right_soft).unwrap(),
+                "{profile:?}"
+            );
+
+            absent.render_config = "cfg1".to_string();
+            let mut explicit_fold = explicit;
+            explicit_fold.render_config = "cfg1".to_string();
+            let left_fold = run(&left, &absent, &spine());
+            let right_fold = run(&right, &explicit_fold, &spine());
+            assert_eq!(left_fold.action, "HARD", "{profile:?}");
+            assert_eq!(
+                serde_json::to_value(left_fold).unwrap(),
+                serde_json::to_value(right_fold).unwrap(),
+                "{profile:?}"
+            );
+            assert_eq!(
+                left.load("identity").unwrap().core,
+                right.load("identity").unwrap().core
+            );
+            assert_eq!(
+                left.load("identity").unwrap().meta,
+                right.load("identity").unwrap().meta
+            );
+        }
     }
 
     #[test]
@@ -7179,6 +7637,16 @@ mod tests {
             cfg,
             messages,
         )
+    }
+
+    fn active_cc_req(
+        session: &str,
+        cfg: &str,
+        messages: Vec<CkIngressMessage>,
+    ) -> TransformRequest {
+        let mut request = cc_req(session, cfg, messages);
+        request.tool_present = true;
+        request
     }
 
     fn effective_render_config_with_epochs(

@@ -146,8 +146,9 @@ pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages.
 pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 1;
-/// Bumps when the visible tagging surface changes (tag prefixes shipping is 0 -> 1).
-pub const TAGGER_FEATURE_EPOCH: u32 = 0;
+/// Bumps when the visible tagging surface changes. The value is folded only for an
+/// active request, so advertising the dormant capability does not change existing bytes.
+pub const TAGGER_FEATURE_EPOCH: u32 = 1;
 
 /// The module-owned rendered-prefix format epoch for a serializer profile.
 ///
@@ -163,23 +164,17 @@ pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     }
 }
 
-/// The tagger epoch folded for this profile. The gate and epoch must both be enabled:
-/// this makes a partial deploy inert rather than allowing tag bytes without a new render
-/// identity.
-#[cfg(not(test))]
-pub const fn tagger_feature_epoch(profile: SerializerProfile) -> u32 {
-    if healing::tagging_enabled(profile) {
-        TAGGER_FEATURE_EPOCH
-    } else {
-        0
-    }
+/// Normalize the request-local Claude Code surface signal once. Every behavior tied to
+/// the reduction tool consumes this value rather than maintaining an independent gate.
+pub const fn cc_u1_active(profile: Option<SerializerProfile>, tool_present: bool) -> bool {
+    matches!(profile, Some(SerializerProfile::ClaudeCodeAnthropic)) && tool_present
 }
 
-/// Tests exercise the future non-zero fold while the production epoch remains zero.
-#[cfg(test)]
-pub fn tagger_feature_epoch(profile: SerializerProfile) -> u32 {
-    if healing::tagging_enabled(profile) {
-        1
+/// The tagger component of the effective render identity. A false request contributes
+/// no component, preserving the render identity used before the capability existed.
+pub const fn tagger_feature_epoch(cc_u1_active: bool) -> u32 {
+    if cc_u1_active {
+        TAGGER_FEATURE_EPOCH
     } else {
         0
     }
@@ -194,6 +189,7 @@ const GUIDANCE_TEXT: &str = include_str!("../assets/guidance_primary.txt");
 /// variant that matches the live tool surface; the two variants have different
 /// content hashes, so a surface widening folds the prefix by construction.
 const GUIDANCE_TEXT_NO_REDUCE: &str = include_str!("../assets/guidance_no_reduce.txt");
+const CTX_REDUCE_ACKNOWLEDGEMENT: &str = "Queued for context compaction.";
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
@@ -1948,43 +1944,12 @@ impl McHandler {
     }
 
     fn handle_agent_drops_value(&self, channel: u16, request: Value) -> HandlerOutcome {
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
-            None => {
-                return HandlerOutcome::Error {
-                    code: "store_unavailable".to_string(),
-                    message: "store not opened (no HELLO_ACK storage seam)".to_string(),
-                }
-            }
-        };
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
             return HandlerOutcome::Error {
                 code: "bad_request".to_string(),
-                message: "ctx_reduce command requires session_id".to_string(),
+                message: "agent_drops.append requires session_id".to_string(),
             };
         };
-        let binding = match self.resolve_binding(channel, session_id) {
-            Ok(binding) => binding,
-            Err(e) => {
-                return match e {
-                    BindingError::Unbound => HandlerOutcome::Error {
-                        code: "route_unbound".to_string(),
-                        message: "ctx_reduce on a channel with no session binding".to_string(),
-                    },
-                    BindingError::SessionMismatch => HandlerOutcome::Error {
-                        code: "session_mismatch".to_string(),
-                        message: "request session_id does not match the channel's bound session"
-                            .to_string(),
-                    },
-                };
-            }
-        };
-        if is_shadow_session(&binding.session) {
-            return HandlerOutcome::Error {
-                code: "non_shadow_op_on_shadow_binding".to_string(),
-                message: "ctx_reduce is not accepted on shadow:<real_session> routes".to_string(),
-            };
-        }
         let command_id = match command_id_from_agent_drops_request(&request) {
             Ok(command_id) => command_id,
             Err(message) => {
@@ -1994,49 +1959,76 @@ impl McHandler {
                 }
             }
         };
-        let mut drop_ids = drop_ids_from_command(&request);
-        // Raw-string form ("1-3", "§1§,99"): canonicalize server-side with the same
-        // parser the MCP facade uses, so range/§ syntax is owned here and consumers
-        // (the thalamus response-tee) never re-implement it. Tag numbers that don't
-        // resolve to a known tag are skipped: the tee replays what the model said,
-        // and the model can name stale or foreign numbers.
-        if let Some(raw) = request.get("drop").and_then(Value::as_str) {
-            let numbers = match parse_tag_range_string(raw) {
-                Ok(numbers) => numbers,
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "bad_request".to_string(),
-                        message: format!("invalid drop range syntax: {error}"),
-                    }
-                }
+        let Some(raw_drop) = request.get("drop").and_then(Value::as_str) else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "'drop' must be a nonempty string".to_string(),
             };
-            let tags = match store.load_tags_for_session(session_id) {
-                Ok(tags) => tags,
-                Err(e) => {
-                    return HandlerOutcome::Error {
-                        code: "store_write_failed".to_string(),
-                        message: e.to_string(),
-                    }
-                }
+        };
+        if raw_drop.trim().is_empty() {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "'drop' must be a nonempty string".to_string(),
             };
-            let by_number = tags
-                .iter()
-                .map(|row| (row.tag_number, &row.block_id))
-                .collect::<HashMap<_, _>>();
-            for number in numbers {
-                if let Some(block_id) = by_number.get(&(number as i64)) {
-                    drop_ids.push((*block_id).clone());
+        }
+        let numbers = match parse_tag_range_string(raw_drop) {
+            Ok(numbers) => numbers,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message: format!("invalid drop range syntax: {error}"),
                 }
             }
-            drop_ids.sort();
-            drop_ids.dedup();
+        };
+        let binding = match self.resolve_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(BindingError::Unbound) => {
+                return HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: "agent_drops.append on a channel with no session binding".to_string(),
+                }
+            }
+            Err(BindingError::SessionMismatch) => {
+                return HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                }
+            }
+        };
+        if is_shadow_session(&binding.session) {
+            return HandlerOutcome::Error {
+                code: "non_shadow_op_on_shadow_binding".to_string(),
+                message: "agent_drops.append is not accepted on shadow routes".to_string(),
+            };
         }
-        if drop_ids.is_empty() && command_id.is_none() {
-            return respond(json!({ "ok": true, "queued": 0 }));
-        }
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+        let tags = match store.load_tags_for_session(session_id) {
+            Ok(tags) => tags,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let by_number = tags
+            .iter()
+            .map(|row| (row.tag_number, &row.block_id))
+            .collect::<HashMap<_, _>>();
+        let mut drop_ids = numbers
+            .into_iter()
+            .filter_map(|number| by_number.get(&(number as i64)).map(|id| (*id).clone()))
+            .collect::<Vec<_>>();
+        drop_ids.sort();
+        drop_ids.dedup();
+
         match store.append_pending_agent_drops_with_command(
             session_id,
-            command_id.as_deref(),
+            Some(&command_id),
             &drop_ids,
             now_ms(),
         ) {
@@ -2044,9 +2036,9 @@ impl McHandler {
                 respond(json!({ "ok": true, "queued": 0, "duplicate": true }))
             }
             Ok(outcome) => respond(json!({ "ok": true, "queued": outcome.queued })),
-            Err(e) => HandlerOutcome::Error {
+            Err(error) => HandlerOutcome::Error {
                 code: "store_write_failed".to_string(),
-                message: e.to_string(),
+                message: error.to_string(),
             },
         }
     }
@@ -2076,6 +2068,37 @@ impl McHandler {
             };
         }
 
+        let tool_present = match request.get("tool_present") {
+            None => false,
+            Some(value) => match value.as_bool() {
+                Some(value) => value,
+                None => {
+                    return HandlerOutcome::Error {
+                        code: "bad_request".to_string(),
+                        message: "guidance.get tool_present must be a boolean".to_string(),
+                    }
+                }
+            },
+        };
+        let profile = match request.get("serializer_profile").and_then(Value::as_str) {
+            None => Some(SerializerProfile::ClaudeCodeAnthropic),
+            Some(value) => match SerializerProfile::parse(value) {
+                Some(profile) => Some(profile),
+                None => return unknown_serializer_profile_error(),
+            },
+        };
+        let active = cc_u1_active(profile, tool_present);
+        let expected_variant = if active { "full" } else { "no_reduce" };
+        if let Some(variant) = request.get("variant").and_then(Value::as_str) {
+            if variant != expected_variant {
+                return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message: format!(
+                        "guidance variant {variant:?} contradicts tool_present={tool_present}"
+                    ),
+                };
+            }
+        }
         let date_line = match self.guidance_date_for_session(&store, session_id) {
             Ok(date) => date,
             Err(error) => {
@@ -2085,17 +2108,10 @@ impl McHandler {
                 }
             }
         };
-        // Default is the full five-tool block; variant="no_reduce" serves the surface
-        // without ctx_reduce/tag discipline for consumers whose tool policy hides it.
-        let text = match request.get("variant").and_then(Value::as_str) {
-            None | Some("full") => GUIDANCE_TEXT,
-            Some("no_reduce") => GUIDANCE_TEXT_NO_REDUCE,
-            Some(other) => {
-                return HandlerOutcome::Error {
-                    code: "bad_request".to_string(),
-                    message: format!("unknown guidance variant: {other}"),
-                }
-            }
+        let text = if active {
+            GUIDANCE_TEXT
+        } else {
+            GUIDANCE_TEXT_NO_REDUCE
         };
         let bytes = guidance_bytes_for(text, &date_line);
         respond(json!({
@@ -3161,6 +3177,7 @@ impl McHandler {
             serializer_profile,
             session_id: binding.session.clone(),
             render_config: parsed.render_config.clone().unwrap_or_default(),
+            tool_present: false,
             full_array_fingerprint: parsed.full_array_fingerprint.clone(),
             messages: shadow_input,
             tail_delta: None,
@@ -3341,82 +3358,10 @@ impl McHandler {
         }
     }
 
-    async fn handle_ctx_reduce_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(args) = facade_arguments(request) else {
-            return invalid_params_error("ctx_reduce arguments must be an object");
-        };
-        let Some(drop_arg) = non_empty_string_arg(args, "drop") else {
-            return tool_error_result("Error: 'drop' must be provided.");
-        };
-        let facade_scope = match self.resolve_facade_scope(channel).await {
-            Ok(scope) => scope,
-            Err(outcome) => return outcome,
-        };
-        let store = match self.store.get() {
-            Some(store) => store,
-            None => return store_unavailable_error(),
-        };
-        let session_id = facade_scope.conversation_key.as_str();
-        let loaded = match store.load(session_id) {
-            Ok(loaded) => loaded,
-            Err(error) => return tool_error_result(format!("Error: {error}")),
-        };
-        let Some(profile) = SerializerProfile::parse(&loaded.meta.last_serializer_profile) else {
-            return tagging_inactive_error();
-        };
-        if !healing::tagging_enabled(profile) {
-            return tagging_inactive_error();
-        }
-        if !healing::tail_reclaim(profile) {
-            return reduce_unavailable_for_profile_error();
-        }
-
-        let requested = match parse_tag_range_string(drop_arg) {
-            Ok(ids) => ids,
-            Err(error) => {
-                return tool_error_result(format!("Error: Invalid range syntax. {error}"))
-            }
-        };
-        let tags = match store.load_tags_for_session(session_id) {
-            Ok(tags) => tags,
-            Err(error) => return tool_error_result(format!("Error: {error}")),
-        };
-        let by_number = tags
-            .iter()
-            .map(|row| (row.tag_number, row))
-            .collect::<HashMap<_, _>>();
-        let mut block_ids = Vec::new();
-        let mut queued_numbers = Vec::new();
-        let mut unknown_numbers = Vec::new();
-        for tag_number in requested {
-            match by_number.get(&(tag_number as i64)) {
-                Some(row) => {
-                    block_ids.push(row.block_id.clone());
-                    queued_numbers.push(tag_number as i64);
-                }
-                None => unknown_numbers.push(tag_number as i64),
-            }
-        }
-        let inserted = if block_ids.is_empty() {
-            0
-        } else {
-            match store.append_pending_agent_drops(session_id, &block_ids, now_ms()) {
-                Ok(count) => count,
-                Err(error) => return tool_error_result(format!("Error: {error}")),
-            }
-        };
-        if inserted > 0 {
-            suppress_channel1_after_ctx_reduce(store, session_id);
-        }
-        mcp_text_result(
-            render_ctx_reduce_response(
-                inserted,
-                queued_numbers.len(),
-                &queued_numbers,
-                &unknown_numbers,
-            ),
-            false,
-        )
+    async fn handle_ctx_reduce_facade(&self, _channel: u16, _request: &Value) -> HandlerOutcome {
+        // The MCP-facing route is acknowledgement-only. Destructive delivery is owned by
+        // the response observer, so this path must return before identity or storage work.
+        mcp_text_result(CTX_REDUCE_ACKNOWLEDGEMENT.to_string(), false)
     }
 
     async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -3878,9 +3823,7 @@ impl McHandler {
                 "state_sync" => self.handle_shadow_state_sync_value(channel, request),
                 "shadow_transform" => self.handle_shadow_transform_value(channel, request).await,
                 "shadow_reset" => self.handle_shadow_reset_value(channel, request),
-                "ctx_reduce" | "append_agent_drops" | "agent_drops.append" => {
-                    self.handle_agent_drops_value(channel, request)
-                }
+                "agent_drops.append" => self.handle_agent_drops_value(channel, request),
                 // Explicit wire-debugging echo. Opt-in only: echoing every
                 // unrecognized body would silently swallow misrouted requests
                 // (a caller can "succeed" against an echo while testing nothing),
@@ -4328,22 +4271,6 @@ fn join_i64s(ids: &[i64]) -> String {
         .join(", ")
 }
 
-fn tagging_inactive_error() -> HandlerOutcome {
-    HandlerOutcome::Error {
-        code: "tagging_inactive".to_string(),
-        message: "tagging not active for this session's profile".to_string(),
-    }
-}
-
-fn reduce_unavailable_for_profile_error() -> HandlerOutcome {
-    HandlerOutcome::Error {
-        code: "reduce_unavailable_for_profile".to_string(),
-        message:
-            "ctx_reduce is unavailable because this session's profile cannot apply tail mutations"
-                .to_string(),
-    }
-}
-
 fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
     const MAX_RANGE_ELEMENTS: u64 = 1000;
     let trimmed = input.replace('§', "").trim().to_string();
@@ -4407,104 +4334,20 @@ fn parse_tag_integer(raw: &str) -> Result<u64, String> {
     Ok(value)
 }
 
-fn format_tag_numbers(ids: &[i64]) -> String {
-    ids.iter()
-        .map(|id| format!("§{id}§"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn render_ctx_reduce_response(
-    inserted: usize,
-    valid_requested: usize,
-    queued_numbers: &[i64],
-    unknown_numbers: &[i64],
-) -> String {
-    let already_queued = valid_requested.saturating_sub(inserted);
-    let mut parts = Vec::new();
-    if inserted > 0 {
-        parts.push(format!(
-            "Queued: drop {}.",
-            format_tag_numbers(&queued_numbers[..inserted.min(queued_numbers.len())])
-        ));
-    } else if valid_requested > 0 {
-        parts.push(
-            "All requested tags were already queued or processed. No new action is needed."
-                .to_string(),
-        );
-    } else {
-        parts.push("No tags queued.".to_string());
-    }
-    if already_queued > 0 {
-        parts.push(format!(
-            "{already_queued} requested tag{} already queued and need no action.",
-            if already_queued == 1 {
-                " was"
-            } else {
-                "s were"
-            }
-        ));
-    }
-    if !unknown_numbers.is_empty() {
-        parts.push(format!(
-            "Unknown tag(s) {} skipped.",
-            format_tag_numbers(unknown_numbers)
-        ));
-    }
-    parts.join(" ")
-}
-
-fn suppress_channel1_after_ctx_reduce(store: &McStore, session_id: &str) {
-    let Ok(loaded) = store.load(session_id) else {
-        return;
-    };
-    let mut meta = loaded.meta.clone();
-    meta.channel1_reduce_suppressed = true;
-    meta.channel1_last_nudge_level = "urgent".to_string();
-    let tag_tokens = store
-        .load_tags_for_session(session_id)
-        .map(|tags| tags.iter().map(|tag| tag.token_count.max(0)).sum::<i64>())
-        .unwrap_or(0);
-    meta.channel1_last_nudge_undropped = meta.channel1_last_nudge_undropped.max(tag_tokens);
-    let _ = store.commit(session_id, loaded.row_version, &loaded.core, &meta);
-}
-
-fn drop_ids_from_command(request: &Value) -> Vec<String> {
-    let mut ids = Vec::new();
-    for key in ["drop_ids", "agent_drop_ids", "ids"] {
-        if let Some(values) = request.get(key).and_then(Value::as_array) {
-            ids.extend(
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(ToOwned::to_owned),
-            );
-        }
-    }
-    ids.sort();
-    ids.dedup();
-    ids
-}
-
-fn command_id_from_agent_drops_request(request: &Value) -> Result<Option<String>, String> {
-    let Some(value) = request.get("command_id") else {
-        return Ok(None);
-    };
-    let Some(command_id) = value.as_str() else {
-        return Err("'command_id' must be a string".to_string());
+fn command_id_from_agent_drops_request(request: &Value) -> Result<String, String> {
+    let Some(command_id) = request.get("command_id").and_then(Value::as_str) else {
+        return Err("'command_id' must be a nonempty string".to_string());
     };
     let command_id = command_id.trim();
     if command_id.is_empty() {
-        return Err("'command_id' must not be empty".to_string());
+        return Err("'command_id' must be a nonempty string".to_string());
     }
     if command_id.len() > MAX_AGENT_DROPS_COMMAND_ID_BYTES {
         return Err(format!(
             "'command_id' exceeds the {MAX_AGENT_DROPS_COMMAND_ID_BYTES}-byte limit"
         ));
     }
-    Ok(Some(command_id.to_string()))
+    Ok(command_id.to_string())
 }
 
 fn is_shadow_session(session_id: &str) -> bool {
@@ -5345,10 +5188,17 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
                 Tool {
                     name: "ctx_reduce".to_string(),
                     description: Some(
-                        "Queue tagged context items for deferred discard on the next cache-busting pass".to_string(),
+                        "Acknowledge a tagged reduction request for asynchronous delivery".to_string(),
                     ),
                     execution_mode: ExecutionMode::Pure,
-                    schema: json!({ "type": "object" }),
+                    schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "drop": { "type": "string" }
+                        },
+                        "required": ["drop"],
+                        "additionalProperties": false
+                    }),
                 },
                 Tool {
                     name: "ctx_memory".to_string(),
@@ -6428,7 +6278,7 @@ mod tests {
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         let full = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         let trimmed = call_dispatch_request(
@@ -6454,6 +6304,18 @@ mod tests {
             )
             .await;
         assert_eq!(error_code(unknown), "bad_request");
+        let contradictory = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "guidance.get",
+                    "session_id": "ses",
+                    "tool_present": false,
+                    "variant": "full"
+                }),
+            )
+            .await;
+        assert_eq!(error_code(contradictory), "bad_request");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6467,7 +6329,7 @@ mod tests {
 
         let first = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         let first_bytes = first["bytes"].as_str().unwrap().to_string();
@@ -6483,7 +6345,7 @@ mod tests {
         );
         let repeated = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         assert_eq!(repeated["bytes"], first["bytes"]);
@@ -6491,7 +6353,7 @@ mod tests {
 
         let still_frozen = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         assert_eq!(still_frozen["bytes"], first["bytes"]);
@@ -6503,7 +6365,7 @@ mod tests {
         let _ = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
         let advanced = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         assert!(advanced["bytes"]
@@ -6519,7 +6381,10 @@ mod tests {
             "Today's date: Sun Jan 03 2016".to_string(),
         );
         let other = match handler
-            .dispatch_value(8, json!({ "kind": "guidance.get", "session_id": "other" }))
+            .dispatch_value(
+                8,
+                json!({ "kind": "guidance.get", "session_id": "other", "tool_present": true }),
+            )
             .await
         {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -6967,8 +6832,8 @@ mod tests {
         assert_eq!(echo_body["ok"], json!(true));
         assert_eq!(echo_body["echo"]["kind"], "echo");
 
-        let reduce = call_facade(&handler, "ctx_reduce", json!({ "drop": "1-3" })).await;
-        assert_eq!(error_code(reduce), "tagging_inactive");
+        let reduce = tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1-3" })).await);
+        assert_eq!(reduce, CTX_REDUCE_ACKNOWLEDGEMENT);
     }
 
     #[test]
@@ -6980,86 +6845,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_ctx_reduce_parses_ranges_resolves_tags_and_dedups_queue() {
-        crate::healing::set_tagging_enabled_for_tests(Some(true));
+    async fn facade_ctx_reduce_is_inert_before_resolution_or_storage() {
         let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(8, binding(project.to_str().unwrap(), "token"));
-
-        let messages = vec![ck("m1", 1, "one"), ck("m2", 2, "two")];
-        let transition = call_transform(&handler, messages.clone()).await;
-        assert_eq!(transition["status"], "ok");
-        assert!(store.load_tags_for_session("ses").unwrap().is_empty());
-        let transformed = call_transform(&handler, messages).await;
-        assert_eq!(transformed["status"], "ok");
-        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 2);
-
-        let mixed = tool_text(
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "§1§,99" })).await,
+        let resolver = FakeSessionResolver::with(&[("unresolvable", FakeResolve::None)]);
+        let handler = McHandler::with_producer_factory_config_resolver(
+            Arc::new(TestProducerFactory { state: producer }),
+            default_test_config(),
+            resolver.clone(),
         );
-        assert!(mixed.contains("Queued: drop §1§."), "{mixed}");
-        assert!(mixed.contains("Unknown tag(s) §99§ skipped."), "{mixed}");
-        let queued = store.load_pending_agent_drops("ses").unwrap();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].target_id, "m1#0");
+        handler.bind_route(8, binding("/path/that/does/not/exist", "unresolvable"));
 
-        let duplicate = tool_text(
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "1" })).await,
+        let response = tool_text(
+            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "not parsed" }))
+                .await,
         );
-        assert!(duplicate.contains("already queued"), "{duplicate}");
-        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
-
-        let malformed = tool_body(
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "3-1" })).await,
+        assert_eq!(response, CTX_REDUCE_ACKNOWLEDGEMENT);
+        assert!(
+            resolver.calls().is_empty(),
+            "the inert facade must not resolve tokens"
         );
-        assert_eq!(malformed["isError"], json!(true));
-        assert!(malformed["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid range syntax"));
-
-        let unbounded = tool_body(
-            call_facade_on_channel(
-                &handler,
-                8,
-                "ctx_reduce",
-                json!({ "drop": "0-18446744073709551615" }),
-            )
-            .await,
+        assert!(
+            handler.store.get().is_none(),
+            "the inert facade must not open or read storage"
         );
-        assert_eq!(unbounded["isError"], json!(true));
-        assert!(unbounded["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid range syntax"));
-        crate::healing::set_tagging_enabled_for_tests(None);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn facade_ctx_reduce_rejects_profiles_that_cannot_drain_tail_mutations() {
-        crate::healing::set_tagging_enabled_for_tests(Some(true));
-        let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(8, binding(project.to_str().unwrap(), "token"));
-
-        let messages = vec![ck("m1", 1, "one")];
-        let mut cc_request = request(messages.clone());
-        cc_request["serializer_profile"] = json!("claude-code-anthropic");
-        let first = call_transform_request(&handler, cc_request.clone()).await;
-        assert_eq!(first["status"], "ok");
-        let second = call_transform_request(&handler, cc_request).await;
-        assert_eq!(second["status"], "ok");
-        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 1);
-
-        let rejected =
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "1" })).await;
-        assert_eq!(error_code(rejected), "reduce_unavailable_for_profile");
-        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
-        crate::healing::set_tagging_enabled_for_tests(None);
+    #[test]
+    fn ctx_reduce_manifest_schema_is_closed_and_requires_drop() {
+        let manifest = manifest("magic-context");
+        let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+            panic!("tool provider manifest entry");
+        };
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "ctx_reduce")
+            .expect("ctx_reduce manifest entry");
+        assert_eq!(
+            tool.schema,
+            json!({
+                "type": "object",
+                "properties": { "drop": { "type": "string" } },
+                "required": ["drop"],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]
@@ -7384,6 +7213,8 @@ mod tests {
         assert_eq!(response["status"], "need_full_sync");
         assert_eq!(response["served_from"], "transform");
         assert_eq!(response["full_array_fingerprint"], "fp-delta");
+        assert_eq!(response["surface_state"], "inactive");
+        assert!(response["row_version"].is_u64());
         // The array field must be ABSENT, not empty: the consumer discriminates
         // structurally on presence, and an empty array would be a third
         // ambiguous state between "transformed to nothing" and "re-send".
@@ -7403,6 +7234,36 @@ mod tests {
         .await;
         assert_eq!(response["status"], "ok");
         assert!(response.get("full_array_fingerprint").is_none());
+        assert_eq!(response["surface_state"], "inactive");
+        assert!(response["row_version"].is_u64());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transform_ok_wire_reports_each_surface_state_and_row_version() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut request = request(vec![ck("m1", 1, "hello")]);
+        request["serializer_profile"] = json!("claude-code-anthropic");
+
+        let inactive = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(inactive["surface_state"], "inactive");
+        assert!(inactive["row_version"].is_u64());
+
+        request["tool_present"] = json!(true);
+        let on_transition = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(on_transition["surface_state"], "transition");
+        assert!(on_transition["row_version"].is_u64());
+        let active = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(active["surface_state"], "active");
+        assert!(active["row_version"].is_u64());
+
+        request["tool_present"] = json!(false);
+        let off_transition = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(off_transition["surface_state"], "transition");
+        assert!(off_transition["row_version"].is_u64());
+        let inactive_again = call_transform_request(&handler, request).await;
+        assert_eq!(inactive_again["surface_state"], "inactive");
+        assert!(inactive_again["row_version"].is_u64());
     }
 
     async fn call_transform_with_usage(
@@ -7418,27 +7279,28 @@ mod tests {
         .await
     }
 
-    fn queue_drop_command(handler: &McHandler, target_id: &str) -> Value {
-        match handler.handle_agent_drops_value(
-            7,
-            json!({
-                "kind": "ctx_reduce",
-                "session_id": "ses",
-                "drop_ids": [target_id],
-            }),
-        ) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
-            other => panic!("unexpected handler outcome: {other:?}"),
-        }
+    fn mint_drop_tag(store: &McStore, target_id: &str) {
+        store
+            .mint_or_get_tags(
+                "ses",
+                &[TagMintInput {
+                    block_id: target_id.to_string(),
+                    kind: "message".to_string(),
+                    token_count: 1,
+                    source_bytes: b"source".to_vec(),
+                }],
+                1,
+            )
+            .unwrap();
     }
 
-    fn queue_drop_command_with_id(handler: &McHandler, target_id: &str, command_id: &str) -> Value {
+    fn queue_drop_command_with_id(handler: &McHandler, command_id: &str) -> Value {
         match handler.handle_agent_drops_value(
             7,
             json!({
-                "kind": "ctx_reduce",
+                "method": "agent_drops.append",
                 "session_id": "ses",
-                "drop_ids": [target_id],
+                "drop": "1",
                 "command_id": command_id,
             }),
         ) {
@@ -7621,16 +7483,42 @@ mod tests {
         assert!(m0_text(&second).contains("autonomous summary"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn management_drop_alias_routes_are_rejected() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        for alias in ["ctx_reduce", "append_agent_drops"] {
+            let outcome = handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": alias,
+                        "session_id": "ses",
+                        "drop": "1",
+                        "command_id": "command"
+                    }),
+                )
+                .await;
+            assert_eq!(error_code(outcome), "unrecognized_request_shape", "{alias}");
+        }
+    }
+
     #[test]
-    fn ctx_reduce_without_command_id_keeps_drop_ids_response() {
+    fn agent_drops_append_rejects_missing_command_id() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        mint_drop_tag(&store, "a#0");
 
-        let first = queue_drop_command(&handler, "a#0");
-        assert_eq!(first, json!({ "ok": true, "queued": 1 }));
-        let repeat = queue_drop_command(&handler, "a#0");
-        assert_eq!(repeat, json!({ "ok": true, "queued": 0 }));
-        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+        let outcome = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1",
+            }),
+        );
+        assert_eq!(error_code(outcome), "bad_request");
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[test]
@@ -7638,11 +7526,12 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
 
-        let first = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        mint_drop_tag(&store, "a#0");
+        let first = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(first, json!({ "ok": true, "queued": 1 }));
         let pending = store.load_pending_agent_drops("ses").unwrap();
 
-        let retry = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        let retry = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
     }
@@ -7651,21 +7540,25 @@ mod tests {
     async fn ctx_reduce_command_id_survives_transform_drain() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
-        let queued = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        mint_drop_tag(&store, "a#0");
+        let queued = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(queued, json!({ "ok": true, "queued": 1 }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
 
-        let response = call_transform(&handler, vec![ck("a", 1, "drop me")]).await;
+        let mut transform_request = request(vec![ck("a", 1, "drop me")]);
+        transform_request["serializer_profile"] = json!("claude-code-anthropic");
+        transform_request["tool_present"] = json!(true);
+        let response = call_transform_request(&handler, transform_request).await;
         assert!(serde_json::to_string(&response)
             .unwrap()
             .contains("[dropped]"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-        let retry = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        let retry = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-        let new_request = queue_drop_command_with_id(&handler, "a#0", "tool-use-2");
+        let new_request = queue_drop_command_with_id(&handler, "tool-use-2");
         assert_eq!(new_request, json!({ "ok": true, "queued": 1 }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
     }
@@ -7681,8 +7574,27 @@ mod tests {
                 json!({
                     "method": "agent_drops.append",
                     "session_id": "ses",
-                    "drop_ids": ["a#0"],
+                    "drop": "1",
                     "command_id": command_id,
+                }),
+            );
+            assert_eq!(error_code(outcome), "bad_request");
+        }
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_drops_append_rejects_missing_or_empty_raw_drop() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        for drop in [Value::Null, json!(""), json!("  "), json!(["1"])] {
+            let outcome = handler.handle_agent_drops_value(
+                7,
+                json!({
+                    "method": "agent_drops.append",
+                    "session_id": "ses",
+                    "drop": drop,
+                    "command_id": "command"
                 }),
             );
             assert_eq!(error_code(outcome), "bad_request");
@@ -7723,6 +7635,7 @@ mod tests {
                 "method": "agent_drops.append",
                 "session_id": "ses",
                 "drop": "§1§-2, 99",
+                "command_id": "raw-1",
             }),
         ) {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -7739,6 +7652,7 @@ mod tests {
                 "method": "agent_drops.append",
                 "session_id": "ses",
                 "drop": "1-2",
+                "command_id": "raw-2",
             }),
         ) {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -7753,6 +7667,7 @@ mod tests {
                 "method": "agent_drops.append",
                 "session_id": "ses",
                 "drop": "3-1",
+                "command_id": "raw-bad",
             }),
         ) {
             HandlerOutcome::Error { code, .. } => assert_eq!(code, "bad_request"),

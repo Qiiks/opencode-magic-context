@@ -1292,6 +1292,7 @@ mod tests {
             &connection_file,
             &ConnectionInfo {
                 schema: SCHEMA_VERSION,
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
                 endpoints: vec![Endpoint {
                     host: addr.ip().to_string(),
                     port: addr.port(),
