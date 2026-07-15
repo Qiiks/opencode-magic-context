@@ -758,6 +758,22 @@ const MIGRATIONS: &[Migration] = &[
         );
     ",
     },
+    Migration {
+        version: 18,
+        // Auto-search decisions are append-only overlay bytes. Empty hint_text records a
+        // durable no-result decision so changing memory state cannot rewrite an old turn.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_user_hints (
+            session_id  TEXT NOT NULL,
+            block_id    TEXT NOT NULL,
+            hint_text   TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            PRIMARY KEY (session_id, block_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_user_hints_session_created
+            ON mc_user_hints(session_id, created_at, block_id);
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1357,6 +1373,13 @@ pub struct Channel1AppendRow {
     pub fired_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserHintRow {
+    pub block_id: String,
+    pub hint_text: String,
+    pub created_at: i64,
+}
+
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
 /// chronological order (1 = oldest).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1946,6 +1969,7 @@ fn session_has_durable_state(
              UNION ALL SELECT 1 FROM pending_agent_drops WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_reduce_command_ledger WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_channel1_appends WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_user_hints WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_pass_trace WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_chunk_transcripts WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_notes WHERE session_id = ?1
@@ -2412,6 +2436,79 @@ impl McStore {
                     block_id: r.get(0)?,
                     reminder_text: r.get(1)?,
                     fired_at_ms: r.get(2)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?)
+    }
+
+    /// Return whether a block may receive the next first-sight hint decision.
+    /// Tag numbers preserve first-observation order, so any decided higher number closes
+    /// the frontier even when that later block is absent from the current request.
+    pub fn user_hint_frontier_open(
+        &self,
+        session_id: &str,
+        block_id: &str,
+        tag_number: i64,
+    ) -> Result<bool, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT
+                     NOT EXISTS(
+                         SELECT 1 FROM mc_user_hints
+                         WHERE session_id = ?1 AND block_id = ?2
+                     )
+                     AND NOT EXISTS(
+                         SELECT 1
+                         FROM mc_user_hints AS hint
+                         JOIN mc_tags AS tag
+                           ON tag.session_id = hint.session_id
+                          AND tag.block_id = hint.block_id
+                         WHERE hint.session_id = ?1 AND tag.tag_number > ?3
+                     )",
+                params![session_id, block_id, tag_number],
+                |row| row.get(0),
+            )
+        })?)
+    }
+
+    /// Persist one auto-search decision, including an empty no-result decision.
+    pub fn append_user_hint(
+        &self,
+        session_id: &str,
+        block_id: &str,
+        hint_text: &str,
+        created_at: i64,
+    ) -> Result<bool, McStoreError> {
+        Ok(self.inner.with_conn_fenced(|tx| {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO mc_user_hints
+                     (session_id, block_id, hint_text, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, block_id, hint_text, created_at],
+            )?;
+            Ok(inserted > 0)
+        })?)
+    }
+
+    /// Load exact auto-search overlay bytes and durable empty decisions.
+    pub fn load_user_hints(&self, session_id: &str) -> Result<Vec<UserHintRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT block_id, hint_text, created_at
+                 FROM mc_user_hints
+                 WHERE session_id = ?1
+                 ORDER BY created_at ASC, block_id ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok(UserHintRow {
+                    block_id: row.get(0)?,
+                    hint_text: row.get(1)?,
+                    created_at: row.get(2)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -5990,6 +6087,37 @@ mod tests {
             appends[0].reminder_text,
             "\n\n<system-reminder>hi</system-reminder>"
         );
+
+        assert!(store.append_user_hint("ses", "m1#0", "", 500).unwrap());
+        assert!(!store
+            .append_user_hint("ses", "m1#0", "different", 600)
+            .unwrap());
+        assert!(store
+            .append_user_hint(
+                "ses",
+                "m3#0",
+                "\n\n<ctx-search-hint>hit</ctx-search-hint>",
+                700
+            )
+            .unwrap());
+        assert_eq!(
+            store.load_user_hints("ses").unwrap(),
+            vec![
+                UserHintRow {
+                    block_id: "m1#0".to_string(),
+                    hint_text: String::new(),
+                    created_at: 500,
+                },
+                UserHintRow {
+                    block_id: "m3#0".to_string(),
+                    hint_text: "\n\n<ctx-search-hint>hit</ctx-search-hint>".to_string(),
+                    created_at: 700,
+                },
+            ]
+        );
+        assert!(!store.user_hint_frontier_open("ses", "m1#0", 1).unwrap());
+        assert!(!store.user_hint_frontier_open("ses", "m2#0", 2).unwrap());
+        assert!(store.user_hint_frontier_open("ses", "m4#0", 4).unwrap());
     }
 
     #[test]
@@ -6052,6 +6180,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_has_import_table.as_deref(), Some("mc_state_imports"));
+        let fresh_has_hints_table = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mc_user_hints'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(fresh_has_hints_table.as_deref(), Some("mc_user_hints"));
 
         let migrated_dir = tempfile::tempdir().unwrap();
         let path = migrated_dir.path().join("store.db");
@@ -6133,6 +6273,18 @@ mod tests {
             migrated_has_import_table.as_deref(),
             Some("mc_state_imports")
         );
+        let migrated_has_hints_table = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mc_user_hints'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(migrated_has_hints_table.as_deref(), Some("mc_user_hints"));
         let migrated_date_columns = migrated
             .inner
             .with_conn(|conn| {
@@ -6307,8 +6459,16 @@ mod tests {
         store
             .append_pending_agent_drops_with_command("ledger", Some("command"), &[], 1)
             .unwrap();
+        store.append_user_hint("hints", "m1#0", "", 1).unwrap();
 
-        for session_id in ["cache", "compartments", "tags", "pending", "ledger"] {
+        for session_id in [
+            "cache",
+            "compartments",
+            "tags",
+            "pending",
+            "ledger",
+            "hints",
+        ] {
             assert!(matches!(
                 store.preflight_state_import(session_id, "bundle"),
                 Err(StateImportError::SessionNotEmpty)

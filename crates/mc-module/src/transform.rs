@@ -32,6 +32,7 @@ use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInpu
 use mc_store::{
     Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, ModuleMeta,
     ModuleUsage, PendingAgentDrop, PendingRewriteState, StoredCompartment, TagMintInput,
+    UserHintRow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,6 +66,18 @@ const CHANNEL1_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_PRESSURE_FLOOR: f64 = 0.8;
 const CHANNEL1_USABLE_FRACTION: f64 = 1.0 / 3.0;
+const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
+const USER_HINT_QUERY_CHAR_CAP: usize = 500;
+const USER_HINT_FRAGMENT_CHAR_CAP: usize = 100;
+const USER_HINT_TOTAL_CHAR_CAP: usize = 600;
+const USER_HINT_SEARCH_LIMIT: usize = 10;
+const USER_HINT_RESULT_LIMIT: usize = 3;
+const USER_HINT_LEXICAL_SCORE_FLOOR: f64 = 0.25;
+
+#[cfg(test)]
+thread_local! {
+    static USER_HINT_LEXICAL_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The m1 delta content + its byte-affecting digest. `revision` is a digest over ALL
 /// byte-affecting m1 render inputs such that `render` is a pure function of what the
@@ -470,6 +483,8 @@ impl Channel1Level {
 #[derive(Debug, Clone, Default)]
 struct TagOverlayState {
     tag_by_block_id: BTreeMap<String, i64>,
+    temporal_by_block_id: BTreeMap<String, String>,
+    user_hint_by_block_id: BTreeMap<String, String>,
     channel1_by_block_id: BTreeMap<String, String>,
 }
 
@@ -487,6 +502,15 @@ struct Channel1Decision {
     reclaimable_tokens: i64,
     next_last_nudge: i64,
     next_last_level: String,
+}
+
+struct UserHintInputs<'a, 'ctx> {
+    store: &'a McStore,
+    req: &'a TransformRequest,
+    ctx: &'a ProducerContext<'ctx>,
+    projection: &'a FlatProjection,
+    tag_rows: &'a [McTagRow],
+    user_hints: &'a [UserHintRow],
 }
 
 struct Channel1NudgeInputs<'a, 'ctx> {
@@ -520,6 +544,8 @@ pub enum TransformError {
     /// A stored coverage range overlaps, or the live array proves a present raw message
     /// would be trimmed without being covered by any compartment. Fail loud.
     CoverageGap(String),
+    /// The lexical hint query failed before a durable decision could be written.
+    Search(String),
     /// CK ingress rejected an unsupported or unpairable block before any partial projection.
     CkWire(CkWireError),
     /// Two flattened blocks produced the same `mid#block_index` id in one request.
@@ -552,6 +578,7 @@ impl std::fmt::Display for TransformError {
                 "decider re-supplied an already-frozen reduction target with different bytes"
             ),
             TransformError::CoverageGap(m) => write!(f, "{m}"),
+            TransformError::Search(m) => write!(f, "search: {m}"),
             TransformError::CkWire(e) => write!(f, "ck wire: {e}"),
             TransformError::DuplicateBlockId(id) => write!(f, "duplicate flattened block id: {id}"),
             TransformError::IdentityDrift(mid) => {
@@ -756,6 +783,11 @@ fn apply_once(
     } else {
         Vec::new()
     };
+    let mut user_hints = if tagging_active {
+        store.load_user_hints(&req.session_id)?
+    } else {
+        Vec::new()
+    };
 
     // Check whether the boundary is present in the live messages, or through a shadow
     // trim record that matches durable coverage and the first untrimmed message. A failed
@@ -803,8 +835,9 @@ fn apply_once(
                 "mc-module: pending_rewrite raw pass-through for {} fingerprint {}",
                 req.session_id, fingerprint
             );
-            let passthrough_overlay =
-                tagging_active.then(|| tag_overlay_state(&tag_rows, &channel1_appends));
+            let passthrough_overlay = tagging_active.then(|| {
+                tag_overlay_state(&req.messages, &tag_rows, &user_hints, &channel1_appends)
+            });
             return Ok(pending_passthrough_result(
                 projection,
                 req,
@@ -844,8 +877,8 @@ fn apply_once(
             "mc-module: armed pending_rewrite for {} fingerprint {} ambiguous={}",
             req.session_id, fingerprint, ambiguous
         );
-        let passthrough_overlay =
-            tagging_active.then(|| tag_overlay_state(&tag_rows, &channel1_appends));
+        let passthrough_overlay = tagging_active
+            .then(|| tag_overlay_state(&req.messages, &tag_rows, &user_hints, &channel1_appends));
         return Ok(pending_passthrough_result(
             projection,
             req,
@@ -1415,8 +1448,20 @@ fn apply_once(
 
     let result_action = action_str(&plan, &core);
 
+    if tagging_active {
+        if let Some(row) = maybe_append_user_hint(UserHintInputs {
+            store,
+            req,
+            ctx,
+            projection: &projection,
+            tag_rows: &tag_rows,
+            user_hints: &user_hints,
+        })? {
+            user_hints.push(row);
+        }
+    }
     let mut tag_overlay = if tagging_active {
-        tag_overlay_state(&tag_rows, &channel1_appends)
+        tag_overlay_state(&req.messages, &tag_rows, &user_hints, &channel1_appends)
     } else {
         TagOverlayState::default()
     };
@@ -2471,17 +2516,94 @@ fn newest_active_tag_block_ids(
         .collect()
 }
 
-fn tag_overlay_state(tag_rows: &[McTagRow], appends: &[Channel1AppendRow]) -> TagOverlayState {
+fn tag_overlay_state(
+    messages: &[CkIngressMessage],
+    tag_rows: &[McTagRow],
+    user_hints: &[UserHintRow],
+    appends: &[Channel1AppendRow],
+) -> TagOverlayState {
     TagOverlayState {
         tag_by_block_id: tag_rows
             .iter()
             .map(|row| (row.block_id.clone(), row.tag_number))
+            .collect(),
+        temporal_by_block_id: temporal_gap_overlays(messages, tag_rows),
+        user_hint_by_block_id: user_hints
+            .iter()
+            .filter(|row| !row.hint_text.is_empty())
+            .map(|row| (row.block_id.clone(), row.hint_text.clone()))
             .collect(),
         channel1_by_block_id: appends
             .iter()
             .map(|row| (row.block_id.clone(), row.reminder_text.clone()))
             .collect(),
     }
+}
+
+fn temporal_gap_overlays(
+    messages: &[CkIngressMessage],
+    tag_rows: &[McTagRow],
+) -> BTreeMap<String, String> {
+    let mint_by_block = tag_rows
+        .iter()
+        .map(|row| (row.block_id.as_str(), row.created_at_ms))
+        .collect::<HashMap<_, _>>();
+    let mut overlays = BTreeMap::new();
+    let mut previous_first_mint = None;
+
+    for message in messages.iter().filter(|message| !message.ck.meta.synthetic) {
+        let first_block_id = format!("{}#0", message.mid);
+        let current_first_mint = mint_by_block.get(first_block_id.as_str()).copied();
+        if message.ck.role == "user" {
+            if let (Some(current), Some(previous)) = (current_first_mint, previous_first_mint) {
+                if let Some(prefix) = current.checked_sub(previous).and_then(temporal_gap_prefix) {
+                    overlays.insert(first_block_id, prefix);
+                }
+            }
+        }
+        // A missing mint on the immediately previous ordinal makes the gap unknowable.
+        // Retaining an older timestamp would attach a marker for the wrong message pair.
+        previous_first_mint = current_first_mint;
+    }
+
+    overlays
+}
+
+/// Format a mint-time delta as the deterministic prefix used by the active overlay.
+pub fn temporal_gap_prefix(gap_ms: i64) -> Option<String> {
+    if gap_ms < TEMPORAL_AWARENESS_THRESHOLD_MS {
+        return None;
+    }
+
+    let seconds = gap_ms / 1_000;
+    let marker = if seconds < 60 * 60 {
+        format!("+{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        let hours = seconds / (60 * 60);
+        let minutes = (seconds - hours * 60 * 60) / 60;
+        if minutes == 0 {
+            format!("+{hours}h")
+        } else {
+            format!("+{hours}h {minutes}m")
+        }
+    } else if seconds < 7 * 24 * 60 * 60 {
+        let days = seconds / (24 * 60 * 60);
+        let hours = (seconds - days * 24 * 60 * 60) / (60 * 60);
+        if hours == 0 {
+            format!("+{days}d")
+        } else {
+            format!("+{days}d {hours}h")
+        }
+    } else {
+        let weeks = seconds / (7 * 24 * 60 * 60);
+        let days = (seconds - weeks * 7 * 24 * 60 * 60) / (24 * 60 * 60);
+        if days == 0 {
+            format!("+{weeks}w")
+        } else {
+            format!("+{weeks}w {days}d")
+        }
+    };
+    Some(format!("<!-- {marker} -->\n"))
 }
 
 fn apply_tag_overlay_to_message(
@@ -2520,6 +2642,12 @@ fn apply_tag_overlay_to_message(
                         block.id
                     );
                 }
+            }
+            if let Some(prefix) = overlay.temporal_by_block_id.get(&block.id) {
+                block_changed |= prepend_temporal_to_block(target, prefix);
+            }
+            if let Some(hint) = overlay.user_hint_by_block_id.get(&block.id) {
+                block_changed |= append_user_hint_to_block(target, hint);
             }
             if let Some(reminder) = overlay.channel1_by_block_id.get(&block.id) {
                 block_changed |= append_channel1_to_block(target, reminder);
@@ -2603,6 +2731,28 @@ fn prepend_tag_to_tool_output(output: &mut ck_wire::CkToolOutput, tag_number: i6
     false
 }
 
+fn prepend_temporal_to_block(block: &mut CkWireBlock, prefix: &str) -> bool {
+    let ck_wire::CkKind::Text { text } = &mut block.kind else {
+        return false;
+    };
+    if text.starts_with(prefix) {
+        return false;
+    }
+    text.insert_str(0, prefix);
+    true
+}
+
+fn append_user_hint_to_block(block: &mut CkWireBlock, hint: &str) -> bool {
+    let ck_wire::CkKind::Text { text } = &mut block.kind else {
+        return false;
+    };
+    if text.ends_with(hint) {
+        return false;
+    }
+    text.push_str(hint);
+    true
+}
+
 fn append_channel1_to_block(block: &mut CkWireBlock, reminder: &str) -> bool {
     match &mut block.kind {
         ck_wire::CkKind::ToolResult { output, .. } => append_channel1_to_output(output, reminder),
@@ -2673,6 +2823,211 @@ fn strip_leading_tag_imitations(value: &str) -> &str {
         };
         rest = after_close.trim_start_matches(char::is_whitespace);
     }
+}
+
+fn maybe_append_user_hint(
+    input: UserHintInputs<'_, '_>,
+) -> Result<Option<UserHintRow>, TransformError> {
+    let Some(message) = input
+        .req
+        .messages
+        .iter()
+        .rfind(|message| !message.ck.meta.synthetic)
+    else {
+        return Ok(None);
+    };
+    if message.ck.role != "user" {
+        return Ok(None);
+    }
+
+    let block_id = format!("{}#0", message.mid);
+    let first_block_is_text = input.projection.blocks.iter().any(|block| {
+        block.id == block_id && matches!(taggable_kind(block), Some(TaggableKind::Message))
+    });
+    if !first_block_is_text || input.user_hints.iter().any(|row| row.block_id == block_id) {
+        return Ok(None);
+    }
+    let Some(candidate_tag) = input
+        .tag_rows
+        .iter()
+        .find(|row| row.block_id == block_id)
+        .map(|row| row.tag_number)
+    else {
+        return Ok(None);
+    };
+    if !input
+        .store
+        .user_hint_frontier_open(&input.req.session_id, &block_id, candidate_tag)?
+    {
+        return Ok(None);
+    }
+
+    let query = user_hint_query(message);
+    let hint_text = if query.is_empty() {
+        String::new()
+    } else {
+        let results = run_user_hint_lexical_search(
+            input.store,
+            input.ctx.project_path,
+            &input.req.session_id,
+            &query,
+            input.ctx.memory_enabled,
+        )?;
+        render_user_hint(&results).unwrap_or_default()
+    };
+    let inserted = input.store.append_user_hint(
+        &input.req.session_id,
+        &block_id,
+        &hint_text,
+        input.ctx.now_ms,
+    )?;
+    Ok(inserted.then_some(UserHintRow {
+        block_id,
+        hint_text,
+        created_at: input.ctx.now_ms,
+    }))
+}
+
+fn run_user_hint_lexical_search(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    query: &str,
+    include_memories: bool,
+) -> Result<Vec<crate::memory_tool::MemorySearchResult>, TransformError> {
+    #[cfg(test)]
+    USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(count.get() + 1));
+
+    let ranked = crate::memory_tool::search_memories_and_compartments_for_session(
+        store,
+        project_path,
+        session_id,
+        query,
+        USER_HINT_SEARCH_LIMIT,
+        include_memories,
+    )
+    .map_err(|error| match error {
+        crate::memory_tool::MemoryToolError::Store(store_error) => {
+            TransformError::Store(store_error)
+        }
+        other => TransformError::Search(other.to_string()),
+    })?;
+    Ok(ranked
+        .into_iter()
+        .filter(|result| result.source_kind != crate::memory_tool::MemorySearchSourceKind::Note)
+        .enumerate()
+        .take_while(|(rank, _)| 1.0 / (*rank as f64 + 1.0) > USER_HINT_LEXICAL_SCORE_FLOOR)
+        .take(USER_HINT_RESULT_LIMIT)
+        .map(|(_, result)| result)
+        .collect())
+}
+
+fn user_hint_query(message: &CkIngressMessage) -> String {
+    let raw = message
+        .ck
+        .content
+        .iter()
+        .filter_map(|block| match &block.kind {
+            ck_wire::CkKind::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let without_reminders = strip_system_reminder_wrappers(&raw);
+    let without_tags = strip_mc_tag_notation(&without_reminders);
+    without_tags
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(USER_HINT_QUERY_CHAR_CAP)
+        .collect()
+}
+
+fn strip_system_reminder_wrappers(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut output = String::new();
+    let mut depth = 0usize;
+    let mut offset = 0usize;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        if rest.starts_with(OPEN) {
+            depth += 1;
+            offset += OPEN.len();
+        } else if rest.starts_with(CLOSE) {
+            depth = depth.saturating_sub(1);
+            offset += CLOSE.len();
+        } else {
+            let ch = rest.chars().next().expect("non-empty remainder");
+            if depth == 0 {
+                output.push(ch);
+            }
+            offset += ch.len_utf8();
+        }
+    }
+    output
+}
+
+fn strip_mc_tag_notation(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(after_open) = rest.strip_prefix('\u{a7}') {
+            let digits = after_open.chars().take_while(char::is_ascii_digit).count();
+            if digits > 0 {
+                if let Some(after_close) = after_open[digits..].strip_prefix('\u{a7}') {
+                    rest = after_close.trim_start_matches(char::is_whitespace);
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().expect("non-empty remainder");
+        output.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    output
+}
+
+fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Option<String> {
+    if results.is_empty() {
+        return None;
+    }
+    let lines = results
+        .iter()
+        .take(USER_HINT_RESULT_LIMIT)
+        .map(|result| {
+            format!(
+                "- {}",
+                one_line_fragment(&result.snippet, USER_HINT_FRAGMENT_CHAR_CAP)
+            )
+        })
+        .filter(|line| line.len() > 2)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let hint = format!(
+        "\n\n<ctx-search-hint>\nYour memory may contain related fragments:\n{}\nIf relevant, run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>",
+        lines.join("\n")
+    );
+    debug_assert!(hint.chars().count() <= USER_HINT_TOTAL_CHAR_CAP);
+    Some(hint)
+}
+
+fn one_line_fragment(text: &str, limit: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= limit {
+        return normalized;
+    }
+    let mut truncated = normalized
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    truncated.push('…');
+    truncated
 }
 
 fn maybe_append_channel1_nudge(
@@ -6968,7 +7323,7 @@ mod tests {
             .unwrap()
             .meta
             .last_render_config
-            .contains("tfe:4:tfe1"));
+            .contains("tfe:4:tfe2"));
 
         let after_commit = run(&s, &request, &spine());
         assert_eq!(after_commit.action, "SOFT+");
@@ -7004,6 +7359,226 @@ mod tests {
             "§42§ user content",
             "only one registered prefix occurrence is removed"
         );
+    }
+
+    #[test]
+    fn temporal_gap_format_matches_typescript_goldens() {
+        let fixtures = [
+            (0, None),
+            (299_999, None),
+            (300_000, Some("<!-- +5m -->\n")),
+            (12 * 60 * 1_000, Some("<!-- +12m -->\n")),
+            ((2 * 60 * 60 + 15 * 60) * 1_000, Some("<!-- +2h 15m -->\n")),
+            (24 * 60 * 60 * 1_000, Some("<!-- +1d -->\n")),
+            (
+                (3 * 24 * 60 * 60 + 4 * 60 * 60) * 1_000,
+                Some("<!-- +3d 4h -->\n"),
+            ),
+            (7 * 24 * 60 * 60 * 1_000, Some("<!-- +1w -->\n")),
+            (
+                (2 * 7 * 24 * 60 * 60 + 3 * 24 * 60 * 60) * 1_000,
+                Some("<!-- +2w 3d -->\n"),
+            ),
+        ];
+        for (gap_ms, expected) in fixtures {
+            assert_eq!(temporal_gap_prefix(gap_ms).as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn temporal_gap_overlay_replays_and_false_window_is_verbatim() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first_messages = vec![wire_item("user", "m1", 1, &["start"])];
+            let first_request = active_cc_req("temporal", "cfg0", first_messages.clone());
+            transform(
+                &s,
+                &first_request,
+                &pctx("git:proj", "/nonexistent-docs", 1_000),
+            )
+            .unwrap();
+            transform(
+                &s,
+                &first_request,
+                &pctx("git:proj", "/nonexistent-docs", 1_000),
+            )
+            .unwrap();
+
+            let mut with_assistant = first_messages;
+            with_assistant.push(wire_item("assistant", "m2", 2, &["answer"]));
+            let assistant_request = active_cc_req("temporal", "cfg0", with_assistant.clone());
+            transform(
+                &s,
+                &assistant_request,
+                &pctx("git:proj", "/nonexistent-docs", 10_000),
+            )
+            .unwrap();
+
+            let mut complete = with_assistant;
+            complete.push(wire_item("user", "m3", 3, &["question"]));
+            let active = active_cc_req("temporal", "cfg0", complete.clone());
+            let first =
+                transform(&s, &active, &pctx("git:proj", "/nonexistent-docs", 730_000)).unwrap();
+            assert_eq!(tail_bytes(&first, "m3"), "<!-- +12m -->\n§3§ question");
+            let replay =
+                transform(&s, &active, &pctx("git:proj", "/nonexistent-docs", 999_000)).unwrap();
+            assert_eq!(tail_bytes(&replay, "m3"), tail_bytes(&first, "m3"));
+
+            let dormant = cc_req("temporal", "cfg0", complete);
+            let false_window = transform(
+                &s,
+                &dormant,
+                &pctx("git:proj", "/nonexistent-docs", 1_000_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&false_window, "m3"), "question");
+        });
+    }
+
+    #[test]
+    fn temporal_gap_midlife_activation_has_zero_gaps() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let messages = vec![
+                wire_item("user", "m1", 1, &["old question"]),
+                wire_item("assistant", "m2", 2, &["old answer"]),
+                wire_item("user", "m3", 3, &["current question"]),
+            ];
+            let request = active_cc_req("temporal-midlife", "cfg0", messages);
+            transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 600_000),
+            )
+            .unwrap();
+            let active = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 600_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&active, "m3"), "§3§ current question");
+        });
+    }
+
+    #[test]
+    fn user_hint_query_strips_tags_reminders_and_caps_input() {
+        let long_tail = "x".repeat(600);
+        let message = wire_item(
+            "user",
+            "query",
+            1,
+            &[
+                "§12§ keep <system-reminder>drop <system-reminder>nested</system-reminder> tail</system-reminder> words",
+                &long_tail,
+            ],
+        );
+        let query = user_hint_query(&message);
+        assert!(query.starts_with("keep words "));
+        assert!(!query.contains("§12§"));
+        assert!(!query.contains("drop"));
+        assert_eq!(query.chars().count(), USER_HINT_QUERY_CHAR_CAP);
+    }
+
+    #[test]
+    fn user_hint_is_computed_once_replayed_and_inactive_is_verbatim() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership uses borrowing safely",
+                70,
+            )
+            .unwrap();
+            let messages = vec![wire_item("user", "m1", 1, &["rust ownership"])];
+            let request = active_cc_req("user-hint", "cfg0", messages.clone());
+            run(&s, &request, &spine());
+            let first = run(&s, &request, &spine());
+            let expected_hint = "\n\n<ctx-search-hint>\nYour memory may contain related fragments:\n- rust ownership uses borrowing safely\nIf relevant, run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>";
+            assert_eq!(
+                tail_bytes(&first, "m1"),
+                format!("§1§ rust ownership{expected_hint}")
+            );
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+
+            let replay = run(&s, &request, &spine());
+            assert_eq!(tail_bytes(&replay, "m1"), tail_bytes(&first, "m1"));
+            assert_eq!(
+                USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get),
+                1,
+                "a durable row bypasses the lexical query on replay"
+            );
+            assert_eq!(s.load_user_hints("user-hint").unwrap().len(), 1);
+
+            let dormant = cc_req("user-hint", "cfg0", messages);
+            let false_window = run(&s, &dormant, &spine());
+            assert_eq!(tail_bytes(&false_window, "m1"), "rust ownership");
+        });
+    }
+
+    #[test]
+    fn empty_user_hint_decision_skips_future_queries() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let request = active_cc_req(
+                "empty-user-hint",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["no matching fragment"])],
+            );
+            run(&s, &request, &spine());
+            let first = run(&s, &request, &spine());
+            assert_eq!(tail_bytes(&first, "m1"), "§1§ no matching fragment");
+            let decisions = s.load_user_hints("empty-user-hint").unwrap();
+            assert_eq!(decisions.len(), 1);
+            assert!(decisions[0].hint_text.is_empty());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+
+            run(&s, &request, &spine());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+        });
+    }
+
+    #[test]
+    fn user_hint_frontier_never_backfills_an_older_turn() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let both = vec![
+                wire_item("user", "m1", 1, &["older prompt"]),
+                wire_item("user", "m2", 2, &["newer prompt"]),
+            ];
+            let request = active_cc_req("hint-frontier", "cfg0", both);
+            run(&s, &request, &spine());
+            run(&s, &request, &spine());
+            assert_eq!(
+                s.load_user_hints("hint-frontier").unwrap()[0].block_id,
+                "m2#0"
+            );
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+
+            let older_only = active_cc_req(
+                "hint-frontier",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["older prompt"])],
+            );
+            let response = run(&s, &older_only, &spine());
+            assert_eq!(tail_bytes(&response, "m1"), "§1§ older prompt");
+            assert_eq!(s.load_user_hints("hint-frontier").unwrap().len(), 1);
+            assert_eq!(
+                USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get),
+                1,
+                "a later durable decision closes the first-apply frontier"
+            );
+        });
     }
 
     #[test]
@@ -7318,7 +7893,7 @@ mod tests {
         let on_config = store.load("surface-flip").unwrap().meta.last_render_config;
         assert!(on_config.contains("tf1"));
         assert!(on_config.contains("gfull"));
-        assert!(on_config.contains("tfe:4:tfe1"));
+        assert!(on_config.contains("tfe:4:tfe2"));
         let on_steady = run(&store, &active, &spine());
         assert_ne!(on_steady.action, "HARD");
         assert_eq!(on_steady.surface_state, SurfaceState::Active);
@@ -8899,6 +9474,95 @@ mod tests {
             matches!(drift, TransformError::IdentityDrift(ref mid) if mid == "sys0"),
             "covered system content drift must fail via IdentityDrift, got {drift:?}"
         );
+    }
+
+    #[test]
+    fn staged_epoch_bump_takes_exactly_one_hard_when_client_config_frozen() {
+        assert_eq!(crate::TAGGER_FEATURE_EPOCH, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let r1 = "pe1/tf1/gfull";
+        let messages = vec![wire_item("user", "m1", 1, &["stable bytes"])];
+        let request = active_cc_req("staged-tfe", r1, messages);
+
+        run(&s, &request, &spine());
+        run(&s, &request, &spine());
+        let mut loaded = s.load("staged-tfe").unwrap();
+        loaded.meta.last_render_config = effective_render_config_with_epochs(
+            &s,
+            r1,
+            format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+            format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
+            format!(
+                "mpe{}",
+                crate::profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic)
+            ),
+            "tfe1".to_string(),
+        );
+        s.commit("staged-tfe", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        // The consumer base string stays frozen while the module epoch moves. Epoch pins
+        // are status assertions, not extra wire tokens; changing both identities would
+        // coordinate two folds instead of the one fold owned by the module upgrade.
+        let pass_a = run(&s, &request, &spine());
+        assert_eq!(pass_a.action, "HARD");
+        let expected_tfe2 = effective_render_config_with_epochs(
+            &s,
+            r1,
+            format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+            format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
+            format!(
+                "mpe{}",
+                crate::profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic)
+            ),
+            "tfe2".to_string(),
+        );
+        assert_eq!(
+            s.load("staged-tfe").unwrap().meta.last_render_config,
+            expected_tfe2
+        );
+
+        let pass_b = run(&s, &request, &spine());
+        assert_ne!(pass_b.action, "HARD");
+        assert_eq!(
+            serde_json::to_vec(pass_a.messages()).unwrap(),
+            serde_json::to_vec(pass_b.messages()).unwrap()
+        );
+
+        let r2_request = active_cc_req("staged-tfe", "pe1/tf2/gfull", request.messages.clone());
+        let pass_c = run(&s, &r2_request, &spine());
+        assert_eq!(
+            pass_c.action, "HARD",
+            "the opaque client base is independently identity-bearing"
+        );
+    }
+
+    #[test]
+    fn inactive_surface_omits_tagger_epoch_and_keeps_render_identity() {
+        assert_eq!(crate::tagger_feature_epoch(false), 0);
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = cc_req(
+            "inactive-tfe",
+            "pe1/tf1/gfull",
+            vec![wire_item("user", "m1", 1, &["raw bytes"])],
+        );
+        let first = run(&s, &request, &spine());
+        let first_config = s.load("inactive-tfe").unwrap().meta.last_render_config;
+        assert!(!first_config.contains("tfe:"));
+
+        let replay = run(&s, &request, &spine());
+        assert_ne!(replay.action, "HARD");
+        assert_eq!(
+            s.load("inactive-tfe").unwrap().meta.last_render_config,
+            first_config
+        );
+        assert_eq!(
+            serde_json::to_vec(first.messages()).unwrap(),
+            serde_json::to_vec(replay.messages()).unwrap()
+        );
+        assert_eq!(tail_bytes(&replay, "m1"), "raw bytes");
     }
 
     #[test]

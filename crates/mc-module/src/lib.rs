@@ -147,9 +147,10 @@ pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages.
 pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 1;
-/// Bumps when the visible tagging surface changes. The value is folded only for an
-/// active request, so advertising the dormant capability does not change existing bytes.
-pub const TAGGER_FEATURE_EPOCH: u32 = 1;
+/// Bumps when any active tag overlay changes provider-visible bytes. Every such change
+/// requires an epoch bump so established sessions coordinate one cache-breaking fold before
+/// rendering the new overlay. Inactive requests omit the component and retain their identity.
+pub const TAGGER_FEATURE_EPOCH: u32 = 2;
 
 /// The module-owned rendered-prefix format epoch for a serializer profile.
 ///
