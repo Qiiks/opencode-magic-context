@@ -6,24 +6,33 @@ import * as configDir from "./opencode-config-dir";
 
 describe("opencode-compaction-detector", () => {
     let tmpDir: string;
+    let previousDisableAutocompact: string | undefined;
+    let restoreConfigPaths: () => void;
 
     beforeEach(() => {
         tmpDir = join("/tmp", `compaction-detector-test-${Date.now()}`);
         mkdirSync(join(tmpDir, ".opencode"), { recursive: true });
+        previousDisableAutocompact = process.env.OPENCODE_DISABLE_AUTOCOMPACT;
         delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
-        spyOn(configDir, "getOpenCodeConfigPaths").mockReturnValue({
+        const configPathsSpy = spyOn(configDir, "getOpenCodeConfigPaths").mockReturnValue({
             configJson: join(tmpDir, "user-config", "opencode.json"),
             configJsonc: join(tmpDir, "user-config", "opencode.jsonc"),
         } as ReturnType<typeof configDir.getOpenCodeConfigPaths>);
+        restoreConfigPaths = () => configPathsSpy.mockRestore();
     });
 
     afterEach(() => {
+        restoreConfigPaths();
         try {
             rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
             /* Ignore EBUSY on Windows */
         }
-        delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+        if (previousDisableAutocompact === undefined) {
+            delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+        } else {
+            process.env.OPENCODE_DISABLE_AUTOCOMPACT = previousDisableAutocompact;
+        }
     });
 
     describe("#given no config exists", () => {

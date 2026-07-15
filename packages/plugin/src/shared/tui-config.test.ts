@@ -4,11 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const roots: string[] = [];
-const prevConfigDir = process.env.OPENCODE_CONFIG_DIR;
-
 afterEach(() => {
-    if (prevConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR;
-    else process.env.OPENCODE_CONFIG_DIR = prevConfigDir;
     for (const root of roots.splice(0)) {
         rmSync(root, { recursive: true, force: true });
     }
@@ -18,7 +14,6 @@ describe("ensureTuiPluginEntry", () => {
     it("preserves tuple dev-path plugin entry and does not add @latest", async () => {
         const root = mkdtempSync(join(tmpdir(), "mc-tui-"));
         roots.push(root);
-        process.env.OPENCODE_CONFIG_DIR = root;
         const devPath = "/Work/magic-context/packages/plugin";
         const tuiPath = join(root, "tui.json");
         writeFileSync(
@@ -27,7 +22,7 @@ describe("ensureTuiPluginEntry", () => {
         );
 
         const { ensureTuiPluginEntry } = await import("./tui-config");
-        const changed = ensureTuiPluginEntry();
+        const changed = ensureTuiPluginEntry({ configDir: root });
         expect(changed).toBe(false);
         const parsed = JSON.parse(readFileSync(tuiPath, "utf-8")) as { plugin: unknown[] };
         expect(parsed.plugin).toHaveLength(2);
@@ -40,7 +35,6 @@ describe("ensureTuiPluginEntry", () => {
     it("upgrades bare npm name to @latest while preserving tuple options", async () => {
         const root = mkdtempSync(join(tmpdir(), "mc-tui-npm-"));
         roots.push(root);
-        process.env.OPENCODE_CONFIG_DIR = root;
         const tuiPath = join(root, "tui.json");
         writeFileSync(
             tuiPath,
@@ -54,7 +48,7 @@ describe("ensureTuiPluginEntry", () => {
         );
 
         const { ensureTuiPluginEntry } = await import("./tui-config");
-        expect(ensureTuiPluginEntry()).toBe(true);
+        expect(ensureTuiPluginEntry({ configDir: root })).toBe(true);
         const parsed = JSON.parse(readFileSync(tuiPath, "utf-8")) as { plugin: unknown[] };
         const entry = parsed.plugin[0] as unknown[];
         expect(entry[0]).toBe("@cortexkit/opencode-magic-context@latest");
@@ -64,10 +58,9 @@ describe("ensureTuiPluginEntry", () => {
     it("creates tui.jsonc (not tui.json) on a fresh install", async () => {
         const root = mkdtempSync(join(tmpdir(), "mc-tui-fresh-"));
         roots.push(root);
-        process.env.OPENCODE_CONFIG_DIR = root;
 
         const { ensureTuiPluginEntry } = await import("./tui-config");
-        expect(ensureTuiPluginEntry()).toBe(true);
+        expect(ensureTuiPluginEntry({ configDir: root })).toBe(true);
 
         // The new file must be tui.jsonc so a tui.json stub never ends up
         // sitting next to a tui.jsonc the user writes later (#176).
@@ -82,7 +75,6 @@ describe("ensureTuiPluginEntry", () => {
     it("writes into the existing tui.jsonc when both files exist", async () => {
         const root = mkdtempSync(join(tmpdir(), "mc-tui-both-"));
         roots.push(root);
-        process.env.OPENCODE_CONFIG_DIR = root;
         // A real user config in tui.jsonc plus a leftover empty tui.json.
         writeFileSync(
             join(root, "tui.jsonc"),
@@ -91,7 +83,7 @@ describe("ensureTuiPluginEntry", () => {
         writeFileSync(join(root, "tui.json"), "{}\n");
 
         const { ensureTuiPluginEntry } = await import("./tui-config");
-        expect(ensureTuiPluginEntry()).toBe(true);
+        expect(ensureTuiPluginEntry({ configDir: root })).toBe(true);
 
         // The plugin entry must land in tui.jsonc (higher precedence), and the
         // user's keybinds must survive; tui.json must be left untouched.
