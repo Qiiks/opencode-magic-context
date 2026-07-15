@@ -1429,6 +1429,7 @@ mod tests {
             serializer_profile: "owned-llmrunner".to_string(),
             session_id: "ses".to_string(),
             render_config: "cfg".to_string(),
+            tool_present: false,
             full_array_fingerprint: None,
             messages,
             tail_delta: None,

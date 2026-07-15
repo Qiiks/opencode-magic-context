@@ -151,9 +151,12 @@ pub struct SelectionContext {
     /// drop (0 if never), and whether any emergency drop has happened.
     pub prior_input_sample: f64,
     pub has_prior_drop: bool,
-    /// Agent-marked drop ids (the ctx_reduce §N§ signal), a caller-owned side input
-    /// (empty on the MITM leg). Canonical flat ids of the marked blocks.
+    /// Agent-marked drop ids (the ctx_reduce §N§ signal), a caller-owned side input.
+    /// Canonical flat ids of the marked blocks.
     pub agent_drop_ids: Vec<String>,
+    /// Dynamic newest-tag protection expressed as exact block ids. This applies to
+    /// automatic selectors and agent-marked drops alike.
+    pub protected_block_ids: HashSet<String>,
 }
 
 /// Which scheduler class this pass is — gates which selectors run.
@@ -781,6 +784,10 @@ pub fn select_reductions(
     // from live_ids so Media and Opaque can never become reduction targets.
     select_agent_drops(&ctx.agent_drop_ids, &live_ids, frozen_keys, &mut out);
 
+    // Protection is block-specific, not an ordinal cutoff: remove protected targets from
+    // both automatic arc decisions and agent-directed decisions before the stable merge.
+    out.retain(|decision| !ctx.protected_block_ids.contains(&decision.target_id));
+
     // Deterministic merge: exactly one decision per target (drop > edit_marker >
     // skeleton), stable output order (by target_id).
     dedupe_and_sort(out)
@@ -925,6 +932,7 @@ mod tests {
             prior_input_sample: 0.0,
             has_prior_drop: false,
             agent_drop_ids: Vec::new(),
+            protected_block_ids: HashSet::new(),
         }
     }
 
@@ -1097,6 +1105,7 @@ mod tests {
                 prior_input_sample: case.ctx.prior_input_sample,
                 has_prior_drop: case.ctx.has_prior_drop,
                 agent_drop_ids: case.ctx.agent_drop_ids.clone(),
+                protected_block_ids: HashSet::new(),
             };
             let cfg = SelectionConfig {
                 smart_drops: case.smart_drops,
@@ -1173,6 +1182,29 @@ mod tests {
         assert!(
             out.iter().any(|d| d.target_id.starts_with("c2")),
             "c2 should still reduce"
+        );
+    }
+
+    #[test]
+    fn dynamic_block_protection_filters_automatic_and_agent_drop_decisions() {
+        let items = vec![
+            tool_call("c1", 1, "bash", serde_json::json!({}), 200),
+            tool_result("c1", 1, "bash", 200),
+            tool_call("c2", 2, "bash", serde_json::json!({}), 200),
+            tool_result("c2", 2, "bash", 200),
+        ];
+        let protected = result_block_id("c1");
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = 2;
+        ctx.agent_drop_ids = vec![protected.clone()];
+        ctx.protected_block_ids.insert(protected.clone());
+
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(out.iter().all(|decision| decision.target_id != protected));
+        assert!(
+            out.iter()
+                .any(|decision| decision.target_id == result_block_id("c2")),
+            "the unprotected automatic candidate must still be selected"
         );
     }
 
