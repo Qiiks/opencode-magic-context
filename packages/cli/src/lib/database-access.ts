@@ -34,9 +34,15 @@ export function openExistingDatabase(
     if (!existsSync(path)) return null;
     if (options.readonly) return new Database(path, { readonly: true });
 
-    // SQLite's URI mode=rw omits SQLITE_OPEN_CREATE. The existence check gives
-    // callers a graceful null result, while the URI also closes the race where
-    // the file disappears between that check and the constructor.
+    // Open read-write WITHOUT SQLITE_OPEN_CREATE, so the race where the file
+    // disappears between the existence check and the constructor errors instead
+    // of silently creating an empty database. The two backends need different
+    // spellings: bun:sqlite's Linux build rejects file:// URIs ("unable to open
+    // database file") but honors { create: false }, while node:sqlite has no
+    // create option and needs the URI's mode=rw.
+    if (typeof Bun !== "undefined") {
+        return new Database(path, { create: false, readwrite: true });
+    }
     const uri = pathToFileURL(path);
     uri.searchParams.set("mode", "rw");
     return new Database(uri.href);
