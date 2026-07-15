@@ -221,6 +221,16 @@ pub struct BoundaryResolution {
     pub boundary_reason: String,
 }
 
+/// A manual wrapup cut and the raw-tail accounting used to report its outcome.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WrapupBoundaryResolution {
+    pub boundary: BoundaryResolution,
+    /// Number of raw messages of any role above the latest compartment.
+    pub raw_messages_above_last_compartment: usize,
+    /// First ordinal retained in the verbatim tail after safety snapping.
+    pub target_protected_start_ordinal: u64,
+}
+
 /// Chunked tail measurement in the historian's `U:`/`A:`/`TC:` block format.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkEstimate {
@@ -518,6 +528,95 @@ pub fn resolve_protected_tail_boundary(
         oversize_atomic_unit: head.oversize_atomic_unit,
         raw_message_count,
         boundary_reason,
+    }
+}
+
+/// Resolve the fixed keep watermark for an explicit session wrapup.
+///
+/// The watermark counts messages of every role. Safety adjustments may move it earlier,
+/// retaining more than `keep`, but never later. This keeps tool invocations atomic and
+/// leaves the newest message, including its complete tool arc, in the verbatim tail.
+pub fn resolve_wrapup_boundary(
+    messages: &[BoundaryMsg],
+    last_compartment_end_ordinal: Option<u64>,
+    keep: usize,
+) -> WrapupBoundaryResolution {
+    let index = TokenIndex::new(messages);
+    let raw_message_count = index.raw_message_count;
+    let offset = compartment_offset(last_compartment_end_ordinal, messages).unwrap_or(1);
+    let mut live_ordinals = messages
+        .iter()
+        .map(|message| message.message_ordinal)
+        .filter(|ordinal| *ordinal >= offset)
+        .collect::<Vec<_>>();
+    live_ordinals.sort_unstable();
+    live_ordinals.dedup();
+    let raw_messages_above_last_compartment = live_ordinals.len();
+    let keep = keep.max(1);
+
+    let mut boundary_reason = if live_ordinals.is_empty() {
+        "manual-wrapup-empty"
+    } else if live_ordinals.len() <= keep {
+        "manual-wrapup-within-keep"
+    } else {
+        "manual-wrapup-keep-watermark"
+    }
+    .to_string();
+    let mut protected_tail_start = if live_ordinals.len() <= keep {
+        offset
+    } else {
+        live_ordinals[live_ordinals.len() - keep]
+    };
+
+    if live_ordinals.len() > keep {
+        let arcs = build_tool_arcs(messages);
+        let fenced = fence_wrapup_boundary_for_tool_arcs(protected_tail_start, &arcs, offset);
+        if fenced != protected_tail_start {
+            boundary_reason = "manual-wrapup-tool-arc".to_string();
+        }
+        protected_tail_start = fenced;
+
+        let trigger_budget = derive_trigger_budget(128_000.0, 65.0);
+        let snapped = snap_wrapup_boundary_to_user(
+            messages,
+            &index,
+            protected_tail_start,
+            offset,
+            trigger_budget,
+        );
+        if snapped != protected_tail_start {
+            boundary_reason = "manual-wrapup-user-snap".to_string();
+        }
+        protected_tail_start = snapped;
+
+        let refenced = fence_wrapup_boundary_for_tool_arcs(protected_tail_start, &arcs, offset);
+        if refenced != protected_tail_start {
+            boundary_reason = "manual-wrapup-tool-arc".to_string();
+        }
+        protected_tail_start = refenced;
+
+        // A keep value of one still cannot make the latest tool result's invocation
+        // eligible. The normal verbatim-tail guard defines the same protected floor.
+        protected_tail_start =
+            protected_tail_start.min(newest_message_protected_floor(&arcs, &index));
+    }
+
+    protected_tail_start = protected_tail_start.max(offset);
+    protected_tail_start = index.clamp_ordinal(protected_tail_start);
+    WrapupBoundaryResolution {
+        boundary: BoundaryResolution {
+            protected_start_ordinal: protected_tail_start,
+            eligible_head: offset..protected_tail_start,
+            n_tokens: keep as f64,
+            floored_by_live_prompt: false,
+            fenced_by_open_arc: false,
+            true_raw_eligible_tokens: index.range_tokens(offset, protected_tail_start),
+            oversize_atomic_unit: false,
+            raw_message_count,
+            boundary_reason,
+        },
+        raw_messages_above_last_compartment,
+        target_protected_start_ordinal: protected_tail_start,
     }
 }
 
@@ -1079,6 +1178,57 @@ fn fence_boundary_for_tool_arcs(
         boundary,
         open_arc: false,
     }
+}
+
+fn fence_wrapup_boundary_for_tool_arcs(candidate: u64, arcs: &[ToolArc], offset: u64) -> u64 {
+    let mut boundary = candidate;
+    for _ in 0..=arcs.len() {
+        let mut next = boundary;
+        for arc in arcs {
+            let Some(result) = arc.res_ordinal else {
+                // Interrupted invocations older than the watermark cannot pin every later
+                // wrapup. Open invocations already in the retained tail need no adjustment.
+                continue;
+            };
+            if arc.inv_ordinal >= offset && arc.inv_ordinal < next && next <= result {
+                next = arc.inv_ordinal;
+            }
+        }
+        if next == boundary {
+            break;
+        }
+        boundary = next;
+    }
+    boundary
+}
+
+fn snap_wrapup_boundary_to_user(
+    messages: &[BoundaryMsg],
+    index: &TokenIndex,
+    candidate: u64,
+    offset: u64,
+    trigger_budget: f64,
+) -> u64 {
+    if candidate <= offset {
+        return candidate;
+    }
+    let snap_token_limit = trigger_budget.clamp(2_000.0, 48_000.0);
+    let mut ordered = messages.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|message| std::cmp::Reverse(message.message_ordinal));
+    for message in ordered {
+        if message.message_ordinal > candidate || message.message_ordinal < offset {
+            continue;
+        }
+        if message.role != Role::User || !has_meaningful_user_text(&message.blocks) {
+            continue;
+        }
+        return if index.range_tokens(message.message_ordinal, candidate) <= snap_token_limit {
+            message.message_ordinal
+        } else {
+            candidate
+        };
+    }
+    candidate
 }
 
 fn semantic_snap_boundary(
@@ -2334,6 +2484,56 @@ mod tests {
             "large head before the deep newest arc must still fold, got {}",
             boundary.true_raw_eligible_tokens
         );
+    }
+
+    #[test]
+    fn wrapup_counts_every_role_and_keeps_the_newest_messages() {
+        let tail = vec![
+            text_msg(1, Role::User, "one"),
+            text_msg(2, Role::Assistant, "two"),
+            text_msg(3, Role::System, "three"),
+            text_msg(4, Role::User, "four"),
+            text_msg(5, Role::Assistant, "five"),
+        ];
+
+        let plan = resolve_wrapup_boundary(&tail, None, 2);
+
+        assert_eq!(plan.raw_messages_above_last_compartment, 5);
+        assert_eq!(plan.target_protected_start_ordinal, 4);
+        assert_eq!(plan.boundary.eligible_head, 1..4);
+    }
+
+    #[test]
+    fn wrapup_moves_the_keep_watermark_before_a_straddling_tool_arc() {
+        let tail = vec![
+            text_msg(1, Role::Assistant, "head"),
+            tool_call_msg(2, "arc"),
+            text_msg(3, Role::Assistant, "working"),
+            tool_result_msg(4, "arc", "done"),
+            text_msg(5, Role::Assistant, "newest"),
+        ];
+
+        let plan = resolve_wrapup_boundary(&tail, None, 2);
+
+        assert_eq!(plan.target_protected_start_ordinal, 2);
+        assert_eq!(plan.boundary.eligible_head, 1..2);
+        assert_eq!(plan.boundary.boundary_reason, "manual-wrapup-tool-arc");
+    }
+
+    #[test]
+    fn wrapup_terminal_guard_retains_the_newest_messages_complete_arc() {
+        let tail = vec![
+            text_msg(1, Role::Assistant, "head"),
+            text_msg(2, Role::Assistant, "middle"),
+            tool_call_msg(3, "latest"),
+            text_msg(4, Role::Assistant, "working"),
+            tool_result_msg(5, "latest", "done"),
+        ];
+
+        let plan = resolve_wrapup_boundary(&tail, None, 1);
+
+        assert_eq!(plan.target_protected_start_ordinal, 3);
+        assert_eq!(plan.boundary.eligible_head, 1..3);
     }
 
     #[test]

@@ -200,6 +200,11 @@ const DEFAULT_MIN_COMMIT_CLUSTERS: usize = 3;
 const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
 /// Secondary assembler guard; TS trigger sizing is authoritative, this only rejects tiny chunks.
 const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
+/// Thalamus clamps the prompt argument to the same range before forwarding it.
+/// Changing either bound requires a coordinated module and Thalamus update so a
+/// retried prompt resolves to the same keep watermark on both sides.
+const WRAPUP_KEEP_MIN: usize = 5;
+const WRAPUP_KEEP_MAX: usize = 100;
 /// After a historian abandon, suppress refires for this long so a persistently
 /// failing model does not burn a full summarization pass on every transform.
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
@@ -1091,6 +1096,8 @@ pub struct McHandler {
     fixed_config: Option<McModuleConfig>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     live_historian_sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
+    wrapup_sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
+    latest_transform_requests: Mutex<HashMap<String, Arc<TransformRequest>>>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
     #[cfg(test)]
@@ -1207,6 +1214,49 @@ enum PreparedHistorianAction {
     FireReady(Box<PreparedHistorianFiring>),
 }
 
+#[derive(Clone)]
+struct LiveWrapupSession {
+    token: Arc<()>,
+    rounds: usize,
+}
+
+struct WrapupSessionGuard {
+    sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
+    session_id: String,
+    token: Arc<()>,
+}
+
+impl WrapupSessionGuard {
+    fn set_rounds(&self, rounds: usize) {
+        let mut sessions = self.sessions.lock().expect("wrapup sessions mutex");
+        if let Some(session) = sessions
+            .get_mut(&self.session_id)
+            .filter(|session| Arc::ptr_eq(&session.token, &self.token))
+        {
+            session.rounds = rounds;
+        }
+    }
+}
+
+impl Drop for WrapupSessionGuard {
+    fn drop(&mut self) {
+        let mut sessions = self.sessions.lock().expect("wrapup sessions mutex");
+        let matches_current = sessions
+            .get(&self.session_id)
+            .is_some_and(|session| Arc::ptr_eq(&session.token, &self.token));
+        if matches_current {
+            sessions.remove(&self.session_id);
+        }
+    }
+}
+
+enum PreparedWrapupAction {
+    Busy(LiveHistorianCompletionWait),
+    Nothing(String),
+    FireReady(Box<HistorianFiringTask>),
+    Failed(String),
+}
+
 struct HistorianFiringTask {
     store: Arc<McStore>,
     session_id: String,
@@ -1260,6 +1310,8 @@ impl McHandler {
             fixed_config: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
+            wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
+            latest_transform_requests: Mutex::new(HashMap::new()),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -1315,6 +1367,8 @@ impl McHandler {
             fixed_config: Some(config),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
+            wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
+            latest_transform_requests: Mutex::new(HashMap::new()),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             guidance_now_ms: Mutex::new(None),
@@ -1349,6 +1403,10 @@ impl McHandler {
                 .lock()
                 .expect("state import mutex")
                 .discard(&session_id);
+            self.latest_transform_requests
+                .lock()
+                .expect("latest transform requests mutex")
+                .remove(&session_id);
         }
     }
 
@@ -1392,6 +1450,10 @@ impl McHandler {
                 .lock()
                 .expect("state import mutex")
                 .discard(&session);
+            self.latest_transform_requests
+                .lock()
+                .expect("latest transform requests mutex")
+                .remove(&session);
         }
     }
 
@@ -1756,6 +1818,26 @@ impl McHandler {
             session_id: session_id.to_string(),
             token,
             completion,
+        })
+    }
+
+    fn try_claim_wrapup_session(&self, session_id: &str) -> Result<WrapupSessionGuard, usize> {
+        let mut sessions = self.wrapup_sessions.lock().expect("wrapup sessions mutex");
+        if let Some(session) = sessions.get(session_id) {
+            return Err(session.rounds);
+        }
+        let token = Arc::new(());
+        sessions.insert(
+            session_id.to_string(),
+            LiveWrapupSession {
+                token: Arc::clone(&token),
+                rounds: 0,
+            },
+        );
+        Ok(WrapupSessionGuard {
+            sessions: Arc::clone(&self.wrapup_sessions),
+            session_id: session_id.to_string(),
+            token,
         })
     }
 
@@ -2190,6 +2272,92 @@ impl McHandler {
         }))
     }
 
+    fn prepare_wrapup_fire(
+        &self,
+        store: Arc<McStore>,
+        parsed: &TransformRequest,
+        binding: &SessionBinding,
+        projection: &crate::ck_wire::FlatProjection,
+        boundary: &boundary::BoundaryResolution,
+        now: i64,
+    ) -> PreparedWrapupAction {
+        let loaded = match store.load(&parsed.session_id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return PreparedWrapupAction::Failed(format!("state load failed: {error}"))
+            }
+        };
+        if loaded.meta.pending_rewrite.is_some() {
+            return PreparedWrapupAction::Failed("a boundary rewrite is pending".to_string());
+        }
+        if let Some(completion) = self.live_historian_completion_wait(&parsed.session_id) {
+            return PreparedWrapupAction::Busy(completion);
+        }
+        if loaded.meta.historian.state != HistorianPhase::Idle {
+            return PreparedWrapupAction::Failed(format!(
+                "historian recovery is required from {}",
+                loaded.meta.historian.state.as_str()
+            ));
+        }
+
+        let cfg = self.effective_config(&binding.project_root);
+        if cfg.model_chain.is_empty() {
+            return PreparedWrapupAction::Failed("no historian models are configured".to_string());
+        }
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .cloned()
+            .collect::<Vec<_>>();
+        let project_path = binding.project_root.to_string_lossy().to_string();
+        let project_slug = project_slug(&binding.project_root);
+        let assemble = assemble_historian_firing(
+            &store,
+            &parsed.messages,
+            &live,
+            HistorianAssemblerConfig {
+                session_id: parsed.session_id.clone(),
+                project_path: project_path.clone(),
+                project_slug: project_slug.clone(),
+                model_chain: cfg.model_chain,
+                token_budget: DEFAULT_HISTORIAN_CHUNK_TOKENS,
+                boundary: boundary.clone(),
+                memory_enabled: cfg.memory_enabled,
+                extraction_free: false,
+                in_emergency: false,
+                // Explicit wrapup is the only reclaim mechanism on this surface, so a
+                // small final chunk must not be rejected by the substance floor.
+                fold_is_only_reclaim: true,
+                failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
+                min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
+            },
+            now,
+        );
+        let firing = match assemble {
+            Ok(AssembleHistorianFiringOutcome::Fire(firing)) => *firing,
+            Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
+                return PreparedWrapupAction::Nothing(format!("{reason:?}"))
+            }
+            Err(error) => return PreparedWrapupAction::Failed(format!("assembly failed: {error}")),
+        };
+        let live_guard = match self.try_claim_live_historian_session(&parsed.session_id) {
+            LiveHistorianSessionClaim::Acquired(guard) => guard,
+            LiveHistorianSessionClaim::Busy(completion) => {
+                return PreparedWrapupAction::Busy(completion)
+            }
+        };
+        PreparedWrapupAction::FireReady(Box::new(HistorianFiringTask {
+            store,
+            session_id: parsed.session_id.clone(),
+            project_path,
+            project_root: binding.project_root.clone(),
+            project_slug,
+            firing,
+            live_guard,
+        }))
+    }
+
     fn refresh_historian_diagnostics(
         &self,
         store: &McStore,
@@ -2301,6 +2469,29 @@ impl McHandler {
         completion: LiveHistorianCompletionWait,
     ) -> bool {
         tokio::time::timeout(historian::completion_wait_budget(), completion)
+            .await
+            .is_ok()
+    }
+
+    async fn run_wrapup_firing(
+        &self,
+        task: HistorianFiringTask,
+    ) -> Result<historian::HistorianDriveOutcome, String> {
+        let factory = Arc::clone(&self.producer_factory);
+        let handle = tokio::spawn(Self::execute_historian_firing_task(factory, task));
+        match tokio::time::timeout(historian::wrapup_round_wait_budget(), handle).await {
+            Ok(Ok(Ok(outcome))) => Ok(outcome),
+            Ok(Ok(Err(error))) => Err(error.to_string()),
+            Ok(Err(error)) => Err(format!("historian task failed: {error}")),
+            Err(_) => Err("historian round timed out after 600 seconds".to_string()),
+        }
+    }
+
+    async fn await_wrapup_historian_completion(
+        &self,
+        completion: LiveHistorianCompletionWait,
+    ) -> bool {
+        tokio::time::timeout(historian::wrapup_round_wait_budget(), completion)
             .await
             .is_ok()
     }
@@ -2611,6 +2802,360 @@ impl McHandler {
         }
     }
 
+    fn management_binding(
+        &self,
+        channel: u16,
+        request: &Value,
+        operation: &str,
+    ) -> Result<(String, SessionBinding), HandlerOutcome> {
+        if request.get("v").and_then(Value::as_u64) != Some(1) {
+            return Err(HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: format!("{operation} requires v=1"),
+            });
+        }
+        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            return Err(HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: format!("{operation} requires session_id"),
+            });
+        };
+        if session_id.trim().is_empty() {
+            return Err(HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: format!("{operation} requires a nonempty session_id"),
+            });
+        }
+        let binding = match self.resolve_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(BindingError::Unbound) => {
+                return Err(HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: format!("{operation} on a channel with no session binding"),
+                })
+            }
+            Err(BindingError::SessionMismatch) => {
+                return Err(HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                })
+            }
+        };
+        if is_shadow_session(&binding.session) {
+            return Err(HandlerOutcome::Error {
+                code: "non_shadow_op_on_shadow_binding".to_string(),
+                message: format!("{operation} is not accepted on shadow routes"),
+            });
+        }
+        Ok((session_id.to_string(), binding))
+    }
+
+    fn handle_session_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, _binding) =
+            match self.management_binding(channel, request, "session.status") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        let loaded = match store.load(&session_id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let compartment_count = match store.load_compartments(&session_id) {
+            Ok(compartments) => compartments.len(),
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let pending_drop_count = match store.load_pending_agent_drops(&session_id) {
+            Ok(drops) => drops.len(),
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let tag_count = match store.load_tags_for_session(&session_id) {
+            Ok(tags) => tags.len(),
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let pass_trace = match store.load_pass_trace(&session_id) {
+            Ok(trace) => trace,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let coverage = loaded
+            .meta
+            .coverage_ordinal
+            .map(|ordinal| ordinal.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let boundary = if loaded.core.boundary_id.trim().is_empty() {
+            "absent"
+        } else {
+            "present"
+        };
+        let surface = if loaded.meta.cc_u1_active {
+            "active"
+        } else {
+            "inactive"
+        };
+        let historian = historian_status_summary(&loaded.meta.historian);
+        let newest_pass_at = pass_trace
+            .as_ref()
+            .map(|trace| {
+                trace
+                    .last_received_at_ms
+                    .max(trace.last_completed_at_ms)
+                    .max(trace.last_reject_at_ms.unwrap_or(0))
+            })
+            .unwrap_or(0)
+            .max(loaded.meta.last_committed_pass_at_ms);
+        let short_session = session_id.chars().take(12).collect::<String>();
+        let age = format_traffic_age(newest_pass_at, now_ms());
+        // Status can outlive the caller's current lineage. Naming the subject and its
+        // durable traffic age makes a stale read visible instead of silently ambiguous.
+        let summary = format!(
+            "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, last historian: {historian}, surface {surface}",
+            compartment_count,
+            plural_word(compartment_count, "compartment"),
+            pending_drop_count,
+            plural_word(pending_drop_count, "drop"),
+            tag_count,
+            plural_word(tag_count, "tag"),
+        );
+        respond(json!({ "ok": true, "summary": summary }))
+    }
+
+    async fn handle_session_wrapup_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, binding) =
+            match self.management_binding(channel, request, "session.wrapup") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let keep = match request.get("keep") {
+            None => 20,
+            Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+                Some(value) => value.clamp(WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX),
+                None => {
+                    return HandlerOutcome::Error {
+                        code: "bad_request".to_string(),
+                        message: "session.wrapup keep must be a nonnegative integer".to_string(),
+                    }
+                }
+            },
+        };
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+
+        // The module owns the only store writer, so a process-local per-session latch is
+        // sufficient to prevent duplicate producer drives. Durable historian state still
+        // protects publication if the process exits while a round is running.
+        let wrapup_guard = match self.try_claim_wrapup_session(&session_id) {
+            Ok(guard) => guard,
+            Err(rounds) => {
+                return respond(json!({
+                    "ok": true,
+                    "summary": format!("wrapup already in progress, {rounds} rounds done"),
+                }))
+            }
+        };
+        let parsed = match self
+            .latest_transform_requests
+            .lock()
+            .expect("latest transform requests mutex")
+            .get(&session_id)
+            .cloned()
+        {
+            Some(parsed) => parsed,
+            None => {
+                return respond(json!({
+                    "ok": false,
+                    "summary": "wrapup unavailable until a full session transform has been observed",
+                }))
+            }
+        };
+        let projection = match crate::ck_wire::project_messages(&parsed.messages) {
+            Ok(projection) => projection,
+            Err(error) => {
+                return respond(json!({
+                    "ok": false,
+                    "summary": format!("wrapup boundary assembly failed: {error}"),
+                }))
+            }
+        };
+        let boundary_messages = wrapup_boundary_messages(&parsed, &projection);
+        let initial_compartments = match store.load_compartments(&session_id) {
+            Ok(compartments) => compartments,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let initial_end = initial_compartments
+            .iter()
+            .map(|compartment| compartment.end_message as u64)
+            .max();
+        let plan = boundary::resolve_wrapup_boundary(&boundary_messages, initial_end, keep);
+        let target = plan.target_protected_start_ordinal;
+        if plan.raw_messages_above_last_compartment <= keep
+            || !wrapup_has_remaining_messages(&parsed.messages, initial_end, target)
+        {
+            return respond(json!({
+                "ok": true,
+                "summary": format!(
+                    "nothing to compact; {} raw messages already fit within the keep watermark of {keep}",
+                    plan.raw_messages_above_last_compartment,
+                ),
+            }));
+        }
+
+        let mut rounds = 0usize;
+        let mut failure = None;
+        while rounds < historian::MAX_WRAPUP_ROUNDS {
+            let current_end = match store.load_compartments(&session_id) {
+                Ok(compartments) => compartments
+                    .iter()
+                    .map(|compartment| compartment.end_message as u64)
+                    .max(),
+                Err(error) => {
+                    failure = Some(format!("store load failed before round: {error}"));
+                    break;
+                }
+            };
+            if !wrapup_has_remaining_messages(&parsed.messages, current_end, target) {
+                break;
+            }
+            match self.prepare_wrapup_fire(
+                Arc::clone(&store),
+                &parsed,
+                &binding,
+                &projection,
+                &plan.boundary,
+                now_ms(),
+            ) {
+                PreparedWrapupAction::Busy(completion) => {
+                    if !self.await_wrapup_historian_completion(completion).await {
+                        failure =
+                            Some("timed out while joining the active historian run".to_string());
+                        break;
+                    }
+                }
+                PreparedWrapupAction::Nothing(reason) => {
+                    failure = Some(format!("historian made no forward progress: {reason}"));
+                    break;
+                }
+                PreparedWrapupAction::Failed(reason) => {
+                    failure = Some(reason);
+                    break;
+                }
+                PreparedWrapupAction::FireReady(task) => {
+                    match self.run_wrapup_firing(*task).await {
+                        Ok(historian::HistorianDriveOutcome::Completed(_)) => {
+                            let after_end = store.load_compartments(&session_id).ok().and_then(
+                                |compartments| {
+                                    compartments
+                                        .iter()
+                                        .map(|compartment| compartment.end_message as u64)
+                                        .max()
+                                },
+                            );
+                            if after_end <= current_end {
+                                failure = Some(
+                                "historian completed without advancing the compartment boundary"
+                                    .to_string(),
+                            );
+                                break;
+                            }
+                            rounds += 1;
+                            wrapup_guard.set_rounds(rounds);
+                        }
+                        Ok(historian::HistorianDriveOutcome::Busy(_)) => {
+                            failure =
+                                Some("historian became busy before the round started".to_string());
+                            break;
+                        }
+                        Err(reason) => {
+                            failure = Some(reason);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let final_compartments = match store.load_compartments(&session_id) {
+            Ok(compartments) => compartments,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let final_end = final_compartments
+            .iter()
+            .map(|compartment| compartment.end_message as u64)
+            .max();
+        let compacted_messages = parsed
+            .messages
+            .iter()
+            .filter(|message| !message.ck.meta.synthetic)
+            .filter(|message| initial_end.is_none_or(|end| message.ordinal > end))
+            .filter(|message| final_end.is_some_and(|end| message.ordinal <= end))
+            .count();
+        let compartments_created = final_compartments
+            .len()
+            .saturating_sub(initial_compartments.len());
+        let remaining = wrapup_has_remaining_messages(&parsed.messages, final_end, target);
+        if failure.is_none() && remaining {
+            failure = Some(format!(
+                "stopped at the {}-round cap before the keep watermark",
+                historian::MAX_WRAPUP_ROUNDS
+            ));
+        }
+        let effect = "takes effect on your next message";
+        match failure {
+            Some(reason) => respond(json!({
+                "ok": false,
+                "summary": format!(
+                    "compacted {compacted_messages} messages into {compartments_created} compartments; {reason}; {effect}"
+                ),
+            })),
+            None => respond(json!({
+                "ok": true,
+                "summary": format!(
+                    "compacted {compacted_messages} messages into {compartments_created} compartments; {effect}"
+                ),
+            })),
+        }
+    }
+
     fn handle_guidance_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
@@ -2828,6 +3373,7 @@ impl McHandler {
                 .unwrap_or(Value::Null),
             );
         }
+        let parsed = Arc::new(parsed);
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
             None => {
@@ -3050,6 +3596,13 @@ impl McHandler {
         response.historian = Some(diagnostics);
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
+        // Management requests carry identity but not raw history. Retaining the latest
+        // decoded full-sync request lets an explicit wrapup reuse the same CK input without
+        // adding raw conversation content to durable module metadata.
+        self.latest_transform_requests
+            .lock()
+            .expect("latest transform requests mutex")
+            .insert(parsed.session_id.clone(), Arc::clone(&parsed));
         respond(serde_json::to_value(response).unwrap_or(Value::Null))
     }
 
@@ -4393,6 +4946,8 @@ impl McHandler {
                 "shadow_reset" => self.handle_shadow_reset_value(channel, request),
                 "state_import" => self.handle_state_import_value(channel, request),
                 "agent_drops.append" => self.handle_agent_drops_value(channel, request),
+                "session.status" => self.handle_session_status_value(channel, &request),
+                "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
                 // Explicit wire-debugging echo. Opt-in only: echoing every
                 // unrecognized body would silently swallow misrouted requests
                 // (a caller can "succeed" against an echo while testing nothing),
@@ -5491,6 +6046,100 @@ fn split_synthetic_todo(messages: &[crate::ck_wire::CkWireMessage]) -> (Vec<Valu
 fn sorted_strings(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values
+}
+
+fn plural_word(count: usize, singular: &'static str) -> String {
+    if count == 1 {
+        singular.to_string()
+    } else {
+        format!("{singular}s")
+    }
+}
+
+fn format_traffic_age(observed_at_ms: i64, now: i64) -> String {
+    if observed_at_ms <= 0 {
+        return "unknown".to_string();
+    }
+    let elapsed_seconds = now.saturating_sub(observed_at_ms).max(0) / 1_000;
+    if elapsed_seconds < 60 {
+        format!("{elapsed_seconds}s ago")
+    } else if elapsed_seconds < 60 * 60 {
+        format!("{}m ago", elapsed_seconds / 60)
+    } else if elapsed_seconds < 24 * 60 * 60 {
+        format!("{}h ago", elapsed_seconds / (60 * 60))
+    } else {
+        format!("{}d ago", elapsed_seconds / (24 * 60 * 60))
+    }
+}
+
+fn compact_status_detail(detail: &str) -> String {
+    detail
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect()
+}
+
+fn historian_status_summary(state: &mc_store::HistorianDurableState) -> String {
+    if state.state != HistorianPhase::Idle {
+        return format!("fire seq {} {}", state.firing_seq, state.state.as_str());
+    }
+    if let Some(reason) = state.last_no_fire.as_deref() {
+        return format!("no fire: {}", compact_status_detail(reason));
+    }
+    if let Some(reason) = state.last_failure.as_deref() {
+        return format!("failure: {}", compact_status_detail(reason));
+    }
+    if state.firing_seq > 0 {
+        return format!("published seq {}", state.firing_seq);
+    }
+    "none".to_string()
+}
+
+fn wrapup_has_remaining_messages(
+    messages: &[crate::ck_wire::CkIngressMessage],
+    last_compartment_end: Option<u64>,
+    protected_start: u64,
+) -> bool {
+    messages.iter().any(|message| {
+        !message.ck.meta.synthetic
+            && message.ordinal < protected_start
+            && last_compartment_end.is_none_or(|end| message.ordinal > end)
+    })
+}
+
+fn wrapup_boundary_messages(
+    parsed: &TransformRequest,
+    projection: &crate::ck_wire::FlatProjection,
+) -> Vec<BoundaryMsg> {
+    parsed
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+        .map(|message| BoundaryMsg {
+            message_ordinal: message.ordinal,
+            message_id: message.mid.clone(),
+            role: Role::from_provider(&message.ck.role),
+            blocks: projection
+                .blocks
+                .iter()
+                .filter(|block| block.mid == message.mid && !block.synthetic)
+                .map(|block| BoundaryBlock {
+                    id: block.id.clone(),
+                    ordinal: block.ordinal,
+                    kind: sel_kind_for_flat(block),
+                    provider_executed: block.provider_executed,
+                    byte_size: block.bytes.len(),
+                    arc_id: block.arc_id.clone(),
+                    original: block.bytes.clone(),
+                    rendered: None,
+                    ignored: false,
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn boundary_messages(
@@ -7919,6 +8568,33 @@ mod tests {
             .unwrap();
     }
 
+    fn wrapup_messages(count: u64, words_per_message: usize) -> Vec<CkIngressMessage> {
+        (1..=count)
+            .map(|ordinal| {
+                ck_with_role(
+                    &format!("m{ordinal}"),
+                    ordinal,
+                    if ordinal % 2 == 0 {
+                        "assistant"
+                    } else {
+                        "user"
+                    },
+                    &format!("message {ordinal} {}", "word ".repeat(words_per_message)),
+                )
+            })
+            .collect()
+    }
+
+    fn cache_wrapup_messages(handler: &McHandler, messages: Vec<CkIngressMessage>) {
+        let mut parsed = transform_request(messages, 1, 200_000);
+        parsed.serializer_profile = SerializerProfile::ClaudeCodeAnthropic.wire_id().to_string();
+        handler
+            .latest_transform_requests
+            .lock()
+            .expect("latest transform requests mutex")
+            .insert(parsed.session_id.clone(), Arc::new(parsed));
+    }
+
     fn queue_drop_command_with_id(handler: &McHandler, command_id: &str) -> Value {
         match handler.handle_agent_drops_value(
             7,
@@ -8395,6 +9071,95 @@ mod tests {
     }
 
     #[test]
+    fn session_status_rejects_unbound_and_mismatched_routes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let request = json!({ "method": "session.status", "v": 1, "session_id": "ses" });
+
+        assert_eq!(
+            error_code(handler.handle_session_status_value(8, &request)),
+            "route_unbound"
+        );
+        let mismatch = json!({
+            "method": "session.status",
+            "v": 1,
+            "session_id": "other",
+        });
+        assert_eq!(
+            error_code(handler.handle_session_status_value(7, &mismatch)),
+            "session_mismatch"
+        );
+    }
+
+    #[test]
+    fn session_status_summarizes_seeded_store_with_identity_and_durable_age() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
+        let session_id = "ccm-8518e338-extra";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session_id));
+        store
+            .commit_state_import(
+                session_id,
+                "status-seed",
+                &[
+                    stored_comp(1, 1, 5, "m5", "first"),
+                    stored_comp(2, 6, 10, "m10", "second"),
+                ],
+                1,
+            )
+            .unwrap();
+        let loaded = store.load(session_id).unwrap();
+        let mut core = loaded.core.clone();
+        core.boundary_id = "m10#0".to_string();
+        let mut meta = loaded.meta.clone();
+        meta.coverage_ordinal = Some(10);
+        meta.cc_u1_active = true;
+        meta.last_committed_pass_at_ms = now_ms() - 125_000;
+        meta.historian.firing_seq = 3;
+        store
+            .commit(session_id, loaded.row_version, &core, &meta)
+            .unwrap();
+        store
+            .append_pending_agent_drops(session_id, &["m8#0".to_string()], 2)
+            .unwrap();
+        store
+            .mint_or_get_tags(
+                session_id,
+                &[
+                    TagMintInput {
+                        block_id: "m8#0".to_string(),
+                        kind: "message".to_string(),
+                        token_count: 2,
+                        source_bytes: b"eight".to_vec(),
+                    },
+                    TagMintInput {
+                        block_id: "m9#0".to_string(),
+                        kind: "message".to_string(),
+                        token_count: 2,
+                        source_bytes: b"nine".to_vec(),
+                    },
+                ],
+                2,
+            )
+            .unwrap();
+
+        let body = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": session_id }),
+        ));
+        let summary = body["summary"].as_str().unwrap();
+
+        assert!(summary.starts_with("session ccm-8518e338 (last active 2m ago):"));
+        assert!(summary.contains("2 compartments"));
+        assert!(summary.contains("coverage ordinal 10"));
+        assert!(summary.contains("boundary present"));
+        assert!(summary.contains("1 pending drop"));
+        assert!(summary.contains("2 tags"));
+        assert!(summary.contains("last historian: published seq 3"));
+        assert!(summary.ends_with("surface active"));
+    }
+
+    #[test]
     fn agent_drops_append_rejects_missing_command_id() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -8612,6 +9377,153 @@ mod tests {
         };
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_drives_to_keep_watermark_and_reinvoke_is_idle() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert!(body["summary"]
+            .as_str()
+            .unwrap()
+            .contains("takes effect on your next message"));
+        let starts = producer.starts.load(Ordering::SeqCst);
+        assert!((2..=historian::MAX_WRAPUP_ROUNDS).contains(&starts));
+        let final_end = store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert_eq!(final_end, 60);
+
+        let retry = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+        assert_eq!(retry["ok"], json!(true));
+        assert!(retry["summary"]
+            .as_str()
+            .unwrap()
+            .contains("nothing to compact"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_session_wrapup_returns_progress_without_double_fire() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(
+            &handler,
+            (1..=10).map(|n| ck(&format!("m{n}"), n, "work")).collect(),
+        );
+        let handler = Arc::new(handler);
+        let first_handler = Arc::clone(&handler);
+        let first = tokio::spawn(async move {
+            first_handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
+                )
+                .await
+        });
+        wait_for_count(&producer.starts, 1).await;
+
+        let second = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
+                )
+                .await,
+        );
+        assert_eq!(second["ok"], json!(true));
+        assert_eq!(
+            second["summary"],
+            "wrapup already in progress, 0 rounds done"
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        let first = tool_body(first.await.unwrap());
+        assert_eq!(first["ok"], json!(true), "{first}");
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_stops_at_the_five_round_cap() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(11, 36_000));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["ok"], json!(false), "{body}");
+        assert!(body["summary"]
+            .as_str()
+            .unwrap()
+            .contains("stopped at the 5-round cap"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 5);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_stops_on_normal_producer_failure_state() {
+        let producer = Arc::new(ProducerState::default());
+        producer.await_results.lock().unwrap().extend([
+            Err(HistorianProducerError::TimedOut),
+            Err(HistorianProducerError::TimedOut),
+        ]);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(
+            &handler,
+            (1..=10).map(|n| ck(&format!("m{n}"), n, "work")).collect(),
+        );
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["ok"], json!(false), "{body}");
+        assert!(body["summary"].as_str().unwrap().contains("producer"));
+        let durable = store.load("ses").unwrap().meta.historian;
+        assert_eq!(durable.state, HistorianPhase::Idle);
+        assert!(durable.last_failure.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
