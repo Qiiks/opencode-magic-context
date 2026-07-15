@@ -40,8 +40,12 @@ export function openExistingDatabase(
     // spellings: bun:sqlite's Linux build rejects file:// URIs ("unable to open
     // database file") but honors { create: false }, while node:sqlite has no
     // create option and needs the URI's mode=rw.
-    if (typeof Bun !== "undefined") {
-        return new Database(path, { create: false, readwrite: true });
+    if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
+        // create/readwrite are bun:sqlite-only options, absent from the shared
+        // better-sqlite3-shaped Options type the wrapper exports.
+        return new Database(path, { create: false, readwrite: true } as unknown as {
+            readonly: boolean;
+        });
     }
     const uri = pathToFileURL(path);
     uri.searchParams.set("mode", "rw");
