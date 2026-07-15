@@ -653,6 +653,14 @@ pub fn completion_wait_budget() -> Duration {
 /// Maximum producer rounds driven by one explicit session wrapup.
 pub const MAX_WRAPUP_ROUNDS: usize = 5;
 
+/// The per-attempt deadline a consumer sets, VERBATIM, for `session.wrapup` calls —
+/// margin included, no consumer-side arithmetic on top (the module owns the margin,
+/// mirroring `MAX_EMERGENCY_REQUEST_BUDGET`). Derivation: one busy-join at entry
+/// (bounded by [`completion_wait_budget`], 660s) plus [`MAX_WRAPUP_ROUNDS`] producer
+/// rounds at [`wrapup_round_wait_budget`] (5 x 600s) = 3660s worst case, plus margin.
+/// Bump this in the same commit as any change to those inputs and notify consumers.
+pub const MAX_WRAPUP_REQUEST_BUDGET: Duration = Duration::from_secs(3_800);
+
 /// Per-round wrapup wait bound. A timed-out producer keeps running under the normal
 /// historian guard so durable recovery remains identical to an incremental firing.
 pub fn wrapup_round_wait_budget() -> Duration {
