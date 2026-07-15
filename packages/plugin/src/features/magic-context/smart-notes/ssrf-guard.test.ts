@@ -228,9 +228,13 @@ describe("createPinnedLookup", () => {
 
 describe("guarded HTTPS request agent", () => {
     test("does not use a pre-seeded keep-alive global agent", async () => {
-        const originalCreateConnection = https.globalAgent.createConnection;
-        const globalCreateConnection = mock(originalCreateConnection.bind(https.globalAgent));
-        https.globalAgent.createConnection = globalCreateConnection;
+        // Intercept at addRequest: every request routed through an Agent must
+        // enter addRequest, and it exists on every supported runtime — bun's
+        // stable node:https shim leaves globalAgent.createConnection undefined,
+        // so spying on createConnection only works on canary builds.
+        const originalAddRequest = https.globalAgent.addRequest;
+        const globalAddRequest = mock(originalAddRequest.bind(https.globalAgent));
+        https.globalAgent.addRequest = globalAddRequest;
         try {
             const dedicated = createSmartNoteRequestAgent();
             expect(dedicated).not.toBe(https.globalAgent);
@@ -249,9 +253,9 @@ describe("guarded HTTPS request agent", () => {
                     { signal, timeoutMs: 100, bodyLimitBytes: 1024 },
                 ),
             ).rejects.toBeInstanceOf(SmartNoteNetworkError);
-            expect(globalCreateConnection).not.toHaveBeenCalled();
+            expect(globalAddRequest).not.toHaveBeenCalled();
         } finally {
-            https.globalAgent.createConnection = originalCreateConnection;
+            https.globalAgent.addRequest = originalAddRequest;
         }
     });
 });
