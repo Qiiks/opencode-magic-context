@@ -2527,7 +2527,7 @@ fn apply_tag_overlay_to_message(
             if block_changed {
                 // Overlay edits mutate the typed kind in place, but Serialize
                 // prefers a block's retained ingress bytes for lossless
-                // pass-through — an uncleared block silently serializes its
+                // pass-through: an uncleared block silently serializes its
                 // pre-mutation form and the edit never reaches the wire. One
                 // clear site covers every overlay mutator.
                 target.mark_modified();
@@ -2554,7 +2554,7 @@ fn apply_tag_prefix_to_block(
             // their own replies with §N§ copies. Strip well-formed LEADING
             // prefixes from assistant text before applying the official tag
             // (display-only: mint provenance still hashes the verbatim ingress
-            // bytes). Leading-only on purpose — mid-prose references like
+            // bytes). Leading-only on purpose, because mid-prose references like
             // "I dropped §12§" are meaningful model-authored content.
             let base = if role == "assistant" {
                 strip_leading_tag_imitations(text)
@@ -2653,9 +2653,11 @@ fn strip_tag_prefix(value: &str, tag_number: i64) -> &str {
     value.strip_prefix(&tag_prefix(tag_number)).unwrap_or(value)
 }
 
-/// Strip a run of well-formed `§N§ `-shaped prefixes from the head of assistant
+/// Strip a run of well-formed `§N§`-shaped prefixes from the head of assistant
 /// text. Deterministic over ingress bytes, so the wire replays byte-identically
-/// on every pass.
+/// on every pass. Inter-prefix separators use the full whitespace class on
+/// purpose: models copy the notation with spaces, tabs, or newlines between
+/// imitation prefixes, and any leaked separator would ride the wire forever.
 fn strip_leading_tag_imitations(value: &str) -> &str {
     let mut rest = value;
     loop {
@@ -2669,7 +2671,7 @@ fn strip_leading_tag_imitations(value: &str) -> &str {
         let Some(after_close) = after_open[digits..].strip_prefix('\u{a7}') else {
             return rest;
         };
-        rest = after_close.trim_start_matches(' ');
+        rest = after_close.trim_start_matches(char::is_whitespace);
     }
 }
 
@@ -3311,7 +3313,7 @@ mod tests {
 
     /// Mirror of the first live rig drive's beat shape: a CC session whose first
     /// user message carries several text blocks (system-reminder wrappers around
-    /// the prompt), followed by an assistant reply and a fresh user turn — all
+    /// the prompt), followed by an assistant reply and a fresh user turn, all
     /// built through wire deserialization so blocks retain pass-through bytes.
     /// The drive observed zero tag prefixes on the second active pass.
     #[test]
@@ -3350,7 +3352,7 @@ mod tests {
         );
         // The live drive paused ~434s between beats, so the second pass classified
         // HARD via the idle-TTL trigger (default cache_ttl 5m). The TTL predicate
-        // needs an observed prior response time to arm — without it the pass stays
+        // needs an observed prior response time to arm; without it the pass stays
         // SOFT-class and this fixture would not cover the drive's actual shape.
         let mut ttl_ctx = pctx("git:proj", "/nonexistent-docs", 434_000);
         ttl_ctx.observed_last_response_at_ms = Some(1);
@@ -3521,8 +3523,8 @@ mod tests {
     }
 
     /// Mixed-message canary: a mutated block must canonicalize while its untouched
-    /// sibling keeps its retained pass-through bytes VERBATIM — including unknown
-    /// fields serde would drop — and message-level provenance survives.
+    /// sibling keeps its retained pass-through bytes VERBATIM, including unknown
+    /// fields serde would drop, and message-level provenance survives.
     #[test]
     fn overlay_canonicalizes_only_the_mutated_block() {
         let dir = tempfile::tempdir().unwrap();
@@ -3569,7 +3571,7 @@ mod tests {
 
     /// Models copy the tag notation they see in history onto their own replies.
     /// The overlay must strip those imitation prefixes on assistant text (leading
-    /// only — mid-prose references stay verbatim) on ACTIVE passes, while false
+    /// only; mid-prose references stay verbatim) on ACTIVE passes, while false
     /// passes serve the ingress bytes untouched.
     #[test]
     fn assistant_tag_imitation_prefixes_strip_on_active_passes_only() {
@@ -3606,6 +3608,45 @@ mod tests {
         assert!(
             joined_off.contains("\u{a7}39\u{a7} \u{a7}39\u{a7} BEAT3-OK"),
             "false passes must serve model-authored bytes verbatim: {joined_off}"
+        );
+    }
+
+    /// The strip's inter-prefix separator class is full whitespace: models copy
+    /// imitation prefixes separated by spaces, tabs, or newlines, and a leaked
+    /// separator would put the imitation back on the wire behind the official
+    /// tag. Malformed shapes and mid-prose references must stay verbatim.
+    #[test]
+    fn strip_leading_tag_imitations_covers_whitespace_and_preserves_malformed() {
+        // Multi-prefix runs across every separator class strip completely.
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7} \u{a7}40\u{a7} BEAT"),
+            "BEAT"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7}\t\u{a7}40\u{a7}\tBEAT"),
+            "BEAT"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7}\n\u{a7}40\u{a7}\nBEAT"),
+            "BEAT"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7} \n\t \u{a7}40\u{a7}BEAT"),
+            "BEAT"
+        );
+        // Malformed leading shapes are NOT well-formed prefixes: verbatim.
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39 BEAT"),
+            "\u{a7}39 BEAT"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}\u{a7} BEAT"),
+            "\u{a7}\u{a7} BEAT"
+        );
+        // Mid-prose references stay: the strip is anchored to the head.
+        assert_eq!(
+            strip_leading_tag_imitations("I dropped \u{a7}12\u{a7} earlier"),
+            "I dropped \u{a7}12\u{a7} earlier"
         );
     }
 
@@ -4009,7 +4050,7 @@ mod tests {
 
     /// Cross-repo drift pin for the shared CK wire fixture. Three parties ride
     /// this exact byte shape (llm-runner produces it, this module parses it,
-    /// the thalamus gateway produces it), and each repo vendors its own copy — so a
+    /// the thalamus gateway produces it), and each repo vendors its own copy, so a
     /// one-sided regeneration would leave every repo locally green while the
     /// wire silently drifts. Each repo pins the fixture's sha256; a regen
     /// fails the pin everywhere until each consumer deliberately re-vendors
