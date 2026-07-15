@@ -222,6 +222,10 @@ const STATE_IMPORT_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const STATE_IMPORT_MAX_PENDING: usize = 64;
 const STATE_IMPORT_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSFORM_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// InFlight snapshot markers have no byte charge, so they need their own count bound:
+/// a marker is minted per transform start and only replaced on success, so unique
+/// failing sessions would otherwise accumulate for the process lifetime.
+const MAX_IN_FLIGHT_SNAPSHOT_ENTRIES: usize = 4_096;
 const WRAPUP_REQUEST_MARGIN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
@@ -1116,9 +1120,14 @@ enum TransformSnapshotLookup {
 struct TransformSnapshotCache {
     entries: HashMap<String, TransformSnapshot>,
     ready_lru: VecDeque<String>,
+    /// Insertion-ordered InFlight sessions. Failed or rejected transforms never
+    /// reach `finish_ready`, so without its own bound this class of entry would
+    /// grow with every unique failing session for the process lifetime.
+    in_flight_lru: VecDeque<String>,
     ready_bytes: usize,
     next_generation: u64,
     max_ready_bytes: usize,
+    max_in_flight_entries: usize,
 }
 
 impl TransformSnapshotCache {
@@ -1126,9 +1135,11 @@ impl TransformSnapshotCache {
         Self {
             entries: HashMap::new(),
             ready_lru: VecDeque::new(),
+            in_flight_lru: VecDeque::new(),
             ready_bytes: 0,
             next_generation: 0,
             max_ready_bytes,
+            max_in_flight_entries: MAX_IN_FLIGHT_SNAPSHOT_ENTRIES,
         }
     }
 
@@ -1148,6 +1159,23 @@ impl TransformSnapshotCache {
             session_id.to_string(),
             TransformSnapshot::InFlight { generation },
         );
+        self.in_flight_lru
+            .retain(|candidate| candidate != session_id);
+        self.in_flight_lru.push_back(session_id.to_string());
+        // Evicting an InFlight entry to Missing is correctness-safe: wrapup refuses
+        // Missing, and finish_ready's generation match refuses to resurrect an
+        // evicted session's stale snapshot.
+        while self.in_flight_lru.len() > self.max_in_flight_entries {
+            let Some(oldest) = self.in_flight_lru.pop_front() else {
+                break;
+            };
+            if matches!(
+                self.entries.get(&oldest),
+                Some(TransformSnapshot::InFlight { .. })
+            ) {
+                self.entries.remove(&oldest);
+            }
+        }
         generation
     }
 
@@ -1166,6 +1194,8 @@ impl TransformSnapshotCache {
         if !matches_current {
             return;
         }
+        self.in_flight_lru
+            .retain(|candidate| candidate != session_id);
         if retained_bytes > self.max_ready_bytes {
             self.entries.remove(session_id);
             return;
@@ -1225,6 +1255,8 @@ impl TransformSnapshotCache {
 
     fn remove(&mut self, session_id: &str) {
         self.remove_ready_charge(session_id);
+        self.in_flight_lru
+            .retain(|candidate| candidate != session_id);
         self.entries.remove(session_id);
     }
 }
@@ -3238,14 +3270,17 @@ impl McHandler {
         let command_id = match request.get("command_id") {
             None => None,
             Some(value) => match value.as_str() {
-                Some(command_id) if command_id.len() <= 128 => Some(command_id),
-                _ => {
-                    return HandlerOutcome::Error {
-                        code: "bad_request".to_string(),
-                        message: "session.wrapup command_id must be a string of at most 128 bytes"
-                            .to_string(),
-                    }
+                // Empty ids are rejected so every retrying caller cannot collide on one
+                // shared durable ledger key.
+                Some(command_id) if !command_id.is_empty() && command_id.len() <= 128 => {
+                    Some(command_id)
                 }
+                _ => return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message:
+                        "session.wrapup command_id must be a nonempty string of at most 128 bytes"
+                            .to_string(),
+                },
             },
         };
         let store = match self.store.get() {
@@ -3266,12 +3301,16 @@ impl McHandler {
         }
         let keep = match request.get("keep") {
             None => 20,
-            Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
-                Some(value) => value.clamp(WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX),
+            // Any signed integer clamps into [WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX]; a negative
+            // keep is a clamp input, not an error, matching the boundary-side contract.
+            Some(value) => match value.as_i64() {
+                Some(value) => usize::try_from(value.max(0))
+                    .unwrap_or(usize::MAX)
+                    .clamp(WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX),
                 None => {
                     return HandlerOutcome::Error {
                         code: "bad_request".to_string(),
-                        message: "session.wrapup keep must be a nonnegative integer".to_string(),
+                        message: "session.wrapup keep must be an integer".to_string(),
                     }
                 }
             },
@@ -3286,6 +3325,7 @@ impl McHandler {
                 return respond(json!({
                     "ok": true,
                     "disposition": "already_in_progress",
+                    "rounds": rounds,
                     "summary": format!("wrapup already in progress, {rounds} rounds done"),
                 }))
             }
@@ -7426,6 +7466,52 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_snapshot_entries_are_count_bounded_and_cannot_resurrect() {
+        let mut cache = TransformSnapshotCache::new(1024);
+        cache.max_in_flight_entries = 8;
+        let request = |session_id: &str| {
+            let mut request = transform_request(vec![ck("m1", 1, "text")], 1, 200_000);
+            request.session_id = session_id.to_string();
+            Arc::new(request)
+        };
+        // Unique failing sessions: begin() without finish_ready, far past the cap.
+        let mut first_generation = 0;
+        for index in 0..64 {
+            let generation = cache.begin(&format!("failed-{index}"));
+            if index == 0 {
+                first_generation = generation;
+            }
+        }
+        assert!(
+            cache.entries.len() <= 8,
+            "InFlight entries must stay bounded"
+        );
+        assert!(cache.in_flight_lru.len() <= 8);
+        // Evicted sessions read Missing, and a late finish_ready for an evicted
+        // generation cannot resurrect a snapshot.
+        assert!(matches!(
+            cache.get("failed-0"),
+            TransformSnapshotLookup::Missing
+        ));
+        cache.finish_ready("failed-0", first_generation, request("failed-0"), 0, 16);
+        assert!(matches!(
+            cache.get("failed-0"),
+            TransformSnapshotLookup::Missing
+        ));
+        // Ready entries do not occupy InFlight slots: completing one frees its slot.
+        let generation = cache.begin("completes");
+        cache.finish_ready("completes", generation, request("completes"), 0, 16);
+        assert!(!cache
+            .in_flight_lru
+            .iter()
+            .any(|candidate| candidate == "completes"));
+        assert!(matches!(
+            cache.get("completes"),
+            TransformSnapshotLookup::Ready(_)
+        ));
+    }
+
+    #[test]
     fn transform_snapshot_cache_is_generation_safe_and_lru_bounded() {
         let request = |session_id: &str| {
             let mut request = transform_request(vec![ck("m1", 1, "text")], 1, 200_000);
@@ -9977,6 +10063,90 @@ mod tests {
             .unwrap()
             .contains("nothing to compact"));
         assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_handler_contract_edges_hold() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+
+        // Empty command_id must reject: every retrying caller would otherwise share
+        // one durable ledger key.
+        let empty_id = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "session.wrapup",
+                    "v": 1,
+                    "session_id": "ses",
+                    "command_id": ""
+                }),
+            )
+            .await;
+        match empty_id {
+            HandlerOutcome::Error { code, message } => {
+                assert_eq!(code, "bad_request");
+                assert!(message.contains("nonempty"), "{message}");
+            }
+            other => panic!("empty command_id must reject, got {other:?}"),
+        }
+
+        // Negative keep is a clamp input, not an error: [WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX].
+        let negative_keep = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": -3
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(negative_keep["ok"], json!(true), "{negative_keep}");
+        assert_eq!(negative_keep["disposition"], json!("completed"));
+        // keep=-3 clamps to WRAPUP_KEEP_MIN=5: coverage must reach past keep=20's
+        // watermark (60), proving the clamp floor was used, not the default or a reject.
+        let final_end = _store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert!(
+            final_end > 60,
+            "keep must clamp to MIN=5, got end {final_end}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn already_in_progress_response_carries_rounds() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let guard = handler
+            .try_claim_wrapup_session("ses")
+            .expect("first claim");
+        let busy = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+        drop(guard);
+        assert_eq!(busy["disposition"], json!("already_in_progress"), "{busy}");
+        assert!(
+            busy["rounds"].is_u64(),
+            "machine contract: rounds must ride every disposition, got {busy}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
