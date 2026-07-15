@@ -810,7 +810,12 @@ async function runCell(args: {
     promptPath: string;
 }): Promise<CellResult> {
     const prompt = readFileSync(args.promptPath, "utf8");
-    const directory = join(TRIALS_DIR, `${safeName(basename(args.promptPath), { stripExtension: true })}__${safeName(args.model)}`);
+    // Suffix the think mode so A/B arms (think:false vs think:low) write
+    // distinct directories instead of clobbering each other's artifacts.
+    const directory = join(
+        TRIALS_DIR,
+        `${safeName(basename(args.promptPath), { stripExtension: true })}__${safeName(args.model)}__think-${safeName(String(ollamaThink))}`,
+    );
     mkdirSync(directory, { recursive: true });
     const importanceById = new Map(args.corpus.memories.map((memory) => [memory.id, memory.importance]));
     const categoryRuns: CategoryRun[] = [];
