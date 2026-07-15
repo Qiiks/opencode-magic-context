@@ -2946,7 +2946,26 @@ impl McHandler {
             tag_count,
             plural_word(tag_count, "tag"),
         );
-        respond(json!({ "ok": true, "summary": summary }))
+        // Structured fields beside the prose: reconcilers must never parse summary
+        // text, and a retained delivered-command row needs coverage/row_version plus
+        // the live wrapup latch to decide completion without a second op.
+        let wrapup_active = self
+            .wrapup_sessions
+            .lock()
+            .expect("wrapup sessions mutex")
+            .get(&session_id)
+            .map(|session| session.rounds);
+        respond(json!({
+            "ok": true,
+            "summary": summary,
+            "wrapup_active": wrapup_active.is_some(),
+            "wrapup_rounds": wrapup_active,
+            "coverage_ordinal": loaded.meta.coverage_ordinal,
+            "row_version": loaded.row_version,
+            "boundary_present": !loaded.core.boundary_id.trim().is_empty(),
+            "compartment_count": compartment_count,
+            "pending_drop_count": pending_drop_count,
+        }))
     }
 
     async fn handle_session_wrapup_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -2980,6 +2999,7 @@ impl McHandler {
             Err(rounds) => {
                 return respond(json!({
                     "ok": true,
+                    "disposition": "already_in_progress",
                     "summary": format!("wrapup already in progress, {rounds} rounds done"),
                 }))
             }
@@ -2995,6 +3015,7 @@ impl McHandler {
             None => {
                 return respond(json!({
                     "ok": false,
+                    "disposition": "failed",
                     "summary": "wrapup unavailable until a full session transform has been observed",
                 }))
             }
@@ -3004,6 +3025,7 @@ impl McHandler {
             Err(error) => {
                 return respond(json!({
                     "ok": false,
+                    "disposition": "failed",
                     "summary": format!("wrapup boundary assembly failed: {error}"),
                 }))
             }
@@ -3029,6 +3051,8 @@ impl McHandler {
         {
             return respond(json!({
                 "ok": true,
+                "disposition": "nothing_to_compact",
+                "rounds": 0,
                 "summary": format!(
                     "nothing to compact; {} raw messages already fit within the keep watermark of {keep}",
                     plan.raw_messages_above_last_compartment,
@@ -3141,15 +3165,28 @@ impl McHandler {
             ));
         }
         let effect = "takes effect on your next message";
+        // Machine-readable outcome beside the prose: callers reconcile durable command
+        // rows on this field, never on summary text. A zero-round clean pass means the
+        // tail was already inside the keep watermark.
         match failure {
             Some(reason) => respond(json!({
                 "ok": false,
+                "disposition": "failed",
+                "rounds": rounds,
                 "summary": format!(
                     "compacted {compacted_messages} messages into {compartments_created} compartments; {reason}; {effect}"
                 ),
             })),
+            None if rounds == 0 => respond(json!({
+                "ok": true,
+                "disposition": "nothing_to_compact",
+                "rounds": 0,
+                "summary": "nothing to compact; the tail is already within the keep watermark",
+            })),
             None => respond(json!({
                 "ok": true,
+                "disposition": "completed",
+                "rounds": rounds,
                 "summary": format!(
                     "compacted {compacted_messages} messages into {compartments_created} compartments; {effect}"
                 ),
@@ -9397,6 +9434,7 @@ mod tests {
         );
 
         assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
         assert!(body["summary"]
             .as_str()
             .unwrap()
@@ -9421,6 +9459,7 @@ mod tests {
                 .await,
         );
         assert_eq!(retry["ok"], json!(true));
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
         assert!(retry["summary"]
             .as_str()
             .unwrap()
@@ -9463,6 +9502,7 @@ mod tests {
             second["summary"],
             "wrapup already in progress, 0 rounds done"
         );
+        assert_eq!(second["disposition"], json!("already_in_progress"));
         assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
 
         producer.block_output.store(false, Ordering::SeqCst);
