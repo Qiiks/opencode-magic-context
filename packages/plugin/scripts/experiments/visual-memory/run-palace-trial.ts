@@ -354,7 +354,13 @@ function parseInteger(value: string, context: string): number {
 }
 
 function parseManifest(raw: string, expectedCategory: Category, importanceById: Map<number, number>): SpecEntry[] {
-    const text = raw.trim();
+    // Models intermittently wrap the manifest in a Markdown code fence despite
+    // the prompt's instruction. The fence carries no authoring signal (the XML
+    // inside is complete and valid), so unwrap it rather than burning a retry
+    // on a formatting tic.
+    let text = raw.trim();
+    const fence = text.match(/^```(?:xml)?\s*\n([\s\S]*?)\n?```\s*$/);
+    if (fence?.[1]) text = fence[1].trim();
     if (!text.startsWith("<palace")) throw new Error("palace manifest must begin with <palace");
     if (!text.endsWith("</palace>")) {
         try {
