@@ -171,7 +171,13 @@ describe("hasShareabilitySensitiveText", () => {
     });
 
     it("allows non-sensitive project facts", () => {
-        expect(hasShareabilitySensitiveText("Use Bun for test scripts in this repo.")).toBe(false);
+        // Fixture must avoid plausible machine usernames ("test", "runner",
+        // "admin"): sanitize replaces the current login name anywhere it
+        // appears, so a fixture containing it flips sensitive on that box
+        // (bench machines log in as "test", CI as "runner").
+        expect(
+            hasShareabilitySensitiveText("Migration v45 adds the retrospective watermark column."),
+        ).toBe(false);
     });
 });
 
