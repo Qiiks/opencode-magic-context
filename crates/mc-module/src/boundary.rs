@@ -553,10 +553,25 @@ pub fn resolve_wrapup_boundary(
     live_ordinals.dedup();
     let raw_messages_above_last_compartment = live_ordinals.len();
     let keep = keep.max(1);
+    if live_ordinals.is_empty() {
+        return WrapupBoundaryResolution {
+            boundary: BoundaryResolution {
+                protected_start_ordinal: offset,
+                eligible_head: offset..offset,
+                n_tokens: keep as f64,
+                floored_by_live_prompt: false,
+                fenced_by_open_arc: false,
+                true_raw_eligible_tokens: 0.0,
+                oversize_atomic_unit: false,
+                raw_message_count,
+                boundary_reason: "manual-wrapup-empty".to_string(),
+            },
+            raw_messages_above_last_compartment: 0,
+            target_protected_start_ordinal: offset,
+        };
+    }
 
-    let mut boundary_reason = if live_ordinals.is_empty() {
-        "manual-wrapup-empty"
-    } else if live_ordinals.len() <= keep {
+    let mut boundary_reason = if live_ordinals.len() <= keep {
         "manual-wrapup-within-keep"
     } else {
         "manual-wrapup-keep-watermark"
@@ -2534,6 +2549,24 @@ mod tests {
 
         assert_eq!(plan.target_protected_start_ordinal, 3);
         assert_eq!(plan.boundary.eligible_head, 1..3);
+    }
+
+    #[test]
+    fn wrapup_coverage_beyond_cached_terminal_returns_offset_anchored_empty_range() {
+        let tail = vec![
+            text_msg(1, Role::User, "one"),
+            text_msg(2, Role::Assistant, "two"),
+            text_msg(3, Role::Assistant, "three"),
+        ];
+
+        let plan = resolve_wrapup_boundary(&tail, Some(10), 2);
+
+        assert_eq!(plan.raw_messages_above_last_compartment, 0);
+        assert_eq!(plan.target_protected_start_ordinal, 11);
+        assert_eq!(plan.boundary.protected_start_ordinal, 11);
+        assert_eq!(plan.boundary.eligible_head, 11..11);
+        assert_eq!(plan.boundary.boundary_reason, "manual-wrapup-empty");
+        assert_eq!(plan.boundary.true_raw_eligible_tokens, 0.0);
     }
 
     #[test]

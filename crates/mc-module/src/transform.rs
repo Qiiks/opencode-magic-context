@@ -32,7 +32,7 @@ use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInpu
 use mc_store::{
     Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, ModuleMeta,
     ModuleUsage, PendingAgentDrop, PendingRewriteState, StoredCompartment, TagMintInput,
-    UserHintRow,
+    TemporalMarkInput, TemporalMarkRow, UserHintDecisionInput, UserHintRow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -788,6 +788,25 @@ fn apply_once(
     } else {
         Vec::new()
     };
+    let mut temporal_marks = if tagging_active {
+        store.load_temporal_marks(&req.session_id)?
+    } else {
+        Vec::new()
+    };
+    if tagging_active {
+        persist_active_overlay_decisions(UserHintInputs {
+            store,
+            req,
+            ctx,
+            projection: &projection,
+            tag_rows: &tag_rows,
+            user_hints: &user_hints,
+        })?;
+        // Reload after the atomic apply so a concurrent winner's canonical bytes are
+        // rendered by this pass rather than this caller's speculative hint result.
+        user_hints = store.load_user_hints(&req.session_id)?;
+        temporal_marks = store.load_temporal_marks(&req.session_id)?;
+    }
 
     // Check whether the boundary is present in the live messages, or through a shadow
     // trim record that matches durable coverage and the first untrimmed message. A failed
@@ -836,7 +855,7 @@ fn apply_once(
                 req.session_id, fingerprint
             );
             let passthrough_overlay = tagging_active.then(|| {
-                tag_overlay_state(&req.messages, &tag_rows, &user_hints, &channel1_appends)
+                tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
             });
             return Ok(pending_passthrough_result(
                 projection,
@@ -878,7 +897,7 @@ fn apply_once(
             req.session_id, fingerprint, ambiguous
         );
         let passthrough_overlay = tagging_active
-            .then(|| tag_overlay_state(&req.messages, &tag_rows, &user_hints, &channel1_appends));
+            .then(|| tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends));
         return Ok(pending_passthrough_result(
             projection,
             req,
@@ -1448,20 +1467,8 @@ fn apply_once(
 
     let result_action = action_str(&plan, &core);
 
-    if tagging_active {
-        if let Some(row) = maybe_append_user_hint(UserHintInputs {
-            store,
-            req,
-            ctx,
-            projection: &projection,
-            tag_rows: &tag_rows,
-            user_hints: &user_hints,
-        })? {
-            user_hints.push(row);
-        }
-    }
     let mut tag_overlay = if tagging_active {
-        tag_overlay_state(&req.messages, &tag_rows, &user_hints, &channel1_appends)
+        tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
     } else {
         TagOverlayState::default()
     };
@@ -2517,8 +2524,8 @@ fn newest_active_tag_block_ids(
 }
 
 fn tag_overlay_state(
-    messages: &[CkIngressMessage],
     tag_rows: &[McTagRow],
+    temporal_marks: &[TemporalMarkRow],
     user_hints: &[UserHintRow],
     appends: &[Channel1AppendRow],
 ) -> TagOverlayState {
@@ -2527,7 +2534,11 @@ fn tag_overlay_state(
             .iter()
             .map(|row| (row.block_id.clone(), row.tag_number))
             .collect(),
-        temporal_by_block_id: temporal_gap_overlays(messages, tag_rows),
+        temporal_by_block_id: temporal_marks
+            .iter()
+            .filter(|row| !row.marker_text.is_empty())
+            .map(|row| (row.block_id.clone(), row.marker_text.clone()))
+            .collect(),
         user_hint_by_block_id: user_hints
             .iter()
             .filter(|row| !row.hint_text.is_empty())
@@ -2538,35 +2549,6 @@ fn tag_overlay_state(
             .map(|row| (row.block_id.clone(), row.reminder_text.clone()))
             .collect(),
     }
-}
-
-fn temporal_gap_overlays(
-    messages: &[CkIngressMessage],
-    tag_rows: &[McTagRow],
-) -> BTreeMap<String, String> {
-    let mint_by_block = tag_rows
-        .iter()
-        .map(|row| (row.block_id.as_str(), row.created_at_ms))
-        .collect::<HashMap<_, _>>();
-    let mut overlays = BTreeMap::new();
-    let mut previous_first_mint = None;
-
-    for message in messages.iter().filter(|message| !message.ck.meta.synthetic) {
-        let first_block_id = format!("{}#0", message.mid);
-        let current_first_mint = mint_by_block.get(first_block_id.as_str()).copied();
-        if message.ck.role == "user" {
-            if let (Some(current), Some(previous)) = (current_first_mint, previous_first_mint) {
-                if let Some(prefix) = current.checked_sub(previous).and_then(temporal_gap_prefix) {
-                    overlays.insert(first_block_id, prefix);
-                }
-            }
-        }
-        // A missing mint on the immediately previous ordinal makes the gap unknowable.
-        // Retaining an older timestamp would attach a marker for the wrong message pair.
-        previous_first_mint = current_first_mint;
-    }
-
-    overlays
 }
 
 /// Format a mint-time delta as the deterministic prefix used by the active overlay.
@@ -2825,67 +2807,109 @@ fn strip_leading_tag_imitations(value: &str) -> &str {
     }
 }
 
-fn maybe_append_user_hint(
-    input: UserHintInputs<'_, '_>,
-) -> Result<Option<UserHintRow>, TransformError> {
-    let Some(message) = input
+fn persist_active_overlay_decisions(input: UserHintInputs<'_, '_>) -> Result<(), TransformError> {
+    let watermark = input.store.overlay_watermark(&input.req.session_id)?;
+    let max_seen_ordinal = input
         .req
         .messages
         .iter()
-        .rfind(|message| !message.ck.meta.synthetic)
-    else {
-        return Ok(None);
-    };
-    if message.ck.role != "user" {
-        return Ok(None);
-    }
-
-    let block_id = format!("{}#0", message.mid);
-    let first_block_is_text = input.projection.blocks.iter().any(|block| {
-        block.id == block_id && matches!(taggable_kind(block), Some(TaggableKind::Message))
-    });
-    if !first_block_is_text || input.user_hints.iter().any(|row| row.block_id == block_id) {
-        return Ok(None);
-    }
-    let Some(candidate_tag) = input
+        .filter(|message| !message.ck.meta.synthetic)
+        .map(|message| message.ordinal)
+        .max()
+        .unwrap_or(0);
+    let mint_by_block = input
         .tag_rows
         .iter()
-        .find(|row| row.block_id == block_id)
-        .map(|row| row.tag_number)
-    else {
-        return Ok(None);
-    };
-    if !input
-        .store
-        .user_hint_frontier_open(&input.req.session_id, &block_id, candidate_tag)?
+        .map(|row| (row.block_id.as_str(), row.created_at_ms))
+        .collect::<HashMap<_, _>>();
+    let mut previous_first_mint = None;
+    let mut temporal_marks = Vec::new();
+
+    for message in input
+        .req
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
     {
-        return Ok(None);
+        let current = input
+            .projection
+            .blocks
+            .iter()
+            .filter(|block| block.mid == message.mid)
+            .find_map(|block| {
+                taggable_kind(block).and_then(|_| {
+                    mint_by_block
+                        .get(block.id.as_str())
+                        .copied()
+                        .map(|created_at| (block.id.as_str(), created_at))
+                })
+            });
+        if message.ck.role == "user" && message.ordinal > watermark {
+            if let Some((block_id, current_mint)) = current {
+                let marker_text = previous_first_mint
+                    .and_then(|previous| current_mint.checked_sub(previous))
+                    .and_then(temporal_gap_prefix)
+                    .unwrap_or_default();
+                temporal_marks.push(TemporalMarkInput {
+                    ordinal: message.ordinal,
+                    block_id: block_id.to_string(),
+                    marker_text,
+                });
+            }
+        }
+        // An untaggable immediate predecessor makes the elapsed time unknowable. Do not
+        // carry an older timestamp across it and attach a marker to the wrong pair.
+        previous_first_mint = current.map(|(_, created_at)| created_at);
     }
 
-    let query = user_hint_query(message);
-    let hint_text = if query.is_empty() {
-        String::new()
-    } else {
-        let results = run_user_hint_lexical_search(
-            input.store,
-            input.ctx.project_path,
-            &input.req.session_id,
-            &query,
-            input.ctx.memory_enabled,
-        )?;
-        render_user_hint(&results).unwrap_or_default()
-    };
-    let inserted = input.store.append_user_hint(
+    let user_hint = input
+        .req
+        .messages
+        .iter()
+        .rfind(|message| !message.ck.meta.synthetic && message.ck.role == "user")
+        .and_then(|message| {
+            let block = input.projection.blocks.iter().find(|block| {
+                block.mid == message.mid
+                    && block.role == "user"
+                    && matches!(block.wire.kind, ck_wire::CkKind::Text { .. })
+            })?;
+            if message.ordinal <= watermark
+                || input.user_hints.iter().any(|row| row.block_id == block.id)
+            {
+                return None;
+            }
+            Some((message, block.id.clone()))
+        })
+        .map(|(message, block_id)| {
+            let query = user_hint_query(message);
+            let hint_text = if query.is_empty() {
+                String::new()
+            } else {
+                let results = run_user_hint_lexical_search(
+                    input.store,
+                    input.ctx.project_path,
+                    &input.req.session_id,
+                    &query,
+                    input.ctx.memory_enabled,
+                )?;
+                render_user_hint(&results).unwrap_or_default()
+            };
+            Ok::<_, TransformError>(UserHintDecisionInput {
+                ordinal: message.ordinal,
+                block_id,
+                hint_text,
+            })
+        })
+        .transpose()?;
+
+    input.store.apply_active_overlay_decisions(
         &input.req.session_id,
-        &block_id,
-        &hint_text,
+        max_seen_ordinal,
+        &temporal_marks,
+        user_hint.as_ref(),
         input.ctx.now_ms,
     )?;
-    Ok(inserted.then_some(UserHintRow {
-        block_id,
-        hint_text,
-        created_at: input.ctx.now_ms,
-    }))
+    Ok(())
 }
 
 fn run_user_hint_lexical_search(
@@ -7323,7 +7347,7 @@ mod tests {
             .unwrap()
             .meta
             .last_render_config
-            .contains("tfe:4:tfe2"));
+            .contains("tfe:4:tfe3"));
 
         let after_commit = run(&s, &request, &spine());
         assert_eq!(after_commit.action, "SOFT+");
@@ -7433,6 +7457,84 @@ mod tests {
             )
             .unwrap();
             assert_eq!(tail_bytes(&false_window, "m3"), "question");
+        });
+    }
+
+    #[test]
+    fn sparse_temporal_decision_stays_frozen_when_an_older_ordinal_returns() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first_messages = vec![wire_item("user", "m1", 1, &["start"])];
+            let first_request = active_cc_req("temporal-sparse", "cfg0", first_messages.clone());
+            run(&s, &first_request, &spine());
+            run(&s, &first_request, &spine());
+
+            let sparse = vec![
+                first_messages[0].clone(),
+                wire_item("user", "m3", 3, &["later"]),
+            ];
+            let sparse_request = active_cc_req("temporal-sparse", "cfg0", sparse.clone());
+            let first = transform(
+                &s,
+                &sparse_request,
+                &pctx("git:proj", "/nonexistent-docs", 721_000),
+            )
+            .unwrap();
+            let frozen = tail_bytes(&first, "m3").to_string();
+            assert_eq!(frozen, "<!-- +12m -->\n§2§ later");
+
+            let restored = active_cc_req(
+                "temporal-sparse",
+                "cfg0",
+                vec![
+                    sparse[0].clone(),
+                    wire_item("assistant", "m2", 2, &["restored"]),
+                    sparse[1].clone(),
+                ],
+            );
+            let replay = transform(
+                &s,
+                &restored,
+                &pctx("git:proj", "/nonexistent-docs", 1_500_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&replay, "m3").as_bytes(), frozen.as_bytes());
+            assert!(s
+                .load_temporal_marks("temporal-sparse")
+                .unwrap()
+                .iter()
+                .all(|row| row.block_id != "m2#0"));
+
+            let near = active_cc_req(
+                "temporal-sparse",
+                "cfg0",
+                vec![
+                    sparse[0].clone(),
+                    restored.messages[1].clone(),
+                    sparse[1].clone(),
+                    wire_item("user", "m4", 4, &["nearby"]),
+                ],
+            );
+            let near_response =
+                transform(&s, &near, &pctx("git:proj", "/nonexistent-docs", 721_100)).unwrap();
+            assert_eq!(tail_bytes(&near_response, "m4"), "§4§ nearby");
+            let empty = s
+                .load_temporal_marks("temporal-sparse")
+                .unwrap()
+                .into_iter()
+                .find(|row| row.block_id == "m4#0")
+                .expect("empty temporal decision");
+            assert!(empty.marker_text.is_empty());
+
+            let false_window = transform(
+                &s,
+                &cc_req("temporal-sparse", "cfg0", near.messages),
+                &pctx("git:proj", "/nonexistent-docs", 2_000_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&false_window, "m3"), "later");
+            assert_eq!(tail_bytes(&false_window, "m4"), "nearby");
         });
     }
 
@@ -7555,6 +7657,7 @@ mod tests {
             let both = vec![
                 wire_item("user", "m1", 1, &["older prompt"]),
                 wire_item("user", "m2", 2, &["newer prompt"]),
+                wire_item("assistant", "m3", 3, &["trailing answer"]),
             ];
             let request = active_cc_req("hint-frontier", "cfg0", both);
             run(&s, &request, &spine());
@@ -7564,6 +7667,7 @@ mod tests {
                 "m2#0"
             );
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+            assert_eq!(s.overlay_watermark("hint-frontier").unwrap(), 3);
 
             let older_only = active_cc_req(
                 "hint-frontier",
@@ -7577,6 +7681,104 @@ mod tests {
                 USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get),
                 1,
                 "a later durable decision closes the first-apply frontier"
+            );
+        });
+    }
+
+    #[test]
+    fn user_hint_targets_first_text_after_media() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "media prompt has a remembered fragment",
+                70,
+            )
+            .unwrap();
+            let mut message = wire_item("user", "m1", 1, &["media prompt"]);
+            message.ck.content.insert(
+                0,
+                CkWireBlock::bare(ck_wire::CkKind::Media(ck_wire::MediaBlock {
+                    kind: ck_wire::MediaKind::Image,
+                    media_type: "image/png".to_string(),
+                    filename: None,
+                    source: serde_json::json!({"type": "base64", "data": "AA=="}),
+                })),
+            );
+            let request = active_cc_req("media-hint", "cfg0", vec![message]);
+            run(&s, &request, &spine());
+            let response = run(&s, &request, &spine());
+            let rendered = response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("m1"))
+                .unwrap();
+            let ck_wire::CkKind::Text { text } = &rendered.content[1].kind else {
+                panic!("second block must remain text");
+            };
+            assert!(text.starts_with("§1§ media prompt"));
+            assert!(text.contains("<ctx-search-hint>"));
+            assert_eq!(s.load_user_hints("media-hint").unwrap()[0].block_id, "m1#1");
+        });
+    }
+
+    #[test]
+    fn pending_rewrite_passthrough_computes_the_newest_user_hint() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "foreign prompt has durable context",
+                70,
+            )
+            .unwrap();
+            s.replace_compartments("pending-hint", &[comp(1, 1, 2, "t2#0", "summary")])
+                .unwrap();
+            let present = active_cc_req(
+                "pending-hint",
+                "cfg0",
+                vec![
+                    wire_item("assistant", "t2", 2, &["covered"]),
+                    wire_item("assistant", "t3", 3, &["tail"]),
+                ],
+            );
+            run(&s, &present, &spine());
+            run(&s, &present, &spine());
+            let mut loaded = s.load("pending-hint").unwrap();
+            loaded.meta.pending_rewrite = Some(PendingRewriteState {
+                armed_at_ms: 1,
+                absent_shape_fingerprint: "held".to_string(),
+                absent_request_count: 1,
+                last_present_at_ms: Some(1),
+            });
+            s.commit(
+                "pending-hint",
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
+
+            let absent = active_cc_req(
+                "pending-hint",
+                "cfg0",
+                vec![wire_item("user", "foreign", 50, &["foreign prompt"])],
+            );
+            let response = run(&s, &absent, &spine());
+            assert_eq!(response.action, "PASSTHROUGH");
+            assert!(tail_bytes(&response, "foreign").contains("<ctx-search-hint>"));
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+            assert_eq!(
+                s.load_user_hints("pending-hint").unwrap()[0].block_id,
+                "foreign#0"
             );
         });
     }
@@ -7893,7 +8095,7 @@ mod tests {
         let on_config = store.load("surface-flip").unwrap().meta.last_render_config;
         assert!(on_config.contains("tf1"));
         assert!(on_config.contains("gfull"));
-        assert!(on_config.contains("tfe:4:tfe2"));
+        assert!(on_config.contains("tfe:4:tfe3"));
         let on_steady = run(&store, &active, &spine());
         assert_ne!(on_steady.action, "HARD");
         assert_eq!(on_steady.surface_state, SurfaceState::Active);
@@ -9478,7 +9680,7 @@ mod tests {
 
     #[test]
     fn staged_epoch_bump_takes_exactly_one_hard_when_client_config_frozen() {
-        assert_eq!(crate::TAGGER_FEATURE_EPOCH, 2);
+        assert_eq!(crate::TAGGER_FEATURE_EPOCH, 3);
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let r1 = "pe1/tf1/gfull";
@@ -9497,7 +9699,7 @@ mod tests {
                 "mpe{}",
                 crate::profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic)
             ),
-            "tfe1".to_string(),
+            "tfe2".to_string(),
         );
         s.commit("staged-tfe", loaded.row_version, &loaded.core, &loaded.meta)
             .unwrap();
@@ -9507,7 +9709,7 @@ mod tests {
         // coordinate two folds instead of the one fold owned by the module upgrade.
         let pass_a = run(&s, &request, &spine());
         assert_eq!(pass_a.action, "HARD");
-        let expected_tfe2 = effective_render_config_with_epochs(
+        let expected_tfe3 = effective_render_config_with_epochs(
             &s,
             r1,
             format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
@@ -9516,11 +9718,11 @@ mod tests {
                 "mpe{}",
                 crate::profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic)
             ),
-            "tfe2".to_string(),
+            "tfe3".to_string(),
         );
         assert_eq!(
             s.load("staged-tfe").unwrap().meta.last_render_config,
-            expected_tfe2
+            expected_tfe3
         );
 
         let pass_b = run(&s, &request, &spine());

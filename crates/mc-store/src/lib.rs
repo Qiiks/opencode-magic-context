@@ -774,6 +774,42 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_user_hints(session_id, created_at, block_id);
     ",
     },
+    Migration {
+        version: 19,
+        // Overlay decisions use an ordinal watermark rather than observation order so a
+        // restored older message cannot first-apply bytes after a newer pass. Empty marker
+        // text freezes a no-marker decision. Wrapup command rows make response-loss retries
+        // replay the original terminal result without driving the historian again.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_overlay_frontiers (
+            session_id        TEXT PRIMARY KEY,
+            max_seen_ordinal  INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS mc_temporal_marks (
+            session_id   TEXT NOT NULL,
+            block_id     TEXT NOT NULL,
+            marker_text  TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            PRIMARY KEY (session_id, block_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_temporal_marks_session_created
+            ON mc_temporal_marks(session_id, created_at, block_id);
+
+        CREATE TABLE IF NOT EXISTS mc_wrapup_commands (
+            session_id   TEXT NOT NULL,
+            command_id   TEXT NOT NULL,
+            disposition  TEXT NOT NULL
+                CHECK (disposition IN ('completed', 'nothing_to_compact', 'failed')),
+            rounds       INTEGER NOT NULL,
+            summary      TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            PRIMARY KEY (session_id, command_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_wrapup_commands_session_created
+            ON mc_wrapup_commands(session_id, created_at, command_id);
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1380,6 +1416,35 @@ pub struct UserHintRow {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalMarkInput {
+    pub ordinal: u64,
+    pub block_id: String,
+    pub marker_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalMarkRow {
+    pub block_id: String,
+    pub marker_text: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserHintDecisionInput {
+    pub ordinal: u64,
+    pub block_id: String,
+    pub hint_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrapupCommandRow {
+    pub disposition: String,
+    pub rounds: usize,
+    pub summary: String,
+    pub created_at: i64,
+}
+
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
 /// chronological order (1 = oldest).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1970,6 +2035,9 @@ fn session_has_durable_state(
              UNION ALL SELECT 1 FROM mc_reduce_command_ledger WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_channel1_appends WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_user_hints WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_temporal_marks WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_overlay_frontiers WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_wrapup_commands WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_pass_trace WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_chunk_transcripts WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_notes WHERE session_id = ?1
@@ -2446,33 +2514,127 @@ impl McStore {
         })?)
     }
 
-    /// Return whether a block may receive the next first-sight hint decision.
-    /// Tag numbers preserve first-observation order, so any decided higher number closes
-    /// the frontier even when that later block is absent from the current request.
-    pub fn user_hint_frontier_open(
+    /// Read the ordinal watermark used to avoid speculative searches for closed turns.
+    /// The transactional apply method remains authoritative when concurrent passes race.
+    pub fn overlay_watermark(&self, session_id: &str) -> Result<u64, McStoreError> {
+        let value = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT max_seen_ordinal FROM mc_overlay_frontiers WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        })?;
+        Ok(value.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Freeze first-sight overlay decisions and advance the pass watermark atomically.
+    /// Every candidate is compared with the watermark from before this transaction. A
+    /// racing hint writer returns the already-stored bytes so both callers render the
+    /// same canonical decision.
+    pub fn apply_active_overlay_decisions(
         &self,
         session_id: &str,
-        block_id: &str,
-        tag_number: i64,
-    ) -> Result<bool, McStoreError> {
-        Ok(self.inner.with_conn(|conn| {
-            conn.query_row(
-                "SELECT
-                     NOT EXISTS(
-                         SELECT 1 FROM mc_user_hints
-                         WHERE session_id = ?1 AND block_id = ?2
-                     )
-                     AND NOT EXISTS(
-                         SELECT 1
-                         FROM mc_user_hints AS hint
-                         JOIN mc_tags AS tag
-                           ON tag.session_id = hint.session_id
-                          AND tag.block_id = hint.block_id
-                         WHERE hint.session_id = ?1 AND tag.tag_number > ?3
-                     )",
-                params![session_id, block_id, tag_number],
-                |row| row.get(0),
-            )
+        max_seen_ordinal: u64,
+        temporal_marks: &[TemporalMarkInput],
+        user_hint: Option<&UserHintDecisionInput>,
+        created_at: i64,
+    ) -> Result<Option<UserHintRow>, McStoreError> {
+        let max_seen_ordinal = i64::try_from(max_seen_ordinal)
+            .map_err(|_| McStoreError::Serde("message ordinal exceeds SQLite range".to_string()))?;
+        let temporal_marks = temporal_marks
+            .iter()
+            .map(|mark| {
+                i64::try_from(mark.ordinal)
+                    .map(|ordinal| (ordinal, mark))
+                    .map_err(|_| {
+                        McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let hint_ordinal = user_hint
+            .map(|hint| {
+                i64::try_from(hint.ordinal).map_err(|_| {
+                    McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
+                })
+            })
+            .transpose()?;
+
+        Ok(self.inner.with_conn_fenced(|tx| {
+            let previous = tx
+                .query_row(
+                    "SELECT max_seen_ordinal
+                     FROM mc_overlay_frontiers
+                     WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+
+            for (ordinal, mark) in &temporal_marks {
+                if *ordinal > previous {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO mc_temporal_marks
+                             (session_id, block_id, marker_text, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![session_id, mark.block_id, mark.marker_text, created_at],
+                    )?;
+                }
+            }
+
+            let canonical_hint = if let Some(hint) = user_hint {
+                let existing = tx
+                    .query_row(
+                        "SELECT block_id, hint_text, created_at
+                         FROM mc_user_hints
+                         WHERE session_id = ?1 AND block_id = ?2",
+                        params![session_id, hint.block_id],
+                        |row| {
+                            Ok(UserHintRow {
+                                block_id: row.get(0)?,
+                                hint_text: row.get(1)?,
+                                created_at: row.get(2)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+                if existing.is_some() || hint_ordinal.is_some_and(|ordinal| ordinal <= previous) {
+                    existing
+                } else {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO mc_user_hints
+                             (session_id, block_id, hint_text, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![session_id, hint.block_id, hint.hint_text, created_at],
+                    )?;
+                    tx.query_row(
+                        "SELECT block_id, hint_text, created_at
+                         FROM mc_user_hints
+                         WHERE session_id = ?1 AND block_id = ?2",
+                        params![session_id, hint.block_id],
+                        |row| {
+                            Ok(UserHintRow {
+                                block_id: row.get(0)?,
+                                hint_text: row.get(1)?,
+                                created_at: row.get(2)?,
+                            })
+                        },
+                    )
+                    .optional()?
+                }
+            } else {
+                None
+            };
+
+            tx.execute(
+                "INSERT INTO mc_overlay_frontiers (session_id, max_seen_ordinal)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     max_seen_ordinal = MAX(max_seen_ordinal, excluded.max_seen_ordinal)",
+                params![session_id, max_seen_ordinal],
+            )?;
+            Ok(canonical_hint)
         })?)
     }
 
@@ -2516,6 +2678,102 @@ impl McStore {
                 out.push(row?);
             }
             Ok(out)
+        })?)
+    }
+
+    /// Load persisted marker bytes, including empty no-marker decisions.
+    pub fn load_temporal_marks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TemporalMarkRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT block_id, marker_text, created_at
+                 FROM mc_temporal_marks
+                 WHERE session_id = ?1
+                 ORDER BY created_at ASC, block_id ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok(TemporalMarkRow {
+                    block_id: row.get(0)?,
+                    marker_text: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?)
+    }
+
+    pub fn load_wrapup_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<Option<WrapupCommandRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT disposition, rounds, summary, created_at
+                 FROM mc_wrapup_commands
+                 WHERE session_id = ?1 AND command_id = ?2",
+                params![session_id, command_id],
+                |row| {
+                    let rounds = row.get::<_, i64>(1)?;
+                    Ok(WrapupCommandRow {
+                        disposition: row.get(0)?,
+                        rounds: rounds.max(0) as usize,
+                        summary: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+        })?)
+    }
+
+    /// Record a terminal wrapup outcome and return the canonical row on a retry race.
+    pub fn record_wrapup_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        disposition: &str,
+        rounds: usize,
+        summary: &str,
+        created_at: i64,
+    ) -> Result<WrapupCommandRow, McStoreError> {
+        let rounds = i64::try_from(rounds)
+            .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
+        Ok(self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO mc_wrapup_commands
+                     (session_id, command_id, disposition, rounds, summary, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session_id,
+                    command_id,
+                    disposition,
+                    rounds,
+                    summary,
+                    created_at
+                ],
+            )?;
+            tx.query_row(
+                "SELECT disposition, rounds, summary, created_at
+                 FROM mc_wrapup_commands
+                 WHERE session_id = ?1 AND command_id = ?2",
+                params![session_id, command_id],
+                |row| {
+                    let rounds = row.get::<_, i64>(1)?;
+                    Ok(WrapupCommandRow {
+                        disposition: row.get(0)?,
+                        rounds: rounds.max(0) as usize,
+                        summary: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
         })?)
     }
 
@@ -2899,6 +3157,10 @@ impl McStore {
             )?;
             tx.execute(
                 "DELETE FROM mc_reduce_command_ledger WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_wrapup_commands WHERE session_id = ?1",
                 params![session_id],
             )?;
             tx.execute(
@@ -6115,9 +6377,98 @@ mod tests {
                 },
             ]
         );
-        assert!(!store.user_hint_frontier_open("ses", "m1#0", 1).unwrap());
-        assert!(!store.user_hint_frontier_open("ses", "m2#0", 2).unwrap());
-        assert!(store.user_hint_frontier_open("ses", "m4#0", 4).unwrap());
+        assert_eq!(store.overlay_watermark("ses").unwrap(), 0);
+        store
+            .apply_active_overlay_decisions("ses", 4, &[], None, 800)
+            .unwrap();
+        assert_eq!(store.overlay_watermark("ses").unwrap(), 4);
+    }
+
+    #[test]
+    fn overlay_decisions_share_an_atomic_ordinal_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(McStore::open(&descriptor(dir.path())).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for hint_text in ["winner-a", "winner-b"] {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .apply_active_overlay_decisions(
+                        "race",
+                        3,
+                        &[TemporalMarkInput {
+                            ordinal: 3,
+                            block_id: "m3#0".to_string(),
+                            marker_text: "<!-- +5m -->\n".to_string(),
+                        }],
+                        Some(&UserHintDecisionInput {
+                            ordinal: 3,
+                            block_id: "m3#0".to_string(),
+                            hint_text: hint_text.to_string(),
+                        }),
+                        100,
+                    )
+                    .unwrap()
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let rows = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0], rows[1], "the loser returns the winner's bytes");
+        assert_eq!(
+            store.load_user_hints("race").unwrap(),
+            vec![rows[0].clone()]
+        );
+        assert_eq!(store.overlay_watermark("race").unwrap(), 3);
+        assert_eq!(store.load_temporal_marks("race").unwrap().len(), 1);
+
+        store
+            .apply_active_overlay_decisions(
+                "race",
+                4,
+                &[TemporalMarkInput {
+                    ordinal: 2,
+                    block_id: "m2#0".to_string(),
+                    marker_text: "late marker".to_string(),
+                }],
+                Some(&UserHintDecisionInput {
+                    ordinal: 2,
+                    block_id: "m2#0".to_string(),
+                    hint_text: "late hint".to_string(),
+                }),
+                200,
+            )
+            .unwrap();
+        assert_eq!(store.overlay_watermark("race").unwrap(), 4);
+        assert_eq!(store.load_user_hints("race").unwrap().len(), 1);
+        assert_eq!(store.load_temporal_marks("race").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wrapup_command_ledger_keeps_the_first_terminal_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let first = store
+            .record_wrapup_command("session", "command", "completed", 2, "done", 10)
+            .unwrap();
+        let retry = store
+            .record_wrapup_command("session", "command", "failed", 9, "changed", 20)
+            .unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(
+            store.load_wrapup_command("session", "command").unwrap(),
+            Some(first)
+        );
+        assert!(store
+            .load_wrapup_command("session", "other")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -6192,6 +6543,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_has_hints_table.as_deref(), Some("mc_user_hints"));
+        let fresh_migration_19_tables = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table'
+                       AND name IN ('mc_overlay_frontiers', 'mc_temporal_marks', 'mc_wrapup_commands')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(fresh_migration_19_tables, 3);
 
         let migrated_dir = tempfile::tempdir().unwrap();
         let path = migrated_dir.path().join("store.db");
@@ -6285,6 +6649,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_has_hints_table.as_deref(), Some("mc_user_hints"));
+        let migrated_migration_19_tables = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table'
+                       AND name IN ('mc_overlay_frontiers', 'mc_temporal_marks', 'mc_wrapup_commands')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(migrated_migration_19_tables, 3);
         let migrated_date_columns = migrated
             .inner
             .with_conn(|conn| {
@@ -6460,6 +6837,22 @@ mod tests {
             .append_pending_agent_drops_with_command("ledger", Some("command"), &[], 1)
             .unwrap();
         store.append_user_hint("hints", "m1#0", "", 1).unwrap();
+        store
+            .apply_active_overlay_decisions(
+                "overlays",
+                1,
+                &[TemporalMarkInput {
+                    ordinal: 1,
+                    block_id: "m1#0".to_string(),
+                    marker_text: String::new(),
+                }],
+                None,
+                1,
+            )
+            .unwrap();
+        store
+            .record_wrapup_command("wrapup", "command", "completed", 1, "done", 1)
+            .unwrap();
 
         for session_id in [
             "cache",
@@ -6468,6 +6861,8 @@ mod tests {
             "pending",
             "ledger",
             "hints",
+            "overlays",
+            "wrapup",
         ] {
             assert!(matches!(
                 store.preflight_state_import(session_id, "bundle"),
