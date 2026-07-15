@@ -972,14 +972,15 @@ fn apply_once(
     };
     let selected_reductions = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
-        let agent_drop_ids = if cc_u1_active {
-            pending_agent_drops
-                .iter()
-                .map(|drop| drop.target_id.clone())
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        // No per-request gate here: producer_gate already requires
+        // tail_reclaim_enabled, which is the profile default OR the request-local
+        // surface. Gating again on the request-local surface alone would starve
+        // the durable queue on profiles whose default is true (owned/Pi/OpenCode
+        // legs drain unconditionally).
+        let agent_drop_ids = pending_agent_drops
+            .iter()
+            .map(|drop| drop.target_id.clone())
+            .collect::<Vec<_>>();
         select_reductions(
             &tail_for_selection,
             &frozen,
@@ -1800,10 +1801,17 @@ fn consumed_pending_drop_ids(
 ) -> Vec<i64> {
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
-    let live_tail = projection
+    // Retirement must be PROVEN, not inferred from absence: the request array can be
+    // a transient subset of the session (interactive side-requests), so a target
+    // missing from this pass's projection may reappear on the next one. Consuming
+    // its row on absence would silently lose an acknowledged drop. A block that is
+    // PRESENT but at-or-under the coverage watermark is permanently retired
+    // (coverage only advances), and an already-frozen target is satisfied — those
+    // are the only non-applied rows safe to consume.
+    let covered = projection
         .blocks
         .iter()
-        .filter(|block| !block.synthetic && is_tail(block.ordinal, final_coverage))
+        .filter(|block| !block.synthetic && !is_tail(block.ordinal, final_coverage))
         .map(|block| block.id.as_str())
         .collect::<HashSet<_>>();
 
@@ -1813,7 +1821,7 @@ fn consumed_pending_drop_ids(
             let applied =
                 !frozen_before.contains(&drop.target_id) && frozen_after.contains(&drop.target_id);
             let obsolete = frozen_before.contains(&drop.target_id)
-                || (!applied && !live_tail.contains(drop.target_id.as_str()));
+                || covered.contains(drop.target_id.as_str());
             applied || obsolete
         })
         .map(|drop| drop.id)
@@ -7048,7 +7056,17 @@ mod tests {
     fn obsolete_pending_row_commits_consumption_without_core_or_meta_changes() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let request = cc_req("consume-only", "cfg0", vec![item("live", 1, "hello")]);
+        // "gone" is PRESENT in the array but covered by the compartment boundary:
+        // provably retired (coverage only advances), so its pending row is
+        // consumable even though nothing else about the pass changes state.
+        store
+            .replace_compartments("consume-only", &[comp(1, 1, 1, "gone", "summary")])
+            .unwrap();
+        let request = cc_req(
+            "consume-only",
+            "cfg0",
+            vec![item("gone", 1, "folded away"), item("live", 2, "hello")],
+        );
         run(&store, &request, &spine());
         store
             .append_pending_agent_drops("consume-only", &["gone#0".to_string()], 1)
@@ -7069,6 +7087,70 @@ mod tests {
             .load_pending_agent_drops("consume-only")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn absent_target_pending_row_survives_subset_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let full = active_cc_req(
+            "subset-safety",
+            "cfg0",
+            vec![item("a", 1, "first"), item("m9", 9, "drop me")],
+        );
+        run(&store, &full, &spine());
+        store
+            .append_pending_agent_drops("subset-safety", &["m9#0".to_string()], 1)
+            .unwrap();
+
+        // An interactive side-request arrives as a SUBSET of the session: the
+        // pending target is absent from this pass entirely. Absence proves
+        // nothing (the full array returns next pass), so the row must survive.
+        let subset = active_cc_req("subset-safety", "cfg0", vec![item("a", 1, "first")]);
+        run(&store, &subset, &spine());
+        let survived = store.load_pending_agent_drops("subset-safety").unwrap();
+        assert_eq!(survived.len(), 1, "absent-target row must not be consumed");
+        assert_eq!(survived[0].target_id, "m9#0");
+
+        // The full array returns: the target is live-tail again and its row is
+        // still queued for the next producing pass (drop application itself is
+        // covered by the dormant/active drain tests).
+        run(&store, &full, &spine());
+        let requeued = store.load_pending_agent_drops("subset-safety").unwrap();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].target_id, "m9#0");
+    }
+
+    #[test]
+    fn owned_profile_drains_pending_drops_without_request_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // Owned-leg consumers never send the reduction-surface field; their
+        // profile default alone must keep the durable queue draining.
+        let request = req(
+            "owned-drain",
+            "cfg0",
+            vec![item("a", 1, "first"), item("m2", 2, "drop me")],
+        );
+        run(&store, &request, &spine());
+        store
+            .append_pending_agent_drops("owned-drain", &["m2#0".to_string()], 1)
+            .unwrap();
+
+        let producing = req(
+            "owned-drain",
+            "cfg1",
+            vec![item("a", 1, "first"), item("m2", 2, "drop me")],
+        );
+        let response = run(&store, &producing, &spine());
+        assert_eq!(tail_bytes(&response, "m2"), "[dropped]");
+        assert!(
+            store
+                .load_pending_agent_drops("owned-drain")
+                .unwrap()
+                .is_empty(),
+            "profile-default tail reclaim must drain the queue"
+        );
     }
 
     #[test]
