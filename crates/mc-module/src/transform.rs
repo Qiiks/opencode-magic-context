@@ -9974,6 +9974,7 @@ mod tests {
                 compartments: &compartments,
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: Value::Null,

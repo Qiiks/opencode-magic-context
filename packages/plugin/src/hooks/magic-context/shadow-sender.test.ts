@@ -20,6 +20,7 @@ import {
     appendAutoSearchHintDecision,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { setRawMessageProvider } from "./read-session-chunk";
@@ -1038,6 +1039,26 @@ describe("shadow sender", () => {
         }
     });
 
+    it("seeds ordered active user-profile lines without reading project memories", async () => {
+        useTempDataHome("shadow-profile-seed-");
+        const db = openDatabase();
+        insertUserMemory(db, "prefers root cause", []);
+        insertUserMemory(db, "x < y & z", []);
+        const state = __shadowSenderTest.createSessionQueueState();
+        const sync = await __shadowSenderTest.buildStateSyncPayload({
+            state,
+            pass: basePass({ db, sessionId: "s-profile-seed" }),
+            force: true,
+        });
+        expect(sync).toEqual(
+            expect.objectContaining({
+                params: expect.objectContaining({
+                    user_profile: ["prefers root cause", "x < y & z"],
+                }),
+            }),
+        );
+    });
+
     it("pages force seeds by exact flat wire bytes and keeps scalar state on the final batch", () => {
         const watermarks = {
             compartment_sequence: 2,
@@ -1183,6 +1204,39 @@ describe("shadow sender", () => {
         expect(assembled).toEqual(original);
     });
 
+    it("slices one oversized transform item and reassembles its original JSON", () => {
+        const item = { id: "oversized", text: "x".repeat(2 * 1024 * 1024) };
+        const body: Record<string, unknown> = {
+            method: "shadow_transform",
+            session_id: "shadow:oversized",
+            shadow_generation: 3,
+            seed_pass: false,
+            input: [item],
+            ts_output: [],
+            normalizations: [],
+            pass_inputs: { now_ms: 1 },
+            ts_decision: { class: "defer" },
+            declared_trim: null,
+        };
+        const pages = __shadowSenderTest.buildPagedTransformPayloads(body);
+        expect(pages.length).toBeGreaterThan(1);
+        expect(
+            pages.every(
+                (page) =>
+                    Buffer.byteLength(JSON.stringify(page)) <=
+                    __shadowSenderTest.SHADOW_TRANSFORM_PAGE_MAX_BYTES,
+            ),
+        ).toBe(true);
+        const chunks = pages.flatMap((page) =>
+            ((page.input as Array<Record<string, unknown>> | undefined) ?? []).filter(
+                (value) => value.__shadow_item_continuation !== undefined,
+            ),
+        );
+        expect(chunks.length).toBeGreaterThan(1);
+        const reassembled = JSON.parse(chunks.map((chunk) => chunk.chunk as string).join(""));
+        expect(reassembled).toEqual(item);
+    });
+
     it("does not interleave pages from two transform passes for one session", async () => {
         useTempDataHome("shadow-transform-pages-");
         const sessionId = "s-transform-pages";
@@ -1226,7 +1280,7 @@ describe("shadow sender", () => {
             const pageCalls = transport.calls.filter((call) => call.method === "shadow_transform");
             const pageIds = pageCalls.map((call) => (call.body as { transform_page_id?: string }).transform_page_id);
             const firstId = pageIds[0];
-            const firstEnd = pageIds.findLastIndex((id) => id === firstId);
+            const firstEnd = pageIds.lastIndexOf(firstId);
             expect(firstId).toBeDefined();
             expect(pageIds.slice(0, firstEnd + 1).every((id) => id === firstId)).toBe(true);
             expect(pageIds.slice(firstEnd + 1).every((id) => id !== firstId)).toBe(true);

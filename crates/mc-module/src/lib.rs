@@ -222,6 +222,7 @@ const SHADOW_TRANSFORM_PAGE_MAX_BYTES: usize = 512 * 1024;
 const SHADOW_TRANSFORM_PAGE_MAX_STAGED_BYTES: usize = 128 * 1024 * 1024;
 const SHADOW_TRANSFORM_PAGE_MAX_PENDING: usize = 64;
 const SHADOW_TRANSFORM_PAGE_MAX_ID_BYTES: usize = 128;
+const SHADOW_ITEM_CONTINUATION_KEY: &str = "__shadow_item_continuation";
 const STATE_IMPORT_MAX_ID_BYTES: usize = 128;
 const STATE_IMPORT_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const STATE_IMPORT_MAX_PENDING: usize = 64;
@@ -259,6 +260,8 @@ struct ShadowStateSyncWire {
     memories: Vec<ShadowMemoryWire>,
     #[serde(default)]
     memory_mutations: Vec<ShadowMemoryMutationWire>,
+    #[serde(default)]
+    user_profile: Vec<String>,
     #[serde(default)]
     workspace: Option<ShadowWorkspaceWire>,
     #[serde(default)]
@@ -5304,6 +5307,7 @@ impl McHandler {
             compartments: &compartments,
             memories: &memories,
             memory_mutations: &memory_mutations,
+            user_profile: &parsed.user_profile,
             workspace: workspace.as_ref(),
             last_todo_state: parsed.last_todo_state,
             acked_watermarks,
@@ -6621,6 +6625,88 @@ fn shadow_transform_page_content_digest(request: &Value) -> String {
     sha256_hex(canonical_value(&Value::Object(content)).as_bytes())
 }
 
+fn assemble_shadow_transform_field(field: &str, values: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut assembled = Vec::new();
+    let mut index = 0usize;
+    while index < values.len() {
+        let Some(marker) = values[index]
+            .get(SHADOW_ITEM_CONTINUATION_KEY)
+            .and_then(Value::as_object)
+        else {
+            assembled.push(values[index].clone());
+            index += 1;
+            continue;
+        };
+        let marker_field = marker
+            .get("field")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "transform continuation marker is missing its field".to_string())?;
+        let item_index = marker
+            .get("item_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "transform continuation marker has an invalid item index".to_string())?;
+        let chunk_index = marker
+            .get("chunk_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                "transform continuation marker has an invalid chunk index".to_string()
+            })?;
+        let chunk_total = marker
+            .get("chunk_total")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                "transform continuation marker has an invalid chunk total".to_string()
+            })?;
+        if marker_field != field
+            || item_index != assembled.len()
+            || chunk_index != 0
+            || chunk_total == 0
+        {
+            return Err(
+                "transform continuation marker does not match its array position".to_string(),
+            );
+        }
+
+        let mut serialized = String::new();
+        for expected_chunk in 0..chunk_total {
+            let Some(chunk_value) = values.get(index + expected_chunk) else {
+                return Err(
+                    "transform continuation item ended before all chunks arrived".to_string(),
+                );
+            };
+            let Some(chunk_marker) = chunk_value
+                .get(SHADOW_ITEM_CONTINUATION_KEY)
+                .and_then(Value::as_object)
+            else {
+                return Err("transform continuation item was interrupted".to_string());
+            };
+            let same_item = chunk_marker.get("field").and_then(Value::as_str) == Some(field)
+                && chunk_marker.get("item_index").and_then(Value::as_u64)
+                    == Some(item_index as u64)
+                && chunk_marker.get("chunk_index").and_then(Value::as_u64)
+                    == Some(expected_chunk as u64)
+                && chunk_marker.get("chunk_total").and_then(Value::as_u64)
+                    == Some(chunk_total as u64);
+            if !same_item {
+                return Err("transform continuation chunks were reordered".to_string());
+            }
+            let chunk = chunk_value
+                .get("chunk")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "transform continuation marker is missing its chunk".to_string())?;
+            serialized.push_str(chunk);
+        }
+        let item = serde_json::from_str::<Value>(&serialized)
+            .map_err(|error| format!("transform continuation item was not valid JSON: {error}"))?;
+        assembled.push(item);
+        index += chunk_total;
+    }
+    Ok(assembled)
+}
+
 fn assemble_shadow_transform(mut pages: Vec<Value>) -> Result<Value, String> {
     let mut final_page = pages
         .pop()
@@ -6655,6 +6741,7 @@ fn assemble_shadow_transform(mut pages: Vec<Value>) -> Result<Value, String> {
             }
         }
         if had_field || !values.is_empty() {
+            let values = assemble_shadow_transform_field(field, values)?;
             let Some(object) = final_page.as_object_mut() else {
                 return Err("transform page was not an object".to_string());
             };
@@ -6673,14 +6760,17 @@ fn assemble_shadow_seed(
     let mut compartments = Vec::new();
     let mut memories = Vec::new();
     let mut memory_mutations = Vec::new();
+    let mut user_profile = Vec::new();
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
         memories.append(&mut batch.memories);
         memory_mutations.append(&mut batch.memory_mutations);
+        user_profile.append(&mut batch.user_profile);
     }
     compartments.append(&mut final_batch.compartments);
     memories.append(&mut final_batch.memories);
     memory_mutations.append(&mut final_batch.memory_mutations);
+    user_profile.append(&mut final_batch.user_profile);
     ShadowStateSyncWire {
         session_id: final_batch.session_id,
         shadow_generation: generation,
@@ -6694,6 +6784,7 @@ fn assemble_shadow_seed(
         compartments,
         memories,
         memory_mutations,
+        user_profile,
         workspace: final_batch.workspace,
         last_todo_state: final_batch.last_todo_state,
         acked_watermarks: final_batch.acked_watermarks,
@@ -7288,6 +7379,15 @@ fn rs_decision_class(action: &str) -> &'static str {
     }
 }
 
+fn comparable_decision_class(decision: &Value, rust_vocabulary: bool) -> Option<&str> {
+    if rust_vocabulary {
+        if let Some(action) = decision.get("action").and_then(Value::as_str) {
+            return Some(rs_decision_class(action));
+        }
+    }
+    decision.get("class").and_then(Value::as_str)
+}
+
 fn compare_shadow_outputs(
     ts_messages: &[crate::ck_wire::CkWireMessage],
     rs_messages: &[crate::ck_wire::CkWireMessage],
@@ -7298,16 +7398,16 @@ fn compare_shadow_outputs(
 ) -> CompareOutcome {
     let ts_canonical = canonical_messages(ts_messages);
     let rs_canonical = canonical_messages(rs_messages);
-    let decision_mismatch = ts_decision
-        .get("class")
-        .and_then(Value::as_str)
-        .is_some_and(|class| {
-            class
-                != rs_decision
-                    .get("class")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-        });
+    // TypeScript reports decision classes, while Rust reports action names. Map both to
+    // one vocabulary so Rust's SOFT+ action and TypeScript's defer class compare equally.
+    let decision_mismatch = match (
+        comparable_decision_class(ts_decision, false),
+        comparable_decision_class(rs_decision, true),
+    ) {
+        (Some(ts_class), Some(rs_class)) => ts_class != rs_class,
+        (Some(_), None) => true,
+        _ => false,
+    };
 
     if let Some(trim) = trim_mismatch {
         let first = first_message_hint(ts_messages, rs_messages);
@@ -13499,6 +13599,7 @@ mod tests {
         compartments: Vec<StrictShadowCompartment>,
         memories: Vec<StrictShadowMemory>,
         memory_mutations: Vec<StrictShadowMemoryMutation>,
+        user_profile: Vec<String>,
         workspace: Option<StrictShadowWorkspace>,
         last_todo_state: String,
         acked_watermarks: StrictShadowWatermarks,
@@ -13735,6 +13836,7 @@ mod tests {
         assert_eq!(fixture.state_sync.compartments.len(), 2);
         assert_eq!(fixture.state_sync.memories.len(), 2);
         assert_eq!(fixture.state_sync.memory_mutations.len(), 1);
+        assert!(fixture.state_sync.user_profile.is_empty());
         assert_eq!(
             fixture
                 .state_sync
@@ -13923,6 +14025,7 @@ mod tests {
                         "target_memory_id": 0,
                         "new_content": "zero memory updated"
                     }],
+                    "user_profile": ["prefers root cause", "x < y"],
                     "last_todo_state": "[]"
                 }),
             )
@@ -13940,6 +14043,10 @@ mod tests {
         assert_eq!(loaded.meta.coverage_compartment_seq, Some(0));
         assert_eq!(loaded.meta.folded_compartment_seq, 0);
         assert_eq!(loaded.meta.last_todo_state.as_deref(), Some("[]"));
+        assert_eq!(
+            store.load_shadow_user_profile("shadow:ses").unwrap(),
+            vec!["prefers root cause", "x < y"]
+        );
         let stored_compartments = store.load_compartments("shadow:ses").unwrap();
         assert_eq!(
             stored_compartments[0].start_date.as_deref(),
@@ -14456,6 +14563,7 @@ mod tests {
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: Value::Null,
@@ -14593,6 +14701,106 @@ mod tests {
         ])
         .expect("paged transform should assemble");
         assert_eq!(assembled, original);
+    }
+
+    #[test]
+    fn paged_shadow_transform_reassembles_oversized_item_continuations() {
+        let item = Value::String("x".repeat(2 * 1024 * 1024));
+        let serialized = serde_json::to_string(&item).unwrap();
+        let chunk_size = 64 * 1024;
+        let chunk_total = serialized.len().div_ceil(chunk_size);
+        let mut pages = Vec::new();
+        for chunk_index in 0..chunk_total {
+            let start = chunk_index * chunk_size;
+            let end = std::cmp::min(start + chunk_size, serialized.len());
+            let mut page = json!({
+                "method": "shadow_transform",
+                "session_id": "shadow:oversized",
+                "shadow_generation": 4,
+                "transform_page_id": "oversized-page",
+                "transform_generation": 4,
+                "transform_page_index": chunk_index,
+                "transform_page_total": chunk_total,
+                "transform_page_complete": chunk_index + 1 == chunk_total,
+                "input": [{
+                    "__shadow_item_continuation": {
+                        "field": "input",
+                        "item_index": 0,
+                        "chunk_index": chunk_index,
+                        "chunk_total": chunk_total,
+                    },
+                    "chunk": &serialized[start..end],
+                }],
+                "ts_output": [],
+                "normalizations": [],
+            });
+            page["transform_page_digest"] = json!(shadow_transform_page_content_digest(&page));
+            if chunk_index + 1 == chunk_total {
+                page["pass_inputs"] = shadow_pass_inputs();
+                page["ts_decision"] = json!({ "class": "defer" });
+                page["declared_trim"] = Value::Null;
+            }
+            pages.push(page);
+        }
+
+        let assembled =
+            assemble_shadow_transform(pages).expect("continuation item should assemble");
+        assert_eq!(assembled["input"], json!([item]));
+    }
+
+    #[test]
+    fn paged_shadow_transform_generation_change_discards_partial_attempt() {
+        let mut coordinator = ShadowTransformCoordinator::default();
+        let page = |generation: u64, index: usize, complete: bool| {
+            let mut page = json!({
+                "method": "shadow_transform",
+                "session_id": "shadow:generation",
+                "shadow_generation": generation,
+                "transform_page_id": "generation-page",
+                "transform_generation": generation,
+                "transform_page_index": index,
+                "transform_page_total": 2,
+                "transform_page_complete": complete,
+                "input": [format!("page-{generation}-{index}")],
+            });
+            let digest = shadow_transform_page_content_digest(&page);
+            page["transform_page_digest"] = json!(digest.clone());
+            (page, digest)
+        };
+        let (first, first_digest) = page(1, 0, false);
+        let first_bytes = serde_json::to_vec(&first).unwrap().len();
+        assert!(matches!(
+            coordinator.stage(
+                "shadow:generation",
+                "generation-page".to_string(),
+                1,
+                0,
+                2,
+                first_digest,
+                first,
+                first_bytes,
+                false,
+            ),
+            Ok(ShadowTransformStageAction::Ack(1))
+        ));
+        let (stale, stale_digest) = page(2, 1, true);
+        let stale_bytes = serde_json::to_vec(&stale).unwrap().len();
+        assert!(matches!(
+            coordinator.stage(
+                "shadow:generation",
+                "generation-page".to_string(),
+                2,
+                1,
+                2,
+                stale_digest,
+                stale,
+                stale_bytes,
+                true,
+            ),
+            Err(ShadowTransformStageError::AttemptMismatch)
+        ));
+        assert_eq!(coordinator.pending_transform_count, 0);
+        assert_eq!(coordinator.total_staged_bytes, 0);
     }
 
     #[test]
@@ -14738,6 +14946,63 @@ mod tests {
         assert_eq!(
             store.load_shadow_divergences("shadow:ses").unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn shadow_decision_comparator_maps_ts_classes_to_rust_actions() {
+        let messages = vec![ck("same", 1, "same").ck];
+        let ts_defer = json!({ "class": "defer" });
+        let ts_soft = json!({ "class": "soft" });
+        let ts_hard = json!({ "class": "hard" });
+
+        assert_eq!(
+            compare_shadow_outputs(
+                &messages,
+                &messages,
+                &ts_defer,
+                &json!({ "action": "SOFT+", "class": "defer" }),
+                &[],
+                None,
+            )
+            .class,
+            "identical"
+        );
+        assert_eq!(
+            compare_shadow_outputs(
+                &messages,
+                &messages,
+                &ts_soft,
+                &json!({ "action": "SOFT", "class": "soft" }),
+                &[],
+                None,
+            )
+            .class,
+            "identical"
+        );
+        assert_eq!(
+            compare_shadow_outputs(
+                &messages,
+                &messages,
+                &ts_hard,
+                &json!({ "action": "HARD", "class": "hard" }),
+                &[],
+                None,
+            )
+            .class,
+            "identical"
+        );
+        assert_eq!(
+            compare_shadow_outputs(
+                &messages,
+                &messages,
+                &ts_soft,
+                &json!({ "action": "SOFT+", "class": "defer" }),
+                &[],
+                None,
+            )
+            .class,
+            "decision-mismatch"
         );
     }
 

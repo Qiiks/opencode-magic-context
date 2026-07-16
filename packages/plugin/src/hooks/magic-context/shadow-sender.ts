@@ -31,6 +31,7 @@ import {
     getAutoSearchHintDecisions,
     getPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { getActiveUserMemories } from "../../features/magic-context/user-memory/storage-user-memory";
 import {
     computeWorkspaceEpochFingerprint,
     expandWorkspaceIdentitySetWithAliases,
@@ -70,6 +71,10 @@ const SHADOW_SEED_YIELD_EVERY_COMPARTMENTS = 10;
 const SHADOW_SEED_BUDGET_MS = 30_000;
 const SHADOW_SEED_BATCH_MAX_BYTES = 512 * 1024;
 const SHADOW_TRANSFORM_PAGE_MAX_BYTES = SHADOW_SEED_BATCH_MAX_BYTES;
+// Large array items in the transform payload are split across pages to stay under the
+// byte limit. Small chunks leave room for JSON escaping and continuation metadata.
+const SHADOW_TRANSFORM_ITEM_CHUNK_BYTES = 64 * 1024;
+const SHADOW_ITEM_CONTINUATION_KEY = "__shadow_item_continuation";
 const SHADOW_RESET_REASON_RING_SIZE = 8;
 const MAX_FACADE_FRAME_BYTES = 1024 * 1024;
 
@@ -234,6 +239,7 @@ interface ShadowStateSyncPayload {
         compartments: unknown[];
         memories: unknown[];
         memory_mutations: unknown[];
+        user_profile: string[];
         workspace?: ShadowWorkspacePayload | null;
         last_todo_state?: string;
         acked_watermarks?: ShadowWatermarks;
@@ -245,7 +251,8 @@ interface ShadowStateSyncPayload {
 type ShadowSeedItem =
     | { kind: "compartment"; value: unknown }
     | { kind: "memory"; value: unknown }
-    | { kind: "memory_mutation"; value: unknown };
+    | { kind: "memory_mutation"; value: unknown }
+    | { kind: "user_profile"; value: string };
 
 function flatWireBodyBytes(payload: ShadowStateSyncPayload): number {
     return Buffer.byteLength(JSON.stringify(toFlatWireBody(payload)));
@@ -259,6 +266,7 @@ function buildPagedSeedPayloads(args: {
     compartments: unknown[];
     memories: unknown[];
     memoryMutations: unknown[];
+    userProfile?: string[];
     workspace: ShadowWorkspacePayload | null;
     lastTodoState: string;
     watermarks: ShadowWatermarks;
@@ -267,6 +275,7 @@ function buildPagedSeedPayloads(args: {
         ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
         ...args.memories.map((value) => ({ kind: "memory", value }) as const),
         ...args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const),
+        ...(args.userProfile ?? []).map((value) => ({ kind: "user_profile", value }) as const),
     ];
     const makePayload = (input: {
         index: number;
@@ -275,6 +284,7 @@ function buildPagedSeedPayloads(args: {
         compartments: unknown[];
         memories: unknown[];
         memoryMutations: unknown[];
+        userProfile: string[];
     }): ShadowStateSyncPayload => ({
         method: "state_sync",
         params: {
@@ -288,6 +298,7 @@ function buildPagedSeedPayloads(args: {
             compartments: input.compartments,
             memories: input.memories,
             memory_mutations: input.memoryMutations,
+            user_profile: input.userProfile,
             ...(input.complete
                 ? {
                       seed_boundary_id: args.seedBoundaryId,
@@ -300,27 +311,35 @@ function buildPagedSeedPayloads(args: {
         watermarks: args.watermarks,
     });
     const appendItem = (
-        batch: { compartments: unknown[]; memories: unknown[]; memoryMutations: unknown[] },
+        batch: {
+            compartments: unknown[];
+            memories: unknown[];
+            memoryMutations: unknown[];
+            userProfile: string[];
+        },
         item: ShadowSeedItem,
     ): void => {
         if (item.kind === "compartment") batch.compartments.push(item.value);
         else if (item.kind === "memory") batch.memories.push(item.value);
-        else batch.memoryMutations.push(item.value);
+        else if (item.kind === "memory_mutation") batch.memoryMutations.push(item.value);
+        else batch.userProfile.push(item.value);
     };
 
     let assumedTotal = 1;
     for (let attempt = 0; attempt < 10; attempt += 1) {
         const batches: ShadowStateSyncPayload[] = [];
-        let current = { compartments: [], memories: [], memoryMutations: [] } as {
+        let current = { compartments: [], memories: [], memoryMutations: [], userProfile: [] } as {
             compartments: unknown[];
             memories: unknown[];
             memoryMutations: unknown[];
+            userProfile: string[];
         };
         for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
             const candidate = {
                 compartments: [...current.compartments],
                 memories: [...current.memories],
                 memoryMutations: [...current.memoryMutations],
+                userProfile: [...current.userProfile],
             };
             appendItem(candidate, items[itemIndex]);
             const complete = itemIndex + 1 === items.length;
@@ -337,7 +356,8 @@ function buildPagedSeedPayloads(args: {
             const currentHasItems =
                 current.compartments.length > 0 ||
                 current.memories.length > 0 ||
-                current.memoryMutations.length > 0;
+                current.memoryMutations.length > 0 ||
+                current.userProfile.length > 0;
             if (currentHasItems) {
                 batches.push(
                     makePayload({
@@ -348,7 +368,7 @@ function buildPagedSeedPayloads(args: {
                     }),
                 );
             }
-            current = { compartments: [], memories: [], memoryMutations: [] };
+            current = { compartments: [], memories: [], memoryMutations: [], userProfile: [] };
             appendItem(current, items[itemIndex]);
             const itemOnlyPayload = makePayload({
                 index: batches.length,
@@ -368,7 +388,12 @@ function buildPagedSeedPayloads(args: {
                 });
                 if (flatWireBodyBytes(itemWithTailPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
                     batches.push(itemOnlyPayload);
-                    current = { compartments: [], memories: [], memoryMutations: [] };
+                    current = {
+                        compartments: [],
+                        memories: [],
+                        memoryMutations: [],
+                        userProfile: [],
+                    };
                 }
             }
         }
@@ -1146,6 +1171,10 @@ async function buildStateSyncPayload(args: {
         }));
 
     const renderedMemoryIds = allMemories.map((memory) => memory.id);
+    // Profile changes are not sent as incremental updates mid-session because sync
+    // tracking is scoped to session and project rows, not global profile rows. A full
+    // comparison flags one divergence, and the next complete sync applies the new profile.
+    const userProfile = getActiveUserMemories(args.pass.db).map((memory) => memory.content);
     const memoryMutations = args.pass.projectPath
         ? getMemoryMutationsForRenderByProjects(
               args.pass.db,
@@ -1182,6 +1211,7 @@ async function buildStateSyncPayload(args: {
             compartments,
             memories,
             memoryMutations,
+            userProfile,
             workspace: workspace.workspace,
             lastTodoState: sessionMeta.lastTodoState ?? "",
             watermarks: currentWatermarks,
@@ -1197,6 +1227,7 @@ async function buildStateSyncPayload(args: {
             compartments,
             memories,
             memory_mutations: memoryMutations,
+            user_profile: userProfile,
             workspace: workspace.workspace,
             last_todo_state: sessionMeta.lastTodoState ?? "",
             acked_watermarks: currentWatermarks,
@@ -1347,7 +1378,7 @@ function buildPagedTransformPayloads(body: Record<string, unknown>): Record<stri
     for (const field of arrayFields) delete scalarFields[field];
     const transformPageId = randomUUID();
     const items = arrayFields.flatMap((field) =>
-        (body[field] as unknown[]).map((value) => ({ field, value })),
+        (body[field] as unknown[]).map((value, itemIndex) => ({ field, value, itemIndex })),
     );
     const emptyArrays = (): Record<string, unknown[]> =>
         Object.fromEntries(arrayFields.map((field) => [field, []]));
@@ -1375,13 +1406,15 @@ function buildPagedTransformPayloads(body: Record<string, unknown>): Record<stri
         if (args.complete) Object.assign(page, scalarFields);
         return page;
     };
+    const hasItems = (arrays: Record<string, unknown[]>): boolean =>
+        Object.values(arrays).some((values) => values.length > 0);
 
     let assumedTotal = 1;
     for (let attempt = 0; attempt < 10; attempt += 1) {
         const pages: Record<string, unknown>[] = [];
         let current = emptyArrays();
-        for (const item of items) {
-            const candidate = { ...current, [item.field]: [...current[item.field], item.value] };
+        const appendUnit = (field: string, value: unknown): boolean => {
+            const candidate = { ...current, [field]: [...current[field], value] };
             const candidatePage = makePage({
                 index: pages.length,
                 total: assumedTotal,
@@ -1390,29 +1423,58 @@ function buildPagedTransformPayloads(body: Record<string, unknown>): Record<stri
             });
             if (Buffer.byteLength(JSON.stringify(candidatePage)) <= SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
                 current = candidate;
-                continue;
+                return true;
             }
-            if (Object.values(current).every((values) => values.length === 0)) {
-                throw new Error("shadow transform item exceeds the 512 KiB page limit");
+            if (hasItems(current)) {
+                pages.push(
+                    makePage({
+                        index: pages.length,
+                        total: assumedTotal,
+                        complete: false,
+                        arrays: current,
+                    }),
+                );
+                current = emptyArrays();
             }
-            pages.push(
-                makePage({
-                    index: pages.length,
-                    total: assumedTotal,
-                    complete: false,
-                    arrays: current,
-                }),
-            );
-            current = emptyArrays();
-            current[item.field].push(item.value);
-            const itemPage = makePage({
+            const itemOnlyPage = makePage({
                 index: pages.length,
                 total: assumedTotal,
                 complete: false,
-                arrays: current,
+                arrays: { ...current, [field]: [...current[field], value] },
             });
-            if (Buffer.byteLength(JSON.stringify(itemPage)) > SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
-                throw new Error("shadow transform item exceeds the 512 KiB page limit");
+            if (Buffer.byteLength(JSON.stringify(itemOnlyPage)) > SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
+                return false;
+            }
+            current[field].push(value);
+            return true;
+        };
+
+        for (const item of items) {
+            if (appendUnit(item.field, item.value)) continue;
+
+            const serialized = JSON.stringify(item.value) ?? "null";
+            const bytes = Buffer.from(serialized, "utf8");
+            const chunks: string[] = [];
+            for (let start = 0; start < bytes.length; ) {
+                let end = Math.min(start + SHADOW_TRANSFORM_ITEM_CHUNK_BYTES, bytes.length);
+                while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
+                chunks.push(bytes.subarray(start, end).toString("utf8"));
+                start = end;
+            }
+            const chunkTotal = chunks.length;
+            for (const [chunkIndex, chunk] of chunks.entries()) {
+                const marker = {
+                    [SHADOW_ITEM_CONTINUATION_KEY]: {
+                        field: item.field,
+                        item_index: item.itemIndex,
+                        chunk_index: chunkIndex,
+                        chunk_total: chunkTotal,
+                    },
+                    chunk,
+                };
+                if (!appendUnit(item.field, marker)) {
+                    throw new Error("shadow transform continuation exceeds the 512 KiB page limit");
+                }
             }
         }
 
@@ -1423,7 +1485,7 @@ function buildPagedTransformPayloads(body: Record<string, unknown>): Record<stri
             arrays: current,
         });
         if (Buffer.byteLength(JSON.stringify(finalPage)) > SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
-            if (Object.values(current).every((values) => values.length === 0)) {
+            if (!hasItems(current)) {
                 throw new Error("shadow transform scalar tail exceeds the 512 KiB page limit");
             }
             pages.push(

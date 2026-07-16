@@ -810,6 +810,25 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_wrapup_commands(session_id, created_at, command_id);
     ",
     },
+    Migration {
+        version: 20,
+        // User-profile rows belong to the shadow project namespace. Before 2026-07-16
+        // 17:14Z, missing profile rows and unsendable oversized items were known false
+        // positives. Delete those diagnostic rows because they predate both fixes.
+        statements: "
+        CREATE TABLE IF NOT EXISTS shadow_user_profile (
+            shadow_project_path  TEXT NOT NULL,
+            profile_index        INTEGER NOT NULL,
+            content              TEXT NOT NULL,
+            PRIMARY KEY (shadow_project_path, profile_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_shadow_user_profile_project
+            ON shadow_user_profile(shadow_project_path, profile_index);
+        DELETE FROM shadow_divergences
+         WHERE session_id LIKE 'shadow:%'
+           AND created_at < 1784222040000;
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1771,6 +1790,7 @@ pub struct ShadowStateSyncRequest<'a> {
     pub compartments: &'a [StoredCompartment],
     pub memories: &'a [ShadowMemoryRow],
     pub memory_mutations: &'a [ShadowMemoryMutationRow],
+    pub user_profile: &'a [String],
     pub workspace: Option<&'a ShadowWorkspaceRow>,
     pub last_todo_state: Option<String>,
     pub acked_watermarks: Value,
@@ -3713,6 +3733,7 @@ impl McStore {
             replace_shadow_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
             replace_shadow_memories_tx(tx, request.memories)?;
             replace_shadow_memory_mutations_tx(tx, request.memory_mutations)?;
+            replace_shadow_user_profile_tx(tx, request.shadow_project_path, request.user_profile)?;
 
             meta.last_todo_state = request.last_todo_state.clone();
             meta.shadow_seq = meta.shadow_seq.saturating_add(1);
@@ -3822,6 +3843,10 @@ impl McStore {
                              ON member.workspace_id = anchor.workspace_id
                           WHERE anchor.project_path = ?1
                      )",
+                params![shadow_project_path],
+            )?;
+            tx.execute(
+                "DELETE FROM shadow_user_profile WHERE shadow_project_path = ?1",
                 params![shadow_project_path],
             )?;
             tx.execute(
@@ -5755,6 +5780,26 @@ impl McStore {
         Ok(rows)
     }
 
+    /// Load the profile lines mirrored for one shadow project. Shadow composition must not
+    /// read the global user-memory table owned by the production leg.
+    pub fn load_shadow_user_profile(
+        &self,
+        shadow_project_path: &str,
+    ) -> Result<Vec<String>, McStoreError> {
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT content FROM shadow_user_profile
+                 WHERE shadow_project_path = ?1
+                 ORDER BY profile_index ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![shadow_project_path], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
     /// The highest memory-mutation-log id across the given project identities (the union,
     /// or a single-element slice). The cursor a baseline re-render (HARD) folds the
     /// corrections up to, and the watermark a delta pass (SOFT) reads new corrections
@@ -6148,6 +6193,25 @@ fn replace_shadow_memories_tx(
                 memory.merged_from.as_deref(),
                 memory.metadata_json.as_deref(),
             ],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_shadow_user_profile_tx(
+    tx: &rusqlite::Transaction<'_>,
+    shadow_project_path: &str,
+    profile_lines: &[String],
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM shadow_user_profile WHERE shadow_project_path = ?1",
+        params![shadow_project_path],
+    )?;
+    for (profile_index, content) in profile_lines.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO shadow_user_profile (shadow_project_path, profile_index, content)
+             VALUES (?1, ?2, ?3)",
+            params![shadow_project_path, profile_index as i64, content],
         )?;
     }
     Ok(())
@@ -7728,8 +7792,9 @@ mod tests {
                  (session_id, pass_seq, class, ts_prefix, rs_prefix, normalizations,
                   ts_decision, rs_decision, state_hash, created_at)
              VALUES
-                 ('shadow:test', 1, 'byte-mismatch', 'ts', 'rs', '[]', '{}', '{}', 'a', 1),
-                 ('shadow:test', 1, 'quarantined', '', '', '[]', '{}', '{}', 'b', 2);",
+                  ('shadow:test', 0, 'old-noise', 'old-ts', 'old-rs', '[]', '{}', '{}', 'old', 1),
+                  ('shadow:test', 1, 'byte-mismatch', 'ts', 'rs', '[]', '{}', '{}', 'a', 1784222040001),
+                  ('shadow:test', 1, 'quarantined', '', '', '[]', '{}', '{}', 'b', 2);",
         )
         .unwrap();
         for migration in MIGRATIONS
@@ -9308,6 +9373,7 @@ mod shadow_tests {
                 compartments: &[],
                 memories: &[own, shared, private],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: Some(&workspace),
                 last_todo_state: None,
                 acked_watermarks: serde_json::Value::Null,
@@ -9373,6 +9439,7 @@ mod shadow_tests {
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &mutations,
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: Some("[]".to_string()),
                 acked_watermarks: serde_json::json!({"seq": 0}),
@@ -9402,6 +9469,7 @@ mod shadow_tests {
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: serde_json::Value::Null,
@@ -9431,6 +9499,7 @@ mod shadow_tests {
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: serde_json::Value::Null,
@@ -9461,6 +9530,7 @@ mod shadow_tests {
                 compartments: &initial,
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: serde_json::Value::Null,
@@ -9480,6 +9550,7 @@ mod shadow_tests {
                 compartments: &replacement,
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: serde_json::Value::Null,
@@ -9507,6 +9578,7 @@ mod shadow_tests {
                 compartments: &replacement,
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: serde_json::Value::Null,
@@ -9532,6 +9604,7 @@ mod shadow_tests {
                 compartments: &compartments,
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: serde_json::Value::Null,
