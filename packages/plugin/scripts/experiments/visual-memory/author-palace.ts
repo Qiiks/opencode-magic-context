@@ -95,21 +95,19 @@ type LayoutItem = {
     heightPixels: number;
 };
 
-type Box = {
+type RoomPlan = {
     category: Category;
     name: string;
     lines: string[];
-    bodyLines: string[];
     entryBodyLines: Map<number, number>;
     relativeLines: Map<number, number>;
     entries: SpecEntry[];
     merges: SpecEntry[];
     peakImportance: number;
     sharedPairCount: number;
-    continuation: boolean;
-    segment: number;
-    heightPixels: number;
 };
+
+type StreamSlot = { column: number; row: number };
 
 function codepoints(value: string): number {
     return [...value].length;
@@ -392,54 +390,22 @@ function appendEntry(body: string[], cue: string, width: number): number {
     return placement;
 }
 
-function frameBox(
-    name: string,
-    bodyLines: string[],
-    peakImportance: number,
-    continuation: boolean,
-): string[] {
-    const innerWidth = ROOM_WIDTH - 2;
-    const high = peakImportance >= 70;
-    const [tl, fill, tr, side, bl, br] = high
-        ? ["╔", "═", "╗", "║", "╚", "╝"]
-        : ["┌", "─", "┐", "│", "└", "┘"];
-    const bottom = `${bl}${fill.repeat(innerWidth)}${br}`;
-    if (continuation) {
-        const marker = " … ";
-        const remaining = innerWidth - codepoints(marker);
-        const top = `${tl}${fill.repeat(Math.floor(remaining / 2))}${marker}${fill.repeat(Math.ceil(remaining / 2))}${tr}`;
-        return [
-            top,
-            ...bodyLines.map((line) => `${side}${line.padEnd(innerWidth)}${side}`),
-            bottom,
-        ];
-    }
-    const titlePadding = innerWidth - codepoints(name);
-    const title = `${" ".repeat(Math.floor(titlePadding / 2))}${name}${" ".repeat(Math.ceil(titlePadding / 2))}`;
-    return [
-        `${tl}${fill.repeat(innerWidth)}${tr}`,
-        `${side}${title}${side}`,
-        ...bodyLines.map((line) => `${side}${line.padEnd(innerWidth)}${side}`),
-        bottom,
-    ];
-}
-
-function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Box {
-    // Manifest order is the author's importance ranking; never sort it by id.
+function buildRoomPlan(category: Category, name: string, allEntries: SpecEntry[]): RoomPlan {
+    // Manifest order is the author's importance ranking; never sort entries by id.
     const entries = allEntries.filter((entry) => entry.mergeInto === undefined);
     const merges = allEntries.filter((entry) => entry.mergeInto !== undefined);
-    const innerWidth = ROOM_WIDTH - 2;
     const requiredTokenWidth = longestToken(entries);
-    if (requiredTokenWidth > innerWidth) {
-        throw new Error(`room ${name} has ${requiredTokenWidth}-char anchor (max ${innerWidth})`);
+    if (requiredTokenWidth > ROOM_WIDTH) {
+        throw new Error(`room ${name} has ${requiredTokenWidth}-char anchor (max ${ROOM_WIDTH})`);
     }
-    if (codepoints(name) * 2 > innerWidth) {
-        throw new Error(`2x room title ${name} exceeds ${innerWidth} cells`);
+    const header = `— ${name} —`;
+    if (codepoints(header) > ROOM_WIDTH) {
+        throw new Error(`room header ${name} exceeds ${ROOM_WIDTH} cells`);
     }
 
     const bodyLines: string[] = [];
     const entryBodyLines = new Map<number, number>();
-    const shortEntryLimit = Math.floor((innerWidth - 4) / 2);
+    const shortEntryLimit = Math.floor((ROOM_WIDTH - 4) / 2);
     let sharedPairCount = 0;
     for (let index = 0; index < entries.length; index++) {
         const entry = entries[index];
@@ -454,7 +420,7 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
             !nextCue.includes("⊘") &&
             codepoints(cue) <= shortEntryLimit &&
             codepoints(nextCue) <= shortEntryLimit &&
-            codepoints(shared) <= innerWidth
+            codepoints(shared) <= ROOM_WIDTH
         ) {
             const bodyLine = bodyLines.length;
             bodyLines.push(shared);
@@ -464,7 +430,7 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
             index++;
             continue;
         }
-        const bodyLine = appendEntry(bodyLines, cue, innerWidth);
+        const bodyLine = appendEntry(bodyLines, cue, ROOM_WIDTH);
         entryBodyLines.set(entry.id, bodyLine);
     }
     const peakImportance = Math.max(...allEntries.map((entry) => entry.importance));
@@ -472,7 +438,8 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
     for (const entry of entries) {
         const bodyLine = entryBodyLines.get(entry.id);
         if (bodyLine === undefined) throw new Error(`body line missing for ${entry.id}`);
-        relativeLines.set(entry.id, bodyLine + 2);
+        // The room header occupies line zero; palace lines are one-based.
+        relativeLines.set(entry.id, bodyLine + 1);
     }
     for (const merge of merges) {
         const targetLine =
@@ -483,17 +450,13 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
     return {
         category,
         name,
-        lines: frameBox(name, bodyLines, peakImportance, false),
-        bodyLines,
+        lines: [header, ...bodyLines],
         entryBodyLines,
         relativeLines,
         entries,
         merges,
         peakImportance,
         sharedPairCount,
-        continuation: false,
-        segment: 0,
-        heightPixels: 3 * CELL_HEIGHT + bodyLines.length * BODY_LINE_PITCH,
     };
 }
 
@@ -513,7 +476,14 @@ export function renderPalace(specs: SpecEntry[]): {
     droppedByTrimIds: number[];
     droppedBySkipIds: number[];
 } {
-    type RoomInput = { category: Category; name: string; entries: SpecEntry[] };
+    type RoomInput = {
+        category: Category;
+        name: string;
+        entries: SpecEntry[];
+        categoryIndex: number;
+        manifestOrder: number;
+    };
+    type Allocation = { banner?: StreamSlot; room: StreamSlot[]; end: StreamSlot };
     const grouped = new Map<string, RoomInput>();
     const MAX_RENDER_ITERATIONS = 1_000_000;
     let iterations = 0;
@@ -525,15 +495,38 @@ export function renderPalace(specs: SpecEntry[]): {
         }
     };
 
+    const nextManifestOrder = new Map<Category, number>();
     for (const spec of specs) {
         guard("grouping manifest entries");
         const key = `${spec.category}\u0000${spec.room}`;
-        const room = grouped.get(key) ?? { category: spec.category, name: spec.room, entries: [] };
+        const categoryOrder = nextManifestOrder.get(spec.category) ?? 0;
+        const room =
+            grouped.get(key) ??
+            {
+                category: spec.category,
+                name: spec.room,
+                entries: [],
+                categoryIndex: CATEGORY_ORDER.indexOf(spec.category),
+                manifestOrder: categoryOrder,
+            };
+        if (!grouped.has(key)) nextManifestOrder.set(spec.category, categoryOrder + 1);
         room.entries.push(spec);
         grouped.set(key, room);
     }
 
-    const palaceLines: string[] = [];
+    // Rooms keep their manifest order inside a category, while the global stream
+    // promotes the room whose best memory is most important.
+    const rooms = [...grouped.values()].sort((left, right) => {
+        const leftPeak = Math.max(...left.entries.map((entry) => entry.importance));
+        const rightPeak = Math.max(...right.entries.map((entry) => entry.importance));
+        return (
+            rightPeak - leftPeak ||
+            left.categoryIndex - right.categoryIndex ||
+            left.manifestOrder - right.manifestOrder
+        );
+    });
+
+    const columns = Array.from({ length: COLUMN_COUNT }, () => Array<string>(PAGE_HEIGHT_CELLS).fill(""));
     const placements = new Map<number, Placement>();
     const roomSummaries: RoomSummary[] = [];
     const layoutItems: LayoutItem[] = [];
@@ -541,17 +534,13 @@ export function renderPalace(specs: SpecEntry[]): {
     const droppedBySkipIds: number[] = [];
     const droppedTrimSet = new Set<number>();
     const droppedSkipSet = new Set<number>();
-    let usedHeightPixels = 0;
-    let usedRows = 0;
-    let categoryRendered = false;
-    let currentCategory: Category | undefined;
-    let currentBoxes: Box[] = [];
-    let currentBandHeightPixels = 0;
-    let currentBandHeightRows = 0;
+    const categoryRendered = new Set<Category>();
+    let cursor: StreamSlot = { column: 0, row: 0 };
 
     const categoryBanner = (category: Category): string => {
         const label = ` <${category}> `;
-        const remaining = MAX_LINE_CHARS - codepoints(label);
+        const remaining = ROOM_WIDTH - codepoints(label);
+        if (remaining < 0) throw new Error(`category banner exceeds column width: ${category}`);
         return `${"─".repeat(Math.floor(remaining / 2))}${label}${"─".repeat(Math.ceil(remaining / 2))}`;
     };
     const addDropped = (id: number, kind: "trim" | "skip"): void => {
@@ -565,193 +554,209 @@ export function renderPalace(specs: SpecEntry[]): {
         const ids = new Set(entries.map((entry) => entry.id));
         return entries.every((entry) => entry.mergeInto === undefined || ids.has(entry.mergeInto));
     };
-    const flushBand = (category: Category): void => {
-        if (currentBoxes.length === 0) return;
-        guard(`flushing ${category} placement band`);
-        if (currentCategory !== category) {
-            throw new Error(`placement band category changed from ${currentCategory} to ${category}`);
+    const isEnd = (slot: StreamSlot): boolean => slot.column >= COLUMN_COUNT;
+    const advance = (slot: StreamSlot): StreamSlot => {
+        const nextRow = slot.row + 1;
+        if (nextRow < PAGE_HEIGHT_CELLS) return { column: slot.column, row: nextRow };
+        return { column: slot.column + 1, row: 0 };
+    };
+    const segmentHeight = (lineCount: number, continuation: boolean): number => {
+        if (lineCount <= 0) return 0;
+        return continuation
+            ? lineCount * BODY_LINE_PITCH
+            : CELL_HEIGHT + Math.max(0, lineCount - 1) * BODY_LINE_PITCH;
+    };
+    const simulate = (
+        category: Category,
+        plan: RoomPlan,
+        includeBanner: boolean,
+    ): Allocation | undefined => {
+        let next = { ...cursor };
+        let banner: StreamSlot | undefined;
+        if (includeBanner) {
+            if (isEnd(next)) return undefined;
+            banner = next;
+            next = advance(next);
         }
-
-        let bandTopPixels = usedHeightPixels;
-        let bandTopRows = usedRows;
-        if (!categoryRendered) {
-            const bannerLine = palaceLines.length + 1;
-            const banner = categoryBanner(category);
-            palaceLines.push(banner);
-            layoutItems.push({
-                kind: "category",
-                category,
-                categories: [category],
-                column: 0,
-                startLine: bannerLine,
-                endLine: bannerLine,
-                page: 1,
-                pageLine: bannerLine,
-                pageTopPixels: usedHeightPixels,
-                heightPixels: BANNER_HEIGHT_PIXELS,
-            });
-            usedHeightPixels += BANNER_HEIGHT_PIXELS;
-            usedRows++;
-            bandTopPixels = usedHeightPixels;
-            bandTopRows = usedRows;
-            categoryRendered = true;
-        }
-
-        const bandStartLine = palaceLines.length + 1;
-        const bandPageLine = bandStartLine;
-        const columns = Array.from({ length: COLUMN_COUNT }, () => [] as string[]);
-        const columnRows = Array<number>(COLUMN_COUNT).fill(0);
-        const columnPixelRows = Array<number>(COLUMN_COUNT).fill(0);
-        for (const [index, box] of currentBoxes.entries()) {
-            guard(`placing ${category} room boxes`);
-            const column = index;
-            const boxLines = columns[column];
-            if (!boxLines) throw new Error(`missing column ${column} while placing ${category}`);
-            boxLines.push(...box.lines);
-            const row = columnRows[column] ?? 0;
-            const pixelRow = columnPixelRows[column] ?? 0;
-            columnRows[column] = row + box.lines.length;
-            columnPixelRows[column] = pixelRow + box.heightPixels;
-            const startLine = bandStartLine + row;
-            const roomPageLine = bandPageLine + row;
-            const roomPageTopPixels = bandTopPixels + pixelRow;
-            for (const entry of [...box.entries, ...box.merges]) {
-                guard(`placing ${category}/${box.name} entries`);
-                const relativeLine = box.relativeLines.get(entry.id);
-                if (relativeLine === undefined) throw new Error(`placement missing for ${entry.id}`);
-                placements.set(entry.id, {
-                    category: box.category,
-                    room: box.name,
-                    palaceLine: startLine + relativeLine,
-                    palaceColumn: column * (ROOM_WIDTH + COLUMN_GAP) + 1,
-                    page: 1,
-                    pageLine: roomPageLine + relativeLine,
-                    ...(entry.mergeInto === undefined ? {} : { mergedInto: entry.mergeInto }),
-                });
+        // Keeping the header beside the bottom edge would make it an orphan.
+        if (isEnd(next)) return undefined;
+        if (next.row === PAGE_HEIGHT_CELLS - 1) next = advance(next);
+        if (isEnd(next)) return undefined;
+        const roomSlots: StreamSlot[] = [];
+        for (const line of plan.lines) {
+            guard(`simulating ${category}/${plan.name} flow`);
+            if (codepoints(line) > ROOM_WIDTH) {
+                throw new Error(`line in ${category}/${plan.name} exceeds ${ROOM_WIDTH} cells`);
             }
-            roomSummaries.push({
-                category: box.category,
-                name: box.name,
-                entryCount: box.entries.length,
-                mergeCount: box.merges.length,
-                memoryCount: box.entries.length + box.merges.length,
-                peakImportance: box.peakImportance,
-                border: box.peakImportance >= 70 ? "double" : "single",
-                column,
-                startLine,
-                endLine: startLine + box.lines.length - 1,
-                heightCells: box.lines.length,
-                sharedPairCount: box.sharedPairCount,
-                continuation: false,
-                segment: 0,
-                page: 1,
-                pageLine: roomPageLine,
-                pageTopPixels: roomPageTopPixels,
-                heightPixels: box.heightPixels,
+            roomSlots.push(next);
+            next = advance(next);
+            if (isEnd(next) && roomSlots.length < plan.lines.length) return undefined;
+        }
+        if (roomSlots.length < 2) return undefined;
+        return { ...(banner ? { banner } : {}), room: roomSlots, end: next };
+    };
+    const writeSlot = (slot: StreamSlot, line: string, context: string): void => {
+        guard(`writing ${context}`);
+        const column = columns[slot.column];
+        if (!column) throw new Error(`missing column ${slot.column} while writing ${context}`);
+        if (slot.row < 0 || slot.row >= column.length) {
+            throw new Error(`line ${slot.row} is outside column ${slot.column} while writing ${context}`);
+        }
+        if (codepoints(line) > ROOM_WIDTH) throw new Error(`${context} exceeds ${ROOM_WIDTH} cells`);
+        column[slot.row] = line;
+    };
+    const recordCategory = (category: Category, slot: StreamSlot): void => {
+        writeSlot(slot, categoryBanner(category), `${category} banner`);
+        const line = slot.row + 1;
+        layoutItems.push({
+            kind: "category",
+            category,
+            categories: [category],
+            column: slot.column,
+            startLine: line,
+            endLine: line,
+            page: 1,
+            pageLine: line,
+            pageTopPixels: slot.row * BODY_LINE_PITCH,
+            heightPixels: CELL_HEIGHT,
+        });
+    };
+    const recordRoom = (room: RoomInput, plan: RoomPlan, allocation: Allocation): void => {
+        const segmentSlots = new Map<number, StreamSlot[]>();
+        for (const slot of allocation.room) {
+            const segment = segmentSlots.get(slot.column) ?? [];
+            segment.push(slot);
+            segmentSlots.set(slot.column, segment);
+        }
+        const segmentColumns = [...segmentSlots.keys()];
+        if (segmentColumns.length > 1) {
+            // This is the only count that describes a room crossing a column.
+            // It is intentionally derived from the emitted segments, not from
+            // source order, so split coverage remains deterministic.
+        }
+        for (const [segmentIndex, column] of segmentColumns.entries()) {
+            guard(`recording ${room.category}/${room.name} segment`);
+            const slots = segmentSlots.get(column);
+            if (!slots || slots.length === 0) throw new Error(`empty segment for ${room.name}`);
+            const startLine = (slots[0]?.row ?? 0) + 1;
+            const endLine = (slots.at(-1)?.row ?? 0) + 1;
+            const continuation = segmentIndex > 0;
+            const segmentEntries = [...plan.entries, ...plan.merges].filter((entry) => {
+                const relativeLine = plan.relativeLines.get(entry.id);
+                const slot = relativeLine === undefined ? undefined : allocation.room[relativeLine];
+                return slot?.column === column;
             });
-            layoutItems.push({
+            const entryCount = segmentEntries.filter((entry) => entry.mergeInto === undefined).length;
+            const mergeCount = segmentEntries.length - entryCount;
+            const heightPixels = segmentHeight(slots.length, continuation);
+            const layoutItem: LayoutItem = {
                 kind: "room",
-                category: box.category,
-                room: box.name,
-                continuation: false,
-                segment: 0,
+                category: room.category,
+                room: room.name,
+                continuation,
+                segment: segmentIndex,
                 column,
                 startLine,
-                endLine: startLine + box.lines.length - 1,
+                endLine,
                 page: 1,
-                pageLine: roomPageLine,
-                pageTopPixels: roomPageTopPixels,
-                heightPixels: box.heightPixels,
+                pageLine: startLine,
+                pageTopPixels: (slots[0]?.row ?? 0) * BODY_LINE_PITCH,
+                heightPixels,
+            };
+            layoutItems.push(layoutItem);
+            roomSummaries.push({
+                category: room.category,
+                name: room.name,
+                entryCount,
+                mergeCount,
+                memoryCount: entryCount + mergeCount,
+                peakImportance: plan.peakImportance,
+                // Retained for sidecar compatibility; border characters are no longer emitted.
+                border: plan.peakImportance >= 70 ? "double" : "single",
+                column,
+                startLine,
+                endLine,
+                heightCells: slots.length,
+                sharedPairCount: segmentIndex === 0 ? plan.sharedPairCount : 0,
+                continuation,
+                segment: segmentIndex,
+                page: 1,
+                pageLine: startLine,
+                pageTopPixels: (slots[0]?.row ?? 0) * BODY_LINE_PITCH,
+                heightPixels,
             });
         }
-
-        const bandHeight = Math.max(...columnRows);
-        for (let row = 0; row < bandHeight; row++) {
-            guard(`writing ${category} placement band lines`);
-            const line = columns
-                .map((column) => (column[row] ?? "").padEnd(ROOM_WIDTH))
-                .join(" ".repeat(COLUMN_GAP))
-                .padEnd(MAX_LINE_CHARS);
-            palaceLines.push(line);
+        for (const entry of [...plan.entries, ...plan.merges]) {
+            guard(`recording ${room.category}/${room.name} entries`);
+            const relativeLine = plan.relativeLines.get(entry.id);
+            if (relativeLine === undefined) throw new Error(`placement missing for ${entry.id}`);
+            const slot = allocation.room[relativeLine];
+            if (!slot) throw new Error(`room line ${relativeLine} missing for ${entry.id}`);
+            placements.set(entry.id, {
+                category: room.category,
+                room: room.name,
+                palaceLine: slot.row + 1,
+                palaceColumn: slot.column * (ROOM_WIDTH + COLUMN_GAP) + 1,
+                page: 1,
+                pageLine: slot.row + 1,
+                ...(entry.mergeInto === undefined ? {} : { mergedInto: entry.mergeInto }),
+            });
         }
-        usedHeightPixels = bandTopPixels + currentBandHeightPixels;
-        usedRows = bandTopRows + bandHeight;
-        if (usedHeightPixels > PAGE_HEIGHT_PIXELS) {
-            throw new Error(`single-page placement exceeds page by ${usedHeightPixels - PAGE_HEIGHT_PIXELS}px`);
-        }
-        if (usedRows > PAGE_HEIGHT_CELLS) {
-            throw new Error(`single-page text placement exceeds page by ${usedRows - PAGE_HEIGHT_CELLS} rows`);
-        }
-        currentBoxes = [];
-        currentBandHeightPixels = 0;
-        currentBandHeightRows = 0;
     };
 
-    for (const category of CATEGORY_ORDER) {
-        guard(`scanning ${category} rooms`);
-        const rooms = [...grouped.values()].filter((room) => room.category === category);
-        if (rooms.length === 0) continue;
-        currentCategory = category;
-        categoryRendered = false;
-        for (const room of rooms) {
-            guard(`selecting ${category}/${room.name}`);
-            if (currentBoxes.length >= COLUMN_COUNT) flushBand(category);
-            const fits = (box: Box): boolean => {
-                const bannerHeight = categoryRendered || currentBoxes.length > 0 ? 0 : BANNER_HEIGHT_PIXELS;
-                const bannerRows = categoryRendered || currentBoxes.length > 0 ? 0 : 1;
-                return (
-                    usedHeightPixels + bannerHeight + Math.max(currentBandHeightPixels, box.heightPixels) <=
-                        PAGE_HEIGHT_PIXELS &&
-                    usedRows + bannerRows + Math.max(currentBandHeightRows, box.lines.length) <=
-                        PAGE_HEIGHT_CELLS
-                );
-            };
-            const selectBox = (): { box: Box; trimmed: SpecEntry[] } | undefined => {
-                if (!mergeTargetsArePresent(room.entries)) {
-                    throw new Error(`room ${room.name} has a merge target outside its manifest order`);
-                }
-                const full = buildBox(room.category, room.name, room.entries);
-                if (fits(full)) return { box: full, trimmed: [] };
-                for (let keep = room.entries.length - 1; keep >= 2; keep--) {
-                    guard(`trimming ${category}/${room.name}`);
-                    const prefix = room.entries.slice(0, keep);
-                    if (!mergeTargetsArePresent(prefix)) continue;
-                    const trial = buildBox(room.category, room.name, prefix);
-                    if (fits(trial)) return { box: trial, trimmed: room.entries.slice(keep) };
-                }
-                return undefined;
-            };
-
-            let selected = selectBox();
-            if (!selected && currentBoxes.length > 0) {
-                flushBand(category);
-                selected = selectBox();
-            }
-            if (!selected) {
-                for (const entry of room.entries) {
-                    guard(`dropping skipped ${category}/${room.name}`);
-                    addDropped(entry.id, "skip");
-                }
-                continue;
-            }
-            for (const entry of selected.trimmed) {
-                guard(`dropping trimmed ${category}/${room.name}`);
-                addDropped(entry.id, "trim");
-            }
-            currentBoxes.push(selected.box);
-            currentBandHeightPixels = Math.max(currentBandHeightPixels, selected.box.heightPixels);
-            currentBandHeightRows = Math.max(currentBandHeightRows, selected.box.lines.length);
+    for (const room of rooms) {
+        guard(`selecting ${room.category}/${room.name}`);
+        if (!mergeTargetsArePresent(room.entries)) {
+            throw new Error(`room ${room.name} has a merge target outside its manifest order`);
         }
-        flushBand(category);
-        currentCategory = undefined;
+        const includeBanner = !categoryRendered.has(room.category);
+        const select = (entries: SpecEntry[]): { plan: RoomPlan; allocation: Allocation } | undefined => {
+            if (!mergeTargetsArePresent(entries)) return undefined;
+            const plan = buildRoomPlan(room.category, room.name, entries);
+            const allocation = simulate(room.category, plan, includeBanner);
+            return allocation ? { plan, allocation } : undefined;
+        };
+        let selected = select(room.entries);
+        if (!selected) {
+            for (let keep = room.entries.length - 1; keep >= 1; keep--) {
+                guard(`trimming ${room.category}/${room.name}`);
+                selected = select(room.entries.slice(0, keep));
+                if (selected) {
+                    for (const entry of room.entries.slice(keep)) addDropped(entry.id, "trim");
+                    break;
+                }
+            }
+        }
+        if (!selected) {
+            for (const entry of room.entries) {
+                guard(`dropping skipped ${room.category}/${room.name}`);
+                addDropped(entry.id, "skip");
+            }
+            continue;
+        }
+        if (selected.allocation.banner) recordCategory(room.category, selected.allocation.banner);
+        categoryRendered.add(room.category);
+        for (let index = 0; index < selected.plan.lines.length; index++) {
+            const slot = selected.allocation.room[index];
+            const line = selected.plan.lines[index];
+            if (!slot || line === undefined) throw new Error(`room line ${index} missing for ${room.name}`);
+            writeSlot(slot, line, `${room.category}/${room.name} room line`);
+        }
+        recordRoom(room, selected.plan, selected.allocation);
+        // Rooms may touch: the newspaper flow must consume every available line.
+        cursor = selected.allocation.end;
     }
 
-    for (let row = palaceLines.length; row < PAGE_HEIGHT_CELLS; row++) {
+    const palaceLines = columns[0]?.map((_, row) =>
+        columns
+            .map((column) => (column[row] ?? "").padEnd(ROOM_WIDTH))
+            .join(" ".repeat(COLUMN_GAP)),
+    ) ?? [];
+    for (let row = 0; row < palaceLines.length; row++) {
         guard("padding the fixed page canvas");
-        palaceLines.push("");
-    }
-    if (palaceLines.length > PAGE_HEIGHT_CELLS) {
-        throw new Error(`single-page text canvas has ${palaceLines.length} rows (max ${PAGE_HEIGHT_CELLS})`);
+        if (codepoints(palaceLines[row] ?? "") > MAX_LINE_CHARS) {
+            throw new Error(`line ${row + 1} exceeds ${MAX_LINE_CHARS} cells`);
+        }
     }
     const palace = `${palaceLines.join("\n")}\n`;
     const longLines = palaceLines
@@ -782,7 +787,11 @@ export function renderPalace(specs: SpecEntry[]): {
                 heightPixels: PAGE_HEIGHT_PIXELS,
             },
         ],
-        leveling: { gapRowsBefore: 0, gapRowsAfter: 0, splitCount: 0 },
+        leveling: {
+            gapRowsBefore: 0,
+            gapRowsAfter: 0,
+            splitCount: roomSummaries.filter((room) => room.continuation).length,
+        },
         droppedByTrimIds,
         droppedBySkipIds,
     };
