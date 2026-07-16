@@ -327,7 +327,7 @@ export async function runAutoSearchHint(args: {
                     signal,
                     "query",
                 );
-                return result?.vector ?? null;
+                return result;
             },
             isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
             // Hard-filter memories already rendered in <session-history>.

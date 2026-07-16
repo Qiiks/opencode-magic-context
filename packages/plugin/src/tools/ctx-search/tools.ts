@@ -224,7 +224,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                             signal,
                             "query",
                         );
-                        return result?.vector ?? null;
+                        return result;
                     },
                     isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
                     readMessages: deps.readMessages,

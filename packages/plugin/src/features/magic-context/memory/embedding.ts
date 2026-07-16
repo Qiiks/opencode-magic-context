@@ -8,6 +8,7 @@ import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import { LocalEmbeddingProvider } from "./embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./embedding-openai";
 import type { EmbeddingProvider } from "./embedding-provider";
+import { SynapseEmbeddingProvider } from "./embedding-synapse";
 import { saveEmbedding } from "./storage-memory-embeddings";
 
 export type {
@@ -17,14 +18,22 @@ export type {
 export {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
+    contentSha256,
     embedBatchForProject,
+    embedItemsForProject,
+    embedShadowTextForProject,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
     embedUnembeddedMemoriesForProject,
+    enqueueShadowEmbeddingItems,
+    getPrimaryEmbeddingMeasurementCohort,
     getProjectEmbeddingSnapshot,
+    getShadowEmbeddingMeasurementCohort,
     markProjectLoadUntrusted,
     registerProjectEmbedding,
     registerProjectInObservationMode,
+    registerProjectShadowEmbedding,
+    type ShadowEmbeddingMeasurementCohort,
     sweepAllRegisteredProjects,
     unregisterProjectEmbedding,
 } from "../project-embedding-registry";
@@ -103,7 +112,15 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
         };
     }
 
-    return { provider: "off" };
+    if (config.provider === "off") {
+        return { provider: "off" };
+    }
+
+    if (config.provider === "synapse") {
+        return { ...config, max_input_tokens: 8192 };
+    }
+
+    throw new Error("Unknown embedding provider");
 }
 
 function resolveProviderIdentity(config: EmbeddingConfig): string {
@@ -127,7 +144,34 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
         });
     }
 
-    return new LocalEmbeddingProvider(config.model, config.max_input_tokens);
+    if (config.provider === "local") {
+        return new LocalEmbeddingProvider(config.model, config.max_input_tokens);
+    }
+
+    if (config.provider === "synapse") {
+        const synapse = config as EmbeddingConfig & {
+            model?: string;
+            synapse_connection_file?: string;
+            synapse_fingerprint?: string;
+            synapse_table_epoch?: number;
+            synapse_dims?: number;
+            synapse_recommended_batch?: number;
+            synapse_provenance?: unknown;
+        };
+        return new SynapseEmbeddingProvider({
+            connectionFile: synapse.synapse_connection_file ?? "",
+            projectRoot: "",
+            session: "embedding",
+            model: synapse.model,
+            fingerprint: synapse.synapse_fingerprint,
+            tableEpoch: synapse.synapse_table_epoch,
+            dims: synapse.synapse_dims,
+            recommendedBatch: synapse.synapse_recommended_batch,
+            provenance: synapse.synapse_provenance,
+        });
+    }
+
+    throw new Error("Unknown embedding provider");
 }
 
 function getOrCreateProvider(): EmbeddingProvider | null {

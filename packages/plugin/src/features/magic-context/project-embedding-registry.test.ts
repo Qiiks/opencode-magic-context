@@ -223,6 +223,45 @@ describe("project embedding registry", () => {
         tempDirs.length = 0;
     });
 
+    it("preserves existing provider and runtime identity goldens", () => {
+        const db = useTempDb();
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const local = registerProjectEmbedding(
+            db,
+            "golden-local",
+            { provider: "local", model: "Xenova/all-MiniLM-L6-v2" },
+            features,
+            "/repo",
+        );
+        const openai = registerProjectEmbedding(
+            db,
+            "golden-openai",
+            {
+                provider: "openai-compatible",
+                model: "text-embedding-3-small",
+                endpoint: "https://example.test/v1",
+                api_key: "secret",
+                input_type: "passage",
+                truncate: "END",
+            },
+            features,
+            "/repo",
+        );
+        const off = registerProjectEmbedding(db, "golden-off", { provider: "off" }, features, "/repo");
+        expect({ providerIdentity: local.providerIdentity, runtimeFingerprint: local.runtimeFingerprint }).toEqual({
+            providerIdentity: "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357",
+            runtimeFingerprint: "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357:f0bab7fe74e0f0a0",
+        });
+        expect({ providerIdentity: openai.providerIdentity, runtimeFingerprint: openai.runtimeFingerprint }).toEqual({
+            providerIdentity: "embedding-provider:efd9edf1dbe1d83cef0860fb93475cb4",
+            runtimeFingerprint: "embedding-provider:efd9edf1dbe1d83cef0860fb93475cb4:9b840cd5c05319d9",
+        });
+        expect({ providerIdentity: off.providerIdentity, runtimeFingerprint: off.runtimeFingerprint }).toEqual({
+            providerIdentity: "embedding-provider:off",
+            runtimeFingerprint: "embedding-provider:off",
+        });
+    });
+
     it("takes a BEGIN IMMEDIATE write lock while registering a project", () => {
         const db = useTempDb();
         const calls: string[] = [];

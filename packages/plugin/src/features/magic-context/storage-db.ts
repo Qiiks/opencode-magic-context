@@ -44,7 +44,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 52;
+export const LATEST_SUPPORTED_VERSION = 53;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -613,6 +613,76 @@ export function initializeDatabase(db: Database): void {
       last_active_at INTEGER NOT NULL,
       PRIMARY KEY(project_path, scope, model_id)
     );
+
+    CREATE TABLE IF NOT EXISTS embedding_registrations (
+      project_path TEXT PRIMARY KEY,
+      provider_identity TEXT NOT NULL DEFAULT '',
+      model_id TEXT NOT NULL DEFAULT '',
+      chunk_model_id TEXT NOT NULL DEFAULT '',
+      fingerprint TEXT NOT NULL DEFAULT '',
+      table_epoch INTEGER NOT NULL DEFAULT 0,
+      dims INTEGER NOT NULL DEFAULT 0,
+      provenance_json TEXT NOT NULL DEFAULT '{}',
+      generation INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS synapse_batch_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      project_path TEXT NOT NULL DEFAULT '',
+      scope TEXT NOT NULL DEFAULT '',
+      manifest_json TEXT NOT NULL DEFAULT '{}',
+      request_key TEXT NOT NULL DEFAULT '',
+      job_id TEXT,
+      cursor TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(session_id, request_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_synapse_batch_ledger_session
+      ON synapse_batch_ledger(session_id, updated_at);
+
+    CREATE TABLE IF NOT EXISTS shadow_embedding_registrations (
+      project_path TEXT NOT NULL,
+      scope TEXT NOT NULL CHECK(scope IN ('memory', 'commit', 'chunk')),
+      model_id TEXT NOT NULL,
+      generation INTEGER NOT NULL DEFAULT 0,
+      fingerprint TEXT NOT NULL DEFAULT '',
+      table_epoch INTEGER NOT NULL DEFAULT 0,
+      dims INTEGER NOT NULL DEFAULT 0,
+      provenance_json TEXT NOT NULL DEFAULT '{}',
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(project_path, scope, model_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS embedding_measurement_corpus (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      project_path TEXT NOT NULL DEFAULT '',
+      dedup_key TEXT NOT NULL DEFAULT '',
+      cohort_key TEXT NOT NULL DEFAULT '',
+      query_text_hash TEXT NOT NULL DEFAULT '',
+      primary_result_ids_json TEXT NOT NULL DEFAULT '[]',
+      shadow_result_ids_json TEXT NOT NULL DEFAULT '[]',
+      primary_latency_ms INTEGER,
+      shadow_latency_ms INTEGER,
+      primary_failed INTEGER NOT NULL DEFAULT 0,
+      shadow_failed INTEGER NOT NULL DEFAULT 0,
+      primary_model_id TEXT NOT NULL DEFAULT '',
+      shadow_model_id TEXT NOT NULL DEFAULT '',
+      primary_fingerprint TEXT NOT NULL DEFAULT '',
+      shadow_fingerprint TEXT NOT NULL DEFAULT '',
+      primary_epoch INTEGER NOT NULL DEFAULT 0,
+      shadow_epoch INTEGER NOT NULL DEFAULT 0,
+      corpus_hash TEXT NOT NULL DEFAULT '',
+      coverage_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(dedup_key, cohort_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_embedding_measurement_session
+      ON embedding_measurement_corpus(session_id, created_at);
 
     CREATE TABLE IF NOT EXISTS memory_verifications (
       memory_id    INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,

@@ -129,7 +129,7 @@ export interface MagicContextDeps {
             };
         };
         embedding?: {
-            provider?: "local" | "openai-compatible" | "off";
+            provider?: "local" | "openai-compatible" | "off" | "synapse";
         };
         sidekick?: SidekickConfig;
         dreamer?: DreamerConfig;

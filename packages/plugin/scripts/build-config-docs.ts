@@ -163,7 +163,7 @@ function renderTable(rows: LeafRow[]): string {
 // generated JSON schema (so editors validate them) but are not user-facing
 // features; documenting them would invite support questions about internal
 // tooling that requires a local daemon setup users do not have.
-const DEV_ONLY_KEYS = new Set<string>(["shadow_transform"]);
+const DEV_ONLY_KEYS = new Set<string>(["shadow_transform", "shadow_embedding"]);
 
 export function buildConfigDocs(): string {
     const schema = buildSchema() as JsonSchema;

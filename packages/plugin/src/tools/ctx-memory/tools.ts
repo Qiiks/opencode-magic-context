@@ -18,6 +18,7 @@ import {
 } from "../../features/magic-context/memory";
 import {
     embedTextForProject,
+    enqueueShadowEmbeddingItems,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
 import { invalidateMemory } from "../../features/magic-context/memory/embedding-cache";
@@ -184,6 +185,7 @@ function queueMemoryEmbedding(args: {
             return;
         }
 
+        enqueueShadowEmbeddingItems(args.projectPath, "memory", [String(args.memoryId)]);
         sessionLog(args.sessionId, `proactively embedded memory ${args.memoryId}.`);
     })().catch((error: unknown) => {
         sessionLog(args.sessionId, `memory embedding failed for memory ${args.memoryId}:`, error);

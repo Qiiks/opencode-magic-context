@@ -35,6 +35,12 @@ import { LocalEmbeddingProvider } from "./memory/embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./memory/embedding-openai";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import {
+    getSynapseBatchRequestKey,
+    SYNAPSE_DEFAULT_MODEL,
+    SYNAPSE_MAX_INPUT_TOKENS,
+    SynapseEmbeddingProvider,
+} from "./memory/embedding-synapse";
+import {
     getMemoryEmbedCoverage,
     saveEmbeddingIfHashMatches,
 } from "./memory/storage-memory-embeddings";
@@ -42,6 +48,10 @@ import {
     recordSessionProjectIdentity,
     repairMisScopedCompartmentChunkEmbeddingsForProject,
 } from "./session-project-storage";
+import {
+    beginSynapseBatchLedger,
+    finishSynapseBatchLedger,
+} from "./storage-embedding-measurements";
 
 const OFF_PROVIDER_IDENTITY = "embedding-provider:off";
 const SWEEP_MAX_WALL_CLOCK_MS = 10 * 60 * 1000;
@@ -142,6 +152,32 @@ interface StaleIdentityRow {
 }
 
 const projectRegistrations = new Map<string, ProjectEmbeddingRegistration>();
+
+interface ShadowEmbeddingRegistration {
+    projectIdentity: string;
+    sourceDirectory: string;
+    config: EmbeddingConfig;
+    provider: EmbeddingProvider;
+    providerIdentity: string;
+    modelId: string;
+    chunkModelId: string;
+    generation: number;
+}
+
+type ShadowScope = "memory" | "commit" | "chunk";
+interface ShadowQueueItem {
+    projectIdentity: string;
+    scope: ShadowScope;
+    ids: string[];
+}
+
+const shadowRegistrations = new Map<string, ShadowEmbeddingRegistration>();
+const shadowQueue: ShadowQueueItem[] = [];
+let shadowWorker: Promise<void> | null = null;
+const SHADOW_MAX_ITEMS_PER_TICK = 64;
+const SHADOW_MAX_BYTES_PER_TICK = 512 * 1024;
+const SHADOW_MAX_WALL_CLOCK_MS = 2_000;
+
 const loadUnembeddedMemoriesStatements = new WeakMap<Database, PreparedStatement>();
 const upsertActiveIdentityStatements = new WeakMap<Database, PreparedStatement>();
 const backfillActiveIdentityStatements = new Map<
@@ -171,6 +207,140 @@ export function markProjectLoadUntrusted(projectIdentity: string): void {
 }
 let projectSweepInProgress = false;
 let testProviderFactory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null = null;
+
+function synapseConfigFields(config: EmbeddingConfig): {
+    model?: string;
+    fingerprint?: string;
+    tableEpoch?: number;
+    dims?: number;
+    provenance?: unknown;
+} {
+    const raw = config as unknown as Record<string, unknown>;
+    return {
+        ...(typeof raw.model === "string" ? { model: raw.model } : {}),
+        ...(typeof raw.synapse_fingerprint === "string"
+            ? { fingerprint: raw.synapse_fingerprint }
+            : {}),
+        ...(typeof raw.synapse_table_epoch === "number"
+            ? { tableEpoch: raw.synapse_table_epoch }
+            : {}),
+        ...(typeof raw.synapse_dims === "number" ? { dims: raw.synapse_dims } : {}),
+        ...(raw.synapse_provenance !== undefined ? { provenance: raw.synapse_provenance } : {}),
+    };
+}
+
+function persistPrimaryDescriptor(db: Database, registration: ProjectEmbeddingRegistration): void {
+    const descriptorTable = db
+        .prepare(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'embedding_registrations'",
+        )
+        .get();
+    if (!descriptorTable) return;
+    const fields = synapseConfigFields(registration.config);
+    db.prepare(
+        `INSERT INTO embedding_registrations
+            (project_path, provider_identity, model_id, chunk_model_id, fingerprint, table_epoch, dims, provenance_json, generation, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path) DO UPDATE SET
+            provider_identity = excluded.provider_identity,
+            model_id = excluded.model_id,
+            chunk_model_id = excluded.chunk_model_id,
+            fingerprint = excluded.fingerprint,
+            table_epoch = excluded.table_epoch,
+            dims = excluded.dims,
+            provenance_json = excluded.provenance_json,
+            generation = excluded.generation,
+            updated_at = excluded.updated_at`,
+    ).run(
+        registration.projectIdentity,
+        registration.providerIdentity,
+        registration.modelId,
+        registration.chunkModelId,
+        fields.fingerprint ?? "",
+        fields.tableEpoch ?? 0,
+        fields.dims ?? 0,
+        JSON.stringify(fields.provenance ?? {}),
+        registration.generation,
+        Date.now(),
+    );
+}
+
+function persistShadowDescriptor(db: Database, registration: ShadowEmbeddingRegistration): void {
+    const descriptorTable = db
+        .prepare(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'shadow_embedding_registrations'",
+        )
+        .get();
+    if (!descriptorTable) return;
+    const fields = synapseConfigFields(registration.config);
+    const now = Date.now();
+    db.prepare(
+        `INSERT INTO shadow_embedding_registrations
+            (project_path, scope, model_id, generation, fingerprint, table_epoch, dims, provenance_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path, scope, model_id) DO UPDATE SET
+            generation = excluded.generation,
+            fingerprint = excluded.fingerprint,
+            table_epoch = excluded.table_epoch,
+            dims = excluded.dims,
+            provenance_json = excluded.provenance_json,
+            updated_at = excluded.updated_at`,
+    ).run(
+        registration.projectIdentity,
+        "memory",
+        registration.modelId,
+        registration.generation,
+        fields.fingerprint ?? "",
+        fields.tableEpoch ?? 0,
+        fields.dims ?? 0,
+        JSON.stringify(fields.provenance ?? {}),
+        now,
+    );
+    db.prepare(
+        `INSERT INTO shadow_embedding_registrations
+            (project_path, scope, model_id, generation, fingerprint, table_epoch, dims, provenance_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path, scope, model_id) DO UPDATE SET
+            generation = excluded.generation,
+            fingerprint = excluded.fingerprint,
+            table_epoch = excluded.table_epoch,
+            dims = excluded.dims,
+            provenance_json = excluded.provenance_json,
+            updated_at = excluded.updated_at`,
+    ).run(
+        registration.projectIdentity,
+        "commit",
+        registration.modelId,
+        registration.generation,
+        fields.fingerprint ?? "",
+        fields.tableEpoch ?? 0,
+        fields.dims ?? 0,
+        JSON.stringify(fields.provenance ?? {}),
+        now,
+    );
+    db.prepare(
+        `INSERT INTO shadow_embedding_registrations
+            (project_path, scope, model_id, generation, fingerprint, table_epoch, dims, provenance_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path, scope, model_id) DO UPDATE SET
+            generation = excluded.generation,
+            fingerprint = excluded.fingerprint,
+            table_epoch = excluded.table_epoch,
+            dims = excluded.dims,
+            provenance_json = excluded.provenance_json,
+            updated_at = excluded.updated_at`,
+    ).run(
+        registration.projectIdentity,
+        "chunk",
+        registration.chunkModelId,
+        registration.generation,
+        fields.fingerprint ?? "",
+        fields.tableEpoch ?? 0,
+        fields.dims ?? 0,
+        JSON.stringify(fields.provenance ?? {}),
+        now,
+    );
+}
 
 function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
     if (!config || config.provider === "local") {
@@ -216,10 +386,52 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
         };
     }
 
-    return { provider: "off" };
+    if (config.provider === "off") {
+        return { provider: "off" };
+    }
+
+    if (config.provider === "synapse") {
+        const synapse = config as EmbeddingConfig & {
+            model?: string;
+            synapse_connection_file?: string;
+            synapse_fingerprint?: string;
+            synapse_table_epoch?: number;
+            synapse_dims?: number;
+            synapse_recommended_batch?: number;
+            synapse_provenance?: unknown;
+        };
+        return {
+            provider: "synapse",
+            model: synapse.model?.trim() || "gte-modernbert-base-f16",
+            max_input_tokens: SYNAPSE_MAX_INPUT_TOKENS,
+            ...(synapse.synapse_connection_file
+                ? { synapse_connection_file: synapse.synapse_connection_file }
+                : {}),
+            ...(synapse.synapse_fingerprint
+                ? { synapse_fingerprint: synapse.synapse_fingerprint }
+                : {}),
+            ...(typeof synapse.synapse_table_epoch === "number"
+                ? { synapse_table_epoch: synapse.synapse_table_epoch }
+                : {}),
+            ...(typeof synapse.synapse_dims === "number"
+                ? { synapse_dims: synapse.synapse_dims }
+                : {}),
+            ...(typeof synapse.synapse_recommended_batch === "number"
+                ? { synapse_recommended_batch: synapse.synapse_recommended_batch }
+                : {}),
+            ...(synapse.synapse_provenance !== undefined
+                ? { synapse_provenance: synapse.synapse_provenance }
+                : {}),
+        } as EmbeddingConfig;
+    }
+
+    throw new Error("Unknown embedding provider");
 }
 
-function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
+function createProvider(
+    config: EmbeddingConfig,
+    context?: { projectRoot: string; session: string },
+): EmbeddingProvider | null {
     if (testProviderFactory) {
         return testProviderFactory(config);
     }
@@ -240,7 +452,34 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
         });
     }
 
-    return new LocalEmbeddingProvider(config.model, config.max_input_tokens);
+    if (config.provider === "local") {
+        return new LocalEmbeddingProvider(config.model, config.max_input_tokens);
+    }
+
+    if (config.provider === "synapse") {
+        const synapse = config as EmbeddingConfig & {
+            model?: string;
+            synapse_connection_file?: string;
+            synapse_fingerprint?: string;
+            synapse_table_epoch?: number;
+            synapse_dims?: number;
+            synapse_recommended_batch?: number;
+            synapse_provenance?: unknown;
+        };
+        return new SynapseEmbeddingProvider({
+            connectionFile: synapse.synapse_connection_file ?? "",
+            projectRoot: context?.projectRoot ?? "",
+            session: context?.session ?? "embedding",
+            model: synapse.model,
+            fingerprint: synapse.synapse_fingerprint,
+            tableEpoch: synapse.synapse_table_epoch,
+            dims: synapse.synapse_dims,
+            recommendedBatch: synapse.synapse_recommended_batch,
+            provenance: synapse.synapse_provenance,
+        });
+    }
+
+    throw new Error("Unknown embedding provider");
 }
 
 function stableStringify(value: unknown): string {
@@ -258,6 +497,10 @@ function stableStringify(value: unknown): string {
 
 function sha256Prefix(value: string, length = 16): string {
     return createHash("sha256").update(value).digest("hex").slice(0, length);
+}
+
+export function contentSha256(value: string): string {
+    return createHash("sha256").update(value).digest("hex");
 }
 
 function getRuntimeFingerprint(config: EmbeddingConfig): string {
@@ -299,6 +542,10 @@ function snapshotFor(
         !registration.observationMode && providerIsOn && registration.features.memoryEnabled;
     const gitCommitEnabled =
         !registration.observationMode && providerIsOn && registration.features.gitCommitEnabled;
+    const configuredModel =
+        "model" in registration.config && typeof registration.config.model === "string"
+            ? registration.config.model.trim()
+            : "";
     return {
         projectIdentity: registration.projectIdentity,
         sourceDirectory: registration.sourceDirectory,
@@ -314,8 +561,8 @@ function snapshotFor(
         model:
             registration.observationMode || !providerIsOn
                 ? "off"
-                : "model" in registration.config && registration.config.model.trim()
-                  ? registration.config.model.trim()
+                : configuredModel
+                  ? configuredModel
                   : registration.modelId,
         provider:
             registration.observationMode || !providerIsOn
@@ -471,6 +718,7 @@ function staleModelsForScope(
     scope: EmbeddingIdentityScope,
     currentModelId: string,
     cutoff: number,
+    protectedModelIds: ReadonlySet<string> = new Set([currentModelId]),
 ): string[] {
     const rows = getStaleIdentityStatement(db, scope).all(
         projectIdentity,
@@ -478,7 +726,9 @@ function staleModelsForScope(
         currentModelId,
         cutoff,
     ) as StaleIdentityRow[];
-    return rows.map((row) => row.modelId).filter((modelId) => typeof modelId === "string");
+    return rows
+        .map((row) => row.modelId)
+        .filter((modelId) => typeof modelId === "string" && !protectedModelIds.has(modelId));
 }
 
 export interface StaleEmbeddingSweepResult {
@@ -602,6 +852,12 @@ export function sweepStaleEmbeddingIdentitiesForProject(
 
     const cutoff = now - EMBEDDING_IDENTITY_GC_GRACE_MS;
     const deleteTracking = getDeleteActiveIdentityStatement(db);
+    const shadow = shadowRegistrations.get(projectIdentity);
+    const protectedModels = {
+        memory: new Set([snapshot.modelId, ...(shadow ? [shadow.modelId] : [])]),
+        commit: new Set([snapshot.modelId, ...(shadow ? [shadow.modelId] : [])]),
+        chunk: new Set([snapshot.chunkModelId, ...(shadow ? [shadow.chunkModelId] : [])]),
+    };
     const scopes: Array<{
         scope: EmbeddingIdentityScope;
         enabled: boolean;
@@ -638,6 +894,7 @@ export function sweepStaleEmbeddingIdentitiesForProject(
                 scope,
                 currentModelId,
                 cutoff,
+                protectedModels[scope],
             )) {
                 if (remainingBudget === 0) break;
                 const deleted = deleteStaleEmbeddingBatch(
@@ -721,12 +978,387 @@ export function registerProjectEmbedding(
     };
 
     projectRegistrations.set(projectIdentity, registration);
+    persistPrimaryDescriptor(db, registration);
 
     if (!canReuseProvider) {
         disposeProvider(prior?.provider ?? null);
     }
 
     return snapshotFor(registration);
+}
+
+export function registerProjectShadowEmbedding(
+    db: Database,
+    projectIdentity: string,
+    config: EmbeddingConfig,
+    sourceDirectory: string,
+): ProjectEmbeddingRegistrationSnapshot | null {
+    const resolvedConfig = resolveEmbeddingConfig(config);
+    if (resolvedConfig.provider !== "synapse") {
+        throw new Error("Shadow embedding registration requires the synapse provider");
+    }
+    const providerIdentity = getEmbeddingProviderIdentity(resolvedConfig);
+    const chunkModelId = getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
+    const provider = createProvider(resolvedConfig, {
+        projectRoot: sourceDirectory,
+        session: `shadow:${projectIdentity}`,
+    });
+    if (!provider) return null;
+    const prior = shadowRegistrations.get(projectIdentity);
+    if (prior && prior.providerIdentity === providerIdentity) {
+        void provider.dispose();
+        persistShadowDescriptor(db, prior);
+        return {
+            ...snapshotFor({
+                projectIdentity,
+                sourceDirectory,
+                config: prior.config,
+                providerIdentity: prior.providerIdentity,
+                runtimeFingerprint: `shadow:${prior.providerIdentity}`,
+                provider: prior.provider,
+                generation: prior.generation,
+                features: { memoryEnabled: true, gitCommitEnabled: true },
+                modelId: prior.modelId,
+                chunkModelId: prior.chunkModelId,
+                observationMode: false,
+            }),
+            provider: "synapse",
+        };
+    }
+    const generation = ++globalRegistrationGeneration;
+    const registration: ShadowEmbeddingRegistration = {
+        projectIdentity,
+        sourceDirectory,
+        config: resolvedConfig,
+        provider,
+        providerIdentity,
+        modelId: providerIdentity,
+        chunkModelId,
+        generation,
+    };
+    shadowRegistrations.set(projectIdentity, registration);
+    dbForShadowQueue.set(projectIdentity, db);
+    if (prior) disposeProvider(prior.provider);
+    db.transaction(() => {
+        const now = Date.now();
+        recordScopeActiveIdentity(db, projectIdentity, "memory", registration.modelId, now);
+        recordScopeActiveIdentity(db, projectIdentity, "commit", registration.modelId, now);
+        recordScopeActiveIdentity(db, projectIdentity, "chunk", registration.chunkModelId, now);
+        persistShadowDescriptor(db, registration);
+    })();
+    return {
+        projectIdentity,
+        sourceDirectory,
+        providerIdentity,
+        runtimeFingerprint: `shadow:${providerIdentity}`,
+        generation,
+        features: { memoryEnabled: true, gitCommitEnabled: true },
+        enabled: true,
+        gitCommitEnabled: true,
+        modelId: registration.modelId,
+        chunkModelId: registration.chunkModelId,
+        model:
+            "model" in resolvedConfig && typeof resolvedConfig.model === "string"
+                ? resolvedConfig.model
+                : registration.modelId,
+        provider: "synapse",
+    };
+}
+
+function startShadowWorker(): void {
+    if (shadowWorker) return;
+    shadowWorker = runShadowWorker().finally(() => {
+        shadowWorker = null;
+        if (shadowQueue.length > 0) startShadowWorker();
+    });
+}
+
+export interface ShadowEmbeddingMeasurementCohort {
+    modelId: string;
+    chunkModelId: string;
+    fingerprint: string;
+    epoch: number;
+    dims: number;
+}
+
+export function getShadowEmbeddingMeasurementCohort(
+    projectIdentity: string,
+): ShadowEmbeddingMeasurementCohort | null {
+    const registration = shadowRegistrations.get(projectIdentity);
+    if (!registration) return null;
+    const fields = synapseConfigFields(registration.config);
+    return {
+        modelId: registration.modelId,
+        chunkModelId: registration.chunkModelId,
+        fingerprint: fields.fingerprint ?? "",
+        epoch: fields.tableEpoch ?? 0,
+        dims: fields.dims ?? 0,
+    };
+}
+
+export function getPrimaryEmbeddingMeasurementCohort(
+    projectIdentity: string,
+): ShadowEmbeddingMeasurementCohort | null {
+    const registration = projectRegistrations.get(projectIdentity);
+    if (!registration) return null;
+    const fields = synapseConfigFields(registration.config);
+    return {
+        modelId: registration.modelId,
+        chunkModelId: registration.chunkModelId,
+        fingerprint: fields.fingerprint ?? "",
+        epoch: fields.tableEpoch ?? 0,
+        dims: fields.dims ?? 0,
+    };
+}
+
+export async function embedShadowTextForProject(
+    projectIdentity: string,
+    text: string,
+    signal?: AbortSignal,
+): Promise<Float32Array | null> {
+    const registration = shadowRegistrations.get(projectIdentity);
+    if (!registration) return null;
+    try {
+        return await registration.provider.embed(text, signal, "query");
+    } catch (error) {
+        log("[magic-context] Synapse shadow query failed:", error);
+        return null;
+    }
+}
+
+export function enqueueShadowEmbeddingItems(
+    projectIdentity: string,
+    scope: ShadowScope,
+    ids: readonly string[],
+): void {
+    if (ids.length === 0 || !shadowRegistrations.has(projectIdentity)) return;
+    shadowQueue.push({ projectIdentity, scope, ids: [...ids] });
+    startShadowWorker();
+}
+
+async function embedShadowItems(
+    registration: ShadowEmbeddingRegistration,
+    items: readonly { id: string; text: string; contentSha256: string }[],
+    db: Database,
+    scope: ShadowScope,
+): Promise<Map<string, Float32Array>> {
+    const raw = registration.config as unknown as Record<string, unknown>;
+    const fingerprint = typeof raw.synapse_fingerprint === "string" ? raw.synapse_fingerprint : "";
+    const tableEpoch = typeof raw.synapse_table_epoch === "number" ? raw.synapse_table_epoch : 0;
+    const requestKey = getSynapseBatchRequestKey({
+        model: typeof raw.model === "string" ? raw.model : SYNAPSE_DEFAULT_MODEL,
+        fingerprint,
+        tableEpoch,
+        items,
+    });
+    beginSynapseBatchLedger(db, {
+        sessionId: `shadow:${registration.projectIdentity}`,
+        projectPath: registration.projectIdentity,
+        scope,
+        manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+        requestKey,
+    });
+    try {
+        if (registration.provider.embedItems) {
+            const vectors = await registration.provider.embedItems(items);
+            finishSynapseBatchLedger(
+                db,
+                `shadow:${registration.projectIdentity}`,
+                requestKey,
+                vectors.size === items.length ? "complete" : "partial",
+            );
+            return vectors;
+        }
+        const positional = await registration.provider.embedBatch(items.map((item) => item.text));
+        const vectors = new Map(
+            items.flatMap((item, index) => {
+                const vector = positional[index];
+                return vector ? [[item.id, vector] as const] : [];
+            }),
+        );
+        finishSynapseBatchLedger(
+            db,
+            `shadow:${registration.projectIdentity}`,
+            requestKey,
+            vectors.size === items.length ? "complete" : "partial",
+        );
+        return vectors;
+    } catch (error) {
+        finishSynapseBatchLedger(
+            db,
+            `shadow:${registration.projectIdentity}`,
+            requestKey,
+            "failed",
+        );
+        throw error;
+    }
+}
+
+async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
+    const registration = shadowRegistrations.get(item.projectIdentity);
+    if (!registration) return;
+    const boundedIds = item.ids.slice(0, SHADOW_MAX_ITEMS_PER_TICK);
+    if (item.scope === "memory") {
+        const db = dbForShadowQueue.get(item.projectIdentity);
+        if (!db) return;
+        const placeholders = boundedIds.map(() => "?").join(",");
+        const rows = db
+            .prepare(
+                `SELECT id, content, normalized_hash FROM memories
+                 WHERE project_path = ? AND id IN (${placeholders}) AND status = 'active'`,
+            )
+            .all(item.projectIdentity, ...boundedIds.map((id) => Number(id))) as Array<{
+            id: number;
+            content: string;
+            normalized_hash: string;
+        }>;
+        const vectors = await embedShadowItems(
+            registration,
+            rows.map((row) => ({
+                id: `memory:${row.id}`,
+                text: row.content,
+                contentSha256: contentSha256(row.content),
+            })),
+            db,
+            "memory",
+        );
+        db.transaction(() => {
+            for (const row of rows) {
+                const vector = vectors.get(`memory:${row.id}`);
+                if (vector)
+                    saveEmbeddingIfHashMatches(
+                        db,
+                        row.id,
+                        vector,
+                        registration.modelId,
+                        row.normalized_hash,
+                    );
+            }
+        })();
+        return;
+    }
+    if (item.scope === "commit") {
+        const db = dbForShadowQueue.get(item.projectIdentity);
+        if (!db) return;
+        const placeholders = boundedIds.map(() => "?").join(",");
+        const rows = db
+            .prepare(
+                `SELECT sha, message FROM git_commits WHERE project_path = ? AND sha IN (${placeholders})`,
+            )
+            .all(item.projectIdentity, ...boundedIds) as Array<{ sha: string; message: string }>;
+        const vectors = await embedShadowItems(
+            registration,
+            rows.map((row) => ({
+                id: `commit:${row.sha}`,
+                text: row.message,
+                contentSha256: contentSha256(row.message),
+            })),
+            db,
+            "commit",
+        );
+        db.transaction(() => {
+            for (const row of rows) {
+                const vector = vectors.get(`commit:${row.sha}`);
+                if (vector) saveCommitEmbedding(db, row.sha, vector, registration.modelId);
+            }
+        })();
+        return;
+    }
+
+    const db = dbForShadowQueue.get(item.projectIdentity);
+    if (!db) return;
+    const placeholders = boundedIds.map(() => "?").join(",");
+    const candidates = db
+        .prepare(
+            `SELECT id, session_id, start_message, end_message
+         FROM compartments WHERE id IN (${placeholders})`,
+        )
+        .all(...boundedIds.map((id) => Number(id))) as Array<{
+        id: number;
+        session_id: string;
+        start_message: number;
+        end_message: number;
+    }>;
+    const prepared = candidates.flatMap((candidate) => {
+        const text =
+            buildCanonicalChunkTextFromFts(
+                db,
+                candidate.session_id,
+                candidate.start_message,
+                candidate.end_message,
+            ) || buildCompartmentSummaryFallbackText(db, candidate.id);
+        if (!text) return [];
+        const windows = chunkCanonicalText(
+            text,
+            candidate.start_message,
+            candidate.end_message,
+            SYNAPSE_MAX_INPUT_TOKENS,
+        );
+        return windows.length > 0 ? [{ candidate, windows }] : [];
+    });
+    const items = prepared.flatMap((item) =>
+        item.windows.map((window) => ({
+            id: `chunk:${item.candidate.id}:${window.windowIndex}`,
+            text: window.text,
+            contentSha256: contentSha256(window.text),
+        })),
+    );
+    const vectors = await embedShadowItems(registration, items, db, "chunk");
+    for (const item of prepared) {
+        const rows: SaveCompartmentChunkEmbeddingInput[] = item.windows.flatMap((window) => {
+            const vector = vectors.get(`chunk:${item.candidate.id}:${window.windowIndex}`);
+            return vector
+                ? [
+                      {
+                          compartmentId: item.candidate.id,
+                          sessionId: item.candidate.session_id,
+                          projectPath: registration.projectIdentity,
+                          window,
+                          modelId: registration.chunkModelId,
+                          vector,
+                      },
+                  ]
+                : [];
+        });
+        if (rows.length === item.windows.length) replaceCompartmentChunkEmbeddings(db, rows);
+    }
+}
+
+const dbForShadowQueue = new Map<string, Database>();
+
+async function runShadowWorker(): Promise<void> {
+    const startedAt = Date.now();
+    let processed = 0;
+    let processedBytes = 0;
+    while (
+        shadowQueue.length > 0 &&
+        processed < SHADOW_MAX_ITEMS_PER_TICK &&
+        Date.now() - startedAt < SHADOW_MAX_WALL_CLOCK_MS
+    ) {
+        const item = shadowQueue.shift();
+        if (!item) break;
+        const itemBytes = item.ids.reduce((total, id) => total + id.length, 0);
+        if (processed > 0 && processedBytes + itemBytes > SHADOW_MAX_BYTES_PER_TICK) {
+            shadowQueue.unshift(item);
+            break;
+        }
+        try {
+            await processShadowQueueItem(item);
+        } catch (error) {
+            log("[magic-context] Synapse shadow write failed:", error);
+        }
+        processed += item.ids.length;
+        processedBytes += itemBytes;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+}
+
+export function attachShadowQueueDatabase(projectIdentity: string, db: Database): void {
+    dbForShadowQueue.set(projectIdentity, db);
+}
+
+export function detachShadowQueueDatabase(projectIdentity: string): void {
+    dbForShadowQueue.delete(projectIdentity);
 }
 
 export function registerProjectInObservationMode(
@@ -765,10 +1397,14 @@ export function registerProjectInObservationMode(
 
 export function unregisterProjectEmbedding(projectIdentity: string): void {
     const prior = projectRegistrations.get(projectIdentity);
-    if (!prior) return;
+    const shadow = shadowRegistrations.get(projectIdentity);
+    if (!prior && !shadow) return;
     projectRegistrations.delete(projectIdentity);
+    shadowRegistrations.delete(projectIdentity);
+    dbForShadowQueue.delete(projectIdentity);
     globalRegistrationGeneration += 1;
-    disposeProvider(prior.provider);
+    disposeProvider(prior?.provider ?? null);
+    disposeProvider(shadow?.provider ?? null);
 }
 
 export function getProjectEmbeddingSnapshot(
@@ -803,7 +1439,10 @@ function getOrCreateProjectProvider(
     if (registration.provider) {
         return registration.provider;
     }
-    const provider = createProvider(registration.config);
+    const provider = createProvider(registration.config, {
+        projectRoot: registration.sourceDirectory,
+        session: `project:${registration.projectIdentity}`,
+    });
     registration.provider = provider;
     return provider;
 }
@@ -813,7 +1452,12 @@ export async function embedTextForProject(
     text: string,
     signal?: AbortSignal,
     purpose: EmbeddingPurpose = "passage",
-): Promise<{ vector: Float32Array; modelId: string; generation: number } | null> {
+): Promise<{
+    vector: Float32Array;
+    modelId: string;
+    chunkModelId: string;
+    generation: number;
+} | null> {
     const registration = projectRegistrations.get(projectIdentity);
     if (!registration) return null;
     const generation = registration.generation;
@@ -833,7 +1477,7 @@ export async function embedTextForProject(
         return null;
     }
 
-    return { vector, modelId, generation };
+    return { vector, modelId, chunkModelId: registration.chunkModelId, generation };
 }
 
 export async function embedBatchForProject(
@@ -869,44 +1513,123 @@ export async function embedBatchForProject(
     return { vectors, modelId, generation };
 }
 
-/**
- * Embed `texts` while keeping each provider HTTP call bounded to
- * `MAX_WINDOWS_PER_EMBED_CALL` inputs, concatenating the vectors back into one
- * array aligned 1:1 with `texts`. This holds the per-request payload bound even
- * when the caller's slice contains a single compartment whose window count
- * exceeds the cap (the candidate-batch slice builder always includes at least
- * one compartment whole). If any sub-batch fails (provider returns null), the
- * whole call returns null so the caller's existing all-or-nothing retry/failure
- * accounting is unchanged. modelId/generation come from the first sub-batch; a
- * mid-stream generation change surfaces as a null sub-batch result.
- */
-async function embedTextsWindowBounded(
+export async function embedItemsForProject(
     projectIdentity: string,
-    texts: string[],
+    items: readonly { id: string; text: string; contentSha256: string }[],
     signal?: AbortSignal,
-): Promise<Awaited<ReturnType<typeof embedBatchForProject>>> {
-    if (texts.length <= MAX_WINDOWS_PER_EMBED_CALL) {
-        return embedBatchForProject(projectIdentity, texts, signal);
+    db?: Database,
+    sessionId = projectIdentity,
+): Promise<{ vectors: Map<string, Float32Array>; modelId: string; generation: number } | null> {
+    const registration = projectRegistrations.get(projectIdentity);
+    if (!registration || registration.observationMode || items.length === 0) return null;
+    const generation = registration.generation;
+    const modelId = registration.modelId;
+    const runtimeFingerprint = registration.runtimeFingerprint;
+    const provider = getOrCreateProjectProvider(registration);
+    if (!provider) return null;
+
+    const rawConfig = registration.config as unknown as Record<string, unknown>;
+    const fingerprint =
+        typeof rawConfig.synapse_fingerprint === "string" ? rawConfig.synapse_fingerprint : "";
+    const tableEpoch =
+        typeof rawConfig.synapse_table_epoch === "number"
+            ? rawConfig.synapse_table_epoch
+            : undefined;
+    const isSynapse =
+        registration.providerIdentity.startsWith("synapse:v1:") &&
+        fingerprint &&
+        tableEpoch !== undefined;
+    const ledgerKey = isSynapse
+        ? getSynapseBatchRequestKey({
+              model: typeof rawConfig.model === "string" ? rawConfig.model : registration.modelId,
+              fingerprint,
+              tableEpoch,
+              items,
+          })
+        : null;
+    if (db && ledgerKey) {
+        beginSynapseBatchLedger(db, {
+            sessionId,
+            projectPath: projectIdentity,
+            scope: items[0].id.split(":", 1)[0] as "memory" | "commit" | "chunk",
+            manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+            requestKey: ledgerKey,
+        });
     }
-    const vectors: (Float32Array | null)[] = [];
+
+    let vectors: Map<string, Float32Array>;
+    try {
+        if (provider.embedItems) {
+            vectors = await provider.embedItems(items, signal);
+        } else {
+            const positional = await provider.embedBatch(
+                items.map((item) => item.text),
+                signal,
+                "passage",
+            );
+            vectors = new Map(
+                items.flatMap((item, index) => {
+                    const vector = positional[index];
+                    return vector ? [[item.id, vector] as const] : [];
+                }),
+            );
+        }
+    } catch (error) {
+        if (db && ledgerKey) finishSynapseBatchLedger(db, sessionId, ledgerKey, "failed");
+        throw error;
+    }
+
+    if (db && ledgerKey) {
+        finishSynapseBatchLedger(
+            db,
+            sessionId,
+            ledgerKey,
+            vectors.size === items.length ? "complete" : "partial",
+        );
+    }
+
+    const current = projectRegistrations.get(projectIdentity);
+    if (
+        !current ||
+        current.generation !== generation ||
+        current.runtimeFingerprint !== runtimeFingerprint
+    ) {
+        return null;
+    }
+    return { vectors, modelId, generation };
+}
+
+/** Keep domain items bounded to the same per-call window cap used by positional providers. */
+async function embedItemsWindowBounded(
+    projectIdentity: string,
+    items: readonly { id: string; text: string; contentSha256: string }[],
+    signal?: AbortSignal,
+    db?: Database,
+): Promise<Awaited<ReturnType<typeof embedItemsForProject>>> {
+    if (items.length <= MAX_WINDOWS_PER_EMBED_CALL) {
+        return embedItemsForProject(projectIdentity, items, signal, db, projectIdentity);
+    }
+    const vectors = new Map<string, Float32Array>();
     let modelId: string | null = null;
     let generation: number | null = null;
-    for (let start = 0; start < texts.length; start += MAX_WINDOWS_PER_EMBED_CALL) {
-        if (signal?.aborted) return null;
-        const sub = texts.slice(start, start + MAX_WINDOWS_PER_EMBED_CALL);
-        const result = await embedBatchForProject(projectIdentity, sub, signal);
+    for (let start = 0; start < items.length; start += MAX_WINDOWS_PER_EMBED_CALL) {
+        const result = await embedItemsForProject(
+            projectIdentity,
+            items.slice(start, start + MAX_WINDOWS_PER_EMBED_CALL),
+            signal,
+            db,
+            projectIdentity,
+        );
         if (!result) return null;
-        // Guard against a mid-stream identity change splitting vector spaces.
         if (modelId === null) {
             modelId = result.modelId;
             generation = result.generation;
-        } else if (result.modelId !== modelId || result.generation !== generation) {
+        } else if (modelId !== result.modelId || generation !== result.generation) {
             return null;
         }
-        vectors.push(...result.vectors);
+        for (const [id, vector] of result.vectors) vectors.set(id, vector);
     }
-    if (modelId === null || generation === null) return null;
-    return { vectors, modelId, generation };
+    return modelId === null || generation === null ? null : { vectors, modelId, generation };
 }
 
 function isUnembeddedMemoryRow(row: unknown): row is UnembeddedMemoryRow {
@@ -945,16 +1668,23 @@ export async function embedUnembeddedMemoriesForProject(
     if (memories.length === 0) return 0;
 
     try {
-        const result = await embedBatchForProject(
+        const result = await embedItemsForProject(
             projectIdentity,
-            memories.map((memory) => memory.content),
+            memories.map((memory) => ({
+                id: `memory:${memory.id}`,
+                text: memory.content,
+                contentSha256: contentSha256(memory.content),
+            })),
+            undefined,
+            db,
+            projectIdentity,
         );
         if (!result) return 0;
 
         let embeddedCount = 0;
         db.transaction(() => {
-            for (const [index, memory] of memories.entries()) {
-                const embedding = result.vectors[index];
+            for (const memory of memories) {
+                const embedding = result.vectors.get(`memory:${memory.id}`);
                 if (!embedding) continue;
                 if (
                     saveEmbeddingIfHashMatches(
@@ -969,6 +1699,13 @@ export async function embedUnembeddedMemoriesForProject(
                 }
             }
         })();
+        enqueueShadowEmbeddingItems(
+            projectIdentity,
+            "memory",
+            memories
+                .filter((memory) => result.vectors.has(`memory:${memory.id}`))
+                .map((memory) => String(memory.id)),
+        );
         return embeddedCount;
     } catch (error) {
         log("[magic-context] failed to proactively embed missing memories:", error);
@@ -992,21 +1729,35 @@ async function embedCommitBatch(
     );
     if (commits.length === 0) return 0;
 
-    const result = await embedBatchForProject(
+    const result = await embedItemsForProject(
         projectIdentity,
-        commits.map((commit) => commit.message),
+        commits.map((commit) => ({
+            id: `commit:${commit.sha}`,
+            text: commit.message,
+            contentSha256: contentSha256(commit.message),
+        })),
+        undefined,
+        db,
+        projectIdentity,
     );
     if (!result) return 0;
 
     let embeddedCount = 0;
     db.transaction(() => {
-        for (const [index, commit] of commits.entries()) {
-            const embedding = result.vectors[index];
+        for (const commit of commits) {
+            const embedding = result.vectors.get(`commit:${commit.sha}`);
             if (!embedding) continue;
             saveCommitEmbedding(db, commit.sha, embedding, result.modelId);
             embeddedCount += 1;
         }
     })();
+    enqueueShadowEmbeddingItems(
+        projectIdentity,
+        "commit",
+        commits
+            .filter((commit) => result.vectors.has(`commit:${commit.sha}`))
+            .map((commit) => commit.sha),
+    );
     return embeddedCount;
 }
 
@@ -1182,8 +1933,13 @@ async function embedCandidateChunkBatch(
             windowCount + prepared[i].windows.length <= MAX_WINDOWS_PER_EMBED_CALL
         );
 
-        const texts: string[] = [];
-        for (const item of slice) texts.push(...item.windows.map((w) => w.text));
+        const items = slice.flatMap((item) =>
+            item.windows.map((window) => ({
+                id: `chunk:${item.candidate.id}:${window.windowIndex}`,
+                text: window.text,
+                contentSha256: contentSha256(window.text),
+            })),
+        );
 
         // Retry the provider call a few times with backoff. The provider returns
         // null / all-null on failure (never throws), so we can't read the failure
@@ -1205,7 +1961,7 @@ async function embedCandidateChunkBatch(
         const persistedIds = new Set<number>();
         for (let attempt = 0; attempt < EMBED_SLICE_RETRY_ATTEMPTS; attempt++) {
             if (signal?.aborted) break;
-            let result: Awaited<ReturnType<typeof embedBatchForProject>> = null;
+            let result: Awaited<ReturnType<typeof embedItemsForProject>> = null;
             const attemptStart = Date.now();
             try {
                 // Sub-batch the provider call by window count so the per-request
@@ -1216,17 +1972,17 @@ async function embedCandidateChunkBatch(
                 // compartment" rule could hand the provider one enormous text array
                 // in a single HTTP call, defeating the payload bound and risking
                 // provider timeouts/rejections (PR #207 review).
-                result = await embedTextsWindowBounded(projectIdentity, texts, signal);
+                result = await embedItemsWindowBounded(projectIdentity, items, signal, db);
             } catch (error) {
                 log("[magic-context] failed to proactively embed compartment chunks:", error);
             }
             if (signal?.aborted) break;
             if (result) {
-                let offset = 0;
                 for (const item of slice) {
-                    const vectors = result.vectors.slice(offset, offset + item.windows.length);
-                    offset += item.windows.length;
-                    if (persistedIds.has(item.candidate.id)) continue; // done on a prior attempt
+                    if (persistedIds.has(item.candidate.id)) continue;
+                    const vectors = item.windows.map((window) =>
+                        result.vectors.get(`chunk:${item.candidate.id}:${window.windowIndex}`),
+                    );
                     if (vectors.length !== item.windows.length || vectors.some((v) => !v)) {
                         continue;
                     }
@@ -1242,6 +1998,9 @@ async function embedCandidateChunkBatch(
                     );
                     replaceCompartmentChunkEmbeddings(db, rows);
                     persistedIds.add(item.candidate.id);
+                    enqueueShadowEmbeddingItems(projectIdentity, "chunk", [
+                        String(item.candidate.id),
+                    ]);
                 }
             }
             if (persistedIds.size === slice.length) break; // whole slice done
@@ -1661,7 +2420,13 @@ export function _resetProjectEmbeddingRegistryForTests(): void {
     for (const registration of projectRegistrations.values()) {
         disposeProvider(registration.provider);
     }
+    for (const registration of shadowRegistrations.values()) {
+        disposeProvider(registration.provider);
+    }
     projectRegistrations.clear();
+    shadowRegistrations.clear();
+    shadowQueue.length = 0;
+    dbForShadowQueue.clear();
     untrustedLoadProjects.clear();
     globalRegistrationGeneration = 0;
     projectSweepInProgress = false;

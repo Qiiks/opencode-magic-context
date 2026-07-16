@@ -41,7 +41,7 @@ const HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"] as const;
  * historian spend on the user's dime.
  */
 const AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"] as const;
-const EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider"] as const;
+const EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider", "fallback_provider"] as const;
 const PERCENTAGE_THRESHOLD_REASON =
     "security: a repository may only raise compaction thresholds above the user's effective value; it cannot force earlier historian work or cloned-repo cost escalation.";
 const TOKEN_THRESHOLD_REASON =
@@ -236,6 +236,15 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         warnings.push(
             "Ignoring shadow_transform from project config (security: this developer-only mirror lane is user-level only).",
         );
+    }
+
+    for (const field of ["subc", "shadow_embedding"] as const) {
+        if (field in projectRaw) {
+            delete projectRaw[field];
+            warnings.push(
+                `Ignoring ${field} from project config (security: daemon routing and developer-only embedding traffic are user-level settings).`,
+            );
+        }
     }
 
     const embedding = projectRaw.embedding;
