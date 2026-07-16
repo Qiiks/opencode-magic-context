@@ -19,7 +19,9 @@ export interface ResolvedSynapseEmbeddingConfig {
     synapse_connection_file: string;
     synapse_fingerprint: string;
     synapse_table_epoch: number;
-    synapse_dims: number;
+    // Dims are absent until the first embed response pins them; the registry
+    // treats a missing value as adopt-on-first-write.
+    synapse_dims?: number;
     synapse_recommended_batch?: number;
     synapse_provenance?: unknown;
 }
@@ -139,7 +141,7 @@ function resolvedSynapseConfig(
         synapse_connection_file: subc.connection_file,
         synapse_fingerprint: metadata.fingerprint,
         synapse_table_epoch: metadata.table_epoch,
-        synapse_dims: metadata.dims,
+        ...(typeof metadata.dims === "number" ? { synapse_dims: metadata.dims } : {}),
         ...(metadata.recommended_batch
             ? { synapse_recommended_batch: metadata.recommended_batch }
             : {}),
