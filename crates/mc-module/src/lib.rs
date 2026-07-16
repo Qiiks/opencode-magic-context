@@ -1555,6 +1555,7 @@ impl McHandler {
                 memory_enabled: true,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
+                shadow_enabled: true,
             },
         )
     }
@@ -1908,6 +1909,17 @@ impl McHandler {
             .get(&channel)
             .cloned()
             .ok_or(BindingError::Unbound)
+    }
+
+    /// Shadow ops check the user-tier flag on every dispatch (mtime-cached read),
+    /// so flipping the flag plus bouncing this module stops a runaway shadow
+    /// lane without any harness restart. Senders treat the rejection as an
+    /// ignorable failure and short-circuit before their expensive capture work.
+    fn shadow_lane_enabled(&self) -> bool {
+        // effective_config honors the test seam, so tests never read the real
+        // user config file (a developer's live kill-switch flip must not turn
+        // the suite's shadow coverage off).
+        self.effective_config(Path::new("/")).shadow_enabled
     }
 
     fn effective_config(&self, project_root: &Path) -> McModuleConfig {
@@ -5633,6 +5645,14 @@ impl McHandler {
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
                 "transform" => self.handle_transform_value(channel, request).await,
+                "state_sync" | "shadow_transform" | "shadow_reset"
+                    if !self.shadow_lane_enabled() =>
+                {
+                    HandlerOutcome::Error {
+                        code: "shadow_disabled".to_string(),
+                        message: "shadow lane is disabled by configuration".to_string(),
+                    }
+                }
                 "state_sync" => self.handle_shadow_state_sync_value(channel, request),
                 "shadow_transform" => self.handle_shadow_transform_value(channel, request).await,
                 "shadow_reset" => self.handle_shadow_reset_value(channel, request),
@@ -7970,6 +7990,7 @@ mod tests {
             memory_enabled: true,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
+            shadow_enabled: true,
         }
     }
 
