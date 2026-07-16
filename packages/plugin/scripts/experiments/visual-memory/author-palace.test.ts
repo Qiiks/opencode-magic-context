@@ -64,28 +64,32 @@ describe("palace cue budgets", () => {
     });
 });
 
-describe("single-page priority placement", () => {
-    test("greedily truncates to one fixed page instead of stacking pages", () => {
+describe("single-page newspaper flow", () => {
+    test("fills one fixed page with a continuous three-column stream", () => {
         const rendered = renderPalace(
-            [1_000, 800, 700, 600, 500, 400, 300, 300, 300].map((count, index) => ({
-                id: index + 1,
-                category: "PROJECT_RULES" as const,
-                room: `Room ${index + 1}`,
-                cue: "filler ".repeat(count),
-                importance: 50,
-            })),
+            [...Array(10)].flatMap((_, roomIndex) =>
+                [...Array(150)].map((__, entryIndex) => ({
+                    id: roomIndex * 150 + entryIndex + 1,
+                    category: "PROJECT_RULES" as const,
+                    room: `Room ${roomIndex + 1}`,
+                    cue: `value-${roomIndex * 150 + entryIndex + 1}`,
+                    importance: 100 - roomIndex,
+                })),
+            ),
         );
-
+        const lines = rendered.palace.trimEnd().split("\n");
+        const width = rendered.layoutItems[0] ? 72 : 0;
+        const pitch = width + 1;
         expect(rendered.pages).toHaveLength(1);
-        expect(rendered.pages[0]).toMatchObject({ heightPixels: 1_092 });
         expect(rendered.layoutItems.filter((item) => item.kind === "category")).toHaveLength(1);
-        expect(rendered.rooms.length).toBeGreaterThan(0);
-        expect(rendered.droppedBySkipIds.length).toBeGreaterThan(0);
+        expect([0, 1, 2].map((column) =>
+            lines.filter((line) => line.slice(column * pitch, column * pitch + width).trim()).length,
+        )).toEqual([121, 121, 121]);
     });
 
-    test("keeps bounded greedy placement for many small rooms", () => {
+    test("never leaves a room header as the last line of a column", () => {
         const rendered = renderPalace(
-            Array.from({ length: 13 }, (_, index) => ({
+            [...Array(13)].map((_, index) => ({
                 id: index + 1,
                 category: "PROJECT_RULES" as const,
                 room: `Room ${index + 1}`,
@@ -93,13 +97,37 @@ describe("single-page priority placement", () => {
                 importance: 50,
             })),
         );
-
-        expect(rendered.rooms).toHaveLength(13);
-        expect(rendered.palace).toContain("→");
-        expect(rendered.pages).toHaveLength(1);
+        for (const item of rendered.layoutItems) {
+            if (item.kind === "room" && !item.continuation) {
+                expect(item.startLine).toBeLessThan(121);
+            }
+        }
+        expect(rendered.palace).not.toMatch(/[╔╗╚╝┌┐└┘│═]{2,}/);
     });
 
-    test("drops a low-priority room and records trim versus skip coverage", () => {
+    test("splits a room across columns without dropping its entries", () => {
+        const entries = [...Array(300)].map((_, index) => ({
+            id: index + 1,
+            category: "PROJECT_RULES" as const,
+            room: "Long room",
+            cue: `value-${index + 1}`,
+            importance: 50,
+        }));
+        const rendered = renderPalace(entries);
+        expect(rendered.placements.size).toBe(entries.length);
+        expect(rendered.layoutItems.filter((item) => item.kind === "room" && item.continuation).length).toBeGreaterThan(0);
+        expect(rendered.palace).toContain("— Long room —");
+    });
+
+    test("globally interleaves a high-importance later-category room", () => {
+        const rendered = renderPalace([
+            { id: 1, category: "PROJECT_RULES", room: "Early low", cue: "policy", importance: 10 },
+            { id: 2, category: "ARCHITECTURE", room: "Later high", cue: "policy", importance: 90 },
+        ]);
+        expect(rendered.layoutItems.find((item) => item.kind === "room")?.category).toBe("ARCHITECTURE");
+    });
+
+    test("keeps trim and skip sidecar coverage distinct", () => {
         const directory = mkdtempSync(join(tmpdir(), "palace-knapsack-"));
         try {
             const sourceMemories = Array.from({ length: 6 }, (_, index) => ({
@@ -114,23 +142,17 @@ describe("single-page priority placement", () => {
                         id,
                         category: "PROJECT_RULES" as const,
                         room: "High",
-                        cue: "filler ".repeat(400),
+                        cue: "filler ".repeat(1_300),
                         importance: 90,
                     })),
                     ...[4, 5].map((id) => ({
                         id,
                         category: "PROJECT_RULES" as const,
                         room: "Low",
-                        cue: "filler ".repeat(1_000),
+                        cue: "filler ".repeat(2_000),
                         importance: 10,
                     })),
-                    {
-                        id: 6,
-                        category: "PROJECT_RULES" as const,
-                        room: "Tiny",
-                        cue: "small",
-                        importance: 1,
-                    },
+                    { id: 6, category: "PROJECT_RULES" as const, room: "Tiny", cue: "small", importance: 1 },
                 ],
                 palaceOutput: join(directory, "palace.txt"),
                 coverageOutput: join(directory, "coverage.json"),
@@ -143,7 +165,6 @@ describe("single-page priority placement", () => {
                 droppedMemoryCount: number;
                 memories: Record<string, unknown>;
             };
-
             expect(rendered.coverage.layout.pages).toHaveLength(1);
             expect(coverage.renderedIds).toEqual([1, 2, 6]);
             expect(coverage.droppedByTrimIds).toEqual([3]);
