@@ -463,15 +463,11 @@ fn expand_arc(
             });
         }
     }
-    for rid in &arc.reasoning_ids {
-        if !frozen.contains(rid) {
-            out.push(ReductionDecision {
-                target_id: rid.clone(),
-                kind: RedKind::Drop.as_str().to_string(),
-                payload: DROPPED_PLACEHOLDER.to_string(),
-            });
-        }
-    }
+    // Reasoning blocks are NEVER reduction targets: signed thinking is
+    // provider-verified content, and a placeholder-rewritten reasoning block can
+    // never re-encode for Anthropic (the signature is gone), which permanently
+    // fences the session to raw. The arc's reasoning stays verbatim; reclaim
+    // comes from the call/result blocks only.
 }
 
 // --- the five selectors: each returns the ARC-IDs (or block-ids) it targets ---
@@ -686,7 +682,16 @@ pub fn select_reductions(
 
     let live_ids: HashSet<String> = items
         .iter()
-        .filter(|item| !matches!(item.kind, SelKind::Media | SelKind::Opaque))
+        .filter(|item| {
+            // Media/Opaque are pass-through carriers; Reasoning is signed
+            // provider-verified content whose rewrite can never re-encode.
+            // None of the three may ever become a reduction target, including
+            // via agent-directed ctx_reduce ids.
+            !matches!(
+                item.kind,
+                SelKind::Media | SelKind::Opaque | SelKind::Reasoning | SelKind::RedactedReasoning
+            )
+        })
         .map(|item| item.id.clone())
         .collect();
     let arcs = group_arcs(items, frozen_keys);
@@ -1209,8 +1214,11 @@ mod tests {
     }
 
     #[test]
-    fn arc_atomic_emission_call_result_reasoning() {
-        // A dropped arc emits decisions for the call, result, AND adjacent reasoning.
+    fn arc_atomic_emission_targets_call_and_result_never_reasoning() {
+        // A dropped arc emits decisions for the call and result. The adjacent
+        // reasoning block stays verbatim: rewriting signed thinking discards the
+        // signature and the block can never re-encode for Anthropic, which
+        // permanently fences the session to raw serving.
         let items = vec![
             reasoning("c1", 1, 100),
             tool_call("c1", 1, "bash", serde_json::json!({}), 50),
@@ -1222,9 +1230,32 @@ mod tests {
         let ids: HashSet<&str> = out.iter().map(|d| d.target_id.as_str()).collect();
         assert!(
             ids.contains(call_block_id("c1").as_str())
-                && ids.contains(result_block_id("c1").as_str())
-                && ids.contains(reasoning_block_id("c1").as_str()),
+                && ids.contains(result_block_id("c1").as_str()),
             "{ids:?}"
+        );
+        assert!(
+            !ids.contains(reasoning_block_id("c1").as_str()),
+            "reasoning must never be a reduction target: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn agent_drop_on_reasoning_block_is_refused() {
+        // ctx_reduce ids aimed at reasoning blocks are filtered at the live-ids
+        // boundary, same as Media/Opaque pass-through carriers.
+        let items = vec![
+            reasoning("c1", 1, 100),
+            tool_call("c1", 1, "bash", serde_json::json!({}), 50),
+            tool_result("c1", 1, "bash", 300),
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = 1;
+        ctx.agent_drop_ids = vec![reasoning_block_id("c1")];
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(
+            out.iter()
+                .all(|d| d.target_id != reasoning_block_id("c1")),
+            "{out:?}"
         );
     }
 

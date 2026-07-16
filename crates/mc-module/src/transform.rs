@@ -1908,6 +1908,15 @@ fn consumed_pending_drop_ids(
         .filter(|block| !block.synthetic && !is_tail(block.ordinal, final_coverage))
         .map(|block| block.id.as_str())
         .collect::<HashSet<_>>();
+    // A drop aimed at a reasoning block is structurally unappliable (reasoning is
+    // never a reduction target), proven from this pass's projection. Retiring the
+    // row here keeps the queue from carrying it forever.
+    let reasoning = projection
+        .blocks
+        .iter()
+        .filter(|block| is_reasoning_block(&block.wire))
+        .map(|block| block.id.as_str())
+        .collect::<HashSet<_>>();
 
     pending
         .iter()
@@ -1915,7 +1924,8 @@ fn consumed_pending_drop_ids(
             let applied =
                 !frozen_before.contains(&drop.target_id) && frozen_after.contains(&drop.target_id);
             let obsolete = frozen_before.contains(&drop.target_id)
-                || covered.contains(drop.target_id.as_str());
+                || covered.contains(drop.target_id.as_str())
+                || reasoning.contains(drop.target_id.as_str());
             applied || obsolete
         })
         .map(|drop| drop.id)
@@ -1984,8 +1994,20 @@ fn new_reduction_units(
         .filter(|i| is_tail(i.ordinal(), coverage))
         .map(|i| i.id())
         .collect();
+    // Defense in depth behind the selector's own exclusion: refuse to mint a
+    // frozen unit whose target is a reasoning block. A placeholder-rewritten
+    // reasoning block loses its signature and can never re-encode for
+    // Anthropic, permanently fencing the session to raw.
+    let reasoning_targets: std::collections::HashSet<&str> = live
+        .iter()
+        .filter(|i| is_reasoning_block(&i.wire))
+        .map(|i| i.id())
+        .collect();
     let mut by_target: BTreeMap<String, FrozenUnit> = BTreeMap::new();
     for r in reductions {
+        if reasoning_targets.contains(r.target_id.as_str()) {
+            continue;
+        }
         if tail.contains(r.target_id.as_str()) && !frozen.contains(&r.target_id) {
             by_target
                 .entry(r.target_id.clone())
@@ -3654,6 +3676,14 @@ fn build_output(
         let rendered = if let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) {
             let reduced: BTreeMap<usize, &str> = blocks
                 .iter()
+                // Render-time heal: a frozen unit targeting a reasoning block is
+                // ignored and the block serves its verbatim signed source bytes.
+                // Applying it would emit an unsigned typed reasoning block that
+                // Anthropic refuses to encode, so a historically poisoned unit
+                // would otherwise fence the session raw forever. The unit stays
+                // frozen (monotonicity untouched) but is permanently inert, and
+                // the exemption is deterministic on every pass.
+                .filter(|block| !is_reasoning_block(&block.wire))
                 .filter_map(|block| {
                     frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
                 })
@@ -10623,6 +10653,97 @@ mod tests {
             );
             assert!(!steady.committed);
         }
+    }
+
+    #[test]
+    fn reasoning_blocks_are_never_reduction_targets_and_poisoned_units_heal() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+
+        fn reasoning_item(mid: &str, ordinal: u64) -> CkIngressMessage {
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    vec![
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                            text: format!("signed thinking {mid}"),
+                            signature: Some(format!("sig-{mid}")),
+                        }),
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                            text: format!("answer {mid}"),
+                        }),
+                    ],
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        let messages = vec![
+            item("u1", 1, "question"),
+            reasoning_item("a1", 2),
+            item("u2", 3, "live tail"),
+        ];
+
+        // An agent drop aimed at the reasoning block must not freeze, and its
+        // pending row must retire as structurally unappliable.
+        let active = active_cc_req("reason-guard", "cfg0", messages.clone());
+        run(&s, &active, &spine());
+        s.append_pending_agent_drops("reason-guard", &["a1#0".to_string()], 1)
+            .unwrap();
+        let busted = active_cc_req("reason-guard", "cfg1", messages.clone());
+        let consumed = run(&s, &busted, &spine());
+        assert_eq!(consumed.action, "HARD");
+        let loaded = s.load("reason-guard").unwrap();
+        assert!(
+            !frozen_red_targets(&loaded.core).contains("a1#0"),
+            "reasoning target must never freeze"
+        );
+        assert!(
+            s.load_pending_agent_drops("reason-guard").unwrap().is_empty(),
+            "structurally unappliable drop must retire from the queue"
+        );
+        let joined = serde_json::to_string(&consumed.ck_messages).unwrap();
+        assert!(joined.contains("signed thinking a1"), "{joined}");
+        assert!(joined.contains("sig-a1"), "{joined}");
+
+        // A historically poisoned unit (minted by an older binary) heals at
+        // render: the block serves verbatim signed bytes on every pass while the
+        // unit stays frozen and inert.
+        let mut poisoned = s.load("reason-guard").unwrap();
+        poisoned
+            .core
+            .frozen_units
+            .push(red_unit("a1#0", "drop", "[dropped]"));
+        s.commit_transform(
+            "reason-guard",
+            TransformCommit {
+                expected: poisoned.row_version,
+                core: &poisoned.core,
+                meta: &poisoned.meta,
+                consumed_drop_ids: &[],
+                memory_revision: None,
+                overlays: TransformOverlayBatch::default(),
+            },
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let pass = run(&s, &busted, &spine());
+            let bytes = serde_json::to_string(&pass.ck_messages).unwrap();
+            assert!(bytes.contains("signed thinking a1"), "{bytes}");
+            assert!(bytes.contains("sig-a1"), "{bytes}");
+            assert!(!bytes.contains("[dropped]"), "{bytes}");
+        }
+        assert!(
+            frozen_red_targets(&s.load("reason-guard").unwrap().core).contains("a1#0"),
+            "the poisoned unit stays frozen (monotonicity untouched), only inert"
+        );
     }
 
     #[test]
