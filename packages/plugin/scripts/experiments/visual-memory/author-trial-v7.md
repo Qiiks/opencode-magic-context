@@ -72,6 +72,42 @@ Choose-B (use A not B) prohibition:
 - WRONG: `resolveLimit uses input not context` — `not` with no marker.
 - RIGHT: `resolveLimit=`input`; ⊘`context` (marketing number, over-accepts)`
 
+## Compression is the job — worked examples (wrong → right)
+
+Every cue you emit almost verbatim is a defect: it spends lines that would have rendered other memories. Study the transformations, then apply them to EVERY cue. All examples are synthetic; do not reuse their facts.
+
+1. DROP DIRECTORY SPINES. A filename or symbol is a complete anchor; the reader can search it.
+- SOURCE: `The retry queue flush interval is configured in packages/server/src/queue/flush-scheduler.ts and defaults to 30 seconds.`
+- WRONG: `retry queue flush interval configured in packages/server/src/queue/flush-scheduler.ts, default 30s`
+- RIGHT: `flush-scheduler.ts retry flush 30s` (34 chars)
+
+2. SENTENCE → ANCHOR + RELATION. Keep the distinctive tokens and one pidgin relation; delete grammar.
+- SOURCE: `Session snapshots are written by the exporter only after the checksum of the manifest has been verified against the ledger.`
+- WRONG: `session snapshots written by exporter only after manifest checksum verified against ledger`
+- RIGHT: `exporter: ledger-checksum ≺ snapshot write` (43 chars)
+
+3. COMPOUND FACT → STRONGEST HALF. If a memory says X and also Y, cue only the half you could not guess.
+- SOURCE: `The importer validates row counts before commit and logs a warning when the source file is empty.`
+- WRONG: `importer validates row counts before commit; warns on empty source file`
+- RIGHT: `importer: row-count gate ≺ commit` (33 chars)
+
+4. NUMBERS AND ENUMS ARE THE CHEAPEST ANCHORS. Prefer the exact value over the phrase describing it.
+- SOURCE: `The websocket reconnect backoff starts at 250 milliseconds and doubles up to a ceiling of 16 seconds.`
+- WRONG: `websocket reconnect backoff doubles from small initial value up to a ceiling`
+- RIGHT: `ws backoff 250ms→16s ×2` (23 chars)
+
+5. PROHIBITION → ⊘ + TERSE MECHANISM. The marker replaces the trigger words; the mechanism stays short.
+- SOURCE: `Workers must never open the settings database directly because the migration lock is owned by the coordinator process.`
+- WRONG: `workers must never open settings DB directly because coordinator owns migration lock`
+- RIGHT: `workers: ⊘direct settings-DB open (coordinator owns lock)` (58 chars)
+
+6. NEAR-DUPLICATES → ONE CUE + MERGE. When two memories share an anchor, cue the stronger and merge the other into it.
+- SOURCE A: `The audit log rotates at 64 MiB.` SOURCE B: `Rotated audit logs are compressed with zstd.`
+- WRONG: two entries `audit log rotates 64MiB` + `rotated audit logs zstd-compressed`
+- RIGHT: one entry `audit log: 64MiB rotate → zstd` plus `<merge id="B" into="A"/>`
+
+CJK is allowed where genuinely shorter (e.g. `每turn` for `on every turn`), but exact identifiers stay verbatim Latin.
+
 ## Worked compression example
 
 Source memory, verbatim:
