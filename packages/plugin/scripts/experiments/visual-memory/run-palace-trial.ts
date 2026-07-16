@@ -16,6 +16,7 @@ import { extractCompleteManifestBody } from "../../../src/features/magic-context
 
 import {
     authorPalace,
+    cueBudgetViolations,
     isExactToken,
     type Category,
     type SourceMemory,
@@ -683,8 +684,44 @@ async function runCategory(args: {
         parseError = errorMessage(error);
     }
     if (entries) {
+        const violations = cueBudgetViolations(entries, args.importanceById);
+        if (violations.length === 0) {
+            writeFileSync(rawPath, raw);
+            return { category: args.category, parse: "ok", entries, attempts: 1, usage };
+        }
+        // Budget violations reject the whole category once with per-id feedback;
+        // mechanical enforcement replaced the prose that flash imitated instead
+        // of obeying.
+        writeFileSync(rawPath.replace(/\.xml$/, ".attempt-1.xml"), raw);
+        const list = violations
+            .slice(0, 20)
+            .map((v) => `id ${v.id}: ${v.length} chars (max ${v.budget})`)
+            .join("; ");
+        try {
+            const completion = await callModel(args.model, [
+                ...baseMessages,
+                { role: "assistant", content: raw },
+                {
+                    role: "user",
+                    content: `REJECTED: ${violations.length} cue(s) exceed their hard character budget: ${list}. Budgets: importance >= 70 allows 90 chars, everything else 50 chars, counted on the rendered cue. Compress the flagged cues (drop path spines, keep anchors and one relation, use the strongest half) and return the complete corrected XML manifest. Do not change ids, rooms, or importance values.`,
+                },
+            ]);
+            raw = completion.content;
+            if (completion.usage) usage.push(completion.usage);
+        } catch (error) {
+            return { category: args.category, parse: "fail", attempts: 2, usage, error: errorMessage(error) };
+        }
         writeFileSync(rawPath, raw);
-        return { category: args.category, parse: "ok", entries, attempts: 1, usage };
+        try {
+            entries = parseManifest(raw, args.category, args.importanceById);
+            const still = cueBudgetViolations(entries, args.importanceById);
+            if (still.length > 0) {
+                console.warn(`[palace] ${args.category}: ${still.length} cue(s) still over budget after retry; keeping with warnings`);
+            }
+            return { category: args.category, parse: "retry", entries, attempts: 2, usage };
+        } catch (error) {
+            return { category: args.category, parse: "fail", attempts: 2, usage, error: errorMessage(error) };
+        }
     }
 
     writeFileSync(rawPath.replace(/\.xml$/, ".attempt-1.xml"), raw);

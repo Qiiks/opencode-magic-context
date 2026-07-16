@@ -219,6 +219,25 @@ function compactCue(raw: string, room: string): string {
     return value.trim().replace(/^[-:;,]+|[-:;,]+$/g, "");
 }
 
+// Per-entry budget check for the authoring retry loop: the harness rejects and
+// re-prompts a category whose cues exceed the budget, so size enforcement is
+// mechanical rather than prose guidance in the prompt.
+export function cueBudgetViolations(
+    entries: SpecEntry[],
+    importanceById: Map<number, number>,
+): { id: number; length: number; budget: number }[] {
+    const violations: { id: number; length: number; budget: number }[] = [];
+    for (const entry of entries) {
+        if (entry.cue === undefined) continue;
+        const rendered = displayCue(entry);
+        const importance = importanceById.get(entry.id) ?? entry.importance;
+        const budget = importance >= 70 ? 90 : 50;
+        const length = codepoints(rendered);
+        if (length > budget) violations.push({ id: entry.id, length, budget });
+    }
+    return violations;
+}
+
 function displayCue(entry: SpecEntry): string {
     const raw = Array.isArray(entry.cue) ? entry.cue.join("; ") : (entry.cue ?? "");
     return compactCue(raw, entry.room);
