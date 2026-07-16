@@ -8,9 +8,6 @@
 use std::fmt;
 use std::time::Duration;
 
-#[cfg(test)]
-use std::cell::RefCell;
-
 use mc_store::{
     FactCandidate, HistorianChunkRange, HistorianDurableState, HistorianPhase,
     HistorianPublishError, HistorianPublishPredicate, HistorianPublishRequest,
@@ -32,32 +29,6 @@ pub const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
 const CHAIN_EXHAUSTED_PERMANENT_PREFIX: &str = "chain-exhausted-permanent:";
 const AUTH_REQUIRED_PREFIX: &str = "auth-required:";
 const UNKNOWN_ERROR_CLASS_PREFIX: &str = "unknown-error-class:";
-
-#[cfg(test)]
-thread_local! {
-    static MATCHING_RUN_ABANDON_INTERLEAVE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
-        RefCell::new(None);
-}
-
-#[cfg(test)]
-pub(crate) fn set_matching_run_abandon_interleave_hook(hook: Box<dyn FnOnce()>) {
-    MATCHING_RUN_ABANDON_INTERLEAVE_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
-}
-
-#[cfg(test)]
-fn run_matching_run_abandon_interleave_hook(
-    store: &McStore,
-    session_id: &str,
-) -> Result<(), HistorianStateError> {
-    let hook = MATCHING_RUN_ABANDON_INTERLEAVE_HOOK.with(|slot| slot.borrow_mut().take());
-    if let Some(hook) = hook {
-        // Simulate a stale caller read so the race test proves cleanup re-reads the
-        // current historian state inside its fenced transaction.
-        let _stale = store.load(session_id)?;
-        hook();
-    }
-    Ok(())
-}
 
 /// Project a validated compartment onto the durable store row shape. Validation
 /// resolves the message-id endpoints and tiers; publication only stamps the
@@ -1460,8 +1431,6 @@ fn abandon_matching_run_without_cooldown(
     predicate: &HistorianPublishPredicate,
     detail: Option<String>,
 ) -> Result<Option<u64>, HistorianStateError> {
-    #[cfg(test)]
-    run_matching_run_abandon_interleave_hook(store, session_id)?;
     Ok(store.abandon_historian_run_if_matching(session_id, predicate, None, detail.as_deref())?)
 }
 
@@ -3255,6 +3224,11 @@ mod tests {
             .unwrap();
         let loaded = store.load("ses").unwrap();
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
+        let abandon_hook_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let abandon_hook_calls_for_hook = std::sync::Arc::clone(&abandon_hook_calls);
+        store.set_abandon_historian_hook(Box::new(move || {
+            abandon_hook_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
         let err = publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
@@ -3281,6 +3255,11 @@ mod tests {
         let after = store.load("ses").unwrap().meta.historian;
         assert_eq!(after.state, HistorianPhase::Idle);
         assert_eq!(after.failure_backoff_at_ms, Some(999));
+        assert_eq!(
+            abandon_hook_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fingerprint cleanup must use the store's fenced abandon primitive"
+        );
         assert!(matches!(
             fire(&after, 6, 7, "new".into(), 0, 1000).unwrap(),
             FireOutcome::Fired(_)

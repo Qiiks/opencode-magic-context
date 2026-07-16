@@ -1138,12 +1138,6 @@ enum TransformSnapshotLookup {
     Ready(SnapshotLease),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransformSnapshotObservation {
-    Absent,
-    Generation(u64),
-}
-
 struct TransformSnapshotCache {
     entries: HashMap<String, TransformSnapshot>,
     ready_lru: VecDeque<String>,
@@ -1304,33 +1298,15 @@ impl TransformSnapshotCache {
         )
     }
 
-    fn observe(&self, session_id: &str) -> TransformSnapshotObservation {
-        match self.entries.get(session_id) {
-            Some(TransformSnapshot::InFlight { generation })
-            | Some(TransformSnapshot::Ready { generation, .. }) => {
-                TransformSnapshotObservation::Generation(*generation)
-            }
-            None => TransformSnapshotObservation::Absent,
-        }
-    }
-
-    fn matches_observation(
-        &self,
-        session_id: &str,
-        observation: TransformSnapshotObservation,
-    ) -> bool {
-        match observation {
-            TransformSnapshotObservation::Absent => !self.entries.contains_key(session_id),
-            TransformSnapshotObservation::Generation(generation) => matches!(
-                self.entries.get(session_id),
-                Some(TransformSnapshot::InFlight {
-                    generation: current,
-                }) | Some(TransformSnapshot::Ready {
+    fn generation_present_in_flight_or_ready(&self, session_id: &str, generation: u64) -> bool {
+        matches!(
+            self.entries.get(session_id),
+            Some(TransformSnapshot::InFlight { generation: current })
+                | Some(TransformSnapshot::Ready {
                     generation: current,
                     ..
                 }) if *current == generation
-            ),
-        }
+        )
     }
 
     fn remove(&mut self, session_id: &str) {
@@ -1477,6 +1453,11 @@ enum PreparedHistorianAction {
     FireReady(Box<PreparedHistorianFiring>),
 }
 
+struct HistorianPrepareContext {
+    now: i64,
+    snapshot_generation: u64,
+}
+
 #[derive(Clone)]
 struct LiveWrapupSession {
     token: Arc<()>,
@@ -1587,7 +1568,7 @@ impl historian::HistorianPublicationFence for WrapupSnapshotPublicationFence {
 struct ReattachSnapshotPublicationFence {
     snapshots: Arc<Mutex<TransformSnapshotCache>>,
     session_id: String,
-    observation: TransformSnapshotObservation,
+    generation: u64,
     #[cfg(test)]
     after_store_publish: ConnectFailureCommitHook,
 }
@@ -1598,10 +1579,11 @@ impl historian::HistorianPublicationFence for ReattachSnapshotPublicationFence {
         store: &McStore,
         request: mc_store::HistorianPublishRequest<'_>,
     ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
-        // The observation and SQLite write share this lock so a new transform cannot
-        // replace the raw tail after validation but before additive rows are committed.
+        // Keep the cache check and database write under one lock. A later transform
+        // then cannot replace the messages selected by this request before the
+        // corresponding history rows are stored.
         let snapshots = self.snapshots.lock().expect("transform snapshots mutex");
-        if !snapshots.matches_observation(&self.session_id, self.observation) {
+        if !snapshots.generation_present_in_flight_or_ready(&self.session_id, self.generation) {
             return Err(mc_store::HistorianPublishError::FenceRejected {
                 reason: "transform snapshot state changed after reattach started".to_string(),
             });
@@ -2238,6 +2220,7 @@ impl McHandler {
         &self,
         store: Arc<McStore>,
         parsed: &TransformRequest,
+        snapshot_generation: u64,
         project_path: String,
         projection: &crate::ck_wire::FlatProjection,
         now: i64,
@@ -2278,15 +2261,10 @@ impl McHandler {
 
         match phase {
             HistorianPhase::AwaitingProducer => {
-                let observation = self
-                    .transform_snapshots
-                    .lock()
-                    .expect("transform snapshots mutex")
-                    .observe(&session_id);
                 let publication_fence = Arc::new(ReattachSnapshotPublicationFence {
                     snapshots: Arc::clone(&self.transform_snapshots),
                     session_id: session_id.clone(),
-                    observation,
+                    generation: snapshot_generation,
                     #[cfg(test)]
                     after_store_publish: Arc::clone(&self.publication_fence_write_hook),
                 });
@@ -2395,8 +2373,12 @@ impl McHandler {
         binding: &SessionBinding,
         project_path: &str,
         projection: &crate::ck_wire::FlatProjection,
-        now: i64,
+        prepare: HistorianPrepareContext,
     ) -> PreparedHistorianAction {
+        let HistorianPrepareContext {
+            now,
+            snapshot_generation,
+        } = prepare;
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -2440,6 +2422,7 @@ impl McHandler {
                 .maybe_spawn_reattach(
                     Arc::clone(&store),
                     parsed,
+                    snapshot_generation,
                     project_path.to_string(),
                     projection,
                     now,
@@ -4356,7 +4339,10 @@ impl McHandler {
                 &binding,
                 &project_path,
                 &result.projection,
-                pass_now,
+                HistorianPrepareContext {
+                    now: pass_now,
+                    snapshot_generation,
+                },
             ) {
                 PreparedHistorianAction::Complete(diagnostics) => diagnostics,
                 PreparedHistorianAction::Busy {
@@ -4378,7 +4364,10 @@ impl McHandler {
                             &binding,
                             &project_path,
                             &result.projection,
-                            pass_now,
+                            HistorianPrepareContext {
+                                now: pass_now,
+                                snapshot_generation,
+                            },
                         ) {
                             PreparedHistorianAction::Complete(diagnostics) => diagnostics,
                             PreparedHistorianAction::Busy { diagnostics, .. } => diagnostics,
@@ -4437,7 +4426,10 @@ impl McHandler {
                 &binding,
                 &project_path,
                 &result.projection,
-                pass_now,
+                HistorianPrepareContext {
+                    now: pass_now,
+                    snapshot_generation,
+                },
             ) {
                 PreparedHistorianAction::Complete(diagnostics) => diagnostics,
                 PreparedHistorianAction::Busy { diagnostics, .. } => diagnostics,
@@ -7990,16 +7982,11 @@ mod tests {
             Arc::new(request)
         };
         let mut cache = TransformSnapshotCache::new(10);
-        assert_eq!(cache.observe("a"), TransformSnapshotObservation::Absent);
-        assert!(cache.matches_observation("a", TransformSnapshotObservation::Absent));
+        assert!(!cache.generation_present_in_flight_or_ready("a", 1));
         let a = cache.begin("a");
-        assert_eq!(
-            cache.observe("a"),
-            TransformSnapshotObservation::Generation(a)
-        );
-        assert!(cache.matches_observation("a", TransformSnapshotObservation::Generation(a)));
+        assert!(cache.generation_present_in_flight_or_ready("a", a));
         cache.finish_ready("a", a, request("a"), 1, 5);
-        assert!(cache.matches_observation("a", TransformSnapshotObservation::Generation(a)));
+        assert!(cache.generation_present_in_flight_or_ready("a", a));
         let b = cache.begin("b");
         cache.finish_ready("b", b, request("b"), 2, 5);
         assert!(matches!(cache.get("a"), TransformSnapshotLookup::Ready(_)));
@@ -11301,7 +11288,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fence_cleanup_atomically_survives_cache_state_bump_without_cooldown() {
+    async fn fence_cleanup_uses_fenced_abandon_without_cooldown() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -11336,12 +11323,10 @@ mod tests {
                 .expect("transform snapshots mutex")
                 .begin("ses");
         }));
-        let bump_store = Arc::clone(&store);
-        historian::set_matching_run_abandon_interleave_hook(Box::new(move || {
-            let loaded = bump_store.load("ses").unwrap();
-            bump_store
-                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
-                .unwrap();
+        let abandon_hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let abandon_hook_calls_for_hook = Arc::clone(&abandon_hook_calls);
+        store.set_abandon_historian_hook(Box::new(move || {
+            abandon_hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
         }));
 
         let stale = tool_body(
@@ -11356,6 +11341,11 @@ mod tests {
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
         assert_eq!(state.failure_backoff_at_ms, None);
+        assert_eq!(
+            abandon_hook_calls.load(Ordering::SeqCst),
+            1,
+            "the in-transaction abandon hook must run before cleanup commits"
+        );
         assert_eq!(historian_additive_rows(&store, "ses", &project), before);
 
         cache_wrapup_messages(&handler, wrapup_messages(20, 40));
@@ -12395,12 +12385,19 @@ mod tests {
         assert_eq!(producer.await_outputs.load(Ordering::SeqCst), 0);
     }
 
+    #[derive(Clone, Copy)]
+    enum ReattachGenerationCase {
+        SupersededBeforeReattachSpawn,
+        FinishedReadyWithSameGeneration,
+    }
+
     async fn run_reattach_generation_case(
-        interleave_new_generation: bool,
+        case: ReattachGenerationCase,
     ) -> (
         HistorianAdditiveRows,
         HistorianAdditiveRows,
         HistorianDurableState,
+        bool,
     ) {
         let producer = Arc::new(ProducerState::default());
         producer.block_output.store(true, Ordering::SeqCst);
@@ -12418,35 +12415,76 @@ mod tests {
         let messages = big_messages();
         seed_awaiting(&store, &messages);
         let before = historian_additive_rows(&store, "ses", &project);
+        let hook_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_ran_for_hook = Arc::clone(&hook_ran);
+        let snapshots = Arc::clone(&handler.transform_snapshots);
+        let store_for_hook = Arc::clone(&store);
+        let messages_for_hook = messages.clone();
+        *handler
+            .between_transform_and_prepare
+            .lock()
+            .expect("interleave hook mutex") = Some(Box::new(move || {
+            hook_ran_for_hook.store(true, Ordering::SeqCst);
+            let mut snapshots = snapshots.lock().expect("transform snapshots mutex");
+            match case {
+                ReattachGenerationCase::SupersededBeforeReattachSpawn => {
+                    snapshots.begin("ses");
+                }
+                ReattachGenerationCase::FinishedReadyWithSameGeneration => {
+                    // Move the cache record from pending to completed for the same numeric
+                    // version before publication. This proves publication accepts a completed
+                    // record when its version did not change.
+                    let parsed = transform_request(messages_for_hook, 1, 200_000);
+                    let retained_bytes = serde_json::to_vec(&parsed).unwrap().len();
+                    let revert_epoch = store_for_hook.load("ses").unwrap().meta.revert_epoch;
+                    snapshots.finish_ready(
+                        "ses",
+                        1,
+                        Arc::new(parsed),
+                        revert_epoch,
+                        retained_bytes,
+                    );
+                    assert!(matches!(
+                        snapshots.entries.get("ses"),
+                        Some(TransformSnapshot::Ready { generation: 1, .. })
+                    ));
+                }
+            }
+        }));
 
         let response = call_transform(&handler, messages).await;
         assert_eq!(response["historian"]["no_fire"], "reattaching");
         wait_for_count(&producer.await_outputs, 1).await;
-        if interleave_new_generation {
-            handler
-                .transform_snapshots
-                .lock()
-                .expect("transform snapshots mutex")
-                .begin("ses");
-        }
         producer.block_output.store(false, Ordering::SeqCst);
         producer.notify.notify_waiters();
         wait_for_idle(&store).await;
 
         let after = historian_additive_rows(&store, "ses", &project);
         let state = store.load("ses").unwrap().meta.historian;
-        (before, after, state)
+        (before, after, state, hook_ran.load(Ordering::SeqCst))
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn reattach_snapshot_fence_rejects_new_generation_and_control_publishes() {
-        let (stale_before, stale_after, stale_state) = run_reattach_generation_case(true).await;
+    async fn reattach_snapshot_fence_rejects_pre_observation_supersession_and_accepts_ready() {
+        let (stale_before, stale_after, stale_state, stale_hook_ran) =
+            run_reattach_generation_case(ReattachGenerationCase::SupersededBeforeReattachSpawn)
+                .await;
+        assert!(stale_hook_ran, "the pre-reattach interleave hook must run");
         assert_eq!(stale_after, stale_before);
         assert_eq!(stale_state.state, HistorianPhase::Idle);
         assert_eq!(stale_state.failure_backoff_at_ms, None);
+        assert_eq!(
+            stale_state.last_failure.as_deref(),
+            Some("publish rejected: transform snapshot state changed after reattach started")
+        );
 
-        let (control_before, control_after, control_state) =
-            run_reattach_generation_case(false).await;
+        let (control_before, control_after, control_state, control_hook_ran) =
+            run_reattach_generation_case(ReattachGenerationCase::FinishedReadyWithSameGeneration)
+                .await;
+        assert!(
+            control_hook_ran,
+            "the same-generation control hook must run"
+        );
         assert_ne!(control_after, control_before);
         assert_eq!(control_state.state, HistorianPhase::Idle);
     }

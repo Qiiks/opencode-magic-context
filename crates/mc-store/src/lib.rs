@@ -2206,10 +2206,15 @@ enum ShadowDivergenceTxnOutcome {
     Serde(String),
 }
 
+#[cfg(any(test, feature = "test-support"))]
+type AbandonHistorianHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
 /// The Magic Context cache-state store: one single-writer SQLite handle for the
 /// module's lifetime.
 pub struct McStore {
     inner: SqliteStore,
+    #[cfg(any(test, feature = "test-support"))]
+    abandon_historian_hook: AbandonHistorianHook,
 }
 
 impl McStore {
@@ -2218,7 +2223,22 @@ impl McStore {
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
         let inner = open_sqlite(descriptor)?;
         inner.migrate(NS, MIGRATIONS)?;
-        Ok(McStore { inner })
+        Ok(McStore {
+            inner,
+            #[cfg(any(test, feature = "test-support"))]
+            abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    /// Install a test callback while cleanup of a matching pending historian run holds
+    /// SQLite's writer lock. The callback checks that a competing write cannot slip
+    /// between reading the match and storing the idle state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_abandon_historian_hook(&self, hook: Box<dyn FnMut() + Send>) {
+        *self
+            .abandon_historian_hook
+            .lock()
+            .expect("abandon historian hook mutex") = Some(hook);
     }
 
     /// Load a session's persisted state. Returns defaults (uninitialized, no row)
@@ -4721,6 +4741,16 @@ impl McStore {
                 && historian.chunk_fingerprint == predicate.chunk_fingerprint;
             if !predicate_matches || historian.state == HistorianPhase::Idle {
                 return Ok(AbandonHistorianTxnOutcome::Unchanged);
+            }
+
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(hook) = self
+                .abandon_historian_hook
+                .lock()
+                .expect("abandon historian hook mutex")
+                .as_mut()
+            {
+                hook();
             }
 
             let last_failure = detail
@@ -8702,18 +8732,42 @@ mod tests {
     }
 
     #[test]
-    fn matching_historian_abandon_uses_the_transaction_current_row() {
+    fn matching_historian_abandon_fences_predicate_and_update_for_both_backoffs() {
         let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let descriptor = descriptor(dir.path());
+        let raw_path = match &descriptor.backend {
+            StorageBackend::Sqlite { path } => path.clone(),
+            _ => unreachable!("test descriptor is SQLite"),
+        };
+        let store = McStore::open(&descriptor).unwrap();
         store
             .commit("ses", None, &CoreState::default(), &publishing_meta())
             .unwrap();
-        let stale = store.load("ses").unwrap();
-        let bumped = store
-            .commit("ses", stale.row_version, &stale.core, &stale.meta)
-            .unwrap();
 
-        let abandoned = store
+        let hook_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_calls_for_hook = std::sync::Arc::clone(&hook_calls);
+        store.set_abandon_historian_hook(Box::new(move || {
+            hook_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let raw = rusqlite::Connection::open(&raw_path).unwrap();
+            raw.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let error = raw
+                .execute(
+                    "UPDATE mc_cache_state SET row_version = row_version WHERE session_id = ?1",
+                    params!["ses"],
+                )
+                .expect_err("BEGIN IMMEDIATE must block a competing writer");
+            assert!(
+                matches!(
+                    error,
+                    rusqlite::Error::SqliteFailure(ref error, _)
+                        if error.code == rusqlite::ErrorCode::DatabaseBusy
+                ),
+                "the competing write must fail with SQLITE_BUSY: {error}"
+            );
+        }));
+
+        let first_before = store.load("ses").unwrap();
+        let first_abandoned = store
             .abandon_historian_run_if_matching(
                 "ses",
                 &publish_predicate(),
@@ -8721,30 +8775,53 @@ mod tests {
                 Some("snapshot generation changed"),
             )
             .unwrap();
-        assert_eq!(abandoned, Some(bumped + 1));
-        let loaded = store.load("ses").unwrap();
-        assert_eq!(loaded.row_version, abandoned);
-        assert_eq!(loaded.meta.historian.state, HistorianPhase::Idle);
-        assert_eq!(loaded.meta.historian.firing_seq, 7);
-        assert_eq!(loaded.meta.historian.failure_backoff_at_ms, None);
+        assert_eq!(first_abandoned, Some(first_before.row_version.unwrap() + 1));
+        let idle = store.load("ses").unwrap();
+        assert_eq!(idle.row_version, first_abandoned);
+        assert_eq!(idle.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(idle.meta.historian.firing_seq, 7);
+        assert_eq!(idle.meta.historian.failure_backoff_at_ms, None);
         assert_eq!(
-            loaded.meta.historian.last_failure.as_deref(),
+            idle.meta.historian.last_failure.as_deref(),
             Some("snapshot generation changed")
         );
 
-        let unchanged_version = loaded.row_version;
+        let publishing = store.load("ses").unwrap();
+        let publishing_meta = publishing_meta();
+        store
+            .commit(
+                "ses",
+                publishing.row_version,
+                &publishing.core,
+                &publishing_meta,
+            )
+            .unwrap();
+        let second_before = store.load("ses").unwrap();
+        let second_abandoned = store
+            .abandon_historian_run_if_matching(
+                "ses",
+                &publish_predicate(),
+                Some(999),
+                Some("fingerprint or CAS conflict"),
+            )
+            .unwrap();
         assert_eq!(
-            store
-                .abandon_historian_run_if_matching(
-                    "ses",
-                    &publish_predicate(),
-                    Some(999),
-                    Some("must not replace Idle"),
-                )
-                .unwrap(),
-            None
+            second_abandoned,
+            Some(second_before.row_version.unwrap() + 1)
         );
-        assert_eq!(store.load("ses").unwrap().row_version, unchanged_version);
+        let cooled_down = store.load("ses").unwrap();
+        assert_eq!(cooled_down.row_version, second_abandoned);
+        assert_eq!(cooled_down.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(cooled_down.meta.historian.failure_backoff_at_ms, Some(999));
+        assert_eq!(
+            cooled_down.meta.historian.last_failure.as_deref(),
+            Some("fingerprint or CAS conflict")
+        );
+        assert_eq!(
+            hook_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the fenced callback must run for both abandon variants"
+        );
     }
 
     #[test]
