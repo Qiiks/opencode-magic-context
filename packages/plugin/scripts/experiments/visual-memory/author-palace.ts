@@ -613,12 +613,33 @@ export function renderPalace(specs: SpecEntry[]): {
         grouped.set(key, list);
     }
 
-    const assignmentFor = (boxes: Box[]): number[] => {
+    const MAX_EXACT_LAYOUT_BOXES = 12;
+    const MAX_LAYOUT_SEARCH_ITERATIONS = 1_000_000;
+    const assignmentFor = (boxes: Box[], context: string): number[] => {
+        // Exhaustively comparing every three-column assignment is useful for normal
+        // manifests, but its search space is exponential. Review renders must also
+        // survive malformed manifests that put many one-entry rooms in one category.
+        if (boxes.length > MAX_EXACT_LAYOUT_BOXES) {
+            const columns = Array<number>(boxes.length).fill(0);
+            const heights = Array<number>(COLUMN_COUNT).fill(0);
+            for (const [index, box] of boxes.entries()) {
+                const column = index === 0 ? 0 : heights.indexOf(Math.min(...heights));
+                columns[index] = column;
+                heights[column] += box.heightPixels;
+            }
+            return columns;
+        }
         let best: { columns: number[]; max: number; range: number; rowRange: number } | undefined;
         const columns = Array<number>(boxes.length).fill(0);
         const heights = Array<number>(COLUMN_COUNT).fill(0);
         const rowHeights = Array<number>(COLUMN_COUNT).fill(0);
+        let iterations = 0;
         const visit = (index: number): void => {
+            if (++iterations > MAX_LAYOUT_SEARCH_ITERATIONS) {
+                throw new Error(
+                    `masonry assignment exceeded ${MAX_LAYOUT_SEARCH_ITERATIONS} iterations while placing ${context}`,
+                );
+            }
             if (index === boxes.length) {
                 const max = Math.max(...heights);
                 const range = max - Math.min(...heights);
@@ -646,7 +667,7 @@ export function renderPalace(specs: SpecEntry[]): {
             }
         };
         visit(0);
-        if (!best) throw new Error("unable to assign masonry band");
+        if (!best) throw new Error(`unable to assign masonry band while placing ${context}`);
         return best.columns;
     };
 
@@ -710,6 +731,7 @@ export function renderPalace(specs: SpecEntry[]): {
     const subsetForCapacity = (
         boxes: Box[],
         capacity: number,
+        context: string,
     ): { indexes: number[]; columns: number[] } => {
         let best:
             | {
@@ -723,8 +745,38 @@ export function renderPalace(specs: SpecEntry[]): {
                   totalRowGap: number;
               }
             | undefined;
-        const limit = 1 << boxes.length;
+        if (boxes.length > MAX_EXACT_LAYOUT_BOXES) {
+            const indexes: number[] = [];
+            const selected: Box[] = [];
+            const candidates = boxes
+                .map((box, index) => ({ box, index }))
+                .sort((a, b) => a.box.heightPixels - b.box.heightPixels);
+            for (const candidate of candidates) {
+                const trial = [...selected, candidate.box];
+                const trialColumns = assignmentFor(trial, context);
+                const trialLeveled = levelBand(trial, trialColumns);
+                const trialHeights = Array<number>(COLUMN_COUNT).fill(0);
+                for (const [index, box] of trialLeveled.boxes.entries()) {
+                    trialHeights[trialLeveled.assignment[index] ?? 0] += box.heightPixels;
+                }
+                if (Math.max(...trialHeights) <= capacity) {
+                    indexes.push(candidate.index);
+                    selected.push(candidate.box);
+                }
+            }
+            if (indexes.length === 0) {
+                throw new Error(`no room fits ${capacity}-row page while placing ${context}`);
+            }
+            return { indexes, columns: assignmentFor(selected, context) };
+        }
+        const limit = 2 ** boxes.length;
+        let iterations = 0;
         for (let mask = 1; mask < limit - 1; mask++) {
+            if (++iterations > MAX_LAYOUT_SEARCH_ITERATIONS) {
+                throw new Error(
+                    `masonry subset search exceeded ${MAX_LAYOUT_SEARCH_ITERATIONS} iterations while placing ${context}`,
+                );
+            }
             const indexes = boxes
                 .map((_, index) => index)
                 .filter((index) => (mask & (1 << index)) !== 0);
@@ -732,7 +784,7 @@ export function renderPalace(specs: SpecEntry[]): {
                 .map((index) => boxes[index])
                 .filter((box): box is Box => Boolean(box));
             const remainder = boxes.filter((_, index) => (mask & (1 << index)) === 0);
-            const columns = assignmentFor(selected);
+            const columns = assignmentFor(selected, context);
             const selectedLeveled = levelBand(selected, columns);
             const selectedHeights = Array<number>(COLUMN_COUNT).fill(0);
             for (const [index, box] of selectedLeveled.boxes.entries()) {
@@ -740,7 +792,7 @@ export function renderPalace(specs: SpecEntry[]): {
             }
             const selectedMax = Math.max(...selectedHeights);
             if (selectedMax > capacity) continue;
-            const remainderColumns = assignmentFor(remainder);
+            const remainderColumns = assignmentFor(remainder, context);
             const remainderLeveled = levelBand(remainder, remainderColumns);
             const remainderHeights = Array<number>(COLUMN_COUNT).fill(0);
             for (const [index, box] of remainderLeveled.boxes.entries()) {
@@ -838,6 +890,7 @@ export function renderPalace(specs: SpecEntry[]): {
         while (remaining.length > 0) {
             const pendingBox = remaining[0];
             if (!pendingBox) throw new Error("page packer lost a pending room");
+            const placementContext = `${pendingBox.category}/${pendingBox.name} segment ${pendingBox.segment} entry ${pendingBox.entries[0]?.id ?? "none"}`;
             if (++packIterations > maxPackIterations) {
                 throw new Error(
                     `page packer exceeded ${maxPackIterations} iterations while placing room ${pendingBox.category}/${pendingBox.name} segment ${pendingBox.segment}`,
@@ -883,7 +936,7 @@ export function renderPalace(specs: SpecEntry[]): {
                 continue;
             }
             const remainingCount = remaining.length;
-            const fullAssignment = assignmentFor(remaining);
+            const fullAssignment = assignmentFor(remaining, placementContext);
             const fullHeights = Array<number>(COLUMN_COUNT).fill(0);
             for (const [index, box] of remaining.entries()) {
                 fullHeights[fullAssignment[index] ?? 0] += box.heightPixels;
@@ -896,7 +949,7 @@ export function renderPalace(specs: SpecEntry[]): {
                 assignment = fullAssignment;
                 selectedIndexes = remaining.map((_, index) => index);
             } else {
-                const subset = subsetForCapacity(remaining, available);
+                const subset = subsetForCapacity(remaining, available, placementContext);
                 selectedIndexes = subset.indexes;
                 segmentBoxes = selectedIndexes
                     .map((index) => remaining[index])

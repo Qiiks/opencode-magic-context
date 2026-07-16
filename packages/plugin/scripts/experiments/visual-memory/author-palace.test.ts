@@ -88,4 +88,20 @@ describe("palace page packing", () => {
         expect(architectureBanner).toBeDefined();
         expect(architectureBanner).not.toContain("CONT.");
     });
+
+    test("uses bounded layout search for many pidgin-glyph rooms", () => {
+        const rendered = renderPalace(
+            Array.from({ length: 13 }, (_, index) => ({
+                id: index + 1,
+                category: "PROJECT_RULES" as const,
+                room: `Room ${index + 1}`,
+                cue: "`cmd` → ⊘ ∵",
+                importance: 50,
+            })),
+        );
+
+        expect(rendered.rooms).toHaveLength(13);
+        expect(rendered.palace).toContain("→");
+        expect(rendered.pages.length).toBeGreaterThan(0);
+    });
 });
