@@ -16,6 +16,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SOURCE_PATH = process.env.PALACE_SOURCE_PATH ?? "/tmp/visual-memory/trimmed-memories-source.txt";
 const OUTPUT_DIR = process.env.PALACE_OUTPUT_DIR ?? "/tmp/visual-memory";
 const MAX_PALACE_CHARS = 70_000;
+const REVIEW_RENDER = Boolean(process.env.PALACE_RENDER_DESPITE_VALIDATOR);
 const JETBRAINS_VARIANT = process.env.PALACE_RENDER_FONT === "jetbrains-mono-10";
 const RENDER_FONT = JETBRAINS_VARIANT ? "jetbrains-mono-10" : "spleen-5x8";
 const RENDER_STYLE = { aa: true, font: RENDER_FONT } as const;
@@ -150,6 +151,18 @@ function ratio(numerator: number, denominator: number): number {
     return Number((numerator / denominator).toFixed(2));
 }
 
+function assertOrWarnReview(assertion: () => void, message: string): void {
+    if (!REVIEW_RENDER) {
+        assertion();
+        return;
+    }
+    try {
+        assertion();
+    } catch {
+        console.warn(`[palace] ${message}; rendering review manifest anyway`);
+    }
+}
+
 function concat(parts: Uint8Array[]): Uint8Array {
     const length = parts.reduce((sum, part) => sum + part.length, 0);
     const result = new Uint8Array(length);
@@ -274,10 +287,12 @@ function prohibitionCells(lines: string[], context: string): Set<string> {
                     break;
                 }
             }
-            assert.ok(
-                open >= 0,
-                `${context}: prohibition at row ${marker.row + 1} lacks following mechanism: ${lines[marker.row] ?? ""}`,
-            );
+            if (open < 0) {
+                const message = `${context}: prohibition at row ${marker.row + 1} lacks following mechanism: ${lines[marker.row] ?? ""}`;
+                if (!REVIEW_RENDER) assert.ok(open >= 0, message);
+                else console.warn(`[palace] ${message}; rendering review manifest anyway`);
+                continue;
+            }
             let depth = 0;
             let close = -1;
             for (let cursor = open; cursor < end; cursor++) {
@@ -289,7 +304,12 @@ function prohibitionCells(lines: string[], context: string): Set<string> {
                     break;
                 }
             }
-            assert.ok(close >= open, `prohibition at row ${marker.row + 1} has unclosed mechanism`);
+            if (close < open) {
+                const message = `prohibition at row ${marker.row + 1} has unclosed mechanism`;
+                if (!REVIEW_RENDER) assert.ok(close >= open, message);
+                else console.warn(`[palace] ${message}; rendering review manifest anyway`);
+                continue;
+            }
             for (let cursor = open; cursor <= close; cursor++) {
                 const cell = cells[cursor];
                 const lineWidth = cell ? [...(lines[cell.row] ?? "")].length : 0;
@@ -495,17 +515,39 @@ const palaceLines = palace.endsWith("\n") ? palace.slice(0, -1).split("\n") : pa
 
 assert.ok(ids.length > 0, "source must contain at least one memory");
 assert.equal(new Set(ids).size, ids.length, "source memory ids must be unique");
-assert.deepEqual(
-    [...coveredIds].sort((a, b) => a - b),
-    [...ids].sort((a, b) => a - b),
-    "coverage sidecar must map every source memory id exactly once",
+assertOrWarnReview(
+    () =>
+        assert.deepEqual(
+            [...coveredIds].sort((a, b) => a - b),
+            [...ids].sort((a, b) => a - b),
+            "coverage sidecar must map every source memory id exactly once",
+        ),
+    "coverage sidecar does not map every source memory id exactly once",
 );
-assert.equal(coverage.sourceMemoryCount, ids.length);
-assert.equal(coverage.entryCount + coverage.mergeCount, ids.length);
-assert.equal(coverage.representedMemoryCount, ids.length);
-assert.equal(coverage.palaceChars, palace.length);
-assert.ok(palace.length <= MAX_PALACE_CHARS, `palace exceeds ${MAX_PALACE_CHARS} chars`);
-assert.ok(!/#\d+/.test(palace), "palace surface must not render memory ids");
+assertOrWarnReview(
+    () => assert.equal(coverage.sourceMemoryCount, ids.length),
+    "coverage source memory count does not match the source",
+);
+assertOrWarnReview(
+    () => assert.equal(coverage.entryCount + coverage.mergeCount, ids.length),
+    "coverage entry and merge counts do not match the source",
+);
+assertOrWarnReview(
+    () => assert.equal(coverage.representedMemoryCount, ids.length),
+    "coverage represented memory count does not match the source",
+);
+assertOrWarnReview(
+    () => assert.equal(coverage.palaceChars, palace.length),
+    "coverage palace character count does not match palace text",
+);
+assertOrWarnReview(
+    () => assert.ok(palace.length <= MAX_PALACE_CHARS, `palace exceeds ${MAX_PALACE_CHARS} chars`),
+    `palace exceeds ${MAX_PALACE_CHARS} chars`,
+);
+assertOrWarnReview(
+    () => assert.ok(!/#\d+/.test(palace), "palace surface must not render memory ids"),
+    "palace surface renders memory ids",
+);
 assert.equal(palaceLines.length, coverage.layout.canvasHeightCells);
 const maxLineChars = Math.max(...palaceLines.map((line) => [...line].length));
 assert.equal(coverage.maxLineChars, maxLineChars);

@@ -805,7 +805,19 @@ export function renderPalace(specs: SpecEntry[]): {
                 return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
             });
         let continued = false;
+        let packIterations = 0;
+        const maxPackIterations = Math.max(
+            64,
+            remaining.reduce((total, box) => total + box.bodyLines.length, 0) * 4,
+        );
         while (remaining.length > 0) {
+            const pendingBox = remaining[0];
+            if (!pendingBox) throw new Error("page packer lost a pending room");
+            if (++packIterations > maxPackIterations) {
+                throw new Error(
+                    `page packer exceeded ${maxPackIterations} iterations while placing room ${pendingBox.category}/${pendingBox.name} segment ${pendingBox.segment}`,
+                );
+            }
             let pageIndex = pageLines.length - 1;
             let available =
                 PAGE_HEIGHT_PIXELS - (pagePixelHeights[pageIndex] ?? 0) - BANNER_HEIGHT_PIXELS;
@@ -815,12 +827,38 @@ export function renderPalace(specs: SpecEntry[]): {
                 pageIndex++;
                 available = PAGE_HEIGHT_PIXELS - BANNER_HEIGHT_PIXELS;
             }
-            if (Math.min(...remaining.map((box) => box.heightPixels)) > available) {
-                pageLines.push([]);
-                pagePixelHeights.push(0);
-                continued = true;
+            const smallestBox = remaining.reduce((smallest, box) =>
+                box.heightPixels < smallest.heightPixels ? box : smallest,
+            );
+            if (smallestBox.heightPixels > available) {
+                if ((pagePixelHeights[pageIndex] ?? 0) > 0) {
+                    pageLines.push([]);
+                    pagePixelHeights.push(0);
+                    continued = true;
+                    continue;
+                }
+                const split = splitBox(smallestBox);
+                if (!split) {
+                    throw new Error(
+                        `room ${smallestBox.category}/${smallestBox.name} segment ${smallestBox.segment} is ${smallestBox.heightPixels}px and cannot split into an ${available}px page`,
+                    );
+                }
+                const [first, continuation] = split;
+                if (
+                    first.heightPixels >= smallestBox.heightPixels ||
+                    continuation.heightPixels >= smallestBox.heightPixels
+                ) {
+                    throw new Error(
+                        `room ${smallestBox.category}/${smallestBox.name} segment ${smallestBox.segment} did not shrink when split for an ${available}px page`,
+                    );
+                }
+                const splitIndex = remaining.indexOf(smallestBox);
+                if (splitIndex < 0) throw new Error("page packer lost its oversized room");
+                remaining.splice(splitIndex, 1, first, continuation);
+                splitCount++;
                 continue;
             }
+            const remainingCount = remaining.length;
             const fullAssignment = assignmentFor(remaining);
             const fullHeights = Array<number>(COLUMN_COUNT).fill(0);
             for (const [index, box] of remaining.entries()) {
@@ -957,7 +995,13 @@ export function renderPalace(specs: SpecEntry[]): {
             pagePixelHeights[pageIndex] = bannerTopPixels + BANNER_HEIGHT_PIXELS + bandHeightPixels;
 
             const selected = new Set(selectedIndexes);
-            remaining = remaining.filter((_, index) => !selected.has(index));
+            const nextRemaining = remaining.filter((_, index) => !selected.has(index));
+            if (nextRemaining.length >= remainingCount) {
+                throw new Error(
+                    `page packer made no progress while placing room ${pendingBox.category}/${pendingBox.name} segment ${pendingBox.segment}`,
+                );
+            }
+            remaining = nextRemaining;
             if (remaining.length > 0) {
                 pageLines.push([]);
                 pagePixelHeights.push(0);
@@ -974,9 +1018,15 @@ export function renderPalace(specs: SpecEntry[]): {
         throw new Error(`lines exceed ${MAX_LINE_CHARS}: ${JSON.stringify(longLines)}`);
     }
     if (palace.length > MAX_PALACE_CHARS) {
-        throw new Error(`palace has ${palace.length} chars (max ${MAX_PALACE_CHARS})`);
+        const message = `palace has ${palace.length} chars (max ${MAX_PALACE_CHARS})`;
+        if (!process.env.PALACE_RENDER_DESPITE_VALIDATOR) throw new Error(message);
+        console.warn(`[palace] ${message}; rendering review manifest anyway`);
     }
-    if (/#\d+/.test(palace)) throw new Error("memory id leaked into palace.txt");
+    if (/#\d+/.test(palace)) {
+        const message = "memory id leaked into palace.txt";
+        if (!process.env.PALACE_RENDER_DESPITE_VALIDATOR) throw new Error(message);
+        console.warn(`[palace] ${message}; rendering review manifest anyway`);
+    }
     let startLine = 1;
     const pages = pageLines.map((lines, index) => {
         const page = {
@@ -1008,7 +1058,8 @@ export function authorPalace(args: {
 }) {
     const palaceOutput = args.palaceOutput ?? PALACE_OUTPUT;
     const coverageOutput = args.coverageOutput ?? COVERAGE_OUTPUT;
-    if (process.env.PALACE_RENDER_DESPITE_VALIDATOR) {
+    const reviewRender = Boolean(process.env.PALACE_RENDER_DESPITE_VALIDATOR);
+    if (reviewRender) {
         // Review renders soft-break oversized unbreakable anchors BEFORE any
         // validation or box measurement, so every downstream consumer (width
         // checks, box geometry, the page packer) sees the same widths. Breaking
@@ -1041,15 +1092,26 @@ export function authorPalace(args: {
         }
     }
     validate(args.source, args.specs);
-    const { palace, placements, rooms, layoutItems, pages, leveling } = renderPalace(args.specs);
-    const cueLengths = args.specs
+    let renderSpecs = args.specs;
+    if (reviewRender) {
+        // Validation keeps the first duplicate id, so the review layout must do
+        // the same instead of drawing one memory in multiple rooms.
+        const renderedIds = new Set<number>();
+        renderSpecs = args.specs.filter((entry) => {
+            if (renderedIds.has(entry.id)) return false;
+            renderedIds.add(entry.id);
+            return true;
+        });
+    }
+    const { palace, placements, rooms, layoutItems, pages, leveling } = renderPalace(renderSpecs);
+    const cueLengths = renderSpecs
         .filter((entry) => entry.mergeInto === undefined)
         .map((entry) => codepoints(displayCue(entry)))
         .sort((a, b) => a - b);
     const percentile = (value: number): number =>
         cueLengths[Math.round((cueLengths.length - 1) * value)] ?? 0;
-    const entryCount = args.specs.filter((entry) => entry.mergeInto === undefined).length;
-    const mergeCount = args.specs.length - entryCount;
+    const entryCount = renderSpecs.filter((entry) => entry.mergeInto === undefined).length;
+    const mergeCount = renderSpecs.length - entryCount;
     const coverage = {
         source: args.sourceLabel ?? SOURCE_PATH,
         sourceMemoryCount: args.source.length,
@@ -1091,8 +1153,11 @@ export function authorPalace(args: {
                 .map(([id, placement]) => [String(id), placement]),
         ),
     };
-    if (placements.size !== args.source.length)
-        throw new Error(`coverage has ${placements.size}/${args.source.length}`);
+    if (placements.size !== args.source.length) {
+        const message = `coverage has ${placements.size}/${args.source.length}`;
+        if (!reviewRender) throw new Error(message);
+        console.warn(`[palace] ${message}; rendering review manifest anyway`);
+    }
     writeFileSync(palaceOutput, palace);
     writeFileSync(coverageOutput, `${JSON.stringify(coverage, null, 4)}\n`);
     return { palace, coverage };

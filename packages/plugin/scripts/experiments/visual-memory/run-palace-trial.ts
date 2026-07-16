@@ -97,6 +97,7 @@ type CellResult = {
     roomCount?: number;
     imageTokens?: number;
     utilizationPercent?: number;
+    pages?: number;
     renderError?: string;
     usage: TokenUsage[];
     cost?: number;
@@ -910,6 +911,7 @@ async function runCell(args: {
                   roomCount: new Set(specs.map((entry) => `${entry.category}\u0000${entry.room}`)).size,
                   imageTokens: metrics.imageTokens,
                   utilizationPercent: metrics.utilizationPercent,
+                  pages: metrics.pages,
               }
             : {}),
         ...(renderError ? { renderError } : {}),
