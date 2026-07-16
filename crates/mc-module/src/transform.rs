@@ -10623,4 +10623,43 @@ mod tests {
             assert!(!steady.committed);
         }
     }
+
+    #[test]
+    fn rig_repro_consumed_drops_render_bare_on_false_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // Active window: enough tagged blocks that the two oldest fall outside the
+        // newest-20 protection set, so their drops actually consume.
+        let messages: Vec<CkIngressMessage> = (1..=25)
+            .map(|n| item(Box::leak(format!("u{n}").into_boxed_str()), n, "droppable content"))
+            .collect();
+        let active = active_cc_req("rig-b", "cfg0", messages.clone());
+        let warm = run(&s, &active, &spine());
+        assert_eq!(warm.action, "HARD");
+        s.append_pending_agent_drops("rig-b", &["u1#0".to_string(), "u2#0".to_string()], 1)
+            .unwrap();
+        // Drops drain only on bust-gated passes; a config change forces the HARD
+        // that consumes them, mirroring how the rig's drops were consumed.
+        let active_busted = active_cc_req("rig-b", "cfg1", messages.clone());
+        let consumed = run(&s, &active_busted, &spine());
+        assert_eq!(consumed.action, "HARD");
+        // While active the numbered egress overlay is expected.
+        let active_joined = serde_json::to_string(&consumed.ck_messages).unwrap();
+        assert!(active_joined.contains("[dropped \u{a7}"), "{active_joined}");
+        // Frozen bytes stay canonical bare.
+        let frozen = s.load("rig-b").unwrap().core.frozen_units;
+        for unit in frozen.iter() {
+            assert!(!unit.frozen_payload.contains('\u{a7}'), "{}", unit.frozen_payload);
+        }
+        // False pass: hide the tool. Placeholders persist but must render BARE.
+        let mut hidden = cc_req("rig-b", "cfg1", messages);
+        hidden.tool_present = false;
+        let transition = run(&s, &hidden, &spine());
+        let false_joined = serde_json::to_string(&transition.ck_messages).unwrap();
+        assert!(false_joined.contains("[dropped]"), "{false_joined}");
+        assert!(!false_joined.contains('\u{a7}'), "{false_joined}");
+        let steady = run(&s, &hidden, &spine());
+        let steady_joined = serde_json::to_string(&steady.ck_messages).unwrap();
+        assert!(!steady_joined.contains('\u{a7}'), "{steady_joined}");
+    }
 }
