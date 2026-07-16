@@ -1530,7 +1530,7 @@ export function createShadowSender(
         args.state.counters.resets_sent += 1;
         sessionLog(
             args.sessionId,
-            `shadow: reset acknowledged (generation=${args.state.shadowGeneration})`,
+            `shadow: reset acknowledged (generation=${args.state.shadowGeneration}, reason=${args.reason})`,
         );
     };
 
@@ -1594,6 +1594,12 @@ export function createShadowSender(
                 state.counters.ordinal_mismatch += 1;
                 state.idOrdinalMemo.clear();
                 if (state.seedPassPending) {
+                    // Without this line a persistent seed-pass mismatch loops reset,
+                    // seed, mismatch silently; the ack lines alone look healthy.
+                    sessionLog(
+                        pass.sessionId,
+                        "shadow: seed pass ordinal mismatch, reset re-armed",
+                    );
                     markResetRequired(pass.sessionId, state, "ordinal_mismatch");
                 } else {
                     await performReset({

@@ -5521,8 +5521,8 @@ impl ModuleHandler for McHandler {
     }
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        if body.len() > MAX_FACADE_FRAME_BYTES {
-            return invalid_params_error("request body exceeds the 1 MiB limit");
+        if let Err(outcome) = enforce_request_byte_cap(&body) {
+            return outcome;
         }
         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
         self.dispatch_value(ctx.route_handle().channel, request)
@@ -5754,6 +5754,56 @@ fn store_unavailable_error() -> HandlerOutcome {
 }
 
 const MAX_FACADE_FRAME_BYTES: usize = 1024 * 1024;
+/// Transform-class requests carry a session's full message array. The transport
+/// frame ceiling is 64 MiB; half that leaves headroom for envelope overhead while
+/// still admitting the largest observed live sessions (multi-MiB CK arrays with
+/// retained ingress bytes).
+const MAX_TRANSFORM_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
+/// Minimal probe deserialized from an oversized body ONLY to pick the right byte
+/// cap. serde ignores every other field, so this stays cheap relative to a full
+/// Value parse of a multi-MiB array.
+#[derive(Deserialize)]
+struct RequestMethodProbe {
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+impl RequestMethodProbe {
+    fn is_transform_class(&self) -> bool {
+        let named = |value: &Option<String>, name: &str| value.as_deref() == Some(name);
+        named(&self.kind, "transform")
+            || named(&self.method, "shadow_transform")
+            // Paged shadow seeds stay under the sender's 512 KiB batch budget by
+            // design, but a single stored compartment or memory row can exceed the
+            // facade cap on its own; the wider cap keeps such rows syncable.
+            || named(&self.method, "state_sync")
+    }
+}
+
+/// The facade byte budget exists for agent tool calls; transform-class requests
+/// legitimately carry a session's full message array (multi-MiB on large
+/// sessions), so they get the wider cap. Method sniffing on raw bytes avoids
+/// parsing multi-MiB JSON just to reject it.
+fn enforce_request_byte_cap(body: &[u8]) -> Result<(), HandlerOutcome> {
+    if body.len() <= MAX_FACADE_FRAME_BYTES {
+        return Ok(());
+    }
+    let transform_class = serde_json::from_slice::<RequestMethodProbe>(body)
+        .map(|probe| probe.is_transform_class())
+        .unwrap_or(false);
+    if transform_class {
+        if body.len() <= MAX_TRANSFORM_FRAME_BYTES {
+            return Ok(());
+        }
+        return Err(invalid_params_error(
+            "request body exceeds the 32 MiB transform limit",
+        ));
+    }
+    Err(invalid_params_error("request body exceeds the 1 MiB limit"))
+}
 const MAX_AGENT_DROPS_COMMAND_ID_BYTES: usize = 128;
 const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_NOTE_CONTENT_BYTES: usize = 64 * 1024;
@@ -7594,6 +7644,32 @@ mod tests {
             cache.get("completes"),
             TransformSnapshotLookup::Ready(_)
         ));
+    }
+
+    #[test]
+    fn request_byte_cap_widens_for_transform_class_only() {
+        let pad = |method: &str, key: &str, bytes: usize| {
+            format!(
+                "{{\"{key}\":\"{method}\",\"pad\":\"{}\"}}",
+                "x".repeat(bytes)
+            )
+            .into_bytes()
+        };
+        // Under the facade cap everything passes without parsing.
+        assert!(enforce_request_byte_cap(b"{}").is_ok());
+        // Oversized transform-class bodies pass up to the transform cap.
+        let two_mib = 2 * 1024 * 1024;
+        assert!(enforce_request_byte_cap(&pad("transform", "kind", two_mib)).is_ok());
+        assert!(enforce_request_byte_cap(&pad("shadow_transform", "method", two_mib)).is_ok());
+        assert!(enforce_request_byte_cap(&pad("state_sync", "method", two_mib)).is_ok());
+        // Oversized facade bodies still reject at 1 MiB.
+        assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
+        // Unparseable oversized bodies reject conservatively.
+        assert!(enforce_request_byte_cap(&vec![b'x'; two_mib]).is_err());
+        // The transform cap itself is still a hard ceiling.
+        assert!(
+            enforce_request_byte_cap(&pad("transform", "kind", MAX_TRANSFORM_FRAME_BYTES)).is_err()
+        );
     }
 
     #[test]
