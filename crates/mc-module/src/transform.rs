@@ -32,7 +32,8 @@ use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInpu
 use mc_store::{
     Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, ModuleMeta,
     ModuleUsage, PendingAgentDrop, PendingRewriteState, StoredCompartment, TagMintInput,
-    TemporalMarkInput, TemporalMarkRow, UserHintDecisionInput, UserHintRow,
+    TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
+    UserHintDecisionInput, UserHintRow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -70,9 +71,11 @@ const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
 const USER_HINT_QUERY_CHAR_CAP: usize = 500;
 const USER_HINT_FRAGMENT_CHAR_CAP: usize = 100;
 const USER_HINT_TOTAL_CHAR_CAP: usize = 600;
-const USER_HINT_SEARCH_LIMIT: usize = 10;
+const USER_HINT_CANDIDATE_LIMIT: usize = 100;
+const USER_HINT_TOKEN_CAP: usize = 24;
 const USER_HINT_RESULT_LIMIT: usize = 3;
-const USER_HINT_LEXICAL_SCORE_FLOOR: f64 = 0.25;
+const USER_HINT_MIN_MATCHED_TOKENS: usize = 2;
+const USER_HINT_NORMALIZED_SCORE_FLOOR: f64 = 0.35;
 
 #[cfg(test)]
 thread_local! {
@@ -214,6 +217,10 @@ pub struct TransformRequest {
     pub usage: Option<ModuleUsage>,
     #[serde(default)]
     pub provider_error: Option<String>,
+    /// Proxy-observed completion time for the prior successful response on this exact
+    /// conversation key. It is request evidence only and never enters render identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_response_completed_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
 }
@@ -247,6 +254,8 @@ struct TransformRequestWire {
     #[serde(default)]
     provider_error: Option<String>,
     #[serde(default)]
+    prev_response_completed_at_ms: Option<u64>,
+    #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
 }
 
@@ -273,6 +282,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             tail_delta: wire.tail_delta,
             usage: wire.usage,
             provider_error: wire.provider_error,
+            prev_response_completed_at_ms: wire.prev_response_completed_at_ms,
             declared_trim: wire.declared_trim,
         })
     }
@@ -504,18 +514,37 @@ struct Channel1Decision {
     next_last_level: String,
 }
 
-struct UserHintInputs<'a, 'ctx> {
+#[derive(Debug, Default)]
+struct PendingOverlayDecisions {
+    max_seen_ordinal: Option<u64>,
+    tag_mints: Vec<TagMintInput>,
+    temporal_marks: Vec<TemporalMarkInput>,
+    user_hint: Option<UserHintDecisionInput>,
+    channel1_append: Option<Channel1AppendRow>,
+}
+
+struct OverlayComputation<'a, 'ctx> {
     store: &'a McStore,
     req: &'a TransformRequest,
     ctx: &'a ProducerContext<'ctx>,
     projection: &'a FlatProjection,
-    tag_rows: &'a [McTagRow],
-    user_hints: &'a [UserHintRow],
+    core: &'a CoreState,
+    tag_rows: &'a mut Vec<McTagRow>,
+    temporal_rows: &'a mut Vec<TemporalMarkRow>,
+    user_hint_rows: &'a mut Vec<UserHintRow>,
+}
+
+impl PendingOverlayDecisions {
+    fn is_empty(&self) -> bool {
+        self.max_seen_ordinal.is_none()
+            && self.tag_mints.is_empty()
+            && self.temporal_marks.is_empty()
+            && self.user_hint.is_none()
+            && self.channel1_append.is_none()
+    }
 }
 
 struct Channel1NudgeInputs<'a, 'ctx> {
-    store: &'a McStore,
-    req: &'a TransformRequest,
     ctx: &'a ProducerContext<'ctx>,
     core: &'a CoreState,
     projection: &'a FlatProjection,
@@ -762,18 +791,10 @@ fn apply_once(
         },
     );
     let tagging_active = cc_u1_active && loaded.meta.cc_u1_active;
-    let tag_rows = if cc_u1_active {
-        // Prior rows must be visible on the activation transition so protected pending
-        // drops are classified against the same durable tag history as steady passes.
-        if tagging_active {
-            mint_tags_for_projection(
-                store,
-                &req.session_id,
-                &projection,
-                &loaded.core,
-                ctx.now_ms,
-            )?;
-        }
+    // Previously stored overlay rows may still replay when boundary-lineage validation
+    // later forces pass-through. Decisions from this request stay in memory until the
+    // final cache-state compare-and-swap accepts the pass.
+    let mut tag_rows = if cc_u1_active {
         store.load_tags_for_session(&req.session_id)?
     } else {
         Vec::new()
@@ -793,20 +814,6 @@ fn apply_once(
     } else {
         Vec::new()
     };
-    if tagging_active {
-        persist_active_overlay_decisions(UserHintInputs {
-            store,
-            req,
-            ctx,
-            projection: &projection,
-            tag_rows: &tag_rows,
-            user_hints: &user_hints,
-        })?;
-        // Reload after the atomic apply so a concurrent winner's canonical bytes are
-        // rendered by this pass rather than this caller's speculative hint result.
-        user_hints = store.load_user_hints(&req.session_id)?;
-        temporal_marks = store.load_temporal_marks(&req.session_id)?;
-    }
 
     // Check whether the boundary is present in the live messages, or through a shadow
     // trim record that matches durable coverage and the first untrimmed message. A failed
@@ -913,6 +920,22 @@ fn apply_once(
         loaded.meta.pending_rewrite.is_some() && boundary_present;
 
     enforce_block_identity(&loaded.meta, &projection, &loaded.core)?;
+    let mut pending_overlays = PendingOverlayDecisions::default();
+    if tagging_active
+        && !loaded.core.reconcile_pending
+        && (loaded.meta.pending_rewrite.is_none() || clear_pending_rewrite_on_present)
+    {
+        pending_overlays = compute_active_overlay_decisions(OverlayComputation {
+            store,
+            req,
+            ctx,
+            projection: &projection,
+            core: &loaded.core,
+            tag_rows: &mut tag_rows,
+            temporal_rows: &mut temporal_marks,
+            user_hint_rows: &mut user_hints,
+        })?;
+    }
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
 
     // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
@@ -1475,8 +1498,6 @@ fn apply_once(
     if tagging_active {
         if let Some(row) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
-                store,
-                req,
                 ctx,
                 core: &core,
                 projection: &projection,
@@ -1486,10 +1507,11 @@ fn apply_once(
                 input_tokens: usage_input_tokens,
             },
             &mut meta,
-        )? {
+        ) {
             tag_overlay
                 .channel1_by_block_id
                 .insert(row.block_id.clone(), row.reminder_text.clone());
+            pending_overlays.channel1_append = Some(row.clone());
             channel1_appends.push(row);
         }
     }
@@ -1517,20 +1539,27 @@ fn apply_once(
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
     }
-    let commit_required = state_changed || !consumed_drop_ids.is_empty();
+    let commit_required =
+        state_changed || !consumed_drop_ids.is_empty() || !pending_overlays.is_empty();
     let row_version = if commit_required {
-        if consumed_drop_ids.is_empty() && commit_memory_revision.is_none() {
-            store.commit(&req.session_id, commit_expected, &core, &meta)?
-        } else {
-            store.commit_with_consumed_drops(
-                &req.session_id,
-                commit_expected,
-                &core,
-                &meta,
-                &consumed_drop_ids,
-                commit_memory_revision.as_ref(),
-            )?
-        }
+        store.commit_transform(
+            &req.session_id,
+            TransformCommit {
+                expected: commit_expected,
+                core: &core,
+                meta: &meta,
+                consumed_drop_ids: &consumed_drop_ids,
+                memory_revision: commit_memory_revision.as_ref(),
+                overlays: TransformOverlayBatch {
+                    max_seen_ordinal: pending_overlays.max_seen_ordinal,
+                    tag_mints: &pending_overlays.tag_mints,
+                    temporal_marks: &pending_overlays.temporal_marks,
+                    user_hint: pending_overlays.user_hint.as_ref(),
+                    channel1_append: pending_overlays.channel1_append.as_ref(),
+                    created_at_ms: ctx.now_ms,
+                },
+            },
+        )?
     } else {
         loaded.row_version.unwrap_or(0)
     };
@@ -2417,15 +2446,9 @@ fn push_synthetic_todo_pair(out: &mut Vec<CkWireMessage>, meta: &ModuleMeta) {
     }
 }
 
-fn mint_tags_for_projection(
-    store: &McStore,
-    session_id: &str,
-    projection: &FlatProjection,
-    core: &CoreState,
-    now_ms: i64,
-) -> Result<(), TransformError> {
+fn tag_mint_inputs(projection: &FlatProjection, core: &CoreState) -> Vec<TagMintInput> {
     let frozen = frozen_red_targets(core);
-    let inputs = projection
+    projection
         .blocks
         .iter()
         .filter(|block| !frozen.contains(&block.id))
@@ -2438,11 +2461,7 @@ fn mint_tags_for_projection(
                 source_bytes: source.as_bytes().to_vec(),
             })
         })
-        .collect::<Vec<_>>();
-    if !inputs.is_empty() {
-        store.mint_or_get_tags(session_id, &inputs, now_ms)?;
-    }
-    Ok(())
+        .collect()
 }
 
 /// Return exactly the span the overlay can prefix. Mint scope and overlay scope share
@@ -2617,13 +2636,10 @@ fn apply_tag_overlay_to_message(
                         kind,
                         *tag_number,
                     );
-                } else {
-                    debug_assert!(
-                        false,
-                        "taggable block {} was not minted before render",
-                        block.id
-                    );
                 }
+                // A boundary-lineage alarm forces raw pass-through, so only tags stored
+                // before this request are available. Newly seen blocks wait for a normal
+                // accepted pass rather than consuming tag numbers on rejected lineage.
             }
             if let Some(prefix) = overlay.temporal_by_block_id.get(&block.id) {
                 block_changed |= prepend_temporal_to_block(target, prefix);
@@ -2807,32 +2823,82 @@ fn strip_leading_tag_imitations(value: &str) -> &str {
     }
 }
 
-fn persist_active_overlay_decisions(input: UserHintInputs<'_, '_>) -> Result<(), TransformError> {
-    let watermark = input.store.overlay_watermark(&input.req.session_id)?;
-    let max_seen_ordinal = input
-        .req
+fn eligible_authored_user_tail(req: &TransformRequest) -> Option<&CkIngressMessage> {
+    // Synthetic messages and system-role blocks are transport noise for authored-tail
+    // decisions. Any other role is meaningful, so an assistant or tool tail prevents a
+    // buried user from receiving first-sight bytes.
+    let tail = req
         .messages
         .iter()
-        .filter(|message| !message.ck.meta.synthetic)
+        .rev()
+        .find(|message| !message.ck.meta.synthetic && message.ck.role != "system")?;
+    (tail.ck.role == "user").then_some(tail)
+}
+
+fn compute_active_overlay_decisions(
+    input: OverlayComputation<'_, '_>,
+) -> Result<PendingOverlayDecisions, TransformError> {
+    let OverlayComputation {
+        store,
+        req,
+        ctx,
+        projection,
+        core,
+        tag_rows,
+        temporal_rows,
+        user_hint_rows,
+    } = input;
+    let frontier = store.overlay_watermark(&req.session_id)?;
+    let max_seen_ordinal = req
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic && message.ck.role != "system")
         .map(|message| message.ordinal)
         .max()
-        .unwrap_or(0);
-    let mint_by_block = input
-        .tag_rows
+        .filter(|ordinal| frontier.is_none_or(|frontier| *ordinal > frontier));
+
+    let existing_tag_ids = tag_rows
+        .iter()
+        .map(|row| row.block_id.as_str())
+        .collect::<HashSet<_>>();
+    let tag_mints = tag_mint_inputs(projection, core)
+        .into_iter()
+        .filter(|input| !existing_tag_ids.contains(input.block_id.as_str()))
+        .collect::<Vec<_>>();
+    let next_tag = tag_rows.iter().map(|row| row.tag_number).max().unwrap_or(0);
+    for (offset, input) in tag_mints.iter().enumerate() {
+        tag_rows.push(McTagRow {
+            tag_number: next_tag + offset as i64 + 1,
+            block_id: input.block_id.clone(),
+            kind: input.kind.clone(),
+            token_count: input.token_count.max(0),
+            created_at_ms: ctx.now_ms,
+            source_bytes: input.source_bytes.clone(),
+        });
+    }
+
+    let mint_by_block = tag_rows
         .iter()
         .map(|row| (row.block_id.as_str(), row.created_at_ms))
         .collect::<HashMap<_, _>>();
-    let mut previous_first_mint = None;
+    let decided_temporal = temporal_rows
+        .iter()
+        .map(|row| row.block_id.clone())
+        .collect::<HashSet<_>>();
+    let authored_tail = eligible_authored_user_tail(req);
+    let mut previous_new_user_mint = None;
     let mut temporal_marks = Vec::new();
-
-    for message in input
-        .req
+    for message in req
         .messages
         .iter()
-        .filter(|message| !message.ck.meta.synthetic)
+        .filter(|message| !message.ck.meta.synthetic && message.ck.role != "system")
     {
-        let current = input
-            .projection
+        let is_new = frontier.is_none_or(|frontier| message.ordinal > frontier);
+        if message.ck.role != "user" || !is_new {
+            previous_new_user_mint = None;
+            continue;
+        }
+        let Some((block_id, current_mint)) = projection
             .blocks
             .iter()
             .filter(|block| block.mid == message.mid)
@@ -2841,41 +2907,58 @@ fn persist_active_overlay_decisions(input: UserHintInputs<'_, '_>) -> Result<(),
                     mint_by_block
                         .get(block.id.as_str())
                         .copied()
-                        .map(|created_at| (block.id.as_str(), created_at))
+                        .map(|created_at| (block.id.clone(), created_at))
                 })
-            });
-        if message.ck.role == "user" && message.ordinal > watermark {
-            if let Some((block_id, current_mint)) = current {
-                let marker_text = previous_first_mint
-                    .and_then(|previous| current_mint.checked_sub(previous))
-                    .and_then(temporal_gap_prefix)
-                    .unwrap_or_default();
-                temporal_marks.push(TemporalMarkInput {
-                    ordinal: message.ordinal,
-                    block_id: block_id.to_string(),
-                    marker_text,
-                });
-            }
+            })
+        else {
+            previous_new_user_mint = None;
+            continue;
+        };
+        if decided_temporal.contains(block_id.as_str()) {
+            previous_new_user_mint = Some(current_mint);
+            continue;
         }
-        // An untaggable immediate predecessor makes the elapsed time unknowable. Do not
-        // carry an older timestamp across it and attach a marker to the wrong pair.
-        previous_first_mint = current.map(|(_, created_at)| created_at);
+
+        let marker_text = if authored_tail.is_some_and(|tail| tail.mid == message.mid) {
+            let observed_now = u64::try_from(ctx.now_ms).unwrap_or(0);
+            req.prev_response_completed_at_ms
+                .filter(|completed| *completed > 0 && *completed < observed_now)
+                .and_then(|completed| {
+                    i64::try_from(observed_now - completed)
+                        .ok()
+                        .and_then(temporal_gap_prefix)
+                })
+                .unwrap_or_default()
+        } else {
+            // Multiple newly observed consecutive user messages have no provider response
+            // boundary. Mint times are retained only for that rare between-users fallback.
+            previous_new_user_mint
+                .and_then(|previous| current_mint.checked_sub(previous))
+                .and_then(temporal_gap_prefix)
+                .unwrap_or_default()
+        };
+        temporal_marks.push(TemporalMarkInput {
+            ordinal: message.ordinal,
+            block_id: block_id.clone(),
+            marker_text: marker_text.clone(),
+        });
+        temporal_rows.push(TemporalMarkRow {
+            block_id,
+            marker_text,
+            created_at: ctx.now_ms,
+        });
+        previous_new_user_mint = Some(current_mint);
     }
 
-    let user_hint = input
-        .req
-        .messages
-        .iter()
-        .rfind(|message| !message.ck.meta.synthetic && message.ck.role == "user")
+    let user_hint = authored_tail
+        .filter(|message| frontier.is_none_or(|frontier| message.ordinal > frontier))
         .and_then(|message| {
-            let block = input.projection.blocks.iter().find(|block| {
+            let block = projection.blocks.iter().find(|block| {
                 block.mid == message.mid
                     && block.role == "user"
                     && matches!(block.wire.kind, ck_wire::CkKind::Text { .. })
             })?;
-            if message.ordinal <= watermark
-                || input.user_hints.iter().any(|row| row.block_id == block.id)
-            {
+            if user_hint_rows.iter().any(|row| row.block_id == block.id) {
                 return None;
             }
             Some((message, block.id.clone()))
@@ -2886,11 +2969,11 @@ fn persist_active_overlay_decisions(input: UserHintInputs<'_, '_>) -> Result<(),
                 String::new()
             } else {
                 let results = run_user_hint_lexical_search(
-                    input.store,
-                    input.ctx.project_path,
-                    &input.req.session_id,
+                    store,
+                    ctx.project_path,
+                    &req.session_id,
                     &query,
-                    input.ctx.memory_enabled,
+                    ctx.memory_enabled,
                 )?;
                 render_user_hint(&results).unwrap_or_default()
             };
@@ -2901,15 +2984,36 @@ fn persist_active_overlay_decisions(input: UserHintInputs<'_, '_>) -> Result<(),
             })
         })
         .transpose()?;
+    if let Some(hint) = &user_hint {
+        user_hint_rows.push(UserHintRow {
+            block_id: hint.block_id.clone(),
+            hint_text: hint.hint_text.clone(),
+            created_at: ctx.now_ms,
+        });
+    }
 
-    input.store.apply_active_overlay_decisions(
-        &input.req.session_id,
+    Ok(PendingOverlayDecisions {
         max_seen_ordinal,
-        &temporal_marks,
-        user_hint.as_ref(),
-        input.ctx.now_ms,
-    )?;
-    Ok(())
+        tag_mints,
+        temporal_marks,
+        user_hint,
+        channel1_append: None,
+    })
+}
+
+fn lexical_tokens(text: &str) -> BTreeSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "and", "are", "but", "for", "from", "have", "into", "not", "that", "the", "this", "use",
+        "was", "with", "you", "your",
+    ];
+    text.to_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.chars().count() >= 3 && !STOPWORDS.contains(token))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(USER_HINT_TOKEN_CAP)
+        .collect()
 }
 
 fn run_user_hint_lexical_search(
@@ -2922,27 +3026,124 @@ fn run_user_hint_lexical_search(
     #[cfg(test)]
     USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(count.get() + 1));
 
-    let ranked = crate::memory_tool::search_memories_and_compartments_for_session(
-        store,
-        project_path,
-        session_id,
-        query,
-        USER_HINT_SEARCH_LIMIT,
-        include_memories,
-    )
-    .map_err(|error| match error {
-        crate::memory_tool::MemoryToolError::Store(store_error) => {
-            TransformError::Store(store_error)
+    struct Candidate {
+        result: crate::memory_tool::MemorySearchResult,
+        tokens: BTreeSet<String>,
+        recency: i64,
+    }
+
+    let query_tokens = lexical_tokens(query);
+    if query_tokens.len() < USER_HINT_MIN_MATCHED_TOKENS {
+        return Ok(Vec::new());
+    }
+    let mut candidates = Vec::new();
+    if include_memories {
+        for memory in
+            store.load_visible_memory_candidates(project_path, USER_HINT_CANDIDATE_LIMIT)?
+        {
+            candidates.push(Candidate {
+                tokens: lexical_tokens(&memory.content),
+                recency: memory.updated_at,
+                result: crate::memory_tool::MemorySearchResult {
+                    source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                    id: memory.id,
+                    snippet: memory.content,
+                    category: Some(memory.category),
+                    sequence: None,
+                    title: None,
+                    note_status: None,
+                    surface_condition: None,
+                },
+            });
         }
-        other => TransformError::Search(other.to_string()),
-    })?;
-    Ok(ranked
+    }
+    for compartment in store.load_compartment_candidates(session_id, USER_HINT_CANDIDATE_LIMIT)? {
+        let body = [
+            Some(compartment.title.as_str()),
+            Some(compartment.content.as_str()),
+            compartment.p1.as_deref(),
+            compartment.p2.as_deref(),
+            compartment.p3.as_deref(),
+            compartment.p4.as_deref(),
+        ]
         .into_iter()
-        .filter(|result| result.source_kind != crate::memory_tool::MemorySearchSourceKind::Note)
-        .enumerate()
-        .take_while(|(rank, _)| 1.0 / (*rank as f64 + 1.0) > USER_HINT_LEXICAL_SCORE_FLOOR)
+        .flatten()
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+        candidates.push(Candidate {
+            tokens: lexical_tokens(&body),
+            recency: compartment.created_at,
+            result: crate::memory_tool::MemorySearchResult {
+                source_kind: crate::memory_tool::MemorySearchSourceKind::CompartmentBody,
+                id: compartment.sequence,
+                snippet: body,
+                category: None,
+                sequence: Some(compartment.sequence),
+                title: Some(compartment.title),
+                note_status: None,
+                surface_condition: None,
+            },
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut document_frequency = HashMap::new();
+    for token in &query_tokens {
+        let count = candidates
+            .iter()
+            .filter(|candidate| candidate.tokens.contains(token))
+            .count();
+        document_frequency.insert(token, count);
+    }
+    let pool_size = candidates.len() as f64;
+    let total_query_weight = query_tokens
+        .iter()
+        .map(|token| {
+            let frequency = *document_frequency.get(token).unwrap_or(&0) as f64;
+            ((pool_size + 1.0) / (frequency + 1.0)).ln() + 1.0
+        })
+        .sum::<f64>();
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let matched = query_tokens
+                .iter()
+                .filter(|token| candidate.tokens.contains(*token))
+                .collect::<Vec<_>>();
+            if matched.len() < USER_HINT_MIN_MATCHED_TOKENS {
+                return None;
+            }
+            let score = matched
+                .iter()
+                .map(|token| {
+                    let frequency = *document_frequency.get(*token).unwrap_or(&0) as f64;
+                    ((pool_size + 1.0) / (frequency + 1.0)).ln() + 1.0
+                })
+                .sum::<f64>();
+            let normalized = score / total_query_weight.max(f64::EPSILON);
+            (normalized >= USER_HINT_NORMALIZED_SCORE_FLOOR).then_some((
+                normalized,
+                matched.len(),
+                candidate.recency,
+                candidate.result,
+            ))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.id.cmp(&right.3.id))
+    });
+    Ok(scored
+        .into_iter()
         .take(USER_HINT_RESULT_LIMIT)
-        .map(|(_, result)| result)
+        .map(|(_, _, _, result)| result)
         .collect())
 }
 
@@ -3057,7 +3258,7 @@ fn one_line_fragment(text: &str, limit: usize) -> String {
 fn maybe_append_channel1_nudge(
     input: Channel1NudgeInputs<'_, '_>,
     meta: &mut ModuleMeta,
-) -> Result<Option<Channel1AppendRow>, TransformError> {
+) -> Option<Channel1AppendRow> {
     let active_tags = active_tags_for_nudge(input.core, meta, input.projection, input.tag_rows);
     let live_tail_tokens = active_tags
         .iter()
@@ -3084,35 +3285,22 @@ fn maybe_append_channel1_nudge(
     let was_suppressed = meta.channel1_reduce_suppressed;
     meta.channel1_reduce_suppressed = false;
     if was_suppressed || !decision.fire {
-        return Ok(None);
+        return None;
     }
     let existing_blocks = input
         .channel1_appends
         .iter()
         .map(|row| row.block_id.as_str())
         .collect::<HashSet<_>>();
-    let Some(block_id) =
-        newest_tool_result_for_channel1(input.core, meta, input.projection, &existing_blocks)
-    else {
-        return Ok(None);
-    };
+    let block_id =
+        newest_tool_result_for_channel1(input.core, meta, input.projection, &existing_blocks)?;
     let hint = oldest_reclaimable_hint(&active_tags, working_window_tokens);
     let reminder = build_channel1_reminder(decision.level, decision.reclaimable_tokens, &hint);
-    let inserted = input.store.append_channel1_nudge(
-        &input.req.session_id,
-        &block_id,
-        &reminder,
-        input.ctx.now_ms,
-    )?;
-    if inserted {
-        Ok(Some(Channel1AppendRow {
-            block_id,
-            reminder_text: reminder,
-            fired_at_ms: input.ctx.now_ms,
-        }))
-    } else {
-        Ok(None)
-    }
+    Some(Channel1AppendRow {
+        block_id,
+        reminder_text: reminder,
+        fired_at_ms: input.ctx.now_ms,
+    })
 }
 
 fn active_tags_for_nudge(
@@ -4133,6 +4321,7 @@ mod tests {
             tail_delta: None,
             usage: None,
             provider_error: None,
+            prev_response_completed_at_ms: None,
             declared_trim: None,
         }
     }
@@ -7441,10 +7630,12 @@ mod tests {
 
             let mut complete = with_assistant;
             complete.push(wire_item("user", "m3", 3, &["question"]));
-            let active = active_cc_req("temporal", "cfg0", complete.clone());
+            let mut active = active_cc_req("temporal", "cfg0", complete.clone());
+            active.prev_response_completed_at_ms = Some(10_000);
             let first =
                 transform(&s, &active, &pctx("git:proj", "/nonexistent-docs", 730_000)).unwrap();
             assert_eq!(tail_bytes(&first, "m3"), "<!-- +12m -->\n§3§ question");
+            active.prev_response_completed_at_ms = Some(990_000);
             let replay =
                 transform(&s, &active, &pctx("git:proj", "/nonexistent-docs", 999_000)).unwrap();
             assert_eq!(tail_bytes(&replay, "m3"), tail_bytes(&first, "m3"));
@@ -7482,7 +7673,7 @@ mod tests {
             )
             .unwrap();
             let frozen = tail_bytes(&first, "m3").to_string();
-            assert_eq!(frozen, "<!-- +12m -->\n§2§ later");
+            assert_eq!(frozen, "§2§ later");
 
             let restored = active_cc_req(
                 "temporal-sparse",
@@ -7563,6 +7754,50 @@ mod tests {
             .unwrap();
             assert_eq!(tail_bytes(&active, "m3"), "§3§ current question");
         });
+    }
+
+    #[test]
+    fn temporal_gap_invalid_or_missing_observation_freezes_no_marker() {
+        run_active_surface_test(|| {
+            for (session, observed) in [
+                ("temporal-absent", None),
+                ("temporal-zero", Some(0)),
+                ("temporal-equal", Some(600_000)),
+                ("temporal-future", Some(600_001)),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let s = store(dir.path());
+                let mut request = active_cc_req(
+                    session,
+                    "cfg0",
+                    vec![wire_item("user", "m0", 0, &["question"])],
+                );
+                request.prev_response_completed_at_ms = observed;
+                run(&s, &request, &spine());
+                let response = transform(
+                    &s,
+                    &request,
+                    &pctx("git:proj", "/nonexistent-docs", 600_000),
+                )
+                .unwrap();
+                assert_eq!(tail_bytes(&response, "m0"), "§1§ question");
+                assert_eq!(s.load_temporal_marks(session).unwrap()[0].marker_text, "");
+            }
+        });
+    }
+
+    #[test]
+    fn v2_request_tolerates_absent_previous_response_completion() {
+        let parsed: TransformRequest = serde_json::from_value(serde_json::json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "claude-code-anthropic",
+            "session_id": "parse-gap",
+            "render_config": "cfg",
+            "messages": []
+        }))
+        .unwrap();
+        assert_eq!(parsed.prev_response_completed_at_ms, None);
     }
 
     #[test]
@@ -7649,11 +7884,19 @@ mod tests {
     }
 
     #[test]
-    fn user_hint_frontier_never_backfills_an_older_turn() {
+    fn buried_user_does_not_mint_a_hint_or_backfill_later() {
         run_active_surface_test(|| {
             USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "newer prompt carries related durable context",
+                70,
+            )
+            .unwrap();
             let both = vec![
                 wire_item("user", "m1", 1, &["older prompt"]),
                 wire_item("user", "m2", 2, &["newer prompt"]),
@@ -7662,12 +7905,9 @@ mod tests {
             let request = active_cc_req("hint-frontier", "cfg0", both);
             run(&s, &request, &spine());
             run(&s, &request, &spine());
-            assert_eq!(
-                s.load_user_hints("hint-frontier").unwrap()[0].block_id,
-                "m2#0"
-            );
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
-            assert_eq!(s.overlay_watermark("hint-frontier").unwrap(), 3);
+            assert!(s.load_user_hints("hint-frontier").unwrap().is_empty());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
+            assert_eq!(s.overlay_watermark("hint-frontier").unwrap(), Some(3));
 
             let older_only = active_cc_req(
                 "hint-frontier",
@@ -7676,13 +7916,68 @@ mod tests {
             );
             let response = run(&s, &older_only, &spine());
             assert_eq!(tail_bytes(&response, "m1"), "§1§ older prompt");
-            assert_eq!(s.load_user_hints("hint-frontier").unwrap().len(), 1);
-            assert_eq!(
-                USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get),
+            assert!(s.load_user_hints("hint-frontier").unwrap().is_empty());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
+        });
+    }
+
+    #[test]
+    fn ordinal_zero_user_is_eligible_on_a_fresh_frontier() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
                 1,
-                "a later durable decision closes the first-apply frontier"
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership uses borrowing safely",
+                70,
+            )
+            .unwrap();
+            let request = active_cc_req(
+                "zero-frontier",
+                "cfg0",
+                vec![wire_item("user", "m0", 0, &["rust ownership"])],
+            );
+            run(&s, &request, &spine());
+            let active = run(&s, &request, &spine());
+            assert!(tail_bytes(&active, "m0").contains("<ctx-search-hint>"));
+            assert_eq!(s.overlay_watermark("zero-frontier").unwrap(), Some(0));
+            assert_eq!(
+                s.load_user_hints("zero-frontier").unwrap()[0].block_id,
+                "m0#0"
             );
         });
+    }
+
+    #[test]
+    fn lexical_hint_scoring_requires_two_specific_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        for id in 1..=30 {
+            let content = if id == 1 {
+                "rust ownership borrowing safely across async tasks".to_string()
+            } else if id == 2 {
+                "quasar appears in an otherwise unrelated archive".to_string()
+            } else {
+                format!("fixture memory {id} about ordinary unrelated material")
+            };
+            s.seed_memory(id, "git:proj", "CONSTRAINTS", &content, 50)
+                .unwrap();
+        }
+
+        let related =
+            run_user_hint_lexical_search(&s, "git:proj", "lexical", "rust ownership", true)
+                .unwrap();
+        assert_eq!(related[0].id, 1);
+        let unrelated =
+            run_user_hint_lexical_search(&s, "git:proj", "lexical", "galaxy telescope", true)
+                .unwrap();
+        assert!(unrelated.is_empty());
+        let one_common_token =
+            run_user_hint_lexical_search(&s, "git:proj", "lexical", "quasar deployment", true)
+                .unwrap();
+        assert!(one_common_token.is_empty());
     }
 
     #[test]
@@ -7727,7 +8022,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_rewrite_passthrough_computes_the_newest_user_hint() {
+    fn pending_rewrite_passthrough_replays_only_existing_overlays() {
         run_active_surface_test(|| {
             USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
             let dir = tempfile::tempdir().unwrap();
@@ -7774,7 +8069,22 @@ mod tests {
             );
             let response = run(&s, &absent, &spine());
             assert_eq!(response.action, "PASSTHROUGH");
-            assert!(tail_bytes(&response, "foreign").contains("<ctx-search-hint>"));
+            assert!(!tail_bytes(&response, "foreign").contains("<ctx-search-hint>"));
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
+            assert!(s.load_user_hints("pending-hint").unwrap().is_empty());
+            assert_eq!(s.overlay_watermark("pending-hint").unwrap(), Some(3));
+
+            let accepted = active_cc_req(
+                "pending-hint",
+                "cfg0",
+                vec![
+                    present.messages[0].clone(),
+                    present.messages[1].clone(),
+                    wire_item("user", "foreign", 50, &["foreign prompt"]),
+                ],
+            );
+            let active = run(&s, &accepted, &spine());
+            assert!(tail_bytes(&active, "foreign").contains("<ctx-search-hint>"));
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
             assert_eq!(
                 s.load_user_hints("pending-hint").unwrap()[0].block_id,
@@ -7879,7 +8189,7 @@ mod tests {
     }
 
     #[test]
-    fn tag_minting_is_deterministic_monotonic_and_survives_rejected_pass() {
+    fn tag_minting_is_deterministic_and_rejected_pass_is_speculative() {
         run_active_surface_test(|| {
             let messages = vec![
                 item("m1", 1, "hello"),
@@ -7945,8 +8255,91 @@ mod tests {
                 tags.iter()
                     .map(|row| row.block_id.as_str())
                     .collect::<Vec<_>>(),
-                vec!["m1#0", "m2#0"]
+                vec!["m1#0"]
             );
+        });
+    }
+
+    #[test]
+    fn boundary_rejection_leaves_all_overlay_decisions_uncommitted() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership durable context",
+                70,
+            )
+            .unwrap();
+            let baseline = active_cc_req(
+                "overlay-reject",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["baseline prompt"])],
+            );
+            run(&s, &baseline, &spine());
+            run(&s, &baseline, &spine());
+            let tags_before = s.load_tags_for_session("overlay-reject").unwrap();
+            let hints_before = s.load_user_hints("overlay-reject").unwrap();
+            let temporal_before = s.load_temporal_marks("overlay-reject").unwrap();
+            let frontier_before = s.overlay_watermark("overlay-reject").unwrap();
+
+            s.replace_compartments(
+                "overlay-reject",
+                &[comp(1, 3, 3, "m3#0", "only the last message")],
+            )
+            .unwrap();
+            let mut rejected = active_cc_req(
+                "overlay-reject",
+                "cfg0",
+                vec![
+                    baseline.messages[0].clone(),
+                    wire_item("assistant", "m2", 2, &["answer"]),
+                    wire_item("user", "m3", 3, &["rust ownership"]),
+                ],
+            );
+            rejected.prev_response_completed_at_ms = Some(1);
+            let error = transform(
+                &s,
+                &rejected,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap_err();
+            assert!(matches!(error, TransformError::CoverageGap(_)));
+            assert_eq!(
+                s.load_tags_for_session("overlay-reject").unwrap(),
+                tags_before
+            );
+            assert_eq!(s.load_user_hints("overlay-reject").unwrap(), hints_before);
+            assert_eq!(
+                s.load_temporal_marks("overlay-reject").unwrap(),
+                temporal_before
+            );
+            assert_eq!(
+                s.overlay_watermark("overlay-reject").unwrap(),
+                frontier_before
+            );
+
+            s.replace_compartments("overlay-reject", &[comp(1, 1, 3, "m3#0", "complete range")])
+                .unwrap();
+            transform(
+                &s,
+                &rejected,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap();
+            assert!(s
+                .load_user_hints("overlay-reject")
+                .unwrap()
+                .iter()
+                .any(|row| row.block_id == "m3#0" && !row.hint_text.is_empty()));
+            assert_eq!(s.overlay_watermark("overlay-reject").unwrap(), Some(3));
+            assert!(s
+                .load_temporal_marks("overlay-reject")
+                .unwrap()
+                .iter()
+                .any(|row| row.block_id == "m3#0"));
         });
     }
 

@@ -51,11 +51,11 @@ use tokio::sync::Notify;
 use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
-    validate_state_import_compartments, HistorianPhase, InsertMemoryInput, McStore, NoteInput,
-    ShadowDivergenceRecord, ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError,
-    ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError,
-    StateImportPreflight, StateImportValidationError, StoredChunkTranscript, StoredCompartment,
-    StoredMemoryMutation, StoredNote,
+    validate_state_import_compartments, HistorianPhase, InsertMemoryInput, McStore, McStoreError,
+    NoteInput, ShadowDivergenceRecord, ShadowMemoryMutationRow, ShadowMemoryRow,
+    ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow,
+    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
+    StoredCompartment, StoredMemoryMutation, StoredNote,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -1442,6 +1442,25 @@ struct TerminalWrapupResponse {
     include_rounds_without_command: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryableWrapupReason {
+    BackoffActive,
+    SnapshotUnavailable,
+    SnapshotStale,
+    BudgetExhausted,
+}
+
+impl RetryableWrapupReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BackoffActive => "backoff_active",
+            Self::SnapshotUnavailable => "snapshot_unavailable",
+            Self::SnapshotStale => "snapshot_stale",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
 struct HistorianFiringTask {
     store: Arc<McStore>,
     session_id: String,
@@ -2697,21 +2716,48 @@ impl McHandler {
         &self,
         task: HistorianFiringTask,
         deadline: Instant,
-    ) -> Result<historian::HistorianDriveOutcome, String> {
+    ) -> Result<historian::HistorianDriveOutcome, (RetryableWrapupReason, String)> {
         let Some(remaining) = Self::remaining_wrapup_budget(deadline) else {
-            return Err("wrapup request budget expired before historian round".to_string());
+            return Err((
+                RetryableWrapupReason::BudgetExhausted,
+                "wrapup request budget expired before historian round".to_string(),
+            ));
         };
         let wait = historian::wrapup_round_wait_budget().min(remaining);
         let factory = Arc::clone(&self.producer_factory);
         let handle = tokio::spawn(Self::execute_historian_firing_task(factory, task));
         match tokio::time::timeout(wait, handle).await {
             Ok(Ok(Ok(outcome))) => Ok(outcome),
-            Ok(Ok(Err(error))) => Err(error.to_string()),
-            Ok(Err(error)) => Err(format!("historian task failed: {error}")),
-            Err(_) if Instant::now() >= deadline => {
-                Err("wrapup request budget expired during historian round".to_string())
+            Ok(Ok(Err(error))) => {
+                let reason = match &error {
+                    historian::HistorianDriveError::State(
+                        historian::HistorianStateError::Publish(
+                            mc_store::HistorianPublishError::CasConflict { .. },
+                        ),
+                    )
+                    | historian::HistorianDriveError::State(
+                        historian::HistorianStateError::Store(McStoreError::CasConflict { .. }),
+                    ) => RetryableWrapupReason::SnapshotStale,
+                    historian::HistorianDriveError::Producer(_)
+                    | historian::HistorianDriveError::Validation(_) => {
+                        RetryableWrapupReason::BackoffActive
+                    }
+                    _ => RetryableWrapupReason::SnapshotUnavailable,
+                };
+                Err((reason, error.to_string()))
             }
-            Err(_) => Err("historian round timed out after 600 seconds".to_string()),
+            Ok(Err(error)) => Err((
+                RetryableWrapupReason::SnapshotUnavailable,
+                format!("historian task failed: {error}"),
+            )),
+            Err(_) if Instant::now() >= deadline => Err((
+                RetryableWrapupReason::BudgetExhausted,
+                "wrapup request budget expired during historian round".to_string(),
+            )),
+            Err(_) => Err((
+                RetryableWrapupReason::SnapshotUnavailable,
+                "historian round timed out after 600 seconds".to_string(),
+            )),
         }
     }
 
@@ -3098,8 +3144,8 @@ impl McHandler {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
-        let loaded = match store.load(&session_id) {
-            Ok(loaded) => loaded,
+        let snapshot = match store.load_session_status_snapshot(&session_id) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -3107,42 +3153,11 @@ impl McHandler {
                 }
             }
         };
-        let compartment_count = match store.load_compartments(&session_id) {
-            Ok(compartments) => compartments.len(),
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "store_load_failed".to_string(),
-                    message: error.to_string(),
-                }
-            }
-        };
-        let pending_drop_count = match store.load_pending_agent_drops(&session_id) {
-            Ok(drops) => drops.len(),
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "store_load_failed".to_string(),
-                    message: error.to_string(),
-                }
-            }
-        };
-        let tag_count = match store.load_tags_for_session(&session_id) {
-            Ok(tags) => tags.len(),
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "store_load_failed".to_string(),
-                    message: error.to_string(),
-                }
-            }
-        };
-        let pass_trace = match store.load_pass_trace(&session_id) {
-            Ok(trace) => trace,
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "store_load_failed".to_string(),
-                    message: error.to_string(),
-                }
-            }
-        };
+        let loaded = snapshot.loaded;
+        let compartment_count = snapshot.compartment_count;
+        let pending_drop_count = snapshot.pending_drop_count;
+        let tag_count = snapshot.tag_count;
+        let pass_trace = snapshot.pass_trace;
         let coverage = loaded
             .meta
             .coverage_ordinal
@@ -3173,14 +3188,17 @@ impl McHandler {
         let age = format_traffic_age(newest_pass_at, now_ms());
         // Status can outlive the caller's current lineage. Naming the subject and its
         // durable traffic age makes a stale read visible instead of silently ambiguous.
-        let summary = format!(
-            "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, last historian: {historian}, surface {surface}",
-            compartment_count,
-            plural_word(compartment_count, "compartment"),
-            pending_drop_count,
-            plural_word(pending_drop_count, "drop"),
-            tag_count,
-            plural_word(tag_count, "tag"),
+        let summary = sanitize_status_text(
+            &format!(
+                "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, last historian: {historian}, surface {surface}",
+                compartment_count,
+                plural_word(compartment_count, "compartment"),
+                pending_drop_count,
+                plural_word(pending_drop_count, "drop"),
+                tag_count,
+                plural_word(tag_count, "tag"),
+            ),
+            500,
         );
         // Structured fields beside the prose: reconcilers must never parse summary
         // text, and a retained delivered-command row needs coverage/row_version plus
@@ -3204,6 +3222,36 @@ impl McHandler {
         }))
     }
 
+    fn wrapup_snapshot_is_current(
+        &self,
+        store: &McStore,
+        session_id: &str,
+        generation: u64,
+        revert_epoch: u64,
+    ) -> Result<bool, McStoreError> {
+        let generation_current = self
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .ready_generation_matches(session_id, generation);
+        if !generation_current {
+            return Ok(false);
+        }
+        Ok(store.load(session_id)?.meta.revert_epoch == revert_epoch)
+    }
+
+    fn retryable_wrapup_response(
+        reason: RetryableWrapupReason,
+        summary: impl Into<String>,
+    ) -> HandlerOutcome {
+        respond(json!({
+            "ok": false,
+            "disposition": "retryable",
+            "reason": reason.as_str(),
+            "summary": summary.into(),
+        }))
+    }
+
     fn terminal_wrapup_response(
         &self,
         store: &McStore,
@@ -3217,6 +3265,7 @@ impl McHandler {
             summary,
             include_rounds_without_command,
         } = response;
+        debug_assert!(matches!(disposition, "completed" | "nothing_to_compact"));
         let (disposition, rounds, summary) = if let Some(command_id) = command_id {
             match store.record_wrapup_command(
                 session_id,
@@ -3238,7 +3287,7 @@ impl McHandler {
             (disposition.to_string(), rounds, summary)
         };
         let mut payload = json!({
-            "ok": disposition != "failed",
+            "ok": true,
             "disposition": disposition,
             "summary": summary,
         });
@@ -3343,19 +3392,12 @@ impl McHandler {
         let entry_now = now_ms();
         if let Some(until) = entry_state.meta.historian.failure_backoff_at_ms {
             if until > entry_now {
-                return self.terminal_wrapup_response(
-                    &store,
-                    &session_id,
-                    command_id,
-                    TerminalWrapupResponse {
-                        disposition: "failed",
-                        rounds: 0,
-                        summary: format!(
-                            "historian failure backoff active for {} ms",
-                            until.saturating_sub(entry_now)
-                        ),
-                        include_rounds_without_command: false,
-                    },
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::BackoffActive,
+                    format!(
+                        "historian failure backoff active for {} ms",
+                        until.saturating_sub(entry_now)
+                    ),
                 );
             }
         }
@@ -3368,18 +3410,9 @@ impl McHandler {
         let ready = match snapshot {
             TransformSnapshotLookup::Ready(ready) => ready,
             TransformSnapshotLookup::Missing | TransformSnapshotLookup::InFlight => {
-                return self.terminal_wrapup_response(
-                    &store,
-                    &session_id,
-                    command_id,
-                    TerminalWrapupResponse {
-                        disposition: "failed",
-                        rounds: 0,
-                        summary:
-                            "wrapup unavailable until a full session transform has been observed"
-                                .to_string(),
-                        include_rounds_without_command: false,
-                    },
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::SnapshotUnavailable,
+                    "wrapup unavailable until a full session transform has been observed",
                 )
             }
         };
@@ -3394,32 +3427,17 @@ impl McHandler {
             }
         };
         if ready.revert_epoch != initial_snapshot.revert_epoch {
-            return self.terminal_wrapup_response(
-                &store,
-                &session_id,
-                command_id,
-                TerminalWrapupResponse {
-                    disposition: "failed",
-                    rounds: 0,
-                    summary: "wrapup unavailable until a full session transform has been observed"
-                        .to_string(),
-                    include_rounds_without_command: false,
-                },
+            return Self::retryable_wrapup_response(
+                RetryableWrapupReason::SnapshotStale,
+                "wrapup unavailable until a full session transform has been observed",
             );
         }
         let projection = match crate::ck_wire::project_messages(&parsed.messages) {
             Ok(projection) => projection,
             Err(error) => {
-                return self.terminal_wrapup_response(
-                    &store,
-                    &session_id,
-                    command_id,
-                    TerminalWrapupResponse {
-                        disposition: "failed",
-                        rounds: 0,
-                        summary: format!("wrapup boundary assembly failed: {error}"),
-                        include_rounds_without_command: false,
-                    },
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::SnapshotUnavailable,
+                    format!("wrapup boundary assembly failed: {error}"),
                 )
             }
         };
@@ -3431,24 +3449,25 @@ impl McHandler {
             .max();
         let plan = boundary::resolve_wrapup_boundary(&boundary_messages, initial_end, keep);
         let target = plan.target_protected_start_ordinal;
-        if !self
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex")
-            .ready_generation_matches(&session_id, ready.generation)
-        {
-            return self.terminal_wrapup_response(
-                &store,
-                &session_id,
-                command_id,
-                TerminalWrapupResponse {
-                    disposition: "failed",
-                    rounds: 0,
-                    summary: "wrapup unavailable until a full session transform has been observed"
-                        .to_string(),
-                    include_rounds_without_command: false,
-                },
-            );
+        match self.wrapup_snapshot_is_current(
+            &store,
+            &session_id,
+            ready.generation,
+            ready.revert_epoch,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::SnapshotStale,
+                    "wrapup unavailable until a full session transform has been observed",
+                )
+            }
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
         }
         if plan.raw_messages_above_last_compartment <= keep
             || !wrapup_has_remaining_messages(&parsed.messages, initial_end, target)
@@ -3470,10 +3489,13 @@ impl McHandler {
         }
 
         let mut rounds = 0usize;
-        let mut failure = None;
+        let mut failure: Option<(RetryableWrapupReason, String)> = None;
         while rounds < historian::MAX_WRAPUP_ROUNDS {
             if Self::remaining_wrapup_budget(deadline).is_none() {
-                failure = Some("wrapup request budget expired before the next round".to_string());
+                failure = Some((
+                    RetryableWrapupReason::BudgetExhausted,
+                    "wrapup request budget expired before the next round".to_string(),
+                ));
                 break;
             }
             if !self
@@ -3482,31 +3504,38 @@ impl McHandler {
                 .expect("transform snapshots mutex")
                 .ready_generation_matches(&session_id, ready.generation)
             {
-                failure = Some(
+                failure = Some((
+                    RetryableWrapupReason::SnapshotStale,
                     "wrapup unavailable because a newer full session transform started".to_string(),
-                );
+                ));
                 break;
             }
             let current_state = match store.load(&session_id) {
                 Ok(loaded) => loaded,
                 Err(error) => {
-                    failure = Some(format!("store load failed before round: {error}"));
-                    break;
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    };
                 }
             };
             if current_state.meta.revert_epoch != ready.revert_epoch {
-                failure = Some(
+                failure = Some((
+                    RetryableWrapupReason::SnapshotStale,
                     "wrapup unavailable until a full session transform has been observed"
                         .to_string(),
-                );
+                ));
                 break;
             }
             let round_now = now_ms();
             if let Some(until) = current_state.meta.historian.failure_backoff_at_ms {
                 if until > round_now {
-                    failure = Some(format!(
-                        "historian failure backoff active for {} ms",
-                        until.saturating_sub(round_now)
+                    failure = Some((
+                        RetryableWrapupReason::BackoffActive,
+                        format!(
+                            "historian failure backoff active for {} ms",
+                            until.saturating_sub(round_now)
+                        ),
                     ));
                     break;
                 }
@@ -3517,13 +3546,19 @@ impl McHandler {
                     .map(|compartment| compartment.end_message as u64)
                     .max(),
                 Err(error) => {
-                    failure = Some(format!("store load failed before round: {error}"));
-                    break;
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    };
                 }
             };
             if !wrapup_has_remaining_messages(&parsed.messages, current_end, target) {
                 break;
             }
+            // Assembly re-reads one historian snapshot for this round. The firing carries
+            // that snapshot's revert epoch, and publication loads the current row version
+            // immediately before its store CAS, so a transform re-cut during production is
+            // rejected at publication rather than publishing against retired state.
             let prepared = self.prepare_wrapup_fire(
                 Arc::clone(&store),
                 &parsed,
@@ -3541,9 +3576,10 @@ impl McHandler {
                 .expect("transform snapshots mutex")
                 .ready_generation_matches(&session_id, ready.generation)
             {
-                failure = Some(
+                failure = Some((
+                    RetryableWrapupReason::SnapshotStale,
                     "wrapup unavailable because a newer full session transform started".to_string(),
-                );
+                ));
                 break;
             }
             match prepared {
@@ -3552,16 +3588,29 @@ impl McHandler {
                         .await_wrapup_historian_completion(completion, deadline)
                         .await
                     {
-                        failure = Some(reason);
+                        let retry_reason = if reason.contains("request budget expired") {
+                            RetryableWrapupReason::BudgetExhausted
+                        } else {
+                            RetryableWrapupReason::SnapshotUnavailable
+                        };
+                        failure = Some((retry_reason, reason));
                         break;
                     }
                 }
                 PreparedWrapupAction::Nothing(reason) => {
-                    failure = Some(format!("historian made no forward progress: {reason}"));
+                    failure = Some((
+                        RetryableWrapupReason::SnapshotUnavailable,
+                        format!("historian made no forward progress: {reason}"),
+                    ));
                     break;
                 }
                 PreparedWrapupAction::Failed(reason) => {
-                    failure = Some(reason);
+                    let retry_reason = if reason.contains("backoff") {
+                        RetryableWrapupReason::BackoffActive
+                    } else {
+                        RetryableWrapupReason::SnapshotUnavailable
+                    };
+                    failure = Some((retry_reason, reason));
                     break;
                 }
                 PreparedWrapupAction::FireReady(task) => {
@@ -3576,18 +3625,21 @@ impl McHandler {
                                 },
                             );
                             if after_end <= current_end {
-                                failure = Some(
+                                failure = Some((
+                                    RetryableWrapupReason::SnapshotUnavailable,
                                     "historian completed without advancing the compartment boundary"
                                         .to_string(),
-                                );
+                                ));
                                 break;
                             }
                             rounds += 1;
                             wrapup_guard.set_rounds(rounds);
                         }
                         Ok(historian::HistorianDriveOutcome::Busy(_)) => {
-                            failure =
-                                Some("historian became busy before the round started".to_string());
+                            failure = Some((
+                                RetryableWrapupReason::SnapshotUnavailable,
+                                "historian became busy before the round started".to_string(),
+                            ));
                             break;
                         }
                         Err(reason) => {
@@ -3624,25 +3676,43 @@ impl McHandler {
             .saturating_sub(initial_compartments.len());
         let remaining = wrapup_has_remaining_messages(&parsed.messages, final_end, target);
         if failure.is_none() && remaining {
-            failure = Some(format!(
-                "stopped at the {}-round cap before the keep watermark",
-                historian::MAX_WRAPUP_ROUNDS
+            failure = Some((
+                RetryableWrapupReason::SnapshotUnavailable,
+                format!(
+                    "stopped at the {}-round cap before the keep watermark",
+                    historian::MAX_WRAPUP_ROUNDS
+                ),
             ));
         }
         let effect = "takes effect on your next message";
-        match failure {
-            Some(reason) => self.terminal_wrapup_response(
+        if failure.is_none() {
+            match self.wrapup_snapshot_is_current(
                 &store,
                 &session_id,
-                command_id,
-                TerminalWrapupResponse {
-                    disposition: "failed",
-                    rounds,
-                    summary: format!(
-                        "compacted {compacted_messages} messages into {compartments_created} compartments; {reason}; {effect}"
-                    ),
-                    include_rounds_without_command: true,
-                },
+                ready.generation,
+                ready.revert_epoch,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Self::retryable_wrapup_response(
+                        RetryableWrapupReason::SnapshotStale,
+                        "wrapup snapshot changed before terminal result recording",
+                    )
+                }
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            }
+        }
+        match failure {
+            Some((reason, detail)) => Self::retryable_wrapup_response(
+                reason,
+                format!(
+                    "compacted {compacted_messages} messages into {compartments_created} compartments; {detail}; {effect}"
+                ),
             ),
             None if rounds == 0 => self.terminal_wrapup_response(
                 &store,
@@ -4840,6 +4910,7 @@ impl McHandler {
             tail_delta: None,
             usage,
             provider_error: parsed.pass_inputs.provider_error.clone(),
+            prev_response_completed_at_ms: None,
             declared_trim: parsed.declared_trim.clone(),
         };
         let shadow_project = shadow_project_path(&binding.session);
@@ -6608,14 +6679,28 @@ fn format_traffic_age(observed_at_ms: i64, now: i64) -> String {
     }
 }
 
-fn compact_status_detail(detail: &str) -> String {
-    detail
+fn sanitize_status_text(text: &str, limit: usize) -> String {
+    let controls_removed = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    controls_removed
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
-        .take(120)
+        .take(limit)
         .collect()
+}
+
+fn compact_status_detail(detail: &str) -> String {
+    sanitize_status_text(detail, 120)
 }
 
 fn historian_status_summary(state: &mc_store::HistorianDurableState) -> String {
@@ -7561,6 +7646,7 @@ mod tests {
         await_results: Mutex<VecDeque<Result<ProducerOutput, HistorianProducerError>>>,
         outputs: Mutex<VecDeque<String>>,
         prompts: Mutex<Vec<String>>,
+        on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     struct TestProducerFactory {
@@ -7628,6 +7714,15 @@ mod tests {
             _run_id: &str,
         ) -> Result<ProducerOutput, HistorianProducerError> {
             self.state.await_outputs.fetch_add(1, Ordering::SeqCst);
+            if let Some(hook) = self
+                .state
+                .on_await_output
+                .lock()
+                .expect("await-output hook mutex")
+                .take()
+            {
+                hook();
+            }
             while self.state.block_output.load(Ordering::SeqCst) {
                 self.state.notify.notified().await;
             }
@@ -9796,6 +9891,27 @@ mod tests {
     }
 
     #[test]
+    fn session_status_sanitizes_controls_and_caps_summary() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.historian.last_failure = Some(format!("bad\0line\n{}", "x".repeat(2_000)));
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
+        let body = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        let summary = body["summary"].as_str().unwrap();
+        assert!(!summary.chars().any(char::is_control));
+        assert!(!summary.contains('\n'));
+        assert!(summary.chars().count() <= 500);
+    }
+
+    #[test]
     fn agent_drops_append_rejects_missing_command_id() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -10016,6 +10132,68 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn retryable_snapshot_conditions_do_not_poison_command_ids() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let missing_request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "missing-retry"
+        });
+        let missing = tool_body(handler.dispatch_value(7, missing_request.clone()).await);
+        assert_eq!(missing["disposition"], json!("retryable"));
+        assert_eq!(missing["reason"], json!("snapshot_unavailable"));
+        assert!(store
+            .load_wrapup_command("ses", "missing-retry")
+            .unwrap()
+            .is_none());
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let retry = tool_body(handler.dispatch_value(7, missing_request).await);
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
+        assert!(store
+            .load_wrapup_command("ses", "missing-retry")
+            .unwrap()
+            .is_some());
+
+        let mut malformed = transform_request(wrapup_messages(20, 40), 0, 200_000);
+        malformed.messages[0].mid = "reserved#mid".to_string();
+        let generation = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .begin("ses");
+        let revert_epoch = store.load("ses").unwrap().meta.revert_epoch;
+        handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .finish_ready("ses", generation, Arc::new(malformed), revert_epoch, 1);
+        let malformed_request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "malformed-retry"
+        });
+        let malformed_response =
+            tool_body(handler.dispatch_value(7, malformed_request.clone()).await);
+        assert_eq!(malformed_response["disposition"], json!("retryable"));
+        assert_eq!(malformed_response["reason"], json!("snapshot_unavailable"));
+        assert!(store
+            .load_wrapup_command("ses", "malformed-retry")
+            .unwrap()
+            .is_none());
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let retry = tool_body(handler.dispatch_value(7, malformed_request).await);
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
+        assert!(store
+            .load_wrapup_command("ses", "malformed-retry")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn session_wrapup_drives_to_keep_watermark_and_reinvoke_is_idle() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
@@ -10205,6 +10383,98 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_publish_recut_is_retryable_and_never_recorded() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let hook_store = Arc::clone(&store);
+        *producer
+            .on_await_output
+            .lock()
+            .expect("await-output hook mutex") = Some(Box::new(move || {
+            let loaded = hook_store.load("ses").unwrap();
+            let mut meta = loaded.meta.clone();
+            meta.revert_epoch = meta.revert_epoch.saturating_add(1);
+            hook_store
+                .commit("ses", loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+        }));
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "keep": 5,
+            "command_id": "recut-retry"
+        });
+
+        let stale = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(stale["disposition"], json!("retryable"), "{stale}");
+        assert_eq!(stale["reason"], json!("snapshot_stale"));
+        assert!(store
+            .load_wrapup_command("ses", "recut-retry")
+            .unwrap()
+            .is_none());
+
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.historian.failure_backoff_at_ms = None;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let retry = tool_body(handler.dispatch_value(7, request).await);
+        assert!(matches!(
+            retry["disposition"].as_str(),
+            Some("completed" | "nothing_to_compact")
+        ));
+        assert!(store
+            .load_wrapup_command("ses", "recut-retry")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_generation_before_terminal_recording_is_retryable() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let hook_handler = Arc::clone(&handler);
+        *producer
+            .on_await_output
+            .lock()
+            .expect("await-output hook mutex") = Some(Box::new(move || {
+            hook_handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .begin("ses");
+        }));
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 5,
+                        "command_id": "generation-retry"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(response["disposition"], json!("retryable"), "{response}");
+        assert_eq!(response["reason"], json!("snapshot_stale"));
+        assert!(store
+            .load_wrapup_command("ses", "generation-retry")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn concurrent_session_wrapup_returns_progress_without_double_fire() {
         let producer = Arc::new(ProducerState::default());
         producer.block_output.store(true, Ordering::SeqCst);
@@ -10297,6 +10567,8 @@ mod tests {
         );
 
         assert_eq!(body["ok"], json!(false), "{body}");
+        assert_eq!(body["disposition"], json!("retryable"));
+        assert_eq!(body["reason"], json!("snapshot_unavailable"));
         assert!(body["summary"]
             .as_str()
             .unwrap()
@@ -10329,6 +10601,8 @@ mod tests {
         );
 
         assert_eq!(body["ok"], json!(false), "{body}");
+        assert_eq!(body["disposition"], json!("retryable"));
+        assert_eq!(body["reason"], json!("backoff_active"));
         assert!(body["summary"].as_str().unwrap().contains("producer"));
         let durable = store.load("ses").unwrap().meta.historian;
         assert_eq!(durable.state, HistorianPhase::Idle);
@@ -10382,7 +10656,8 @@ mod tests {
                 )
                 .await,
         );
-        assert_eq!(body["disposition"], json!("failed"));
+        assert_eq!(body["disposition"], json!("retryable"));
+        assert_eq!(body["reason"], json!("snapshot_unavailable"));
         assert_eq!(
             body["summary"],
             "wrapup unavailable until a full session transform has been observed"
@@ -10406,15 +10681,44 @@ mod tests {
             handler
                 .dispatch_value(
                     7,
-                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "stale-retry"
+                    }),
                 )
                 .await,
         );
-        assert_eq!(mismatch["disposition"], json!("failed"));
+        assert_eq!(mismatch["disposition"], json!("retryable"));
+        assert_eq!(mismatch["reason"], json!("snapshot_stale"));
         assert_eq!(
             mismatch["summary"],
             "wrapup unavailable until a full session transform has been observed"
         );
+        assert!(store
+            .load_wrapup_command("ses", "stale-retry")
+            .unwrap()
+            .is_none());
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let retry = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "stale-retry"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
+        assert!(store
+            .load_wrapup_command("ses", "stale-retry")
+            .unwrap()
+            .is_some());
 
         handler
             .transform_snapshots
@@ -10430,7 +10734,8 @@ mod tests {
                 )
                 .await,
         );
-        assert_eq!(evicted["disposition"], json!("failed"));
+        assert_eq!(evicted["disposition"], json!("retryable"));
+        assert_eq!(evicted["reason"], json!("snapshot_unavailable"));
         assert_eq!(
             evicted["summary"],
             "wrapup unavailable until a full session transform has been observed"
@@ -10453,16 +10758,20 @@ mod tests {
             .lock()
             .expect("wrapup operation budget mutex") = Some(Duration::from_millis(40));
 
-        let body = tool_body(
-            handler
-                .dispatch_value(
-                    7,
-                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
-                )
-                .await,
-        );
-        assert_eq!(body["disposition"], json!("failed"), "{body}");
-        assert_eq!(body["rounds"], json!(0));
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "keep": 5,
+            "command_id": "budget-retry"
+        });
+        let body = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(body["disposition"], json!("retryable"), "{body}");
+        assert_eq!(body["reason"], json!("budget_exhausted"));
+        assert!(store
+            .load_wrapup_command("ses", "budget-retry")
+            .unwrap()
+            .is_none());
         assert!(body["summary"]
             .as_str()
             .unwrap()
@@ -10472,6 +10781,19 @@ mod tests {
         producer.block_output.store(false, Ordering::SeqCst);
         producer.notify.notify_waiters();
         wait_for_idle(&store).await;
+        *handler
+            .wrapup_operation_budget
+            .lock()
+            .expect("wrapup operation budget mutex") = None;
+        let retry = tool_body(handler.dispatch_value(7, request).await);
+        assert!(matches!(
+            retry["disposition"].as_str(),
+            Some("completed" | "nothing_to_compact")
+        ));
+        assert!(store
+            .load_wrapup_command("ses", "budget-retry")
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10486,21 +10808,38 @@ mod tests {
             "producer failed",
         );
 
-        let body = tool_body(
-            handler
-                .dispatch_value(
-                    7,
-                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
-                )
-                .await,
-        );
-        assert_eq!(body["disposition"], json!("failed"));
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "backoff-retry"
+        });
+        let body = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(body["disposition"], json!("retryable"));
+        assert_eq!(body["reason"], json!("backoff_active"));
         assert!(body["summary"]
             .as_str()
             .unwrap()
             .contains("historian failure backoff active for"));
+        assert!(store
+            .load_wrapup_command("ses", "backoff-retry")
+            .unwrap()
+            .is_none());
         assert_eq!(producer.connects.load(Ordering::SeqCst), 0);
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.historian.failure_backoff_at_ms = None;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let retry = tool_body(handler.dispatch_value(7, request).await);
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
+        assert!(store
+            .load_wrapup_command("ses", "backoff-retry")
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]

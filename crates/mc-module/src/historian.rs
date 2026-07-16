@@ -1452,6 +1452,7 @@ mod tests {
             tail_delta: None,
             usage: None,
             provider_error: None,
+            prev_response_completed_at_ms: None,
             declared_trim: None,
         }
     }

@@ -1437,6 +1437,46 @@ pub struct UserHintDecisionInput {
     pub hint_text: String,
 }
 
+/// Overlay writes staged by a transform and committed only after every local validation
+/// has accepted the pass. The cache-state CAS serializes competing speculative renders.
+#[derive(Debug, Default)]
+pub struct TransformOverlayBatch<'a> {
+    pub max_seen_ordinal: Option<u64>,
+    pub tag_mints: &'a [TagMintInput],
+    pub temporal_marks: &'a [TemporalMarkInput],
+    pub user_hint: Option<&'a UserHintDecisionInput>,
+    pub channel1_append: Option<&'a Channel1AppendRow>,
+    pub created_at_ms: i64,
+}
+
+impl TransformOverlayBatch<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.max_seen_ordinal.is_none()
+            && self.tag_mints.is_empty()
+            && self.temporal_marks.is_empty()
+            && self.user_hint.is_none()
+            && self.channel1_append.is_none()
+    }
+}
+
+pub struct TransformCommit<'a> {
+    pub expected: Option<u64>,
+    pub core: &'a CoreState,
+    pub meta: &'a ModuleMeta,
+    pub consumed_drop_ids: &'a [i64],
+    pub memory_revision: Option<&'a MemoryRevision>,
+    pub overlays: TransformOverlayBatch<'a>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionStatusSnapshot {
+    pub loaded: LoadedState,
+    pub compartment_count: usize,
+    pub pending_drop_count: usize,
+    pub tag_count: usize,
+    pub pass_trace: Option<PassTrace>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrapupCommandRow {
     pub disposition: String,
@@ -2168,6 +2208,89 @@ impl McStore {
         }
     }
 
+    /// Load all durable fields used by session.status from one SQLite read transaction.
+    pub fn load_session_status_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionStatusSnapshot, McStoreError> {
+        let snapshot = self.inner.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let state = transaction
+                .query_row(
+                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? as u64,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let loaded = match state {
+                Some((row_version, core_json, meta_json)) => LoadedState {
+                    core: serde_json::from_str(&core_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    meta: serde_json::from_str(&meta_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    row_version: Some(row_version),
+                },
+                None => LoadedState {
+                    core: CoreState::default(),
+                    meta: ModuleMeta::default(),
+                    row_version: None,
+                },
+            };
+            let count = |table: &str| -> Result<usize, rusqlite::Error> {
+                transaction.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|value| value.max(0) as usize)
+            };
+            let pass_trace = transaction
+                .query_row(
+                    "SELECT last_received_at_ms, last_completed_at_ms, last_reject_error,
+                            last_reject_at_ms, reject_count, receive_count
+                       FROM mc_pass_trace WHERE session_id = ?1",
+                    params![session_id],
+                    |row| {
+                        Ok(PassTrace {
+                            last_received_at_ms: row.get(0)?,
+                            last_completed_at_ms: row.get(1)?,
+                            last_reject_error: row.get(2)?,
+                            last_reject_at_ms: row.get(3)?,
+                            reject_count: row.get::<_, i64>(4)?.max(0) as u64,
+                            receive_count: row.get::<_, i64>(5)?.max(0) as u64,
+                        })
+                    },
+                )
+                .optional()?;
+            let snapshot = SessionStatusSnapshot {
+                loaded,
+                compartment_count: count("mc_compartments")?,
+                pending_drop_count: count("pending_agent_drops")?,
+                tag_count: count("mc_tags")?,
+                pass_trace,
+            };
+            transaction.commit()?;
+            Ok(snapshot)
+        })?;
+        Ok(snapshot)
+    }
+
     /// Record that the module accepted a transform request for this session. This is a
     /// plain one-statement UPSERT outside the fenced cache-state transaction so the
     /// observability write never contends with or extends the pass commit.
@@ -2514,9 +2637,9 @@ impl McStore {
         })?)
     }
 
-    /// Read the ordinal watermark used to avoid speculative searches for closed turns.
-    /// The transactional apply method remains authoritative when concurrent passes race.
-    pub fn overlay_watermark(&self, session_id: &str) -> Result<u64, McStoreError> {
+    /// Read the ordinal frontier used to avoid first-applying overlays to closed turns.
+    /// A missing row is distinct from ordinal zero, which is a valid first message.
+    pub fn overlay_watermark(&self, session_id: &str) -> Result<Option<u64>, McStoreError> {
         let value = self.inner.with_conn(|conn| {
             conn.query_row(
                 "SELECT max_seen_ordinal FROM mc_overlay_frontiers WHERE session_id = ?1",
@@ -2525,7 +2648,7 @@ impl McStore {
             )
             .optional()
         })?;
-        Ok(value.unwrap_or(0).max(0) as u64)
+        Ok(value.map(|ordinal| ordinal.max(0) as u64))
     }
 
     /// Freeze first-sight overlay decisions and advance the pass watermark atomically.
@@ -2569,11 +2692,10 @@ impl McStore {
                     params![session_id],
                     |row| row.get::<_, i64>(0),
                 )
-                .optional()?
-                .unwrap_or(0);
+                .optional()?;
 
             for (ordinal, mark) in &temporal_marks {
-                if *ordinal > previous {
+                if previous.is_none_or(|frontier| *ordinal > frontier) {
                     tx.execute(
                         "INSERT OR IGNORE INTO mc_temporal_marks
                              (session_id, block_id, marker_text, created_at)
@@ -2599,7 +2721,10 @@ impl McStore {
                         },
                     )
                     .optional()?;
-                if existing.is_some() || hint_ordinal.is_some_and(|ordinal| ordinal <= previous) {
+                if existing.is_some()
+                    || hint_ordinal
+                        .is_some_and(|ordinal| previous.is_some_and(|frontier| ordinal <= frontier))
+                {
                     existing
                 } else {
                     tx.execute(
@@ -2900,6 +3025,60 @@ impl McStore {
         consumed_drop_ids: &[i64],
         memory_revision: Option<&MemoryRevision>,
     ) -> Result<u64, McStoreError> {
+        self.commit_transform(
+            session_id,
+            TransformCommit {
+                expected,
+                core,
+                meta,
+                consumed_drop_ids,
+                memory_revision,
+                overlays: TransformOverlayBatch::default(),
+            },
+        )
+    }
+
+    /// Commit accepted cache state and its speculative overlays in one CAS transaction.
+    pub fn commit_transform(
+        &self,
+        session_id: &str,
+        request: TransformCommit<'_>,
+    ) -> Result<u64, McStoreError> {
+        let TransformCommit {
+            expected,
+            core,
+            meta,
+            consumed_drop_ids,
+            memory_revision,
+            overlays,
+        } = request;
+        let max_seen_ordinal = overlays
+            .max_seen_ordinal
+            .map(|ordinal| {
+                i64::try_from(ordinal).map_err(|_| {
+                    McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
+                })
+            })
+            .transpose()?;
+        let temporal_marks = overlays
+            .temporal_marks
+            .iter()
+            .map(|mark| {
+                i64::try_from(mark.ordinal)
+                    .map(|ordinal| (ordinal, mark))
+                    .map_err(|_| {
+                        McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let hint_ordinal = overlays
+            .user_hint
+            .map(|hint| {
+                i64::try_from(hint.ordinal).map_err(|_| {
+                    McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
+                })
+            })
+            .transpose()?;
         let core_json =
             serde_json::to_string(core).map_err(|e| McStoreError::Serde(e.to_string()))?;
         let meta_json =
@@ -2961,13 +3140,114 @@ impl McStore {
             // INSERT-or-UPDATE in the same fenced txn (bootstrap has no row to UPDATE).
             tx.execute(
                 "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                     row_version = excluded.row_version,
-                     core_state  = excluded.core_state,
-                     meta        = excluded.meta",
+                  VALUES (?1, ?2, ?3, ?4)
+                  ON CONFLICT(session_id) DO UPDATE SET
+                      row_version = excluded.row_version,
+                      core_state  = excluded.core_state,
+                      meta        = excluded.meta",
                 params![session_id, next as i64, core_json, meta_json],
             )?;
+
+            for input in overlays.tag_mints {
+                let block_id = input.block_id.trim();
+                if block_id.is_empty() {
+                    continue;
+                }
+                let exists = tx
+                    .query_row(
+                        "SELECT 1 FROM mc_tags WHERE session_id = ?1 AND block_id = ?2",
+                        params![session_id, block_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if exists {
+                    continue;
+                }
+                let next_tag = tx.query_row(
+                    "SELECT COALESCE(MAX(tag_number), 0) + 1 FROM mc_tags WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_tags
+                         (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        session_id,
+                        next_tag,
+                        block_id,
+                        input.kind,
+                        input.token_count.max(0),
+                        overlays.created_at_ms,
+                        input.source_bytes,
+                    ],
+                )?;
+            }
+
+            let previous_frontier = tx
+                .query_row(
+                    "SELECT max_seen_ordinal FROM mc_overlay_frontiers WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            for (ordinal, mark) in &temporal_marks {
+                if previous_frontier.is_none_or(|frontier| *ordinal > frontier) {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO mc_temporal_marks
+                             (session_id, block_id, marker_text, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            session_id,
+                            mark.block_id,
+                            mark.marker_text,
+                            overlays.created_at_ms
+                        ],
+                    )?;
+                }
+            }
+            if let Some(hint) = overlays.user_hint {
+                let eligible = hint_ordinal.is_some_and(|ordinal| {
+                    previous_frontier.is_none_or(|frontier| ordinal > frontier)
+                });
+                if eligible {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO mc_user_hints
+                             (session_id, block_id, hint_text, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            session_id,
+                            hint.block_id,
+                            hint.hint_text,
+                            overlays.created_at_ms
+                        ],
+                    )?;
+                }
+            }
+            if let Some(append) = overlays.channel1_append {
+                tx.execute(
+                    "INSERT OR IGNORE INTO mc_channel1_appends
+                         (session_id, block_id, reminder_text, fired_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        session_id,
+                        append.block_id,
+                        append.reminder_text,
+                        append.fired_at_ms
+                    ],
+                )?;
+            }
+            if let Some(max_seen_ordinal) = max_seen_ordinal {
+                tx.execute(
+                    "INSERT INTO mc_overlay_frontiers (session_id, max_seen_ordinal)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                         max_seen_ordinal = MAX(max_seen_ordinal, excluded.max_seen_ordinal)",
+                    params![session_id, max_seen_ordinal],
+                )?;
+            }
+
             for drop_id in consumed_drop_ids {
                 tx.execute(
                     "DELETE FROM pending_agent_drops WHERE session_id = ?1 AND id = ?2",
@@ -4644,6 +4924,87 @@ impl McStore {
             })
         })?;
         Ok(snapshot)
+    }
+
+    /// Load the bounded visible pool used by the in-memory lexical hint scorer.
+    pub fn load_visible_memory_candidates(
+        &self,
+        project_path: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredMemorySearchRow>, McStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let membership = self.resolve_workspace_membership(project_path)?;
+        let (sharing, binds) = match &membership {
+            Some(membership) => workspace_union_memory_visibility_filter(membership),
+            None => project_memory_visibility_filter(project_path),
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.inner.with_conn(|conn| {
+            let sql = format!(
+                "SELECT id, project_path, category, content, updated_at
+                   FROM mc_memories
+                  WHERE ({sharing})
+                    AND status IN ('active', 'permanent')
+                    AND (expires_at IS NULL OR expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000)
+                  ORDER BY updated_at DESC, id ASC
+                  LIMIT ?"
+            );
+            let mut statement = conn.prepare(&sql)?;
+            let mut all_binds = binds.clone();
+            all_binds.push(rusqlite::types::Value::from(limit));
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(all_binds.iter()), |row| {
+                    Ok(StoredMemorySearchRow {
+                        id: row.get(0)?,
+                        project_path: row.get(1)?,
+                        category: row.get(2)?,
+                        content: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows)
+    }
+
+    /// Load the bounded session compartment pool used by lexical hint scoring.
+    pub fn load_compartment_candidates(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredCompartmentSearchRow>, McStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT sequence, title, content, p1, p2, p3, p4, created_at
+                   FROM mc_compartments
+                  WHERE session_id = ?1
+                  ORDER BY sequence DESC
+                  LIMIT ?2",
+            )?;
+            let rows = statement
+                .query_map(params![session_id, limit], |row| {
+                    Ok(StoredCompartmentSearchRow {
+                        sequence: row.get(0)?,
+                        title: row.get(1)?,
+                        content: row.get(2)?,
+                        p1: row.get(3)?,
+                        p2: row.get(4)?,
+                        p3: row.get(5)?,
+                        p4: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows)
     }
 
     /// Search active/permanent memory content visible to `project_path` with a literal,
@@ -6377,11 +6738,11 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(store.overlay_watermark("ses").unwrap(), 0);
+        assert_eq!(store.overlay_watermark("ses").unwrap(), None);
         store
             .apply_active_overlay_decisions("ses", 4, &[], None, 800)
             .unwrap();
-        assert_eq!(store.overlay_watermark("ses").unwrap(), 4);
+        assert_eq!(store.overlay_watermark("ses").unwrap(), Some(4));
     }
 
     #[test]
@@ -6425,7 +6786,7 @@ mod tests {
             store.load_user_hints("race").unwrap(),
             vec![rows[0].clone()]
         );
-        assert_eq!(store.overlay_watermark("race").unwrap(), 3);
+        assert_eq!(store.overlay_watermark("race").unwrap(), Some(3));
         assert_eq!(store.load_temporal_marks("race").unwrap().len(), 1);
 
         store
@@ -6445,7 +6806,7 @@ mod tests {
                 200,
             )
             .unwrap();
-        assert_eq!(store.overlay_watermark("race").unwrap(), 4);
+        assert_eq!(store.overlay_watermark("race").unwrap(), Some(4));
         assert_eq!(store.load_user_hints("race").unwrap().len(), 1);
         assert_eq!(store.load_temporal_marks("race").unwrap().len(), 1);
     }
