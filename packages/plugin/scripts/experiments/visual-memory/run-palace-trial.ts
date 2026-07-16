@@ -48,6 +48,7 @@ const VALIDATOR_FAILURE_CLASSES = [
     "memory ID leakage",
     "broken exact anchors",
     "unbalanced parentheses",
+    "cue over budget",
     "coverage",
     "other validator failures",
 ] as const;
@@ -718,6 +719,7 @@ function classifyValidatorError(message: string): ValidatorFailureClass {
     if (/memory id leaked into cue/i.test(message)) return "memory ID leakage";
     if (/exact anchor .* missing from rendered cue/i.test(message)) return "broken exact anchors";
     if (/polarity mechanism is unclosed|unbalanced mechanism/i.test(message)) return "unbalanced parentheses";
+    if (/cue over budget/i.test(message)) return "cue over budget";
     if (/uncovered source ids|duplicate spec id|absent from source|category mismatch/i.test(message)) return "coverage";
     return "other validator failures";
 }
@@ -783,7 +785,11 @@ function renderPalaceCell(args: {
     try {
         authorPalace({
             source: args.corpus.memories.map(
-                (memory): SourceMemory => ({ id: memory.id, category: memory.category }),
+                (memory): SourceMemory => ({
+                    id: memory.id,
+                    category: memory.category,
+                    importance: memory.importance,
+                }),
             ),
             specs: args.specs,
             sourceLabel: CORPUS_PATH,
@@ -870,12 +876,17 @@ async function runCell(args: {
         renderError = "parse failure prevented fail-closed authoring";
     } else {
         try {
-            validate(
+            const validationDefects = validate(
                 args.corpus.memories.map(
-                    (memory): SourceMemory => ({ id: memory.id, category: memory.category }),
+                    (memory): SourceMemory => ({
+                        id: memory.id,
+                        category: memory.category,
+                        importance: memory.importance,
+                    }),
                 ),
                 specs,
             );
+            for (const defect of validationDefects) addValidatorFailure(failures, defect);
         } catch (error) {
             const message = errorMessage(error);
             addValidatorFailure(failures, message);
