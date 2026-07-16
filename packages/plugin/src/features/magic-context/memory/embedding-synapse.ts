@@ -26,7 +26,9 @@ export interface SynapseCatalogEntry {
     model: string;
     fingerprint: string;
     table_epoch: number;
-    dims: number;
+    // The live catalog omits dims; it is adopted from the first embed response
+    // envelope and pinned for the provider's lifetime.
+    dims?: number;
     recommended_batch?: number;
     provenance?: unknown;
     certified?: boolean;
@@ -202,37 +204,64 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
           : Array.isArray(value)
             ? value
             : [];
+    // The live catalog serves {model_id, fingerprints[], state} per entry with
+    // table_epoch on the envelope; dims and recommended_batch arrive only on
+    // embed responses. Accept both that shape and the field-per-entry form so a
+    // future catalog enrichment does not need a parser change.
+    const envelopeEpoch =
+        typeof body.table_epoch === "number" && Number.isInteger(body.table_epoch)
+            ? body.table_epoch
+            : undefined;
     return raw.flatMap((entry) => {
         const record = asRecord(entry);
         if (!record) return [];
-        const model = typeof record.model === "string" ? record.model : "";
-        const fingerprint = typeof record.fingerprint === "string" ? record.fingerprint : "";
-        const tableEpoch = record.table_epoch ?? record.tableEpoch;
+        const model =
+            typeof record.model === "string" && record.model.length > 0
+                ? record.model
+                : typeof record.model_id === "string"
+                  ? record.model_id
+                  : "";
+        const fingerprint =
+            typeof record.fingerprint === "string" && record.fingerprint.length > 0
+                ? record.fingerprint
+                : Array.isArray(record.fingerprints) &&
+                    typeof record.fingerprints[0] === "string"
+                  ? record.fingerprints[0]
+                  : "";
+        const entryEpoch = record.table_epoch ?? record.tableEpoch;
+        const tableEpoch =
+            typeof entryEpoch === "number" && Number.isInteger(entryEpoch)
+                ? entryEpoch
+                : envelopeEpoch;
         const dims = record.dims ?? record.dimensions;
         if (
             model.length === 0 ||
             fingerprint.length === 0 ||
             typeof tableEpoch !== "number" ||
-            !Number.isInteger(tableEpoch) ||
-            typeof dims !== "number" ||
-            !Number.isInteger(dims) ||
-            dims <= 0
+            !Number.isInteger(tableEpoch)
         ) {
             return [];
         }
         const recommendedBatch = record.recommended_batch ?? record.recommendedBatch;
+        const state = typeof record.state === "string" ? record.state : undefined;
         return [
             {
                 model,
                 fingerprint,
                 table_epoch: tableEpoch,
-                dims,
+                ...(typeof dims === "number" && Number.isInteger(dims) && dims > 0
+                    ? { dims }
+                    : {}),
                 ...(typeof recommendedBatch === "number" && recommendedBatch > 0
                     ? { recommended_batch: Math.floor(recommendedBatch) }
                     : {}),
                 ...(record.provenance !== undefined ? { provenance: record.provenance } : {}),
                 ...(typeof record.certified === "boolean" ? { certified: record.certified } : {}),
-                ...(typeof record.status === "string" ? { status: record.status } : {}),
+                ...(typeof record.status === "string"
+                    ? { status: record.status }
+                    : state
+                      ? { status: state }
+                      : {}),
             },
         ];
     });
@@ -242,7 +271,13 @@ function extractVector(
     value: unknown,
 ): { vector: Float32Array; metadata: Record<string, unknown> } | null {
     const body = responseBody(value);
-    const raw = body.vector ?? body.embedding;
+    // The live envelope carries vectors: [{id, vector, content_sha256}] for
+    // every embed op, including single-text queries; older sketches used a
+    // top-level vector/embedding field, kept as a fallback.
+    const fromVectors = Array.isArray(body.vectors)
+        ? asRecord(body.vectors[0])?.vector
+        : undefined;
+    const raw = fromVectors ?? body.vector ?? body.embedding;
     if (
         !Array.isArray(raw) ||
         raw.some((item) => typeof item !== "number" || !Number.isFinite(item))
@@ -254,11 +289,13 @@ function extractVector(
 
 function extractBatchItems(value: unknown): Array<Record<string, unknown>> {
     const body = responseBody(value);
-    const raw = Array.isArray(body.items)
-        ? body.items
-        : Array.isArray(body.results)
-          ? body.results
-          : [];
+    const raw = Array.isArray(body.vectors)
+        ? body.vectors
+        : Array.isArray(body.items)
+          ? body.items
+          : Array.isArray(body.results)
+            ? body.results
+            : [];
     return raw.flatMap((item) => {
         const record = asRecord(item);
         return record ? [record] : [];
@@ -649,10 +686,25 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     private validateResponse(body: Record<string, unknown>, dims: number): void {
         const metadata = this.metadata;
-        if (!metadata || dims !== metadata.dims) {
+        if (!metadata) {
+            throw new SynapseEmbeddingError("artifact_invalid", "Synapse lane metadata missing");
+        }
+        // The catalog omits dims, so the first embed response pins them; every
+        // later response must match the pinned value exactly.
+        if (metadata.dims === undefined) {
+            const envelopeDims = body.dims;
+            if (typeof envelopeDims === "number" && envelopeDims !== dims) {
+                throw new SynapseEmbeddingError(
+                    "artifact_invalid",
+                    `Synapse envelope declares ${envelopeDims} dimensions but the vector has ${dims}`,
+                );
+            }
+            metadata.dims = dims;
+        }
+        if (dims !== metadata.dims) {
             throw new SynapseEmbeddingError(
                 "artifact_invalid",
-                `Synapse returned ${dims} dimensions, expected ${metadata?.dims ?? "unknown"}`,
+                `Synapse returned ${dims} dimensions, expected ${metadata.dims}`,
             );
         }
         const fingerprint = body.fingerprint ?? body.served_fingerprint;
