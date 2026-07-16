@@ -622,7 +622,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     params,
                     {
                         timeoutMs,
-                        targetKind: "tool_provider",
+                        // Synapse registers exactly one provider role, ManagementSurface;
+                        // every op (embed.*, models.list, jobs) is dispatched by the JSON
+                        // method field over that single route.
+                        targetKind: "management_surface",
                         identity: {
                             project_root: this.options.projectRoot,
                             harness: getHarness(),
