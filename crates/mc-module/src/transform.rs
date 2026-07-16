@@ -532,6 +532,7 @@ struct OverlayComputation<'a, 'ctx> {
     tag_rows: &'a mut Vec<McTagRow>,
     temporal_rows: &'a mut Vec<TemporalMarkRow>,
     user_hint_rows: &'a mut Vec<UserHintRow>,
+    overlay_frontier: Option<u64>,
 }
 
 impl PendingOverlayDecisions {
@@ -744,7 +745,9 @@ fn apply_once(
 
     let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
     let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
-    let loaded = store.load(&req.session_id)?;
+    let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
+    let loaded = transform_snapshot.loaded;
+    let overlay_frontier = transform_snapshot.overlay_frontier;
     let surface_transition = serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic)
         && loaded.meta.cc_u1_active != cc_u1_active;
     let surface_state = if surface_transition {
@@ -795,22 +798,22 @@ fn apply_once(
     // later forces pass-through. Decisions from this request stay in memory until the
     // final cache-state compare-and-swap accepts the pass.
     let mut tag_rows = if cc_u1_active {
-        store.load_tags_for_session(&req.session_id)?
+        transform_snapshot.tags
     } else {
         Vec::new()
     };
     let mut channel1_appends = if tagging_active {
-        store.load_channel1_appends(&req.session_id)?
+        transform_snapshot.channel1_appends
     } else {
         Vec::new()
     };
     let mut user_hints = if tagging_active {
-        store.load_user_hints(&req.session_id)?
+        transform_snapshot.user_hints
     } else {
         Vec::new()
     };
     let mut temporal_marks = if tagging_active {
-        store.load_temporal_marks(&req.session_id)?
+        transform_snapshot.temporal_marks
     } else {
         Vec::new()
     };
@@ -934,6 +937,7 @@ fn apply_once(
             tag_rows: &mut tag_rows,
             temporal_rows: &mut temporal_marks,
             user_hint_rows: &mut user_hints,
+            overlay_frontier,
         })?;
     }
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
@@ -2823,16 +2827,27 @@ fn strip_leading_tag_imitations(value: &str) -> &str {
     }
 }
 
+fn is_authored_user_message(message: &CkIngressMessage) -> bool {
+    message.ck.role == "user"
+        && !message.ck.meta.synthetic
+        && message
+            .ck
+            .content
+            .iter()
+            .any(|block| matches!(&block.kind, ck_wire::CkKind::Text { .. }))
+}
+
 fn eligible_authored_user_tail(req: &TransformRequest) -> Option<&CkIngressMessage> {
-    // Synthetic messages and system-role blocks are transport noise for authored-tail
-    // decisions. Any other role is meaningful, so an assistant or tool tail prevents a
-    // buried user from receiving first-sight bytes.
-    let tail = req
-        .messages
-        .iter()
-        .rev()
-        .find(|message| !message.ck.meta.synthetic && message.ck.role != "system")?;
-    (tail.ck.role == "user").then_some(tail)
+    // Tool results are transport messages even when a provider carries them with role=user.
+    // Skip those carriers like synthetic and system messages, while an assistant tail still
+    // closes the authored-user eligibility window.
+    let tail = req.messages.iter().rev().find(|message| {
+        !message.ck.meta.synthetic
+            && message.ck.role != "system"
+            && message.ck.role != "tool"
+            && (message.ck.role != "user" || is_authored_user_message(message))
+    })?;
+    is_authored_user_message(tail).then_some(tail)
 }
 
 fn compute_active_overlay_decisions(
@@ -2847,12 +2862,12 @@ fn compute_active_overlay_decisions(
         tag_rows,
         temporal_rows,
         user_hint_rows,
+        overlay_frontier: frontier,
     } = input;
-    let frontier = store.overlay_watermark(&req.session_id)?;
     let max_seen_ordinal = req
         .messages
         .iter()
-        .filter(|message| !message.ck.meta.synthetic && message.ck.role != "system")
+        .filter(|message| is_authored_user_message(message))
         .map(|message| message.ordinal)
         .max()
         .filter(|ordinal| frontier.is_none_or(|frontier| *ordinal > frontier));
@@ -2888,13 +2903,14 @@ fn compute_active_overlay_decisions(
     let authored_tail = eligible_authored_user_tail(req);
     let mut previous_new_user_mint = None;
     let mut temporal_marks = Vec::new();
-    for message in req
-        .messages
-        .iter()
-        .filter(|message| !message.ck.meta.synthetic && message.ck.role != "system")
-    {
+    for message in req.messages.iter().filter(|message| {
+        !message.ck.meta.synthetic
+            && message.ck.role != "system"
+            && message.ck.role != "tool"
+            && (message.ck.role != "user" || is_authored_user_message(message))
+    }) {
         let is_new = frontier.is_none_or(|frontier| message.ordinal > frontier);
-        if message.ck.role != "user" || !is_new {
+        if !is_authored_user_message(message) || !is_new {
             previous_new_user_mint = None;
             continue;
         }
@@ -2903,12 +2919,14 @@ fn compute_active_overlay_decisions(
             .iter()
             .filter(|block| block.mid == message.mid)
             .find_map(|block| {
-                taggable_kind(block).and_then(|_| {
-                    mint_by_block
-                        .get(block.id.as_str())
-                        .copied()
-                        .map(|created_at| (block.id.clone(), created_at))
-                })
+                matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
+                    .then(|| {
+                        mint_by_block
+                            .get(block.id.as_str())
+                            .copied()
+                            .map(|created_at| (block.id.clone(), created_at))
+                    })
+                    .flatten()
             })
         else {
             previous_new_user_mint = None;
@@ -3006,6 +3024,8 @@ fn lexical_tokens(text: &str) -> BTreeSet<String> {
         "and", "are", "but", "for", "from", "have", "into", "not", "that", "the", "this", "use",
         "was", "with", "you", "your",
     ];
+    // Unicode normalization is intentionally out of scope. Case folding and provider text
+    // token boundaries are sufficient for this conservative, non-semantic hint gate.
     text.to_lowercase()
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|token| token.chars().count() >= 3 && !STOPWORDS.contains(token))
@@ -3098,7 +3118,8 @@ fn run_user_hint_lexical_search(
             .count();
         document_frequency.insert(token, count);
     }
-    let pool_size = candidates.len() as f64;
+    let pool_count = candidates.len();
+    let pool_size = pool_count as f64;
     let total_query_weight = query_tokens
         .iter()
         .map(|token| {
@@ -3113,7 +3134,13 @@ fn run_user_hint_lexical_search(
                 .iter()
                 .filter(|token| candidate.tokens.contains(*token))
                 .collect::<Vec<_>>();
-            if matched.len() < USER_HINT_MIN_MATCHED_TOKENS {
+            if matched.len() < USER_HINT_MIN_MATCHED_TOKENS
+                || !matched.iter().any(|token| {
+                    document_frequency
+                        .get(*token)
+                        .is_some_and(|frequency| frequency.saturating_mul(2) < pool_count)
+                })
+            {
                 return None;
             }
             let score = matched
@@ -3160,13 +3187,28 @@ fn user_hint_query(message: &CkIngressMessage) -> String {
         .join("\n");
     let without_reminders = strip_system_reminder_wrappers(&raw);
     let without_tags = strip_mc_tag_notation(&without_reminders);
-    without_tags
+    let normalized = without_tags
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
+        .join(" ");
+    let mut chars = normalized.chars();
+    let mut capped = chars
+        .by_ref()
         .take(USER_HINT_QUERY_CHAR_CAP)
-        .collect()
+        .collect::<String>();
+    if chars.next().is_some_and(|next| !next.is_whitespace())
+        && capped
+            .chars()
+            .last()
+            .is_some_and(|last| !last.is_whitespace())
+    {
+        if let Some(boundary) = capped.rfind(char::is_whitespace) {
+            capped.truncate(boundary);
+        } else {
+            capped.clear();
+        }
+    }
+    capped
 }
 
 fn strip_system_reminder_wrappers(text: &str) -> String {
@@ -4076,7 +4118,7 @@ mod tests {
         let transition = run(&s, &req, &spine());
         assert_eq!(transition.surface_state, SurfaceState::Transition);
         run(&s, &req, &spine());
-        s.append_channel1_nudge("wire-ch1", "t1#0", "reminder: reduce spent outputs", 5)
+        s.seed_channel1_append_for_test("wire-ch1", "t1#0", "reminder: reduce spent outputs", 5)
             .unwrap();
         // Ingress always carries the ORIGINAL bytes (tags exist only on the
         // provider wire; raw ingress bytes are identity), so the same request
@@ -4391,6 +4433,17 @@ mod tests {
         ctx
     }
 
+    fn seed_unrelated_hint_candidates(store: &McStore) {
+        for (id, content) in [
+            (9_998, "unrelated fixture material"),
+            (9_999, "separate archive subject"),
+        ] {
+            store
+                .seed_memory(id, "git:proj", "CONSTRAINTS", content, 50)
+                .unwrap();
+        }
+    }
+
     fn with_usage(
         mut request: TransformRequest,
         current_total_input_tokens: u64,
@@ -4504,6 +4557,30 @@ mod tests {
                 text: text.to_string(),
             },
         )
+    }
+
+    fn opaque_result_carrier(mid: &str, ordinal: u64, role: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                role,
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(
+                    ck_wire::OpaqueBlock {
+                        source: json!({ "type": "tool_result" }),
+                        kind: "tool_result".to_string(),
+                        raw: json!({ "output": "transport" }),
+                        arc: None,
+                    },
+                ))],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
     }
 
     fn tool_result_with_output(
@@ -7635,9 +7712,13 @@ mod tests {
             let first =
                 transform(&s, &active, &pctx("git:proj", "/nonexistent-docs", 730_000)).unwrap();
             assert_eq!(tail_bytes(&first, "m3"), "<!-- +12m -->\n§3§ question");
-            active.prev_response_completed_at_ms = Some(990_000);
-            let replay =
-                transform(&s, &active, &pctx("git:proj", "/nonexistent-docs", 999_000)).unwrap();
+            active.prev_response_completed_at_ms = Some(800_000);
+            let replay = transform(
+                &s,
+                &active,
+                &pctx("git:proj", "/nonexistent-docs", 8_000_000),
+            )
+            .unwrap();
             assert_eq!(tail_bytes(&replay, "m3"), tail_bytes(&first, "m3"));
 
             let dormant = cc_req("temporal", "cfg0", complete);
@@ -7813,10 +7894,10 @@ mod tests {
             ],
         );
         let query = user_hint_query(&message);
-        assert!(query.starts_with("keep words "));
+        assert_eq!(query, "keep words");
         assert!(!query.contains("§12§"));
         assert!(!query.contains("drop"));
-        assert_eq!(query.chars().count(), USER_HINT_QUERY_CHAR_CAP);
+        assert!(query.chars().count() < USER_HINT_QUERY_CHAR_CAP);
     }
 
     #[test]
@@ -7833,6 +7914,7 @@ mod tests {
                 70,
             )
             .unwrap();
+            seed_unrelated_hint_candidates(&s);
             let messages = vec![wire_item("user", "m1", 1, &["rust ownership"])];
             let request = active_cc_req("user-hint", "cfg0", messages.clone());
             run(&s, &request, &spine());
@@ -7907,7 +7989,7 @@ mod tests {
             run(&s, &request, &spine());
             assert!(s.load_user_hints("hint-frontier").unwrap().is_empty());
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
-            assert_eq!(s.overlay_watermark("hint-frontier").unwrap(), Some(3));
+            assert_eq!(s.overlay_watermark("hint-frontier").unwrap(), Some(2));
 
             let older_only = active_cc_req(
                 "hint-frontier",
@@ -7934,6 +8016,7 @@ mod tests {
                 70,
             )
             .unwrap();
+            seed_unrelated_hint_candidates(&s);
             let request = active_cc_req(
                 "zero-frontier",
                 "cfg0",
@@ -7947,6 +8030,122 @@ mod tests {
                 s.load_user_hints("zero-frontier").unwrap()[0].block_id,
                 "m0#0"
             );
+        });
+    }
+
+    #[test]
+    fn authored_tail_skips_tool_result_blocks_for_both_wire_roles() {
+        let user = wire_item("user", "m1", 1, &["authored"]);
+        let role_tool = active_cc_req(
+            "tool-tail",
+            "cfg0",
+            vec![
+                user.clone(),
+                tool_result("result-tool", 2, "call", "output"),
+            ],
+        );
+        assert_eq!(eligible_authored_user_tail(&role_tool).unwrap().mid, "m1");
+
+        let role_user = active_cc_req(
+            "user-result-tail",
+            "cfg0",
+            vec![
+                user,
+                wire_tool_result(
+                    "result-user",
+                    2,
+                    json!({ "kind": { "type": "text", "text": "output" } }),
+                ),
+            ],
+        );
+        assert_eq!(eligible_authored_user_tail(&role_user).unwrap().mid, "m1");
+        assert!(!is_authored_user_message(&role_user.messages[1]));
+    }
+
+    #[test]
+    fn trailing_tool_role_transport_keeps_authored_user_eligible() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            store
+                .seed_memory(
+                    1,
+                    "git:proj",
+                    "CONSTRAINTS",
+                    "rust ownership uses borrowing safely",
+                    70,
+                )
+                .unwrap();
+            seed_unrelated_hint_candidates(&store);
+            let request = active_cc_req(
+                "tool-role-tail",
+                "cfg0",
+                vec![
+                    wire_item("user", "m1", 1, &["rust ownership"]),
+                    wire_item("tool", "result", 2, &["transport output"]),
+                ],
+            );
+            run(&store, &request, &spine());
+            let response = run(&store, &request, &spine());
+            assert!(tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
+            assert_eq!(store.overlay_watermark("tool-role-tail").unwrap(), Some(1));
+        });
+    }
+
+    #[test]
+    fn user_role_result_carrier_neither_targets_overlays_nor_burns_frontier() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            store
+                .seed_memory(
+                    1,
+                    "git:proj",
+                    "CONSTRAINTS",
+                    "rust ownership uses borrowing safely",
+                    70,
+                )
+                .unwrap();
+            seed_unrelated_hint_candidates(&store);
+            let mut request = active_cc_req(
+                "user-result-tail",
+                "cfg0",
+                vec![
+                    wire_item("user", "m1", 1, &["rust ownership"]),
+                    opaque_result_carrier("result", 2, "user"),
+                ],
+            );
+            request.prev_response_completed_at_ms = Some(1);
+            run(&store, &request, &spine());
+            let response = transform(
+                &store,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap();
+            assert!(tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
+            assert_eq!(
+                store.overlay_watermark("user-result-tail").unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                store
+                    .load_temporal_marks("user-result-tail")
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.block_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["m1#0"]
+            );
+            let result = response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("result"))
+                .expect("result carrier remains in the tail");
+            assert!(matches!(
+                &result.content[0].kind,
+                ck_wire::CkKind::Opaque(opaque) if opaque.raw == json!({ "output": "transport" })
+            ));
         });
     }
 
@@ -7978,6 +8177,22 @@ mod tests {
             run_user_hint_lexical_search(&s, "git:proj", "lexical", "quasar deployment", true)
                 .unwrap();
         assert!(one_common_token.is_empty());
+        let ubiquitous_tokens =
+            run_user_hint_lexical_search(&s, "git:proj", "lexical", "fixture memory", true)
+                .unwrap();
+        assert!(
+            ubiquitous_tokens.is_empty(),
+            "matches need at least one token present in less than half the candidate pool"
+        );
+    }
+
+    #[test]
+    fn user_hint_query_drops_a_token_split_by_the_character_cap() {
+        let complete_prefix = "word ".repeat(99);
+        let split = format!("{complete_prefix}partialtoken suffix");
+        let query = user_hint_query(&wire_item("user", "m1", 1, &[&split]));
+        assert_eq!(query, complete_prefix.trim_end());
+        assert!(!query.contains("parti"));
     }
 
     #[test]
@@ -7994,6 +8209,7 @@ mod tests {
                 70,
             )
             .unwrap();
+            seed_unrelated_hint_candidates(&s);
             let mut message = wire_item("user", "m1", 1, &["media prompt"]);
             message.ck.content.insert(
                 0,
@@ -8035,6 +8251,14 @@ mod tests {
                 70,
             )
             .unwrap();
+            s.seed_memory(
+                2,
+                "git:proj",
+                "CONSTRAINTS",
+                "unrelated fixture material",
+                50,
+            )
+            .unwrap();
             s.replace_compartments("pending-hint", &[comp(1, 1, 2, "t2#0", "summary")])
                 .unwrap();
             let present = active_cc_req(
@@ -8072,7 +8296,7 @@ mod tests {
             assert!(!tail_bytes(&response, "foreign").contains("<ctx-search-hint>"));
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
             assert!(s.load_user_hints("pending-hint").unwrap().is_empty());
-            assert_eq!(s.overlay_watermark("pending-hint").unwrap(), Some(3));
+            assert_eq!(s.overlay_watermark("pending-hint").unwrap(), None);
 
             let accepted = active_cc_req(
                 "pending-hint",
@@ -8273,6 +8497,14 @@ mod tests {
                 70,
             )
             .unwrap();
+            s.seed_memory(
+                2,
+                "git:proj",
+                "CONSTRAINTS",
+                "unrelated fixture material",
+                50,
+            )
+            .unwrap();
             let baseline = active_cc_req(
                 "overlay-reject",
                 "cfg0",
@@ -8283,6 +8515,7 @@ mod tests {
             let tags_before = s.load_tags_for_session("overlay-reject").unwrap();
             let hints_before = s.load_user_hints("overlay-reject").unwrap();
             let temporal_before = s.load_temporal_marks("overlay-reject").unwrap();
+            let channel1_before = s.load_channel1_appends("overlay-reject").unwrap();
             let frontier_before = s.overlay_watermark("overlay-reject").unwrap();
 
             s.replace_compartments(
@@ -8319,6 +8552,10 @@ mod tests {
             assert_eq!(
                 s.overlay_watermark("overlay-reject").unwrap(),
                 frontier_before
+            );
+            assert_eq!(
+                s.load_channel1_appends("overlay-reject").unwrap(),
+                channel1_before
             );
 
             s.replace_compartments("overlay-reject", &[comp(1, 1, 3, "m3#0", "complete range")])
@@ -8639,7 +8876,7 @@ mod tests {
                 source_bytes: b"ghost".to_vec(),
             });
         }
-        store.mint_or_get_tags("protected", &tags, 1).unwrap();
+        store.seed_tags_for_test("protected", &tags, 1).unwrap();
         store
             .append_pending_agent_drops(
                 "protected",
@@ -8694,7 +8931,7 @@ mod tests {
                 source_bytes: format!("text {ordinal}").into_bytes(),
             })
             .collect::<Vec<_>>();
-        store.mint_or_get_tags("slot-free", &tags, 1).unwrap();
+        store.seed_tags_for_test("slot-free", &tags, 1).unwrap();
 
         // Pass 1 bootstraps, then the freeze is seeded directly in durable state
         // (selection itself refuses to reduce a protected newest tag, so a
@@ -8761,7 +8998,7 @@ mod tests {
                 },
             })
             .collect::<Vec<_>>();
-        store.mint_or_get_tags("stale-slot", &tags, 1).unwrap();
+        store.seed_tags_for_test("stale-slot", &tags, 1).unwrap();
         store
             .append_pending_agent_drops("stale-slot", &["m1#0".to_string()], 2)
             .unwrap();

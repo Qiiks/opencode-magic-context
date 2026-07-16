@@ -52,10 +52,11 @@ use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
     validate_state_import_compartments, HistorianPhase, InsertMemoryInput, McStore, McStoreError,
-    NoteInput, ShadowDivergenceRecord, ShadowMemoryMutationRow, ShadowMemoryRow,
-    ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow,
-    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
-    StoredCompartment, StoredMemoryMutation, StoredNote,
+    NoteInput, RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowMemoryMutationRow,
+    ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow,
+    ShadowWorkspaceRow, StateImportError, StateImportPreflight, StateImportValidationError,
+    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
+    WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -1287,6 +1288,9 @@ pub struct McHandler {
     between_transform_and_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     wrapup_operation_budget: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    status_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    connect_failure_commit_hook: ConnectFailureCommitHook,
     /// Route channel → its session binding. Populated at `on_bind`, removed at
     /// `on_route_gone`. The SDK validates the route handle's epoch before dispatching a
     /// request, so a channel key cannot resolve a stale route. A `Mutex<HashMap>` (not a
@@ -1461,6 +1465,8 @@ impl RetryableWrapupReason {
     }
 }
 
+type ConnectFailureCommitHook = Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
 struct HistorianFiringTask {
     store: Arc<McStore>,
     session_id: String,
@@ -1469,6 +1475,7 @@ struct HistorianFiringTask {
     project_slug: String,
     firing: AssembledHistorianFiring,
     live_guard: SessionSetGuard,
+    connect_failure_commit_hook: ConnectFailureCommitHook,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1528,6 +1535,9 @@ impl McHandler {
             between_transform_and_prepare: Mutex::new(None),
             #[cfg(test)]
             wrapup_operation_budget: Mutex::new(None),
+            #[cfg(test)]
+            status_snapshot_hook: Mutex::new(None),
+            connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
@@ -1585,6 +1595,8 @@ impl McHandler {
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
             wrapup_operation_budget: Mutex::new(None),
+            status_snapshot_hook: Mutex::new(None),
+            connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
@@ -2479,6 +2491,7 @@ impl McHandler {
                 project_slug,
                 firing,
                 live_guard,
+                connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
             },
         }))
     }
@@ -2574,6 +2587,7 @@ impl McHandler {
             project_slug,
             firing,
             live_guard,
+            connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
         }))
     }
 
@@ -2622,6 +2636,7 @@ impl McHandler {
             project_slug,
             firing,
             live_guard,
+            connect_failure_commit_hook,
         } = task;
         let _guard = live_guard;
         let failure_started_at_ms = firing.now_ms;
@@ -2638,13 +2653,19 @@ impl McHandler {
                     configured_failure_backoff_at_ms,
                     now_ms(),
                 );
-                record_historian_connect_failure(
+                let backoff_error = record_historian_connect_failure(
                     &store,
                     &session_id,
                     failure_backoff_at_ms,
                     &format!("producer connect: {err}"),
-                );
-                Err(historian::HistorianDriveError::Producer(err))
+                    &connect_failure_commit_hook,
+                )
+                .err()
+                .map(Box::new);
+                Err(historian::HistorianDriveError::ProducerConnect {
+                    source: Box::new(err),
+                    backoff_error,
+                })
             }
         }
     }
@@ -2738,10 +2759,18 @@ impl McHandler {
                     | historian::HistorianDriveError::State(
                         historian::HistorianStateError::Store(McStoreError::CasConflict { .. }),
                     ) => RetryableWrapupReason::SnapshotStale,
-                    historian::HistorianDriveError::Producer(_)
+                    historian::HistorianDriveError::ProducerConnect {
+                        backoff_error: None,
+                        ..
+                    }
+                    | historian::HistorianDriveError::Producer(_)
                     | historian::HistorianDriveError::Validation(_) => {
                         RetryableWrapupReason::BackoffActive
                     }
+                    historian::HistorianDriveError::ProducerConnect {
+                        backoff_error: Some(_),
+                        ..
+                    } => RetryableWrapupReason::SnapshotUnavailable,
                     _ => RetryableWrapupReason::SnapshotUnavailable,
                 };
                 Err((reason, error.to_string()))
@@ -3144,7 +3173,15 @@ impl McHandler {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
-        let snapshot = match store.load_session_status_snapshot(&session_id) {
+        let sample_wrapup_latch = || {
+            self.wrapup_sessions
+                .lock()
+                .expect("wrapup sessions mutex")
+                .get(&session_id)
+                .map(|session| (Arc::as_ptr(&session.token) as usize, session.rounds))
+        };
+        let latch_before = sample_wrapup_latch();
+        let mut snapshot = match store.load_session_status_snapshot(&session_id) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return HandlerOutcome::Error {
@@ -3153,6 +3190,30 @@ impl McHandler {
                 }
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = self
+            .status_snapshot_hook
+            .lock()
+            .expect("status snapshot hook mutex")
+            .take()
+        {
+            hook();
+        }
+        let mut wrapup_latch = sample_wrapup_latch();
+        if latch_before != wrapup_latch {
+            // Holding the latch mutex across SQLite I/O would block wrapup progress. A single
+            // bounded re-read instead places the durable snapshot after the observed latch edge.
+            snapshot = match store.load_session_status_snapshot(&session_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            wrapup_latch = sample_wrapup_latch();
+        }
         let loaded = snapshot.loaded;
         let compartment_count = snapshot.compartment_count;
         let pending_drop_count = snapshot.pending_drop_count;
@@ -3203,12 +3264,7 @@ impl McHandler {
         // Structured fields beside the prose: reconcilers must never parse summary
         // text, and a retained delivered-command row needs coverage/row_version plus
         // the live wrapup latch to decide completion without a second op.
-        let wrapup_active = self
-            .wrapup_sessions
-            .lock()
-            .expect("wrapup sessions mutex")
-            .get(&session_id)
-            .map(|session| session.rounds);
+        let wrapup_active = wrapup_latch.map(|(_, rounds)| rounds);
         respond(json!({
             "ok": true,
             "summary": summary,
@@ -3257,6 +3313,8 @@ impl McHandler {
         store: &McStore,
         session_id: &str,
         command_id: Option<&str>,
+        expected_generation: u64,
+        expected_revert_epoch: u64,
         response: TerminalWrapupResponse,
     ) -> HandlerOutcome {
         let TerminalWrapupResponse {
@@ -3267,15 +3325,54 @@ impl McHandler {
         } = response;
         debug_assert!(matches!(disposition, "completed" | "nothing_to_compact"));
         let (disposition, rounds, summary) = if let Some(command_id) = command_id {
-            match store.record_wrapup_command(
+            // The generation check and fenced SQLite insert share this short critical
+            // section. The local write is bounded and prevents a transform from starting
+            // after validation but before its terminal ledger row becomes durable.
+            let snapshots = self
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            if !snapshots.ready_generation_matches(session_id, expected_generation) {
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::SnapshotStale,
+                    "wrapup snapshot changed before terminal result recording",
+                );
+            }
+            let current = match store.load(session_id) {
+                Ok(current) if current.meta.revert_epoch == expected_revert_epoch => current,
+                Ok(_) => {
+                    return Self::retryable_wrapup_response(
+                        RetryableWrapupReason::SnapshotStale,
+                        "wrapup state changed before terminal result recording",
+                    )
+                }
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            match store.record_wrapup_command_if_current(WrapupCommandRecord {
                 session_id,
                 command_id,
                 disposition,
                 rounds,
-                &summary,
-                now_ms(),
-            ) {
-                Ok(row) => (row.disposition, row.rounds, row.summary),
+                summary: &summary,
+                created_at: now_ms(),
+                expected_row_version: current.row_version,
+                expected_revert_epoch,
+            }) {
+                Ok(
+                    RecordWrapupCommandOutcome::Recorded(row)
+                    | RecordWrapupCommandOutcome::LegacyFailurePreserved(row),
+                ) => (row.disposition, row.rounds, row.summary),
+                Ok(RecordWrapupCommandOutcome::Stale { .. }) => {
+                    return Self::retryable_wrapup_response(
+                        RetryableWrapupReason::SnapshotStale,
+                        "wrapup state changed before terminal result recording",
+                    )
+                }
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "store_commit_failed".to_string(),
@@ -3338,6 +3435,9 @@ impl McHandler {
         };
         if let Some(command_id) = command_id {
             match store.load_wrapup_command(&session_id, command_id) {
+                // Legacy failed rows are audit records, not terminal command results. Leave
+                // them durable while allowing the command to execute again.
+                Ok(Some(row)) if row.disposition == "failed" => {}
                 Ok(Some(row)) => return Self::replayed_wrapup_response(row),
                 Ok(None) => {}
                 Err(error) => {
@@ -3476,6 +3576,8 @@ impl McHandler {
                 &store,
                 &session_id,
                 command_id,
+                ready.generation,
+                ready.revert_epoch,
                 TerminalWrapupResponse {
                     disposition: "nothing_to_compact",
                     rounds: 0,
@@ -3685,28 +3787,6 @@ impl McHandler {
             ));
         }
         let effect = "takes effect on your next message";
-        if failure.is_none() {
-            match self.wrapup_snapshot_is_current(
-                &store,
-                &session_id,
-                ready.generation,
-                ready.revert_epoch,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Self::retryable_wrapup_response(
-                        RetryableWrapupReason::SnapshotStale,
-                        "wrapup snapshot changed before terminal result recording",
-                    )
-                }
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "store_load_failed".to_string(),
-                        message: error.to_string(),
-                    }
-                }
-            }
-        }
         match failure {
             Some((reason, detail)) => Self::retryable_wrapup_response(
                 reason,
@@ -3718,6 +3798,8 @@ impl McHandler {
                 &store,
                 &session_id,
                 command_id,
+                ready.generation,
+                ready.revert_epoch,
                 TerminalWrapupResponse {
                     disposition: "nothing_to_compact",
                     rounds: 0,
@@ -3731,6 +3813,8 @@ impl McHandler {
                 &store,
                 &session_id,
                 command_id,
+                ready.generation,
+                ready.revert_epoch,
                 TerminalWrapupResponse {
                     disposition: "completed",
                     rounds,
@@ -6841,24 +6925,37 @@ fn record_historian_connect_failure(
     session_id: &str,
     failure_backoff_at_ms: i64,
     detail: &str,
-) {
-    let Ok(loaded) = store.load(session_id) else {
-        return;
-    };
-    let mut meta = loaded.meta.clone();
-    if meta.historian.state == HistorianPhase::Idle {
-        // Connection failures happen before the historian transitions out of Idle, but
-        // they still need the same durable cooldown as failures after preparation.
-        meta.historian.last_failure = Some(detail.to_string());
-        meta.historian.failure_backoff_at_ms = Some(failure_backoff_at_ms);
-    } else {
-        meta.historian = historian::abandon_with_detail(
-            &meta.historian,
-            failure_backoff_at_ms,
-            Some(detail.to_string()),
-        );
+    before_commit: &ConnectFailureCommitHook,
+) -> Result<(), McStoreError> {
+    for attempt in 0..2 {
+        let loaded = store.load(session_id)?;
+        let mut meta = loaded.meta.clone();
+        if meta.historian.state == HistorianPhase::Idle {
+            // Connection failures happen before the historian transitions out of Idle, but
+            // they still need the same durable cooldown as failures after preparation.
+            meta.historian.last_failure = Some(detail.to_string());
+            meta.historian.failure_backoff_at_ms = Some(failure_backoff_at_ms);
+        } else {
+            meta.historian = historian::abandon_with_detail(
+                &meta.historian,
+                failure_backoff_at_ms,
+                Some(detail.to_string()),
+            );
+        }
+        if let Some(hook) = before_commit
+            .lock()
+            .expect("connect failure commit hook mutex")
+            .as_mut()
+        {
+            hook();
+        }
+        match store.commit(session_id, loaded.row_version, &loaded.core, &meta) {
+            Ok(_) => return Ok(()),
+            Err(McStoreError::CasConflict { .. }) if attempt == 0 => continue,
+            Err(error) => return Err(error),
+        }
     }
-    let _ = store.commit(session_id, loaded.row_version, &loaded.core, &meta);
+    unreachable!("the connect-failure CAS loop returns from both attempts")
 }
 
 /// Resolve the storage descriptor: prefer the daemon-provided `ack.storage`, else
@@ -9269,7 +9366,7 @@ mod tests {
 
     fn mint_drop_tag(store: &McStore, target_id: &str) {
         store
-            .mint_or_get_tags(
+            .seed_tags_for_test(
                 "ses",
                 &[TagMintInput {
                     block_id: target_id.to_string(),
@@ -9854,7 +9951,7 @@ mod tests {
             .append_pending_agent_drops(session_id, &["m8#0".to_string()], 2)
             .unwrap();
         store
-            .mint_or_get_tags(
+            .seed_tags_for_test(
                 session_id,
                 &[
                     TagMintInput {
@@ -9888,6 +9985,46 @@ mod tests {
         assert!(summary.contains("2 tags"));
         assert!(summary.contains("last historian: published seq 3"));
         assert!(summary.ends_with("surface active"));
+    }
+
+    #[test]
+    fn session_status_rereads_when_wrapup_latch_changes_during_snapshot() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let handler = Arc::new(handler);
+        let hook_handler = Arc::clone(&handler);
+        let hook_store = Arc::clone(&store);
+        *handler
+            .status_snapshot_hook
+            .lock()
+            .expect("status snapshot hook mutex") = Some(Box::new(move || {
+            let loaded = hook_store.load("ses").unwrap();
+            let mut meta = loaded.meta.clone();
+            meta.coverage_ordinal = Some(7);
+            hook_store
+                .commit("ses", loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+            hook_handler
+                .wrapup_sessions
+                .lock()
+                .expect("wrapup sessions mutex")
+                .insert(
+                    "ses".to_string(),
+                    LiveWrapupSession {
+                        token: Arc::new(()),
+                        rounds: 3,
+                    },
+                );
+        }));
+
+        let body = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        assert_eq!(body["wrapup_active"], json!(true));
+        assert_eq!(body["wrapup_rounds"], json!(3));
+        assert_eq!(body["coverage_ordinal"], json!(7));
+        assert_eq!(body["row_version"], json!(1));
     }
 
     #[test]
@@ -10015,7 +10152,7 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         store
-            .mint_or_get_tags(
+            .seed_tags_for_test(
                 "ses",
                 &[
                     TagMintInput {
@@ -10089,7 +10226,7 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         store
-            .mint_or_get_tags(
+            .seed_tags_for_test(
                 "ses",
                 &[TagMintInput {
                     block_id: "a#0".to_string(),
@@ -10380,6 +10517,159 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_failed_wrapup_row_is_not_replayed_and_retry_executes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        store
+            .seed_legacy_wrapup_command_for_test(
+                "ses",
+                "legacy-failed",
+                "failed",
+                1,
+                "old failure",
+                1,
+            )
+            .unwrap();
+
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 5,
+                        "command_id": "legacy-failed"
+                    }),
+                )
+                .await,
+        );
+        assert_ne!(response.get("replayed"), Some(&json!(true)), "{response}");
+        assert_eq!(response["disposition"], json!("completed"), "{response}");
+        assert!(producer.starts.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            store
+                .load_wrapup_command("ses", "legacy-failed")
+                .unwrap()
+                .expect("legacy row remains for audit")
+                .disposition,
+            "failed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_connect_failure_without_durable_backoff_is_snapshot_unavailable() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .connect_errors
+            .lock()
+            .expect("connect errors mutex")
+            .push_back(HistorianProducerError::Connect {
+                endpoint: "127.0.0.1:1".to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+            });
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let conflict_store = Arc::clone(&store);
+        *handler
+            .connect_failure_commit_hook
+            .lock()
+            .expect("connect failure commit hook mutex") = Some(Box::new(move || {
+            let loaded = conflict_store.load("ses").unwrap();
+            conflict_store
+                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+        }));
+
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 5,
+                        "command_id": "connect-conflict"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(response["disposition"], json!("retryable"), "{response}");
+        assert_eq!(response["reason"], json!("snapshot_unavailable"));
+        assert!(store
+            .load("ses")
+            .unwrap()
+            .meta
+            .historian
+            .failure_backoff_at_ms
+            .is_none());
+        assert!(store
+            .load_wrapup_command("ses", "connect-conflict")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_connect_failure_retries_one_cas_conflict_and_arms_backoff() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .connect_errors
+            .lock()
+            .expect("connect errors mutex")
+            .push_back(HistorianProducerError::Connect {
+                endpoint: "127.0.0.1:1".to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+            });
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let conflict_store = Arc::clone(&store);
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        *handler
+            .connect_failure_commit_hook
+            .lock()
+            .expect("connect failure commit hook mutex") = Some(Box::new(move || {
+            if hook_calls_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                let loaded = conflict_store.load("ses").unwrap();
+                conflict_store
+                    .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                    .unwrap();
+            }
+        }));
+
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 5,
+                        "command_id": "connect-retry"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(response["disposition"], json!("retryable"), "{response}");
+        assert_eq!(response["reason"], json!("backoff_active"));
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+        assert!(store
+            .load("ses")
+            .unwrap()
+            .meta
+            .historian
+            .failure_backoff_at_ms
+            .is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]

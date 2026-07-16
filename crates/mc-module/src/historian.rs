@@ -489,6 +489,10 @@ pub enum HistorianDriveError {
     NoModels,
     State(HistorianStateError),
     Producer(HistorianProducerError),
+    ProducerConnect {
+        source: Box<HistorianProducerError>,
+        backoff_error: Option<Box<McStoreError>>,
+    },
     Validation(HistorianValidationError),
 }
 
@@ -498,6 +502,17 @@ impl fmt::Display for HistorianDriveError {
             HistorianDriveError::NoModels => write!(f, "historian model chain is empty"),
             HistorianDriveError::State(e) => write!(f, "state: {e}"),
             HistorianDriveError::Producer(e) => write!(f, "producer: {e}"),
+            HistorianDriveError::ProducerConnect {
+                source,
+                backoff_error: Some(error),
+            } => write!(
+                f,
+                "producer connect: {source}; durable backoff could not be recorded: {error}"
+            ),
+            HistorianDriveError::ProducerConnect {
+                source,
+                backoff_error: None,
+            } => write!(f, "producer connect: {source}"),
             HistorianDriveError::Validation(e) => write!(f, "validation: {e}"),
         }
     }
