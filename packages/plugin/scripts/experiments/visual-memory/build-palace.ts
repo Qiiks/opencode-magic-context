@@ -32,6 +32,7 @@ const PAGE_WIDTH_PIXELS = 1_092;
 const PAGE_HEIGHT_PIXELS = 1_092;
 const BODY_INK = [18, 20, 24] as const;
 const PROHIBITION_INK = [148, 28, 35] as const;
+const ROOM_HEADER_MARKER = "▰";
 const CATEGORY_INK: Record<string, readonly [number, number, number]> = {
     PROJECT_RULES: [24, 58, 112],
     ARCHITECTURE: [0, 88, 92],
@@ -143,6 +144,7 @@ type Panel = GrayImage & {
     lineTops: number[];
     bodyRows: Set<number>;
     composedHeight: number;
+    headerBar: boolean;
 };
 
 function sourceIds(source: string): number[] {
@@ -320,6 +322,21 @@ function blitPanel(
     assert.ok(baseCategoryColor, `missing category color for ${panel.item.category}`);
     const rows = panel.height / cellHeight;
     const columns = panel.width / cellWidth;
+    const roomHeader = panel.item.kind === "room" && panel.headerBar;
+    if (roomHeader) {
+        const background = baseCategoryColor.map((channel) =>
+            Math.round(channel + (255 - channel) * 0.86),
+        );
+        for (let y = 0; y < cellHeight; y++) {
+            const targetY = top + y;
+            for (let x = 0; x < panel.width; x++) {
+                const index = (targetY * target.width + left + x) * 3;
+                for (let channel = 0; channel < 3; channel++) {
+                    target.pixels[index + channel] = background[channel] ?? 255;
+                }
+            }
+        }
+    }
     const colorFor = (
         row: number,
         column: number,
@@ -497,8 +514,12 @@ for (const item of coverage.layout.items) {
         assert.ok(room, `coverage room missing for ${item.category}/${item.room}`);
         assert.ok(lines.length >= (item.continuation ? 1 : 2), `room ${room.name} lacks header/body rows`);
         const redCells = prohibitionCells(lines, `${item.category}/${room.name}`);
+        const headerBar = !item.continuation && lines[0]?.startsWith(ROOM_HEADER_MARKER) === true;
+        const renderLines = headerBar
+            ? [lines[0]?.slice(ROOM_HEADER_MARKER.length) ?? "", ...lines.slice(1)]
+            : lines;
         const titleDroppedChars = 0;
-        const panel = await renderPanelText(lines.join("\n"), coverage.layout.roomWidthChars);
+        const panel = await renderPanelText(renderLines.join("\n"), coverage.layout.roomWidthChars);
         const geometry = panelGeometry(
             item,
             lines.length,
@@ -512,6 +533,7 @@ for (const item of coverage.layout.items) {
             droppedChars: panel.droppedChars + titleDroppedChars,
             item,
             redCells,
+            headerBar,
         });
     } else {
         const panel = await renderPanelText(lines.join("\n"), coverage.layout.roomWidthChars);
@@ -527,6 +549,7 @@ for (const item of coverage.layout.items) {
             droppedChars: panel.droppedChars,
             item,
             redCells: new Set(),
+            headerBar: false,
         });
     }
 }

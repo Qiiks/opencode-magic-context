@@ -25,7 +25,9 @@ const BODY_LINE_PITCH = CELL_HEIGHT + 1;
 const PAGE_WIDTH_CHARS = COLUMN_COUNT * ROOM_WIDTH;
 const MAX_LINE_CHARS = PAGE_WIDTH_CHARS + (COLUMN_COUNT - 1) * COLUMN_GAP;
 const PAGE_HEIGHT_CELLS = Math.floor(PAGE_HEIGHT_PIXELS / BODY_LINE_PITCH);
+const PAGE_LINE_CAPACITY = COLUMN_COUNT * PAGE_HEIGHT_CELLS;
 const MAX_PALACE_CHARS = 27_000;
+export const ROOM_HEADER_MARKER = "▰";
 const SOURCE_PATH = "/tmp/visual-memory/trimmed-memories-source.txt";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ALTERNATE_LAYOUT = LAYOUT_FONT === "jetbrains-mono-10";
@@ -398,7 +400,7 @@ function buildRoomPlan(category: Category, name: string, allEntries: SpecEntry[]
     if (requiredTokenWidth > ROOM_WIDTH) {
         throw new Error(`room ${name} has ${requiredTokenWidth}-char anchor (max ${ROOM_WIDTH})`);
     }
-    const header = `— ${name} —`;
+    const header = `${ROOM_HEADER_MARKER} — ${name} —`;
     if (codepoints(header) > ROOM_WIDTH) {
         throw new Error(`room header ${name} exceeds ${ROOM_WIDTH} cells`);
     }
@@ -483,9 +485,10 @@ export function renderPalace(specs: SpecEntry[]): {
         categoryIndex: number;
         manifestOrder: number;
     };
-    type Allocation = { banner?: StreamSlot; room: StreamSlot[]; end: StreamSlot };
+    type Allocation = { banner?: StreamSlot; gap?: StreamSlot; room: StreamSlot[]; end: StreamSlot };
     const grouped = new Map<string, RoomInput>();
     const MAX_RENDER_ITERATIONS = 1_000_000;
+    const MAX_SHARE_ITERATIONS = 1_000;
     let iterations = 0;
     const guard = (context: string): void => {
         if (++iterations > MAX_RENDER_ITERATIONS) {
@@ -493,6 +496,11 @@ export function renderPalace(specs: SpecEntry[]): {
                 `single-page placement exceeded ${MAX_RENDER_ITERATIONS} iterations while ${context}`,
             );
         }
+    };
+
+    const mergeTargetsArePresent = (entries: SpecEntry[]): boolean => {
+        const ids = new Set(entries.map((entry) => entry.id));
+        return entries.every((entry) => entry.mergeInto === undefined || ids.has(entry.mergeInto));
     };
 
     const nextManifestOrder = new Map<Category, number>();
@@ -514,17 +522,98 @@ export function renderPalace(specs: SpecEntry[]): {
         grouped.set(key, room);
     }
 
-    // Rooms keep their manifest order inside a category, while the global stream
-    // promotes the room whose best memory is most important.
-    const rooms = [...grouped.values()].sort((left, right) => {
-        const leftPeak = Math.max(...left.entries.map((entry) => entry.importance));
-        const rightPeak = Math.max(...right.entries.map((entry) => entry.importance));
-        return (
-            rightPeak - leftPeak ||
-            left.categoryIndex - right.categoryIndex ||
-            left.manifestOrder - right.manifestOrder
+    // The category order is the page's spatial order. Within a category, the best
+    // room leads while manifest order remains the tie-breaker and entry order.
+    const roomsByCategory = new Map<Category, RoomInput[]>();
+    for (const category of CATEGORY_ORDER) roomsByCategory.set(category, []);
+    for (const room of grouped.values()) roomsByCategory.get(room.category)?.push(room);
+    for (const category of CATEGORY_ORDER) {
+        const categoryRooms = roomsByCategory.get(category) ?? [];
+        categoryRooms.sort((left, right) => {
+            const leftPeak = Math.max(...left.entries.map((entry) => entry.importance));
+            const rightPeak = Math.max(...right.entries.map((entry) => entry.importance));
+            return rightPeak - leftPeak || left.manifestOrder - right.manifestOrder;
+        });
+    }
+
+    const plans = new Map<RoomInput, RoomPlan>();
+    const categoryDemand = new Map<Category, number>();
+    for (const category of CATEGORY_ORDER) {
+        const categoryRooms = roomsByCategory.get(category) ?? [];
+        let demand = categoryRooms.length > 0 ? 1 : 0;
+        for (const room of categoryRooms) {
+            guard(`measuring ${category}/${room.name} demand`);
+            if (!mergeTargetsArePresent(room.entries)) {
+                throw new Error(`room ${room.name} has a merge target outside its manifest order`);
+            }
+            const plan = buildRoomPlan(room.category, room.name, room.entries);
+            plans.set(room, plan);
+            // One blank line separates adjacent rooms unless the next room starts
+            // at a new column; that boundary exception is handled during placement.
+            demand += plan.lines.length;
+        }
+        if (categoryRooms.length > 1) demand += categoryRooms.length - 1;
+        categoryDemand.set(category, demand);
+    }
+
+    const initialShare = Math.floor(PAGE_LINE_CAPACITY / CATEGORY_ORDER.length);
+    const categoryBudgets = new Map<Category, number>();
+    let unassignedLines = PAGE_LINE_CAPACITY - initialShare * CATEGORY_ORDER.length;
+    for (const category of CATEGORY_ORDER) {
+        const demand = categoryDemand.get(category) ?? 0;
+        if (demand < initialShare) {
+            categoryBudgets.set(category, demand);
+            unassignedLines += initialShare - demand;
+        } else {
+            categoryBudgets.set(category, initialShare);
+        }
+    }
+
+    // Redistribute short categories' unused share proportionally to categories
+    // that still have unmet demand. Repeating after each integer allocation lets
+    // small residual demands receive a line without starving larger categories.
+    for (let shareIteration = 0; unassignedLines > 0; shareIteration++) {
+        if (shareIteration >= MAX_SHARE_ITERATIONS) {
+            throw new Error(`category share redistribution exceeded ${MAX_SHARE_ITERATIONS} iterations`);
+        }
+        const unmet = CATEGORY_ORDER.map((category) => {
+            const budget = categoryBudgets.get(category) ?? 0;
+            const demand = categoryDemand.get(category) ?? 0;
+            return { category, budget, remaining: Math.max(0, demand - budget) };
+        }).filter((item) => item.remaining > 0);
+        if (unmet.length === 0) break;
+        const totalRemaining = unmet.reduce((total, item) => total + item.remaining, 0);
+        const pool = unassignedLines;
+        const allocations = unmet.map((item) => {
+            const exact = (pool * item.remaining) / totalRemaining;
+            return {
+                ...item,
+                extra: Math.min(item.remaining, Math.floor(exact)),
+                fraction: exact - Math.floor(exact),
+            };
+        });
+        let assigned = allocations.reduce((total, item) => total + item.extra, 0);
+        allocations.sort(
+            (left, right) =>
+                right.fraction - left.fraction ||
+                CATEGORY_ORDER.indexOf(left.category) - CATEGORY_ORDER.indexOf(right.category),
         );
-    });
+        for (const allocation of allocations) {
+            if (assigned >= pool) break;
+            if (allocation.extra >= allocation.remaining) continue;
+            allocation.extra++;
+            assigned++;
+        }
+        for (const allocation of allocations) {
+            if (allocation.extra > 0) {
+                categoryBudgets.set(allocation.category, allocation.budget + allocation.extra);
+            }
+        }
+        if (assigned === 0) {
+            throw new Error("category share redistribution made no progress");
+        }
+        unassignedLines -= assigned;
+    }
 
     const columns = Array.from({ length: COLUMN_COUNT }, () => Array<string>(PAGE_HEIGHT_CELLS).fill(""));
     const placements = new Map<number, Placement>();
@@ -534,8 +623,8 @@ export function renderPalace(specs: SpecEntry[]): {
     const droppedBySkipIds: number[] = [];
     const droppedTrimSet = new Set<number>();
     const droppedSkipSet = new Set<number>();
-    const categoryRendered = new Set<Category>();
     let cursor: StreamSlot = { column: 0, row: 0 };
+    let spilloverLines = 0;
 
     const categoryBanner = (category: Category): string => {
         const label = ` <${category}> `;
@@ -549,10 +638,6 @@ export function renderPalace(specs: SpecEntry[]): {
         if (placements.has(id) || set.has(id)) return;
         set.add(id);
         output.push(id);
-    };
-    const mergeTargetsArePresent = (entries: SpecEntry[]): boolean => {
-        const ids = new Set(entries.map((entry) => entry.id));
-        return entries.every((entry) => entry.mergeInto === undefined || ids.has(entry.mergeInto));
     };
     const isEnd = (slot: StreamSlot): boolean => slot.column >= COLUMN_COUNT;
     const advance = (slot: StreamSlot): StreamSlot => {
@@ -570,6 +655,8 @@ export function renderPalace(specs: SpecEntry[]): {
         category: Category,
         plan: RoomPlan,
         includeBanner: boolean,
+        includeGap: boolean,
+        lineBudget: number,
     ): Allocation | undefined => {
         let next = { ...cursor };
         let banner: StreamSlot | undefined;
@@ -578,10 +665,28 @@ export function renderPalace(specs: SpecEntry[]): {
             banner = next;
             next = advance(next);
         }
-        // Keeping the header beside the bottom edge would make it an orphan.
+
+        let gap: StreamSlot | undefined;
+        let needsGap = includeGap && next.row > 0;
+        // Keep a blank/header unit together at the bottom of a column. If the
+        // header would cross the boundary, the room begins at the next column and
+        // therefore needs no leading blank.
+        if (needsGap && next.row >= PAGE_HEIGHT_CELLS - 2) {
+            next = advance(next);
+            needsGap = false;
+        }
+        if (!needsGap && next.row === PAGE_HEIGHT_CELLS - 1) next = advance(next);
+        if (isEnd(next)) return undefined;
+        if (needsGap) {
+            gap = next;
+            next = advance(next);
+        }
         if (isEnd(next)) return undefined;
         if (next.row === PAGE_HEIGHT_CELLS - 1) next = advance(next);
         if (isEnd(next)) return undefined;
+
+        const fixedLines = (banner ? 1 : 0) + (gap ? 1 : 0);
+        if (fixedLines + plan.lines.length > lineBudget) return undefined;
         const roomSlots: StreamSlot[] = [];
         for (const line of plan.lines) {
             guard(`simulating ${category}/${plan.name} flow`);
@@ -593,7 +698,7 @@ export function renderPalace(specs: SpecEntry[]): {
             if (isEnd(next) && roomSlots.length < plan.lines.length) return undefined;
         }
         if (roomSlots.length < 2) return undefined;
-        return { ...(banner ? { banner } : {}), room: roomSlots, end: next };
+        return { ...(banner ? { banner } : {}), ...(gap ? { gap } : {}), room: roomSlots, end: next };
     };
     const writeSlot = (slot: StreamSlot, line: string, context: string): void => {
         guard(`writing ${context}`);
@@ -629,11 +734,6 @@ export function renderPalace(specs: SpecEntry[]): {
             segmentSlots.set(slot.column, segment);
         }
         const segmentColumns = [...segmentSlots.keys()];
-        if (segmentColumns.length > 1) {
-            // This is the only count that describes a room crossing a column.
-            // It is intentionally derived from the emitted segments, not from
-            // source order, so split coverage remains deterministic.
-        }
         for (const [segmentIndex, column] of segmentColumns.entries()) {
             guard(`recording ${room.category}/${room.name} segment`);
             const slots = segmentSlots.get(column);
@@ -704,47 +804,70 @@ export function renderPalace(specs: SpecEntry[]): {
         }
     };
 
-    for (const room of rooms) {
-        guard(`selecting ${room.category}/${room.name}`);
-        if (!mergeTargetsArePresent(room.entries)) {
-            throw new Error(`room ${room.name} has a merge target outside its manifest order`);
-        }
-        const includeBanner = !categoryRendered.has(room.category);
-        const select = (entries: SpecEntry[]): { plan: RoomPlan; allocation: Allocation } | undefined => {
-            if (!mergeTargetsArePresent(entries)) return undefined;
-            const plan = buildRoomPlan(room.category, room.name, entries);
-            const allocation = simulate(room.category, plan, includeBanner);
-            return allocation ? { plan, allocation } : undefined;
-        };
-        let selected = select(room.entries);
-        if (!selected) {
-            for (let keep = room.entries.length - 1; keep >= 1; keep--) {
-                guard(`trimming ${room.category}/${room.name}`);
-                selected = select(room.entries.slice(0, keep));
-                if (selected) {
-                    for (const entry of room.entries.slice(keep)) addDropped(entry.id, "trim");
-                    break;
+    for (const category of CATEGORY_ORDER) {
+        const categoryRooms = roomsByCategory.get(category) ?? [];
+        if (categoryRooms.length === 0) continue;
+        let remainingBudget = (categoryBudgets.get(category) ?? 0) + spilloverLines;
+        spilloverLines = 0;
+        let categoryRendered = false;
+        for (const room of categoryRooms) {
+            guard(`selecting ${room.category}/${room.name}`);
+            const includeBanner = !categoryRendered;
+            const includeGap = categoryRendered;
+            const fullPlan = plans.get(room);
+            if (!fullPlan) throw new Error(`room plan missing for ${room.category}/${room.name}`);
+            const select = (entries: SpecEntry[]): { plan: RoomPlan; allocation: Allocation } | undefined => {
+                if (!mergeTargetsArePresent(entries)) return undefined;
+                const plan = entries === room.entries ? fullPlan : buildRoomPlan(room.category, room.name, entries);
+                const allocation = simulate(
+                    room.category,
+                    plan,
+                    includeBanner,
+                    includeGap,
+                    remainingBudget,
+                );
+                return allocation ? { plan, allocation } : undefined;
+            };
+            let selected = select(room.entries);
+            if (!selected) {
+                for (let keep = room.entries.length - 1; keep >= 1; keep--) {
+                    guard(`trimming ${room.category}/${room.name}`);
+                    selected = select(room.entries.slice(0, keep));
+                    if (selected) {
+                        for (const entry of room.entries.slice(keep)) addDropped(entry.id, "trim");
+                        break;
+                    }
                 }
             }
-        }
-        if (!selected) {
-            for (const entry of room.entries) {
-                guard(`dropping skipped ${room.category}/${room.name}`);
-                addDropped(entry.id, "skip");
+            if (!selected) {
+                for (const entry of room.entries) {
+                    guard(`dropping skipped ${room.category}/${room.name}`);
+                    addDropped(entry.id, "skip");
+                }
+                continue;
             }
-            continue;
+            if (selected.allocation.banner) recordCategory(category, selected.allocation.banner);
+            categoryRendered = true;
+            for (let index = 0; index < selected.plan.lines.length; index++) {
+                const slot = selected.allocation.room[index];
+                const line = selected.plan.lines[index];
+                if (!slot || line === undefined) throw new Error(`room line ${index} missing for ${room.name}`);
+                writeSlot(slot, line, `${room.category}/${room.name} room line`);
+            }
+            recordRoom(room, selected.plan, selected.allocation);
+            const consumed =
+                (selected.allocation.banner ? 1 : 0) +
+                (selected.allocation.gap ? 1 : 0) +
+                selected.plan.lines.length;
+            if (consumed > remainingBudget) {
+                throw new Error(`category ${category} exceeded its line share`);
+            }
+            remainingBudget -= consumed;
+            cursor = selected.allocation.end;
         }
-        if (selected.allocation.banner) recordCategory(room.category, selected.allocation.banner);
-        categoryRendered.add(room.category);
-        for (let index = 0; index < selected.plan.lines.length; index++) {
-            const slot = selected.allocation.room[index];
-            const line = selected.plan.lines[index];
-            if (!slot || line === undefined) throw new Error(`room line ${index} missing for ${room.name}`);
-            writeSlot(slot, line, `${room.category}/${room.name} room line`);
-        }
-        recordRoom(room, selected.plan, selected.allocation);
-        // Rooms may touch: the newspaper flow must consume every available line.
-        cursor = selected.allocation.end;
+        // A category that cannot use its final partial room returns those lines
+        // as spill for the next category rather than leaving a silent hole.
+        spilloverLines += remainingBudget;
     }
 
     const palaceLines = columns[0]?.map((_, row) =>
