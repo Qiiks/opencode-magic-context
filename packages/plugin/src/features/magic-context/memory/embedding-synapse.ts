@@ -306,12 +306,22 @@ let sharedClient: SynapseClientLike | null = null;
 let sharedClientFile: string | null = null;
 let sharedClientPromise: Promise<SynapseClientLike> | null = null;
 
+const factoryClients = new WeakMap<() => Promise<SynapseClientLike>, Promise<SynapseClientLike>>();
+
 async function getSharedClient(
     options: SynapseEmbeddingProviderOptions,
 ): Promise<SynapseClientLike> {
     if (options.clientFactory) {
-        if (!sharedClientPromise) sharedClientPromise = options.clientFactory();
-        return sharedClientPromise;
+        // Factory clients (tests, embedded fixtures) memoize per factory, never
+        // in the module-global slot: a cached fixture client would otherwise
+        // leak across providers and poison every later real connection in the
+        // same process.
+        let promise = factoryClients.get(options.clientFactory);
+        if (!promise) {
+            promise = options.clientFactory();
+            factoryClients.set(options.clientFactory, promise);
+        }
+        return promise;
     }
     if (sharedClient && sharedClientFile === options.connectionFile) return sharedClient;
     if (sharedClientPromise && sharedClientFile === options.connectionFile)
