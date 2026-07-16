@@ -106,6 +106,7 @@ type Args = {
     models: string[];
     prompts: string[];
     rebuildCorpus: boolean;
+    reuseManifests: boolean;
 };
 
 function errorMessage(error: unknown): string {
@@ -127,7 +128,7 @@ function splitValues(value: string): string[] {
 }
 
 function parseArgs(argv = process.argv.slice(2)): Args {
-    const args: Args = { models: [], prompts: [], rebuildCorpus: false };
+    const args: Args = { models: [], prompts: [], rebuildCorpus: false, reuseManifests: false };
     for (let index = 0; index < argv.length; index++) {
         const argument = argv[index];
         const value = argv[index + 1];
@@ -151,6 +152,12 @@ function parseArgs(argv = process.argv.slice(2)): Args {
                 break;
             case "--rebuild-corpus":
                 args.rebuildCorpus = true;
+                break;
+            case "--reuse-manifests":
+                // Re-render from a previous run's saved raw-<category>.xml manifests
+                // without spending model quota on re-authoring. Categories with no
+                // saved manifest still author normally.
+                args.reuseManifests = true;
                 break;
             case "--help":
             case "-h":
@@ -814,6 +821,7 @@ async function runCell(args: {
     corpus: PalaceCorpus;
     model: string;
     promptPath: string;
+    reuseManifests: boolean;
 }): Promise<CellResult> {
     const prompt = readFileSync(args.promptPath, "utf8");
     // Suffix the think mode so A/B arms (think:false vs think:low) write
@@ -828,6 +836,18 @@ async function runCell(args: {
     for (const category of CATEGORY_ORDER) {
         const memories = args.corpus.memories.filter((memory) => memory.category === category);
         if (memories.length === 0) continue;
+        if (args.reuseManifests) {
+            const rawPath = join(directory, `raw-${category.toLowerCase()}.xml`);
+            if (existsSync(rawPath)) {
+                try {
+                    const entries = parseManifest(readFileSync(rawPath, "utf8"), category, importanceById);
+                    categoryRuns.push({ category, parse: "ok", entries, attempts: 0, usage: [] });
+                    continue;
+                } catch {
+                    // A stale or malformed saved manifest falls through to authoring.
+                }
+            }
+        }
         categoryRuns.push(
             await runCategory({
                 model: args.model,
@@ -1076,7 +1096,14 @@ async function main(): Promise<void> {
         const candidatePrompt = promptPath(requestedPrompt);
         for (const model of args.models) {
             console.log(`running ${model} × ${basename(candidatePrompt)}`);
-            results.push(await runCell({ corpus, model, promptPath: candidatePrompt }));
+            results.push(
+                await runCell({
+                    corpus,
+                    model,
+                    promptPath: candidatePrompt,
+                    reuseManifests: args.reuseManifests,
+                }),
+            );
         }
     }
     writeReport(results);
