@@ -395,6 +395,21 @@ pub fn publish_validated_chunk(
     };
     match publish_result {
         Ok(result) => Ok(result),
+        Err(HistorianPublishError::FenceRejected { reason }) => {
+            // A fence rejection is a fast local race (the caller's snapshot was
+            // retired mid-round), not a producer failure: return the run to Idle
+            // with NO failure cooldown so an immediate retry on a fresh snapshot
+            // is admitted instead of reading backoff_active for a minute.
+            abandon_matching_run_without_cooldown(
+                store,
+                request.session_id,
+                request.predicate,
+                Some(format!("publish rejected: {reason}")),
+            )?;
+            Err(HistorianStateError::Publish(
+                HistorianPublishError::FenceRejected { reason },
+            ))
+        }
         Err(HistorianPublishError::CasConflict {
             expected,
             found,
@@ -1403,6 +1418,36 @@ fn idle_after_success(firing_seq: u64) -> HistorianDurableState {
         firing_seq,
         ..HistorianDurableState::default()
     }
+}
+
+/// Abandon like `abandon_matching_run_with_detail` but WITHOUT arming the
+/// failure backoff: used when the publish was refused by a local fence rather
+/// than failing in the producer, so the next attempt should not wait out a
+/// model-failure cooldown.
+fn abandon_matching_run_without_cooldown(
+    store: &McStore,
+    session_id: &str,
+    predicate: &HistorianPublishPredicate,
+    detail: Option<String>,
+) -> Result<Option<u64>, HistorianStateError> {
+    let loaded = store.load(session_id)?;
+    let state = &loaded.meta.historian;
+    let matches = state.firing_seq == predicate.firing_seq
+        && state.producer_run_id.as_deref() == Some(predicate.producer_run_id.as_str())
+        && state.chunk_fingerprint == predicate.chunk_fingerprint;
+    if !matches || state.state == HistorianPhase::Idle {
+        return Ok(None);
+    }
+    let mut meta = loaded.meta.clone();
+    meta.historian = HistorianDurableState {
+        state: HistorianPhase::Idle,
+        firing_seq: state.firing_seq,
+        failure_backoff_at_ms: None,
+        last_failure: detail.or_else(|| state.last_failure.clone()),
+        ..HistorianDurableState::default()
+    };
+    let row_version = store.commit(session_id, loaded.row_version, &loaded.core, &meta)?;
+    Ok(Some(row_version))
 }
 
 fn abandon_matching_run_with_detail(

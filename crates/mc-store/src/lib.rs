@@ -1028,6 +1028,13 @@ pub enum HistorianPublishError {
         found: u64,
         reason: Option<String>,
     },
+    /// A caller-supplied publication fence refused the publish before any write.
+    /// Distinct from CasConflict so callers can abandon the run WITHOUT arming a
+    /// model-failure cooldown: a fence rejection is a fast local race, not a
+    /// producer failure, and an immediate retry with a fresh snapshot is valid.
+    FenceRejected {
+        reason: String,
+    },
     StateMismatch {
         expected: Box<HistorianPublishPredicate>,
         found: Box<HistorianDurableState>,
@@ -1042,6 +1049,9 @@ impl std::fmt::Display for HistorianPublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HistorianPublishError::Store(e) => write!(f, "store: {e}"),
+            HistorianPublishError::FenceRejected { reason } => {
+                write!(f, "publication fence rejected: {reason}")
+            }
             HistorianPublishError::CasConflict {
                 expected,
                 found,

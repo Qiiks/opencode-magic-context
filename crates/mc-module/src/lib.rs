@@ -1527,10 +1527,8 @@ impl historian::HistorianPublicationFence for WrapupSnapshotPublicationFence {
         // cannot retire the cached raw snapshot between the check and additive writes.
         let snapshots = self.snapshots.lock().expect("transform snapshots mutex");
         if !snapshots.ready_generation_matches(&self.session_id, self.generation) {
-            return Err(mc_store::HistorianPublishError::CasConflict {
-                expected: request.expected_row_version,
-                found: request.expected_row_version.unwrap_or_default(),
-                reason: Some("transform snapshot generation changed before publication".into()),
+            return Err(mc_store::HistorianPublishError::FenceRejected {
+                reason: "transform snapshot generation changed before publication".to_string(),
             });
         }
         store.publish_historian_chunk(request)
@@ -2842,7 +2840,8 @@ impl McHandler {
                 let reason = match &error {
                     historian::HistorianDriveError::State(
                         historian::HistorianStateError::Publish(
-                            mc_store::HistorianPublishError::CasConflict { .. },
+                            mc_store::HistorianPublishError::CasConflict { .. }
+                            | mc_store::HistorianPublishError::FenceRejected { .. },
                         ),
                     )
                     | historian::HistorianDriveError::State(
@@ -11092,6 +11091,82 @@ mod tests {
             historian_additive_rows(&store, "ses", &project),
             before,
             "the generation fence must run before compartments, transcripts, facts, or the publication floor change"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fence_rejection_leaves_no_backoff_and_immediate_retry_executes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let hook_handler = Arc::clone(&handler);
+        let hook_producer = Arc::clone(&producer);
+        *producer
+            .on_await_output
+            .lock()
+            .expect("await-output hook mutex") = Some(Box::new(move || {
+            let prompt = hook_producer
+                .prompts
+                .lock()
+                .expect("prompts mutex")
+                .last()
+                .cloned()
+                .expect("producer prompt");
+            let (start, end) = prompt_ordinal_range(&prompt).expect("prompt ordinal range");
+            hook_producer
+                .await_results
+                .lock()
+                .expect("await results mutex")
+                .push_back(Ok(ProducerOutput {
+                    text: historian_output_with_fact(start, end, "Fence race fact."),
+                    length_capped: false,
+                }));
+            hook_handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .begin("ses");
+        }));
+        let stale = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert_eq!(stale["disposition"], json!("retryable"), "{stale}");
+        assert_eq!(stale["reason"], json!("snapshot_stale"));
+        // The fence race is not a producer failure: no cooldown may be armed, so an
+        // immediate retry with a fresh snapshot executes instead of backoff_active.
+        assert_eq!(
+            store
+                .load("ses")
+                .unwrap()
+                .meta
+                .historian
+                .failure_backoff_at_ms,
+            None,
+            "fence rejection must not arm the failure backoff"
+        );
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        // The retry must be ADMITTED (no cooldown at entry) and drive the producer.
+        // The mock's canned output no longer matches the window, so the retry may
+        // fail validation afterwards; being turned away at the door is the bug.
+        let starts_before_retry = producer.starts.load(Ordering::SeqCst);
+        let retry = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert!(
+            producer.starts.load(Ordering::SeqCst) > starts_before_retry,
+            "immediate retry must be admitted and drive the producer, got {retry}"
         );
     }
 
