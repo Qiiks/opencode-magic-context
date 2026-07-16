@@ -39,7 +39,6 @@ const CATEGORY_ORDER = [
     "CONSTRAINTS",
     "CONFIG_VALUES",
     "NAMING",
-    "KNOWN_ISSUES",
 ] as const;
 
 const VALIDATOR_FAILURE_CLASSES = [
@@ -944,8 +943,7 @@ function formatFailures(failures: Partial<Record<ValidatorFailureClass, number>>
 function cellVerdict(result: CellResult): "VIABLE" | "VIABLE-WITH-CAVEATS" | "NOT-VIABLE" {
     if (
         result.parse === "fail" ||
-        result.coverage.covered !== result.coverage.total ||
-        Object.keys(result.validatorFailures).length > 0 ||
+        Object.keys(result.validatorFailures).some((kind) => kind !== "cue over budget") ||
         result.renderError
     ) {
         return "NOT-VIABLE";
@@ -1083,9 +1081,9 @@ function writeReport(results: CellResult[]): void {
         "",
         "## Verdict policy",
         "",
-        "A cell is **VIABLE** only when parsing, full validation, rendering, and full coverage succeed with at least " +
+        "A cell is **VIABLE** when parsing, validation, rendering, and the author's selected-memory manifest succeed with at least " +
             ANCHOR_FIDELITY_FLOOR +
-            "% anchor fidelity. A parse-recovered or low-anchor cell is **VIABLE-WITH-CAVEATS**. Any parse, validation, coverage, or rendering failure is **NOT-VIABLE**.",
+            "% anchor fidelity. Uncovered source memories are an intentional selection outcome. A parse-recovered or low-anchor cell is **VIABLE-WITH-CAVEATS**; cue-budget diagnostics are warnings. Any parse, hard-validation, or rendering failure is **NOT-VIABLE**.",
         "",
     );
     writeFileSync(join(TRIALS_DIR, "REPORT.md"), lines.join("\n"));

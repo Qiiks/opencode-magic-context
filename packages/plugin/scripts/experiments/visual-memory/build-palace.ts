@@ -14,9 +14,9 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SOURCE_PATH = process.env.PALACE_SOURCE_PATH ?? "/tmp/visual-memory/trimmed-memories-source.txt";
-const OUTPUT_DIR = process.env.PALACE_OUTPUT_DIR ?? "/tmp/visual-memory";
-const MAX_PALACE_CHARS = 70_000;
 const REVIEW_RENDER = Boolean(process.env.PALACE_RENDER_DESPITE_VALIDATOR);
+const OUTPUT_DIR = process.env.PALACE_OUTPUT_DIR ?? "/tmp/visual-memory";
+const MAX_PALACE_CHARS = 27_000;
 const JETBRAINS_VARIANT = process.env.PALACE_RENDER_FONT === "jetbrains-mono-10";
 const RENDER_FONT = JETBRAINS_VARIANT ? "jetbrains-mono-10" : "spleen-5x8";
 const RENDER_STYLE = { aa: true, font: RENDER_FONT } as const;
@@ -80,6 +80,11 @@ type CoverageRoom = {
 };
 type Coverage = {
     sourceMemoryCount: number;
+    renderedIds: number[];
+    droppedByTrimIds: number[];
+    droppedBySkipIds: number[];
+    renderedMemoryCount: number;
+    droppedMemoryCount: number;
     entryCount: number;
     mergeCount: number;
     representedMemoryCount: number;
@@ -149,18 +154,6 @@ function sourceIds(source: string): number[] {
 
 function ratio(numerator: number, denominator: number): number {
     return Number((numerator / denominator).toFixed(2));
-}
-
-function assertOrWarnReview(assertion: () => void, message: string): void {
-    if (!REVIEW_RENDER) {
-        assertion();
-        return;
-    }
-    try {
-        assertion();
-    } catch {
-        console.warn(`[palace] ${message}; rendering review manifest anyway`);
-    }
 }
 
 function concat(parts: Uint8Array[]): Uint8Array {
@@ -510,43 +503,53 @@ const palace = readFileSync(PALACE_PATH, "utf8");
 const coverage = JSON.parse(readFileSync(COVERAGE_PATH, "utf8")) as Coverage;
 const source = readFileSync(SOURCE_PATH, "utf8");
 const ids = sourceIds(source);
-const coveredIds = Object.keys(coverage.memories).map(Number);
+const renderedIds = coverage.renderedIds;
+const droppedByTrimIds = coverage.droppedByTrimIds;
+const droppedBySkipIds = coverage.droppedBySkipIds;
 const palaceLines = palace.endsWith("\n") ? palace.slice(0, -1).split("\n") : palace.split("\n");
 
 assert.ok(ids.length > 0, "source must contain at least one memory");
 assert.equal(new Set(ids).size, ids.length, "source memory ids must be unique");
-assertOrWarnReview(
-    () =>
-        assert.deepEqual(
-            [...coveredIds].sort((a, b) => a - b),
-            [...ids].sort((a, b) => a - b),
-            "coverage sidecar must map every source memory id exactly once",
-        ),
-    "coverage sidecar does not map every source memory id exactly once",
+const uniqueRenderedIds = new Set(renderedIds);
+const uniqueTrimmedIds = new Set(droppedByTrimIds);
+const uniqueSkippedIds = new Set(droppedBySkipIds);
+assert.equal(uniqueRenderedIds.size, renderedIds.length, "rendered memory ids must be unique");
+assert.equal(uniqueTrimmedIds.size, droppedByTrimIds.length, "trimmed memory ids must be unique");
+assert.equal(uniqueSkippedIds.size, droppedBySkipIds.length, "skipped memory ids must be unique");
+assert.equal(
+    new Set([...renderedIds, ...droppedByTrimIds, ...droppedBySkipIds]).size,
+    ids.length,
+    "rendered and dropped ids must partition the source memories",
 );
-assertOrWarnReview(
-    () => assert.equal(coverage.sourceMemoryCount, ids.length),
-    "coverage source memory count does not match the source",
+assert.deepEqual(
+    [...new Set([...renderedIds, ...droppedByTrimIds, ...droppedBySkipIds])].sort((a, b) => a - b),
+    [...ids].sort((a, b) => a - b),
+    "rendered and dropped ids must match the source memories",
 );
-assertOrWarnReview(
-    () => assert.equal(coverage.entryCount + coverage.mergeCount, ids.length),
-    "coverage entry and merge counts do not match the source",
+assert.deepEqual(
+    [...Object.keys(coverage.memories).map(Number)].sort((a, b) => a - b),
+    [...renderedIds].sort((a, b) => a - b),
+    "coverage placements must contain rendered ids only",
 );
-assertOrWarnReview(
-    () => assert.equal(coverage.representedMemoryCount, ids.length),
-    "coverage represented memory count does not match the source",
-);
-assertOrWarnReview(
-    () => assert.equal(coverage.palaceChars, palace.length),
-    "coverage palace character count does not match palace text",
-);
-assertOrWarnReview(
-    () => assert.ok(palace.length <= MAX_PALACE_CHARS, `palace exceeds ${MAX_PALACE_CHARS} chars`),
-    `palace exceeds ${MAX_PALACE_CHARS} chars`,
-);
-assertOrWarnReview(
-    () => assert.ok(!/#\d+/.test(palace), "palace surface must not render memory ids"),
-    "palace surface renders memory ids",
+assert.equal(coverage.sourceMemoryCount, ids.length);
+assert.equal(coverage.renderedMemoryCount, renderedIds.length);
+assert.equal(coverage.droppedMemoryCount, droppedByTrimIds.length + droppedBySkipIds.length);
+assert.equal(coverage.entryCount + coverage.mergeCount, renderedIds.length);
+assert.equal(coverage.representedMemoryCount, coverage.renderedMemoryCount);
+assert.equal(coverage.palaceChars, palace.length);
+assert.ok(palace.length <= MAX_PALACE_CHARS, `palace exceeds ${MAX_PALACE_CHARS} chars`);
+if (/#\d+/.test(palace)) {
+    const message = "palace surface renders memory ids";
+    if (!REVIEW_RENDER) assert.fail(message);
+    console.warn(`[palace] ${message}; rendering review manifest anyway`);
+}
+assert.equal(coverage.layout.pages.length, 1, "palace must contain exactly one page");
+assert.equal(coverage.layout.pages[0]?.page, 1, "the fixed palace page must be page 1");
+assert.equal(coverage.layout.pageHeightPixels, PAGE_HEIGHT_PIXELS, "palace page height must be fixed");
+assert.equal(
+    coverage.layout.canvasHeightCells,
+    Math.floor(PAGE_HEIGHT_PIXELS / coverage.layout.bodyLinePitch),
+    "palace canvas height must be one fixed page",
 );
 assert.equal(palaceLines.length, coverage.layout.canvasHeightCells);
 const maxLineChars = Math.max(...palaceLines.map((line) => [...line].length));
@@ -649,19 +652,15 @@ const columnWidthPixels = coverage.layout.roomWidthChars * cellWidth;
 const contentWidthPixels = coverage.layout.pageWidthChars * cellWidth;
 const pageLeft = Math.floor((PAGE_WIDTH_PIXELS - contentWidthPixels) / 2);
 assert.ok(pageLeft >= 0, "palace content exceeds fixed page width");
-const pageCanvases = coverage.layout.pages.map((layoutPage, index) => {
-    const last = index === coverage.layout.pages.length - 1;
-    const usedHeight = layoutPage.heightPixels;
-    const height = last
-        ? Math.max(PATCH_SIZE, Math.ceil(usedHeight / PATCH_SIZE) * PATCH_SIZE)
-        : PAGE_HEIGHT_PIXELS;
-    assert.ok(height <= PAGE_HEIGHT_PIXELS, `page ${layoutPage.page} exceeds fixed geometry`);
+const pageCanvases = coverage.layout.pages.map((layoutPage) => {
+    assert.equal(layoutPage.heightPixels, PAGE_HEIGHT_PIXELS, "page height must be fixed");
+    assert.equal(layoutPage.heightCells, coverage.layout.canvasHeightCells, "page rows must be fixed");
     return {
         layout: layoutPage,
         image: {
-            pixels: new Uint8Array(PAGE_WIDTH_PIXELS * height * 3).fill(255),
+            pixels: new Uint8Array(PAGE_WIDTH_PIXELS * PAGE_HEIGHT_PIXELS * 3).fill(255),
             width: PAGE_WIDTH_PIXELS,
-            height,
+            height: PAGE_HEIGHT_PIXELS,
         } satisfies RgbImage,
         contentPixels: 0,
     };
@@ -844,7 +843,7 @@ const report = {
     },
     composition: {
         approach:
-            "category-band masonry composed from grayscale room renders into deterministic RGB; nearest-neighbor 2x title overlays",
+            "importance-ordered single-page room knapsack composed from grayscale renders into deterministic RGB; nearest-neighbor 2x title overlays",
         font: RENDER_FONT,
         columns: coverage.layout.columns,
         columnWidthChars: coverage.layout.roomWidthChars,
@@ -875,6 +874,11 @@ const report = {
     },
     coverage: {
         sourceMemories: coverage.sourceMemoryCount,
+        renderedMemories: coverage.renderedMemoryCount,
+        droppedMemories: coverage.droppedMemoryCount,
+        renderedIds: coverage.renderedIds,
+        droppedByTrimIds: coverage.droppedByTrimIds,
+        droppedBySkipIds: coverage.droppedBySkipIds,
         entries: coverage.entryCount,
         merges: coverage.mergeCount,
         representedMemories: coverage.representedMemoryCount,

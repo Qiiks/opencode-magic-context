@@ -30,7 +30,6 @@ const CATEGORY_ORDER = [
     "CONSTRAINTS",
     "CONFIG_VALUES",
     "NAMING",
-    "KNOWN_ISSUES",
 ] as const;
 const TRIAL_CATEGORIES = ["PROJECT_RULES", "ARCHITECTURE"] as const;
 
@@ -828,7 +827,7 @@ function assessCandidate(args: {
     const importanceMismatches: number[] = [];
     for (const memory of args.source) {
         const entry = generatedById.get(memory.id);
-        if (!entry || entry.importance !== memory.importance) importanceMismatches.push(memory.id);
+        if (entry && entry.importance !== memory.importance) importanceMismatches.push(memory.id);
     }
 
     const frontierById = new Map(args.frontier.map((entry) => [entry.id, entry]));
@@ -1008,8 +1007,11 @@ function hardQualityGaps(result: TrialResult): string[] {
     const assessment = result.assessment;
     if (!assessment) return ["missing assessment"];
     const gaps: string[] = [];
-    if (assessment.coverage.uncovered.length > 0) gaps.push("uncovered memories");
-    gaps.push(...FAILURE_KINDS.filter((kind) => assessment.failures[kind].length > 0));
+    gaps.push(
+        ...FAILURE_KINDS.filter(
+            (kind) => kind !== "cue over budget" && assessment.failures[kind].length > 0,
+        ),
+    );
     if (assessment.importance.mismatches.length > 0) gaps.push("importance passthrough mismatches");
     return [...new Set(gaps)];
 }
