@@ -1159,7 +1159,17 @@
       "properties": {
         "provider": {
           "default": "local",
-          "description": "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'off' disables embeddings.",
+          "description": "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings.",
+          "type": "string",
+          "enum": [
+            "local",
+            "openai-compatible",
+            "off",
+            "synapse"
+          ]
+        },
+        "fallback_provider": {
+          "description": "Fallback provider for the Synapse lane. Required when provider is 'synapse'; local, openai-compatible, and off are valid.",
           "type": "string",
           "enum": [
             "local",
@@ -1196,6 +1206,34 @@
           "type": "integer",
           "exclusiveMinimum": 0,
           "maximum": 9007199254740991
+        }
+      }
+    },
+    "subc": {
+      "description": "User-only Synapse daemon connection settings.",
+      "type": "object",
+      "properties": {
+        "connection_file": {
+          "description": "Path to the owner-only subc connection file.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "connection_file"
+      ]
+    },
+    "shadow_embedding": {
+      "default": {
+        "enabled": false
+      },
+      "description": "Developer-only Synapse shadow embedding lane.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Developer-only Synapse shadow embedding lane switch.",
+          "type": "boolean"
         }
       }
     },

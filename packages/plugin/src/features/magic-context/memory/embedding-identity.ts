@@ -1,6 +1,7 @@
 import type { EmbeddingConfig } from "../../../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-context";
 import { computeNormalizedHash } from "./normalize-hash";
+import { getSynapseLaneIdentity } from "./embedding-synapse";
 
 function normalizeEndpoint(endpoint?: string): string {
     return endpoint?.trim().replace(/\/+$/, "") ?? "";
@@ -17,6 +18,19 @@ function normalizeEndpoint(endpoint?: string): string {
 export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
     if (config.provider === "off") {
         return "embedding-provider:off";
+    }
+
+    if (config.provider === "synapse") {
+        const resolved = config as EmbeddingConfig & {
+            model?: string;
+            synapse_fingerprint?: string;
+        };
+        if (!resolved.model || !resolved.synapse_fingerprint) return "synapse:v1:pending";
+        return getSynapseLaneIdentity(resolved.model, resolved.synapse_fingerprint);
+    }
+
+    if (config.provider !== "local" && config.provider !== "openai-compatible") {
+        throw new Error("Unknown embedding provider");
     }
 
     const truncate = config.provider === "openai-compatible" ? config.truncate?.trim() : undefined;

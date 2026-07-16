@@ -12,7 +12,12 @@
 
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
-import { embedBatchForProject, getProjectEmbeddingSnapshot } from "../memory/embedding";
+import {
+    contentSha256,
+    embedItemsForProject,
+    enqueueShadowEmbeddingItems,
+    getProjectEmbeddingSnapshot,
+} from "../memory/embedding";
 import { readGitCommitsResult } from "./git-log-reader";
 import {
     countEmbeddedCommits,
@@ -170,20 +175,34 @@ export async function embedUnembeddedCommits(db: Database, projectPath: string):
 
             let embeddedThisBatch = 0;
             try {
-                const result = await embedBatchForProject(
+                const result = await embedItemsForProject(
                     projectPath,
-                    rows.map((row) => row.message),
+                    rows.map((row) => ({
+                        id: `commit:${row.sha}`,
+                        text: row.message,
+                        contentSha256: contentSha256(row.message),
+                    })),
+                    undefined,
+                    db,
+                    projectPath,
                 );
                 if (!result) break;
 
                 db.transaction(() => {
-                    for (const [index, row] of rows.entries()) {
-                        const embedding = result.vectors[index];
+                    for (const row of rows) {
+                        const embedding = result.vectors.get(`commit:${row.sha}`);
                         if (!embedding) continue;
                         saveCommitEmbedding(db, row.sha, embedding, result.modelId);
                         embeddedThisBatch += 1;
                     }
                 })();
+                enqueueShadowEmbeddingItems(
+                    projectPath,
+                    "commit",
+                    rows
+                        .filter((row) => result.vectors.has(`commit:${row.sha}`))
+                        .map((row) => row.sha),
+                );
             } catch (error) {
                 log(
                     `[git-commits] embed batch failed for ${projectPath}: ${error instanceof Error ? error.message : String(error)}`,

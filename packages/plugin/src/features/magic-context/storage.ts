@@ -192,6 +192,16 @@ export {
 } from "./storage-meta";
 export { bumpSessionFactsVersion } from "./storage-meta-shared";
 export {
+    listEmbeddingMeasurements,
+    normalizedQueryHash,
+    recordEmbeddingMeasurement,
+    type EmbeddingMeasurementInput,
+    type EmbeddingMeasurementRow,
+    beginSynapseBatchLedger,
+    finishSynapseBatchLedger,
+    type SynapseBatchLedgerInput,
+} from "./storage-embedding-measurements";
+export {
     addNote,
     deleteNote,
     dismissNote,

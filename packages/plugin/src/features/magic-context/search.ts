@@ -20,6 +20,7 @@ import {
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
+import { recordShadowMeasurement } from "./search-measurement";
 import { getNotes, type Note } from "./storage-notes";
 import { getActivePrimers, type Primer } from "./storage-primers";
 import {
@@ -62,13 +63,23 @@ const messageSearchStatementsWithCutoff = new WeakMap<Database, PreparedStatemen
 
 export type SearchSource = "memory" | "message" | "git_commit" | "primer" | "note";
 
+export interface CapturedQueryEmbedding {
+    vector: Float32Array;
+    modelId: string;
+    chunkModelId: string;
+    generation: number;
+}
+
 export interface UnifiedSearchOptions {
     limit?: number;
     memoryEnabled?: boolean;
     embeddingEnabled?: boolean;
     /** Deprecated: message search no longer reads raw messages on the hot path. */
     readMessages?: (sessionId: string) => unknown[];
-    embedQuery?: (text: string, signal?: AbortSignal) => Promise<Float32Array | null>;
+    embedQuery?: (
+        text: string,
+        signal?: AbortSignal,
+    ) => Promise<CapturedQueryEmbedding | Float32Array | null>;
     isEmbeddingRuntimeEnabled?: () => boolean;
     /** Only return message-history hits with ordinal ≤ this value (e.g. last compartment end). -1 or omit to search all. */
     maxMessageOrdinal?: number;
@@ -106,6 +117,10 @@ export interface UnifiedSearchOptions {
      *  in; the auto-search hot path stays single-probe to protect its latency
      *  budget. NL queries with no extractable probes are unaffected either way. */
     explicitSearch?: boolean;
+    /** Disables production search metrics while running an offline shadow quality comparison. */
+    measurementDisabled?: boolean;
+    embeddingModelIdOverride?: string;
+    chunkModelIdOverride?: string;
 }
 
 export interface MemorySearchResult {
@@ -1381,6 +1396,7 @@ export async function unifiedSearch(
     options: UnifiedSearchOptions = {},
 ): Promise<UnifiedSearchResult[]> {
     const trimmedQuery = query.trim();
+    const measurementStartedAt = Date.now();
     if (trimmedQuery.length === 0) {
         return [];
     }
@@ -1423,14 +1439,15 @@ export async function unifiedSearch(
         embeddingEnabled &&
         isEmbeddingRuntimeEnabled();
 
-    const queryEmbeddingPromise: Promise<Float32Array | null> = needsEmbedding
-        ? embedQuery(trimmedQuery, options.signal).catch((error) => {
-              log(
-                  `[search] query embedding failed: ${error instanceof Error ? error.message : String(error)}`,
-              );
-              return null;
-          })
-        : Promise.resolve(null);
+    const queryEmbeddingPromise: Promise<CapturedQueryEmbedding | Float32Array | null> =
+        needsEmbedding
+            ? embedQuery(trimmedQuery, options.signal).catch((error) => {
+                  log(
+                      `[search] query embedding failed: ${error instanceof Error ? error.message : String(error)}`,
+                  );
+                  return null;
+              })
+            : Promise.resolve(null);
 
     // Yield to the event loop so the embed fetch's request gets a chance
     // to be dispatched at the runtime level before we run any synchronous
@@ -1460,11 +1477,23 @@ export async function unifiedSearch(
 
     // Wait for the single embed call (if any) and then run the two
     // embedding-dependent searches in parallel using the same vector.
-    const queryEmbedding = await queryEmbeddingPromise;
-    const workspace = resolveSearchWorkspaceContext(db, projectPath);
+    const capturedQuery = await queryEmbeddingPromise;
     const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
-    const embeddingModelId = embeddingSnapshot?.modelId;
-    const chunkModelId = embeddingSnapshot?.chunkModelId;
+    const queryContract =
+        capturedQuery instanceof Float32Array || capturedQuery === null ? null : capturedQuery;
+    const generationIsCurrent =
+        queryContract === null ||
+        (embeddingSnapshot !== null && embeddingSnapshot.generation === queryContract.generation);
+    const queryEmbedding = generationIsCurrent
+        ? (queryContract?.vector ?? (capturedQuery instanceof Float32Array ? capturedQuery : null))
+        : null;
+    const workspace = resolveSearchWorkspaceContext(db, projectPath);
+    const embeddingModelId =
+        queryContract?.modelId ?? options.embeddingModelIdOverride ?? embeddingSnapshot?.modelId;
+    const chunkModelId =
+        queryContract?.chunkModelId ??
+        options.chunkModelIdOverride ??
+        embeddingSnapshot?.chunkModelId;
     const compartmentResults = runCompartmentChunks
         ? searchCompartmentChunks({
               db,
@@ -1546,6 +1575,20 @@ export async function unifiedSearch(
     ]
         .sort(compareUnifiedResults)
         .slice(0, limit);
+
+    if (!options.measurementDisabled) {
+        void recordShadowMeasurement({
+            db,
+            sessionId,
+            projectPath,
+            query: trimmedQuery,
+            options,
+            primaryResults: results,
+            primaryQuery: queryContract,
+            primaryLatencyMs: Date.now() - measurementStartedAt,
+            search: unifiedSearch,
+        });
+    }
 
     // Only count retrievals for explicit agent-driven searches. Plugin-internal
     // automatic surfacing (auto-search hints) should not inflate retrieval_count

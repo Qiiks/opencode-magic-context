@@ -108,7 +108,8 @@ Durable project memory, semantic search, and recall features.
 | `memory.git_commit_indexing.since_days` | number (7–3650) | `365` | Days of HEAD history to index (min: 7, max: 3650, default: 365) |
 | `memory.git_commit_indexing.max_commits` | number (100–20000) | `2000` | Max commits kept per project; oldest evicted (min: 100, max: 20000, default: 2000) |
 | `embedding` | object | — | Embedding provider configuration |
-| `embedding.provider` | `"local"` \\| `"openai-compatible"` \\| `"off"` | `"local"` | Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'off' disables embeddings. |
+| `embedding.provider` | `"local"` \\| `"openai-compatible"` \\| `"off"` \\| `"synapse"` | `"local"` | Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings. |
+| `embedding.fallback_provider` | `"local"` \\| `"openai-compatible"` \\| `"off"` | — | Fallback provider for the Synapse lane. Required when provider is 'synapse'; local, openai-compatible, and off are valid. |
 | `embedding.model` | string | — | Embedding model name. Required for openai-compatible, ignored for local. |
 | `embedding.endpoint` | string | — | API endpoint URL. Required when provider is openai-compatible. |
 | `embedding.api_key` | string | — | API key for remote embedding provider (optional) |
@@ -249,4 +250,5 @@ Behavior tuning most installs never need to touch.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `toast_duration_ms` | number (0–60000) | `5000` | TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000) |
+| `subc.connection_file` | string | — | Path to the owner-only subc connection file. |
 | `smart_drops` | boolean | `false` | Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 5), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart. |

@@ -10,7 +10,9 @@ import {
     type SaveCompartmentChunkEmbeddingInput,
 } from "./compartment-chunk-embedding";
 import {
-    embedBatchForProject,
+    contentSha256,
+    embedItemsForProject,
+    enqueueShadowEmbeddingItems,
     getProjectChunkEmbeddingModelId,
     getProjectEmbeddingMaxInputTokens,
 } from "./project-embedding-registry";
@@ -95,9 +97,16 @@ export async function embedAndStoreCompartmentChunks(
                 continue;
             }
 
-            const result = await embedBatchForProject(
+            const result = await embedItemsForProject(
                 projectPath,
-                windows.map((window) => window.text),
+                windows.map((window) => ({
+                    id: `chunk:${compartment.id}:${window.windowIndex}`,
+                    text: window.text,
+                    contentSha256: contentSha256(window.text),
+                })),
+                undefined,
+                db,
+                sessionId,
             );
             if (!result) continue;
             if (
@@ -113,8 +122,8 @@ export async function embedAndStoreCompartmentChunks(
             }
 
             const rows: SaveCompartmentChunkEmbeddingInput[] = [];
-            for (const [index, window] of windows.entries()) {
-                const vector = result.vectors[index];
+            for (const window of windows) {
+                const vector = result.vectors.get(`chunk:${compartment.id}:${window.windowIndex}`);
                 if (!vector) continue;
                 rows.push({
                     compartmentId: compartment.id,
@@ -127,6 +136,7 @@ export async function embedAndStoreCompartmentChunks(
             }
             if (rows.length === windows.length) {
                 replaceCompartmentChunkEmbeddings(db, rows);
+                enqueueShadowEmbeddingItems(projectPath, "chunk", [String(compartment.id)]);
             }
         } catch (error) {
             sessionLog(

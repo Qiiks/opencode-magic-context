@@ -44,6 +44,10 @@ export const EMBEDDING_AFFECTING_KEYS = new Set([
     // register as trusted and could drive a bogus chunk identity / GC.
     "embedding.max_input_tokens",
     "embedding.query_input_type",
+    "embedding.fallback_provider",
+    "subc",
+    "subc.connection_file",
+    "shadow_embedding",
 ]);
 
 // A `{env:VAR}` / `{file:path}` token left LITERAL in the resolved config.
@@ -63,7 +67,13 @@ function embeddingConfigHasLiteralTokens(embedding: EmbeddingConfig | undefined)
     return false;
 }
 
-export const EMBEDDING_AFFECTING_TOP_LEVEL_KEYS = new Set(["embedding", "memory", "experimental"]);
+export const EMBEDDING_AFFECTING_TOP_LEVEL_KEYS = new Set([
+    "embedding",
+    "memory",
+    "experimental",
+    "subc",
+    "shadow_embedding",
+]);
 
 const EMBEDDING_WARNING_TERMS = [
     "api_key",
@@ -73,6 +83,8 @@ const EMBEDDING_WARNING_TERMS = [
     "embedding",
     "input_type",
     "truncate",
+    "subc",
+    "shadow_embedding",
 ];
 const loggedFailureSignatures = new Map<string, Set<string>>();
 
