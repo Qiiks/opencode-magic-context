@@ -1468,6 +1468,7 @@ mod tests {
             usage: None,
             provider_error: None,
             prev_response_completed_at_ms: None,
+            request_observed_at_ms: None,
             declared_trim: None,
         }
     }

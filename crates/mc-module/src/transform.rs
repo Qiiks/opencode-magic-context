@@ -221,6 +221,12 @@ pub struct TransformRequest {
     /// conversation key. It is request evidence only and never enters render identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_response_completed_at_ms: Option<u64>,
+    /// Proxy-observed wall-clock time at request INGRESS, before transform queueing.
+    /// The G2 gap pairs this with `prev_response_completed_at_ms`: module-side now_ms
+    /// runs after queue/blocking-arm latency (up to minutes under the emergency arms)
+    /// and would inflate every gap by that delay. Request evidence only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_observed_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
 }
@@ -256,6 +262,8 @@ struct TransformRequestWire {
     #[serde(default)]
     prev_response_completed_at_ms: Option<u64>,
     #[serde(default)]
+    request_observed_at_ms: Option<u64>,
+    #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
 }
 
@@ -283,6 +291,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             usage: wire.usage,
             provider_error: wire.provider_error,
             prev_response_completed_at_ms: wire.prev_response_completed_at_ms,
+            request_observed_at_ms: wire.request_observed_at_ms,
             declared_trim: wire.declared_trim,
         })
     }
@@ -2938,11 +2947,20 @@ fn compute_active_overlay_decisions(
         }
 
         let marker_text = if authored_tail.is_some_and(|tail| tail.mid == message.mid) {
+            // The gap pairs the proxy's INGRESS observation with its completion
+            // observation. Module-side now_ms would add queue plus blocking-arm
+            // latency to every gap, so a missing or invalid ingress time freezes
+            // the no-marker decision rather than guessing from a later clock.
             let observed_now = u64::try_from(ctx.now_ms).unwrap_or(0);
-            req.prev_response_completed_at_ms
-                .filter(|completed| *completed > 0 && *completed < observed_now)
-                .and_then(|completed| {
-                    i64::try_from(observed_now - completed)
+            req.request_observed_at_ms
+                .filter(|observed| *observed > 0 && *observed <= observed_now)
+                .and_then(|observed| {
+                    req.prev_response_completed_at_ms
+                        .filter(|completed| *completed > 0 && *completed < observed)
+                        .map(|completed| (observed, completed))
+                })
+                .and_then(|(observed, completed)| {
+                    i64::try_from(observed - completed)
                         .ok()
                         .and_then(temporal_gap_prefix)
                 })
@@ -4364,6 +4382,7 @@ mod tests {
             usage: None,
             provider_error: None,
             prev_response_completed_at_ms: None,
+            request_observed_at_ms: None,
             declared_trim: None,
         }
     }
@@ -7709,8 +7728,16 @@ mod tests {
             complete.push(wire_item("user", "m3", 3, &["question"]));
             let mut active = active_cc_req("temporal", "cfg0", complete.clone());
             active.prev_response_completed_at_ms = Some(10_000);
-            let first =
-                transform(&s, &active, &pctx("git:proj", "/nonexistent-docs", 730_000)).unwrap();
+            // Ingress-time basis: the module clock runs 2h LATER than the proxy's
+            // ingress observation (queue plus blocking-arm delay). A now-basis
+            // implementation would render +2h here instead of +12m.
+            active.request_observed_at_ms = Some(730_000);
+            let first = transform(
+                &s,
+                &active,
+                &pctx("git:proj", "/nonexistent-docs", 7_930_000),
+            )
+            .unwrap();
             assert_eq!(tail_bytes(&first, "m3"), "<!-- +12m -->\n§3§ question");
             active.prev_response_completed_at_ms = Some(800_000);
             let replay = transform(

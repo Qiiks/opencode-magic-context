@@ -4995,6 +4995,7 @@ impl McHandler {
             usage,
             provider_error: parsed.pass_inputs.provider_error.clone(),
             prev_response_completed_at_ms: None,
+            request_observed_at_ms: None,
             declared_trim: parsed.declared_trim.clone(),
         };
         let shadow_project = shadow_project_path(&binding.session);
