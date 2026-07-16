@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
     AdmissionClass,
@@ -69,6 +69,8 @@ const SHADOW_ORDINAL_PAGE_SIZE = 500;
 const SHADOW_SEED_YIELD_EVERY_COMPARTMENTS = 10;
 const SHADOW_SEED_BUDGET_MS = 30_000;
 const SHADOW_SEED_BATCH_MAX_BYTES = 512 * 1024;
+const SHADOW_TRANSFORM_PAGE_MAX_BYTES = SHADOW_SEED_BATCH_MAX_BYTES;
+const SHADOW_RESET_REASON_RING_SIZE = 8;
 const MAX_FACADE_FRAME_BYTES = 1024 * 1024;
 
 const declaredTrimBySession = new Map<string, { markerKey: string; trim: ShadowDeclaredTrim }>();
@@ -151,6 +153,7 @@ interface ShadowSenderCounters {
     resets_sent: number;
     transforms_sent: number;
     seed_budget_exceeded: number;
+    parked: number;
 }
 
 interface SessionQueueState {
@@ -174,6 +177,8 @@ interface SessionQueueState {
     reseedAwaitingSuccess: boolean;
     seedStartedAtMs: number | null;
     seedBudgetSpentMs: number;
+    resetReasons: string[];
+    parked: boolean;
     counters: ShadowSenderCounters;
 }
 
@@ -397,6 +402,7 @@ function emptyCounters(): ShadowSenderCounters {
         resets_sent: 0,
         transforms_sent: 0,
         seed_budget_exceeded: 0,
+        parked: 0,
     };
 }
 
@@ -422,6 +428,8 @@ function createSessionQueueState(): SessionQueueState {
         reseedAwaitingSuccess: false,
         seedStartedAtMs: null,
         seedBudgetSpentMs: 0,
+        resetReasons: [],
+        parked: false,
         counters: emptyCounters(),
     };
 }
@@ -436,6 +444,24 @@ function yieldToEventLoop(): Promise<void> {
 
 function stableHash(value: string): string {
     return createHmac("sha256", "magic-context-shadow-watermark").update(value).digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+    if (isRecord(value)) {
+        return `{${Object.keys(value)
+            .sort()
+            .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+            .join(",")}}`;
+    }
+    const encoded = JSON.stringify(value);
+    return encoded === undefined ? "null" : encoded;
+}
+
+function shadowTransformPageDigest(pageArrays: Record<string, unknown>): string {
+    // Hash the JSON wire values, not in-memory undefined properties that JSON.stringify drops.
+    const wireArrays = JSON.parse(JSON.stringify(pageArrays)) as Record<string, unknown>;
+    return createHash("sha256").update(canonicalJson(wireArrays)).digest("hex");
 }
 
 function getMessageId(message: MessageLike): string | null {
@@ -635,17 +661,19 @@ export async function resolveOrdinalsForShadow(args: {
         return { ok: false, reason: "mismatch" };
     }
 
-    for (const entry of newEntries) {
-        if (!entry.contributesOrdinal) continue;
-        canonicalCount += 1;
-        if (!entry.hasValidInfo) continue;
-        const prior = memo.get(entry.id);
-        if (prior !== undefined && prior !== canonicalCount) {
-            memo.clear();
-            return { ok: false, reason: "mismatch", messageId: entry.id };
+        for (const entry of newEntries) {
+            if (!entry.contributesOrdinal) continue;
+            canonicalCount += 1;
+            // A message can receive a temporary position before its database row is visible.
+            // When the row appears, compare its ID with the counted position even if metadata
+            // is incomplete, so a later read cannot preserve an incorrect temporary position.
+            const prior = memo.get(entry.id);
+            if (prior !== undefined && prior !== canonicalCount) {
+                memo.clear();
+                return { ok: false, reason: "mismatch", messageId: entry.id };
+            }
+            memo.set(entry.id, canonicalCount);
         }
-        memo.set(entry.id, canonicalCount);
-    }
     anchor = pageAnchor;
     storedCount = currentStoredCount;
 
@@ -981,6 +1009,16 @@ function serializeCompartment(args: {
     };
 }
 
+function seedBoundaryFromSerializedCompartments(compartments: unknown[]): string | null {
+    const serialized = compartments.filter(isRecord).filter((compartment) =>
+        typeof compartment.sequence === "number" &&
+        typeof compartment.end_message_id === "string",
+    );
+    serialized.sort((left, right) => (left.sequence as number) - (right.sequence as number));
+    const tail = serialized.at(-1);
+    return typeof tail?.end_message_id === "string" ? tail.end_message_id : null;
+}
+
 async function buildStateSyncPayload(args: {
     state: SessionQueueState;
     pass: Pick<ShadowTransformPass, "db" | "sessionId" | "projectPath" | "passInputs"> & {
@@ -1128,9 +1166,12 @@ async function buildStateSyncPayload(args: {
     const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
     const shadowGeneration = args.state.shadowGeneration;
     const expectedShadowSeq = args.state.lastAckedSeq;
+    // Use the message boundary ID derived from the ranges in this payload, not a fresh storage
+    // read. Validation checks the final serialized range, so a concurrent marker read could see
+    // a newer range and pair this boundary ID with an older payload, causing a mismatch.
     const seedBoundaryId =
         args.state.seedPassPending && compartments.length > 0
-            ? (args.pass.declaredTrim?.flat_boundary_id ?? null)
+            ? seedBoundaryFromSerializedCompartments(compartments)
             : null;
     if (args.force) {
         const wireBatches = buildPagedSeedPayloads({
@@ -1285,6 +1326,131 @@ function buildShadowTransformBody(args: { pass: PreparedShadowPass; state: Sessi
     };
 }
 
+const SHADOW_TRANSFORM_ARRAY_FIELDS = [
+    "input",
+    "messages",
+    "ts_output",
+    "ts_ck_messages",
+    "normalizations",
+] as const;
+
+function buildPagedTransformPayloads(body: Record<string, unknown>): Record<string, unknown>[] {
+    if (Buffer.byteLength(JSON.stringify(body)) <= SHADOW_TRANSFORM_PAGE_MAX_BYTES) return [body];
+
+    const arrayFields = SHADOW_TRANSFORM_ARRAY_FIELDS.filter((field) =>
+        Array.isArray(body[field]),
+    );
+    if (arrayFields.length === 0) {
+        throw new Error("shadow transform body has no pageable message arrays");
+    }
+    const scalarFields = { ...body };
+    for (const field of arrayFields) delete scalarFields[field];
+    const transformPageId = randomUUID();
+    const items = arrayFields.flatMap((field) =>
+        (body[field] as unknown[]).map((value) => ({ field, value })),
+    );
+    const emptyArrays = (): Record<string, unknown[]> =>
+        Object.fromEntries(arrayFields.map((field) => [field, []]));
+    const makePage = (args: {
+        index: number;
+        total: number;
+        complete: boolean;
+        arrays: Record<string, unknown[]>;
+    }): Record<string, unknown> => {
+        const pageArrays = Object.fromEntries(
+            arrayFields.map((field) => [field, args.arrays[field] ?? []]),
+        );
+        const page: Record<string, unknown> = {
+            method: body.method,
+            session_id: body.session_id,
+            shadow_generation: body.shadow_generation,
+            transform_page_id: transformPageId,
+            transform_generation: body.shadow_generation,
+            transform_page_index: args.index,
+            transform_page_total: args.total,
+            transform_page_complete: args.complete,
+            transform_page_digest: shadowTransformPageDigest(pageArrays),
+            ...pageArrays,
+        };
+        if (args.complete) Object.assign(page, scalarFields);
+        return page;
+    };
+
+    let assumedTotal = 1;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        const pages: Record<string, unknown>[] = [];
+        let current = emptyArrays();
+        for (const item of items) {
+            const candidate = { ...current, [item.field]: [...current[item.field], item.value] };
+            const candidatePage = makePage({
+                index: pages.length,
+                total: assumedTotal,
+                complete: false,
+                arrays: candidate,
+            });
+            if (Buffer.byteLength(JSON.stringify(candidatePage)) <= SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
+                current = candidate;
+                continue;
+            }
+            if (Object.values(current).every((values) => values.length === 0)) {
+                throw new Error("shadow transform item exceeds the 512 KiB page limit");
+            }
+            pages.push(
+                makePage({
+                    index: pages.length,
+                    total: assumedTotal,
+                    complete: false,
+                    arrays: current,
+                }),
+            );
+            current = emptyArrays();
+            current[item.field].push(item.value);
+            const itemPage = makePage({
+                index: pages.length,
+                total: assumedTotal,
+                complete: false,
+                arrays: current,
+            });
+            if (Buffer.byteLength(JSON.stringify(itemPage)) > SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
+                throw new Error("shadow transform item exceeds the 512 KiB page limit");
+            }
+        }
+
+        let finalPage = makePage({
+            index: pages.length,
+            total: assumedTotal,
+            complete: true,
+            arrays: current,
+        });
+        if (Buffer.byteLength(JSON.stringify(finalPage)) > SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
+            if (Object.values(current).every((values) => values.length === 0)) {
+                throw new Error("shadow transform scalar tail exceeds the 512 KiB page limit");
+            }
+            pages.push(
+                makePage({
+                    index: pages.length,
+                    total: assumedTotal,
+                    complete: false,
+                    arrays: current,
+                }),
+            );
+            finalPage = makePage({
+                index: pages.length,
+                total: assumedTotal,
+                complete: true,
+                arrays: emptyArrays(),
+            });
+            if (Buffer.byteLength(JSON.stringify(finalPage)) > SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
+                throw new Error("shadow transform scalar tail exceeds the 512 KiB page limit");
+            }
+        }
+        pages.push(finalPage);
+        if (pages.length === assumedTotal) return pages;
+        assumedTotal = pages.length;
+    }
+    throw new Error("shadow transform page count did not stabilize");
+}
+
 export function createShadowSender(
     options: {
         transport?: ShadowTransport;
@@ -1318,6 +1484,38 @@ export function createShadowSender(
             sessions.set(sessionId, state);
         }
         return state;
+    };
+
+    const isTransientResetReason = (reason: string): boolean =>
+        reason === "route_reopen" ||
+        reason === "transport_disconnect" ||
+        reason === "daemon_restart" ||
+        reason.includes("connection");
+
+    const recordResetReason = (
+        sessionId: string,
+        state: SessionQueueState,
+        reason: string,
+    ): boolean => {
+        if (state.parked) return false;
+        const previous = state.resetReasons.at(-1);
+        state.resetReasons.push(reason);
+        if (state.resetReasons.length > SHADOW_RESET_REASON_RING_SIZE) {
+            state.resetReasons.shift();
+        }
+        if (isTransientResetReason(reason) || previous !== reason) return true;
+        state.parked = true;
+        state.queue.length = 0;
+        state.seedStartedAtMs = null;
+        state.seedBudgetSpentMs = 0;
+        state.reseedAwaitingSuccess = false;
+        state.blockedUntilReset = false;
+        state.requireResetReason = null;
+        state.seedPassPending = false;
+        state.counters.parked += 1;
+        transport.closeSession?.(sessionId);
+        sessionLog(sessionId, `shadow: parked (repeated ${reason})`);
+        return false;
     };
 
     const remainingSeedBudgetMs = (state: SessionQueueState): number => {
@@ -1369,17 +1567,17 @@ export function createShadowSender(
 
     const schedule = (sessionId: string): void => {
         const state = getState(sessionId);
-        if (state.running) return;
+        if (state.running || state.parked) return;
         state.running = true;
         void runQueue(sessionId, state).finally(() => {
             state.running = false;
-            if (!state.skipped && state.queue.length > 0) schedule(sessionId);
+            if (!state.skipped && !state.parked && state.queue.length > 0) schedule(sessionId);
         });
     };
 
     const pushWork = (sessionId: string, work: ShadowWorkItem): void => {
         const state = getState(sessionId);
-        if (state.skipped) return;
+        if (state.skipped || state.parked) return;
         let dropped = 0;
         if (work.kind === "pass") {
             state.counters.enqueued += 1;
@@ -1436,7 +1634,7 @@ export function createShadowSender(
     };
 
     const runQueue = async (sessionId: string, state: SessionQueueState): Promise<void> => {
-        while (!state.skipped && state.queue.length > 0) {
+        while (!state.skipped && !state.parked && state.queue.length > 0) {
             const item = state.queue.shift();
             if (!item) continue;
             if (item.kind === "reset") {
@@ -1492,6 +1690,7 @@ export function createShadowSender(
         reason: string;
         projectRoot?: string;
     }): Promise<void> => {
+        if (!recordResetReason(args.sessionId, args.state, args.reason)) return;
         args.state.seedBudgetSpentMs = 0;
         args.state.seedStartedAtMs = seedClock();
         const projectRoot = args.projectRoot ?? process.cwd();
@@ -1553,7 +1752,7 @@ export function createShadowSender(
         state: SessionQueueState,
         pass: ShadowTransformPass,
     ): Promise<void> => {
-        if (state.skipped) return;
+        if (state.skipped || state.parked) return;
         if (state.seedPassPending && state.seedStartedAtMs === null) {
             state.seedStartedAtMs = seedClock();
         }
@@ -1823,14 +2022,18 @@ export function createShadowSender(
 
         const transformBody = toFlatWireBody(
             buildShadowTransformBody({ pass: preparedPass, state }),
-        );
-        const response = await callTransport(state, {
-            sessionId: pass.sessionId,
-            projectRoot: pass.projectRoot,
-            method: "shadow_transform",
-            body: transformBody,
-        });
-        if (state.skipped) return;
+        ) as Record<string, unknown>;
+        const transformPages = buildPagedTransformPayloads(transformBody);
+        let response: unknown;
+        for (const page of transformPages) {
+            response = await callTransport(state, {
+                sessionId: pass.sessionId,
+                projectRoot: pass.projectRoot,
+                method: "shadow_transform",
+                body: page,
+            });
+        }
+        if (state.skipped || state.parked) return;
         const ack = extractAckValue(response);
         state.seedPassPending = false;
         state.counters.transforms_sent += 1;
@@ -1874,6 +2077,7 @@ export function createShadowSender(
         resetSession(sessionId: string, reason: string): void {
             if (subagentSessions.has(sessionId)) return;
             const state = getState(sessionId);
+            if (state.parked) return;
             state.queue.length = 0;
             state.requireResetReason = reason;
             state.blockedUntilReset = true;
@@ -2054,10 +2258,12 @@ class SubcShadowTransport implements ShadowTransport {
 export const __shadowSenderTest = {
     MAX_FACADE_FRAME_BYTES,
     SHADOW_SEED_BATCH_MAX_BYTES,
+    SHADOW_TRANSFORM_PAGE_MAX_BYTES,
     SubcShadowTransport,
     buildPagedSeedPayloads,
     buildShadowResetBody,
     buildShadowTransformBody,
+    buildPagedTransformPayloads,
     buildStateSyncPayload,
     flatWireBodyBytes,
     createSessionQueueState,
