@@ -1667,6 +1667,39 @@ pub struct LoadedState {
     pub row_version: Option<u64>,
 }
 
+/// Cache state and every byte-affecting transform overlay from one SQLite snapshot.
+#[derive(Debug, Clone)]
+pub struct TransformSnapshot {
+    pub loaded: LoadedState,
+    pub tags: Vec<McTagRow>,
+    pub temporal_marks: Vec<TemporalMarkRow>,
+    pub user_hints: Vec<UserHintRow>,
+    pub channel1_appends: Vec<Channel1AppendRow>,
+    pub overlay_frontier: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct WrapupCommandRecord<'a> {
+    pub session_id: &'a str,
+    pub command_id: &'a str,
+    pub disposition: &'a str,
+    pub rounds: usize,
+    pub summary: &'a str,
+    pub created_at: i64,
+    pub expected_row_version: Option<u64>,
+    pub expected_revert_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordWrapupCommandOutcome {
+    Recorded(WrapupCommandRow),
+    LegacyFailurePreserved(WrapupCommandRow),
+    Stale {
+        found_row_version: Option<u64>,
+        found_revert_epoch: u64,
+    },
+}
+
 /// Represents one mirrored project-memory row from shadow state-sync. It keeps the
 /// original memory id unchanged because that id is written into prompt data and
 /// referenced by mutation rows.
@@ -2208,6 +2241,140 @@ impl McStore {
         }
     }
 
+    /// Load cache state and all render overlays from one SQLite read transaction.
+    /// No-write passes use this snapshot as their read linearization point.
+    pub fn load_transform_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<TransformSnapshot, McStoreError> {
+        self.load_transform_snapshot_with_hook(session_id, || {})
+    }
+
+    fn load_transform_snapshot_with_hook(
+        &self,
+        session_id: &str,
+        after_state_read: impl FnOnce(),
+    ) -> Result<TransformSnapshot, McStoreError> {
+        let snapshot = self.inner.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let state = transaction
+                .query_row(
+                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? as u64,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let loaded = match state {
+                Some((row_version, core_json, meta_json)) => LoadedState {
+                    core: serde_json::from_str(&core_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    meta: serde_json::from_str(&meta_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    row_version: Some(row_version),
+                },
+                None => LoadedState {
+                    core: CoreState::default(),
+                    meta: ModuleMeta::default(),
+                    row_version: None,
+                },
+            };
+            after_state_read();
+
+            let tags = {
+                let mut statement = transaction.prepare(
+                    "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
+                     FROM mc_tags WHERE session_id = ?1 ORDER BY tag_number ASC",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id], tag_row_from_sql)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let temporal_marks = {
+                let mut statement = transaction.prepare(
+                    "SELECT block_id, marker_text, created_at FROM mc_temporal_marks
+                     WHERE session_id = ?1 ORDER BY created_at ASC, block_id ASC",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id], |row| {
+                        Ok(TemporalMarkRow {
+                            block_id: row.get(0)?,
+                            marker_text: row.get(1)?,
+                            created_at: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let user_hints = {
+                let mut statement = transaction.prepare(
+                    "SELECT block_id, hint_text, created_at FROM mc_user_hints
+                     WHERE session_id = ?1 ORDER BY created_at ASC, block_id ASC",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id], |row| {
+                        Ok(UserHintRow {
+                            block_id: row.get(0)?,
+                            hint_text: row.get(1)?,
+                            created_at: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let channel1_appends = {
+                let mut statement = transaction.prepare(
+                    "SELECT block_id, reminder_text, fired_at_ms FROM mc_channel1_appends
+                     WHERE session_id = ?1 ORDER BY fired_at_ms ASC, block_id ASC",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id], |row| {
+                        Ok(Channel1AppendRow {
+                            block_id: row.get(0)?,
+                            reminder_text: row.get(1)?,
+                            fired_at_ms: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let overlay_frontier = transaction
+                .query_row(
+                    "SELECT max_seen_ordinal FROM mc_overlay_frontiers WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .map(|ordinal| ordinal.max(0) as u64);
+            transaction.commit()?;
+            Ok(TransformSnapshot {
+                loaded,
+                tags,
+                temporal_marks,
+                user_hints,
+                channel1_appends,
+                overlay_frontier,
+            })
+        })?;
+        Ok(snapshot)
+    }
+
     /// Load all durable fields used by session.status from one SQLite read transaction.
     pub fn load_session_status_snapshot(
         &self,
@@ -2498,7 +2665,7 @@ impl McStore {
     /// Mint tag rows for newly-observed block ids and return every requested row.
     /// Existing rows keep their original numbers; fresh rows consume the next numbers
     /// in the caller's order inside one transaction.
-    pub fn mint_or_get_tags(
+    pub(crate) fn mint_or_get_tags(
         &self,
         session_id: &str,
         inputs: &[TagMintInput],
@@ -2592,7 +2759,7 @@ impl McStore {
     }
 
     /// Insert one Channel-1 append row if this block has not already received one.
-    pub fn append_channel1_nudge(
+    pub(crate) fn append_channel1_nudge(
         &self,
         session_id: &str,
         block_id: &str,
@@ -2655,7 +2822,8 @@ impl McStore {
     /// Every candidate is compared with the watermark from before this transaction. A
     /// racing hint writer returns the already-stored bytes so both callers render the
     /// same canonical decision.
-    pub fn apply_active_overlay_decisions(
+    #[cfg(test)]
+    pub(crate) fn apply_active_overlay_decisions(
         &self,
         session_id: &str,
         max_seen_ordinal: u64,
@@ -2764,7 +2932,8 @@ impl McStore {
     }
 
     /// Persist one auto-search decision, including an empty no-result decision.
-    pub fn append_user_hint(
+    #[cfg(test)]
+    pub(crate) fn append_user_hint(
         &self,
         session_id: &str,
         block_id: &str,
@@ -2780,6 +2949,27 @@ impl McStore {
             )?;
             Ok(inserted > 0)
         })?)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn seed_tags_for_test(
+        &self,
+        session_id: &str,
+        inputs: &[TagMintInput],
+        created_at_ms: i64,
+    ) -> Result<Vec<McTagRow>, McStoreError> {
+        self.mint_or_get_tags(session_id, inputs, created_at_ms)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn seed_channel1_append_for_test(
+        &self,
+        session_id: &str,
+        block_id: &str,
+        reminder_text: &str,
+        fired_at_ms: i64,
+    ) -> Result<bool, McStoreError> {
+        self.append_channel1_nudge(session_id, block_id, reminder_text, fired_at_ms)
     }
 
     /// Load exact auto-search overlay bytes and durable empty decisions.
@@ -2868,6 +3058,13 @@ impl McStore {
         summary: &str,
         created_at: i64,
     ) -> Result<WrapupCommandRow, McStoreError> {
+        let valid_disposition = matches!(disposition, "completed" | "nothing_to_compact");
+        if !valid_disposition {
+            return Err(McStoreError::Serde(format!(
+                "nonterminal wrapup disposition {disposition:?} cannot be recorded"
+            )));
+        }
+        debug_assert!(valid_disposition);
         let rounds = i64::try_from(rounds)
             .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
         Ok(self.inner.with_conn_fenced(|tx| {
@@ -2899,6 +3096,133 @@ impl McStore {
                     })
                 },
             )
+        })?)
+    }
+
+    /// Record a terminal wrapup outcome only while the cache row still matches the
+    /// state validated by the handler.
+    pub fn record_wrapup_command_if_current(
+        &self,
+        record: WrapupCommandRecord<'_>,
+    ) -> Result<RecordWrapupCommandOutcome, McStoreError> {
+        let valid_disposition = matches!(record.disposition, "completed" | "nothing_to_compact");
+        if !valid_disposition {
+            return Err(McStoreError::Serde(format!(
+                "nonterminal wrapup disposition {:?} cannot be recorded",
+                record.disposition
+            )));
+        }
+        debug_assert!(valid_disposition);
+        let rounds = i64::try_from(record.rounds)
+            .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
+        Ok(self.inner.with_conn_fenced(|transaction| {
+            let current = transaction
+                .query_row(
+                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![record.session_id],
+                    |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let (found_row_version, found_revert_epoch) = match current {
+                Some((row_version, meta_json)) => {
+                    let meta = serde_json::from_str::<ModuleMeta>(&meta_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    (Some(row_version), meta.revert_epoch)
+                }
+                None => (None, 0),
+            };
+            if found_row_version != record.expected_row_version
+                || found_revert_epoch != record.expected_revert_epoch
+            {
+                return Ok(RecordWrapupCommandOutcome::Stale {
+                    found_row_version,
+                    found_revert_epoch,
+                });
+            }
+            let legacy_failure = transaction
+                .query_row(
+                    "SELECT disposition FROM mc_wrapup_commands
+                     WHERE session_id = ?1 AND command_id = ?2",
+                    params![record.session_id, record.command_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .is_some_and(|disposition| disposition == "failed");
+            if legacy_failure {
+                return Ok(RecordWrapupCommandOutcome::LegacyFailurePreserved(
+                    WrapupCommandRow {
+                        disposition: record.disposition.to_string(),
+                        rounds: record.rounds,
+                        summary: record.summary.to_string(),
+                        created_at: record.created_at,
+                    },
+                ));
+            }
+
+            transaction.execute(
+                "INSERT OR IGNORE INTO mc_wrapup_commands
+                     (session_id, command_id, disposition, rounds, summary, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    record.session_id,
+                    record.command_id,
+                    record.disposition,
+                    rounds,
+                    record.summary,
+                    record.created_at
+                ],
+            )?;
+            let row = transaction.query_row(
+                "SELECT disposition, rounds, summary, created_at
+                 FROM mc_wrapup_commands
+                 WHERE session_id = ?1 AND command_id = ?2",
+                params![record.session_id, record.command_id],
+                |row| {
+                    let rounds = row.get::<_, i64>(1)?;
+                    Ok(WrapupCommandRow {
+                        disposition: row.get(0)?,
+                        rounds: rounds.max(0) as usize,
+                        summary: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )?;
+            Ok(RecordWrapupCommandOutcome::Recorded(row))
+        })?)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn seed_legacy_wrapup_command_for_test(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        disposition: &str,
+        rounds: usize,
+        summary: &str,
+        created_at: i64,
+    ) -> Result<(), McStoreError> {
+        let rounds = i64::try_from(rounds)
+            .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
+        Ok(self.inner.with_conn_fenced(|transaction| {
+            transaction.execute(
+                "INSERT INTO mc_wrapup_commands
+                     (session_id, command_id, disposition, rounds, summary, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session_id,
+                    command_id,
+                    disposition,
+                    rounds,
+                    summary,
+                    created_at
+                ],
+            )?;
+            Ok(())
         })?)
     }
 
@@ -6372,6 +6696,193 @@ mod tests {
     }
 
     #[test]
+    fn transform_snapshot_resists_commit_between_state_and_overlay_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let store = McStore::open(&descriptor).unwrap();
+        let initial = store.load("ses").unwrap();
+        store
+            .commit("ses", initial.row_version, &initial.core, &initial.meta)
+            .unwrap();
+        let raw_path = match &descriptor.backend {
+            StorageBackend::Sqlite { path } => path,
+            _ => unreachable!("test descriptor is SQLite"),
+        };
+        let mut raw = rusqlite::Connection::open(raw_path).unwrap();
+        raw.pragma_update(None, "busy_timeout", 5_000).unwrap();
+        let core_json = serde_json::to_string(&initial.core).unwrap();
+        let meta_json = serde_json::to_string(&initial.meta).unwrap();
+
+        let snapshot = store
+            .load_transform_snapshot_with_hook("ses", || {
+                let transaction = raw.transaction().unwrap();
+                transaction
+                    .execute(
+                        "UPDATE mc_cache_state SET row_version = 2, core_state = ?2, meta = ?3
+                         WHERE session_id = ?1",
+                        params!["ses", core_json, meta_json],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO mc_tags
+                             (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                         VALUES (?1, 1, 'm1#0', 'message', 1, 10, ?2)",
+                        params!["ses", b"text".as_slice()],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO mc_overlay_frontiers (session_id, max_seen_ordinal)
+                         VALUES (?1, 1)",
+                        params!["ses"],
+                    )
+                    .unwrap();
+                transaction.commit().unwrap();
+            })
+            .unwrap();
+        assert_eq!(snapshot.loaded.row_version, Some(1));
+        assert!(snapshot.tags.is_empty());
+        assert_eq!(snapshot.overlay_frontier, None);
+        let current = store.load_transform_snapshot("ses").unwrap();
+        assert_eq!(current.loaded.row_version, Some(2));
+        assert_eq!(current.tags.len(), 1);
+        assert_eq!(current.overlay_frontier, Some(1));
+    }
+
+    #[test]
+    fn transform_snapshot_keeps_row_version_and_overlays_from_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let initial = store.load("ses").unwrap();
+        store
+            .commit("ses", initial.row_version, &initial.core, &initial.meta)
+            .unwrap();
+
+        let split_state = store.load("ses").unwrap();
+        let tag_mints = [TagMintInput {
+            block_id: "m1#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 4,
+            source_bytes: b"authored text".to_vec(),
+        }];
+        let temporal_marks = [TemporalMarkInput {
+            ordinal: 1,
+            block_id: "m1#0".to_string(),
+            marker_text: "<!-- +5m -->\n".to_string(),
+        }];
+        let hint = UserHintDecisionInput {
+            ordinal: 1,
+            block_id: "m1#0".to_string(),
+            hint_text: "<ctx-search-hint>memory</ctx-search-hint>".to_string(),
+        };
+        let channel1 = Channel1AppendRow {
+            block_id: "m1#0".to_string(),
+            reminder_text: "<system-reminder>reduce</system-reminder>".to_string(),
+            fired_at_ms: 10,
+        };
+        store
+            .commit_transform(
+                "ses",
+                TransformCommit {
+                    expected: split_state.row_version,
+                    core: &split_state.core,
+                    meta: &split_state.meta,
+                    consumed_drop_ids: &[],
+                    memory_revision: None,
+                    overlays: TransformOverlayBatch {
+                        max_seen_ordinal: Some(1),
+                        tag_mints: &tag_mints,
+                        temporal_marks: &temporal_marks,
+                        user_hint: Some(&hint),
+                        channel1_append: Some(&channel1),
+                        created_at_ms: 10,
+                    },
+                },
+            )
+            .unwrap();
+
+        let split_tags = store.load_tags_for_session("ses").unwrap();
+        assert_eq!(split_state.row_version, Some(1));
+        assert_eq!(
+            split_tags.len(),
+            1,
+            "a split read can mix v1 state with v2 overlays"
+        );
+
+        let snapshot = store.load_transform_snapshot("ses").unwrap();
+        assert_eq!(snapshot.loaded.row_version, Some(2));
+        assert_eq!(snapshot.tags.len(), 1);
+        assert_eq!(snapshot.temporal_marks.len(), 1);
+        assert_eq!(snapshot.user_hints.len(), 1);
+        assert_eq!(snapshot.channel1_appends.len(), 1);
+        assert_eq!(snapshot.overlay_frontier, Some(1));
+    }
+
+    #[test]
+    fn transform_cas_conflict_leaves_every_overlay_table_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let initial = store.load("ses").unwrap();
+        store
+            .commit("ses", initial.row_version, &initial.core, &initial.meta)
+            .unwrap();
+        let stale = store.load("ses").unwrap();
+        store
+            .commit("ses", stale.row_version, &stale.core, &stale.meta)
+            .unwrap();
+
+        let tags = [TagMintInput {
+            block_id: "m1#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 1,
+            source_bytes: b"text".to_vec(),
+        }];
+        let marks = [TemporalMarkInput {
+            ordinal: 1,
+            block_id: "m1#0".to_string(),
+            marker_text: "marker".to_string(),
+        }];
+        let hint = UserHintDecisionInput {
+            ordinal: 1,
+            block_id: "m1#0".to_string(),
+            hint_text: "hint".to_string(),
+        };
+        let channel1 = Channel1AppendRow {
+            block_id: "m1#0".to_string(),
+            reminder_text: "reminder".to_string(),
+            fired_at_ms: 1,
+        };
+        let error = store
+            .commit_transform(
+                "ses",
+                TransformCommit {
+                    expected: stale.row_version,
+                    core: &stale.core,
+                    meta: &stale.meta,
+                    consumed_drop_ids: &[],
+                    memory_revision: None,
+                    overlays: TransformOverlayBatch {
+                        max_seen_ordinal: Some(1),
+                        tag_mints: &tags,
+                        temporal_marks: &marks,
+                        user_hint: Some(&hint),
+                        channel1_append: Some(&channel1),
+                        created_at_ms: 1,
+                    },
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, McStoreError::CasConflict { .. }));
+        let snapshot = store.load_transform_snapshot("ses").unwrap();
+        assert!(snapshot.tags.is_empty());
+        assert!(snapshot.temporal_marks.is_empty());
+        assert!(snapshot.user_hints.is_empty());
+        assert!(snapshot.channel1_appends.is_empty());
+        assert_eq!(snapshot.overlay_frontier, None);
+    }
+
+    #[test]
     fn cache_commit_rejects_an_advanced_memory_revision() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -6749,61 +7260,98 @@ mod tests {
     fn overlay_decisions_share_an_atomic_ordinal_watermark() {
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(McStore::open(&descriptor(dir.path())).unwrap());
+        let initial = store.load("race").unwrap();
+        store
+            .commit("race", initial.row_version, &initial.core, &initial.meta)
+            .unwrap();
+
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let mut joins = Vec::new();
         for hint_text in ["winner-a", "winner-b"] {
             let store = std::sync::Arc::clone(&store);
             let barrier = std::sync::Arc::clone(&barrier);
             joins.push(std::thread::spawn(move || {
+                let loaded = store.load("race").unwrap();
+                let temporal_marks = [TemporalMarkInput {
+                    ordinal: 3,
+                    block_id: "m3#0".to_string(),
+                    marker_text: "<!-- +5m -->\n".to_string(),
+                }];
+                let hint = UserHintDecisionInput {
+                    ordinal: 3,
+                    block_id: "m3#0".to_string(),
+                    hint_text: hint_text.to_string(),
+                };
                 barrier.wait();
-                store
-                    .apply_active_overlay_decisions(
-                        "race",
-                        3,
-                        &[TemporalMarkInput {
-                            ordinal: 3,
-                            block_id: "m3#0".to_string(),
-                            marker_text: "<!-- +5m -->\n".to_string(),
-                        }],
-                        Some(&UserHintDecisionInput {
-                            ordinal: 3,
-                            block_id: "m3#0".to_string(),
-                            hint_text: hint_text.to_string(),
-                        }),
-                        100,
-                    )
-                    .unwrap()
-                    .unwrap()
+                store.commit_transform(
+                    "race",
+                    TransformCommit {
+                        expected: loaded.row_version,
+                        core: &loaded.core,
+                        meta: &loaded.meta,
+                        consumed_drop_ids: &[],
+                        memory_revision: None,
+                        overlays: TransformOverlayBatch {
+                            max_seen_ordinal: Some(3),
+                            temporal_marks: &temporal_marks,
+                            user_hint: Some(&hint),
+                            created_at_ms: 100,
+                            ..Default::default()
+                        },
+                    },
+                )
             }));
         }
         barrier.wait();
-        let rows = joins
+        let outcomes = joins
             .into_iter()
             .map(|join| join.join().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(rows[0], rows[1], "the loser returns the winner's bytes");
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
         assert_eq!(
-            store.load_user_hints("race").unwrap(),
-            vec![rows[0].clone()]
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Err(McStoreError::CasConflict { .. })))
+                .count(),
+            1
         );
+        let winner = store.load_user_hints("race").unwrap();
+        assert_eq!(winner.len(), 1);
+        assert!(matches!(
+            winner[0].hint_text.as_str(),
+            "winner-a" | "winner-b"
+        ));
         assert_eq!(store.overlay_watermark("race").unwrap(), Some(3));
         assert_eq!(store.load_temporal_marks("race").unwrap().len(), 1);
 
+        let loaded = store.load("race").unwrap();
+        let late_mark = [TemporalMarkInput {
+            ordinal: 2,
+            block_id: "m2#0".to_string(),
+            marker_text: "late marker".to_string(),
+        }];
+        let late_hint = UserHintDecisionInput {
+            ordinal: 2,
+            block_id: "m2#0".to_string(),
+            hint_text: "late hint".to_string(),
+        };
         store
-            .apply_active_overlay_decisions(
+            .commit_transform(
                 "race",
-                4,
-                &[TemporalMarkInput {
-                    ordinal: 2,
-                    block_id: "m2#0".to_string(),
-                    marker_text: "late marker".to_string(),
-                }],
-                Some(&UserHintDecisionInput {
-                    ordinal: 2,
-                    block_id: "m2#0".to_string(),
-                    hint_text: "late hint".to_string(),
-                }),
-                200,
+                TransformCommit {
+                    expected: loaded.row_version,
+                    core: &loaded.core,
+                    meta: &loaded.meta,
+                    consumed_drop_ids: &[],
+                    memory_revision: None,
+                    overlays: TransformOverlayBatch {
+                        max_seen_ordinal: Some(4),
+                        temporal_marks: &late_mark,
+                        user_hint: Some(&late_hint),
+                        created_at_ms: 200,
+                        ..Default::default()
+                    },
+                },
             )
             .unwrap();
         assert_eq!(store.overlay_watermark("race").unwrap(), Some(4));
@@ -6819,17 +7367,72 @@ mod tests {
             .record_wrapup_command("session", "command", "completed", 2, "done", 10)
             .unwrap();
         let retry = store
-            .record_wrapup_command("session", "command", "failed", 9, "changed", 20)
+            .record_wrapup_command("session", "command", "nothing_to_compact", 9, "changed", 20)
             .unwrap();
         assert_eq!(retry, first);
+        let rejected = store
+            .record_wrapup_command("session", "failed-command", "failed", 9, "changed", 20)
+            .unwrap_err();
+        assert!(rejected
+            .to_string()
+            .contains("nonterminal wrapup disposition"));
         assert_eq!(
             store.load_wrapup_command("session", "command").unwrap(),
             Some(first)
         );
         assert!(store
+            .load_wrapup_command("session", "failed-command")
+            .unwrap()
+            .is_none());
+        assert!(store
             .load_wrapup_command("session", "other")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn wrapup_command_recording_is_fenced_by_row_version_and_revert_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let initial = store.load("session").unwrap();
+        let row_version = store
+            .commit("session", initial.row_version, &initial.core, &initial.meta)
+            .unwrap();
+        let stale = store
+            .record_wrapup_command_if_current(WrapupCommandRecord {
+                session_id: "session",
+                command_id: "stale",
+                disposition: "completed",
+                rounds: 1,
+                summary: "done",
+                created_at: 10,
+                expected_row_version: Some(row_version - 1),
+                expected_revert_epoch: 0,
+            })
+            .unwrap();
+        assert!(matches!(stale, RecordWrapupCommandOutcome::Stale { .. }));
+        assert!(store
+            .load_wrapup_command("session", "stale")
+            .unwrap()
+            .is_none());
+
+        let recorded = store
+            .record_wrapup_command_if_current(WrapupCommandRecord {
+                session_id: "session",
+                command_id: "current",
+                disposition: "completed",
+                rounds: 1,
+                summary: "done",
+                created_at: 10,
+                expected_row_version: Some(row_version),
+                expected_revert_epoch: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            recorded,
+            RecordWrapupCommandOutcome::Recorded(WrapupCommandRow { ref disposition, .. })
+                if disposition == "completed"
+        ));
     }
 
     #[test]
