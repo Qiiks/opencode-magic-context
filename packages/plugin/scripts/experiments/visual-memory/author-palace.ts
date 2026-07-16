@@ -387,23 +387,7 @@ function appendEntry(body: string[], cue: string, width: number): number {
         }
         body.push(line);
         line = ` ${word}`;
-        if (codepoints(line) > width) {
-            if (process.env.PALACE_RENDER_DESPITE_VALIDATOR) {
-                // Review renders soft-break an oversized unbreakable anchor at this
-                // call site's real width so one long path cannot block the whole
-                // page; real runs stay fatal so the authoring prompt owns budgets.
-                const chunks = Array.from(word).reduce<string[]>((acc, ch) => {
-                    const last = acc[acc.length - 1];
-                    if (last === undefined || codepoints(last) >= width - 2) acc.push(ch);
-                    else acc[acc.length - 1] = last + ch;
-                    return acc;
-                }, []);
-                for (let i = 0; i < chunks.length - 1; i++) body.push(` ${chunks[i]}-`);
-                line = ` ${chunks[chunks.length - 1]}`;
-                continue;
-            }
-            throw new Error(`anchor exceeds room width: ${word}`);
-        }
+        if (codepoints(line) > width) throw new Error(`anchor exceeds room width: ${word}`);
     }
     body.push(line);
     return placement;
@@ -450,9 +434,7 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
         .sort((a, b) => a.id - b.id);
     const innerWidth = ROOM_WIDTH - 2;
     const requiredTokenWidth = longestToken(entries);
-    if (requiredTokenWidth > innerWidth && !process.env.PALACE_RENDER_DESPITE_VALIDATOR) {
-        // Review renders skip this pre-check; the line wrapper soft-breaks the
-        // oversized anchor at its call site's real width instead.
+    if (requiredTokenWidth > innerWidth) {
         throw new Error(`room ${name} has ${requiredTokenWidth}-char anchor (max ${innerWidth})`);
     }
     if (codepoints(name) * 2 > innerWidth) {
@@ -1026,6 +1008,38 @@ export function authorPalace(args: {
 }) {
     const palaceOutput = args.palaceOutput ?? PALACE_OUTPUT;
     const coverageOutput = args.coverageOutput ?? COVERAGE_OUTPUT;
+    if (process.env.PALACE_RENDER_DESPITE_VALIDATOR) {
+        // Review renders soft-break oversized unbreakable anchors BEFORE any
+        // validation or box measurement, so every downstream consumer (width
+        // checks, box geometry, the page packer) sees the same widths. Breaking
+        // lazily inside the line wrapper instead once left box geometry measured
+        // from the raw token, and the packer looped forever on a box wider than
+        // its page. Real runs stay fatal so the authoring prompt owns budgets.
+        const maxToken = ROOM_WIDTH - 6;
+        for (const entry of args.specs) {
+            if (entry.cue === undefined) continue;
+            const parts = Array.isArray(entry.cue) ? entry.cue : [entry.cue];
+            const softened = parts.map((part) =>
+                part
+                    .split(" ")
+                    .map((token) =>
+                        codepoints(token) > maxToken
+                            ? (Array.from(token)
+                                  .reduce<string[]>((acc, ch) => {
+                                      const last = acc[acc.length - 1];
+                                      if (last === undefined || codepoints(last) >= maxToken - 1)
+                                          acc.push(ch);
+                                      else acc[acc.length - 1] = last + ch;
+                                      return acc;
+                                  }, [])
+                                  .join("- ") ?? token)
+                            : token,
+                    )
+                    .join(" "),
+            );
+            entry.cue = Array.isArray(entry.cue) ? softened : softened[0];
+        }
+    }
     validate(args.source, args.specs);
     const { palace, placements, rooms, layoutItems, pages, leveling } = renderPalace(args.specs);
     const cueLengths = args.specs
