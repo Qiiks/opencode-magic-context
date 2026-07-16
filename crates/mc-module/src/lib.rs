@@ -1624,6 +1624,8 @@ pub struct McHandler {
     #[cfg(test)]
     wrapup_operation_budget: Mutex<Option<Duration>>,
     #[cfg(test)]
+    unknown_module_retry_delay: Mutex<Option<Duration>>,
+    #[cfg(test)]
     status_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     connect_failure_commit_hook: ConnectFailureCommitHook,
     #[cfg(test)]
@@ -1739,6 +1741,11 @@ struct HistorianPrepareContext {
     snapshot_generation: u64,
 }
 
+struct WrapupPrepareContext {
+    now: i64,
+    allow_unknown_module_retry: bool,
+}
+
 #[derive(Clone)]
 struct LiveWrapupSession {
     token: Arc<()>,
@@ -1786,8 +1793,22 @@ struct TerminalWrapupResponse {
     disposition: &'static str,
     rounds: usize,
     summary: String,
+    reason: Option<&'static str>,
+    detail: Option<String>,
     include_rounds_without_command: bool,
 }
+
+#[derive(Debug)]
+enum WrapupFiringError {
+    Retryable(RetryableWrapupReason, String),
+    UnknownModule(String),
+    Terminal {
+        reason: &'static str,
+        detail: String,
+    },
+}
+
+const TERMINAL_WRAPUP_FAILURE_PREFIX: &str = "mc-terminal-wrapup-failure:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryableWrapupReason {
@@ -1806,6 +1827,23 @@ impl RetryableWrapupReason {
             Self::BudgetExhausted => "budget_exhausted",
         }
     }
+}
+
+fn terminal_wrapup_failure_summary(reason: &str, summary: &str, detail: &str) -> String {
+    format!(
+        "{TERMINAL_WRAPUP_FAILURE_PREFIX}{}",
+        json!({ "reason": reason, "summary": summary, "detail": detail })
+    )
+}
+
+fn terminal_wrapup_failure_fields(summary: &str) -> Option<(String, String, String)> {
+    let encoded = summary.strip_prefix(TERMINAL_WRAPUP_FAILURE_PREFIX)?;
+    let value: Value = serde_json::from_str(encoded).ok()?;
+    Some((
+        value.get("reason")?.as_str()?.to_string(),
+        value.get("summary")?.as_str()?.to_string(),
+        value.get("detail")?.as_str()?.to_string(),
+    ))
 }
 
 type ConnectFailureCommitHook = Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>;
@@ -1953,6 +1991,8 @@ impl McHandler {
             #[cfg(test)]
             wrapup_operation_budget: Mutex::new(None),
             #[cfg(test)]
+            unknown_module_retry_delay: Mutex::new(None),
+            #[cfg(test)]
             status_snapshot_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -2016,6 +2056,7 @@ impl McHandler {
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
             wrapup_operation_budget: Mutex::new(None),
+            unknown_module_retry_delay: Mutex::new(None),
             status_snapshot_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -2980,8 +3021,12 @@ impl McHandler {
         binding: &SessionBinding,
         projection: &crate::ck_wire::FlatProjection,
         boundary: &boundary::BoundaryResolution,
-        now: i64,
+        context: WrapupPrepareContext,
     ) -> PreparedWrapupAction {
+        let WrapupPrepareContext {
+            now,
+            allow_unknown_module_retry,
+        } = context;
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -3000,12 +3045,14 @@ impl McHandler {
                 loaded.meta.historian.state.as_str()
             ));
         }
-        if let Some(until) = loaded.meta.historian.failure_backoff_at_ms {
-            if until > now {
-                return PreparedWrapupAction::Failed(format!(
-                    "historian failure backoff active for {} ms",
-                    until.saturating_sub(now)
-                ));
+        if !allow_unknown_module_retry {
+            if let Some(until) = loaded.meta.historian.failure_backoff_at_ms {
+                if until > now {
+                    return PreparedWrapupAction::Failed(format!(
+                        "historian failure backoff active for {} ms",
+                        until.saturating_sub(now)
+                    ));
+                }
             }
         }
 
@@ -3207,6 +3254,18 @@ impl McHandler {
             .unwrap_or(Duration::ZERO)
     }
 
+    fn unknown_module_retry_delay(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(delay) = *self
+            .unknown_module_retry_delay
+            .lock()
+            .expect("unknown module retry delay mutex")
+        {
+            return delay;
+        }
+        Duration::from_secs(30)
+    }
+
     fn remaining_wrapup_budget(deadline: Instant) -> Option<Duration> {
         deadline
             .checked_duration_since(Instant::now())
@@ -3217,9 +3276,9 @@ impl McHandler {
         &self,
         task: HistorianFiringTask,
         deadline: Instant,
-    ) -> Result<historian::HistorianDriveOutcome, (RetryableWrapupReason, String)> {
+    ) -> Result<historian::HistorianDriveOutcome, WrapupFiringError> {
         let Some(remaining) = Self::remaining_wrapup_budget(deadline) else {
-            return Err((
+            return Err(WrapupFiringError::Retryable(
                 RetryableWrapupReason::BudgetExhausted,
                 "wrapup request budget expired before historian round".to_string(),
             ));
@@ -3230,6 +3289,23 @@ impl McHandler {
         match tokio::time::timeout(wait, handle).await {
             Ok(Ok(Ok(outcome))) => Ok(outcome),
             Ok(Ok(Err(error))) => {
+                if matches!(&error, historian::HistorianDriveError::NoModels) {
+                    return Err(WrapupFiringError::Terminal {
+                        reason: "no_models",
+                        detail: error.to_string(),
+                    });
+                }
+                if matches!(
+                    &error,
+                    historian::HistorianDriveError::Producer(error)
+                        if error.is_unknown_module()
+                ) || matches!(
+                    &error,
+                    historian::HistorianDriveError::ProducerConnect { source, .. }
+                        if source.is_unknown_module()
+                ) {
+                    return Err(WrapupFiringError::UnknownModule(error.to_string()));
+                }
                 let reason = match &error {
                     historian::HistorianDriveError::State(
                         historian::HistorianStateError::Publish(
@@ -3254,17 +3330,17 @@ impl McHandler {
                     } => RetryableWrapupReason::SnapshotUnavailable,
                     _ => RetryableWrapupReason::SnapshotUnavailable,
                 };
-                Err((reason, error.to_string()))
+                Err(WrapupFiringError::Retryable(reason, error.to_string()))
             }
-            Ok(Err(error)) => Err((
+            Ok(Err(error)) => Err(WrapupFiringError::Retryable(
                 RetryableWrapupReason::SnapshotUnavailable,
                 format!("historian task failed: {error}"),
             )),
-            Err(_) if Instant::now() >= deadline => Err((
+            Err(_) if Instant::now() >= deadline => Err(WrapupFiringError::Retryable(
                 RetryableWrapupReason::BudgetExhausted,
                 "wrapup request budget expired during historian round".to_string(),
             )),
-            Err(_) => Err((
+            Err(_) => Err(WrapupFiringError::Retryable(
                 RetryableWrapupReason::SnapshotUnavailable,
                 "historian round timed out after 600 seconds".to_string(),
             )),
@@ -3802,9 +3878,15 @@ impl McHandler {
             disposition,
             rounds,
             summary,
+            reason,
+            detail,
             include_rounds_without_command,
         } = response;
-        debug_assert!(matches!(disposition, "completed" | "nothing_to_compact"));
+        debug_assert!(matches!(
+            disposition,
+            "completed" | "nothing_to_compact" | "failed"
+        ));
+        let ok = disposition != "failed";
         let (disposition, rounds, summary) = if let Some(command_id) = command_id {
             // The generation check and fenced SQLite insert share this short critical
             // section. The local write is bounded and prevents a transform from starting
@@ -3834,18 +3916,31 @@ impl McHandler {
                     }
                 }
             };
+            let ledger_summary = if disposition == "failed" {
+                terminal_wrapup_failure_summary(
+                    reason.unwrap_or("unknown"),
+                    &summary,
+                    detail.as_deref().unwrap_or("terminal wrapup failure"),
+                )
+            } else {
+                summary.clone()
+            };
             match store.record_wrapup_command_if_current(WrapupCommandRecord {
                 session_id,
                 command_id,
                 disposition,
                 rounds,
-                summary: &summary,
+                summary: &ledger_summary,
                 created_at: now_ms(),
                 expected_row_version: current.row_version,
                 expected_revert_epoch,
             }) {
                 Ok(RecordWrapupCommandOutcome::Recorded(row)) => {
-                    (row.disposition, row.rounds, row.summary)
+                    if disposition == "failed" {
+                        (row.disposition, row.rounds, summary)
+                    } else {
+                        (row.disposition, row.rounds, row.summary)
+                    }
                 }
                 Ok(RecordWrapupCommandOutcome::Stale { .. }) => {
                     return Self::retryable_wrapup_response(
@@ -3864,10 +3959,16 @@ impl McHandler {
             (disposition.to_string(), rounds, summary)
         };
         let mut payload = json!({
-            "ok": true,
+            "ok": ok,
             "disposition": disposition,
             "summary": summary,
         });
+        if let Some(reason) = reason {
+            payload["reason"] = json!(reason);
+        }
+        if let Some(detail) = detail {
+            payload["detail"] = json!(detail);
+        }
         if command_id.is_some() || include_rounds_without_command {
             payload["rounds"] = json!(rounds);
         }
@@ -3875,6 +3976,19 @@ impl McHandler {
     }
 
     fn replayed_wrapup_response(row: mc_store::WrapupCommandRow) -> HandlerOutcome {
+        if row.disposition == "failed" {
+            if let Some((reason, summary, detail)) = terminal_wrapup_failure_fields(&row.summary) {
+                return respond(json!({
+                    "ok": false,
+                    "disposition": "failed",
+                    "rounds": row.rounds,
+                    "summary": summary,
+                    "reason": reason,
+                    "detail": detail,
+                    "replayed": true,
+                }));
+            }
+        }
         respond(json!({
             "ok": row.disposition != "failed",
             "disposition": row.disposition,
@@ -3915,9 +4029,11 @@ impl McHandler {
         };
         if let Some(command_id) = command_id {
             match store.load_wrapup_command(&session_id, command_id) {
-                // Legacy failed rows are audit records, not terminal command results. Allow
-                // execution so a successful terminal commit can replace the failed record.
-                Ok(Some(row)) if row.disposition == "failed" => {}
+                // Rows written by the current terminal-failure path carry a marker in their
+                // summary, while older failed rows remain eligible for a successful retry.
+                Ok(Some(row))
+                    if row.disposition == "failed"
+                        && terminal_wrapup_failure_fields(&row.summary).is_none() => {}
                 Ok(Some(row)) => return Self::replayed_wrapup_response(row),
                 Ok(None) => {}
                 Err(error) => {
@@ -4071,6 +4187,8 @@ impl McHandler {
                         "nothing to compact; {} raw messages already fit within the keep watermark of {keep}",
                         plan.raw_messages_above_last_compartment,
                     ),
+                    reason: None,
+                    detail: None,
                     include_rounds_without_command: true,
                 },
             );
@@ -4078,6 +4196,10 @@ impl McHandler {
 
         let mut rounds = 0usize;
         let mut failure: Option<(RetryableWrapupReason, String)> = None;
+        let mut terminal_failure: Option<(&'static str, String)> = None;
+        // This observation is local to the current runner loop execution. A runner that is
+        // still starting gets one bounded chance before a repeated route absence becomes terminal.
+        let mut unknown_module_observed_at = None;
         while rounds < historian::MAX_WRAPUP_ROUNDS {
             if Self::remaining_wrapup_budget(deadline).is_none() {
                 failure = Some((
@@ -4116,16 +4238,18 @@ impl McHandler {
                 break;
             }
             let round_now = now_ms();
-            if let Some(until) = current_state.meta.historian.failure_backoff_at_ms {
-                if until > round_now {
-                    failure = Some((
-                        RetryableWrapupReason::BackoffActive,
-                        format!(
-                            "historian failure backoff active for {} ms",
-                            until.saturating_sub(round_now)
-                        ),
-                    ));
-                    break;
+            if unknown_module_observed_at.is_none() {
+                if let Some(until) = current_state.meta.historian.failure_backoff_at_ms {
+                    if until > round_now {
+                        failure = Some((
+                            RetryableWrapupReason::BackoffActive,
+                            format!(
+                                "historian failure backoff active for {} ms",
+                                until.saturating_sub(round_now)
+                            ),
+                        ));
+                        break;
+                    }
                 }
             }
             let current_end = match store.load_compartments(&session_id) {
@@ -4153,7 +4277,10 @@ impl McHandler {
                 &binding,
                 &projection,
                 &plan.boundary,
-                round_now,
+                WrapupPrepareContext {
+                    now: round_now,
+                    allow_unknown_module_retry: unknown_module_observed_at.is_some(),
+                },
             );
             // Assembly performs store reads, so verify the raw-history generation again
             // before joining or driving the action it produced. A transform that started
@@ -4193,6 +4320,10 @@ impl McHandler {
                     break;
                 }
                 PreparedWrapupAction::Failed(reason) => {
+                    if reason == "no historian models are configured" {
+                        terminal_failure = Some(("no_models", reason));
+                        break;
+                    }
                     let retry_reason = if reason.contains("backoff") {
                         RetryableWrapupReason::BackoffActive
                     } else {
@@ -4238,9 +4369,38 @@ impl McHandler {
                             ));
                             break;
                         }
-                        Err(reason) => {
-                            failure = Some(reason);
+                        Err(WrapupFiringError::Retryable(reason, detail)) => {
+                            failure = Some((reason, detail));
                             break;
+                        }
+                        Err(WrapupFiringError::Terminal { reason, detail }) => {
+                            terminal_failure = Some((reason, detail));
+                            break;
+                        }
+                        Err(WrapupFiringError::UnknownModule(detail)) => {
+                            if unknown_module_observed_at.is_some() {
+                                terminal_failure = Some(("runner_module_unavailable", detail));
+                                break;
+                            }
+                            unknown_module_observed_at = Some(Instant::now());
+                            let delay = self.unknown_module_retry_delay();
+                            let Some(remaining) = Self::remaining_wrapup_budget(deadline) else {
+                                failure = Some((
+                                    RetryableWrapupReason::BudgetExhausted,
+                                    "wrapup request budget expired before retrying an unavailable runner module"
+                                        .to_string(),
+                                ));
+                                break;
+                            };
+                            if delay > remaining {
+                                failure = Some((
+                                    RetryableWrapupReason::BudgetExhausted,
+                                    "wrapup request budget expired before retrying an unavailable runner module"
+                                        .to_string(),
+                                ));
+                                break;
+                            }
+                            tokio::time::sleep(delay).await;
                         }
                     }
                 }
@@ -4271,6 +4431,25 @@ impl McHandler {
             .len()
             .saturating_sub(initial_compartments.len());
         let remaining = wrapup_has_remaining_messages(&parsed.messages, final_end, target);
+        if let Some((reason, detail)) = terminal_failure {
+            return self.terminal_wrapup_response(
+                &store,
+                &session_id,
+                command_id,
+                ready.generation,
+                ready.revert_epoch,
+                TerminalWrapupResponse {
+                    disposition: "failed",
+                    rounds,
+                    summary: format!(
+                        "compacted {compacted_messages} messages into {compartments_created} compartments; wrapup stopped permanently"
+                    ),
+                    reason: Some(reason),
+                    detail: Some(detail),
+                    include_rounds_without_command: true,
+                },
+            );
+        }
         if failure.is_none() && remaining {
             failure = Some((
                 RetryableWrapupReason::SnapshotUnavailable,
@@ -4297,10 +4476,12 @@ impl McHandler {
                 TerminalWrapupResponse {
                     disposition: "nothing_to_compact",
                     rounds: 0,
-                    summary:
-                        "nothing to compact; the tail is already within the keep watermark"
-                            .to_string(),
-                    include_rounds_without_command: true,
+                     summary:
+                         "nothing to compact; the tail is already within the keep watermark"
+                             .to_string(),
+                     reason: None,
+                     detail: None,
+                     include_rounds_without_command: true,
                 },
             ),
             None => self.terminal_wrapup_response(
@@ -4312,10 +4493,12 @@ impl McHandler {
                 TerminalWrapupResponse {
                     disposition: "completed",
                     rounds,
-                    summary: format!(
-                        "compacted {compacted_messages} messages into {compartments_created} compartments; {effect}"
-                    ),
-                    include_rounds_without_command: true,
+                     summary: format!(
+                         "compacted {compacted_messages} messages into {compartments_created} compartments; {effect}"
+                     ),
+                     reason: None,
+                     detail: None,
+                     include_rounds_without_command: true,
                 },
             ),
         }
@@ -8917,6 +9100,7 @@ mod tests {
     struct ProducerState {
         connects: AtomicUsize,
         starts: AtomicUsize,
+        start_errors: Mutex<VecDeque<Result<RunHandle, HistorianProducerError>>>,
         binds: AtomicUsize,
         statuses: AtomicUsize,
         await_outputs: AtomicUsize,
@@ -8979,6 +9163,15 @@ mod tests {
                 .lock()
                 .expect("prompts mutex")
                 .push(prompt.to_string());
+            if let Some(result) = self
+                .state
+                .start_errors
+                .lock()
+                .expect("start errors mutex")
+                .pop_front()
+            {
+                return result;
+            }
             self.state
                 .outputs
                 .lock()
@@ -11568,6 +11761,114 @@ mod tests {
             .load_wrapup_command("ses", "malformed-retry")
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_no_models_is_terminal_and_retains_command() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        let (handler, store, _dir, _project) = handler_with_store(Arc::clone(&producer), config);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "no-models"
+        });
+
+        let response = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(response["ok"], json!(false), "{response}");
+        assert_eq!(response["disposition"], json!("failed"), "{response}");
+        assert_eq!(response["reason"], json!("no_models"), "{response}");
+        assert!(
+            response["rounds"].is_u64(),
+            "terminal failure carries rounds: {response}"
+        );
+        assert!(response["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no historian models"));
+        let row = store
+            .load_wrapup_command("ses", "no-models")
+            .unwrap()
+            .expect("terminal failure row");
+        assert_eq!(row.disposition, "failed");
+        assert_eq!(row.rounds, response["rounds"].as_u64().unwrap() as usize);
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+
+        let replay = tool_body(handler.dispatch_value(7, request).await);
+        assert_eq!(replay["ok"], json!(false), "{replay}");
+        assert_eq!(replay["reason"], json!("no_models"), "{replay}");
+        assert_eq!(replay["replayed"], json!(true));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_unknown_module_retries_once_then_is_terminal() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .start_errors
+            .lock()
+            .expect("start errors mutex")
+            .extend([
+                Err(HistorianProducerError::Subc(
+                    historian_producer::ProducerErrorBody::untagged(
+                        "unknown_module",
+                        "runner module broca is unavailable",
+                    ),
+                )),
+                Err(HistorianProducerError::Subc(
+                    historian_producer::ProducerErrorBody::untagged(
+                        "unknown_module",
+                        "runner module broca is unavailable",
+                    ),
+                )),
+            ]);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        *handler
+            .unknown_module_retry_delay
+            .lock()
+            .expect("unknown module retry delay mutex") = Some(Duration::ZERO);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "runner-missing"
+        });
+
+        let response = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(response["ok"], json!(false), "{response}");
+        assert_eq!(response["disposition"], json!("failed"), "{response}");
+        assert_eq!(
+            response["reason"],
+            json!("runner_module_unavailable"),
+            "{response}"
+        );
+        assert!(
+            response["rounds"].is_u64(),
+            "terminal failure carries rounds: {response}"
+        );
+        assert!(response["detail"]
+            .as_str()
+            .unwrap()
+            .contains("unknown_module"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store
+                .load_wrapup_command("ses", "runner-missing")
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "failed"
+        );
+
+        let replay = tool_body(handler.dispatch_value(7, request).await);
+        assert_eq!(replay["replayed"], json!(true));
+        assert_eq!(replay["reason"], json!("runner_module_unavailable"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

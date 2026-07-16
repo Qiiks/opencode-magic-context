@@ -2711,18 +2711,17 @@ fn apply_tag_prefix_to_block(
         (ck_wire::CkKind::Text { text }, TaggableKind::Message)
             if role == "user" || role == "assistant" =>
         {
-            // Models imitate the tag notation they see in history, prefixing
-            // their own replies with §N§ copies. Strip well-formed LEADING
-            // prefixes from assistant text before applying the official tag
-            // (display-only: mint provenance still hashes the verbatim ingress
-            // bytes). Leading-only on purpose, because mid-prose references like
-            // "I dropped §12§" are meaningful model-authored content.
+            // Models imitate the tag notation they see in history, sometimes at the
+            // start of a later line in one assistant completion. Strip only line-leading
+            // tokens outside code before applying the official tag; inline and prose
+            // references remain authored content. Mint provenance still hashes the
+            // verbatim ingress bytes.
             let base = if role == "assistant" {
                 strip_leading_tag_imitations(text)
             } else {
-                text.as_str()
+                text.clone()
             };
-            let next = prepend_tag(tag_number, base);
+            let next = prepend_tag(tag_number, &base);
             if *text != next {
                 *text = next;
                 return true;
@@ -2836,26 +2835,138 @@ fn strip_tag_prefix(value: &str, tag_number: i64) -> &str {
     value.strip_prefix(&tag_prefix(tag_number)).unwrap_or(value)
 }
 
-/// Strip a run of well-formed `§N§`-shaped prefixes from the head of assistant
-/// text. Deterministic over ingress bytes, so the wire replays byte-identically
-/// on every pass. Inter-prefix separators use the full whitespace class on
-/// purpose: models copy the notation with spaces, tabs, or newlines between
-/// imitation prefixes, and any leaked separator would ride the wire forever.
-fn strip_leading_tag_imitations(value: &str) -> &str {
-    let mut rest = value;
-    loop {
-        let Some(after_open) = rest.strip_prefix('\u{a7}') else {
-            return rest;
-        };
-        let digits = after_open.chars().take_while(char::is_ascii_digit).count();
-        if digits == 0 {
-            return rest;
+/// Strip runs of well-formed `§N§` tokens at the start of any non-code line.
+///
+/// The observed imitation class is line-leading, so this conservative boundary avoids
+/// rewriting genuine references such as `the tag §12§ was dropped`. Code fences and
+/// inline-code lines stay verbatim, and a token must be followed by whitespace or ASCII
+/// punctuation so malformed text is never partially consumed.
+fn strip_leading_tag_imitations(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut in_fenced_code = false;
+    let mut inline_code_delimiter = None;
+    for line in value.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fence = body.trim_start().starts_with("```");
+        if in_fenced_code || fence {
+            output.push_str(line);
+            if fence {
+                in_fenced_code = !in_fenced_code;
+                inline_code_delimiter = None;
+            }
+            continue;
         }
-        let Some(after_close) = after_open[digits..].strip_prefix('\u{a7}') else {
-            return rest;
-        };
-        rest = after_close.trim_start_matches(char::is_whitespace);
+        if inline_code_delimiter.is_some() {
+            output.push_str(line);
+            update_inline_code_delimiter(body, &mut inline_code_delimiter);
+            continue;
+        }
+
+        let leading_whitespace = body.len() - body.trim_start_matches(char::is_whitespace).len();
+        let mut rest = &body[leading_whitespace..];
+        let mut stripped = false;
+        while let Some(after_close) = well_formed_tag_suffix(rest) {
+            stripped = true;
+            rest = after_close.trim_start_matches(char::is_whitespace);
+        }
+        if stripped {
+            output.push_str(rest);
+            if line.ends_with('\n') && !rest.is_empty() {
+                output.push('\n');
+            }
+        } else {
+            output.push_str(line);
+        }
+        update_inline_code_delimiter(body, &mut inline_code_delimiter);
     }
+    output
+}
+
+fn update_inline_code_delimiter(line: &str, delimiter: &mut Option<usize>) {
+    let mut offset = 0usize;
+    while offset < line.len() {
+        let rest = &line[offset..];
+        let Some(backtick_offset) = rest.find('`') else {
+            break;
+        };
+        offset += backtick_offset;
+        let run = line[offset..]
+            .chars()
+            .take_while(|character| *character == '`')
+            .count();
+        match delimiter {
+            Some(expected) if *expected == run => *delimiter = None,
+            None => *delimiter = Some(run),
+            _ => {}
+        }
+        offset += run;
+    }
+}
+
+fn well_formed_tag_suffix(value: &str) -> Option<&str> {
+    let after_open = value.strip_prefix('\u{a7}')?;
+    let digits = after_open.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let after_close = after_open[digits..].strip_prefix('\u{a7}')?;
+    if after_close
+        .chars()
+        .next()
+        .is_some_and(|next| !next.is_whitespace() && !next.is_ascii_punctuation())
+    {
+        return None;
+    }
+    Some(after_close)
+}
+
+fn is_entire_system_reminder_wrapped(text: &str) -> bool {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut depth = 0usize;
+    let mut saw_wrapper = false;
+    let mut offset = 0usize;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        if rest.starts_with(OPEN) {
+            depth += 1;
+            saw_wrapper = true;
+            offset += OPEN.len();
+        } else if rest.starts_with(CLOSE) {
+            if depth == 0 {
+                return false;
+            }
+            depth -= 1;
+            offset += CLOSE.len();
+        } else {
+            let ch = rest.chars().next().expect("non-empty reminder remainder");
+            if depth == 0 && !ch.is_whitespace() {
+                return false;
+            }
+            offset += ch.len_utf8();
+        }
+    }
+    saw_wrapper && depth == 0
+}
+
+fn is_system_reminder_transport_message(message: &CkIngressMessage) -> bool {
+    if message.ck.role != "user" || message.ck.meta.synthetic || message.ck.content.is_empty() {
+        return false;
+    }
+    // CK intentionally has no transport-origin field for this Claude Code shape. The
+    // decoder preserves the reminder as an ordinary user text block, so the narrowest
+    // safe discriminator is a message made entirely of balanced reminder wrappers.
+    let mut saw_text = false;
+    for block in &message.ck.content {
+        let ck_wire::CkKind::Text { text } = &block.kind else {
+            return false;
+        };
+        saw_text = true;
+        if !is_entire_system_reminder_wrapped(text.trim()) {
+            return false;
+        }
+    }
+    saw_text
 }
 
 fn is_authored_user_message(message: &CkIngressMessage) -> bool {
@@ -2866,6 +2977,7 @@ fn is_authored_user_message(message: &CkIngressMessage) -> bool {
             .content
             .iter()
             .any(|block| matches!(&block.kind, ck_wire::CkKind::Text { .. }))
+        && !is_system_reminder_transport_message(message)
 }
 
 fn eligible_authored_user_tail(req: &TransformRequest) -> Option<&CkIngressMessage> {
@@ -2895,14 +3007,6 @@ fn compute_active_overlay_decisions(
         user_hint_rows,
         overlay_frontier: frontier,
     } = input;
-    let max_seen_ordinal = req
-        .messages
-        .iter()
-        .filter(|message| is_authored_user_message(message))
-        .map(|message| message.ordinal)
-        .max()
-        .filter(|ordinal| frontier.is_none_or(|frontier| *ordinal > frontier));
-
     let existing_tag_ids = tag_rows
         .iter()
         .map(|row| row.block_id.as_str())
@@ -2927,7 +3031,7 @@ fn compute_active_overlay_decisions(
         .iter()
         .map(|row| (row.block_id.as_str(), row.created_at_ms))
         .collect::<HashMap<_, _>>();
-    let decided_temporal = temporal_rows
+    let mut decided_temporal = temporal_rows
         .iter()
         .map(|row| row.block_id.clone())
         .collect::<HashSet<_>>();
@@ -3001,12 +3105,39 @@ fn compute_active_overlay_decisions(
             marker_text: marker_text.clone(),
         });
         temporal_rows.push(TemporalMarkRow {
-            block_id,
+            block_id: block_id.clone(),
             marker_text,
             created_at: ctx.now_ms,
         });
+        decided_temporal.insert(block_id);
         previous_new_user_mint = Some(current_mint);
     }
+
+    // Do not advance the frontier past a user whose temporal decision could not be
+    // evaluated. A frozen reduction or another mint-ineligible shape must remain eligible
+    // for a later pass instead of silently making its marker impossible to mint.
+    let mut decided_frontier = frontier;
+    for message in req
+        .messages
+        .iter()
+        .filter(|message| is_authored_user_message(message))
+    {
+        if frontier.is_some_and(|current| message.ordinal <= current) {
+            continue;
+        }
+        let Some(block_id) = projection.blocks.iter().find_map(|block| {
+            (block.mid == message.mid && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
+                .then_some(block.id.as_str())
+        }) else {
+            break;
+        };
+        if !decided_temporal.contains(block_id) {
+            break;
+        }
+        decided_frontier = Some(message.ordinal);
+    }
+    let max_seen_ordinal =
+        decided_frontier.filter(|ordinal| frontier.is_none_or(|current| *ordinal > current));
 
     let user_hint = authored_tail
         .filter(|message| frontier.is_none_or(|frontier| message.ordinal > frontier))
@@ -4227,8 +4358,8 @@ mod tests {
     }
 
     /// Models copy the tag notation they see in history onto their own replies.
-    /// The overlay must strip those imitation prefixes on assistant text (leading
-    /// only; mid-prose references stay verbatim) on ACTIVE passes, while false
+    /// The overlay must strip those imitation prefixes on assistant text at any
+    /// line start while preserving mid-prose references on ACTIVE passes. False
     /// passes serve the ingress bytes untouched.
     #[test]
     fn assistant_tag_imitation_prefixes_strip_on_active_passes_only() {
@@ -4240,7 +4371,7 @@ mod tests {
                 "assistant",
                 "ccm-1",
                 1,
-                &["\u{a7}39\u{a7} \u{a7}39\u{a7} BEAT3-OK, and earlier I dropped \u{a7}12\u{a7}."],
+                &["preamble\n§39§ §39§ BEAT3-OK\nI dropped §12§."],
             ),
         ];
         let req = active_cc_req("imitation", "cfg0", messages.clone());
@@ -4248,9 +4379,10 @@ mod tests {
         assert_eq!(transition.surface_state, SurfaceState::Transition);
         let second = run(&s, &req, &spine());
         let joined = serde_json::to_string(&second.ck_messages).unwrap();
-        assert!(
-            joined.contains("\u{a7}2\u{a7} BEAT3-OK, and earlier I dropped \u{a7}12\u{a7}."),
-            "imitation prefixes must strip, official tag applies, mid-prose reference survives: {joined}"
+        assert_eq!(
+            tail_bytes(&second, "ccm-1"),
+            "§2§ preamble\nBEAT3-OK\nI dropped §12§.",
+            "line-leading imitations must strip, official tag applies, mid-prose reference survives: {joined}"
         );
         assert!(
             !joined.contains("\u{a7}39\u{a7}"),
@@ -4288,7 +4420,7 @@ mod tests {
             "BEAT"
         );
         assert_eq!(
-            strip_leading_tag_imitations("\u{a7}39\u{a7} \n\t \u{a7}40\u{a7}BEAT"),
+            strip_leading_tag_imitations("\u{a7}39\u{a7} \n\t \u{a7}40\u{a7} BEAT"),
             "BEAT"
         );
         // Malformed leading shapes are NOT well-formed prefixes: verbatim.
@@ -4304,6 +4436,20 @@ mod tests {
         assert_eq!(
             strip_leading_tag_imitations("I dropped \u{a7}12\u{a7} earlier"),
             "I dropped \u{a7}12\u{a7} earlier"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7}BEAT"),
+            "\u{a7}39\u{a7}BEAT",
+            "a token without a separator is not an imitation"
+        );
+    }
+
+    #[test]
+    fn assistant_tag_imitations_strip_on_later_lines_but_not_code() {
+        let value = "preamble\n\u{a7}22\u{a7} Delta\n`\u{a7}23\u{a7} inline`\n```rust\n\u{a7}24\u{a7} fenced\n```\n\u{a7}25\u{a7} Echo";
+        assert_eq!(
+            strip_leading_tag_imitations(value),
+            "preamble\nDelta\n`\u{a7}23\u{a7} inline`\n```rust\n\u{a7}24\u{a7} fenced\n```\nEcho"
         );
     }
 
@@ -7786,6 +7932,141 @@ mod tests {
             )
             .unwrap();
             assert_eq!(tail_bytes(&false_window, "m3"), "question");
+        });
+    }
+
+    #[test]
+    fn temporal_gap_trailing_role_system_reminder_keeps_authored_user_eligible() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first = active_cc_req(
+                "temporal-system-tail",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["start"])],
+            );
+            run(&s, &first, &spine());
+            run(&s, &first, &spine());
+
+            let mut request = active_cc_req(
+                "temporal-system-tail",
+                "cfg0",
+                vec![
+                    first.messages[0].clone(),
+                    wire_item("assistant", "m2", 2, &["answer"]),
+                    wire_item("user", "m3", 3, &["question"]),
+                    system_item("reminder", 4, "transport reminder"),
+                ],
+            );
+            request.prev_response_completed_at_ms = Some(10_000);
+            request.request_observed_at_ms = Some(730_000);
+            let response = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 730_000),
+            )
+            .unwrap();
+            assert_eq!(
+                tail_bytes(&response, "m3"),
+                "<!-- +12m -->\n§3§ question",
+                "role=system reminders are skipped when resolving the authored tail"
+            );
+        });
+    }
+
+    #[test]
+    fn temporal_gap_standalone_system_reminder_user_is_transport() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first = active_cc_req(
+                "temporal-user-reminder",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["start"])],
+            );
+            run(&s, &first, &spine());
+            run(&s, &first, &spine());
+
+            let mut request = active_cc_req(
+                "temporal-user-reminder",
+                "cfg0",
+                vec![
+                    first.messages[0].clone(),
+                    wire_item("assistant", "m2", 2, &["answer"]),
+                    wire_item("user", "m3", 3, &["question"]),
+                    wire_item(
+                        "user",
+                        "reminder",
+                        4,
+                        &["<system-reminder>background work finished</system-reminder>"],
+                    ),
+                ],
+            );
+            request.prev_response_completed_at_ms = Some(10_000);
+            request.request_observed_at_ms = Some(730_000);
+            let response = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 730_000),
+            )
+            .unwrap();
+            assert_eq!(
+                tail_bytes(&response, "m3"),
+                "<!-- +12m -->\n§3§ question",
+                "a standalone reminder-shaped user message is transport, not an authored tail"
+            );
+        });
+    }
+
+    #[test]
+    fn temporal_gap_frontier_stays_before_a_mint_ineligible_user() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let request = active_cc_req(
+                "temporal-frontier",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["question"])],
+            );
+            run(&s, &request, &spine());
+
+            let loaded = s.load("temporal-frontier").unwrap();
+            let mut core = loaded.core.clone();
+            core.frozen_units
+                .push(red_unit("m1#0", "drop", "[dropped]"));
+            s.commit("temporal-frontier", loaded.row_version, &core, &loaded.meta)
+                .unwrap();
+
+            let mut gap_request = request.clone();
+            gap_request.prev_response_completed_at_ms = Some(100_000);
+            gap_request.request_observed_at_ms = Some(700_000);
+            let skipped = transform(
+                &s,
+                &gap_request,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&skipped, "m1"), "[dropped]");
+            assert!(s
+                .load_temporal_marks("temporal-frontier")
+                .unwrap()
+                .is_empty());
+            assert_eq!(s.overlay_watermark("temporal-frontier").unwrap(), None);
+
+            let loaded = s.load("temporal-frontier").unwrap();
+            let mut core = loaded.core.clone();
+            core.frozen_units
+                .retain(|unit| !unit.key.starts_with("red:"));
+            s.commit("temporal-frontier", loaded.row_version, &core, &loaded.meta)
+                .unwrap();
+            let minted = transform(
+                &s,
+                &gap_request,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&minted, "m1"), "<!-- +10m -->\n§1§ question");
+            assert_eq!(s.overlay_watermark("temporal-frontier").unwrap(), Some(1));
         });
     }
 

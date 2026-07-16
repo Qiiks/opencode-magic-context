@@ -3160,7 +3160,12 @@ impl McStore {
         &self,
         record: WrapupCommandRecord<'_>,
     ) -> Result<RecordWrapupCommandOutcome, McStoreError> {
-        let valid_disposition = matches!(record.disposition, "completed" | "nothing_to_compact");
+        // Failed rows can be terminal command results; the module keeps a marker in
+        // their summary so older recoverable failure rows retain their retry behavior.
+        let valid_disposition = matches!(
+            record.disposition,
+            "completed" | "nothing_to_compact" | "failed"
+        );
         if !valid_disposition {
             return Err(McStoreError::Serde(format!(
                 "nonterminal wrapup disposition {:?} cannot be recorded",
