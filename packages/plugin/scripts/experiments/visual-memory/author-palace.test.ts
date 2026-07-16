@@ -8,6 +8,7 @@ import {
     authorPalace,
     renderPalace,
     validate,
+    ROOM_HEADER_MARKER,
     type SourceMemory,
     type SpecEntry,
 } from "./author-palace.ts";
@@ -81,10 +82,15 @@ describe("single-page newspaper flow", () => {
         const width = rendered.layoutItems[0] ? 72 : 0;
         const pitch = width + 1;
         expect(rendered.pages).toHaveLength(1);
+        expect(lines).toHaveLength(121);
         expect(rendered.layoutItems.filter((item) => item.kind === "category")).toHaveLength(1);
-        expect([0, 1, 2].map((column) =>
+        const occupied = [0, 1, 2].map((column) =>
             lines.filter((line) => line.slice(column * pitch, column * pitch + width).trim()).length,
-        )).toEqual([121, 121, 121]);
+        );
+        expect(occupied.every((count) => count > 0 && count < 121)).toBe(true);
+        expect([0, 1, 2].every((column) =>
+            lines.at(-1)?.slice(column * pitch, column * pitch + width).trim(),
+        )).toBe(true);
     });
 
     test("never leaves a room header as the last line of a column", () => {
@@ -97,10 +103,29 @@ describe("single-page newspaper flow", () => {
                 importance: 50,
             })),
         );
+        const lines = rendered.palace.trimEnd().split("\n");
+        const width = 72;
+        const pitch = width + 1;
         for (const item of rendered.layoutItems) {
-            if (item.kind === "room" && !item.continuation) {
-                expect(item.startLine).toBeLessThan(121);
+            if (item.kind !== "room" || item.continuation) continue;
+            expect(item.startLine).toBeLessThan(121);
+            const current = lines[item.startLine - 1]?.slice(item.column * pitch, item.column * pitch + width);
+            expect(current?.startsWith(ROOM_HEADER_MARKER)).toBe(true);
+            const previous =
+                item.startLine > 1
+                    ? lines[item.startLine - 2]?.slice(item.column * pitch, item.column * pitch + width)
+                    : undefined;
+            const previousIsCategoryBanner = previous?.includes(`<${item.category}>`) ?? false;
+            if (!previousIsCategoryBanner && item.startLine > 1) {
+                expect(previous?.trim()).toBe("");
+                const beforeGap =
+                    item.startLine > 2
+                        ? lines[item.startLine - 3]?.slice(item.column * pitch, item.column * pitch + width)
+                        : undefined;
+                expect(beforeGap?.trim()).not.toBe("");
             }
+            const next = lines[item.startLine]?.slice(item.column * pitch, item.column * pitch + width);
+            expect(next?.trim()).not.toBe("");
         }
         expect(rendered.palace).not.toMatch(/[╔╗╚╝┌┐└┘│═]{2,}/);
     });
@@ -119,12 +144,52 @@ describe("single-page newspaper flow", () => {
         expect(rendered.palace).toContain("— Long room —");
     });
 
-    test("globally interleaves a high-importance later-category room", () => {
+    test("keeps category-major placement despite a higher-importance later category", () => {
         const rendered = renderPalace([
             { id: 1, category: "PROJECT_RULES", room: "Early low", cue: "policy", importance: 10 },
             { id: 2, category: "ARCHITECTURE", room: "Later high", cue: "policy", importance: 90 },
         ]);
-        expect(rendered.layoutItems.find((item) => item.kind === "room")?.category).toBe("ARCHITECTURE");
+        expect(rendered.layoutItems.find((item) => item.kind === "room")?.category).toBe("PROJECT_RULES");
+        expect(rendered.layoutItems.filter((item) => item.kind === "room").map((item) => item.category)).toEqual([
+            "PROJECT_RULES",
+            "ARCHITECTURE",
+        ]);
+    });
+
+    test("caps a dominant category at its share plus spill while keeping a small category whole", () => {
+        const rendered = renderPalace([
+            ...Array.from({ length: 1_000 }, (_, index) => ({
+                id: index + 1,
+                category: "PROJECT_RULES" as const,
+                room: "Dominant",
+                cue: `dominant-${index + 1}`,
+                importance: 100,
+            })),
+            ...Array.from({ length: 2 }, (_, index) => ({
+                id: 2_000 + index,
+                category: "ARCHITECTURE" as const,
+                room: "Small",
+                cue: `small-${index + 1}`,
+                importance: 50,
+            })),
+        ]);
+        const capacity = rendered.pages[0]?.heightCells ? rendered.pages[0].heightCells * 3 : 0;
+        const dominantRoomLines = rendered.layoutItems
+            .filter((item) => item.kind === "room" && item.category === "PROJECT_RULES")
+            .reduce((total, item) => total + item.endLine - item.startLine + 1, 0);
+        const smallRoomLines = rendered.layoutItems
+            .filter((item) => item.kind === "room" && item.category === "ARCHITECTURE")
+            .reduce((total, item) => total + item.endLine - item.startLine + 1, 0);
+        expect(rendered.placements.size).toBe(718);
+        expect(rendered.droppedByTrimIds.length).toBe(284);
+        expect(rendered.droppedBySkipIds).toEqual([]);
+        expect(smallRoomLines).toBe(2);
+        expect(dominantRoomLines + 1).toBe(capacity - 3);
+        expect(rendered.layoutItems.filter((item) => item.kind === "category").map((item) => item.category)).toEqual([
+            "PROJECT_RULES",
+            "ARCHITECTURE",
+        ]);
+        expect(rendered.palace.trimEnd().split("\n").at(-1)?.trim()).not.toBe("");
     });
 
     test("keeps trim and skip sidecar coverage distinct", () => {
