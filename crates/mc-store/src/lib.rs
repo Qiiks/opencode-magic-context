@@ -829,6 +829,17 @@ const MIGRATIONS: &[Migration] = &[
            AND created_at < 1784222040000;
     ",
     },
+    Migration {
+        version: 21,
+        // A command owns one first-application window. Its protected remainder rides a
+        // later byte-changing pass instead of becoming a sequence of smaller busts.
+        statements: "
+        ALTER TABLE pending_agent_drops ADD COLUMN command_id TEXT;
+        ALTER TABLE mc_reduce_command_ledger ADD COLUMN first_applied_at_ms INTEGER;
+        CREATE INDEX IF NOT EXISTS idx_pending_agent_drops_command
+            ON pending_agent_drops(session_id, command_id, id);
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1405,6 +1416,8 @@ pub struct PendingAgentDrop {
     pub id: i64,
     pub target_id: String,
     pub queued_at_ms: i64,
+    pub command_id: Option<String>,
+    pub command_first_applied_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1493,6 +1506,7 @@ pub struct TransformCommit<'a> {
     pub core: &'a CoreState,
     pub meta: &'a ModuleMeta,
     pub consumed_drop_ids: &'a [i64],
+    pub first_applied_command_ids: &'a [String],
     pub memory_revision: Option<&'a MemoryRevision>,
     pub overlays: TransformOverlayBatch<'a>,
 }
@@ -2673,9 +2687,10 @@ impl McStore {
                     continue;
                 }
                 queued += tx.execute(
-                    "INSERT OR IGNORE INTO pending_agent_drops (session_id, target_id, queued_at)
-                     VALUES (?1, ?2, ?3)",
-                    params![session_id, target_id, queued_at_ms],
+                    "INSERT OR IGNORE INTO pending_agent_drops
+                         (session_id, target_id, queued_at, command_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![session_id, target_id, queued_at_ms, command_id],
                 )? as u64;
             }
 
@@ -2697,16 +2712,21 @@ impl McStore {
     ) -> Result<Vec<PendingAgentDrop>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, target_id, queued_at
-                 FROM pending_agent_drops
-                 WHERE session_id = ?1
-                 ORDER BY queued_at ASC, id ASC",
+                "SELECT p.id, p.target_id, p.queued_at, p.command_id,
+                        l.first_applied_at_ms
+                 FROM pending_agent_drops p
+                 LEFT JOIN mc_reduce_command_ledger l
+                   ON l.session_id = p.session_id AND l.command_id = p.command_id
+                 WHERE p.session_id = ?1
+                 ORDER BY p.queued_at ASC, p.id ASC",
             )?;
             let rows = stmt.query_map(params![session_id], |r| {
                 Ok(PendingAgentDrop {
                     id: r.get(0)?,
                     target_id: r.get(1)?,
                     queued_at_ms: r.get(2)?,
+                    command_id: r.get(3)?,
+                    command_first_applied_at_ms: r.get(4)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -3426,6 +3446,7 @@ impl McStore {
                 core,
                 meta,
                 consumed_drop_ids,
+                first_applied_command_ids: &[],
                 memory_revision,
                 overlays: TransformOverlayBatch::default(),
             },
@@ -3443,6 +3464,7 @@ impl McStore {
             core,
             meta,
             consumed_drop_ids,
+            first_applied_command_ids,
             memory_revision,
             overlays,
         } = request;
@@ -3642,6 +3664,16 @@ impl McStore {
                 )?;
             }
 
+            for command_id in first_applied_command_ids {
+                tx.execute(
+                    "UPDATE mc_reduce_command_ledger
+                     SET first_applied_at_ms = ?3
+                     WHERE session_id = ?1
+                       AND command_id = ?2
+                       AND first_applied_at_ms IS NULL",
+                    params![session_id, command_id, overlays.created_at_ms],
+                )?;
+            }
             for drop_id in consumed_drop_ids {
                 tx.execute(
                     "DELETE FROM pending_agent_drops WHERE session_id = ?1 AND id = ?2",
@@ -6990,6 +7022,7 @@ mod tests {
                     core: &split_state.core,
                     meta: &split_state.meta,
                     consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
                     memory_revision: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
@@ -7062,6 +7095,7 @@ mod tests {
                     core: &stale.core,
                     meta: &stale.meta,
                     consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
                     memory_revision: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
@@ -7172,6 +7206,43 @@ mod tests {
         );
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
         assert_eq!(command_ledger_ids(&store, "ses"), vec!["tool-use-1"]);
+    }
+
+    #[test]
+    fn first_application_marker_is_atomic_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let store = McStore::open(&descriptor).unwrap();
+        let targets = vec!["a#0".to_string(), "b#0".to_string()];
+        store
+            .append_pending_agent_drops_with_command("ses", Some("batch-1"), &targets, 1)
+            .unwrap();
+        let pending = store.load_pending_agent_drops("ses").unwrap();
+        let loaded = store.load("ses").unwrap();
+        let command_ids = vec!["batch-1".to_string()];
+        store
+            .commit_transform(
+                "ses",
+                TransformCommit {
+                    expected: loaded.row_version,
+                    core: &loaded.core,
+                    meta: &loaded.meta,
+                    consumed_drop_ids: &[pending[0].id],
+                    first_applied_command_ids: &command_ids,
+                    memory_revision: None,
+                    overlays: TransformOverlayBatch::default(),
+                },
+            )
+            .unwrap();
+        let remaining = store.load_pending_agent_drops("ses").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].command_id.as_deref(), Some("batch-1"));
+        assert_eq!(remaining[0].command_first_applied_at_ms, Some(0));
+        drop(store);
+
+        let reopened = McStore::open(&descriptor).unwrap();
+        let persisted = reopened.load_pending_agent_drops("ses").unwrap();
+        assert_eq!(persisted, remaining);
     }
 
     #[test]
@@ -7491,6 +7562,7 @@ mod tests {
                         core: &loaded.core,
                         meta: &loaded.meta,
                         consumed_drop_ids: &[],
+                        first_applied_command_ids: &[],
                         memory_revision: None,
                         overlays: TransformOverlayBatch {
                             max_seen_ordinal: Some(3),
@@ -7544,6 +7616,7 @@ mod tests {
                     core: &loaded.core,
                     meta: &loaded.meta,
                     consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
                     memory_revision: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(4),

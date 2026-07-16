@@ -1034,6 +1034,22 @@ fn apply_once(
     };
     let hard_fold_requested =
         first_fold_due || scheduler_outcome.idle_ttl_fired || system_absorb_hard_due;
+    // These are the byte-changing reasons that are knowable before reduction selection:
+    // render epochs, TTL, reconcile rematerialization, emergency arming, and coverage
+    // folds. A reconcile flag with a returned boundary only clears state on a defer, so
+    // it is not a ride opportunity. The selection layer adds a different command's first
+    // application as a ride opportunity. Provider-side rejection and post-selection
+    // output drift are not knowable here; omitting them can delay a held batch to the
+    // next bust, but cannot create an extra bust.
+    let emergency_arm_engaged = matches!(
+        scheduler_outcome.pass,
+        scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
+    ) || scheduler_outcome.drain_latch.is_active();
+    let pass_already_busting = !loaded.meta.initialized
+        || render_config_changed
+        || hard_fold_requested
+        || reconcile_hard_due
+        || emergency_arm_engaged;
     // Profile defaults remain conservative, while the request-local tool signal enables
     // full-array tail reclaim for the Claude Code profile. A false request therefore
     // retains the exact pre-capability behavior without changing the global profile table.
@@ -1069,6 +1085,19 @@ fn apply_once(
             .iter()
             .map(|drop| drop.target_id.clone())
             .collect::<Vec<_>>();
+        let agent_drop_command_ids = pending_agent_drops
+            .iter()
+            .filter_map(|drop| {
+                drop.command_id
+                    .as_ref()
+                    .map(|command_id| (drop.target_id.clone(), command_id.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let first_applied_agent_drop_ids = pending_agent_drops
+            .iter()
+            .filter(|drop| drop.command_first_applied_at_ms.is_some())
+            .map(|drop| drop.target_id.clone())
+            .collect::<HashSet<_>>();
         select_reductions(
             &tail_for_selection,
             &frozen,
@@ -1087,6 +1116,9 @@ fn apply_once(
                 prior_input_sample: loaded.meta.last_emergency_input_sample,
                 has_prior_drop: loaded.meta.has_prior_emergency_drop,
                 agent_drop_ids,
+                agent_drop_command_ids,
+                first_applied_agent_drop_ids,
+                pass_already_busting,
                 protected_block_ids: protected_block_ids.clone(),
             },
             &SelectionConfig {
@@ -1548,6 +1580,8 @@ fn apply_once(
         &projection,
         meta.coverage_ordinal,
     );
+    let first_applied_command_ids =
+        first_applied_pending_command_ids(&pending_agent_drops, &loaded.core, &core);
     let state_changed = core != loaded.core || meta != loaded.meta;
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
@@ -1562,6 +1596,7 @@ fn apply_once(
                 core: &core,
                 meta: &meta,
                 consumed_drop_ids: &consumed_drop_ids,
+                first_applied_command_ids: &first_applied_command_ids,
                 memory_revision: commit_memory_revision.as_ref(),
                 overlays: TransformOverlayBatch {
                     max_seen_ordinal: pending_overlays.max_seen_ordinal,
@@ -1881,6 +1916,28 @@ fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
     core.frozen_units
         .iter()
         .filter_map(|u| u.key.strip_prefix(RED_KEY_PREFIX).map(str::to_string))
+        .collect()
+}
+
+/// Commands whose first application froze at least one previously unfrozen target.
+fn first_applied_pending_command_ids(
+    pending: &[PendingAgentDrop],
+    loaded_core: &CoreState,
+    final_core: &CoreState,
+) -> Vec<String> {
+    let frozen_before = frozen_red_targets(loaded_core);
+    let frozen_after = frozen_red_targets(final_core);
+    pending
+        .iter()
+        .filter_map(|drop| {
+            let command_id = drop.command_id.as_ref()?;
+            let applied = !drop.command_first_applied_at_ms.is_some()
+                && !frozen_before.contains(&drop.target_id)
+                && frozen_after.contains(&drop.target_id);
+            applied.then(|| command_id.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -9166,6 +9223,160 @@ mod tests {
     }
 
     #[test]
+    fn held_agent_remainder_keeps_full_rendered_output_byte_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial_store = store(dir.path());
+        let messages = vec![
+            item("covered", 0, "covered"),
+            item("first", 1, "first"),
+            item("held", 2, "held"),
+        ];
+        initial_store
+            .replace_compartments("held-output", &[comp(1, 0, 0, "covered", "summary")])
+            .unwrap();
+        let stable_request = active_cc_req("held-output", "cfg0", messages.clone());
+        run(&initial_store, &stable_request, &spine());
+        let baseline = run(&initial_store, &stable_request, &spine());
+        let baseline_bytes = serde_json::to_vec(&baseline.ck_messages).unwrap();
+
+        initial_store
+            .append_pending_agent_drops_with_command(
+                "held-output",
+                Some("command-a"),
+                &["first#0".to_string(), "held#0".to_string()],
+                1,
+            )
+            .unwrap();
+        let pending = initial_store.load_pending_agent_drops("held-output").unwrap();
+        let loaded = initial_store.load("held-output").unwrap();
+        let command_ids = vec!["command-a".to_string()];
+        initial_store
+            .commit_transform(
+                "held-output",
+                TransformCommit {
+                    expected: loaded.row_version,
+                    core: &loaded.core,
+                    meta: &loaded.meta,
+                    consumed_drop_ids: &[pending[0].id],
+                    first_applied_command_ids: &command_ids,
+                    memory_revision: None,
+                    overlays: TransformOverlayBatch::default(),
+                },
+            )
+            .unwrap();
+        drop(initial_store);
+        let store_after_restart = store(dir.path());
+
+        for pass in 0..3 {
+            let response = run(
+                &store_after_restart,
+                &with_usage(stable_request.clone(), 70, 100),
+                &spine(),
+            );
+            assert_eq!(
+                serde_json::to_vec(&response.ck_messages).unwrap(),
+                baseline_bytes,
+                "held work must not rewrite the full rendered array on stable pass {pass}"
+            );
+            assert!(
+                frozen_red_payload(
+                    &store_after_restart.load("held-output").unwrap().core,
+                    "held#0",
+                )
+                .is_none(),
+                "a held remainder must remain unfrozen until a ride opportunity"
+            );
+        }
+    }
+
+    #[test]
+    fn another_command_rides_held_remainder_in_one_full_array_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut messages = vec![
+            item("covered", 0, "covered"),
+            item("a-held", 1, "a held"),
+            item("b-first", 2, "b first"),
+            item("a-first", 3, "a first"),
+        ];
+        store
+            .replace_compartments("ride-output", &[comp(1, 0, 0, "covered", "summary")])
+            .unwrap();
+        messages.extend((4..=22).map(|ordinal| {
+            item(
+                &format!("filler-{ordinal}"),
+                ordinal,
+                &format!("filler {ordinal}"),
+            )
+        }));
+        let stable_request = active_cc_req("ride-output", "cfg0", messages.clone());
+        run(&store, &stable_request, &spine());
+        let baseline = run(&store, &stable_request, &spine());
+        let baseline_bytes = serde_json::to_vec(&baseline.ck_messages).unwrap();
+
+        store
+            .append_pending_agent_drops_with_command(
+                "ride-output",
+                Some("command-a"),
+                &["a-first#0".to_string(), "a-held#0".to_string()],
+                1,
+            )
+            .unwrap();
+        let pending_a = store.load_pending_agent_drops("ride-output").unwrap();
+        let loaded = store.load("ride-output").unwrap();
+        let command_a = vec!["command-a".to_string()];
+        store
+            .commit_transform(
+                "ride-output",
+                TransformCommit {
+                    expected: loaded.row_version,
+                    core: &loaded.core,
+                    meta: &loaded.meta,
+                    consumed_drop_ids: &[pending_a[0].id],
+                    first_applied_command_ids: &command_a,
+                    memory_revision: None,
+                    overlays: TransformOverlayBatch::default(),
+                },
+            )
+            .unwrap();
+        store
+            .append_pending_agent_drops_with_command(
+                "ride-output",
+                Some("command-b"),
+                &["b-first#0".to_string()],
+                2,
+            )
+            .unwrap();
+
+        let ride = run(
+            &store,
+            &with_usage(stable_request.clone(), 70, 100),
+            &spine(),
+        );
+        assert_eq!(ride.action, "SOFT", "ride response: {ride:?}");
+        let ride_bytes = serde_json::to_vec(&ride.ck_messages).unwrap();
+        assert_ne!(
+            ride_bytes, baseline_bytes,
+            "the ride pass must be the one bust"
+        );
+        let frozen = store.load("ride-output").unwrap().core;
+        assert!(frozen_red_payload(&frozen, "a-held#0").is_some());
+        assert!(frozen_red_payload(&frozen, "b-first#0").is_some());
+
+        let replay = run(&store, &with_usage(stable_request, 70, 100), &spine());
+        let replay_bytes = serde_json::to_vec(&replay.ck_messages).unwrap();
+        assert_eq!(replay_bytes, ride_bytes);
+        let distinct_byte_changing_passes = [baseline_bytes, ride_bytes, replay_bytes]
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count();
+        assert!(
+            distinct_byte_changing_passes <= 2,
+            "two commands may cause at most two self-caused busts"
+        );
+    }
+
+    #[test]
     fn newest_tag_block_set_isolates_protected_and_applied_pending_rows() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -9216,8 +9427,9 @@ mod tests {
         }
         store.seed_tags_for_test("protected", &tags, 1).unwrap();
         store
-            .append_pending_agent_drops(
+            .append_pending_agent_drops_with_command(
                 "protected",
+                Some("range-command"),
                 &["m4#0".to_string(), "m5#0".to_string(), "m24#1".to_string()],
                 99,
             )
@@ -9247,6 +9459,25 @@ mod tests {
             .collect::<Vec<_>>();
         retained.sort();
         assert_eq!(retained, vec!["m24#1".to_string(), "m5#0".to_string()]);
+        let pending = store.load_pending_agent_drops("protected").unwrap();
+        assert!(pending.iter().all(|row| {
+            row.command_id.as_deref() == Some("range-command")
+                && row.command_first_applied_at_ms.is_some()
+        }));
+        let replay = store
+            .append_pending_agent_drops_with_command(
+                "protected",
+                Some("range-command"),
+                &["m5#0".to_string(), "m24#1".to_string()],
+                100,
+            )
+            .unwrap();
+        assert_eq!(replay.queued, 0);
+        assert!(replay.duplicate);
+        assert_eq!(
+            store.load_pending_agent_drops("protected").unwrap(),
+            pending
+        );
     }
 
     #[test]
@@ -11009,6 +11240,7 @@ mod tests {
                 core: &poisoned.core,
                 meta: &poisoned.meta,
                 consumed_drop_ids: &[],
+                first_applied_command_ids: &[],
                 memory_revision: None,
                 overlays: TransformOverlayBatch::default(),
             },
