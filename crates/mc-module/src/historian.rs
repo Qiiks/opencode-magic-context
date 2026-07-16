@@ -319,6 +319,14 @@ pub fn persist_historian_state(
     Ok(store.commit(session_id, loaded.row_version, &loaded.core, &meta)?)
 }
 
+pub trait HistorianPublicationFence: Send + Sync {
+    fn publish(
+        &self,
+        store: &McStore,
+        request: HistorianPublishRequest<'_>,
+    ) -> Result<HistorianPublishResult, HistorianPublishError>;
+}
+
 pub struct ValidatedPublishRequest<'a> {
     pub session_id: &'a str,
     pub project_path: &'a str,
@@ -332,6 +340,7 @@ pub struct ValidatedPublishRequest<'a> {
     /// Creation timestamp stamped on the appended compartment rows.
     pub created_at_ms: i64,
     pub failure_backoff_at_ms: i64,
+    pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
 /// Publish after re-checking the chunk fingerprint at the commit point. A mismatch
@@ -369,7 +378,7 @@ pub fn publish_validated_chunk(
         .collect();
     let facts: Vec<FactCandidate> = request.validated.facts.iter().map(to_store_fact).collect();
 
-    match store.publish_historian_chunk(HistorianPublishRequest {
+    let publish_request = HistorianPublishRequest {
         session_id: request.session_id,
         expected_row_version: request.expected_row_version,
         expected_revert_epoch: request.expected_revert_epoch,
@@ -379,7 +388,12 @@ pub fn publish_validated_chunk(
         facts: &facts,
         publication_floor_ordinal: request.publication_floor_ordinal,
         chunk_transcript: Some(request.chunk_transcript),
-    }) {
+    };
+    let publish_result = match request.publication_fence {
+        Some(fence) => fence.publish(store, publish_request),
+        None => store.publish_historian_chunk(publish_request),
+    };
+    match publish_result {
         Ok(result) => Ok(result),
         Err(HistorianPublishError::CasConflict {
             expected,
@@ -635,6 +649,7 @@ pub struct HistorianFireRequest<'a> {
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
     pub completion_now_ms: fn() -> i64,
+    pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
 pub struct HistorianReattachRequest<'a> {
@@ -1073,6 +1088,7 @@ where
             failure_started_at_ms: request.now_ms,
             failure_backoff_at_ms: request.failure_backoff_at_ms,
             completion_now_ms: request.completion_now_ms,
+            publication_fence: request.publication_fence,
         });
         producer.close().await;
         let row_version = match publish_result {
@@ -1221,6 +1237,7 @@ where
         failure_started_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
         completion_now_ms: request.completion_now_ms,
+        publication_fence: None,
     });
     producer.close().await;
     let row_version = publish_result?;
@@ -1247,6 +1264,7 @@ struct PublishOutputRequest<'a> {
     failure_started_at_ms: i64,
     failure_backoff_at_ms: i64,
     completion_now_ms: fn() -> i64,
+    publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
 fn publish_output_from_awaiting(
@@ -1267,6 +1285,7 @@ fn publish_output_from_awaiting(
         failure_started_at_ms,
         failure_backoff_at_ms,
         completion_now_ms,
+        publication_fence,
     } = request;
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
@@ -1335,6 +1354,7 @@ fn publish_output_from_awaiting(
             chunk_transcript,
             created_at_ms,
             failure_backoff_at_ms,
+            publication_fence,
         },
     )?;
     Ok(published.row_version)
@@ -1731,6 +1751,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         }
     }
 
@@ -3076,6 +3097,7 @@ mod tests {
                 chunk_transcript: "U: transcript",
                 created_at_ms: 123,
                 failure_backoff_at_ms: 0,
+                publication_fence: None,
             },
         )
         .expect("publish succeeds");
@@ -3190,6 +3212,7 @@ mod tests {
                 chunk_transcript: "U: transcript",
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
+                publication_fence: None,
             },
         )
         .unwrap_err();
@@ -3256,6 +3279,7 @@ mod tests {
                 chunk_transcript: "U: transcript",
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
+                publication_fence: None,
             },
         )
         .unwrap_err();

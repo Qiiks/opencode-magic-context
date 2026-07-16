@@ -1693,7 +1693,6 @@ pub struct WrapupCommandRecord<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordWrapupCommandOutcome {
     Recorded(WrapupCommandRow),
-    LegacyFailurePreserved(WrapupCommandRow),
     Stale {
         found_row_version: Option<u64>,
         found_revert_epoch: u64,
@@ -3144,24 +3143,34 @@ impl McStore {
                     found_revert_epoch,
                 });
             }
-            let legacy_failure = transaction
+            let legacy_failure_created_at = transaction
                 .query_row(
-                    "SELECT disposition FROM mc_wrapup_commands
+                    "SELECT disposition, created_at FROM mc_wrapup_commands
                      WHERE session_id = ?1 AND command_id = ?2",
                     params![record.session_id, record.command_id],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?
-                .is_some_and(|disposition| disposition == "failed");
-            if legacy_failure {
-                return Ok(RecordWrapupCommandOutcome::LegacyFailurePreserved(
-                    WrapupCommandRow {
-                        disposition: record.disposition.to_string(),
-                        rounds: record.rounds,
-                        summary: record.summary.to_string(),
-                        created_at: record.created_at,
-                    },
-                ));
+                .and_then(|(disposition, created_at)| {
+                    (disposition == "failed").then_some(created_at)
+                });
+            if let Some(failed_created_at) = legacy_failure_created_at {
+                // A failed audit row is not replayable. Replace it in this fenced
+                // transaction so a lost successful response becomes durable idempotency.
+                let summary = wrapup_replaced_failure_summary(record.summary, failed_created_at);
+                transaction.execute(
+                    "UPDATE mc_wrapup_commands
+                     SET disposition = ?3, rounds = ?4, summary = ?5, created_at = ?6
+                     WHERE session_id = ?1 AND command_id = ?2 AND disposition = 'failed'",
+                    params![
+                        record.session_id,
+                        record.command_id,
+                        record.disposition,
+                        rounds,
+                        summary,
+                        record.created_at
+                    ],
+                )?;
             }
 
             transaction.execute(
@@ -3196,7 +3205,7 @@ impl McStore {
         })?)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn seed_legacy_wrapup_command_for_test(
         &self,
         session_id: &str,
@@ -6575,6 +6584,18 @@ fn coalesce_mutations(rows: Vec<StoredMemoryMutation>) -> Vec<StoredMemoryMutati
     out
 }
 
+fn wrapup_replaced_failure_summary(summary: &str, failed_created_at: i64) -> String {
+    const SUMMARY_MAX_CHARS: usize = 500;
+
+    let suffix = format!("; replaced failed record from {failed_created_at}");
+    let prefix_chars = SUMMARY_MAX_CHARS.saturating_sub(suffix.chars().count());
+    format!(
+        "{}{}",
+        summary.chars().take(prefix_chars).collect::<String>(),
+        suffix
+    )
+}
+
 fn capped_trace_error(error: &str) -> String {
     error.chars().take(2000).collect()
 }
@@ -7433,6 +7454,54 @@ mod tests {
             RecordWrapupCommandOutcome::Recorded(WrapupCommandRow { ref disposition, .. })
                 if disposition == "completed"
         ));
+    }
+
+    #[test]
+    fn wrapup_command_recording_replaces_legacy_failure_with_capped_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let initial = store.load("session").unwrap();
+        let row_version = store
+            .commit("session", initial.row_version, &initial.core, &initial.meta)
+            .unwrap();
+        store
+            .seed_legacy_wrapup_command_for_test(
+                "session",
+                "legacy",
+                "failed",
+                1,
+                "old failure",
+                17,
+            )
+            .unwrap();
+        let summary = "é".repeat(600);
+
+        let outcome = store
+            .record_wrapup_command_if_current(WrapupCommandRecord {
+                session_id: "session",
+                command_id: "legacy",
+                disposition: "completed",
+                rounds: 3,
+                summary: &summary,
+                created_at: 99,
+                expected_row_version: Some(row_version),
+                expected_revert_epoch: 0,
+            })
+            .unwrap();
+        let RecordWrapupCommandOutcome::Recorded(recorded) = outcome else {
+            panic!("legacy failure must be atomically replaced");
+        };
+        assert_eq!(recorded.disposition, "completed");
+        assert_eq!(recorded.rounds, 3);
+        assert_eq!(recorded.created_at, 99);
+        assert!(recorded.summary.chars().count() <= 500);
+        assert!(recorded
+            .summary
+            .ends_with("; replaced failed record from 17"));
+        assert_eq!(
+            store.load_wrapup_command("session", "legacy").unwrap(),
+            Some(recorded)
+        );
     }
 
     #[test]
