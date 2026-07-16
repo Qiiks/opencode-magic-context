@@ -52,7 +52,11 @@ export type SpecEntry = {
     mergeInto?: number;
     importance: number;
 };
-export type SourceMemory = { id: number; category: Category };
+export type SourceMemory = {
+    id: number;
+    category: Category;
+    importance: number;
+};
 type Placement = {
     category: Category;
     room: string;
@@ -118,7 +122,7 @@ function codepoints(value: string): number {
     return [...value].length;
 }
 
-export function parseSource(source: string): SourceMemory[] {
+export function parseSource(source: string, importanceById: ReadonlyMap<number, number>): SourceMemory[] {
     const memories: SourceMemory[] = [];
     let category: Category | undefined;
     for (const line of source.split("\n")) {
@@ -136,7 +140,11 @@ export function parseSource(source: string): SourceMemory[] {
         const id = line.match(/^#(\d+):/)?.[1];
         if (id) {
             if (!category) throw new Error(`memory ${id} is outside a category`);
-            memories.push({ id: Number(id), category });
+            const numericId = Number(id);
+            const importance = importanceById.get(numericId);
+            if (importance === undefined || !Number.isFinite(importance))
+                throw new Error(`source importance missing for ${id}`);
+            memories.push({ id: numericId, category, importance });
         }
     }
     return memories;
@@ -230,28 +238,33 @@ function cueOutsideCode(value: string): string {
 }
 
 /**
- * Polarity and mechanism defects are model-quality findings, not structural
- * corruption: with PALACE_RENDER_DESPITE_VALIDATOR set they downgrade to
- * warnings so a near-miss manifest can still render for human review, while
- * structural defects (duplicate ids, category mismatches, id leaks) stay fatal.
+ * Cue-quality and reviewable coverage defects downgrade to warnings when
+ * PALACE_RENDER_DESPITE_VALIDATOR is set so near-miss manifests still render
+ * for human review. Other validation failures remain fatal.
  */
-function reportCueDefect(message: string): void {
+function reportCueDefect(message: string, defects: string[]): void {
     if (process.env.PALACE_RENDER_DESPITE_VALIDATOR) {
+        defects.push(message);
         console.warn(`[palace] cue defect (rendering anyway): ${message}`);
         return;
     }
     throw new Error(message);
 }
 
-export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
+export function validate(source: SourceMemory[], specs: SpecEntry[]): string[] {
     if (source.length === 0) throw new Error("source contains no memories");
     if (new Set(source.map((memory) => memory.id)).size !== source.length)
         throw new Error("source contains duplicate memory ids");
+    for (const memory of source) {
+        if (!Number.isFinite(memory.importance))
+            throw new Error(`source importance missing for ${memory.id}`);
+    }
+    const defects: string[] = [];
     const sourceById = new Map(source.map((memory) => [memory.id, memory]));
     const specById = new Map<number, SpecEntry>();
     for (const spec of specs) {
         if (specById.has(spec.id)) {
-            reportCueDefect(`duplicate spec id ${spec.id}`);
+            reportCueDefect(`duplicate spec id ${spec.id}`, defects);
             // First occurrence wins on review renders; a duplicate would otherwise
             // draw the same memory in two rooms and distort utilization numbers.
             continue;
@@ -266,9 +279,17 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
         if (spec.mergeInto !== undefined && spec.cue !== undefined)
             throw new Error(`merged ${spec.id} also has cue`);
         const cue = Array.isArray(spec.cue) ? spec.cue.join(" ") : spec.cue;
-        if (cue && /#\d+/.test(cue)) reportCueDefect(`memory id leaked into cue ${spec.id}`);
+        if (cue && /#\d+/.test(cue)) reportCueDefect(`memory id leaked into cue ${spec.id}`, defects);
         if (cue) {
             const renderedCue = displayCue(spec);
+            const cueBudget = memory.importance >= 70 ? 90 : 50;
+            const renderedCueLength = codepoints(renderedCue);
+            if (renderedCueLength > cueBudget) {
+                reportCueDefect(
+                    `cue over budget for ${spec.id}: ${renderedCueLength} chars (max ${cueBudget})`,
+                    defects,
+                );
+            }
             for (const hubWord of spec.room
                 .split(/[^A-Za-z0-9]+/)
                 .filter((word) => word.length >= 2)) {
@@ -283,6 +304,7 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
             if (negativeRule && !mechanismCue.includes("⊘")) {
                 reportCueDefect(
                     `negative rule missing polarity marker in cue ${spec.id}: ${renderedCue}`,
+                    defects,
                 );
             }
             const polarityCount = mechanismCue.split("⊘").length - 1;
@@ -290,6 +312,7 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
             if (polarityCount > mechanismCount) {
                 reportCueDefect(
                     `polarity mechanism missing from rendered cue ${spec.id}: ${renderedCue}`,
+                    defects,
                 );
             }
             let marker = mechanismCue.indexOf("⊘");
@@ -299,6 +322,7 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
                 if (mechanism < 0 || (nextMarker >= 0 && mechanism > nextMarker)) {
                     reportCueDefect(
                         `polarity mechanism must follow marker ${spec.id}: ${renderedCue}`,
+                        defects,
                     );
                     break;
                 }
@@ -354,7 +378,7 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
     }
     const missing = source.filter((memory) => !specById.has(memory.id));
     if (missing.length > 0)
-        reportCueDefect(`uncovered source ids: ${missing.map((item) => item.id).join(", ")}`);
+        reportCueDefect(`uncovered source ids: ${missing.map((item) => item.id).join(", ")}`, defects);
     for (const spec of specs) {
         if (spec.mergeInto === undefined) continue;
         const target = specById.get(spec.mergeInto);
@@ -364,6 +388,7 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
             throw new Error(`merge ${spec.id} crosses room/category`);
         }
     }
+    return defects;
 }
 
 function longestToken(entries: SpecEntry[]): number {
@@ -834,7 +859,6 @@ export function renderPalace(specs: SpecEntry[]): {
                 if ((pagePixelHeights[pageIndex] ?? 0) > 0) {
                     pageLines.push([]);
                     pagePixelHeights.push(0);
-                    continued = true;
                     continue;
                 }
                 const split = splitBox(smallestBox);
@@ -1002,11 +1026,9 @@ export function renderPalace(specs: SpecEntry[]): {
                 );
             }
             remaining = nextRemaining;
-            if (remaining.length > 0) {
-                pageLines.push([]);
-                pagePixelHeights.push(0);
-                continued = true;
-            }
+            // Keep the page open; the next band creates a page only when its banner and
+            // boxes cannot fit.
+            if (remaining.length > 0) continued = true;
         }
     }
 
@@ -1164,8 +1186,11 @@ export function authorPalace(args: {
 }
 
 function main(): void {
-    const source = parseSource(readFileSync(SOURCE_PATH, "utf8"));
     const specs = readSpecs();
+    const source = parseSource(
+        readFileSync(SOURCE_PATH, "utf8"),
+        new Map(specs.map((spec) => [spec.id, spec.importance])),
+    );
     const { palace, coverage } = authorPalace({ source, specs });
     console.log(
         JSON.stringify({
