@@ -2032,6 +2032,12 @@ enum PublishTxnOutcome {
     Serde(String),
 }
 
+enum AbandonHistorianTxnOutcome {
+    Unchanged,
+    Committed(u64),
+    Serde(String),
+}
+
 enum TruncateTxnOutcome {
     Committed(TruncateOutcome),
     CasConflict(u64),
@@ -4679,6 +4685,71 @@ impl McStore {
             MemoryMutationOutcome::Duplicate(id) => {
                 Err(McStoreError::MemoryDuplicateContent { id })
             }
+        }
+    }
+
+    /// Return a matching in-flight historian run to Idle in one fenced transaction.
+    ///
+    /// This operation deliberately has no caller-supplied row version. A publication
+    /// failure may race with an unrelated cache-state commit, so the predicate and the
+    /// replacement state must both use the row observed after this transaction begins.
+    pub fn abandon_historian_run_if_matching(
+        &self,
+        session_id: &str,
+        predicate: &HistorianPublishPredicate,
+        failure_backoff_at_ms: Option<i64>,
+        detail: Option<&str>,
+    ) -> Result<Option<u64>, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((current, meta_json)) = row else {
+                return Ok(AbandonHistorianTxnOutcome::Unchanged);
+            };
+            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+                Ok(meta) => meta,
+                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+            };
+            let historian = &meta.historian;
+            let predicate_matches = historian.firing_seq == predicate.firing_seq
+                && historian.producer_run_id.as_deref() == Some(predicate.producer_run_id.as_str())
+                && historian.chunk_fingerprint == predicate.chunk_fingerprint;
+            if !predicate_matches || historian.state == HistorianPhase::Idle {
+                return Ok(AbandonHistorianTxnOutcome::Unchanged);
+            }
+
+            let last_failure = detail
+                .map(str::to_string)
+                .or_else(|| historian.last_failure.clone());
+            meta.historian = HistorianDurableState {
+                state: HistorianPhase::Idle,
+                firing_seq: historian.firing_seq,
+                failure_backoff_at_ms,
+                last_failure,
+                ..HistorianDurableState::default()
+            };
+            let next = current.max(0) as u64 + 1;
+            let meta_json = match serde_json::to_string(&meta) {
+                Ok(json) => json,
+                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+            };
+            tx.execute(
+                "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
+                 WHERE session_id = ?1 AND row_version = ?4",
+                params![session_id, next as i64, meta_json, current],
+            )?;
+            Ok(AbandonHistorianTxnOutcome::Committed(next))
+        })?;
+
+        match outcome {
+            AbandonHistorianTxnOutcome::Unchanged => Ok(None),
+            AbandonHistorianTxnOutcome::Committed(row_version) => Ok(Some(row_version)),
+            AbandonHistorianTxnOutcome::Serde(error) => Err(McStoreError::Serde(error)),
         }
     }
 
@@ -8628,6 +8699,52 @@ mod tests {
             content: "published summary".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn matching_historian_abandon_uses_the_transaction_current_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        let stale = store.load("ses").unwrap();
+        let bumped = store
+            .commit("ses", stale.row_version, &stale.core, &stale.meta)
+            .unwrap();
+
+        let abandoned = store
+            .abandon_historian_run_if_matching(
+                "ses",
+                &publish_predicate(),
+                None,
+                Some("snapshot generation changed"),
+            )
+            .unwrap();
+        assert_eq!(abandoned, Some(bumped + 1));
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.row_version, abandoned);
+        assert_eq!(loaded.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(loaded.meta.historian.firing_seq, 7);
+        assert_eq!(loaded.meta.historian.failure_backoff_at_ms, None);
+        assert_eq!(
+            loaded.meta.historian.last_failure.as_deref(),
+            Some("snapshot generation changed")
+        );
+
+        let unchanged_version = loaded.row_version;
+        assert_eq!(
+            store
+                .abandon_historian_run_if_matching(
+                    "ses",
+                    &publish_predicate(),
+                    Some(999),
+                    Some("must not replace Idle"),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.load("ses").unwrap().row_version, unchanged_version);
     }
 
     #[test]

@@ -1138,6 +1138,12 @@ enum TransformSnapshotLookup {
     Ready(SnapshotLease),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformSnapshotObservation {
+    Absent,
+    Generation(u64),
+}
+
 struct TransformSnapshotCache {
     entries: HashMap<String, TransformSnapshot>,
     ready_lru: VecDeque<String>,
@@ -1298,6 +1304,35 @@ impl TransformSnapshotCache {
         )
     }
 
+    fn observe(&self, session_id: &str) -> TransformSnapshotObservation {
+        match self.entries.get(session_id) {
+            Some(TransformSnapshot::InFlight { generation })
+            | Some(TransformSnapshot::Ready { generation, .. }) => {
+                TransformSnapshotObservation::Generation(*generation)
+            }
+            None => TransformSnapshotObservation::Absent,
+        }
+    }
+
+    fn matches_observation(
+        &self,
+        session_id: &str,
+        observation: TransformSnapshotObservation,
+    ) -> bool {
+        match observation {
+            TransformSnapshotObservation::Absent => !self.entries.contains_key(session_id),
+            TransformSnapshotObservation::Generation(generation) => matches!(
+                self.entries.get(session_id),
+                Some(TransformSnapshot::InFlight {
+                    generation: current,
+                }) | Some(TransformSnapshot::Ready {
+                    generation: current,
+                    ..
+                }) if *current == generation
+            ),
+        }
+    }
+
     fn remove(&mut self, session_id: &str) {
         self.remove_ready_charge(session_id);
         self.in_flight_lru
@@ -1335,6 +1370,8 @@ pub struct McHandler {
     #[cfg(test)]
     status_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     connect_failure_commit_hook: ConnectFailureCommitHook,
+    #[cfg(test)]
+    publication_fence_write_hook: ConnectFailureCommitHook,
     /// Route channel → its session binding. Populated at `on_bind`, removed at
     /// `on_route_gone`. The SDK validates the route handle's epoch before dispatching a
     /// request, so a channel key cannot resolve a stale route. A `Mutex<HashMap>` (not a
@@ -1515,6 +1552,8 @@ struct WrapupSnapshotPublicationFence {
     snapshots: Arc<Mutex<TransformSnapshotCache>>,
     session_id: String,
     generation: u64,
+    #[cfg(test)]
+    after_store_publish: ConnectFailureCommitHook,
 }
 
 impl historian::HistorianPublicationFence for WrapupSnapshotPublicationFence {
@@ -1531,7 +1570,53 @@ impl historian::HistorianPublicationFence for WrapupSnapshotPublicationFence {
                 reason: "transform snapshot generation changed before publication".to_string(),
             });
         }
-        store.publish_historian_chunk(request)
+        let published = store.publish_historian_chunk(request);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_store_publish
+            .lock()
+            .expect("publication fence write hook mutex")
+            .as_mut()
+        {
+            hook();
+        }
+        published
+    }
+}
+
+struct ReattachSnapshotPublicationFence {
+    snapshots: Arc<Mutex<TransformSnapshotCache>>,
+    session_id: String,
+    observation: TransformSnapshotObservation,
+    #[cfg(test)]
+    after_store_publish: ConnectFailureCommitHook,
+}
+
+impl historian::HistorianPublicationFence for ReattachSnapshotPublicationFence {
+    fn publish(
+        &self,
+        store: &McStore,
+        request: mc_store::HistorianPublishRequest<'_>,
+    ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
+        // The observation and SQLite write share this lock so a new transform cannot
+        // replace the raw tail after validation but before additive rows are committed.
+        let snapshots = self.snapshots.lock().expect("transform snapshots mutex");
+        if !snapshots.matches_observation(&self.session_id, self.observation) {
+            return Err(mc_store::HistorianPublishError::FenceRejected {
+                reason: "transform snapshot state changed after reattach started".to_string(),
+            });
+        }
+        let published = store.publish_historian_chunk(request);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_store_publish
+            .lock()
+            .expect("publication fence write hook mutex")
+            .as_mut()
+        {
+            hook();
+        }
+        published
     }
 }
 
@@ -1607,6 +1692,8 @@ impl McHandler {
             #[cfg(test)]
             status_snapshot_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
@@ -1667,6 +1754,8 @@ impl McHandler {
             wrapup_operation_budget: Mutex::new(None),
             status_snapshot_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
@@ -2189,6 +2278,18 @@ impl McHandler {
 
         match phase {
             HistorianPhase::AwaitingProducer => {
+                let observation = self
+                    .transform_snapshots
+                    .lock()
+                    .expect("transform snapshots mutex")
+                    .observe(&session_id);
+                let publication_fence = Arc::new(ReattachSnapshotPublicationFence {
+                    snapshots: Arc::clone(&self.transform_snapshots),
+                    session_id: session_id.clone(),
+                    observation,
+                    #[cfg(test)]
+                    after_store_publish: Arc::clone(&self.publication_fence_write_hook),
+                });
                 let factory = Arc::clone(&self.producer_factory);
                 let project_root = PathBuf::from(&project_path);
                 let live: Vec<_> = projection
@@ -2256,6 +2357,7 @@ impl McHandler {
                                 now_ms: now,
                                 failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
                                 completion_now_ms: now_ms,
+                                publication_fence: Some(publication_fence.as_ref()),
                             },
                         )
                         .await
@@ -2573,8 +2675,9 @@ impl McHandler {
                 firing,
                 live_guard,
                 connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
-                // Organic firings assemble from raw store reads, not the cached wrapup
-                // snapshot, so they must not acquire its generation fence.
+                // Organic pressure firings assemble and publish in one continuous drive
+                // while the live-session guard is held. They do not depend on a cached raw
+                // snapshot, so a transform-snapshot generation fence would reject valid work.
                 publication_fence: None,
             },
         }))
@@ -3814,6 +3917,8 @@ impl McHandler {
                         snapshots: Arc::clone(&self.transform_snapshots),
                         session_id: session_id.clone(),
                         generation: ready.generation,
+                        #[cfg(test)]
+                        after_store_publish: Arc::clone(&self.publication_fence_write_hook),
                     }));
                     match self.run_wrapup_firing(task, deadline).await {
                         Ok(historian::HistorianDriveOutcome::Completed(_)) => {
@@ -7885,8 +7990,16 @@ mod tests {
             Arc::new(request)
         };
         let mut cache = TransformSnapshotCache::new(10);
+        assert_eq!(cache.observe("a"), TransformSnapshotObservation::Absent);
+        assert!(cache.matches_observation("a", TransformSnapshotObservation::Absent));
         let a = cache.begin("a");
+        assert_eq!(
+            cache.observe("a"),
+            TransformSnapshotObservation::Generation(a)
+        );
+        assert!(cache.matches_observation("a", TransformSnapshotObservation::Generation(a)));
         cache.finish_ready("a", a, request("a"), 1, 5);
+        assert!(cache.matches_observation("a", TransformSnapshotObservation::Generation(a)));
         let b = cache.begin("b");
         cache.finish_ready("b", b, request("b"), 2, 5);
         assert!(matches!(cache.get("a"), TransformSnapshotLookup::Ready(_)));
@@ -7967,6 +8080,55 @@ mod tests {
             assert_eq!((budget.count, budget.bytes), (0, 0));
         }
         assert!(matches!(cache.get("c"), TransformSnapshotLookup::Ready(_)));
+    }
+
+    #[test]
+    fn snapshot_lease_budget_rejects_second_lease_on_bytes_alone() {
+        let request = |session_id: &str| {
+            let mut request = transform_request(vec![ck("m1", 1, "text")], 1, 200_000);
+            request.session_id = session_id.to_string();
+            Arc::new(request)
+        };
+        let mut cache = TransformSnapshotCache::new(16);
+        {
+            let mut budget = cache
+                .active_leases
+                .lock()
+                .expect("snapshot lease budget mutex");
+            budget.max_bytes = 9;
+            budget.max_count = 8;
+        }
+        let first_generation = cache.begin("first");
+        cache.finish_ready("first", first_generation, request("first"), 0, 5);
+        let second_generation = cache.begin("second");
+        cache.finish_ready("second", second_generation, request("second"), 0, 5);
+
+        let first = match cache.get("first") {
+            TransformSnapshotLookup::Ready(lease) => lease,
+            _ => panic!("first lease must fit within both budgets"),
+        };
+        assert!(matches!(
+            cache.get("second"),
+            TransformSnapshotLookup::LeaseBudgetExceeded
+        ));
+        {
+            let budget = cache
+                .active_leases
+                .lock()
+                .expect("snapshot lease budget mutex");
+            assert_eq!(budget.count, 1);
+            assert!(
+                budget.count < budget.max_count,
+                "the count cap must not decide this case"
+            );
+            assert_eq!(budget.bytes, 5);
+        }
+
+        drop(first);
+        assert!(matches!(
+            cache.get("second"),
+            TransformSnapshotLookup::Ready(_)
+        ));
     }
 
     #[derive(Default)]
@@ -11095,6 +11257,124 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_publication_holds_snapshot_lock_through_store_write() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let before = historian_additive_rows(&store, "ses", &project);
+        let snapshots = Arc::clone(&handler.transform_snapshots);
+        let observed_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_lock_for_hook = Arc::clone(&observed_lock);
+        *handler
+            .publication_fence_write_hook
+            .lock()
+            .expect("publication fence write hook mutex") =
+            Some(Box::new(move || match snapshots.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    observed_lock_for_hook.store(true, Ordering::SeqCst);
+                }
+                Ok(_) => panic!("snapshot lock was released before the store write"),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("transform snapshots mutex poisoned")
+                }
+            }));
+
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert!(
+            matches!(
+                response["disposition"].as_str(),
+                Some("completed" | "nothing_to_compact")
+            ),
+            "{response}"
+        );
+        assert!(observed_lock.load(Ordering::SeqCst));
+        assert_ne!(historian_additive_rows(&store, "ses", &project), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fence_cleanup_atomically_survives_cache_state_bump_without_cooldown() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let before = historian_additive_rows(&store, "ses", &project);
+        let hook_handler = Arc::clone(&handler);
+        let hook_producer = Arc::clone(&producer);
+        *producer
+            .on_await_output
+            .lock()
+            .expect("await-output hook mutex") = Some(Box::new(move || {
+            let prompt = hook_producer
+                .prompts
+                .lock()
+                .expect("prompts mutex")
+                .last()
+                .cloned()
+                .expect("producer prompt");
+            let (start, end) = prompt_ordinal_range(&prompt).expect("prompt ordinal range");
+            hook_producer
+                .await_results
+                .lock()
+                .expect("await results mutex")
+                .push_back(Ok(ProducerOutput {
+                    text: historian_output_with_fact(start, end, "Atomic cleanup race fact."),
+                    length_capped: false,
+                }));
+            hook_handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .begin("ses");
+        }));
+        let bump_store = Arc::clone(&store);
+        historian::set_matching_run_abandon_interleave_hook(Box::new(move || {
+            let loaded = bump_store.load("ses").unwrap();
+            bump_store
+                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+        }));
+
+        let stale = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert_eq!(stale["disposition"], json!("retryable"), "{stale}");
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, None);
+        assert_eq!(historian_additive_rows(&store, "ses", &project), before);
+
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let starts_before_retry = producer.starts.load(Ordering::SeqCst);
+        let retry = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert!(
+            producer.starts.load(Ordering::SeqCst) > starts_before_retry,
+            "immediate retry was not admitted: {retry}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fence_rejection_leaves_no_backoff_and_immediate_retry_executes() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
@@ -12113,6 +12393,62 @@ mod tests {
         assert_eq!(producer.binds.load(Ordering::SeqCst), 0);
         assert_eq!(producer.statuses.load(Ordering::SeqCst), 0);
         assert_eq!(producer.await_outputs.load(Ordering::SeqCst), 0);
+    }
+
+    async fn run_reattach_generation_case(
+        interleave_new_generation: bool,
+    ) -> (
+        HistorianAdditiveRows,
+        HistorianAdditiveRows,
+        HistorianDurableState,
+    ) {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        producer
+            .outputs
+            .lock()
+            .unwrap()
+            .push_back(historian_output_with_fact(
+                1,
+                3,
+                "Reattached generation fact.",
+            ));
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+        seed_awaiting(&store, &messages);
+        let before = historian_additive_rows(&store, "ses", &project);
+
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["no_fire"], "reattaching");
+        wait_for_count(&producer.await_outputs, 1).await;
+        if interleave_new_generation {
+            handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .begin("ses");
+        }
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        wait_for_idle(&store).await;
+
+        let after = historian_additive_rows(&store, "ses", &project);
+        let state = store.load("ses").unwrap().meta.historian;
+        (before, after, state)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reattach_snapshot_fence_rejects_new_generation_and_control_publishes() {
+        let (stale_before, stale_after, stale_state) = run_reattach_generation_case(true).await;
+        assert_eq!(stale_after, stale_before);
+        assert_eq!(stale_state.state, HistorianPhase::Idle);
+        assert_eq!(stale_state.failure_backoff_at_ms, None);
+
+        let (control_before, control_after, control_state) =
+            run_reattach_generation_case(false).await;
+        assert_ne!(control_after, control_before);
+        assert_eq!(control_state.state, HistorianPhase::Idle);
     }
 
     #[tokio::test(flavor = "current_thread")]

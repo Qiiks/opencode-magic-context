@@ -8,6 +8,9 @@
 use std::fmt;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::cell::RefCell;
+
 use mc_store::{
     FactCandidate, HistorianChunkRange, HistorianDurableState, HistorianPhase,
     HistorianPublishError, HistorianPublishPredicate, HistorianPublishRequest,
@@ -29,6 +32,32 @@ pub const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
 const CHAIN_EXHAUSTED_PERMANENT_PREFIX: &str = "chain-exhausted-permanent:";
 const AUTH_REQUIRED_PREFIX: &str = "auth-required:";
 const UNKNOWN_ERROR_CLASS_PREFIX: &str = "unknown-error-class:";
+
+#[cfg(test)]
+thread_local! {
+    static MATCHING_RUN_ABANDON_INTERLEAVE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_matching_run_abandon_interleave_hook(hook: Box<dyn FnOnce()>) {
+    MATCHING_RUN_ABANDON_INTERLEAVE_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+fn run_matching_run_abandon_interleave_hook(
+    store: &McStore,
+    session_id: &str,
+) -> Result<(), HistorianStateError> {
+    let hook = MATCHING_RUN_ABANDON_INTERLEAVE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        // Simulate a stale caller read so the race test proves cleanup re-reads the
+        // current historian state inside its fenced transaction.
+        let _stale = store.load(session_id)?;
+        hook();
+    }
+    Ok(())
+}
 
 /// Project a validated compartment onto the durable store row shape. Validation
 /// resolves the message-id endpoints and tiers; publication only stamps the
@@ -680,6 +709,7 @@ pub struct HistorianReattachRequest<'a> {
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
     pub completion_now_ms: fn() -> i64,
+    pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
 /// Session-id prefix for the module's own producer (child) sessions. The transform
@@ -1252,7 +1282,7 @@ where
         failure_started_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
         completion_now_ms: request.completion_now_ms,
-        publication_fence: None,
+        publication_fence: request.publication_fence,
     });
     producer.close().await;
     let row_version = publish_result?;
@@ -1430,24 +1460,9 @@ fn abandon_matching_run_without_cooldown(
     predicate: &HistorianPublishPredicate,
     detail: Option<String>,
 ) -> Result<Option<u64>, HistorianStateError> {
-    let loaded = store.load(session_id)?;
-    let state = &loaded.meta.historian;
-    let matches = state.firing_seq == predicate.firing_seq
-        && state.producer_run_id.as_deref() == Some(predicate.producer_run_id.as_str())
-        && state.chunk_fingerprint == predicate.chunk_fingerprint;
-    if !matches || state.state == HistorianPhase::Idle {
-        return Ok(None);
-    }
-    let mut meta = loaded.meta.clone();
-    meta.historian = HistorianDurableState {
-        state: HistorianPhase::Idle,
-        firing_seq: state.firing_seq,
-        failure_backoff_at_ms: None,
-        last_failure: detail.or_else(|| state.last_failure.clone()),
-        ..HistorianDurableState::default()
-    };
-    let row_version = store.commit(session_id, loaded.row_version, &loaded.core, &meta)?;
-    Ok(Some(row_version))
+    #[cfg(test)]
+    run_matching_run_abandon_interleave_hook(store, session_id)?;
+    Ok(store.abandon_historian_run_if_matching(session_id, predicate, None, detail.as_deref())?)
 }
 
 fn abandon_matching_run_with_detail(
@@ -1457,19 +1472,12 @@ fn abandon_matching_run_with_detail(
     failure_backoff_at_ms: i64,
     detail: Option<String>,
 ) -> Result<Option<u64>, HistorianStateError> {
-    let loaded = store.load(session_id)?;
-    let state = &loaded.meta.historian;
-    let matches = state.firing_seq == predicate.firing_seq
-        && state.producer_run_id.as_deref() == Some(predicate.producer_run_id.as_str())
-        && state.chunk_fingerprint == predicate.chunk_fingerprint;
-    if !matches || state.state == HistorianPhase::Idle {
-        return Ok(None);
-    }
-
-    let mut meta = loaded.meta.clone();
-    meta.historian = abandon_with_detail(state, failure_backoff_at_ms, detail);
-    let row_version = store.commit(session_id, loaded.row_version, &loaded.core, &meta)?;
-    Ok(Some(row_version))
+    Ok(store.abandon_historian_run_if_matching(
+        session_id,
+        predicate,
+        Some(failure_backoff_at_ms),
+        detail.as_deref(),
+    )?)
 }
 
 #[cfg(test)]
@@ -1818,6 +1826,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         }
     }
 
@@ -2390,6 +2399,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         };
         let right_request = HistorianReattachRequest {
             store: &store,
@@ -2404,6 +2414,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         };
 
         let (left, right) = tokio::join!(
@@ -2830,6 +2841,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         };
         let err = reattach_historian_producer(&mut producer, request)
             .await
