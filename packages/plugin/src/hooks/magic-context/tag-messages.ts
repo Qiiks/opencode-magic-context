@@ -190,7 +190,14 @@ function deriveToolOwnerMessageId(
     return obs.callId;
 }
 
-export type MessageInfo = { id?: string; role?: string; sessionID?: string; error?: unknown };
+export type MessageInfo = {
+    id?: string;
+    role?: string;
+    sessionID?: string;
+    summary?: boolean;
+    finish?: string;
+    error?: unknown;
+};
 
 export interface ThinkingLikePart {
     type: string;

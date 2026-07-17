@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import {
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
@@ -19,11 +20,19 @@ import {
     setPendingCompactionMarkerState,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { getPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
+import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
+import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { registerActiveCompartmentRun } from "./compartment-runner";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
 import { injectM0M1, type M0HardSignals } from "./inject-compartments";
-import type { MessageLike, TagTarget, ThinkingLikePart } from "./tag-messages";
+import {
+    type MessageLike,
+    type TagTarget,
+    type ThinkingLikePart,
+    tagMessages,
+} from "./tag-messages";
 import {
     createToolDropTarget,
     extractToolCallObservation,
@@ -169,6 +178,8 @@ function basePostTransformArgs(
         targets: new Map(),
         reasoningByMessage: new Map(),
         messageTagNumbers: new Map(),
+        tagger: createTagger(),
+        ctxReduceCallable: true,
         batch: null,
         contextUsage: { percentage: 20, inputTokens: 1000 },
         schedulerDecision: "defer",
@@ -293,6 +304,185 @@ function serializeAnthropicWirePrefix(messages: MessageLike[]): string {
         })),
     );
 }
+
+function serializeAnthropicWireWithAdjacentAssistantMerge(messages: MessageLike[]): string {
+    const merged: MessageLike[] = [];
+    for (const message of messages) {
+        const previous = merged.at(-1);
+        if (previous?.info.role === "assistant" && message.info.role === "assistant") {
+            previous.parts.push(...message.parts);
+        } else {
+            merged.push(structuredClone(message));
+        }
+    }
+    return serializeAnthropicWirePrefix(merged);
+}
+
+describe("deferred compaction marker representation", () => {
+    it("keeps the marker-consuming fold byte-identical with the rebuilt defer wire", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-wire-stability";
+        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-marker-wire-"));
+        tempDirs.push(dataHome);
+        process.env.XDG_DATA_HOME = dataHome;
+        mkdirSync(join(dataHome, "opencode"), { recursive: true });
+        const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        opencodeDb.exec(
+            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        const insertMessage = opencodeDb.prepare(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+        );
+        insertMessage.run(
+            "msg-boundary",
+            sessionId,
+            1_000,
+            1_000,
+            JSON.stringify({ role: "user" }),
+        );
+        insertMessage.run(
+            "msg-tail-assistant",
+            sessionId,
+            2_000,
+            2_000,
+            JSON.stringify({ role: "assistant" }),
+        );
+        opencodeDb.close();
+
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 10,
+                startMessageId: "msg-boundary",
+                endMessageId: "msg-boundary",
+                title: "wire stability",
+                content: "test content",
+            },
+        ]);
+        setPendingCompactionMarkerState(db, sessionId, {
+            ordinal: 10,
+            endMessageId: "msg-boundary",
+            publishedAt: 1,
+        });
+
+        const tagger = createTagger();
+        const foldMessages = [
+            {
+                info: {
+                    id: "msg-tail-assistant",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    finish: "stop",
+                },
+                parts: [
+                    {
+                        type: "tool_use",
+                        id: "toolu-tail",
+                        name: "read",
+                        input: { path: "README.md" },
+                    },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, foldMessages, {
+                tagger,
+                deferredHistoryWasPendingAtPassStart: true,
+                historyRebuiltThisPass: true,
+                canConsumeDeferredLate: true,
+                deferredHistoryRefreshSessions,
+                pendingCompartmentInjection: {
+                    block: "",
+                    compartmentEndMessage: 10,
+                    compartmentEndMessageId: "msg-boundary",
+                    compartmentCount: 1,
+                    skippedVisibleMessages: 0,
+                    factCount: 0,
+                    memoryCount: 0,
+                    rebuiltFromDb: true,
+                },
+            }),
+        );
+
+        const marker = getPersistedCompactionMarkerState(db, sessionId);
+        expect(marker?.summaryMessageId).toBeString();
+        expect(foldMessages.map((message) => message.info.id)).toEqual([
+            undefined,
+            marker?.summaryMessageId,
+            "msg-tail-assistant",
+        ]);
+        expect(foldMessages[1]?.parts).toEqual([
+            expect.objectContaining({
+                type: "text",
+                text: expect.stringContaining(MARKER_SUMMARY_TEXT),
+            }),
+        ]);
+
+        const foldWire = serializeAnthropicWireWithAdjacentAssistantMerge(foldMessages);
+        const rebuiltMessages = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<session-history>\n\n</session-history>",
+                        synthetic: true,
+                    },
+                ],
+            },
+            {
+                info: {
+                    id: marker?.summaryMessageId,
+                    role: "assistant",
+                    sessionID: sessionId,
+                    summary: true,
+                    finish: "stop",
+                },
+                parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+            },
+            {
+                info: {
+                    id: "msg-tail-assistant",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    finish: "stop",
+                },
+                parts: [
+                    {
+                        type: "tool_use",
+                        id: "toolu-tail",
+                        name: "read",
+                        input: { path: "README.md" },
+                    },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        tagger.initFromDb(sessionId, db);
+        // This is the next pass's normal tag stage. OpenCode then groups the
+        // adjacent assistant messages while building the Anthropic wire.
+        tagMessages(sessionId, rebuiltMessages, tagger, db);
+        const deferWire = serializeAnthropicWireWithAdjacentAssistantMerge(rebuiltMessages);
+
+        expect(deferWire).toBe(foldWire);
+        expect(JSON.parse(foldWire)).toMatchObject([
+            {},
+            {
+                role: "assistant",
+                content: [
+                    { type: "text", text: expect.stringContaining(MARKER_SUMMARY_TEXT) },
+                    { type: "tool_use", id: "toolu-tail" },
+                ],
+            },
+        ]);
+    });
+});
 
 describe("deferred compaction marker CAS drain", () => {
     it("preserves the deferred-history signal when a newer pending blob exists", () => {

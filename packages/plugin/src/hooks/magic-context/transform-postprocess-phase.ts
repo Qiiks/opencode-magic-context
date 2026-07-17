@@ -23,12 +23,13 @@ import {
     setPersistedTodoSyntheticAnchor,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import type { Tagger } from "../../features/magic-context/tagger";
 import type { SessionMeta, TagEntry } from "../../features/magic-context/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { runAutoSearchHint } from "./auto-search-runner";
-import { applyDeferredCompactionMarker } from "./compaction-marker-manager";
+import { applyDeferredCompactionMarker, MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { getActiveCompartmentRun } from "./compartment-runner";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
@@ -45,6 +46,7 @@ import {
 import { markNoteNudgeDelivered, peekNoteNudgeText } from "./note-nudger";
 import { hasVisibleNoteReadCall } from "./note-visibility";
 import type { PassOutcome } from "./pass-outcome";
+import { estimateTokens } from "./read-session-formatting";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
     clearOldReasoning,
@@ -55,6 +57,7 @@ import {
     stripSystemInjectedMessages,
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
+import { byteSize, prependTag } from "./tag-content-primitives";
 import { buildSyntheticTodoPart } from "./todo-view";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
@@ -87,6 +90,75 @@ export type DeferredCompactionMarkerClearOutcome =
     | "cleared"
     | "cas-lost-newer-pending"
     | "cas-lost-already-cleared";
+
+/**
+ * Add the deferred marker summary to the current transform array before the
+ * marker row becomes visible in OpenCode's database-backed input.
+ *
+ * OpenCode runs this transform before provider serialization. On the next pass
+ * it supplies a separate summary assistant before the retained tail, and the
+ * Anthropic serializer groups adjacent assistant messages into one wire
+ * message. Adding the same source assistant now keeps both passes' provider
+ * content blocks identical. Other providers retain the source message
+ * boundary, which is also the representation they receive on the next pass.
+ *
+ * The summary tag is allocated now, after the current pass has assigned all
+ * visible tags. The allocation is persisted under the summary part's stable
+ * content id, so the next pass reuses the same §N§ prefix when it tags the
+ * database-backed summary row.
+ */
+export function injectDeferredCompactionSummaryRepresentation(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    messages: MessageLike[];
+    tagger: Tagger;
+    summaryMessageId: string;
+    ctxReduceCallable: boolean;
+}): boolean {
+    if (args.messages.some((message) => message.info.id === args.summaryMessageId)) {
+        return false;
+    }
+
+    const summaryTagNumber = args.tagger.assignTag(
+        args.sessionId,
+        `${args.summaryMessageId}:p0`,
+        "message",
+        byteSize(MARKER_SUMMARY_TEXT),
+        args.db,
+        0,
+        null,
+        0,
+        null,
+        () => ({
+            tokenCount: estimateTokens(MARKER_SUMMARY_TEXT),
+            inputTokenCount: null,
+            reasoningTokenCount: null,
+        }),
+    );
+    const summaryText = args.ctxReduceCallable
+        ? prependTag(summaryTagNumber, MARKER_SUMMARY_TEXT)
+        : MARKER_SUMMARY_TEXT;
+    const summaryMessage: MessageLike = {
+        info: {
+            id: args.summaryMessageId,
+            role: "assistant",
+            sessionID: args.sessionId,
+            summary: true,
+            finish: "stop",
+        },
+        parts: [{ type: "text", text: summaryText }],
+    };
+
+    const firstTailAssistant = args.messages.findIndex(
+        (message) => message.info.role === "assistant" && message.info.summary !== true,
+    );
+    args.messages.splice(
+        firstTailAssistant >= 0 ? firstTailAssistant : args.messages.length,
+        0,
+        summaryMessage,
+    );
+    return true;
+}
 
 function pendingMarkerCoveredByConsumedBoundary(
     pending: PendingCompactionMarker,
@@ -132,6 +204,8 @@ interface RunPostTransformPhaseArgs {
     targets: Map<number, TagTarget>;
     reasoningByMessage: Map<MessageLike, { type: string; thinking?: string; text?: string }[]>;
     messageTagNumbers: Map<MessageLike, number>;
+    tagger: Tagger;
+    ctxReduceCallable: boolean;
     batch: { finalize: () => void } | null;
     contextUsage: { percentage: number; inputTokens: number };
     schedulerDecision: "execute" | "defer";
@@ -1288,6 +1362,16 @@ export async function runPostTransformPhase(
                     pending,
                     args.sessionDirectory,
                 );
+                if (outcome.kind === "applied") {
+                    injectDeferredCompactionSummaryRepresentation({
+                        db: args.db,
+                        sessionId: args.sessionId,
+                        messages: args.messages,
+                        tagger: args.tagger,
+                        summaryMessageId: outcome.summaryMessageId,
+                        ctxReduceCallable: args.ctxReduceCallable,
+                    });
+                }
                 switch (outcome.kind) {
                     case "applied":
                     case "already-current":
