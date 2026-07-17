@@ -809,3 +809,37 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
         expect(result.disabled_hooks?.sort()).toEqual(["a", "b", "c"]);
     });
 });
+
+describe("transform_mode resolution", () => {
+    it("keeps project rust mode only when user config supplies subc", () => {
+        const withSubc = loadWithUserAndProjectConfig(
+            JSON.stringify({ subc: { connection_file: "~/.local/share/cortexkit/subc.json" } }),
+            JSON.stringify({ transform_mode: "rust" }),
+        );
+        expect(withSubc.transform_mode).toBe("rust");
+
+        const withoutSubc = loadWithUserAndProjectConfig(
+            JSON.stringify({}),
+            JSON.stringify({ transform_mode: "rust" }),
+        );
+        expect(withoutSubc.transform_mode).toBe("ts");
+        expect(withoutSubc.configWarnings?.join("\n")).toContain(
+            "rust mode requires user-level subc configuration; running ts.",
+        );
+    });
+
+    it("passes the resolved rust mode to the plugin config without mutating project trust", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({
+                subc: { connection_file: "~/.local/share/cortexkit/subc.json" },
+            }),
+            JSON.stringify({
+                transform_mode: "rust",
+                subc: { connection_file: "/tmp/project-controlled.sock" },
+            }),
+        );
+
+        expect(result.transform_mode).toBe("rust");
+        expect(result.subc?.connection_file).not.toContain("project-controlled.sock");
+    });
+});

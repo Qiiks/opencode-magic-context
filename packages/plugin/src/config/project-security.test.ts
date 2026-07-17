@@ -23,6 +23,20 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("language"))).toBe(true);
     });
 
+    it("allows project transform_mode while still stripping project subc routing", () => {
+        const raw: Record<string, unknown> = {
+            transform_mode: "rust",
+            subc: { connection_file: "/tmp/project-controlled.sock" },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect(raw.transform_mode).toBe("rust");
+        expect(raw.subc).toBeUndefined();
+        expect(warnings.some((w) => w.includes("subc"))).toBe(true);
+        expect(warnings.some((w) => w.includes("transform_mode"))).toBe(false);
+    });
+
     it("strips sqlite.* from project config (resource-exhaustion vector)", () => {
         const raw: Record<string, unknown> = {
             sqlite: { cache_size_mb: 999_999, mmap_size_mb: 999_999 },
