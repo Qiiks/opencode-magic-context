@@ -67,6 +67,8 @@ const CHANNEL1_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_PRESSURE_FLOOR: f64 = 0.8;
 const CHANNEL1_USABLE_FRACTION: f64 = 1.0 / 3.0;
+const CHANNEL2_MIN_RECLAIMABLE: i64 = 10_000;
+const CHANNEL2_USABLE_FRACTION: f64 = 1.0 / 3.0;
 const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
 const USER_HINT_QUERY_CHAR_CAP: usize = 500;
 const USER_HINT_FRAGMENT_CHAR_CAP: usize = 100;
@@ -347,6 +349,17 @@ pub enum SurfaceState {
     Active,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Channel2NudgeDirective {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostDirectives {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel2_nudge: Option<Channel2NudgeDirective>,
+}
+
 /// A transform pass result. Diagnostics remain alongside the CK array, but the response
 /// messages themselves are bare CK messages: no request-only `mid` or `ordinal` sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -374,6 +387,10 @@ pub struct TransformResponse {
     /// `Some`, even when legitimately empty.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ck_messages: Option<Vec<CkWireMessage>>,
+    /// Host-delivery instructions are additive and profile-gated. The module does not
+    /// persist delivery because the host owns the channel-2 lease and deduplication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_directives: Option<HostDirectives>,
 }
 
 impl TransformResponse {
@@ -398,6 +415,7 @@ impl TransformResponse {
             coverage_ordinal: None,
             historian: None,
             ck_messages: None,
+            host_directives: None,
         }
     }
 
@@ -419,6 +437,7 @@ impl TransformResponse {
             coverage_ordinal: None,
             historian: None,
             ck_messages: Some(ck_messages),
+            host_directives: None,
         }
     }
 }
@@ -822,11 +841,10 @@ fn apply_once(
     // Previously stored overlay rows may still replay when boundary-lineage validation
     // later forces pass-through. Decisions from this request stay in memory until the
     // final cache-state compare-and-swap accepts the pass.
-    let mut tag_rows = if cc_u1_active {
-        transform_snapshot.tags
-    } else {
-        Vec::new()
-    };
+    // Tags are also the durable token-accounting source for host directives. Keeping them
+    // available on non-CC profiles is render-neutral: overlay bytes remain gated by
+    // `tagging_active`, while the OpenCode host can receive the same ceiling decision.
+    let mut tag_rows = transform_snapshot.tags;
     let mut channel1_appends = if tagging_active {
         transform_snapshot.channel1_appends
     } else {
@@ -986,7 +1004,7 @@ fn apply_once(
     } else {
         0.0
     };
-    let scheduler_outcome = scheduler::decide(&SchedulerInputs {
+    let mut scheduler_outcome = scheduler::decide(&SchedulerInputs {
         config: scheduler_config(ctx.execute_threshold_percentage),
         usage: ContextUsage {
             percentage: usage_percentage,
@@ -1009,12 +1027,19 @@ fn apply_once(
             .as_ref()
             .map(deferred_from_meta),
         boundary_bypass: BoundaryBypass {
-            explicit_bust: false,
+            explicit_bust: loaded.meta.soft_refresh_pending,
             subagent: false,
         },
         drain_latch: latch_from_meta(&loaded.meta),
         overflow_error_text: req.provider_error.clone(),
     });
+    // A flush requests work on the next pass, not a new m0 fold. Promote only a normal
+    // defer to Execute; mandatory bootstrap, epoch, and pressure decisions retain priority.
+    if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
+    {
+        scheduler_outcome.pass = scheduler::PassDecision::Execute;
+        scheduler_outcome.deferred_execute = None;
+    }
     // First-fold HARD trigger: a never-minted boundary (empty boundary_id) means no
     // compartment has ever folded into m0 (the fold is what mints the boundary). Once the
     // historian publishes the session's FIRST compartment, it cannot ride m1 as a SOFT
@@ -1176,7 +1201,8 @@ fn apply_once(
         hard_fold_requested,
         boundary_present,
         reconcile_pending: loaded.core.reconcile_pending,
-        m1_revision_changed: current_m1_digest != loaded.meta.m1_revision,
+        m1_revision_changed: current_m1_digest != loaded.meta.m1_revision
+            || loaded.meta.soft_refresh_pending,
         reductions_pending: reductions_pending_now,
     });
 
@@ -1212,6 +1238,9 @@ fn apply_once(
         plan,
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
     );
+    if loaded.meta.soft_refresh_pending && is_bust_pass {
+        meta.soft_refresh_pending = false;
+    }
     if is_bust_pass {
         if let Some(guidance_date) = ctx.guidance_date.as_ref() {
             meta.guidance_date = guidance_date.clone();
@@ -1633,6 +1662,16 @@ fn apply_once(
     } else {
         loaded.row_version.unwrap_or(0)
     };
+    let host_directives = channel2_directive(Channel2DirectiveInput {
+        profile: serializer_profile,
+        core: &core,
+        meta: &meta,
+        projection: &projection,
+        tag_rows: &tag_rows,
+        context_limit_tokens,
+        input_tokens: usage_input_tokens,
+        execute_threshold_percentage: ctx.execute_threshold_percentage,
+    });
 
     Ok(TransformWithProjection {
         projection,
@@ -1653,6 +1692,7 @@ fn apply_once(
             coverage_ordinal: meta.coverage_ordinal,
             historian: None,
             ck_messages: Some(ck_messages),
+            host_directives,
         },
     })
 }
@@ -3652,6 +3692,120 @@ fn active_tags_for_nudge(
     }
     out.sort_by_key(|tag| tag.tag_number);
     out
+}
+
+/// Reuse the durable CC tag accounting when present, and derive the same accounting basis
+/// from live CK text for profiles that historically did not mint overlay tags. The latter
+/// keeps OpenCode host directives useful without enabling CC-only prompt overlays.
+fn active_tags_for_channel2(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    tag_rows: &[McTagRow],
+) -> Vec<ActiveTagForNudge> {
+    let stored = active_tags_for_nudge(core, meta, projection, tag_rows);
+    if !stored.is_empty() {
+        return stored;
+    }
+    let mut next_tag = 1i64;
+    let mut derived = Vec::new();
+    for block in projection.blocks.iter().filter(|block| {
+        !block.synthetic
+            && is_tail(block.ordinal, meta.coverage_ordinal)
+            && frozen_red_payload(core, block.id()).is_none()
+    }) {
+        let Some((kind, source)) = taggable_source(block) else {
+            continue;
+        };
+        derived.push(ActiveTagForNudge {
+            tag_number: next_tag,
+            kind: kind.as_store_kind().to_string(),
+            token_count: mc_tokenizer::estimate_tokens(source) as i64,
+        });
+        next_tag = next_tag.saturating_add(1);
+    }
+    derived
+}
+
+struct Channel2DirectiveInput<'a> {
+    profile: Option<SerializerProfile>,
+    core: &'a CoreState,
+    meta: &'a ModuleMeta,
+    projection: &'a FlatProjection,
+    tag_rows: &'a [McTagRow],
+    context_limit_tokens: f64,
+    input_tokens: f64,
+    execute_threshold_percentage: f64,
+}
+
+fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirectives> {
+    // OpenCode is the host-delivery leg. CC and owned serializers retain their historic
+    // response shape; their host integrations own any channel-2 surface separately.
+    if input.profile != Some(SerializerProfile::OpencodeAiSdk)
+        || input.context_limit_tokens <= 0.0
+        || input.execute_threshold_percentage <= 0.0
+    {
+        return None;
+    }
+    let working_window_tokens =
+        (input.context_limit_tokens * input.execute_threshold_percentage.clamp(1.0, 100.0) / 100.0)
+            .round()
+            .max(0.0) as i64;
+    let active_tags =
+        active_tags_for_channel2(input.core, input.meta, input.projection, input.tag_rows);
+    let (reclaimable_tokens, live_tail_tokens) = channel2_token_aggregate(&active_tags);
+    let usable_tokens =
+        (working_window_tokens as f64 - input.input_tokens + live_tail_tokens as f64).max(0.0);
+    let due = reclaimable_tokens >= CHANNEL2_MIN_RECLAIMABLE
+        && (usable_tokens == 0.0
+            || reclaimable_tokens as f64 >= usable_tokens * CHANNEL2_USABLE_FRACTION);
+    if !due {
+        return None;
+    }
+    let hint = oldest_channel2_hint(&active_tags);
+    Some(HostDirectives {
+        channel2_nudge: Some(Channel2NudgeDirective {
+            text: build_channel2_reminder(reclaimable_tokens, &hint),
+        }),
+    })
+}
+
+fn channel2_token_aggregate(active_tags: &[ActiveTagForNudge]) -> (i64, i64) {
+    let protected_cutoff =
+        (active_tags.len() > 20).then(|| active_tags[active_tags.len() - 20].tag_number);
+    let reclaimable = active_tags
+        .iter()
+        .filter(|tag| tag.kind == "tool_result")
+        .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
+        .map(|tag| tag.token_count.max(0))
+        .sum();
+    let live_tail = active_tags
+        .iter()
+        .filter(|tag| tag.kind != "tool_result")
+        .map(|tag| tag.token_count.max(0))
+        .sum();
+    (reclaimable, live_tail)
+}
+
+fn oldest_channel2_hint(active_tags: &[ActiveTagForNudge]) -> Vec<(i64, String)> {
+    let protected_cutoff =
+        (active_tags.len() > 20).then(|| active_tags[active_tags.len() - 20].tag_number);
+    active_tags
+        .iter()
+        .filter(|tag| tag.kind == "tool_result")
+        .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
+        .filter(|tag| tag.token_count >= 100)
+        .take(4)
+        .map(|tag| (tag.tag_number, "tool".to_string()))
+        .collect()
+}
+
+fn build_channel2_reminder(reclaimable_tokens: i64, hint: &[(i64, String)]) -> String {
+    let amount = approx_thousands(reclaimable_tokens);
+    let hint_text = format_reclaimable_hint(hint);
+    format!(
+        "<system-reminder>\nRoutine context housekeeping is near: a large span of this session will be comparted soon, and ~{amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce first so the archived span is the part that matters.{hint_text}\n</system-reminder>"
+    )
 }
 
 fn reclaimable_older_than_working_window(

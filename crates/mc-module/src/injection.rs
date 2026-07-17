@@ -208,10 +208,12 @@ pub fn capture_todo_state_on_bust(
     if !is_bust_pass {
         return false;
     }
-    let Some(state_json) = newest_todowrite_state_json(tail) else {
+    let Some((owner_message_id, state_json)) = newest_todowrite_state_json(tail) else {
         return false;
     };
-    meta.last_todo_state = Some(state_json);
+    meta.last_todo_state = Some(state_json.clone());
+    meta.last_todo_state_owner_message_id = Some(owner_message_id);
+    meta.last_todo_state_hash = Some(todo_state_hash(&state_json));
     true
 }
 
@@ -357,8 +359,8 @@ fn is_title_done_status(status: &str) -> bool {
     TITLE_DONE_STATUSES.contains(&status)
 }
 
-fn newest_todowrite_state_json(tail: &[SelItem]) -> Option<String> {
-    let mut latest: Option<(u64, usize, String)> = None;
+fn newest_todowrite_state_json(tail: &[SelItem]) -> Option<(String, String)> {
+    let mut latest: Option<(u64, usize, String, String)> = None;
     for (index, item) in tail.iter().enumerate() {
         let SelKind::ToolCall { name, input } = &item.kind else {
             continue;
@@ -371,15 +373,25 @@ fn newest_todowrite_state_json(tail: &[SelItem]) -> Option<String> {
         };
         let replace = latest
             .as_ref()
-            .map(|(ordinal, seen_index, _)| {
+            .map(|(ordinal, seen_index, _, _)| {
                 item.ordinal > *ordinal || (item.ordinal == *ordinal && index > *seen_index)
             })
             .unwrap_or(true);
         if replace {
-            latest = Some((item.ordinal, index, state_json));
+            let owner_message_id = item
+                .id
+                .split_once('#')
+                .map(|(mid, _)| mid.to_string())
+                .unwrap_or_else(|| item.id.clone());
+            latest = Some((item.ordinal, index, owner_message_id, state_json));
         }
     }
-    latest.map(|(_, _, state_json)| state_json)
+    latest.map(|(_, _, owner_message_id, state_json)| (owner_message_id, state_json))
+}
+
+fn todo_state_hash(state_json: &str) -> String {
+    let digest = Sha256::digest(state_json.as_bytes());
+    format!("{digest:x}")
 }
 
 fn todo_state_from_input(input: &serde_json::Value) -> Option<String> {

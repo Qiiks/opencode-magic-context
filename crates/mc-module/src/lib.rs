@@ -56,7 +56,7 @@ use mc_store::{
     ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow,
     ShadowWorkspaceRow, StateImportError, StateImportPreflight, StateImportValidationError,
     StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
-    WrapupCommandRecord,
+    TodoStateSetOutcome, WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -1612,6 +1612,7 @@ pub struct McHandler {
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     live_historian_sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
     wrapup_sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
+    recomp_sessions: Arc<Mutex<HashSet<String>>>,
     transform_snapshots: Arc<Mutex<TransformSnapshotCache>>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
@@ -1980,6 +1981,7 @@ impl McHandler {
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
+            recomp_sessions: Arc::new(Mutex::new(HashSet::new())),
             transform_snapshots: Arc::new(Mutex::new(TransformSnapshotCache::new(
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
@@ -2050,6 +2052,7 @@ impl McHandler {
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
+            recomp_sessions: Arc::new(Mutex::new(HashSet::new())),
             transform_snapshots: Arc::new(Mutex::new(TransformSnapshotCache::new(
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
@@ -2544,6 +2547,17 @@ impl McHandler {
             session_id: session_id.to_string(),
             token,
             completion,
+        })
+    }
+
+    fn try_claim_recomp_session(&self, session_id: &str) -> Result<StringSetGuard, ()> {
+        let mut sessions = self.recomp_sessions.lock().expect("recomp sessions mutex");
+        if !sessions.insert(session_id.to_string()) {
+            return Err(());
+        }
+        Ok(StringSetGuard {
+            sessions: Arc::clone(&self.recomp_sessions),
+            session_id: session_id.to_string(),
         })
     }
 
@@ -3723,6 +3737,119 @@ impl McHandler {
         Ok((session_id.to_string(), binding))
     }
 
+    fn handle_todo_state_set_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, _binding) =
+            match self.management_binding(channel, request, "todo_state.set") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let Some(state_json) = request.get("state_json").and_then(Value::as_str) else {
+            return invalid_params_error("todo_state.set requires state_json");
+        };
+        if state_json.len() > MAX_FACADE_FRAME_BYTES {
+            return invalid_params_error("state_json exceeds the 1 MiB limit");
+        }
+        let Some(owner_message_id) = request.get("owner_message_id").and_then(Value::as_str) else {
+            return invalid_params_error("todo_state.set requires owner_message_id");
+        };
+        if owner_message_id.is_empty() || owner_message_id.len() > 128 {
+            return invalid_params_error("owner_message_id must contain 1..=128 bytes");
+        }
+        let Some(normalized) = crate::injection::normalize_todo_state_json(state_json) else {
+            return invalid_params_error("state_json must be a JSON todo array");
+        };
+        let state_hash = sha256_hex(normalized.as_bytes());
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        match store.set_todo_state(&session_id, &normalized, owner_message_id, &state_hash) {
+            Ok(TodoStateSetOutcome::Updated { .. }) | Ok(TodoStateSetOutcome::Noop) => {
+                respond(json!({ "ok": true }))
+            }
+            Err(error) => HandlerOutcome::Error {
+                code: "store_write_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_session_flush_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, _binding) =
+            match self.management_binding(channel, request, "session.flush") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        match store.arm_soft_refresh(&session_id) {
+            Ok(armed) => respond(json!({ "ok": true, "armed": armed })),
+            Err(error) => HandlerOutcome::Error {
+                code: "store_write_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_session_recomp_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, _binding) =
+            match self.management_binding(channel, request, "session.recomp") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let Some(command_id) = request.get("command_id").and_then(Value::as_str) else {
+            return invalid_params_error("session.recomp requires command_id");
+        };
+        if command_id.is_empty() || command_id.len() > 128 {
+            return invalid_params_error("command_id must contain 1..=128 bytes");
+        }
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        match store.load_recomp_command(&session_id, command_id) {
+            Ok(Some(row)) => {
+                return respond(json!({
+                    "ok": true,
+                    "disposition": row.disposition,
+                }))
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        }
+        let _guard = match self.try_claim_recomp_session(&session_id) {
+            Ok(guard) => guard,
+            Err(()) => {
+                return respond(json!({
+                    "ok": true,
+                    "disposition": "already_in_progress",
+                }))
+            }
+        };
+
+        // The module currently has durable re-cut and import primitives, but no reachable
+        // operation that turns a raw transform snapshot into a complete recomp staging set.
+        // Returning nothing_to_do is honest; claiming started here would silently rebuild
+        // nothing and would violate the command's structural-rebuild contract.
+        match store.record_recomp_command(&session_id, command_id, "nothing_to_do", now_ms()) {
+            Ok(row) => respond(json!({
+                "ok": true,
+                "disposition": row.disposition,
+            })),
+            Err(error) => HandlerOutcome::Error {
+                code: "store_write_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     fn handle_session_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (session_id, _binding) =
             match self.management_binding(channel, request, "session.status") {
@@ -4572,12 +4699,22 @@ impl McHandler {
                 }
             }
         };
-        let text = if active {
+        let base_text = if active {
             GUIDANCE_TEXT
         } else {
             GUIDANCE_TEXT_NO_REDUCE
         };
-        let bytes = guidance_bytes_for(text, &date_line);
+        let language_text = request
+            .get("language")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|language| !language.is_empty());
+        let language_directive = language_text.and_then(primary_language_directive);
+        let localized_text = language_directive
+            .as_deref()
+            .map(|directive| format!("{base_text}\n\n{directive}"));
+        let text_for_bytes = localized_text.as_deref().unwrap_or(base_text);
+        let bytes = guidance_bytes_for(text_for_bytes, &date_line);
         respond(json!({
             "ok": true,
             "bytes": bytes,
@@ -4586,7 +4723,7 @@ impl McHandler {
             // date line changes every day, so content_hash excludes it; otherwise a
             // date-only change would trigger cache refreshes even when guidance is
             // unchanged.
-            "content_hash": sha256_hex(text.as_bytes()),
+            "content_hash": sha256_hex(text_for_bytes.as_bytes()),
         }))
     }
 
@@ -6681,6 +6818,9 @@ impl McHandler {
                 "shadow_reset" => self.handle_shadow_reset_value(channel, request),
                 "state_import" => self.handle_state_import_value(channel, request),
                 "agent_drops.append" => self.handle_agent_drops_value(channel, request),
+                "todo_state.set" => self.handle_todo_state_set_value(channel, &request),
+                "session.flush" => self.handle_session_flush_value(channel, &request),
+                "session.recomp" => self.handle_session_recomp_value(channel, &request),
                 "session.status" => self.handle_session_status_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
                 // Explicit wire-debugging echo. Opt-in only: echoing every
@@ -6788,6 +6928,47 @@ fn respond(value: Value) -> HandlerOutcome {
 
 fn guidance_bytes_for(text: &str, date_line: &str) -> String {
     format!("{text}\n{date_line}")
+}
+
+fn primary_language_directive(language: &str) -> Option<String> {
+    if language.len() != 2 || !language.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    let name = match language.to_ascii_lowercase().as_str() {
+        "ar" => "Arabic (العربية)",
+        "cs" => "Czech (Čeština)",
+        "da" => "Danish (Dansk)",
+        "de" => "German (Deutsch)",
+        "el" => "Greek (Ελληνικά)",
+        "en" => "English",
+        "es" => "Spanish (Español)",
+        "fi" => "Finnish (Suomi)",
+        "fr" => "French (Français)",
+        "he" => "Hebrew (עברית)",
+        "hi" => "Hindi (हिन्दी)",
+        "hu" => "Hungarian (Magyar)",
+        "id" => "Indonesian",
+        "it" => "Italian (Italiano)",
+        "ja" => "Japanese (日本語)",
+        "ko" => "Korean (한국어)",
+        "nl" => "Dutch (Nederlands)",
+        "no" => "Norwegian (Norsk)",
+        "pl" => "Polish (Polski)",
+        "pt" => "Portuguese (Português)",
+        "ro" => "Romanian (Română)",
+        "ru" => "Russian (Русский)",
+        "sk" => "Slovak (Slovenčina)",
+        "sv" => "Swedish (Svenska)",
+        "th" => "Thai (ไทย)",
+        "tr" => "Turkish (Türkçe)",
+        "uk" => "Ukrainian (Українська)",
+        "vi" => "Vietnamese (Tiếng Việt)",
+        "zh" => "Chinese (中文)",
+        _ => return None,
+    };
+    Some(format!(
+        "Use {name} for your natural-language replies to the user unless the user explicitly asks for another language. Keep code, identifiers, file paths, commands, logs, and quoted text verbatim."
+    ))
 }
 
 fn shadow_seed_content_digest(request: &Value) -> String {
@@ -8448,7 +8629,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::ck_wire::{
-        CkIngressMessage, CkKind, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
+        CkIngressMessage, CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage,
+        HarnessMeta, ProviderExtras,
     };
     use historian_producer::{ProducerOutput, RunHandle, RunState};
     use mc_core::CoreState;
@@ -9310,6 +9492,59 @@ mod tests {
         ck_with_role(mid, ordinal, "user", text)
     }
 
+    fn assistant_tool_call(mid: &str, ordinal: u64) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(CkKind::ToolCall {
+                    id: if mid.starts_with("call-") {
+                        mid.to_string()
+                    } else {
+                        format!("call-{mid}")
+                    },
+                    name: "bash".to_string(),
+                    input: json!({ "command": "printf output" }),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn tool_result(mid: &str, ordinal: u64, text: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "tool",
+                vec![CkWireBlock::bare(CkKind::ToolResult {
+                    id: mid
+                        .strip_prefix("result-")
+                        .map(|suffix| format!("call-{suffix}"))
+                        .unwrap_or_else(|| format!("call-{mid}")),
+                    tool_name: "bash".to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: text.to_string(),
+                    }),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
     fn stored_comp(seq: i64, start: i64, end: i64, end_mid: &str, p1: &str) -> StoredCompartment {
         StoredCompartment {
             sequence: seq,
@@ -9583,6 +9818,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn channel2_host_directive_is_deterministic_due_gated_and_profile_scoped() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let output = "tool output ".repeat(8_000);
+        let mut messages = Vec::new();
+        for index in 0..25u64 {
+            let call_mid = format!("call-{index}");
+            let result_mid = format!("result-{index}");
+            messages.push(assistant_tool_call(&call_mid, index * 2 + 1));
+            messages.push(tool_result(&result_mid, index * 2 + 2, &output));
+        }
+        let opencode_request = json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "opencode-aisdk",
+            "session_id": "ses",
+            "render_config": "cfg0",
+            "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
+            "messages": messages,
+        });
+        let first = call_transform_request(&handler, opencode_request.clone()).await;
+        let first_text = first["host_directives"]["channel2_nudge"]["text"]
+            .as_str()
+            .expect("due OpenCode pass must carry channel2 text");
+        assert!(first_text.contains("Routine context housekeeping is near"));
+        let second = call_transform_request(&handler, opencode_request).await;
+        assert_eq!(
+            second["host_directives"]["channel2_nudge"]["text"],
+            first_text
+        );
+
+        let mut not_due = request_with_usage(vec![ck("short", 1, "small")], 10_000, 100_000);
+        not_due["serializer_profile"] = json!("opencode-aisdk");
+        let not_due_response = call_transform_request(&handler, not_due).await;
+        assert!(not_due_response.get("host_directives").is_none());
+
+        handler.bind_route(8, binding("/tmp/cc", "cc-ses"));
+        let mut cc_request = json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "claude-code-anthropic",
+            "tool_present": true,
+            "session_id": "cc-ses",
+            "render_config": "cfg0",
+            "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
+            "messages": first["ck_messages"],
+        });
+        // The CC response is used only to prove the additive directive remains profile-gated;
+        // its transformed messages are not a request fixture for the OpenCode lane.
+        cc_request["messages"] = json!([ck("cc-short", 1, "small")]);
+        let cc_response = call_transform_request_on_channel(&handler, 8, cc_request).await;
+        assert!(cc_response.get("host_directives").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn transform_reject_records_trace_without_advancing_row_version() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -9779,6 +10069,32 @@ mod tests {
             )
             .await;
         assert_eq!(error_code(contradictory), "bad_request");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guidance_language_directive_is_present_in_both_serializer_variants() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        for request in [
+            json!({
+                "kind": "guidance.get",
+                "session_id": "ses",
+                "serializer_profile": "claude-code-anthropic",
+                "tool_present": true,
+                "language": "tr",
+            }),
+            json!({
+                "kind": "guidance.get",
+                "session_id": "ses",
+                "serializer_profile": "opencode-aisdk",
+                "language": "tr",
+            }),
+        ] {
+            let response = call_dispatch_request(&handler, request).await;
+            let bytes = response["bytes"].as_str().unwrap();
+            assert!(bytes.contains("Use Turkish (Türkçe) for your natural-language replies"));
+            assert_eq!(response["hash"], json!(sha256_hex(bytes.as_bytes())));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11345,6 +11661,97 @@ mod tests {
                 .await;
             assert_eq!(error_code(outcome), "unrecognized_request_shape", "{alias}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn management_todo_flush_and_recomp_contracts_are_replay_safe() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let todo = json!({
+            "method": "todo_state.set",
+            "v": 1,
+            "session_id": "ses",
+            "state_json": "[{\"content\":\"ship module\",\"status\":\"in_progress\",\"priority\":\"high\"}]",
+            "owner_message_id": "m1",
+        });
+        assert_eq!(
+            call_dispatch_request(&handler, todo.clone()).await,
+            json!({ "ok": true })
+        );
+        let first = store.load("ses").unwrap();
+        assert_eq!(
+            first.meta.last_todo_state_owner_message_id.as_deref(),
+            Some("m1")
+        );
+        assert!(first.meta.last_todo_state_hash.is_some());
+        let first_version = first.row_version;
+        assert_eq!(
+            call_dispatch_request(&handler, todo).await,
+            json!({ "ok": true })
+        );
+        assert_eq!(store.load("ses").unwrap().row_version, first_version);
+
+        let flush = call_dispatch_request(
+            &handler,
+            json!({ "method": "session.flush", "v": 1, "session_id": "ses" }),
+        )
+        .await;
+        assert_eq!(flush, json!({ "ok": true, "armed": true }));
+        let flushed = store.load("ses").unwrap();
+        assert!(flushed.meta.soft_refresh_pending);
+
+        let recomp = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "session.recomp",
+                "v": 1,
+                "session_id": "ses",
+                "command_id": "recomp-1",
+            }),
+        )
+        .await;
+        assert_eq!(
+            recomp,
+            json!({ "ok": true, "disposition": "nothing_to_do" })
+        );
+        let replay = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "session.recomp",
+                "v": 1,
+                "session_id": "ses",
+                "command_id": "recomp-1",
+            }),
+        )
+        .await;
+        assert_eq!(replay, recomp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_flush_consumes_once_as_soft_without_forcing_hard() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .commit_state_import(
+                "ses",
+                "flush-seed",
+                &[stored_comp(1, 1, 1, "m1", "seed")],
+                1,
+            )
+            .unwrap();
+        let first = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
+        assert_eq!(first["action"], "HARD");
+        let armed = call_dispatch_request(
+            &handler,
+            json!({ "method": "session.flush", "v": 1, "session_id": "ses" }),
+        )
+        .await;
+        assert_eq!(armed, json!({ "ok": true, "armed": true }));
+        let next = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
+        assert_eq!(next["action"], "SOFT");
+        assert!(!store.load("ses").unwrap().meta.soft_refresh_pending);
+        let replay = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
+        assert_ne!(replay["action"], "HARD");
     }
 
     #[test]
