@@ -97,7 +97,6 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | `boolean` | `true` | Master toggle. |
-| `transform_mode` | `"ts"` or `"rust"` | `"ts"` | **Experimental.** Routes the entire project's Magic Context runtime through the ck-mc Rust module over subc. Rust mode activates only when the user config also provides `subc.connection_file`; project config may select the mode but cannot provide daemon routing. |
 | `auto_update` | `boolean` | `true` | User-config-only plugin self-update toggle; project configs cannot disable it. |
 | `language` | `string` | unset | User-config-only output language for Magic Context generated prose and primary guidance, as a 2-letter ISO 639-1 code, for example `"tr"`, `"es"`, or `"pt"`. Structural tokens stay in English. |
 | `cache_ttl` | `string` or `object` | `"5m"` | Time after a response before applying pending ops. String or per-model map. |

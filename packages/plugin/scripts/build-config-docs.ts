@@ -163,7 +163,14 @@ function renderTable(rows: LeafRow[]): string {
 // generated JSON schema (so editors validate them) but are not user-facing
 // features; documenting them would invite support questions about internal
 // tooling that requires a local daemon setup users do not have.
-const DEV_ONLY_KEYS = new Set<string>(["shadow_transform", "shadow_embedding"]);
+const DEV_ONLY_KEYS = new Set<string>([
+    "shadow_transform",
+    "shadow_embedding",
+    // Unsupported until the fleet stack ships publicly: activating it requires a
+    // subc daemon no public install has, and documenting it would let the dev
+    // gate calcify into a de-facto public mode before the cutover release.
+    "transform_mode",
+]);
 
 export function buildConfigDocs(): string {
     const schema = buildSchema() as JsonSchema;
