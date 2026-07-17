@@ -37,6 +37,7 @@ import {
     getSessionProperties,
 } from "./event-payloads";
 import { resolveSessionId as resolveEventSessionId } from "./event-resolvers";
+import { dropSlot } from "./lkg-slot";
 import {
     clearNoteNudgeTriggerAndCooldown,
     onNoteTrigger,
@@ -285,6 +286,7 @@ export function createEventHook(args: {
                     // watermark would make reasoning cleanup resume from the
                     // previous model's cutoff instead of starting fresh. Clear
                     // it for both forward and backward transitions.
+                    dropSlot(assistantInfo.sessionID, "model-change");
                     sessionLog(
                         assistantInfo.sessionID,
                         `model changed (${previous.providerID}/${previous.modelID} -> ${assistantInfo.providerID}/${assistantInfo.modelID}), clearing historian failure state and reasoning watermark`,

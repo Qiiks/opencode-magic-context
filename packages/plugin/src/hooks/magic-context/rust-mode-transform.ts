@@ -1,6 +1,10 @@
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
-import { casChannel2NudgeState } from "../../features/magic-context/storage-meta-persisted";
+import {
+    casChannel2NudgeState,
+    getOverflowState,
+    isEmergencyRecoveryArmed,
+} from "../../features/magic-context/storage-meta-persisted";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
@@ -9,6 +13,8 @@ import {
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
+import { replayLkg, resolveLkgModelKeys } from "./lkg-replay";
+import { captureSlot, dropSlot, getSlot, type LkgEntryNote, noteEntry } from "./lkg-slot";
 import {
     type ModuleCompartmentMirrorResponse,
     type ModuleCompartmentReader,
@@ -181,6 +187,13 @@ export function applyNativeMessagesVerbatim(
     response: Record<string, unknown>,
 ): void {
     const nativeMessages = response.native_messages;
+    if (typeof nativeMessages === "string") {
+        const parsed = JSON.parse(nativeMessages) as unknown;
+        if (!Array.isArray(parsed))
+            throw new Error("rust transform native_messages string was not an array");
+        output.messages = parsed;
+        return;
+    }
     if (!Array.isArray(nativeMessages)) {
         throw new Error("rust transform response omitted native_messages");
     }
@@ -256,7 +269,7 @@ export function createRustModeTransform(
     const markFailure = (sessionId: string, state: RustSessionState, error: unknown): void => {
         state.consecutiveFailures += 1;
         state.failureCount += 1;
-        sessionLog(sessionId, "rust transform failed; using raw passthrough:", error);
+        sessionLog(sessionId, "rust transform failed; attempting LKG replay:", error);
         if (state.consecutiveFailures < RUST_FAILURE_PARK_THRESHOLD || state.parked) return;
         state.parked = true;
         state.parkCount += 1;
@@ -266,6 +279,84 @@ export function createRustModeTransform(
             "Rust Magic Context is unavailable for this session; continuing with an unmodified prompt until the module recovers.";
         sessionLog(sessionId, "rust transform parked after three consecutive failures");
         options.notifyParked?.(sessionId, warning);
+    };
+
+    const replayLastGood = (
+        sessionId: string,
+        currentMessages: MessageLike[],
+        output: { messages: unknown[] },
+    ): boolean => {
+        const slot = getSlot(sessionId);
+        if (!slot) {
+            sessionLog(sessionId, "lkg_miss");
+            return false;
+        }
+        if (isEmergencyRecoveryArmed(sessionId)) {
+            sessionLog(sessionId, "lkg_emergency_armed");
+            return false;
+        }
+        try {
+            if (getOverflowState(deps.db, sessionId).needsEmergencyRecovery) {
+                sessionLog(sessionId, "lkg_emergency_armed");
+                return false;
+            }
+        } catch {
+            return false;
+        }
+        let entry: LkgEntryNote | null = null;
+        try {
+            entry = noteEntry(sessionId, currentMessages);
+        } catch (error) {
+            sessionLog(sessionId, "rust LKG entry snapshot failed:", error);
+            return false;
+        }
+        if (!entry) {
+            dropSlot(sessionId, "lkg_invalidated_reshape");
+            sessionLog(sessionId, "lkg_invalidated_reshape");
+            return false;
+        }
+        const keys = resolveLkgModelKeys(currentMessages);
+        const replay = replayLkg({
+            sessionId,
+            messages: currentMessages,
+            modelKey: keys.modelKey,
+            providerKey: keys.providerKey,
+            entry,
+            skipSeamValidation: true,
+        });
+        if (!replay.ok) {
+            sessionLog(sessionId, replay.reason);
+            return false;
+        }
+        output.messages = replay.messages;
+        sessionLog(sessionId, "lkg_replay_served");
+        return true;
+    };
+
+    const captureRustResponse = (
+        sessionId: string,
+        input: MessageLike[],
+        response: Record<string, unknown>,
+    ): void => {
+        const ids = input.map((message) => message.info.id);
+        if (
+            ids.some((id) => typeof id !== "string") ||
+            new Set(ids).size !== ids.length ||
+            ids.length === 0
+        )
+            return;
+        const native = response.native_messages;
+        const jsonPrefix = typeof native === "string" ? native : JSON.stringify(native);
+        if (typeof jsonPrefix !== "string") return;
+        const keys = resolveLkgModelKeys(input);
+        captureSlot(sessionId, {
+            jsonPrefix,
+            inputIdSeq: ids as string[],
+            lastInputMessageId: ids[ids.length - 1] as string,
+            modelKey: keys.modelKey,
+            providerKey: keys.providerKey,
+            capturedAt: Date.now(),
+        });
     };
 
     const run = async (
@@ -281,7 +372,7 @@ export function createRustModeTransform(
             // The fifth live pass is the first retry opportunity after the
             // three-failure park; later retries use the same global cadence.
             if (state.passCount % RUST_PROBE_INTERVAL !== 0) {
-                output.messages = messages;
+                if (!replayLastGood(sessionId, messages, output)) output.messages = messages;
                 return;
             }
         }
@@ -421,6 +512,7 @@ export function createRustModeTransform(
                 if (!response) throw new Error("rust module returned no retry transform response");
             }
             applyNativeMessagesVerbatim(output, response);
+            captureRustResponse(sessionId, messages, response);
             state.initialized = true;
             state.seedPassPending = false;
             state.consecutiveFailures = 0;
@@ -458,11 +550,8 @@ export function createRustModeTransform(
                 }
             }
         } catch (error) {
-            output.messages = rawMessages;
+            if (!replayLastGood(sessionId, rawMessages, output)) output.messages = rawMessages;
             markFailure(sessionId, state, error);
-            if (!state.parked) return;
-            // Dogfood behavior intentionally stops at loud raw passthrough while parked;
-            // public deployments will need an explicit pressure-triggered re-entry path.
             return;
         }
     };
@@ -470,6 +559,7 @@ export function createRustModeTransform(
     return {
         run,
         clearSession(sessionId: string): void {
+            dropSlot(sessionId, "session-deleted");
             states.delete(sessionId);
             options.moduleClient.closeSession?.(sessionId);
         },

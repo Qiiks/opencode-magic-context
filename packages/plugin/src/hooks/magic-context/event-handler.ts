@@ -49,6 +49,7 @@ import {
     resolveModelKey,
     resolveSessionId,
 } from "./event-resolvers";
+import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
 import { readRawSessionMessages } from "./read-session-chunk";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
@@ -314,6 +315,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     return;
                 }
                 const existing = getOverflowState(deps.db, errInfo.sessionID);
+                dropSlot(errInfo.sessionID, "overflow-recovery-arm");
                 recordOverflowDetected(deps.db, errInfo.sessionID, detection.reportedLimit);
                 sessionLog(
                     errInfo.sessionID,
@@ -398,6 +400,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                 `overflow detected on subagent via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
                             );
                         } else {
+                            dropSlot(info.sessionID, "overflow-recovery-arm");
                             recordOverflowDetected(
                                 deps.db,
                                 info.sessionID,
@@ -626,6 +629,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
+            dropSlot(info.sessionID, "message.removed");
             sessionLog(
                 info.sessionID,
                 `event message.removed: invalidating state for message ${info.messageID}`,
@@ -681,6 +685,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
+            dropSlot(sessionId, "session.compacted");
             try {
                 deps.compactionHandler.onCompacted(sessionId, deps.db);
             } catch (error) {
@@ -725,6 +730,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
+            dropSlot(sessionId, "session.deleted");
             try {
                 // Read and remove compaction marker BEFORE clearSession destroys session_meta.
                 // Plan v6: pending_compaction_marker_state lives on the same row, so

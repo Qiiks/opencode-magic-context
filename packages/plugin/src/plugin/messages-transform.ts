@@ -1,6 +1,14 @@
 import { getOrCreateSessionMeta, openDatabase } from "../features/magic-context/storage";
+import {
+    getOverflowState,
+    isEmergencyRecoveryArmed,
+} from "../features/magic-context/storage-meta-persisted";
 import { updateSessionMeta } from "../features/magic-context/storage-meta-session";
-import { log } from "../shared/logger";
+import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
+import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
+import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
+import type { MessageLike } from "../hooks/magic-context/transform-operations";
+import { log, sessionLog } from "../shared/logger";
 
 // Error codes that SQLite raises for transient contention — should be retried
 // on next transform pass rather than surfaced as persistent failures. BUSY is
@@ -41,8 +49,9 @@ type MessagesTransformOutput = { messages: MessageWithParts[] };
  *        observability.
  *     3. Return with messages unmodified for this pass.
  *
- * In both cases we NEVER rethrow — OpenCode's Effect pipeline turns thrown
- * errors into user-visible prompt failures. We accept degraded behavior
+ * Ordinary transform failures are not rethrown because OpenCode's Effect pipeline
+ * turns thrown errors into user-visible prompt failures. EmergencyFailClosedError
+ * is the intentional exception and is rethrown. We accept degraded behavior
  * (no injection / no drops this turn) rather than blocking the user.
  *
  * Correctness is preserved because all persistent state mutations inside
@@ -57,9 +66,66 @@ export function createMessagesTransformHandler(args: {
     } | null;
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<void> {
     return async (input, output): Promise<void> => {
+        const sessionId = resolveSessionId(output);
+        const slotAtEntry = sessionId ? getSlot(sessionId) : undefined;
+        const entry = slotAtEntry
+            ? (() => {
+                  try {
+                      return noteEntry(sessionId as string, output.messages as MessageLike[]);
+                  } catch (error) {
+                      sessionLog(
+                          sessionId as string,
+                          "lkg entry snapshot failed; replay unavailable",
+                          error,
+                      );
+                      return null;
+                  }
+              })()
+            : null;
         try {
             await args.magicContext?.["experimental.chat.messages.transform"]?.(input, output);
         } catch (error) {
+            if (error instanceof EmergencyFailClosedError) throw error;
+            if (sessionId && slotAtEntry && !entry) {
+                dropSlot(sessionId, "lkg_invalidated_reshape");
+                sessionLog(sessionId, "lkg_invalidated_reshape");
+            } else if (sessionId && entry) {
+                let replayBlocked = false;
+                try {
+                    const db = openDatabase();
+                    if (
+                        !db ||
+                        isEmergencyRecoveryArmed(sessionId) ||
+                        getOverflowState(db, sessionId).needsEmergencyRecovery
+                    ) {
+                        replayBlocked = true;
+                        sessionLog(sessionId, "lkg_emergency_armed");
+                    } else {
+                        const keys = resolveLkgModelKeys(output.messages as MessageLike[]);
+                        const replay = replayLkg({
+                            sessionId,
+                            messages: output.messages as MessageLike[],
+                            modelKey: keys.modelKey,
+                            providerKey: keys.providerKey,
+                            entry,
+                        });
+                        if (replay.ok) {
+                            output.messages = replay.messages as unknown as MessageWithParts[];
+                            sessionLog(sessionId, "lkg_replay_served");
+                            return;
+                        }
+                        sessionLog(sessionId, replay.reason);
+                    }
+                } catch (replayError) {
+                    replayBlocked = true;
+                    sessionLog(sessionId, "lkg_replay_unavailable", replayError);
+                }
+                if (replayBlocked) {
+                    sessionLog(sessionId, "lkg_replay_declined");
+                }
+            } else if (sessionId) {
+                sessionLog(sessionId, "lkg_miss");
+            }
             const code = (error as { code?: string } | null)?.code;
             const name = (error as { name?: string } | null)?.name;
             const message = error instanceof Error ? error.message : String(error);
@@ -83,8 +149,8 @@ export function createMessagesTransformHandler(args: {
             // Best-effort: surface the error in session_meta so users see
             // something is broken. We can only do this when we have a
             // session id — the output's first message carries it.
-            const sessionId = resolveSessionId(output);
-            if (sessionId) {
+            const persistSessionId = resolveSessionId(output);
+            if (persistSessionId) {
                 try {
                     const db = openDatabase();
                     // null = storage unavailable (schema fence); nothing to persist to.
@@ -94,9 +160,14 @@ export function createMessagesTransformHandler(args: {
                         // every transform pass (e.g. persistent schema corruption),
                         // skip the DB write if lastTransformError already matches.
                         // Prevents needless WAL churn during degraded operation.
-                        const current = getOrCreateSessionMeta(db, sessionId).lastTransformError;
+                        const current = getOrCreateSessionMeta(
+                            db,
+                            persistSessionId,
+                        ).lastTransformError;
                         if (current !== summary) {
-                            updateSessionMeta(db, sessionId, { lastTransformError: summary });
+                            updateSessionMeta(db, persistSessionId, {
+                                lastTransformError: summary,
+                            });
                         }
                     }
                 } catch (persistError) {

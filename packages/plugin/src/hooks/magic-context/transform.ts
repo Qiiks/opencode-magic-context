@@ -61,6 +61,7 @@ import { resolveCtxReduceAvailabilityFromMessages } from "./ctx-reduce-availabil
 import { computeTailTokenEstimate, shouldTriggerChannel2 } from "./ctx-reduce-nudge";
 import { DEFAULT_HISTORY_BUDGET_TOKENS } from "./decay-render";
 import { deriveTriggerBudget } from "./derive-budgets";
+import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     resolveExecuteThreshold,
     resolveModelKey,
@@ -72,7 +73,10 @@ import {
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
 } from "./inject-compartments";
+import { captureLkgSlot, resolveLkgModelKeys } from "./lkg-replay";
+import { dropSlot } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
+import { createPassOutcome } from "./pass-outcome";
 import {
     createDefaultBoundarySnapshotForTests,
     hasRunnableCompartmentWindow,
@@ -115,6 +119,8 @@ import {
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
+
+export { EmergencyFailClosedError } from "./emergency-fail-closed";
 
 // Per-session message token cache. Keyed by message ID, value is the token
 // contribution of that message split into conversation (text/reasoning/images)
@@ -455,6 +461,17 @@ export function createTransform(deps: TransformDeps) {
     ): Promise<void> => {
         const startTime = performance.now();
         const messages = output.messages as MessageLike[];
+        const passOutcome = createPassOutcome();
+        let lkgInput: MessageLike[];
+        try {
+            lkgInput = structuredClone(messages) as MessageLike[];
+        } catch {
+            lkgInput = messages.map((message) => ({
+                info: { ...message.info },
+                parts: [...message.parts],
+            })) as MessageLike[];
+            passOutcome.record("capture-input-clone-failure");
+        }
         const sessionId = findSessionId(messages);
         if (!sessionId) {
             return;
@@ -497,6 +514,7 @@ export function createTransform(deps: TransformDeps) {
             // Intentional fail-open: magic-context should not block live chat if session state read fails.
             sessionMeta = getOrCreateSessionMeta(db, sessionId);
         } catch (error) {
+            passOutcome.record("session-meta-early-return", "fatal");
             sessionLog(sessionId, "transform failed reading session meta:", error);
             return;
         }
@@ -595,9 +613,11 @@ export function createTransform(deps: TransformDeps) {
                     deps.sessionDirectoryBySession?.set(sessionId, sessionDirectory);
                     sessionDirectoryResolvedFromHost = true;
                 }
-            } catch {
-                // ignore; fallback already in place
+            } catch (error) {
+                passOutcome.record("session-directory-fallback");
+                sessionLog(sessionId, "session directory lookup failed; using fallback:", error);
             }
+            if (!sessionDirectoryResolvedFromHost) passOutcome.record("session-directory-fallback");
         }
         const compartmentDirectory = sessionDirectory;
         const historianRunnable = deps.historianRunnable !== false;
@@ -664,6 +684,7 @@ export function createTransform(deps: TransformDeps) {
                     outgoingModelKey != null &&
                     lastUsageModelKey !== outgoingModelKey
                 ) {
+                    dropSlot(sessionId, "model-change");
                     sessionLog(
                         sessionId,
                         `transform: model change since last usage (${lastUsageModelKey} -> ${outgoingModelKey}), clearing stale per-model state`,
@@ -808,6 +829,7 @@ export function createTransform(deps: TransformDeps) {
                     // Flag-only arm: undefined reportedLimit sets
                     // needs_emergency_recovery WITHOUT writing
                     // detected_context_limit.
+                    dropSlot(sessionId, "overflow-recovery-arm");
                     recordOverflowDetected(
                         db,
                         sessionId,
@@ -856,6 +878,7 @@ export function createTransform(deps: TransformDeps) {
                     );
                 }
             } catch (error) {
+                passOutcome.record("overflow-state-read-failure");
                 sessionLog(
                     sessionId,
                     "transform: overflow recovery state read failed:",
@@ -1308,6 +1331,7 @@ export function createTransform(deps: TransformDeps) {
                     triggerBoundarySnapshot = triggerResult.boundarySnapshot;
                 }
             } catch (error) {
+                passOutcome.record("compartment-trigger-failure");
                 sessionLog(sessionId, "compartment trigger failed (non-fatal):", error);
             }
             logTransformTiming(sessionId, "compartmentTrigger", tTrigger);
@@ -1441,6 +1465,7 @@ export function createTransform(deps: TransformDeps) {
             logTransformTiming(sessionId, "tagMessages", t0);
             taggingSucceeded = true;
         } catch (error) {
+            passOutcome.record("tagging-persistence-failure");
             sessionLog(
                 sessionId,
                 "transform tag persistence failed; continuing without tagging:",
@@ -1515,6 +1540,7 @@ export function createTransform(deps: TransformDeps) {
                 batch?.finalize();
                 logTransformTiming(sessionId, "batchFinalize:flushed", t2);
             } catch (error) {
+                passOutcome.record("flushed-status-failure");
                 sessionLog(sessionId, "transform failed applying flushed statuses:", error);
             }
         }
@@ -1689,8 +1715,9 @@ export function createTransform(deps: TransformDeps) {
         let hardTtlMs = 5 * 60 * 1000;
         try {
             hardTtlMs = parseCacheTtl(sessionMeta.cacheTtl);
-        } catch {
-            // invalid cache_ttl → fall back to the 5m default (same as execute-status)
+        } catch (error) {
+            passOutcome.record("invalid-cache-ttl-fallback");
+            sessionLog(sessionId, "invalid cache_ttl; using the 5m default:", error);
         }
         const hardCacheExpired =
             sessionMeta.lastResponseTime > 0 &&
@@ -1783,6 +1810,7 @@ export function createTransform(deps: TransformDeps) {
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
+            passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
             m0M1: {
                 // Memory identity ONLY (drives <project-memory> selection in
@@ -1801,6 +1829,7 @@ export function createTransform(deps: TransformDeps) {
                 hardSignals: m0HardSignals,
             },
         });
+        passOutcome.markFinalized();
         // Fresh-tokenize only in the emergency band. This estimate is telemetry,
         // never an abort gate: provider-accurate accounting is deferred to the
         // module-side implementation.
@@ -1828,21 +1857,30 @@ export function createTransform(deps: TransformDeps) {
         });
         if (emergencyFailClosed.shouldAbort) {
             if (!deps.client) {
-                throw new Error("Cannot fail closed: OpenCode client is unavailable");
+                throw new EmergencyFailClosedError(
+                    "Cannot fail closed: OpenCode client is unavailable",
+                );
             }
-            // The notice must finish before self-abort: OpenCode detaches the hook
-            // effect on interruption, so an unawaited notification is lost exactly
-            // when the user most needs recovery instructions.
-            await sendIgnoredMessage(
-                deps.client,
-                sessionId,
-                "Context full — /ctx-flush or /clear to continue.",
-                notificationParams,
-            );
+            // The notice must finish before self-abort so recovery instructions survive interruption.
+            let notification: Awaited<ReturnType<typeof sendIgnoredMessage>>;
             try {
-                // Returning any message array still creates a provider request.
-                // Await and validate self-abort so only a confirmed interruption
-                // can return normally from this already-unsendable branch.
+                notification = await sendIgnoredMessage(
+                    deps.client,
+                    sessionId,
+                    "Context full — /ctx-flush or /clear to continue.",
+                    notificationParams,
+                );
+            } catch (error) {
+                throw new EmergencyFailClosedError("Emergency recovery notification failed", {
+                    cause: error,
+                });
+            }
+            if (notification !== "sent") {
+                throw new EmergencyFailClosedError(
+                    `Emergency recovery notification was ${notification}`,
+                );
+            }
+            try {
                 await abortSessionFailClosed(deps.client, sessionId);
             } catch (error) {
                 sessionLog(
@@ -1850,16 +1888,44 @@ export function createTransform(deps: TransformDeps) {
                     "transform: emergency fail-closed abort failed; refusing to return a sendable prompt:",
                     getErrorMessage(error),
                 );
-                throw error;
+                throw new EmergencyFailClosedError("Emergency recovery abort failed", {
+                    cause: error,
+                });
             }
             // The abort prevents a fresh provider usage sample. Release the
             // stale-sample latch so the retry can reclaim additional tools.
-            clearEmergencyDropSample(db, sessionId);
+            try {
+                clearEmergencyDropSample(db, sessionId);
+            } catch (error) {
+                throw new EmergencyFailClosedError("Emergency recovery cleanup failed", {
+                    cause: error,
+                });
+            }
             sessionLog(
                 sessionId,
                 `EMERGENCY: fail-closed (reason=${emergencyFailClosed.reason}, recoveryOrigin=${emergencyRecoveryOrigin ?? "unknown"}, finalEstimate=${finalWireEstimate?.tokens ?? "unavailable"}, estimateTrusted=${finalWireEstimate?.trusted ?? false}, syntheticUsage=${usagePercentageSynthetic})`,
             );
             return;
+        }
+
+        if (passOutcome.captureEligible) {
+            const keys = resolveLkgModelKeys(lkgInput);
+            const modelKey = modelForBudget
+                ? `${modelForBudget.providerID}/${modelForBudget.modelID}`
+                : keys.modelKey;
+            const providerKey = modelForBudget?.providerID ?? keys.providerKey;
+            captureLkgSlot({
+                sessionId,
+                input: lkgInput,
+                output: messages,
+                modelKey,
+                providerKey,
+            });
+        } else if (passOutcome.degradations.length > 0) {
+            sessionLog(
+                sessionId,
+                `lkg_capture_declined degradations=${passOutcome.degradations.map((item) => item.site).join(",")}`,
+            );
         }
 
         if (postTransformResult.bustedThisPass) {

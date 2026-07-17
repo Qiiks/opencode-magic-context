@@ -806,3 +806,7 @@ compartment boundary timestamps from `opencode.db` and emit `start-date` / `end-
 boundary-timestamp lookup equivalent to OpenCode's message table. Pi therefore omits
 these attributes while retaining temporal gap markers derived from Pi message data.
 Cached defer passes in both harnesses continue replaying their previously rendered bytes.
+
+## Pending parity
+
+- Last-known-good transform capture and replay for OpenCode and rust-mode sessions is pending for Pi.

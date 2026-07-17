@@ -66,6 +66,7 @@ import {
 } from "./event-resolvers";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
+import { dropSlot } from "./lkg-slot";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import {
@@ -802,6 +803,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 deps.config.toast_duration_ms,
             ),
         onSessionCacheInvalidated: (sessionId: string) => {
+            dropSlot(sessionId, "session-cache-invalidated");
             clearInjectionCache(sessionId);
             deps.onSessionCacheInvalidated?.(sessionId);
         },
@@ -809,6 +811,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // these module/closure-scope maps don't accumulate entries over the
         // plugin's lifetime (Finding #3).
         onSessionDeleted: (sessionId: string) => {
+            dropSlot(sessionId, "session-deleted");
             systemPromptHash.clearSession(sessionId);
             // Prune every per-session map this hook closure owns. These
             // accumulate one entry per session for the plugin process lifetime

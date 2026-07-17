@@ -82,6 +82,12 @@ async function unifiedSearchWithTimeout(
     }
 }
 
+export type AutoSearchOutcome =
+    | { ok: true }
+    | { ok: false; kind: "timeout" | "search-failure" | "cas-exhaustion" };
+
+const AUTO_SEARCH_OK: AutoSearchOutcome = { ok: true };
+
 export interface AutoSearchRunnerOptions {
     enabled: boolean;
     scoreThreshold: number;
@@ -243,12 +249,12 @@ export async function runAutoSearchHint(args: {
     db: Database;
     messages: MessageLike[];
     options: AutoSearchRunnerOptions;
-}): Promise<void> {
+}): Promise<AutoSearchOutcome> {
     const { sessionId, db, messages, options } = args;
-    if (!options.enabled) return;
+    if (!options.enabled) return AUTO_SEARCH_OK;
 
     const userMsg = findLatestMeaningfulUserMessage(messages);
-    if (!userMsg || typeof userMsg.info.id !== "string") return;
+    if (!userMsg || typeof userMsg.info.id !== "string") return AUTO_SEARCH_OK;
     const userMsgId = userMsg.info.id;
 
     const existing = getAutoSearchHintDecisions(db, sessionId);
@@ -257,7 +263,7 @@ export async function runAutoSearchHint(args: {
         if (existingForMessage.decision === "hint") {
             appendReminderToUserMessageById(messages, userMsgId, existingForMessage.text);
         }
-        return;
+        return AUTO_SEARCH_OK;
     }
 
     // Live-tail gate: only compute a NEW hint when the meaningful user message is
@@ -271,19 +277,20 @@ export async function runAutoSearchHint(args: {
     // wrong here: auto-search has no trigger event and runs every pass, so a
     // deferral gate would either no-op or permanently suppress.
     if (messages.length === 0 || messages[messages.length - 1].info.id !== userMsgId) {
-        return;
+        return AUTO_SEARCH_OK;
     }
 
-    const writeNoHintAndReconcile = (reason: AutoSearchHintNoHintReason): void => {
+    const writeNoHintAndReconcile = (reason: AutoSearchHintNoHintReason): AutoSearchOutcome => {
         const outcome = appendAutoSearchHintDecision(db, sessionId, {
             messageId: userMsgId,
             decision: "no-hint",
             reason,
         });
-        if (!outcome.ok) return;
+        if (!outcome.ok) return { ok: false, kind: "cas-exhaustion" };
         if (outcome.kind === "already-present" && outcome.decision.decision === "hint") {
             appendReminderToUserMessageById(messages, userMsgId, outcome.decision.text);
         }
+        return AUTO_SEARCH_OK;
     };
 
     // New turn — compute hint fresh. Suppression check must run BEFORE stripping
@@ -294,13 +301,11 @@ export async function runAutoSearchHint(args: {
             sessionId,
             "auto-search: skipping — user message already carries augmentation/hint",
         );
-        writeNoHintAndReconcile("stacked");
-        return;
+        return writeNoHintAndReconcile("stacked");
     }
     const rawPrompt = extractUserPromptText(userMsg);
     if (rawPrompt.length < options.minPromptChars) {
-        writeNoHintAndReconcile("too-short");
-        return;
+        return writeNoHintAndReconcile("too-short");
     }
 
     let results: UnifiedSearchResult[] | null;
@@ -353,7 +358,7 @@ export async function runAutoSearchHint(args: {
         log(
             `[auto-search] unified search failed for session ${sessionId} (will retry next pass): ${error instanceof Error ? error.message : String(error)}`,
         );
-        return;
+        return { ok: false, kind: "search-failure" };
     }
 
     if (results === null) {
@@ -362,26 +367,23 @@ export async function runAutoSearchHint(args: {
             sessionId,
             `auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn (will retry)`,
         );
-        return;
+        return { ok: false, kind: "timeout" };
     }
 
     if (results.length === 0) {
-        writeNoHintAndReconcile("empty");
-        return;
+        return writeNoHintAndReconcile("empty");
     }
     if (results[0].score < options.scoreThreshold) {
         sessionLog(
             sessionId,
             `auto-search: top score ${results[0].score.toFixed(3)} below threshold ${options.scoreThreshold}`,
         );
-        writeNoHintAndReconcile("below-threshold");
-        return;
+        return writeNoHintAndReconcile("below-threshold");
     }
 
     const hintText = buildAutoSearchHint(results);
     if (!hintText) {
-        writeNoHintAndReconcile("empty");
-        return;
+        return writeNoHintAndReconcile("empty");
     }
 
     // Prefix with double newline so the hint is a separate block, not glued
@@ -394,7 +396,7 @@ export async function runAutoSearchHint(args: {
     });
     if (!outcome.ok) {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);
-        return;
+        return { ok: false, kind: "cas-exhaustion" };
     }
     if (outcome.decision.decision === "hint") {
         appendReminderToUserMessageById(messages, userMsgId, outcome.decision.text);
@@ -403,6 +405,7 @@ export async function runAutoSearchHint(args: {
         sessionId,
         `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,
     );
+    return AUTO_SEARCH_OK;
 }
 
 /** Test hook — wipe the per-turn cache. */

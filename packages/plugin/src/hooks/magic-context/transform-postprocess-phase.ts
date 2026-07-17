@@ -44,6 +44,7 @@ import {
 } from "./inject-compartments";
 import { markNoteNudgeDelivered, peekNoteNudgeText } from "./note-nudger";
 import { hasVisibleNoteReadCall } from "./note-visibility";
+import type { PassOutcome } from "./pass-outcome";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
     clearOldReasoning,
@@ -205,6 +206,7 @@ interface RunPostTransformPhaseArgs {
      * cannot diverge from the main transform on cold DB-recovered passes.
      */
     resolvedProviderID?: string;
+    passOutcome?: PassOutcome;
     historyRefreshSessions?: Set<string>;
     m0M1?: {
         projectPath?: string;
@@ -797,6 +799,7 @@ export async function runPostTransformPhase(
             pendingOpsRanSuccessfully = true;
         }
     } catch (error) {
+        args.passOutcome?.record("pending-operation-failure");
         sessionLog(args.sessionId, "transform failed applying pending operations:", error);
         updateSessionMeta(args.db, args.sessionId, { lastTransformError: getErrorMessage(error) });
     }
@@ -836,6 +839,7 @@ export async function runPostTransformPhase(
             }
             logTransformTiming(args.sessionId, "dropStaleReduceCalls", t8);
         } catch (error) {
+            args.passOutcome?.record("stale-reduce-strip-exception");
             sessionLog(args.sessionId, "transform failed dropping stale ctx_reduce calls:", error);
         }
     }
@@ -860,6 +864,7 @@ export async function runPostTransformPhase(
             }
             logTransformTiming(args.sessionId, "stripProcessedImages", tImg);
         } catch (error) {
+            args.passOutcome?.record("image-strip-exception");
             sessionLog(args.sessionId, "transform failed stripping processed images:", error);
         }
     }
@@ -893,6 +898,7 @@ export async function runPostTransformPhase(
                 );
             }
         } catch (error) {
+            args.passOutcome?.record("m0-m1-injection-degradation");
             sessionLog(
                 args.sessionId,
                 "transform: m[0]/m[1] injection failed:",
@@ -918,6 +924,7 @@ export async function runPostTransformPhase(
                         "transform: rendered legacy <session-history> fallback after m[0]/m[1] failure",
                     );
                 } catch (fallbackError) {
+                    args.passOutcome?.record("m0-m1-fallback-failure", "fatal");
                     sessionLog(
                         args.sessionId,
                         "transform: legacy fallback injection also failed:",
@@ -1101,6 +1108,7 @@ export async function runPostTransformPhase(
         if (anchoredMessageId && outcome.ok) {
             appendReminderToUserMessageById(args.messages, anchoredMessageId, noteInstruction);
         } else if (anchoredMessageId && !outcome.ok) {
+            args.passOutcome?.record("note-nudge-cas-failure");
             sessionLog(args.sessionId, `note-nudge delivery skipped wire append: ${outcome.kind}`);
         }
     }
@@ -1298,6 +1306,7 @@ export async function runPostTransformPhase(
                         // in which case the signal must survive for that blob's pass.
                         break;
                     case "retryable-failure":
+                        args.passOutcome?.record("compaction-marker-drain-failure");
                         sessionLog(
                             args.sessionId,
                             "compaction-marker drain: retryable failure; preserving deferred history refresh signal",
@@ -1367,6 +1376,7 @@ export async function runPostTransformPhase(
                 );
             }
         } catch (err) {
+            args.passOutcome?.record("deferred-execute-drain-failure");
             sessionLog(args.sessionId, `[boundary-exec] drain failed (continuing): ${err}`);
         }
     }
@@ -1380,7 +1390,7 @@ export async function runPostTransformPhase(
         const visibleMemoryIds = getVisibleMemoryIds(args.db, args.sessionId) ?? undefined;
 
         try {
-            await runAutoSearchHint({
+            const autoSearchOutcome = await runAutoSearchHint({
                 sessionId: args.sessionId,
                 db: args.db,
                 messages: args.messages,
@@ -1394,7 +1404,11 @@ export async function runPostTransformPhase(
                     visibleMemoryIds,
                 },
             });
+            if (!autoSearchOutcome.ok) {
+                args.passOutcome?.record(`auto-search-${autoSearchOutcome.kind}`);
+            }
         } catch (error) {
+            args.passOutcome?.record("auto-search-internal-failure");
             sessionLog(args.sessionId, "auto-search runner failed:", error);
         }
         logTransformTiming(args.sessionId, "pp.autoSearchHint", tAutoSearch);

@@ -4,6 +4,16 @@ import { stableStringify } from "../../shared/stable-json";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
 import type { ContextUsage } from "./types";
 
+const emergencyRecoveryArmedSessions = new Set<string>();
+
+export function isEmergencyRecoveryArmed(sessionId: string): boolean {
+    return emergencyRecoveryArmedSessions.has(sessionId);
+}
+
+export function resetEmergencyRecoveryRegistryForTest(): void {
+    emergencyRecoveryArmedSessions.clear();
+}
+
 interface PersistedUsageRow {
     last_context_percentage: number;
     last_input_tokens: number;
@@ -1684,6 +1694,8 @@ export function recordOverflowDetected(
     modelKey?: string | null,
     origin: EmergencyRecoveryOrigin = "provider_overflow",
 ): void {
+    // Arm before the durable write so an unreadable or failed write remains fail-closed.
+    emergencyRecoveryArmedSessions.add(sessionId);
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
         if (typeof reportedLimit === "number" && reportedLimit > 0) {
@@ -1733,6 +1745,8 @@ export function clearEmergencyRecovery(db: Database, sessionId: string): void {
             ).run(sessionId);
         }
     })();
+    // Clear only after the durable clear succeeds.
+    emergencyRecoveryArmedSessions.delete(sessionId);
 }
 
 /**
