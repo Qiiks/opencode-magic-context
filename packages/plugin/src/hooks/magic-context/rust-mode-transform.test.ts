@@ -175,6 +175,18 @@ describe("Rust mode authority adapter", () => {
         const pageIds = new Set(transformBodies.map((body) => body.transform_page_id));
         expect(pageIds.size).toBe(2);
         expect(transformBodies.length).toBeGreaterThan(2);
+        expect(
+            transformBodies.every((body) =>
+                [
+                    "transform_page_id",
+                    "transform_generation",
+                    "transform_page_index",
+                    "transform_page_total",
+                    "transform_page_complete",
+                    "transform_page_digest",
+                ].every((field) => field in body),
+            ),
+        ).toBe(true);
         expect(output.messages).toBe(native);
     });
 

@@ -220,11 +220,30 @@ const SHADOW_COMPARE_PREFIX_LIMIT: usize = 4096;
 const SHADOW_SEED_MAX_ID_BYTES: usize = 128;
 const SHADOW_SEED_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const SHADOW_SEED_MAX_PENDING: usize = 64;
+// These limits are shared by authority and shadow transform pages. The names retain the
+// shadow prefix because the wire was introduced by that lane, but the coordinator is
+// intentionally handler-wide so a real-session sender cannot bypass the same budget.
 const SHADOW_TRANSFORM_PAGE_MAX_BYTES: usize = 512 * 1024;
 const SHADOW_TRANSFORM_PAGE_MAX_STAGED_BYTES: usize = 128 * 1024 * 1024;
 const SHADOW_TRANSFORM_PAGE_MAX_PENDING: usize = 64;
 const SHADOW_TRANSFORM_PAGE_MAX_ID_BYTES: usize = 128;
 const SHADOW_ITEM_CONTINUATION_KEY: &str = "__shadow_item_continuation";
+const TRANSFORM_PAGE_FIELDS: [&str; 6] = [
+    "transform_page_id",
+    "transform_generation",
+    "transform_page_index",
+    "transform_page_total",
+    "transform_page_complete",
+    "transform_page_digest",
+];
+const TRANSFORM_PAGE_ARRAY_FIELDS: [&str; 6] = [
+    "input",
+    "messages",
+    "native_messages",
+    "ts_output",
+    "ts_ck_messages",
+    "normalizations",
+];
 const STATE_IMPORT_MAX_ID_BYTES: usize = 128;
 const STATE_IMPORT_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const STATE_IMPORT_MAX_PENDING: usize = 64;
@@ -279,6 +298,18 @@ enum StateSyncLane {
 }
 
 impl StateSyncLane {
+    const fn is_shadow(self) -> bool {
+        matches!(self, Self::Shadow)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformLane {
+    Authority,
+    Shadow,
+}
+
+impl TransformLane {
     const fn is_shadow(self) -> bool {
         matches!(self, Self::Shadow)
     }
@@ -483,7 +514,7 @@ impl ShadowSeedCoordinator {
 }
 
 #[derive(Debug)]
-struct PendingShadowTransform {
+struct PendingTransformPage {
     transform_id: String,
     generation: u64,
     total: usize,
@@ -494,14 +525,14 @@ struct PendingShadowTransform {
 }
 
 #[derive(Debug)]
-enum ShadowTransformPhase {
+enum TransformPagePhase {
     Idle,
-    Collecting(PendingShadowTransform),
+    Collecting(PendingTransformPage),
     Applying { transform_id: String, bytes: usize },
 }
 
 #[derive(Debug)]
-struct CompletedShadowTransform {
+struct CompletedTransformPage {
     transform_id: String,
     generation: u64,
     final_digest: String,
@@ -509,30 +540,32 @@ struct CompletedShadowTransform {
 }
 
 #[derive(Debug)]
-struct ShadowTransformSession {
-    phase: ShadowTransformPhase,
-    completed: Option<CompletedShadowTransform>,
+struct TransformPageSession {
+    phase: TransformPagePhase,
+    completed: Option<CompletedTransformPage>,
 }
 
-impl Default for ShadowTransformSession {
+impl Default for TransformPageSession {
     fn default() -> Self {
         Self {
-            phase: ShadowTransformPhase::Idle,
+            phase: TransformPagePhase::Idle,
             completed: None,
         }
     }
 }
 
+/// Authority and shadow transform pages share this coordinator so every session has one
+/// in-flight attempt and every sender contributes to the same bounded staging budget.
 #[derive(Debug)]
-struct ShadowTransformCoordinator {
-    sessions: HashMap<String, ShadowTransformSession>,
+struct TransformPageCoordinator {
+    sessions: HashMap<String, TransformPageSession>,
     total_staged_bytes: usize,
     pending_transform_count: usize,
     max_staged_bytes: usize,
     max_pending_transforms: usize,
 }
 
-impl Default for ShadowTransformCoordinator {
+impl Default for TransformPageCoordinator {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
@@ -544,7 +577,7 @@ impl Default for ShadowTransformCoordinator {
     }
 }
 
-enum ShadowTransformStageAction {
+enum TransformPageStageAction {
     Ack(usize),
     Apply {
         pages: Vec<Value>,
@@ -555,7 +588,7 @@ enum ShadowTransformStageAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShadowTransformStageError {
+enum TransformPageStageError {
     AttemptMismatch,
     DigestMismatch,
     OrderMismatch,
@@ -563,20 +596,20 @@ enum ShadowTransformStageError {
     InProgress,
 }
 
-impl ShadowTransformCoordinator {
-    fn phase_bytes(phase: &ShadowTransformPhase) -> usize {
+impl TransformPageCoordinator {
+    fn phase_bytes(phase: &TransformPagePhase) -> usize {
         match phase {
-            ShadowTransformPhase::Collecting(pending) => pending.bytes,
-            ShadowTransformPhase::Applying { bytes, .. } => *bytes,
-            ShadowTransformPhase::Idle => 0,
+            TransformPagePhase::Collecting(pending) => pending.bytes,
+            TransformPagePhase::Applying { bytes, .. } => *bytes,
+            TransformPagePhase::Idle => 0,
         }
     }
 
-    fn is_pending(phase: &ShadowTransformPhase) -> bool {
-        !matches!(phase, ShadowTransformPhase::Idle)
+    fn is_pending(phase: &TransformPagePhase) -> bool {
+        !matches!(phase, TransformPagePhase::Idle)
     }
 
-    fn release_phase(&mut self, phase: &ShadowTransformPhase) {
+    fn release_phase(&mut self, phase: &TransformPagePhase) {
         if Self::is_pending(phase) {
             self.pending_transform_count = self.pending_transform_count.saturating_sub(1);
             self.total_staged_bytes = self
@@ -588,21 +621,21 @@ impl ShadowTransformCoordinator {
     fn discard(&mut self, session_id: &str) {
         let phase = self.sessions.get_mut(session_id).map(|session| {
             session.completed = None;
-            std::mem::replace(&mut session.phase, ShadowTransformPhase::Idle)
+            std::mem::replace(&mut session.phase, TransformPagePhase::Idle)
         });
         if let Some(phase) = phase {
             self.release_phase(&phase);
         }
     }
 
-    fn set_phase(&mut self, session_id: &str, phase: ShadowTransformPhase) {
+    fn set_phase(&mut self, session_id: &str, phase: TransformPagePhase) {
         self.sessions
             .entry(session_id.to_string())
             .or_default()
             .phase = phase;
     }
 
-    fn completed(&self, session_id: &str, transform_id: &str) -> Option<&CompletedShadowTransform> {
+    fn completed(&self, session_id: &str, transform_id: &str) -> Option<&CompletedTransformPage> {
         self.sessions
             .get(session_id)
             .and_then(|session| session.completed.as_ref())
@@ -621,20 +654,20 @@ impl ShadowTransformCoordinator {
         page: Value,
         page_bytes: usize,
         page_complete: bool,
-    ) -> Result<ShadowTransformStageAction, ShadowTransformStageError> {
+    ) -> Result<TransformPageStageAction, TransformPageStageError> {
         if self.pending_transform_count >= self.max_pending_transforms
             && !self.sessions.contains_key(session_id)
         {
-            return Err(ShadowTransformStageError::BufferOverflow);
+            return Err(TransformPageStageError::BufferOverflow);
         }
         let phase = {
             let session = self.sessions.entry(session_id.to_string()).or_default();
-            std::mem::replace(&mut session.phase, ShadowTransformPhase::Idle)
+            std::mem::replace(&mut session.phase, TransformPagePhase::Idle)
         };
         match phase {
-            ShadowTransformPhase::Idle => {
+            TransformPagePhase::Idle => {
                 if page_index != 0 {
-                    return Err(ShadowTransformStageError::AttemptMismatch);
+                    return Err(TransformPageStageError::AttemptMismatch);
                 }
                 if page_bytes > self.max_staged_bytes
                     || self
@@ -642,19 +675,19 @@ impl ShadowTransformCoordinator {
                         .checked_add(page_bytes)
                         .is_none_or(|bytes| bytes > self.max_staged_bytes)
                 {
-                    return Err(ShadowTransformStageError::BufferOverflow);
+                    return Err(TransformPageStageError::BufferOverflow);
                 }
                 self.total_staged_bytes += page_bytes;
                 self.pending_transform_count += 1;
                 if page_complete {
                     self.set_phase(
                         session_id,
-                        ShadowTransformPhase::Applying {
+                        TransformPagePhase::Applying {
                             transform_id: transform_id.clone(),
                             bytes: page_bytes,
                         },
                     );
-                    Ok(ShadowTransformStageAction::Apply {
+                    Ok(TransformPageStageAction::Apply {
                         pages: vec![page],
                         transform_id,
                         generation,
@@ -663,7 +696,7 @@ impl ShadowTransformCoordinator {
                 } else {
                     self.set_phase(
                         session_id,
-                        ShadowTransformPhase::Collecting(PendingShadowTransform {
+                        TransformPagePhase::Collecting(PendingTransformPage {
                             transform_id,
                             generation,
                             total: page_total,
@@ -673,29 +706,29 @@ impl ShadowTransformCoordinator {
                             bytes: page_bytes,
                         }),
                     );
-                    Ok(ShadowTransformStageAction::Ack(1))
+                    Ok(TransformPageStageAction::Ack(1))
                 }
             }
-            ShadowTransformPhase::Applying {
+            TransformPagePhase::Applying {
                 transform_id: active,
                 bytes,
             } => {
                 self.set_phase(
                     session_id,
-                    ShadowTransformPhase::Applying {
+                    TransformPagePhase::Applying {
                         transform_id: active,
                         bytes,
                     },
                 );
-                Err(ShadowTransformStageError::InProgress)
+                Err(TransformPageStageError::InProgress)
             }
-            ShadowTransformPhase::Collecting(mut pending) => {
+            TransformPagePhase::Collecting(mut pending) => {
                 if pending.transform_id != transform_id
                     || pending.generation != generation
                     || pending.total != page_total
                 {
-                    self.release_phase(&ShadowTransformPhase::Collecting(pending));
-                    return Err(ShadowTransformStageError::AttemptMismatch);
+                    self.release_phase(&TransformPagePhase::Collecting(pending));
+                    return Err(TransformPageStageError::AttemptMismatch);
                 }
                 if page_index < pending.next_index {
                     let matches = pending
@@ -704,23 +737,23 @@ impl ShadowTransformCoordinator {
                         .is_some_and(|accepted| accepted == &page_digest);
                     let next_index = pending.next_index;
                     if !matches {
-                        self.release_phase(&ShadowTransformPhase::Collecting(pending));
-                        return Err(ShadowTransformStageError::DigestMismatch);
+                        self.release_phase(&TransformPagePhase::Collecting(pending));
+                        return Err(TransformPageStageError::DigestMismatch);
                     }
-                    self.set_phase(session_id, ShadowTransformPhase::Collecting(pending));
-                    return Ok(ShadowTransformStageAction::Ack(next_index));
+                    self.set_phase(session_id, TransformPagePhase::Collecting(pending));
+                    return Ok(TransformPageStageAction::Ack(next_index));
                 }
                 if page_index > pending.next_index {
-                    self.release_phase(&ShadowTransformPhase::Collecting(pending));
-                    return Err(ShadowTransformStageError::OrderMismatch);
+                    self.release_phase(&TransformPagePhase::Collecting(pending));
+                    return Err(TransformPageStageError::OrderMismatch);
                 }
                 let next_bytes = pending.bytes.checked_add(page_bytes);
                 let total_bytes = self.total_staged_bytes.checked_add(page_bytes);
                 if next_bytes.is_none_or(|bytes| bytes > self.max_staged_bytes)
                     || total_bytes.is_none_or(|bytes| bytes > self.max_staged_bytes)
                 {
-                    self.release_phase(&ShadowTransformPhase::Collecting(pending));
-                    return Err(ShadowTransformStageError::BufferOverflow);
+                    self.release_phase(&TransformPagePhase::Collecting(pending));
+                    return Err(TransformPageStageError::BufferOverflow);
                 }
                 pending.bytes = next_bytes.unwrap_or(usize::MAX);
                 self.total_staged_bytes = total_bytes.unwrap_or(usize::MAX);
@@ -734,12 +767,12 @@ impl ShadowTransformCoordinator {
                     let active_generation = pending.generation;
                     self.set_phase(
                         session_id,
-                        ShadowTransformPhase::Applying {
+                        TransformPagePhase::Applying {
                             transform_id: active_id.clone(),
                             bytes,
                         },
                     );
-                    Ok(ShadowTransformStageAction::Apply {
+                    Ok(TransformPageStageAction::Apply {
                         pages,
                         transform_id: active_id,
                         generation: active_generation,
@@ -747,8 +780,8 @@ impl ShadowTransformCoordinator {
                     })
                 } else {
                     let next_index = pending.next_index;
-                    self.set_phase(session_id, ShadowTransformPhase::Collecting(pending));
-                    Ok(ShadowTransformStageAction::Ack(next_index))
+                    self.set_phase(session_id, TransformPagePhase::Collecting(pending));
+                    Ok(TransformPageStageAction::Ack(next_index))
                 }
             }
         }
@@ -1655,7 +1688,7 @@ pub struct McHandler {
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
     shadow_seeds: Mutex<ShadowSeedCoordinator>,
-    shadow_transforms: Mutex<ShadowTransformCoordinator>,
+    transform_pages: Mutex<TransformPageCoordinator>,
     state_imports: Mutex<StateImportCoordinator>,
 }
 
@@ -2018,7 +2051,7 @@ impl McHandler {
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
-            shadow_transforms: Mutex::new(ShadowTransformCoordinator::default()),
+            transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
         }
     }
@@ -2083,7 +2116,7 @@ impl McHandler {
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
-            shadow_transforms: Mutex::new(ShadowTransformCoordinator::default()),
+            transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
         }
     }
@@ -2107,9 +2140,9 @@ impl McHandler {
                 .lock()
                 .expect("shadow seed mutex")
                 .evict(&session_id);
-            self.shadow_transforms
+            self.transform_pages
                 .lock()
-                .expect("shadow transform mutex")
+                .expect("transform page mutex")
                 .discard(&session_id);
             self.state_imports
                 .lock()
@@ -2138,20 +2171,20 @@ impl McHandler {
             .is_some_and(|state| ShadowSeedCoordinator::is_pending(&state.phase))
     }
 
-    fn discard_shadow_transform(&self, session_id: &str) {
-        self.shadow_transforms
+    fn discard_transform_pages(&self, session_id: &str) {
+        self.transform_pages
             .lock()
-            .expect("shadow transform mutex")
+            .expect("transform page mutex")
             .discard(session_id);
     }
 
-    fn shadow_transform_page_in_progress(&self, session_id: &str) -> bool {
-        self.shadow_transforms
+    fn transform_page_in_progress(&self, session_id: &str) -> bool {
+        self.transform_pages
             .lock()
-            .expect("shadow transform mutex")
+            .expect("transform page mutex")
             .sessions
             .get(session_id)
-            .is_some_and(|state| ShadowTransformCoordinator::is_pending(&state.phase))
+            .is_some_and(|state| TransformPageCoordinator::is_pending(&state.phase))
     }
 
     /// Remove a route and evict process-local session state after its final binding closes.
@@ -2174,9 +2207,9 @@ impl McHandler {
                 .lock()
                 .expect("shadow seed mutex")
                 .evict(&session);
-            self.shadow_transforms
+            self.transform_pages
                 .lock()
-                .expect("shadow transform mutex")
+                .expect("transform page mutex")
                 .discard(&session);
             self.state_imports
                 .lock()
@@ -4995,6 +5028,16 @@ impl McHandler {
     }
 
     async fn handle_transform_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        self.handle_transform_unpaged_value(channel, request, false)
+            .await
+    }
+
+    async fn handle_transform_unpaged_value(
+        &self,
+        channel: u16,
+        request: Value,
+        from_page_apply: bool,
+    ) -> HandlerOutcome {
         let parsed: TransformRequest = match serde_json::from_value(request.clone()) {
             Ok(req) => req,
             Err(e) => {
@@ -5060,6 +5103,12 @@ impl McHandler {
                 code: "plain_transform_on_shadow_binding".to_string(),
                 message: "use shadow_transform for routes bound as shadow:<real_session>"
                     .to_string(),
+            };
+        }
+        if !from_page_apply && self.transform_page_in_progress(&binding.session) {
+            return HandlerOutcome::Error {
+                code: "authority_transform_page_in_progress".to_string(),
+                message: "transform is blocked until all transform pages arrive".to_string(),
             };
         }
         // A newer full transform invalidates the prior wrapup snapshot before any store
@@ -5914,7 +5963,7 @@ impl McHandler {
             Some(store) => Arc::clone(store),
             None => return store_unavailable_error(),
         };
-        self.discard_shadow_transform(&binding.session);
+        self.discard_transform_pages(&binding.session);
         match store.reset_shadow_session(&binding.session, &shadow_project_path(&binding.session)) {
             Ok(result) => {
                 let armed = self
@@ -5948,30 +5997,46 @@ impl McHandler {
         }
     }
 
-    async fn handle_shadow_transform_page_value(
+    async fn handle_transform_page_value(
         &self,
         channel: u16,
         request: Value,
+        lane: TransformLane,
     ) -> HandlerOutcome {
-        const PAGE_FIELDS: [&str; 6] = [
-            "transform_page_id",
-            "transform_generation",
-            "transform_page_index",
-            "transform_page_total",
-            "transform_page_complete",
-            "transform_page_digest",
-        ];
-        let present = PAGE_FIELDS
+        let present = TRANSFORM_PAGE_FIELDS
             .iter()
             .filter(|field| request.get(**field).is_some())
             .count();
         let session_id = request.get("session_id").and_then(Value::as_str);
-        let binding = match self.shadow_binding(channel, session_id) {
+        // This accessor intentionally accepts both real and shadow bindings. The lane is
+        // checked below, after the route identity is resolved, so authority pages cannot be
+        // accidentally forced through shadow-only binding validation.
+        let binding = match self.state_sync_binding(channel, session_id) {
             Ok(binding) => binding,
             Err(outcome) => return outcome,
         };
-        if present != PAGE_FIELDS.len() {
-            self.discard_shadow_transform(&binding.session);
+        let bound_lane = if is_shadow_session(&binding.session) {
+            TransformLane::Shadow
+        } else {
+            TransformLane::Authority
+        };
+        if bound_lane != lane {
+            return if lane.is_shadow() {
+                HandlerOutcome::Error {
+                    code: "shadow_binding_required".to_string(),
+                    message: "shadow ops require a route bound as shadow:<real_session>"
+                        .to_string(),
+                }
+            } else {
+                HandlerOutcome::Error {
+                    code: "plain_transform_on_shadow_binding".to_string(),
+                    message: "use shadow_transform for routes bound as shadow:<real_session>"
+                        .to_string(),
+                }
+            };
+        }
+        if present != TRANSFORM_PAGE_FIELDS.len() {
+            self.discard_transform_pages(&binding.session);
             return invalid_params_error("transform page envelope must be all-or-none");
         }
         let transform_id = match request.get("transform_page_id").and_then(Value::as_str) {
@@ -5979,145 +6044,136 @@ impl McHandler {
                 id.to_string()
             }
             _ => {
-                self.discard_shadow_transform(&binding.session);
+                self.discard_transform_pages(&binding.session);
                 return invalid_params_error(format!(
                     "transform_page_id must contain 1..={SHADOW_TRANSFORM_PAGE_MAX_ID_BYTES} bytes"
                 ));
             }
         };
         let Some(generation) = request.get("transform_generation").and_then(Value::as_u64) else {
-            self.discard_shadow_transform(&binding.session);
+            self.discard_transform_pages(&binding.session);
             return invalid_params_error("transform_generation must be an unsigned integer");
         };
         let Some(page_index) = request.get("transform_page_index").and_then(Value::as_u64) else {
-            self.discard_shadow_transform(&binding.session);
+            self.discard_transform_pages(&binding.session);
             return invalid_params_error("transform_page_index must be an unsigned integer");
         };
         let Some(page_total) = request.get("transform_page_total").and_then(Value::as_u64) else {
-            self.discard_shadow_transform(&binding.session);
+            self.discard_transform_pages(&binding.session);
             return invalid_params_error("transform_page_total must be an unsigned integer");
         };
         let Some(page_complete) = request
             .get("transform_page_complete")
             .and_then(Value::as_bool)
         else {
-            self.discard_shadow_transform(&binding.session);
+            self.discard_transform_pages(&binding.session);
             return invalid_params_error("transform_page_complete must be a boolean");
         };
         let Some(page_digest) = request.get("transform_page_digest").and_then(Value::as_str) else {
-            self.discard_shadow_transform(&binding.session);
+            self.discard_transform_pages(&binding.session);
             return invalid_params_error("transform_page_digest must be a string");
         };
         let page_index = usize::try_from(page_index).unwrap_or(usize::MAX);
         let page_total = usize::try_from(page_total).unwrap_or(usize::MAX);
         if page_total == 0 || page_index >= page_total {
-            self.discard_shadow_transform(&binding.session);
-            return HandlerOutcome::Error {
-                code: "shadow_transform_page_protocol_mismatch".to_string(),
-                message: "transform page index/total is invalid".to_string(),
-            };
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "protocol_mismatch",
+                "transform page index/total is invalid",
+            );
         }
         if page_complete != (page_index + 1 == page_total) {
-            self.discard_shadow_transform(&binding.session);
-            return HandlerOutcome::Error {
-                code: "shadow_transform_page_protocol_mismatch".to_string(),
-                message: "transform page completion disagrees with the final page index"
-                    .to_string(),
-            };
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "protocol_mismatch",
+                "transform page completion disagrees with the final page index",
+            );
         }
-        let allowed_nonterminal = [
-            "method",
-            "session_id",
-            "shadow_generation",
-            "transform_page_id",
-            "transform_generation",
-            "transform_page_index",
-            "transform_page_total",
-            "transform_page_complete",
-            "transform_page_digest",
-            "input",
-            "messages",
-            "ts_output",
-            "ts_ck_messages",
-            "normalizations",
-        ];
         if !page_complete
             && request.as_object().is_some_and(|object| {
-                object
-                    .keys()
-                    .any(|key| !allowed_nonterminal.contains(&key.as_str()))
+                object.keys().any(|key| {
+                    !["method", "session_id", "shadow_generation"]
+                        .into_iter()
+                        .chain(TRANSFORM_PAGE_FIELDS)
+                        .chain(TRANSFORM_PAGE_ARRAY_FIELDS)
+                        .any(|allowed| allowed == key.as_str())
+                })
             })
         {
-            self.discard_shadow_transform(&binding.session);
-            return HandlerOutcome::Error {
-                code: "shadow_transform_page_protocol_mismatch".to_string(),
-                message: "non-final transform pages may carry only message arrays".to_string(),
-            };
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "protocol_mismatch",
+                "non-final transform pages may carry only message arrays",
+            );
         }
-        if shadow_transform_page_content_digest(&request) != page_digest {
-            self.discard_shadow_transform(&binding.session);
-            return HandlerOutcome::Error {
-                code: "shadow_transform_page_digest_mismatch".to_string(),
-                message: "transform page content digest did not match the supplied digest"
-                    .to_string(),
-            };
+        if transform_page_content_digest(&request) != page_digest {
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "digest_mismatch",
+                "transform page content digest did not match the supplied digest",
+            );
         }
         let page_bytes = match serde_json::to_vec(&request) {
             Ok(bytes) => bytes.len(),
             Err(error) => {
-                self.discard_shadow_transform(&binding.session);
+                self.discard_transform_pages(&binding.session);
                 return invalid_params_error(error.to_string());
             }
         };
         if page_bytes > SHADOW_TRANSFORM_PAGE_MAX_BYTES {
-            self.discard_shadow_transform(&binding.session);
-            return HandlerOutcome::Error {
-                code: "shadow_transform_page_buffer_overflow".to_string(),
-                message: "transform page exceeded the 512 KiB page cap".to_string(),
-            };
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "buffer_overflow",
+                "transform page exceeded the 512 KiB page cap",
+            );
         }
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
             None => return store_unavailable_error(),
         };
-        if request.get("shadow_generation").and_then(Value::as_u64) != Some(generation) {
-            self.discard_shadow_transform(&binding.session);
-            return HandlerOutcome::Error {
-                code: "shadow_transform_page_attempt_mismatch".to_string(),
-                message: "shadow_generation must match transform_generation".to_string(),
-            };
-        }
-        if page_index == 0 {
-            let loaded = match store.load(&binding.session) {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    self.discard_shadow_transform(&binding.session);
-                    return HandlerOutcome::Error {
-                        code: "store_load_failed".to_string(),
-                        message: error.to_string(),
-                    };
-                }
-            };
-            if loaded.meta.shadow_generation != generation
-                || loaded.meta.shadow_generation
-                    != request
-                        .get("shadow_generation")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default()
-            {
-                self.discard_shadow_transform(&binding.session);
-                return HandlerOutcome::Error {
-                    code: "shadow_transform_page_attempt_mismatch".to_string(),
-                    message: "transform page generation did not match durable shadow generation"
-                        .to_string(),
+        if lane.is_shadow() {
+            if request.get("shadow_generation").and_then(Value::as_u64) != Some(generation) {
+                self.discard_transform_pages(&binding.session);
+                return transform_page_error(
+                    lane,
+                    "attempt_mismatch",
+                    "shadow_generation must match transform_generation",
+                );
+            }
+            if page_index == 0 {
+                let loaded = match store.load(&binding.session) {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        self.discard_transform_pages(&binding.session);
+                        return HandlerOutcome::Error {
+                            code: "store_load_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
                 };
+                if loaded.meta.shadow_generation != generation
+                    || loaded.meta.shadow_generation
+                        != request
+                            .get("shadow_generation")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default()
+                {
+                    self.discard_transform_pages(&binding.session);
+                    return transform_page_error(
+                        lane,
+                        "attempt_mismatch",
+                        "transform page generation did not match durable shadow generation",
+                    );
+                }
             }
         }
         {
-            let transforms = self
-                .shadow_transforms
-                .lock()
-                .expect("shadow transform mutex");
+            let transforms = self.transform_pages.lock().expect("transform page mutex");
             if let Some(completed) = transforms.completed(&binding.session, &transform_id) {
                 if completed.generation == generation
                     && page_complete
@@ -6125,17 +6181,15 @@ impl McHandler {
                 {
                     return HandlerOutcome::Response(completed.result.clone());
                 }
-                return HandlerOutcome::Error {
-                    code: "shadow_transform_page_digest_mismatch".to_string(),
-                    message: "completed transform page content changed".to_string(),
-                };
+                return transform_page_error(
+                    lane,
+                    "digest_mismatch",
+                    "completed transform page content changed",
+                );
             }
         }
         let action = {
-            let mut transforms = self
-                .shadow_transforms
-                .lock()
-                .expect("shadow transform mutex");
+            let mut transforms = self.transform_pages.lock().expect("transform page mutex");
             match transforms.stage(
                 &binding.session,
                 transform_id,
@@ -6149,81 +6203,77 @@ impl McHandler {
             ) {
                 Ok(action) => action,
                 Err(error) => {
-                    let (code, message) = match error {
-                        ShadowTransformStageError::AttemptMismatch => (
-                            "shadow_transform_page_attempt_mismatch",
+                    let (suffix, message) = match error {
+                        TransformPageStageError::AttemptMismatch => (
+                            "attempt_mismatch",
                             "transform page generation or envelope changed during collection",
                         ),
-                        ShadowTransformStageError::DigestMismatch => (
-                            "shadow_transform_page_digest_mismatch",
-                            "redriven transform page content changed",
-                        ),
-                        ShadowTransformStageError::OrderMismatch => (
-                            "shadow_transform_page_order_mismatch",
+                        TransformPageStageError::DigestMismatch => {
+                            ("digest_mismatch", "redriven transform page content changed")
+                        }
+                        TransformPageStageError::OrderMismatch => (
+                            "order_mismatch",
                             "transform pages must arrive in strict index order",
                         ),
-                        ShadowTransformStageError::BufferOverflow => (
-                            "shadow_transform_page_buffer_overflow",
+                        TransformPageStageError::BufferOverflow => (
+                            "buffer_overflow",
                             "transform page staging exceeded the handler-wide byte cap",
                         ),
-                        ShadowTransformStageError::InProgress => (
-                            "shadow_transform_page_in_progress",
-                            "the final transform page is being applied",
-                        ),
+                        TransformPageStageError::InProgress => {
+                            ("in_progress", "the final transform page is being applied")
+                        }
                     };
-                    return HandlerOutcome::Error {
-                        code: code.to_string(),
-                        message: message.to_string(),
-                    };
+                    return transform_page_error(lane, suffix, message);
                 }
             }
         };
         match action {
-            ShadowTransformStageAction::Ack(next_expected_index) => respond(json!({
+            TransformPageStageAction::Ack(next_expected_index) => respond(json!({
                 "ok": true,
                 "staged": true,
                 "next_expected_index": next_expected_index,
             })),
-            ShadowTransformStageAction::Apply {
+            TransformPageStageAction::Apply {
                 pages,
                 transform_id,
                 generation,
                 final_digest,
             } => {
-                let assembled = match assemble_shadow_transform(pages) {
+                let assembled = match assemble_transform_pages(pages) {
                     Ok(assembled) => assembled,
                     Err(message) => {
-                        self.discard_shadow_transform(&binding.session);
-                        return HandlerOutcome::Error {
-                            code: "shadow_transform_page_protocol_mismatch".to_string(),
-                            message,
-                        };
+                        self.discard_transform_pages(&binding.session);
+                        return transform_page_error(lane, "protocol_mismatch", message);
                     }
                 };
-                let outcome = self
-                    .handle_shadow_transform_unpaged_value(channel, assembled, true)
-                    .await;
+                let outcome = match lane {
+                    TransformLane::Authority => {
+                        self.handle_transform_unpaged_value(channel, assembled, true)
+                            .await
+                    }
+                    TransformLane::Shadow => {
+                        self.handle_shadow_transform_unpaged_value(channel, assembled, true)
+                            .await
+                    }
+                };
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
                     HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
                 };
-                let mut transforms = self
-                    .shadow_transforms
-                    .lock()
-                    .expect("shadow transform mutex");
+                let mut transforms = self.transform_pages.lock().expect("transform page mutex");
                 let phase = {
                     let session = transforms
                         .sessions
                         .entry(binding.session.clone())
                         .or_default();
-                    std::mem::replace(&mut session.phase, ShadowTransformPhase::Idle)
+                    std::mem::replace(&mut session.phase, TransformPagePhase::Idle)
                 };
                 match phase {
-                    ShadowTransformPhase::Applying {
+                    TransformPagePhase::Applying {
                         transform_id: applying_id,
                         bytes,
                     } if applying_id == transform_id => {
-                        transforms.release_phase(&ShadowTransformPhase::Applying {
+                        transforms.release_phase(&TransformPagePhase::Applying {
                             transform_id: applying_id,
                             bytes,
                         });
@@ -6232,7 +6282,7 @@ impl McHandler {
                                 .sessions
                                 .entry(binding.session.clone())
                                 .or_default()
-                                .completed = Some(CompletedShadowTransform {
+                                .completed = Some(CompletedTransformPage {
                                 transform_id,
                                 generation,
                                 final_digest,
@@ -6261,7 +6311,7 @@ impl McHandler {
             .any(|field| request.get(*field).is_some())
         {
             return self
-                .handle_shadow_transform_page_value(channel, request)
+                .handle_transform_page_value(channel, request, TransformLane::Shadow)
                 .await;
         }
         self.handle_shadow_transform_unpaged_value(channel, request, false)
@@ -6282,9 +6332,9 @@ impl McHandler {
             Ok(binding) => binding,
             Err(outcome) => return outcome,
         };
-        if !from_page_apply && self.shadow_transform_page_in_progress(&binding.session) {
+        if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
-                code: "shadow_transform_page_in_progress".to_string(),
+                code: "transform_page_in_progress".to_string(),
                 message: "shadow_transform is blocked until all transform pages arrive".to_string(),
             };
         }
@@ -7039,7 +7089,14 @@ impl McHandler {
                 "guidance.get" => self.handle_guidance_value(channel, &request),
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
-                "transform" => self.handle_transform_value(channel, request).await,
+                "transform" => {
+                    if has_transform_page_fields(&request) {
+                        self.handle_transform_page_value(channel, request, TransformLane::Authority)
+                            .await
+                    } else {
+                        self.handle_transform_value(channel, request).await
+                    }
+                }
                 "state_sync" => {
                     // State sync is shared by both the authority and shadow lanes. Only the
                     // shadow lane is controlled by the mirror kill switch; the authority lane
@@ -7105,6 +7162,33 @@ fn authority_state_sync_outcome(outcome: HandlerOutcome) -> HandlerOutcome {
             message: message.replace("shadow", "authority"),
         },
         other => other,
+    }
+}
+
+fn has_transform_page_fields(request: &Value) -> bool {
+    TRANSFORM_PAGE_FIELDS
+        .iter()
+        .any(|field| request.get(*field).is_some())
+}
+
+fn transform_page_error(
+    lane: TransformLane,
+    suffix: &str,
+    message: impl Into<String>,
+) -> HandlerOutcome {
+    let code = if lane.is_shadow() && suffix == "in_progress" {
+        "transform_page_in_progress".to_string()
+    } else {
+        let prefix = if lane.is_shadow() {
+            "shadow"
+        } else {
+            "authority"
+        };
+        format!("{prefix}_transform_page_{suffix}")
+    };
+    HandlerOutcome::Error {
+        code,
+        message: message.into(),
     }
 }
 
@@ -7283,15 +7367,9 @@ fn shadow_seed_content_digest(request: &Value) -> String {
     sha256_hex(canonical_value(&content).as_bytes())
 }
 
-fn shadow_transform_page_content_digest(request: &Value) -> String {
+fn transform_page_content_digest(request: &Value) -> String {
     let mut content = Map::new();
-    for field in [
-        "input",
-        "messages",
-        "ts_output",
-        "ts_ck_messages",
-        "normalizations",
-    ] {
+    for field in TRANSFORM_PAGE_ARRAY_FIELDS {
         if let Some(value) = request.get(field) {
             content.insert(field.to_string(), value.clone());
         }
@@ -7299,7 +7377,7 @@ fn shadow_transform_page_content_digest(request: &Value) -> String {
     sha256_hex(canonical_value(&Value::Object(content)).as_bytes())
 }
 
-fn assemble_shadow_transform_field(field: &str, values: Vec<Value>) -> Result<Vec<Value>, String> {
+fn assemble_transform_page_field(field: &str, values: Vec<Value>) -> Result<Vec<Value>, String> {
     let mut assembled = Vec::new();
     let mut index = 0usize;
     while index < values.len() {
@@ -7381,7 +7459,7 @@ fn assemble_shadow_transform_field(field: &str, values: Vec<Value>) -> Result<Ve
     Ok(assembled)
 }
 
-fn assemble_shadow_transform(mut pages: Vec<Value>) -> Result<Value, String> {
+fn assemble_transform_pages(mut pages: Vec<Value>) -> Result<Value, String> {
     let mut final_page = pages
         .pop()
         .ok_or_else(|| "transform page collection was empty".to_string())?;
@@ -7400,13 +7478,7 @@ fn assemble_shadow_transform(mut pages: Vec<Value>) -> Result<Value, String> {
             object.remove(field);
         }
     }
-    for field in [
-        "input",
-        "messages",
-        "ts_output",
-        "ts_ck_messages",
-        "normalizations",
-    ] {
+    for field in TRANSFORM_PAGE_ARRAY_FIELDS {
         let had_field = final_page.get(field).is_some();
         let mut values = Vec::new();
         for page in pages.iter().chain(std::iter::once(&final_page)) {
@@ -7415,7 +7487,7 @@ fn assemble_shadow_transform(mut pages: Vec<Value>) -> Result<Value, String> {
             }
         }
         if had_field || !values.is_empty() {
-            let values = assemble_shadow_transform_field(field, values)?;
+            let values = assemble_transform_page_field(field, values)?;
             let Some(object) = final_page.as_object_mut() else {
                 return Err("transform page was not an object".to_string());
             };
@@ -15231,6 +15303,65 @@ mod tests {
         batch
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn paged_transform_page(
+        method: &str,
+        session: &str,
+        page_id: &str,
+        generation: u64,
+        index: usize,
+        total: usize,
+        complete: bool,
+        messages: Vec<Value>,
+    ) -> Value {
+        let mut page = json!({
+            "method": method,
+            "session_id": session,
+            "transform_page_id": page_id,
+            "transform_generation": generation,
+            "transform_page_index": index,
+            "transform_page_total": total,
+            "transform_page_complete": complete,
+            "messages": messages,
+        });
+        if method == "shadow_transform" {
+            page["shadow_generation"] = json!(generation);
+        }
+        if complete {
+            let object = page.as_object_mut().expect("transform page body");
+            if method == "transform" {
+                object.extend([
+                    ("kind".to_string(), json!("transform")),
+                    ("v".to_string(), json!(2)),
+                    ("serializer_profile".to_string(), json!("owned-llmrunner")),
+                    ("render_config".to_string(), json!("cfg0")),
+                    (
+                        "usage".to_string(),
+                        json!({
+                            "current_total_input_tokens": 45_000,
+                            "context_limit_tokens": 50_000,
+                        }),
+                    ),
+                ]);
+            } else {
+                object.extend([
+                    ("kind".to_string(), json!("shadow_transform")),
+                    ("shadow_generation".to_string(), json!(generation)),
+                    ("seed_pass".to_string(), json!(true)),
+                    ("pass_inputs".to_string(), shadow_pass_inputs()),
+                    ("ts_decision".to_string(), json!({ "class": "defer" })),
+                    ("declared_trim".to_string(), Value::Null),
+                    ("ts_ck_messages".to_string(), json!([])),
+                    ("input".to_string(), json!([])),
+                    ("ts_output".to_string(), json!([])),
+                    ("normalizations".to_string(), json!([])),
+                ]);
+            }
+        }
+        page["transform_page_digest"] = json!(transform_page_content_digest(&page));
+        page
+    }
+
     fn seed_accounting(handler: &McHandler) -> (usize, usize) {
         let seeds = handler.shadow_seeds.lock().expect("shadow seed mutex");
         (seeds.total_staged_bytes, seeds.pending_seed_count)
@@ -15380,6 +15511,376 @@ mod tests {
         assert_eq!(
             store.load_active_memories(&project_path, 0).unwrap()[0].content,
             "authority memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn paged_authority_transform_reassembles_and_executes_without_shadow_gate() {
+        let state = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.shadow_enabled = false;
+        let (handler, _store, _dir, _project) = handler_with_store(state, config);
+        let first = paged_transform_page(
+            "transform",
+            "ses",
+            "authority-page",
+            0,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "authority first").ck,
+            })],
+        );
+        let final_page = paged_transform_page(
+            "transform",
+            "ses",
+            "authority-page",
+            0,
+            1,
+            2,
+            true,
+            vec![json!({
+                "mid": "m1",
+                "ordinal": 1,
+                "ck": ck("m1", 1, "authority final").ck,
+            })],
+        );
+        let mut first = first;
+        first["native_messages"] = json!([{ "text": "a".repeat(280 * 1024) }]);
+        first["transform_page_digest"] = json!(transform_page_content_digest(&first));
+        let mut final_page = final_page;
+        final_page["native_messages"] = json!([{ "text": "b".repeat(280 * 1024) }]);
+        final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
+
+        let first_ack = handler.dispatch_value(7, first).await;
+        assert!(matches!(first_ack, HandlerOutcome::Response(_)));
+        let response = handler.dispatch_value(7, final_page).await;
+        let HandlerOutcome::Response(bytes) = response else {
+            panic!("authority page assembly should execute: {response:?}");
+        };
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(response["action"].is_string(), "{response}");
+    }
+
+    #[tokio::test]
+    async fn paged_authority_transform_rejections_discard_partial_assembly() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
+
+        let first = paged_transform_page(
+            "transform",
+            "ses",
+            "order-page",
+            0,
+            0,
+            3,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "first").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let newer = paged_transform_page(
+            "transform",
+            "ses",
+            "newer-page",
+            0,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "newer-m0",
+                "ordinal": 0,
+                "ck": ck("newer-m0", 0, "newer").ck,
+            })],
+        );
+        assert_eq!(
+            error_code(handler.dispatch_value(7, newer).await),
+            "authority_transform_page_attempt_mismatch"
+        );
+        let retry_first = paged_transform_page(
+            "transform",
+            "ses",
+            "order-page",
+            0,
+            0,
+            3,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "first").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, retry_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let gap = paged_transform_page(
+            "transform",
+            "ses",
+            "order-page",
+            0,
+            2,
+            3,
+            true,
+            vec![json!({
+                "mid": "m2",
+                "ordinal": 2,
+                "ck": ck("m2", 2, "gap").ck,
+            })],
+        );
+        assert_eq!(
+            error_code(handler.dispatch_value(7, gap).await),
+            "authority_transform_page_order_mismatch"
+        );
+
+        let replacement = paged_transform_page(
+            "transform",
+            "ses",
+            "replacement-page",
+            0,
+            0,
+            1,
+            true,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "replacement").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, replacement).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        let digest_first = paged_transform_page(
+            "transform",
+            "ses",
+            "digest-page",
+            0,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "digest-first").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, digest_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let mut changed_final = paged_transform_page(
+            "transform",
+            "ses",
+            "digest-page",
+            0,
+            1,
+            2,
+            true,
+            vec![json!({
+                "mid": "m1",
+                "ordinal": 1,
+                "ck": ck("m1", 1, "original-final").ck,
+            })],
+        );
+        changed_final["messages"] = json!([{
+            "mid": "m1",
+            "ordinal": 1,
+            "ck": ck("m1", 1, "changed-final").ck,
+        }]);
+        assert_eq!(
+            error_code(handler.dispatch_value(7, changed_final).await),
+            "authority_transform_page_digest_mismatch"
+        );
+
+        let generation_first = paged_transform_page(
+            "transform",
+            "ses",
+            "generation-page",
+            1,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "generation-first").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, generation_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let generation_changed = paged_transform_page(
+            "transform",
+            "ses",
+            "generation-page",
+            2,
+            1,
+            2,
+            true,
+            vec![json!({
+                "mid": "m1",
+                "ordinal": 1,
+                "ck": ck("m1", 1, "generation-final").ck,
+            })],
+        );
+        assert_eq!(
+            error_code(handler.dispatch_value(7, generation_changed).await),
+            "authority_transform_page_attempt_mismatch"
+        );
+
+        let partial_envelope = json!({
+            "method": "transform",
+            "session_id": "ses",
+            "transform_page_id": "partial",
+        });
+        assert_eq!(
+            error_code(handler.dispatch_value(7, partial_envelope).await),
+            "invalid_params"
+        );
+    }
+
+    #[tokio::test]
+    async fn paged_transform_sessions_are_isolated_and_shadow_pages_keep_the_gate() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "authority-a"));
+        handler.bind_route(9, binding(project.to_str().unwrap(), "authority-b"));
+
+        for (channel, session, mid, text) in [
+            (8, "authority-a", "a0", "authority a"),
+            (9, "authority-b", "b0", "authority b"),
+        ] {
+            let first = paged_transform_page(
+                "transform",
+                session,
+                &format!("page-{session}"),
+                0,
+                0,
+                2,
+                false,
+                vec![json!({
+                    "mid": mid,
+                    "ordinal": 0,
+                    "ck": ck(mid, 0, text).ck,
+                })],
+            );
+            assert!(matches!(
+                handler.dispatch_value(channel, first).await,
+                HandlerOutcome::Response(_)
+            ));
+        }
+        for (channel, session, mid, text) in [
+            (8, "authority-a", "a1", "authority a final"),
+            (9, "authority-b", "b1", "authority b final"),
+        ] {
+            let final_page = paged_transform_page(
+                "transform",
+                session,
+                &format!("page-{session}"),
+                0,
+                1,
+                2,
+                true,
+                vec![json!({
+                    "mid": mid,
+                    "ordinal": 1,
+                    "ck": ck(mid, 1, text).ck,
+                })],
+            );
+            let response = handler.dispatch_value(channel, final_page).await;
+            assert!(matches!(response, HandlerOutcome::Response(_)));
+        }
+
+        handler.bind_route(10, binding(project.to_str().unwrap(), "shadow:paged"));
+        assert!(matches!(
+            handler
+                .dispatch_value(
+                    10,
+                    json!({ "kind": "shadow_reset", "session_id": "shadow:paged" })
+                )
+                .await,
+            HandlerOutcome::Response(_)
+        ));
+        assert!(matches!(
+            handler
+                .dispatch_value(
+                    10,
+                    json!({
+                        "kind": "state_sync",
+                        "session_id": "shadow:paged",
+                        "shadow_generation": 1,
+                        "expected_shadow_seq": 0,
+                    }),
+                )
+                .await,
+            HandlerOutcome::Response(_)
+        ));
+        let shadow_first = paged_transform_page(
+            "shadow_transform",
+            "shadow:paged",
+            "shadow-page",
+            1,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "shadow-m0",
+                "ordinal": 0,
+                "ck": ck("shadow-m0", 0, "shadow input").ck,
+            })],
+        );
+        let shadow_final = paged_transform_page(
+            "shadow_transform",
+            "shadow:paged",
+            "shadow-page",
+            1,
+            1,
+            2,
+            true,
+            Vec::new(),
+        );
+        assert!(matches!(
+            handler.dispatch_value(10, shadow_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let shadow_response = handler.dispatch_value(10, shadow_final).await;
+        let HandlerOutcome::Response(bytes) = shadow_response else {
+            panic!("shadow page assembly should execute: {shadow_response:?}");
+        };
+        let shadow_response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(shadow_response["class"], "identical");
+
+        let mut disabled_config = default_test_config();
+        disabled_config.shadow_enabled = false;
+        let (disabled, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), disabled_config);
+        disabled.bind_route(8, binding(project.to_str().unwrap(), "shadow:paged"));
+        let shadow_page = paged_transform_page(
+            "shadow_transform",
+            "shadow:paged",
+            "shadow-page",
+            1,
+            0,
+            2,
+            false,
+            Vec::new(),
+        );
+        assert_eq!(
+            error_code(disabled.dispatch_value(8, shadow_page).await),
+            "shadow_disabled"
         );
     }
 
@@ -16152,7 +16653,7 @@ mod tests {
                 "ts_output": output,
                 "normalizations": normalizations,
             });
-            page["transform_page_digest"] = json!(shadow_transform_page_content_digest(&page));
+            page["transform_page_digest"] = json!(transform_page_content_digest(&page));
             if complete {
                 page["seed_pass"] = original["seed_pass"].clone();
                 page["pass_inputs"] = original["pass_inputs"].clone();
@@ -16161,7 +16662,7 @@ mod tests {
             }
             page
         };
-        let assembled = assemble_shadow_transform(vec![
+        let assembled = assemble_transform_pages(vec![
             page(
                 0,
                 2,
@@ -16214,7 +16715,7 @@ mod tests {
                 "ts_output": [],
                 "normalizations": [],
             });
-            page["transform_page_digest"] = json!(shadow_transform_page_content_digest(&page));
+            page["transform_page_digest"] = json!(transform_page_content_digest(&page));
             if chunk_index + 1 == chunk_total {
                 page["pass_inputs"] = shadow_pass_inputs();
                 page["ts_decision"] = json!({ "class": "defer" });
@@ -16223,14 +16724,13 @@ mod tests {
             pages.push(page);
         }
 
-        let assembled =
-            assemble_shadow_transform(pages).expect("continuation item should assemble");
+        let assembled = assemble_transform_pages(pages).expect("continuation item should assemble");
         assert_eq!(assembled["input"], json!([item]));
     }
 
     #[test]
     fn paged_shadow_transform_generation_change_discards_partial_attempt() {
-        let mut coordinator = ShadowTransformCoordinator::default();
+        let mut coordinator = TransformPageCoordinator::default();
         let page = |generation: u64, index: usize, complete: bool| {
             let mut page = json!({
                 "method": "shadow_transform",
@@ -16243,7 +16743,7 @@ mod tests {
                 "transform_page_complete": complete,
                 "input": [format!("page-{generation}-{index}")],
             });
-            let digest = shadow_transform_page_content_digest(&page);
+            let digest = transform_page_content_digest(&page);
             page["transform_page_digest"] = json!(digest.clone());
             (page, digest)
         };
@@ -16261,7 +16761,7 @@ mod tests {
                 first_bytes,
                 false,
             ),
-            Ok(ShadowTransformStageAction::Ack(1))
+            Ok(TransformPageStageAction::Ack(1))
         ));
         let (stale, stale_digest) = page(2, 1, true);
         let stale_bytes = serde_json::to_vec(&stale).unwrap().len();
@@ -16277,7 +16777,7 @@ mod tests {
                 stale_bytes,
                 true,
             ),
-            Err(ShadowTransformStageError::AttemptMismatch)
+            Err(TransformPageStageError::AttemptMismatch)
         ));
         assert_eq!(coordinator.pending_transform_count, 0);
         assert_eq!(coordinator.total_staged_bytes, 0);
@@ -16285,7 +16785,7 @@ mod tests {
 
     #[test]
     fn paged_shadow_transform_aggregate_cap_discards_partial_attempt() {
-        let mut coordinator = ShadowTransformCoordinator::default();
+        let mut coordinator = TransformPageCoordinator::default();
         let first = json!({
             "method": "shadow_transform",
             "session_id": "shadow:cap",
@@ -16297,7 +16797,7 @@ mod tests {
             "transform_page_complete": false,
             "input": ["first"],
         });
-        let first_digest = shadow_transform_page_content_digest(&first);
+        let first_digest = transform_page_content_digest(&first);
         let first_bytes = serde_json::to_vec(&first).unwrap().len();
         coordinator.max_staged_bytes = first_bytes * 2 - 1;
         assert!(matches!(
@@ -16312,7 +16812,7 @@ mod tests {
                 first_bytes,
                 false,
             ),
-            Ok(ShadowTransformStageAction::Ack(1))
+            Ok(TransformPageStageAction::Ack(1))
         ));
         let second = json!({
             "method": "shadow_transform",
@@ -16325,7 +16825,7 @@ mod tests {
             "transform_page_complete": true,
             "input": ["second"],
         });
-        let second_digest = shadow_transform_page_content_digest(&second);
+        let second_digest = transform_page_content_digest(&second);
         let second_bytes = serde_json::to_vec(&second).unwrap().len();
         assert!(matches!(
             coordinator.stage(
@@ -16339,7 +16839,7 @@ mod tests {
                 second_bytes,
                 true,
             ),
-            Err(ShadowTransformStageError::BufferOverflow)
+            Err(TransformPageStageError::BufferOverflow)
         ));
         assert_eq!(coordinator.pending_transform_count, 0);
         assert_eq!(coordinator.total_staged_bytes, 0);

@@ -246,7 +246,10 @@ export function buildPagedModuleTransformPayloads(
             session_id: body.session_id,
             shadow_generation: body.shadow_generation,
             transform_page_id: transformPageId,
-            transform_generation: body.shadow_generation,
+            // Authority transforms do not carry a shadow generation. A stable
+            // transform generation still belongs to the page envelope so both
+            // lanes use the same all-or-none paging contract.
+            transform_generation: body.shadow_generation ?? 0,
             transform_page_index: args.index,
             transform_page_total: args.total,
             transform_page_complete: args.complete,
