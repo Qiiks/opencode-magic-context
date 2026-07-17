@@ -85,6 +85,10 @@ export interface ModuleStateSyncOptions {
     beforeSerializeCompartment?: () => void;
     yieldEveryCompartments?: number;
     shouldAbortSeed?: () => boolean;
+    /** Enable the authority sender's one-time durable-sequence adoption. */
+    authority?: boolean;
+    /** Share adoption state across every authority sync attempt in one transform pass. */
+    authoritySeqAdoption?: { used: boolean };
 }
 
 export interface ModuleCompartmentMirrorRow {
@@ -802,6 +806,39 @@ export interface ModuleStateSyncClient {
     }): Promise<unknown>;
 }
 
+function readAuthoritySeqMismatch(error: unknown): number | null {
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        if (current.code === "authority_seq_mismatch") {
+            const direct = current.durable_authority_seq;
+            if (typeof direct === "number" && Number.isSafeInteger(direct) && direct >= 0) {
+                return direct;
+            }
+            if (typeof current.message === "string") {
+                try {
+                    const details: unknown = JSON.parse(current.message);
+                    if (isRecord(details) && details.code === "authority_seq_mismatch") {
+                        const durable = details.durable_authority_seq;
+                        if (
+                            typeof durable === "number" &&
+                            Number.isSafeInteger(durable) &&
+                            durable >= 0
+                        ) {
+                            return durable;
+                        }
+                    }
+                } catch {
+                    // Older transports only expose the typed code and human message.
+                }
+            }
+        }
+        current = current.cause;
+    }
+    return null;
+}
+
 /**
  * Mode-neutral state synchronization: the same watermark-triggered assembly is
  * used by the mirror sender and the Rust authority path. Callers own retries and
@@ -815,36 +852,53 @@ export async function syncModuleState(args: {
     force: boolean;
     options?: ModuleStateSyncOptions;
 }): Promise<ModuleWatermarks | null> {
-    const payload = await buildModuleStateSyncPayload({
-        state: args.state,
-        pass: args.pass,
-        force: args.force,
-        options: args.options,
-    });
-    if (payload === null) return null;
-    if (
-        payload === "m0_mutation" ||
-        payload === "mismatch" ||
-        payload === "unresolved" ||
-        payload === "seed_budget"
-    ) {
-        throw new Error(`module state sync ${payload}`);
-    }
-    const batches = payload.wireBatches ?? [payload];
-    for (const batch of batches) {
-        await args.client.call({
-            sessionId: args.pass.sessionId,
-            projectRoot: args.projectRoot,
-            method: "state_sync",
-            body: {
-                method: batch.method,
-                ...batch.params,
-            },
+    let force = args.force;
+    const adoption = args.options?.authoritySeqAdoption ?? { used: false };
+    for (;;) {
+        const payload = await buildModuleStateSyncPayload({
+            state: args.state,
+            pass: args.pass,
+            force,
+            options: args.options,
         });
+        if (payload === null) return null;
+        if (
+            payload === "m0_mutation" ||
+            payload === "mismatch" ||
+            payload === "unresolved" ||
+            payload === "seed_budget"
+        ) {
+            throw new Error(`module state sync ${payload}`);
+        }
+        try {
+            const batches = payload.wireBatches ?? [payload];
+            for (const batch of batches) {
+                await args.client.call({
+                    sessionId: args.pass.sessionId,
+                    projectRoot: args.projectRoot,
+                    method: "state_sync",
+                    body: {
+                        method: batch.method,
+                        ...batch.params,
+                    },
+                });
+            }
+        } catch (error) {
+            const durableSeq = args.options?.authority ? readAuthoritySeqMismatch(error) : null;
+            if (durableSeq === null || adoption.used) throw error;
+            adoption.used = true;
+            args.state.lastAckedSeq = durableSeq;
+            // A fresh authority process only knows its in-memory sequence. After adopting the
+            // durable sequence, discard sender watermarks and force a full rebuild because it
+            // cannot know which durable rows the sequence covers.
+            args.state.lastAckedWatermarks = null;
+            force = true;
+            continue;
+        }
+        args.state.lastAckedWatermarks = payload.watermarks;
+        args.state.lastAckedSeq += 1;
+        return payload.watermarks;
     }
-    args.state.lastAckedWatermarks = payload.watermarks;
-    args.state.lastAckedSeq += 1;
-    return payload.watermarks;
 }
 
 export const __moduleStateSyncTest = {

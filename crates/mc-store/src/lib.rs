@@ -1907,6 +1907,7 @@ pub enum ShadowStateSyncError {
     Store(McStoreError),
     GenerationMismatch { expected: u64, found: u64 },
     SeqMismatch { expected: u64, found: u64 },
+    AuthoritySeqMismatch { expected: u64, found: u64 },
     InvalidSeedBoundary { declared: String, detail: String },
     Serde(String),
 }
@@ -2067,6 +2068,10 @@ impl std::fmt::Display for ShadowStateSyncError {
             ShadowStateSyncError::SeqMismatch { expected, found } => {
                 write!(f, "shadow seq mismatch: expected {expected}, found {found}")
             }
+            ShadowStateSyncError::AuthoritySeqMismatch { expected, found } => write!(
+                f,
+                "authority seq mismatch: expected {expected}, found {found}"
+            ),
             ShadowStateSyncError::InvalidSeedBoundary { declared, detail } => {
                 write!(f, "invalid seed boundary {declared:?}: {detail}")
             }
@@ -2276,6 +2281,7 @@ enum ShadowSyncTxnOutcome {
     Committed(ShadowStateSyncResult),
     GenerationMismatch { found: u64 },
     SeqMismatch { found: u64 },
+    AuthoritySeqMismatch { found: u64 },
     InvalidSeedBoundary { declared: String, detail: String },
     Serde(String),
 }
@@ -3916,8 +3922,14 @@ impl McStore {
                 });
             }
             if meta.shadow_seq != request.expected_shadow_seq {
-                return Ok(ShadowSyncTxnOutcome::SeqMismatch {
-                    found: meta.shadow_seq,
+                return Ok(if shadow_lane {
+                    ShadowSyncTxnOutcome::SeqMismatch {
+                        found: meta.shadow_seq,
+                    }
+                } else {
+                    ShadowSyncTxnOutcome::AuthoritySeqMismatch {
+                        found: meta.shadow_seq,
+                    }
                 });
             }
 
@@ -3997,6 +4009,12 @@ impl McStore {
                 expected: request.expected_shadow_seq,
                 found,
             }),
+            ShadowSyncTxnOutcome::AuthoritySeqMismatch { found } => {
+                Err(ShadowStateSyncError::AuthoritySeqMismatch {
+                    expected: request.expected_shadow_seq,
+                    found,
+                })
+            }
             ShadowSyncTxnOutcome::InvalidSeedBoundary { declared, detail } => {
                 Err(ShadowStateSyncError::InvalidSeedBoundary { declared, detail })
             }
@@ -10233,5 +10251,62 @@ mod shadow_tests {
         assert!(!loaded.meta.shadow_quarantined);
         assert_eq!(loaded.meta.shadow_quarantined_pass_count, 0);
         assert_eq!(store.load_shadow_divergences(session).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn authority_seq_fence_rejects_an_interleaved_stale_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "authority-session";
+        let project = "authority-project";
+
+        store
+            .apply_authority_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: project,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                compartments: &[comp(0, 0, "first#0")],
+                memories: &[],
+                memory_mutations: &[],
+                user_profile: &[],
+                workspace: None,
+                last_todo_state: Some("first".to_string()),
+                acked_watermarks: serde_json::json!({"sender": "first"}),
+            })
+            .unwrap();
+
+        let stale = store
+            .apply_authority_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: project,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                compartments: &[comp(1, 1, "second#0")],
+                memories: &[],
+                memory_mutations: &[],
+                user_profile: &[],
+                workspace: None,
+                last_todo_state: Some("second".to_string()),
+                acked_watermarks: serde_json::json!({"sender": "second"}),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            stale,
+            ShadowStateSyncError::AuthoritySeqMismatch {
+                expected: 0,
+                found: 1
+            }
+        ));
+        let loaded = store.load(session).unwrap();
+        assert_eq!(loaded.meta.shadow_seq, 1);
+        assert_eq!(loaded.meta.last_todo_state.as_deref(), Some("first"));
+        assert_eq!(
+            store.load_compartments(session).unwrap()[0].end_message_id,
+            "first#0"
+        );
     }
 }

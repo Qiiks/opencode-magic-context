@@ -303,6 +303,31 @@ impl StateSyncLane {
     }
 }
 
+/// State-sync errors use the shared subc code/message envelope. Authority callers receive
+/// the durable sequence as JSON in the message so a fresh process can adopt it and rebuild
+/// its watermarks. Shadow callers retain the reset-on-mismatch error shape because a stale
+/// mirror may be poisoned rather than merely restarted.
+fn state_sync_seq_mismatch_error(lane: StateSyncLane, expected: u64, found: u64) -> HandlerOutcome {
+    if lane.is_shadow() {
+        HandlerOutcome::Error {
+            code: "shadow_seq_mismatch".to_string(),
+            message: format!(
+                "expected_shadow_seq {expected} did not match durable shadow_seq {found}"
+            ),
+        }
+    } else {
+        HandlerOutcome::Error {
+            code: "authority_seq_mismatch".to_string(),
+            message: json!({
+                "code": "authority_seq_mismatch",
+                "expected_authority_seq": expected,
+                "durable_authority_seq": found,
+            })
+            .to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransformLane {
     Authority,
@@ -5532,13 +5557,11 @@ impl McHandler {
                 };
             }
             if loaded.meta.shadow_seq != parsed.expected_shadow_seq {
-                return HandlerOutcome::Error {
-                    code: "shadow_seq_mismatch".to_string(),
-                    message: format!(
-                        "expected_shadow_seq {} did not match durable shadow_seq {}",
-                        parsed.expected_shadow_seq, loaded.meta.shadow_seq
-                    ),
-                };
+                return state_sync_seq_mismatch_error(
+                    lane,
+                    parsed.expected_shadow_seq,
+                    loaded.meta.shadow_seq,
+                );
             }
         }
 
@@ -5937,6 +5960,9 @@ impl McHandler {
                     "expected_shadow_seq {expected} did not match current shadow_seq {found}"
                 ),
             },
+            Err(ShadowStateSyncError::AuthoritySeqMismatch { expected, found }) => {
+                state_sync_seq_mismatch_error(StateSyncLane::Authority, expected, found)
+            }
             Err(ShadowStateSyncError::InvalidSeedBoundary { declared, detail }) => {
                 HandlerOutcome::Error {
                     code: "shadow_seed_boundary_mismatch".to_string(),
@@ -15454,7 +15480,9 @@ mod tests {
             .await;
         let (stale_code, stale_message) = error_frame(stale);
         assert_eq!(stale_code, "authority_seq_mismatch");
-        assert!(!stale_message.contains("shadow"), "{stale_message}");
+        let details: Value = serde_json::from_str(&stale_message).unwrap();
+        assert_eq!(details["code"], "authority_seq_mismatch");
+        assert_eq!(details["durable_authority_seq"], 1);
 
         handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
         for method in ["state_sync", "shadow_transform", "shadow_reset"] {
@@ -15463,6 +15491,44 @@ mod tests {
                 .await;
             assert_eq!(error_code(rejected), "shadow_disabled", "{method}");
         }
+    }
+
+    #[tokio::test]
+    async fn interleaved_authority_senders_keep_the_seq_fence() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
+        let request = || {
+            json!({
+                "kind": "state_sync",
+                "session_id": "ses",
+                "shadow_generation": 0,
+                "expected_shadow_seq": 0,
+                "compartments": [shadow_compartment(0, "first sender")],
+                "user_profile": [],
+            })
+        };
+
+        let (first, second) = tokio::join!(
+            handler.dispatch_value(7, request()),
+            handler.dispatch_value(7, request()),
+        );
+        let outcomes = [first, second];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, HandlerOutcome::Response(_)))
+                .count(),
+            1
+        );
+        let errors = outcomes
+            .into_iter()
+            .filter_map(|outcome| match outcome {
+                HandlerOutcome::Error { code, .. } => Some(code),
+                HandlerOutcome::Response(_) | HandlerOutcome::Streamed => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors, vec!["authority_seq_mismatch"]);
+        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 1);
     }
 
     #[tokio::test]

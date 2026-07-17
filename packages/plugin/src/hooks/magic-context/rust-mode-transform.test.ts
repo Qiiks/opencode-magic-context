@@ -92,7 +92,75 @@ function makeMeta(
     return getOrCreateSessionMeta(db, sessionId);
 }
 
+function authoritySeqMismatch(durableSeq: number): Error & {
+    code: string;
+} {
+    const error = new Error(
+        JSON.stringify({
+            code: "authority_seq_mismatch",
+            durable_authority_seq: durableSeq,
+        }),
+    ) as Error & { code: string };
+    error.code = "authority_seq_mismatch";
+    return error;
+}
+
 describe("Rust mode authority adapter", () => {
+    it("adopts a durable sequence from a fresh process and retries the sync", async () => {
+        const sessionId = `rust-adopt-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const native = [{ role: "assistant", parts: [{ type: "text", text: "module output" }] }];
+        const methods: string[] = [];
+        let firstSync = true;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                methods.push(method);
+                if (method === "state_sync" && firstSync) {
+                    firstSync = false;
+                    throw authoritySeqMismatch(5);
+                }
+                return method === "transform" ? { native_messages: native } : { ok: true };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const messages = makeMessages(sessionId);
+        const output = { messages: messages as unknown[] };
+
+        await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+        expect(methods).toEqual(["state_sync", "state_sync", "transform"]);
+        expect(transform.getState(sessionId).lastAckedSeq).toBe(6);
+        expect(transform.getState(sessionId).lastAckedWatermarks).not.toBeNull();
+        expect(output.messages).toBe(native);
+    });
+
+    it("fails after the second authority mismatch in one transform pass", async () => {
+        const sessionId = `rust-adopt-once-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const messages = makeMessages(sessionId);
+        const methods: string[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                methods.push(method);
+                if (method === "state_sync") throw authoritySeqMismatch(4);
+                return { native_messages: [] };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const output = { messages: messages as unknown[] };
+
+        await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+        expect(methods).toEqual(["state_sync", "state_sync"]);
+        expect(transform.getState(sessionId).lastAckedSeq).toBe(4);
+        expect(transform.getState(sessionId).lastAckedWatermarks).toBeNull();
+        expect(output.messages).toBe(messages);
+    });
+
     it("gates the transform before any TypeScript mutation", async () => {
         const sessionId = `rust-gate-${Date.now()}`;
         sessions.push(sessionId);

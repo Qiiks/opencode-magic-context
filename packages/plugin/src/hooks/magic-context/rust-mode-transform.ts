@@ -447,6 +447,7 @@ export function createRustModeTransform(
                 nowMs: Date.now(),
             };
             const projectRoot = options.projectRoot ?? directory;
+            const authoritySeqAdoption = { used: false };
             if (options.memorySyncRequestedSessions?.delete(sessionId)) {
                 // A memory tool call can complete after the prior authority pass has
                 // acknowledged its watermarks. Rewind only memory watermarks so the
@@ -466,6 +467,7 @@ export function createRustModeTransform(
                 pass: syncPass,
                 projectRoot,
                 force: !state.initialized,
+                options: { authority: true, authoritySeqAdoption },
             });
             const body = buildTransformBody({
                 sessionId,
@@ -497,6 +499,7 @@ export function createRustModeTransform(
                     pass: syncPass,
                     projectRoot,
                     force: true,
+                    options: { authority: true, authoritySeqAdoption },
                 });
                 response = undefined;
                 for (const page of buildPagedModuleTransformPayloads(body)) {
