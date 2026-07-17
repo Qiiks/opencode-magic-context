@@ -129,6 +129,19 @@ function wireMessage(
     };
 }
 
+function syntheticWireMessage(
+    sessionId: string,
+    id: string,
+): {
+    info: { id: string; role: string; sessionID: string };
+    parts: Array<{ type: string; text: string; synthetic: true }>;
+} {
+    return {
+        info: { id, role: "user", sessionID: sessionId },
+        parts: [{ type: "text", text: id, synthetic: true }],
+    };
+}
+
 describe("module compartment ordinal serialization", () => {
     it("uses canonical ordinals when stored boundaries include a summary row", async () => {
         useTempDataHome("module-state-sync-ordinal-basis-");
@@ -254,6 +267,75 @@ describe("module compartment ordinal serialization", () => {
         expect(body.compartments).toEqual([
             expect.objectContaining({ start_message: 1, end_message: 2 }),
         ]);
+    });
+
+    it("keeps persisted ordinals stable around an interior synthetic wire message", async () => {
+        useTempDataHome("module-state-sync-interior-synthetic-");
+        const sessionId = "ses-interior-synthetic";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user" },
+            { id: "m2", role: "assistant" },
+            { id: "m3", role: "user" },
+        ]);
+
+        const result = await resolveOrdinalsForModule({
+            sessionId,
+            messages: [
+                wireMessage(sessionId, "m1"),
+                syntheticWireMessage(sessionId, "nudge"),
+                wireMessage(sessionId, "m2"),
+                wireMessage(sessionId, "m3"),
+            ],
+            generation: 1,
+            memoGeneration: 1,
+            memo: new Map(),
+        });
+
+        expect(result).toEqual(
+            expect.objectContaining({
+                ok: true,
+                annotatedInput: [
+                    expect.objectContaining({ absolute_ordinal: 1 }),
+                    expect.objectContaining({ absolute_ordinal: 1 }),
+                    expect.objectContaining({ absolute_ordinal: 2 }),
+                    expect.objectContaining({ absolute_ordinal: 3 }),
+                ],
+            }),
+        );
+    });
+
+    it("reports the first non-synthetic ordinal gap with its wire identity", async () => {
+        useTempDataHome("module-state-sync-unresolved-diagnostic-");
+        const sessionId = "ses-unresolved-diagnostic";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user" },
+            { id: "m2", role: "assistant" },
+        ]);
+
+        const result = await resolveOrdinalsForModule({
+            sessionId,
+            messages: [
+                wireMessage(sessionId, "m1"),
+                {
+                    info: { id: "missing", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "missing" }],
+                },
+                wireMessage(sessionId, "m2"),
+            ],
+            generation: 1,
+            memoGeneration: 1,
+            memo: new Map(),
+        });
+
+        expect(result).toEqual(
+            expect.objectContaining({
+                ok: false,
+                reason: "unresolved",
+                messageId: "missing",
+                messageIndex: 1,
+                messageRole: "assistant",
+            }),
+        );
     });
 });
 
