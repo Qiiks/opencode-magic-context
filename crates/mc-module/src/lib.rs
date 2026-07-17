@@ -272,6 +272,18 @@ struct ShadowStateSyncWire {
     acked_watermarks: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateSyncLane {
+    Authority,
+    Shadow,
+}
+
+impl StateSyncLane {
+    const fn is_shadow(self) -> bool {
+        matches!(self, Self::Shadow)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ShadowResetWire {
     #[serde(default)]
@@ -2228,6 +2240,33 @@ impl McHandler {
         Ok(binding)
     }
 
+    fn state_sync_binding(
+        &self,
+        channel: u16,
+        request_session: Option<&str>,
+    ) -> Result<SessionBinding, HandlerOutcome> {
+        let binding = self
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .get(&channel)
+            .cloned()
+            .ok_or_else(|| HandlerOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: "state sync on a channel with no session binding".to_string(),
+            })?;
+        if let Some(request_session) = request_session {
+            if binding.session != request_session {
+                return Err(HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                });
+            }
+        }
+        Ok(binding)
+    }
+
     fn evaluate_shadow_historian(
         &self,
         store: &McStore,
@@ -2407,15 +2446,29 @@ impl McHandler {
             .ok_or(BindingError::Unbound)
     }
 
-    /// Shadow ops check the user-tier flag on every dispatch (mtime-cached read),
-    /// so flipping the flag plus bouncing this module stops a runaway shadow
-    /// lane without any harness restart. Senders treat the rejection as an
-    /// ignorable failure and short-circuit before their expensive capture work.
+    /// Check whether the shadow lane is enabled. The cached configuration value is checked
+    /// on every dispatch, so toggling it and restarting this module can stop mirror traffic
+    /// without restarting the full harness. Authority state sync is separate because it
+    /// updates the module's internal transform state.
     fn shadow_lane_enabled(&self) -> bool {
         // effective_config honors the test seam, so tests never read the real
         // user config file (a developer's live kill-switch flip must not turn
         // the suite's shadow coverage off).
         self.effective_config(Path::new("/")).shadow_enabled
+    }
+
+    fn state_sync_targets_shadow(&self, channel: u16, request: &Value) -> bool {
+        request
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(is_shadow_session)
+            .unwrap_or_else(|| {
+                self.bindings
+                    .lock()
+                    .expect("bindings mutex")
+                    .get(&channel)
+                    .is_some_and(|binding| is_shadow_session(&binding.session))
+            })
     }
 
     fn effective_config(&self, project_root: &Path) -> McModuleConfig {
@@ -5243,7 +5296,7 @@ impl McHandler {
         self.handle_transform_value(channel, request).await
     }
 
-    fn handle_shadow_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+    fn handle_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         const ENVELOPE_FIELDS: [&str; 5] = [
             "seed_id",
             "seed_generation",
@@ -5259,16 +5312,21 @@ impl McHandler {
             Ok(req) => req,
             Err(error) => {
                 if envelope_fields_present > 0 {
-                    if let Ok(binding) = self.shadow_binding(channel, None) {
+                    if let Ok(binding) = self.state_sync_binding(channel, None) {
                         self.discard_shadow_seed(&binding.session);
                     }
                 }
                 return invalid_params_error(error.to_string());
             }
         };
-        let binding = match self.shadow_binding(channel, parsed.session_id.as_deref()) {
+        let binding = match self.state_sync_binding(channel, parsed.session_id.as_deref()) {
             Ok(binding) => binding,
             Err(outcome) => return outcome,
+        };
+        let lane = if is_shadow_session(&binding.session) {
+            StateSyncLane::Shadow
+        } else {
+            StateSyncLane::Authority
         };
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
@@ -5296,7 +5354,7 @@ impl McHandler {
                     Some(ShadowSeedPhase::Idle) | None => None,
                 }
             };
-            let outcome = self.apply_shadow_state_sync_wire(&binding, &store, parsed);
+            let outcome = self.apply_state_sync_wire(&binding, &store, parsed, lane);
             if let Some((generation, expected_seq)) = awaiting_attempt {
                 let mut seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
                 let still_same_attempt =
@@ -5452,6 +5510,18 @@ impl McHandler {
             let phase = {
                 let state = seeds.sessions.entry(binding.session.clone()).or_default();
                 std::mem::replace(&mut state.phase, ShadowSeedPhase::Idle)
+            };
+            // Authority callers can send a paged initial feed without a separate reset.
+            // Their bound real session already owns the current generation, so arm the
+            // same bounded collector automatically for the first batch.
+            let phase = match phase {
+                ShadowSeedPhase::Idle if !lane.is_shadow() && batch_index == 0 => {
+                    ShadowSeedPhase::AwaitingSeed {
+                        generation: seed_generation,
+                        expected_seq: parsed.expected_shadow_seq,
+                    }
+                }
+                phase => phase,
             };
             match phase {
                 ShadowSeedPhase::Idle => {
@@ -5633,7 +5703,7 @@ impl McHandler {
                 total,
             } => {
                 let assembled = assemble_shadow_seed(batches, generation, expected_seq);
-                let outcome = self.apply_shadow_state_sync_wire(&binding, &store, assembled);
+                let outcome = self.apply_state_sync_wire(&binding, &store, assembled, lane);
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
                     HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
@@ -5674,11 +5744,12 @@ impl McHandler {
         }
     }
 
-    fn apply_shadow_state_sync_wire(
+    fn apply_state_sync_wire(
         &self,
         binding: &SessionBinding,
         store: &McStore,
         parsed: ShadowStateSyncWire,
+        lane: StateSyncLane,
     ) -> HandlerOutcome {
         let compartments: Vec<StoredCompartment> = parsed
             .compartments
@@ -5686,22 +5757,41 @@ impl McHandler {
             .map(StoredCompartment::from)
             .collect();
         let has_workspace = parsed.workspace.is_some();
-        let (workspace, member_paths) =
-            match prepare_shadow_workspace(&binding.session, parsed.workspace) {
-                Ok(prepared) => prepared,
-                Err(error) => return invalid_params_error(error),
-            };
-        let root_path = shadow_project_path(&binding.session);
+        // The route binding supplies the key for the authority transform. Incoming memory
+        // rows may contain the plugin's stable project identity, so this mapper translates
+        // that identity to the bound key before writing the regular tables.
+        let root_path = if lane.is_shadow() {
+            shadow_project_path(&binding.session)
+        } else {
+            binding.project_root.to_string_lossy().to_string()
+        };
+        let (workspace, member_paths) = match if lane.is_shadow() {
+            prepare_shadow_workspace(&binding.session, parsed.workspace)
+        } else {
+            prepare_authority_workspace(&root_path, parsed.workspace)
+        } {
+            Ok(prepared) => prepared,
+            Err(error) => return invalid_params_error(error),
+        };
         let memories: Vec<ShadowMemoryRow> = match parsed
             .memories
             .into_iter()
             .map(|memory| {
-                let project_path = shadow_source_path(
-                    memory.project_path.as_deref(),
-                    &root_path,
-                    &member_paths,
-                    has_workspace,
-                )?;
+                let project_path = if lane.is_shadow() {
+                    shadow_source_path(
+                        memory.project_path.as_deref(),
+                        &root_path,
+                        &member_paths,
+                        has_workspace,
+                    )?
+                } else {
+                    authority_source_path(
+                        memory.project_path.as_deref(),
+                        &root_path,
+                        &member_paths,
+                        has_workspace,
+                    )?
+                };
                 Ok(memory.into_row(project_path))
             })
             .collect::<Result<Vec<_>, String>>()
@@ -5713,12 +5803,21 @@ impl McHandler {
             .memory_mutations
             .into_iter()
             .map(|mutation| {
-                let project_path = shadow_source_path(
-                    mutation.project_path.as_deref(),
-                    &root_path,
-                    &member_paths,
-                    has_workspace,
-                )?;
+                let project_path = if lane.is_shadow() {
+                    shadow_source_path(
+                        mutation.project_path.as_deref(),
+                        &root_path,
+                        &member_paths,
+                        has_workspace,
+                    )?
+                } else {
+                    authority_source_path(
+                        mutation.project_path.as_deref(),
+                        &root_path,
+                        &member_paths,
+                        has_workspace,
+                    )?
+                };
                 Ok(mutation.into_row(project_path))
             })
             .collect::<Result<Vec<_>, String>>()
@@ -5737,20 +5836,38 @@ impl McHandler {
                 "last_todo_state": parsed.last_todo_state.is_some(),
             })
         });
-        match store.apply_shadow_state_sync(ShadowStateSyncRequest {
-            session_id: &binding.session,
-            shadow_project_path: &root_path,
-            shadow_generation: parsed.shadow_generation,
-            expected_shadow_seq: parsed.expected_shadow_seq,
-            seed_boundary_id: parsed.seed_boundary_id.as_deref(),
-            compartments: &compartments,
-            memories: &memories,
-            memory_mutations: &memory_mutations,
-            user_profile: &parsed.user_profile,
-            workspace: workspace.as_ref(),
-            last_todo_state: parsed.last_todo_state,
-            acked_watermarks,
-        }) {
+        let result = if lane.is_shadow() {
+            store.apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: &binding.session,
+                shadow_project_path: &root_path,
+                shadow_generation: parsed.shadow_generation,
+                expected_shadow_seq: parsed.expected_shadow_seq,
+                seed_boundary_id: parsed.seed_boundary_id.as_deref(),
+                compartments: &compartments,
+                memories: &memories,
+                memory_mutations: &memory_mutations,
+                user_profile: &parsed.user_profile,
+                workspace: workspace.as_ref(),
+                last_todo_state: parsed.last_todo_state,
+                acked_watermarks,
+            })
+        } else {
+            store.apply_authority_state_sync(ShadowStateSyncRequest {
+                session_id: &binding.session,
+                shadow_project_path: &root_path,
+                shadow_generation: parsed.shadow_generation,
+                expected_shadow_seq: parsed.expected_shadow_seq,
+                seed_boundary_id: parsed.seed_boundary_id.as_deref(),
+                compartments: &compartments,
+                memories: &memories,
+                memory_mutations: &memory_mutations,
+                user_profile: &parsed.user_profile,
+                workspace: workspace.as_ref(),
+                last_todo_state: parsed.last_todo_state,
+                acked_watermarks,
+            })
+        };
+        match result {
             Ok(result) => respond(json!({
                 "ok": true,
                 "shadow_generation": result.shadow_generation,
@@ -6923,15 +7040,38 @@ impl McHandler {
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
                 "transform" => self.handle_transform_value(channel, request).await,
-                "state_sync" | "shadow_transform" | "shadow_reset"
-                    if !self.shadow_lane_enabled() =>
-                {
+                "state_sync" => {
+                    // State sync is shared by both the authority and shadow lanes. Only the
+                    // shadow lane is controlled by the mirror kill switch; the authority lane
+                    // must keep receiving its own state updates when mirror traffic is stopped.
+                    if self.state_sync_targets_shadow(channel, &request)
+                        && !self.shadow_lane_enabled()
+                    {
+                        HandlerOutcome::Error {
+                            code: "shadow_disabled".to_string(),
+                            message: "shadow state sync is disabled by configuration".to_string(),
+                        }
+                    } else {
+                        let authority = self
+                            .bindings
+                            .lock()
+                            .expect("bindings mutex")
+                            .get(&channel)
+                            .is_some_and(|binding| !is_shadow_session(&binding.session));
+                        let outcome = self.handle_state_sync_value(channel, request);
+                        if authority {
+                            authority_state_sync_outcome(outcome)
+                        } else {
+                            outcome
+                        }
+                    }
+                }
+                "shadow_transform" | "shadow_reset" if !self.shadow_lane_enabled() => {
                     HandlerOutcome::Error {
                         code: "shadow_disabled".to_string(),
                         message: "shadow lane is disabled by configuration".to_string(),
                     }
                 }
-                "state_sync" => self.handle_shadow_state_sync_value(channel, request),
                 "shadow_transform" => self.handle_shadow_transform_value(channel, request).await,
                 "shadow_reset" => self.handle_shadow_reset_value(channel, request),
                 "state_import" => self.handle_state_import_value(channel, request),
@@ -6953,6 +7093,18 @@ impl McHandler {
             return self.handle_facade_value(channel, request).await;
         }
         unrecognized_request_error(&request)
+    }
+}
+
+// The wire validator uses the same field names and validation paths as the shadow lane.
+// Translate only rejected authority responses so diagnostics identify the lane that failed.
+fn authority_state_sync_outcome(outcome: HandlerOutcome) -> HandlerOutcome {
+    match outcome {
+        HandlerOutcome::Error { code, message } => HandlerOutcome::Error {
+            code: code.replace("shadow", "authority"),
+            message: message.replace("shadow", "authority"),
+        },
+        other => other,
     }
 }
 
@@ -7768,6 +7920,24 @@ fn shadow_source_path(
         .ok_or_else(|| format!("shadow memory project is not a workspace member: {source_path}"))
 }
 
+fn authority_source_path(
+    source_path: Option<&str>,
+    root_path: &str,
+    member_paths: &HashMap<String, String>,
+    has_workspace: bool,
+) -> Result<String, String> {
+    let Some(source_path) = source_path else {
+        return Ok(root_path.to_string());
+    };
+    if !has_workspace {
+        return Ok(root_path.to_string());
+    }
+    member_paths
+        .get(source_path)
+        .cloned()
+        .ok_or_else(|| format!("authority memory project is not a workspace member: {source_path}"))
+}
+
 fn prepare_shadow_workspace(
     session_id: &str,
     workspace: Option<ShadowWorkspaceWire>,
@@ -7823,6 +7993,71 @@ fn prepare_shadow_workspace(
     let name = format!(
         "shadow-workspace-{}-{}",
         sha256_hex(session_id.as_bytes()),
+        workspace.fingerprint
+    );
+    Ok((
+        Some(ShadowWorkspaceRow {
+            name,
+            share_categories,
+            members,
+        }),
+        member_paths,
+    ))
+}
+
+fn prepare_authority_workspace(
+    authority_project_path: &str,
+    workspace: Option<ShadowWorkspaceWire>,
+) -> Result<(Option<ShadowWorkspaceRow>, HashMap<String, String>), String> {
+    let Some(workspace) = workspace else {
+        return Ok((None, HashMap::new()));
+    };
+    let Some(owner) = workspace.members.first() else {
+        return Err("authority workspace must include its owning project first".to_string());
+    };
+    let share_categories = owner.share_categories.clone();
+    if workspace
+        .members
+        .iter()
+        .any(|member| member.share_categories != share_categories)
+    {
+        return Err(
+            "authority workspace members must carry one consistent share policy".to_string(),
+        );
+    }
+
+    let mut member_paths = HashMap::new();
+    let mut members = Vec::with_capacity(workspace.members.len());
+    for (index, member) in workspace.members.into_iter().enumerate() {
+        if member.project_path.is_empty() {
+            return Err("authority workspace member project_path must not be empty".to_string());
+        }
+        let stored_path = if index == 0 {
+            authority_project_path.to_string()
+        } else {
+            member.project_path.clone()
+        };
+        if member_paths
+            .insert(member.project_path.clone(), stored_path.clone())
+            .is_some()
+        {
+            return Err("authority workspace contains a duplicate member".to_string());
+        }
+        let display_name = Path::new(&member.project_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&member.project_path)
+            .to_string();
+        members.push(ShadowWorkspaceMemberRow {
+            project_path: stored_path,
+            display_name,
+            display_path: member.project_path,
+        });
+    }
+    let name = format!(
+        "authority-workspace-{}-{}",
+        sha256_hex(authority_project_path.as_bytes()),
         workspace.fingerprint
     );
     Ok((
@@ -15028,6 +15263,124 @@ mod tests {
             .dispatch_value(7, json!({ "kind": "shadow_reset", "session_id": "ses" }))
             .await;
         assert_eq!(error_code(shadow_on_plain), "shadow_binding_required");
+    }
+
+    #[tokio::test]
+    async fn mirror_kill_switch_gates_shadow_lanes_but_not_authority_state_sync() {
+        let state = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.shadow_enabled = false;
+        let (handler, store, _dir, project) = handler_with_store(state, config);
+        let project_path = project.to_string_lossy().to_string();
+        let synced = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "compartments": [shadow_compartment(0, "authority summary")],
+                    "memories": [{
+                        "id": 42,
+                        "project_path": "git:authority-source",
+                        "category": "CONSTRAINTS",
+                        "content": "authority memory"
+                    }],
+                    "user_profile": ["authority profile"],
+                    "last_todo_state": "[]"
+                }),
+            )
+            .await;
+        assert!(matches!(synced, HandlerOutcome::Response(_)));
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].content,
+            "authority summary"
+        );
+        assert_eq!(
+            store
+                .load_active_memories(&project_path, 0)
+                .unwrap()
+                .iter()
+                .map(|memory| memory.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["authority memory"]
+        );
+        assert_eq!(
+            store.load_active_user_memories().unwrap(),
+            vec!["authority profile"]
+        );
+        let stale = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0
+                }),
+            )
+            .await;
+        let (stale_code, stale_message) = error_frame(stale);
+        assert_eq!(stale_code, "authority_seq_mismatch");
+        assert!(!stale_message.contains("shadow"), "{stale_message}");
+
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+        for method in ["state_sync", "shadow_transform", "shadow_reset"] {
+            let rejected = handler
+                .dispatch_value(8, json!({ "kind": method, "session_id": "shadow:ses" }))
+                .await;
+            assert_eq!(error_code(rejected), "shadow_disabled", "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_state_sync_storage_feeds_real_transform_m0() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
+        let project_path = project.to_string_lossy().to_string();
+        let sync = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "seed_id": "authority-seed",
+                    "seed_generation": 0,
+                    "seed_batch_index": 0,
+                    "seed_batch_total": 1,
+                    "seed_complete": true,
+                    "seed_boundary_id": "m0#0",
+                    "workspace": null,
+                    "acked_watermarks": {},
+                    "compartments": [shadow_compartment(0, "authority summary")],
+                    "memories": [{
+                        "id": 42,
+                        "project_path": "git:authority-source",
+                        "category": "CONSTRAINTS",
+                        "content": "authority memory"
+                    }],
+                    "user_profile": ["authority profile"],
+                    "last_todo_state": "[]"
+                }),
+            )
+            .await;
+        assert!(matches!(sync, HandlerOutcome::Response(_)));
+
+        let response =
+            call_transform_request(&handler, request(vec![ck("m0", 0, "live authority input")]))
+                .await;
+        let m0 = m0_text(&response);
+        assert!(m0.contains("authority summary"), "{m0}");
+        assert!(m0.contains("authority memory"), "{m0}");
+        assert!(m0.contains("authority profile"), "{m0}");
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        assert_eq!(
+            store.load_active_memories(&project_path, 0).unwrap()[0].content,
+            "authority memory"
+        );
     }
 
     #[tokio::test]

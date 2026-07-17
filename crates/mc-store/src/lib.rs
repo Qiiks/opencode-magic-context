@@ -3854,6 +3854,24 @@ impl McStore {
         &self,
         request: ShadowStateSyncRequest<'_>,
     ) -> Result<ShadowStateSyncResult, ShadowStateSyncError> {
+        self.apply_state_sync(request, true)
+    }
+
+    /// Apply an authority state update atomically after validating its sequence. Authority
+    /// rows use the regular memory and profile tables read by real-session transforms, while
+    /// compartment and cache-state tables are shared by both lanes.
+    pub fn apply_authority_state_sync(
+        &self,
+        request: ShadowStateSyncRequest<'_>,
+    ) -> Result<ShadowStateSyncResult, ShadowStateSyncError> {
+        self.apply_state_sync(request, false)
+    }
+
+    fn apply_state_sync(
+        &self,
+        request: ShadowStateSyncRequest<'_>,
+        shadow_lane: bool,
+    ) -> Result<ShadowStateSyncResult, ShadowStateSyncError> {
         let default_core_json = serde_json::to_string(&CoreState::default())
             .map_err(|e| ShadowStateSyncError::Serde(e.to_string()))?;
         let outcome = self.inner.with_conn_fenced(|tx| {
@@ -3925,10 +3943,17 @@ impl McStore {
             for compartment in request.compartments {
                 upsert_compartment_tx(tx, request.session_id, compartment)?;
             }
-            replace_shadow_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
-            replace_shadow_memories_tx(tx, request.memories)?;
-            replace_shadow_memory_mutations_tx(tx, request.memory_mutations)?;
-            replace_shadow_user_profile_tx(tx, request.shadow_project_path, request.user_profile)?;
+            if shadow_lane {
+                replace_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
+                replace_shadow_memories_tx(tx, request.memories)?;
+                replace_shadow_memory_mutations_tx(tx, request.memory_mutations)?;
+                replace_shadow_user_profile_tx(tx, request.shadow_project_path, request.user_profile)?;
+            } else {
+                replace_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
+                replace_authority_memories_tx(tx, request.memories)?;
+                replace_authority_memory_mutations_tx(tx, request.memory_mutations)?;
+                replace_authority_user_profile_tx(tx, request.user_profile)?;
+            }
 
             meta.last_todo_state = request.last_todo_state.clone();
             meta.shadow_seq = meta.shadow_seq.saturating_add(1);
@@ -6389,7 +6414,7 @@ fn upsert_compartment_tx(
     Ok(())
 }
 
-fn replace_shadow_workspace_tx(
+fn replace_workspace_tx(
     tx: &rusqlite::Transaction<'_>,
     shadow_project_path: &str,
     workspace: Option<&ShadowWorkspaceRow>,
@@ -6500,6 +6525,76 @@ fn replace_shadow_memories_tx(
     Ok(())
 }
 
+fn replace_authority_memories_tx(
+    tx: &rusqlite::Transaction<'_>,
+    memories: &[ShadowMemoryRow],
+) -> rusqlite::Result<()> {
+    for memory in memories {
+        tx.execute(
+            "INSERT INTO mc_memories
+               (id, project_path, category, content, normalized_hash, importance,
+                scope, shareable, source_session_id, source_type, seen_count, retrieval_count,
+                first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
+                status, expires_at, verification_status, verified_at, classified_at,
+                superseded_by_memory_id, merged_from, metadata_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+             ON CONFLICT(id) DO UPDATE SET
+                project_path = excluded.project_path,
+                category = excluded.category,
+                content = excluded.content,
+                normalized_hash = excluded.normalized_hash,
+                importance = excluded.importance,
+                scope = excluded.scope,
+                shareable = excluded.shareable,
+                source_session_id = excluded.source_session_id,
+                source_type = excluded.source_type,
+                seen_count = excluded.seen_count,
+                retrieval_count = excluded.retrieval_count,
+                first_seen_at = excluded.first_seen_at,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                last_seen_at = excluded.last_seen_at,
+                last_retrieved_at = excluded.last_retrieved_at,
+                status = excluded.status,
+                expires_at = excluded.expires_at,
+                verification_status = excluded.verification_status,
+                verified_at = excluded.verified_at,
+                classified_at = excluded.classified_at,
+                superseded_by_memory_id = excluded.superseded_by_memory_id,
+                merged_from = excluded.merged_from,
+                metadata_json = excluded.metadata_json",
+            params![
+                memory.id,
+                &memory.project_path,
+                &memory.category,
+                &memory.content,
+                &memory.normalized_hash,
+                memory.importance.map(i64::from),
+                &memory.scope,
+                memory.shareable as i64,
+                memory.source_session_id.as_deref(),
+                memory.source_type.as_deref(),
+                memory.seen_count,
+                memory.retrieval_count,
+                memory.first_seen_at,
+                memory.created_at,
+                memory.updated_at,
+                memory.last_seen_at,
+                memory.last_retrieved_at,
+                &memory.status,
+                memory.expires_at,
+                &memory.verification_status,
+                memory.verified_at,
+                memory.classified_at,
+                memory.superseded_by_memory_id,
+                memory.merged_from.as_deref(),
+                memory.metadata_json.as_deref(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn replace_shadow_user_profile_tx(
     tx: &rusqlite::Transaction<'_>,
     shadow_project_path: &str,
@@ -6550,6 +6645,56 @@ fn replace_shadow_memory_mutations_tx(
                 mutation.new_content.as_deref(),
                 mutation.queued_at,
             ],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_authority_memory_mutations_tx(
+    tx: &rusqlite::Transaction<'_>,
+    mutations: &[ShadowMemoryMutationRow],
+) -> rusqlite::Result<()> {
+    for row in mutations {
+        let mutation = &row.mutation;
+        tx.execute(
+            "INSERT INTO mc_memory_mutation_log
+               (id, project_path, mutation_type, target_memory_id, superseded_by_id,
+                category, new_content, queued_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(id) DO UPDATE SET
+                project_path = excluded.project_path,
+                mutation_type = excluded.mutation_type,
+                target_memory_id = excluded.target_memory_id,
+                superseded_by_id = excluded.superseded_by_id,
+                category = excluded.category,
+                new_content = excluded.new_content,
+                queued_at = excluded.queued_at",
+            params![
+                mutation.id,
+                &row.project_path,
+                &mutation.mutation_type,
+                mutation.target_memory_id,
+                mutation.superseded_by_id,
+                mutation.category.as_deref(),
+                mutation.new_content.as_deref(),
+                mutation.queued_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_authority_user_profile_tx(
+    tx: &rusqlite::Transaction<'_>,
+    profile_lines: &[String],
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM mc_user_memories", [])?;
+    for (index, content) in profile_lines.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO mc_user_memories
+                (content, status, promoted_at, source_candidate_ids, created_at, updated_at)
+             VALUES (?1, 'active', ?2, '[]', 0, 0)",
+            params![content, index as i64],
         )?;
     }
     Ok(())
