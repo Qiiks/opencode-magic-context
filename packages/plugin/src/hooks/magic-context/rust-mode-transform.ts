@@ -480,7 +480,12 @@ export function createRustModeTransform(
                 memoStoredCount: state.ordinalMemoStoredCount,
                 memoCanonicalCount: state.ordinalMemoCanonicalCount,
             });
-            if (!resolved.ok) throw new Error(`rust ordinal ${resolved.reason}`);
+            if (!resolved.ok) {
+                throw new Error(
+                    `rust ordinal ${resolved.reason}: messageId=${resolved.messageId ?? "unknown"} ` +
+                        `index=${resolved.messageIndex ?? "unknown"} role=${resolved.messageRole ?? "unknown"}`,
+                );
+            }
             state.idOrdinalMemoGeneration = resolved.memoGeneration;
             state.ordinalMemoAnchor = resolved.memoAnchor;
             state.ordinalMemoStoredCount = resolved.memoStoredCount;

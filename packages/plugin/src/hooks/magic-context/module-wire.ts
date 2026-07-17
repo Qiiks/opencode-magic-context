@@ -52,6 +52,16 @@ function getMessageId(message: MessageLike): string | null {
         : null;
 }
 
+function isSyntheticWireMessage(message: MessageLike): boolean {
+    if ((message.info as { synthetic?: unknown }).synthetic === true) return true;
+    return message.parts.some(
+        (part) =>
+            part !== null &&
+            typeof part === "object" &&
+            (part as { synthetic?: unknown }).synthetic === true,
+    );
+}
+
 /**
  * Resolve OpenCode message ids to the absolute ordinals used by the module.
  * The module and shadow lanes must see the same provisional suffix behavior, so
@@ -76,7 +86,13 @@ export async function resolveOrdinalsForModule(args: {
           memoCanonicalCount: number;
           normalizations: ModuleNormalizationRecord[];
       }
-    | { ok: false; reason: "unresolved" | "mismatch"; messageId?: string }
+    | {
+          ok: false;
+          reason: "unresolved" | "mismatch";
+          messageId?: string;
+          messageIndex?: number;
+          messageRole?: string;
+      }
 > {
     const memo = args.memo;
     const generationChanged = args.memoGeneration !== args.generation;
@@ -129,8 +145,12 @@ export async function resolveOrdinalsForModule(args: {
     storedCount = currentStoredCount;
 
     const normalizations: ModuleNormalizationRecord[] = [];
-    const visibleMessages = args.messages.filter((message) => {
-        if (!isRawCompactionSummaryInfo(message.info)) return true;
+    const visibleIndexes: number[] = [];
+    const visibleMessages = args.messages.filter((message, index) => {
+        if (!isRawCompactionSummaryInfo(message.info)) {
+            visibleIndexes.push(index);
+            return true;
+        }
         normalizations.push({
             kind: "summary_message",
             message_id: getMessageId(message),
@@ -143,20 +163,60 @@ export async function resolveOrdinalsForModule(args: {
 
     const annotated = visibleMessages as unknown as Array<Record<string, unknown>>;
     const resolved: Array<number | undefined> = new Array(annotated.length);
-    let firstUnresolvedId: string | undefined;
+    let firstUnresolved:
+        | {
+              messageId: string;
+              messageIndex: number;
+              messageRole: string;
+          }
+        | undefined;
     for (let index = 0; index < annotated.length; index += 1) {
         const messageId = getMessageId(visibleMessages[index]);
-        if (!messageId) return { ok: false, reason: "unresolved" };
+        if (!messageId) {
+            return {
+                ok: false,
+                reason: "unresolved",
+                messageIndex: visibleIndexes[index],
+                messageRole: visibleMessages[index].info.role ?? "unknown",
+            };
+        }
         const ordinal = memo.get(messageId);
-        if (ordinal === undefined && firstUnresolvedId === undefined) firstUnresolvedId = messageId;
+        if (ordinal === undefined && firstUnresolved === undefined) {
+            firstUnresolved = {
+                messageId,
+                messageIndex: visibleIndexes[index],
+                messageRole: visibleMessages[index].info.role ?? "unknown",
+            };
+        }
         resolved[index] = ordinal;
+    }
+
+    /**
+     * OpenCode can place an unpersisted synthetic nudge between two persisted
+     * messages in one wire snapshot. It is not part of canonical raw history,
+     * so it borrows the preceding canonical ordinal instead of consuming a
+     * slot. Only explicit synthetic messages get this exception. A genuine
+     * persisted-but-unpaged message remains unresolved and is rejected below;
+     * the stored-row count and ordinal self-heal checks still catch drift.
+     */
+    for (let index = 0; index < resolved.length; index += 1) {
+        if (resolved[index] !== undefined || !isSyntheticWireMessage(visibleMessages[index])) {
+            continue;
+        }
+        const hasResolvedMessageAfter = resolved
+            .slice(index + 1)
+            .some((ordinal) => ordinal !== undefined);
+        if (!hasResolvedMessageAfter) continue;
+        let priorIndex = index - 1;
+        while (priorIndex >= 0 && resolved[priorIndex] === undefined) priorIndex -= 1;
+        resolved[index] = priorIndex >= 0 ? (resolved[priorIndex] as number) : 0;
     }
 
     let suffixStart = annotated.length;
     while (suffixStart > 0 && resolved[suffixStart - 1] === undefined) suffixStart -= 1;
     for (let index = 0; index < suffixStart; index += 1) {
         if (resolved[index] === undefined) {
-            return { ok: false, reason: "unresolved", messageId: firstUnresolvedId };
+            return { ok: false, reason: "unresolved", ...firstUnresolved };
         }
     }
     if (suffixStart < annotated.length) {
@@ -171,7 +231,13 @@ export async function resolveOrdinalsForModule(args: {
         const ordinal = resolved[index] as number;
         const prior = memo.get(messageId);
         if (prior !== undefined && prior !== ordinal) {
-            return { ok: false, reason: "mismatch", messageId };
+            return {
+                ok: false,
+                reason: "mismatch",
+                messageId,
+                messageIndex: visibleIndexes[index],
+                messageRole: visibleMessages[index].info.role ?? "unknown",
+            };
         }
         memo.set(messageId, ordinal);
         annotated[index].absolute_ordinal = ordinal;
