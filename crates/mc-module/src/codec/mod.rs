@@ -2,7 +2,10 @@ pub mod opencode;
 pub mod pi;
 pub mod sidecar;
 
-pub use opencode::{decode_opencode, decode_opencode_with_sidecar, encode_opencode, MessageV2Json};
+pub use opencode::{
+    decode_opencode, decode_opencode_with_sidecar, encode_opencode, encode_opencode_with_session,
+    MessageV2Json,
+};
 pub use pi::{decode_pi, decode_pi_with_sidecar, encode_pi, PiSessionEntryJson};
 pub use sidecar::{DecodeSidecar, DecodedHarnessMessages, ExtractedBoundary};
 
@@ -13,7 +16,12 @@ mod tests {
     use serde::Deserialize;
     use serde_json::Value;
 
-    use super::{decode_opencode, decode_pi, encode_opencode, encode_pi};
+    use crate::ck_wire::CkWireMessage;
+    use crate::injection::build_synthetic_todo_pair;
+
+    use super::{
+        decode_opencode, decode_pi, encode_opencode, encode_opencode_with_session, encode_pi,
+    };
 
     #[derive(Deserialize)]
     struct OpenCodeGolden {
@@ -77,6 +85,42 @@ mod tests {
             assert_eq!(encoded, encoded_again);
             assert_eq!(encoded, strip_opencode_compaction(case.messages));
         }
+    }
+
+    #[test]
+    fn serve_native_golden_preserves_ingress_and_pins_synthetic_shapes() {
+        #[derive(Deserialize)]
+        struct ServeNativeGolden {
+            session_id: String,
+            messages: Vec<Value>,
+            m0: Value,
+            m1: Value,
+            synthetic_todo: Value,
+        }
+
+        let golden: ServeNativeGolden = serde_json::from_str(include_str!(
+            "../../testdata/codec/serve-native-golden.json"
+        ))
+        .unwrap();
+        let decoded = decode_opencode(&golden.messages);
+        let todo = build_synthetic_todo_pair(
+            r#"[{"content":"Ship it","status":"in_progress","priority":"high"}]"#,
+        )
+        .unwrap();
+        let mut output = vec![
+            CkWireMessage::synthetic_user_text("<session-history>\nP1\n</session-history>"),
+            CkWireMessage::synthetic_user_text("session delta"),
+            todo.assistant_msg,
+            todo.tool_msg,
+        ];
+        output.extend(decoded.messages.iter().map(|message| message.ck.clone()));
+
+        let encoded =
+            encode_opencode_with_session(&output, &decoded.sidecar, Some(&golden.session_id));
+        assert_eq!(encoded[0], golden.m0);
+        assert_eq!(encoded[1], golden.m1);
+        assert_eq!(encoded[2], golden.synthetic_todo);
+        assert_eq!(&encoded[3..], golden.messages.as_slice());
     }
 
     #[test]

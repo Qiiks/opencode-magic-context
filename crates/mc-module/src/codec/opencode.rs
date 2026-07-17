@@ -172,6 +172,7 @@ pub fn decode_opencode_with_sidecar(
             }
         }
 
+        let synthetic = is_synthetic_message(&parts);
         let ck = CkWireMessage::from_parts(
             role.clone(),
             content,
@@ -180,7 +181,7 @@ pub fn decode_opencode_with_sidecar(
             HarnessMeta {
                 harness_id: Some(mid.clone()),
                 ordinal: Some(ordinal),
-                synthetic: false,
+                synthetic,
             },
         );
         decoded.push(CkIngressMessage {
@@ -209,14 +210,57 @@ pub fn decode_opencode_with_sidecar(
 }
 
 pub fn encode_opencode(messages: &[CkWireMessage], sidecar: &DecodeSidecar) -> Vec<MessageV2Json> {
-    messages
-        .iter()
-        .enumerate()
-        .map(|(index, msg)| match meta_for_ck(sidecar, msg, index) {
-            Some(meta) => encode_with_meta(msg, meta),
-            None => encode_new_message(msg),
-        })
-        .collect()
+    encode_opencode_impl(messages, sidecar, None, false)
+}
+
+/// Encode CK messages back to OpenCode while optionally supplying the session id used by
+/// newly-created synthetic user messages. Existing messages use their retained sidecar raw
+/// value, so provider fields that CK does not model remain untouched. Native serving also
+/// retains compaction parts because it promises a full-array replay of untouched ingress.
+pub fn encode_opencode_with_session(
+    messages: &[CkWireMessage],
+    sidecar: &DecodeSidecar,
+    session_id: Option<&str>,
+) -> Vec<MessageV2Json> {
+    encode_opencode_impl(messages, sidecar, session_id, true)
+}
+
+fn encode_opencode_impl(
+    messages: &[CkWireMessage],
+    sidecar: &DecodeSidecar,
+    session_id: Option<&str>,
+    preserve_compaction: bool,
+) -> Vec<MessageV2Json> {
+    let mut encoded = Vec::with_capacity(messages.len());
+    let mut synthetic_index = 0;
+    let mut index = 0;
+    while index < messages.len() {
+        if let Some(next) = messages.get(index + 1) {
+            if let Some(part) = render_synthetic_todo_pair(&messages[index], next) {
+                let info = synthetic_message_info(&messages[index], session_id);
+                encoded.push(json!({
+                    "info": info,
+                    "parts": [part],
+                }));
+                index += 2;
+                continue;
+            }
+        }
+        let msg = &messages[index];
+        let meta = if msg.meta.synthetic {
+            let current = sidecar.synthetic_message_for_index(synthetic_index);
+            synthetic_index += 1;
+            current
+        } else {
+            meta_for_ck(sidecar, msg, index)
+        };
+        encoded.push(match meta {
+            Some(meta) => encode_with_meta(msg, meta, preserve_compaction),
+            None => encode_new_message(msg, session_id),
+        });
+        index += 1;
+    }
+    encoded
 }
 
 fn decode_tool_part(
@@ -410,7 +454,11 @@ fn tool_output_from_part(part: &Value, is_error: bool, output_text: String) -> C
     CkToolOutput::bare(CkOutputKind::Content { blocks })
 }
 
-fn encode_with_meta(msg: &CkWireMessage, meta: &HarnessMessageMeta) -> Value {
+fn encode_with_meta(
+    msg: &CkWireMessage,
+    meta: &HarnessMessageMeta,
+    preserve_compaction: bool,
+) -> Value {
     let mut raw = meta.raw.clone();
     let mut parts = raw
         .get("parts")
@@ -435,7 +483,9 @@ fn encode_with_meta(msg: &CkWireMessage, meta: &HarnessMessageMeta) -> Value {
         parts.push(render_block_as_part(block));
     }
 
-    parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("compaction"));
+    if !preserve_compaction {
+        parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("compaction"));
+    }
 
     if let Some(obj) = raw.as_object_mut() {
         obj.insert("parts".to_string(), Value::Array(parts));
@@ -520,7 +570,59 @@ fn update_part_from_block(part: &mut Value, block: &CkWireBlock) {
     }
 }
 
-fn encode_new_message(msg: &CkWireMessage) -> Value {
+fn render_synthetic_todo_pair(call: &CkWireMessage, result: &CkWireMessage) -> Option<Value> {
+    if !call.meta.synthetic
+        || !result.meta.synthetic
+        || call.role != "assistant"
+        || result.role != "tool"
+    {
+        return None;
+    }
+    let CkKind::ToolCall { id, name, .. } = call.content.first()?.kind.clone() else {
+        return None;
+    };
+    let CkKind::ToolResult {
+        id: result_id,
+        output,
+        ..
+    } = result.content.first()?.kind.clone()
+    else {
+        return None;
+    };
+    if id != result_id || !id.starts_with("mc_synthetic_todo_") {
+        return None;
+    }
+    let CkOutputKind::Json { value } = output.kind else {
+        return None;
+    };
+    Some(json!({
+        "type": "tool",
+        "callID": id,
+        "tool": name,
+        "state": value,
+        "syntheticTodoMarker": true,
+    }))
+}
+
+fn synthetic_message_info(msg: &CkWireMessage, session_id: Option<&str>) -> Value {
+    let mut info = json!({ "role": msg.role });
+    if let Some(session_id) = session_id {
+        set_value(
+            &mut info,
+            "sessionID",
+            Value::String(session_id.to_string()),
+        );
+    } else {
+        let id =
+            msg.meta.harness_id.clone().unwrap_or_else(|| {
+                format!("opencode-ck-{}", stable_hash_prefix(&json!(msg.role), 12))
+            });
+        set_value(&mut info, "id", Value::String(id));
+    }
+    info
+}
+
+fn encode_new_message(msg: &CkWireMessage, session_id: Option<&str>) -> Value {
     let id = msg
         .meta
         .harness_id
@@ -543,10 +645,27 @@ fn encode_new_message(msg: &CkWireMessage) -> Value {
         parts.push(render_block_as_part(block));
         index += 1;
     }
-    json!({
-        "info": { "id": id, "role": msg.role },
-        "parts": parts,
-    })
+    if msg.meta.synthetic && msg.role == "user" {
+        for part in &mut parts {
+            set_value(part, "synthetic", Value::Bool(true));
+        }
+    }
+    let info = if msg.meta.synthetic && msg.role == "user" {
+        let mut info = json!({ "role": msg.role });
+        if let Some(session_id) = session_id {
+            set_value(
+                &mut info,
+                "sessionID",
+                Value::String(session_id.to_string()),
+            );
+        } else {
+            set_value(&mut info, "id", Value::String(id));
+        }
+        info
+    } else {
+        json!({ "id": id, "role": msg.role })
+    };
+    json!({ "info": info, "parts": parts })
 }
 
 fn render_block_as_part(block: &CkWireBlock) -> Value {
@@ -710,6 +829,15 @@ fn tool_status(part: &Value) -> Option<String> {
     part.get("state")
         .and_then(|state| string_field(state, "status"))
         .or_else(|| string_field(part, "status"))
+}
+
+fn is_synthetic_message(parts: &[Value]) -> bool {
+    !parts.is_empty()
+        && parts.iter().all(|part| {
+            part.get("synthetic")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {

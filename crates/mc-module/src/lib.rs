@@ -4839,8 +4839,12 @@ impl McHandler {
                 }
             }
         };
-        if SerializerProfile::parse(&parsed.serializer_profile).is_none() {
+        let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile);
+        if serializer_profile.is_none() {
             return unknown_serializer_profile_error();
+        }
+        if parsed.serve_native && serializer_profile != Some(SerializerProfile::OpencodeAiSdk) {
+            return serve_native_unsupported_profile_error(&parsed.serializer_profile);
         }
         if parsed.tail_delta.is_some() {
             return need_full_sync_response(parsed.full_array_fingerprint.clone());
@@ -4853,13 +4857,12 @@ impl McHandler {
             .session_id
             .starts_with(historian::MC_CHILD_SESSION_PREFIX)
         {
-            return respond(
-                serde_json::to_value(transform::TransformResponse::passthrough(
-                    parsed.messages.into_iter().map(|m| m.ck).collect(),
-                    parsed.full_array_fingerprint,
-                ))
-                .unwrap_or(Value::Null),
+            let mut response = transform::TransformResponse::passthrough(
+                parsed.messages.iter().map(|m| m.ck.clone()).collect(),
+                parsed.full_array_fingerprint.clone(),
             );
+            attach_native_messages(&mut response, &parsed);
+            return respond(serde_json::to_value(response).unwrap_or(Value::Null));
         }
         let parsed = Arc::new(parsed);
         let store = match self.store.get() {
@@ -5099,6 +5102,7 @@ impl McHandler {
                 .remove(&parsed.session_id);
         }
         response.historian = Some(diagnostics);
+        attach_native_messages(&mut response, &parsed);
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
         // Management requests carry identity but not raw history. A successful full pass
@@ -6148,6 +6152,8 @@ impl McHandler {
             session_id: binding.session.clone(),
             render_config: parsed.render_config.clone().unwrap_or_default(),
             tool_present: false,
+            serve_native: false,
+            native_messages: None,
             full_array_fingerprint: parsed.full_array_fingerprint.clone(),
             messages: shadow_input,
             tail_delta: None,
@@ -6898,6 +6904,30 @@ fn unknown_serializer_profile_error() -> HandlerOutcome {
         code: "unknown_serializer_profile".to_string(),
         message: "missing or unknown serializer_profile".to_string(),
     }
+}
+
+fn serve_native_unsupported_profile_error(profile: &str) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "serve_native_unsupported_profile".to_string(),
+        message: format!("serve_native requires serializer_profile opencode-aisdk, got {profile}"),
+    }
+}
+
+fn attach_native_messages(response: &mut transform::TransformResponse, request: &TransformRequest) {
+    if !request.serve_native {
+        return;
+    }
+    let sidecar = request
+        .native_messages
+        .as_deref()
+        .map(codec::decode_opencode)
+        .map(|decoded| decoded.sidecar)
+        .unwrap_or_else(|| codec::DecodeSidecar::new("opencode"));
+    response.native_messages = Some(codec::encode_opencode_with_session(
+        response.messages(),
+        &sidecar,
+        Some(&request.session_id),
+    ));
 }
 
 fn state_import_validation_error(error: StateImportValidationError) -> HandlerOutcome {
@@ -9781,6 +9811,88 @@ mod tests {
 
     async fn call_transform(handler: &McHandler, messages: Vec<CkIngressMessage>) -> Value {
         call_transform_request(handler, request(messages)).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_native_false_is_response_byte_identical_for_all_profiles() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        for profile in [
+            "owned-llmrunner",
+            "owned-broca",
+            "claude-code-anthropic",
+            "opencode-aisdk",
+            "pi",
+        ] {
+            let session_id = format!("{}serve-native-false", historian::MC_CHILD_SESSION_PREFIX);
+            let mut absent = request(vec![ck("m1", 1, "hello")]);
+            absent["session_id"] = json!(session_id);
+            absent["serializer_profile"] = json!(profile);
+            let mut explicit_false = absent.clone();
+            explicit_false["serve_native"] = json!(false);
+            let absent_response = call_transform_request(&handler, absent).await;
+            let explicit_response = call_transform_request(&handler, explicit_false).await;
+            assert_eq!(
+                serde_json::to_vec(&absent_response).unwrap(),
+                serde_json::to_vec(&explicit_response).unwrap(),
+                "profile {profile} changed the legacy response when serve_native=false"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_native_rejects_non_opencode_profiles() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut request = request(vec![ck("m1", 1, "hello")]);
+        request["serve_native"] = json!(true);
+        let outcome = call_transform_outcome(&handler, request).await;
+        assert_eq!(error_code(outcome), "serve_native_unsupported_profile");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_native_adds_opencode_messages_without_changing_ck_response() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut request = request(vec![ck("m1", 1, "hello")]);
+        request["serializer_profile"] = json!("opencode-aisdk");
+        request["serve_native"] = json!(true);
+        request["native_messages"] = json!([
+            {
+                "info": {
+                    "id": "m1",
+                    "sessionID": "ses",
+                    "role": "user",
+                    "customInfo": "preserve-me"
+                },
+                "parts": [{ "type": "text", "text": "hello", "customPart": 7 }]
+            }
+        ]);
+
+        let first = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(first["status"], "ok");
+        assert_eq!(
+            first["native_messages"].as_array().unwrap().last().unwrap(),
+            &request["native_messages"][0]
+        );
+        assert!(first["native_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| { message["parts"][0]["synthetic"] == json!(true) }));
+        assert!(first.get("ck_messages").is_some());
+
+        let second = call_transform_request(&handler, request).await;
+        assert_eq!(second["status"], "ok");
+        assert_eq!(second["action"], "SOFT+");
+        assert_eq!(
+            second["native_messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["info"]["customInfo"],
+            "preserve-me"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
