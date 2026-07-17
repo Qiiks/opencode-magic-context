@@ -1,4 +1,4 @@
-import type { Plugin, PluginModule } from "@opencode-ai/plugin";
+import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin";
 
 import {
     buildHiddenAgentConfig,
@@ -468,7 +468,7 @@ const server: Plugin = async (ctx) => {
         }),
         "experimental.chat.messages.transform": createMessagesTransformHandler({
             magicContext: hooks.magicContext,
-        }),
+        }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
             await hooks.magicContext?.["experimental.chat.system.transform"]?.(input, output);
         },

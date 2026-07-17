@@ -24,6 +24,10 @@ type MessageWithParts = {
 
 type MessagesTransformOutput = { messages: MessageWithParts[] };
 
+function replaceMessagesInPlace(output: MessagesTransformOutput, next: MessageWithParts[]): void {
+    if (output.messages !== next) output.messages.splice(0, output.messages.length, ...next);
+}
+
 /**
  * Top-level transform wrapper. Catches errors so OpenCode's prompt loop
  * always proceeds — without this guard, a transient DB contention event can
@@ -64,8 +68,8 @@ export function createMessagesTransformHandler(args: {
             output: MessagesTransformOutput,
         ) => Promise<void>;
     } | null;
-}): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<void> {
-    return async (input, output): Promise<void> => {
+}): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
+    return async (input, output): Promise<MessageWithParts[]> => {
         const sessionId = resolveSessionId(output);
         const slotAtEntry = sessionId ? getSlot(sessionId) : undefined;
         const entry = slotAtEntry
@@ -84,6 +88,7 @@ export function createMessagesTransformHandler(args: {
             : null;
         try {
             await args.magicContext?.["experimental.chat.messages.transform"]?.(input, output);
+            return output.messages;
         } catch (error) {
             if (error instanceof EmergencyFailClosedError) throw error;
             if (sessionId && slotAtEntry && !entry) {
@@ -110,9 +115,12 @@ export function createMessagesTransformHandler(args: {
                             entry,
                         });
                         if (replay.ok) {
-                            output.messages = replay.messages as unknown as MessageWithParts[];
+                            replaceMessagesInPlace(
+                                output,
+                                replay.messages as unknown as MessageWithParts[],
+                            );
                             sessionLog(sessionId, "lkg_replay_served");
-                            return;
+                            return output.messages;
                         }
                         sessionLog(sessionId, replay.reason);
                     }
@@ -135,7 +143,7 @@ export function createMessagesTransformHandler(args: {
                 log(
                     `[magic-context] transform skipped this pass — ${code} (transient; retrying next pass): ${message}`,
                 );
-                return;
+                return output.messages;
             }
 
             // Persistent non-transient errors are the real risk: silent forever
@@ -177,6 +185,7 @@ export function createMessagesTransformHandler(args: {
                 }
             }
         }
+        return output.messages;
     };
 }
 

@@ -5,6 +5,7 @@ import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
+import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { setRawMessageProvider } from "./read-session-chunk";
@@ -133,7 +134,7 @@ describe("Rust mode authority adapter", () => {
         expect(methods).toEqual(["state_sync", "state_sync", "transform"]);
         expect(transform.getState(sessionId).lastAckedSeq).toBe(6);
         expect(transform.getState(sessionId).lastAckedWatermarks).not.toBeNull();
-        expect(output.messages).toBe(native);
+        expect(output.messages).toEqual(native);
     });
 
     it("fails after the second authority mismatch in one transform pass", async () => {
@@ -176,8 +177,84 @@ describe("Rust mode authority adapter", () => {
         const transform = createTransform(deps);
         const output = { messages: input as unknown[] };
         await transform({}, output);
-        expect(output.messages).toBe(native);
-        expect(input[0]?.parts[0]).toEqual({ type: "text", text: "hello" });
+        expect(output.messages).toEqual(native);
+        expect(input).toEqual(native);
+    });
+
+    it("applies module output through the OpenCode hook array reference", async () => {
+        const sessionId = `rust-hook-array-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        const native = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "<project-docs>m0</project-docs>", synthetic: true }],
+            },
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "tail" }],
+            },
+        ];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          action: "CACHE_HIT",
+                          served_from: "transform",
+                          boundary_id: "m1#0",
+                          native_messages: native,
+                      }
+                    : { ok: true },
+        };
+        const transform = createTransform(makeDeps(db, moduleClient));
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": transform as never,
+            },
+        });
+        const output = { messages: input as unknown[] };
+        const callerHeldMessages = output.messages;
+
+        const returned = await handler({}, output as never);
+
+        expect(returned).toEqual(native);
+        expect(output.messages).toEqual(native);
+        expect(callerHeldMessages).toEqual(native);
+        expect(output.messages).toBe(callerHeldMessages);
+    });
+
+    it("fails the pass when a present boundary lacks a synthetic session-scoped m0", async () => {
+        const sessionId = `rust-wire-invariant-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          action: "CACHE_HIT",
+                          served_from: "transform",
+                          boundary_id: "m1#0",
+                          native_messages: [
+                              {
+                                  info: { role: "user", sessionID: sessionId },
+                                  parts: [{ type: "text", text: "not marked synthetic" }],
+                              },
+                          ],
+                      }
+                    : { ok: true },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const output = { messages: input as unknown[] };
+
+        await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+
+        expect(output.messages).toBe(input);
+        expect(output.messages[0]).toEqual(input[0]);
+        expect(transform.getState(sessionId).failureCount).toBe(1);
     });
 
     it("seeds before the first transform and applies native output verbatim", async () => {
@@ -204,14 +281,14 @@ describe("Rust mode authority adapter", () => {
         expect(transformRequest?.serve_native).toBe(true);
         expect(transformRequest?.native_messages).toBe(messages);
         expect(Array.isArray(transformRequest?.messages)).toBe(true);
-        expect(output.messages).toBe(native);
+        expect(output.messages).toEqual(native);
 
         methods.length = 0;
         const secondInput = makeMessages(sessionId);
         const secondOutput = { messages: secondInput as unknown[] };
         await transform.run(sessionId, secondInput, secondOutput, makeMeta(db, sessionId));
         expect(methods).toEqual(["transform"]);
-        expect(secondOutput.messages).toBe(native);
+        expect(secondOutput.messages).toEqual(native);
     });
 
     it("re-pages every transform payload after need_full_sync", async () => {
@@ -255,7 +332,7 @@ describe("Rust mode authority adapter", () => {
                 ].every((field) => field in body),
             ),
         ).toBe(true);
-        expect(output.messages).toBe(native);
+        expect(output.messages).toEqual(native);
     });
 
     it("passes through raw input, parks after three failures, then probes on the fifth pass", async () => {

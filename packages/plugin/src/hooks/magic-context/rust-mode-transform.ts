@@ -78,6 +78,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object";
 }
 
+/**
+ * OpenCode retains the original messages array when it serializes a transform result.
+ * Mutate that array in place so the module response reaches the wire, while returning
+ * the same array for callers that also consume the hook result.
+ */
+function replaceMessagesInPlace(output: { messages: unknown[] }, next: unknown[]): unknown[] {
+    const target = output.messages;
+    if (target !== next) target.splice(0, target.length, ...next);
+    return target;
+}
+
+function messageInfo(value: unknown): Record<string, unknown> {
+    if (!isRecord(value)) return {};
+    return isRecord(value.info) ? value.info : value;
+}
+
+function assertNativeBoundary(output: unknown[], sessionId: string, boundaryId: string): void {
+    const first = output.find((message) => messageInfo(message).role !== "system");
+    const info = messageInfo(first);
+    const parts = isRecord(first) && Array.isArray(first.parts) ? first.parts : [];
+    const synthetic =
+        parts.length > 0 && parts.every((part) => isRecord(part) && part.synthetic === true);
+    if (info.role === "user" && info.sessionID === sessionId && synthetic) return;
+    throw new Error(
+        `rust transform wire invariant failed: boundary=${boundaryId} expected a synthetic m0 user message scoped to session ${sessionId}`,
+    );
+}
+
 function responseValue(response: unknown): Record<string, unknown> {
     if (isRecord(response) && isRecord(response.result)) return response.result;
     if (isRecord(response)) return response;
@@ -185,21 +213,20 @@ function isNeedFullSync(response: Record<string, unknown>): boolean {
 export function applyNativeMessagesVerbatim(
     output: { messages: unknown[] },
     response: Record<string, unknown>,
-): void {
+): unknown[] {
     const nativeMessages = response.native_messages;
     if (typeof nativeMessages === "string") {
         const parsed = JSON.parse(nativeMessages) as unknown;
         if (!Array.isArray(parsed))
             throw new Error("rust transform native_messages string was not an array");
-        output.messages = parsed;
-        return;
+        return replaceMessagesInPlace(output, parsed);
     }
     if (!Array.isArray(nativeMessages)) {
         throw new Error("rust transform response omitted native_messages");
     }
     // The module owns healing, ordering, and codec fidelity. Do not clone,
     // normalize, or otherwise inspect the returned native message array.
-    output.messages = nativeMessages;
+    return replaceMessagesInPlace(output, nativeMessages);
 }
 
 function buildTransformBody(args: {
@@ -331,7 +358,7 @@ export function createRustModeTransform(
             sessionLog(sessionId, replay.reason);
             return false;
         }
-        output.messages = replay.messages;
+        replaceMessagesInPlace(output, replay.messages);
         sessionLog(sessionId, "lkg_replay_served");
         return true;
     };
@@ -370,16 +397,33 @@ export function createRustModeTransform(
     ): Promise<void> => {
         const state = ensureState(states, sessionId);
         state.passCount += 1;
+        const inputCount = messages.length;
+        let decision = "error";
+        let servedFrom = "none";
+        const finishPass = (applied: boolean): void => {
+            sessionLog(
+                sessionId,
+                `rust pass: decision=${decision} served_from=${servedFrom} in=${inputCount} out=${output.messages.length} applied=${applied}`,
+            );
+        };
         if (state.parked) {
             state.passesSincePark += 1;
             // The fifth live pass is the first retry opportunity after the
             // three-failure park; later retries use the same global cadence.
             if (state.passCount % RUST_PROBE_INTERVAL !== 0) {
-                if (!replayLastGood(sessionId, messages, output)) output.messages = messages;
+                decision = "parked";
+                const replayed = replayLastGood(sessionId, messages, output);
+                if (replayed) {
+                    servedFrom = "lkg";
+                } else {
+                    servedFrom = "raw";
+                    replaceMessagesInPlace(output, messages);
+                }
+                finishPass(false);
                 return;
             }
         }
-        const rawMessages = messages;
+        const rawMessages = messages.slice();
         try {
             const { directory } = await getSessionDirectory(deps, sessionId);
             const model =
@@ -497,6 +541,14 @@ export function createRustModeTransform(
                 );
             }
             if (!response) throw new Error("rust module returned no transform response");
+            decision =
+                typeof response.action === "string"
+                    ? response.action
+                    : typeof response.status === "string"
+                      ? response.status
+                      : "unknown";
+            servedFrom =
+                typeof response.served_from === "string" ? response.served_from : "unknown";
             if (isNeedFullSync(response)) {
                 state.initialized = false;
                 await syncModuleState({
@@ -519,9 +571,21 @@ export function createRustModeTransform(
                     );
                 }
                 if (!response) throw new Error("rust module returned no retry transform response");
+                decision =
+                    typeof response.action === "string"
+                        ? response.action
+                        : typeof response.status === "string"
+                          ? response.status
+                          : "unknown";
+                servedFrom =
+                    typeof response.served_from === "string" ? response.served_from : "unknown";
             }
-            applyNativeMessagesVerbatim(output, response);
-            captureRustResponse(sessionId, messages, response);
+            const appliedMessages = applyNativeMessagesVerbatim(output, response);
+            const boundaryId = response.boundary_id;
+            if (typeof boundaryId === "string" && boundaryId.length > 0) {
+                assertNativeBoundary(appliedMessages, sessionId, boundaryId);
+            }
+            captureRustResponse(sessionId, rawMessages, response);
             state.initialized = true;
             state.seedPassPending = false;
             state.consecutiveFailures = 0;
@@ -558,9 +622,26 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust compartment mirror-back failed (ignored):", error);
                 }
             }
+            finishPass(true);
         } catch (error) {
-            if (!replayLastGood(sessionId, rawMessages, output)) output.messages = rawMessages;
+            if (
+                error instanceof Error &&
+                error.message.startsWith("rust transform wire invariant failed")
+            ) {
+                sessionLog(
+                    sessionId,
+                    "rust transform wire invariant failed; LKG replay required",
+                    error,
+                );
+            }
+            // Restore the caller-owned raw array before attempting LKG replay. The
+            // invariant is checked after in-place application, so a failed check may
+            // have already replaced its contents with an untrusted module response.
+            replaceMessagesInPlace(output, rawMessages);
+            const replayed = replayLastGood(sessionId, rawMessages, output);
+            if (!replayed) replaceMessagesInPlace(output, rawMessages);
             markFailure(sessionId, state, error);
+            finishPass(false);
             return;
         }
     };

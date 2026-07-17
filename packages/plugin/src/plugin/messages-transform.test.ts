@@ -33,7 +33,7 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
 
         const output = makeOutput();
         // Should NOT throw — wrapper catches all errors.
-        await expect(handler({}, output)).resolves.toBeUndefined();
+        await expect(handler({}, output)).resolves.toBeDefined();
 
         // Messages are left untouched when transform fails.
         expect(output.messages).toHaveLength(1);
@@ -50,7 +50,7 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
         });
 
         const output = makeOutput();
-        await expect(handler({}, output)).resolves.toBeUndefined();
+        await expect(handler({}, output)).resolves.toBeDefined();
     });
 
     it("passes through non-error transforms normally", async () => {
@@ -76,7 +76,7 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
     it("no-ops when magicContext is null (disabled plugin path)", async () => {
         const handler = createMessagesTransformHandler({ magicContext: null });
         const output = makeOutput();
-        await expect(handler({}, output)).resolves.toBeUndefined();
+        await expect(handler({}, output)).resolves.toBeDefined();
         expect(output.messages).toHaveLength(1);
     });
 });
