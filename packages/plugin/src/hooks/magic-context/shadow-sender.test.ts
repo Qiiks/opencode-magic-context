@@ -125,6 +125,7 @@ function basePass(args: {
     projectPath?: string;
     nowMs?: number;
     isSubagent?: boolean;
+    midTurn?: boolean;
 }): ShadowTransformPass {
     const inputMessages = args.inputMessages ?? [message(args.sessionId, "m1", "hello")];
     return {
@@ -143,6 +144,7 @@ function basePass(args: {
             effective_execute_threshold: 65,
             history_budget_tokens: 19_500,
             cache_ttl: "ephemeral",
+            mid_turn: args.midTurn ?? false,
         },
         tsDecision: { class: "defer", marker_state: { advanced_this_pass: false } },
         declaredTrimBefore: null,
@@ -171,6 +173,8 @@ class FakeTransport implements ShadowTransport {
     closedSessions: string[] = [];
     seedBoundaryFailuresRemaining = 0;
     rejectNextTransform = false;
+    transformFailuresRemaining = 0;
+    transformFailureCode = "shadow_identity_drift";
     quarantinedResponsesRemaining = 0;
     resetFailuresRemaining = 0;
     resetTimeoutAtCall = 0;
@@ -237,6 +241,10 @@ class FakeTransport implements ShadowTransport {
         if (req.method === "shadow_transform" && this.rejectNextTransform) {
             this.rejectNextTransform = false;
             throw new SubcError("generation mismatch", "stale_generation");
+        }
+        if (req.method === "shadow_transform" && this.transformFailuresRemaining > 0) {
+            this.transformFailuresRemaining -= 1;
+            throw new SubcError("CK message block identity drift", this.transformFailureCode);
         }
         if (req.method === "shadow_reset") {
             this.seq = 0;
@@ -413,6 +421,43 @@ describe("shadow sender", () => {
         sender.resetSession(sessionId, "ordinal_mismatch");
         expect(transport.resetCalls).toBe(1);
         expect(sender.getStats(sessionId).parked).toBe(1);
+    });
+
+    it("parks repeated deterministic send failures and recovers after an explicit reset", async () => {
+        useTempDataHome("shadow-send-failure-park-");
+        const sessionId = "s-send-failure-park";
+        createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "hello" }]);
+        const db = openDatabase();
+        if (!db) throw new Error("test database failed to open");
+        const transport = new FakeTransport();
+        transport.transformFailuresRemaining = 3;
+        const sender = createShadowSender({ transport });
+
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+            sender.enqueue(basePass({ db, sessionId, nowMs: attempt }));
+            await waitFor(
+                () =>
+                    transport.calls.filter((call) => call.method === "shadow_transform").length ===
+                    attempt,
+            );
+        }
+        expect(sender.getStats(sessionId).parked).toBe(1);
+        expect(sender.getStats(sessionId).send_failures).toBe(3);
+
+        sender.enqueue(basePass({ db, sessionId, nowMs: 4 }));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(transport.calls.filter((call) => call.method === "shadow_transform")).toHaveLength(
+            3,
+        );
+
+        sender.resetSession(sessionId, "operator_reset");
+        await waitFor(() => transport.resetCalls === 2);
+        sender.enqueue(basePass({ db, sessionId, nowMs: 5 }));
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 4,
+        );
+        expect(sender.getStats(sessionId).parked).toBe(1);
+        expect(sender.getStats(sessionId).transforms_sent).toBe(1);
     });
 
     it("does not park repeated transient route reopen resets", async () => {
@@ -1059,6 +1104,42 @@ describe("shadow sender", () => {
         );
     });
 
+    it("keeps active profile lines in the real multi-batch seed wire shape", () => {
+        const profile = ["prefers root cause", "x < y & z"];
+        const batches = __shadowSenderTest.buildPagedSeedPayloads({
+            shadowGeneration: 7,
+            expectedShadowSeq: 11,
+            seedId: "profile-paged-seed",
+            seedBoundaryId: "m2#0",
+            compartments: [
+                { sequence: 0, content: "a".repeat(300 * 1024) },
+                { sequence: 1, content: "b".repeat(300 * 1024) },
+            ],
+            memories: [],
+            memoryMutations: [],
+            userProfile: profile,
+            workspace: null,
+            lastTodoState: "[]",
+            watermarks: {
+                compartment_sequence: 1,
+                memory_id: 0,
+                m0_mutation_id: 0,
+                memory_mutation_id: 0,
+                last_todo_state_hash: "hash",
+            },
+        });
+
+        expect(batches.length).toBeGreaterThan(1);
+        expect(batches.flatMap((batch) => batch.params.user_profile)).toEqual(profile);
+        expect(
+            batches.flatMap((batch) => {
+                const wire = __shadowSenderTest.toFlatWireBody(batch) as Record<string, unknown>;
+                return (wire.user_profile as string[]) ?? [];
+            }),
+        ).toEqual(profile);
+        expect(batches.at(-1)?.params.seed_complete).toBe(true);
+    });
+
     it("pages force seeds by exact flat wire bytes and keeps scalar state on the final batch", () => {
         const watermarks = {
             compartment_sequence: 2,
@@ -1079,6 +1160,7 @@ describe("shadow sender", () => {
             compartments,
             memories: [],
             memoryMutations: [],
+            userProfile: [],
             workspace: null,
             lastTodoState: "[]",
             watermarks,
@@ -1130,6 +1212,7 @@ describe("shadow sender", () => {
                 compartments: [{ content: "x".repeat(513 * 1024) }],
                 memories: [],
                 memoryMutations: [],
+                userProfile: [],
                 workspace: null,
                 lastTodoState: "[]",
                 watermarks,
@@ -1143,6 +1226,7 @@ describe("shadow sender", () => {
             compartments: [{ content: "x".repeat(300 * 1024) }],
             memories: [],
             memoryMutations: [],
+            userProfile: [],
             workspace: null,
             lastTodoState: "y".repeat(300 * 1024),
             watermarks,
@@ -1165,6 +1249,7 @@ describe("shadow sender", () => {
                 compartments: [],
                 memories: [],
                 memoryMutations: [],
+                userProfile: [],
                 workspace: null,
                 lastTodoState: "x".repeat(513 * 1024),
                 watermarks,

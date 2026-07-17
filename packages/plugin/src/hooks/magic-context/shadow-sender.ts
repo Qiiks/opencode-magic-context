@@ -76,6 +76,7 @@ const SHADOW_TRANSFORM_PAGE_MAX_BYTES = SHADOW_SEED_BATCH_MAX_BYTES;
 const SHADOW_TRANSFORM_ITEM_CHUNK_BYTES = 64 * 1024;
 const SHADOW_ITEM_CONTINUATION_KEY = "__shadow_item_continuation";
 const SHADOW_RESET_REASON_RING_SIZE = 8;
+const SHADOW_SEND_FAILURE_PARK_THRESHOLD = 3;
 const MAX_FACADE_FRAME_BYTES = 1024 * 1024;
 
 const declaredTrimBySession = new Map<string, { markerKey: string; trim: ShadowDeclaredTrim }>();
@@ -93,6 +94,8 @@ export interface ShadowPassInputs {
     history_budget_tokens: number;
     cache_ttl: string;
     provider_error?: string;
+    /** True when the newest assistant message is still streaming. */
+    mid_turn: boolean;
 }
 
 export interface ShadowTransformDecision {
@@ -183,6 +186,9 @@ interface SessionQueueState {
     seedStartedAtMs: number | null;
     seedBudgetSpentMs: number;
     resetReasons: string[];
+    sendFailureClass: string | null;
+    consecutiveSendFailures: number;
+    parkedReason: "send_failure" | "reset_repeat" | null;
     parked: boolean;
     counters: ShadowSenderCounters;
 }
@@ -266,7 +272,7 @@ function buildPagedSeedPayloads(args: {
     compartments: unknown[];
     memories: unknown[];
     memoryMutations: unknown[];
-    userProfile?: string[];
+    userProfile: string[];
     workspace: ShadowWorkspacePayload | null;
     lastTodoState: string;
     watermarks: ShadowWatermarks;
@@ -454,6 +460,9 @@ function createSessionQueueState(): SessionQueueState {
         seedStartedAtMs: null,
         seedBudgetSpentMs: 0,
         resetReasons: [],
+        sendFailureClass: null,
+        consecutiveSendFailures: 0,
+        parkedReason: null,
         parked: false,
         counters: emptyCounters(),
     };
@@ -1274,6 +1283,20 @@ function isPeerReject(error: unknown): boolean {
     );
 }
 
+function deterministicSendFailureClass(error: unknown): string | null {
+    const code = errorCode(error);
+    if (
+        code === "shadow_identity_drift" ||
+        code === "identity_drift" ||
+        code === "shadow_validation_reject" ||
+        code === "invalid_params" ||
+        code === "bad_shadow_input"
+    ) {
+        return code;
+    }
+    return null;
+}
+
 function isSeedBoundaryReject(error: unknown): boolean {
     return errorCode(error) === "shadow_seed_boundary_mismatch";
 }
@@ -1567,6 +1590,7 @@ export function createShadowSender(
         }
         if (isTransientResetReason(reason) || previous !== reason) return true;
         state.parked = true;
+        state.parkedReason = "reset_repeat";
         state.queue.length = 0;
         state.seedStartedAtMs = null;
         state.seedBudgetSpentMs = 0;
@@ -1577,6 +1601,33 @@ export function createShadowSender(
         state.counters.parked += 1;
         transport.closeSession?.(sessionId);
         sessionLog(sessionId, `shadow: parked (repeated ${reason})`);
+        return false;
+    };
+
+    const recordDeterministicSendFailure = (
+        sessionId: string,
+        state: SessionQueueState,
+        failureClass: string,
+    ): boolean => {
+        if (state.sendFailureClass === failureClass) {
+            state.consecutiveSendFailures += 1;
+        } else {
+            state.sendFailureClass = failureClass;
+            state.consecutiveSendFailures = 1;
+        }
+        if (state.consecutiveSendFailures < SHADOW_SEND_FAILURE_PARK_THRESHOLD) return true;
+        state.parked = true;
+        state.parkedReason = "send_failure";
+        state.queue.length = 0;
+        state.seedStartedAtMs = null;
+        state.seedBudgetSpentMs = 0;
+        state.reseedAwaitingSuccess = false;
+        state.blockedUntilReset = false;
+        state.requireResetReason = null;
+        state.seedPassPending = false;
+        state.counters.parked += 1;
+        transport.closeSession?.(sessionId);
+        sessionLog(sessionId, `shadow: parked (repeated send failure ${failureClass})`);
         return false;
     };
 
@@ -1718,8 +1769,17 @@ export function createShadowSender(
             }
             try {
                 await processPass(state, item.pass);
+                state.sendFailureClass = null;
+                state.consecutiveSendFailures = 0;
             } catch (error) {
                 state.counters.send_failures += 1;
+                const failureClass = deterministicSendFailureClass(error);
+                if (failureClass !== null) {
+                    if (!recordDeterministicSendFailure(sessionId, state, failureClass)) continue;
+                } else {
+                    state.sendFailureClass = null;
+                    state.consecutiveSendFailures = 0;
+                }
                 if (isPeerReject(error)) {
                     const code = errorCode(error);
                     if (code?.includes("generation")) state.counters.generation_rejects += 1;
@@ -1788,6 +1848,8 @@ export function createShadowSender(
         // The complete sync makes source state available; the seed pass then establishes
         // the shadow lane's own first-render cache and boundary state.
         args.state.seedPassPending = true;
+        args.state.sendFailureClass = null;
+        args.state.consecutiveSendFailures = 0;
         args.state.counters.resets_sent += 1;
         sessionLog(
             args.sessionId,
@@ -2139,7 +2201,16 @@ export function createShadowSender(
         resetSession(sessionId: string, reason: string): void {
             if (subagentSessions.has(sessionId)) return;
             const state = getState(sessionId);
-            if (state.parked) return;
+            if (state.parked) {
+                if (state.parkedReason !== "send_failure") return;
+                // An explicit reset is the recovery boundary for a deterministic reject:
+                // the module drops the poisoned lineage and the sender may seed it again.
+                state.parked = false;
+                state.parkedReason = null;
+                state.resetReasons = [];
+                state.sendFailureClass = null;
+                state.consecutiveSendFailures = 0;
+            }
             state.queue.length = 0;
             state.requireResetReason = reason;
             state.blockedUntilReset = true;

@@ -33,7 +33,7 @@ use mc_store::{
     Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, ModuleMeta,
     ModuleUsage, PendingAgentDrop, PendingRewriteState, StoredCompartment, TagMintInput,
     TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
-    UserHintDecisionInput, UserHintRow,
+    UserHintDecisionInput, UserHintRow, SHADOW_SESSION_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -217,6 +217,10 @@ pub struct TransformRequest {
     pub usage: Option<ModuleUsage>,
     #[serde(default)]
     pub provider_error: Option<String>,
+    /// Shadow-only evidence that the newest assistant tail is still streaming. When true,
+    /// identity enforcement leaves that tail provisional until a later completed pass.
+    #[serde(default)]
+    pub mid_turn: bool,
     /// Proxy-observed completion time for the prior successful response on this exact
     /// conversation key. It is request evidence only and never enters render identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +264,8 @@ struct TransformRequestWire {
     #[serde(default)]
     provider_error: Option<String>,
     #[serde(default)]
+    mid_turn: bool,
+    #[serde(default)]
     prev_response_completed_at_ms: Option<u64>,
     #[serde(default)]
     request_observed_at_ms: Option<u64>,
@@ -290,6 +296,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             tail_delta: wire.tail_delta,
             usage: wire.usage,
             provider_error: wire.provider_error,
+            mid_turn: wire.mid_turn,
             prev_response_completed_at_ms: wire.prev_response_completed_at_ms,
             request_observed_at_ms: wire.request_observed_at_ms,
             declared_trim: wire.declared_trim,
@@ -641,6 +648,15 @@ impl std::fmt::Display for TransformError {
 }
 impl std::error::Error for TransformError {}
 
+impl TransformError {
+    /// These failures are deterministic for the same shadow payload. The sender can park a
+    /// poisoned shadow lineage instead of retrying it forever; store and search failures remain
+    /// retryable because their cause may be transient.
+    pub fn is_deterministic_reject(&self) -> bool {
+        !matches!(self, Self::Store(_) | Self::Search(_))
+    }
+}
+
 impl From<CkWireError> for TransformError {
     fn from(e: CkWireError) -> Self {
         TransformError::CkWire(e)
@@ -931,7 +947,13 @@ fn apply_once(
     let clear_pending_rewrite_on_present =
         loaded.meta.pending_rewrite.is_some() && boundary_present;
 
-    enforce_block_identity(&loaded.meta, &projection, &loaded.core)?;
+    let provisional_tail_mid = provisional_tail_mid(req);
+    enforce_block_identity(
+        &loaded.meta,
+        &projection,
+        &loaded.core,
+        provisional_tail_mid,
+    )?;
     let mut pending_overlays = PendingOverlayDecisions::default();
     if tagging_active
         && !loaded.core.reconcile_pending
@@ -1179,7 +1201,7 @@ fn apply_once(
             meta.pending_rewrite_last_failure = None;
         }
     }
-    apply_ingress_meta(&mut meta, req, &projection);
+    apply_ingress_meta(&mut meta, req, &projection, provisional_tail_mid);
     meta.cc_u1_active = cc_u1_active;
     if cc_u1_active {
         meta.last_serializer_profile = req.serializer_profile.clone();
@@ -1635,12 +1657,27 @@ fn apply_once(
     })
 }
 
+fn provisional_tail_mid(req: &TransformRequest) -> Option<&str> {
+    if !req.mid_turn || !req.session_id.starts_with(SHADOW_SESSION_PREFIX) {
+        return None;
+    }
+    req.messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
+        .max_by_key(|message| message.ordinal)
+        .map(|message| message.mid.as_str())
+}
+
 fn enforce_block_identity(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     core: &CoreState,
+    provisional_tail_mid: Option<&str>,
 ) -> Result<(), TransformError> {
     for (mid, vector) in &projection.identity_by_mid {
+        if provisional_tail_mid == Some(mid.as_str()) {
+            continue;
+        }
         if let Some(stored) = meta.block_identity_by_mid.get(mid) {
             if stored != vector {
                 return Err(TransformError::IdentityDrift(mid.clone()));
@@ -1663,6 +1700,9 @@ fn enforce_block_identity(
         let Some((mid, _)) = split_block_id(&target) else {
             continue;
         };
+        if provisional_tail_mid == Some(mid) {
+            continue;
+        }
         if live_mids.contains(mid) && !live_ids.contains(target.as_str()) {
             return Err(TransformError::FrozenRedTargetVanish(target));
         }
@@ -1670,8 +1710,21 @@ fn enforce_block_identity(
     Ok(())
 }
 
-fn apply_ingress_meta(meta: &mut ModuleMeta, req: &TransformRequest, projection: &FlatProjection) {
+fn apply_ingress_meta(
+    meta: &mut ModuleMeta,
+    req: &TransformRequest,
+    projection: &FlatProjection,
+    provisional_tail_mid: Option<&str>,
+) {
+    if let Some(mid) = provisional_tail_mid {
+        // Remove any stale pin for a tail that became streaming again. The next completed
+        // pass must establish identity from the stable block vector, not from a partial form.
+        meta.block_identity_by_mid.remove(mid);
+    }
     for (mid, vector) in &projection.identity_by_mid {
+        if provisional_tail_mid == Some(mid.as_str()) {
+            continue;
+        }
         meta.block_identity_by_mid
             .entry(mid.clone())
             .or_insert_with(|| vector.clone());
@@ -4614,6 +4667,7 @@ mod tests {
             tail_delta: None,
             usage: None,
             provider_error: None,
+            mid_turn: false,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
             declared_trim: None,
@@ -5080,6 +5134,116 @@ mod tests {
                 .expect("live media message must pass through");
             assert_eq!(serde_json::to_value(replayed).unwrap(), media_wire);
         }
+    }
+
+    fn assistant_form(mid: &str, ordinal: u64, texts: &[&str]) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                texts
+                    .iter()
+                    .map(|text| {
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                            text: (*text).to_string(),
+                        })
+                    })
+                    .collect(),
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn shadow_mid_turn_tail_stays_provisional_and_reset_recovers_identity_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "shadow:identity-recovery";
+        let partial = assistant_form("tail", 1, &["partial"]);
+        let complete = assistant_form("tail", 1, &["partial", "completed"]);
+
+        // This is the production failure shape when a streaming form is pinned first.
+        let pinned = req(session, "cfg0", vec![partial.clone()]);
+        transform(&store, &pinned, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        let drift = req(session, "cfg0", vec![complete.clone()]);
+        assert!(matches!(
+            transform(&store, &drift, &pctx("git:proj", "/nonexistent-docs", 1)),
+            Err(TransformError::IdentityDrift(mid)) if mid == "tail"
+        ));
+
+        let reset = store.reset_shadow_session(session, session).unwrap();
+        assert!(reset.shadow_seq == 0);
+        assert!(store
+            .load(session)
+            .unwrap()
+            .meta
+            .block_identity_by_mid
+            .is_empty());
+        transform(&store, &drift, &pctx("git:proj", "/nonexistent-docs", 2)).unwrap();
+
+        // The exemption is shadow-only; a non-shadow request remains byte-for-byte strict even
+        // if an unexpected caller supplies the mid_turn field.
+        let owned_session = "owned:identity-provisional";
+        let mut owned_mid_turn = req(
+            owned_session,
+            "cfg0",
+            vec![assistant_form("owned", 1, &["partial"])],
+        );
+        owned_mid_turn.mid_turn = true;
+        transform(
+            &store,
+            &owned_mid_turn,
+            &pctx("git:proj", "/nonexistent-docs", 3),
+        )
+        .unwrap();
+        assert!(store
+            .load(owned_session)
+            .unwrap()
+            .meta
+            .block_identity_by_mid
+            .get("owned")
+            .is_some());
+
+        // Shadow sends carry mid_turn, so the same partial form is never pinned.
+        let shadow_session = "shadow:identity-provisional";
+        let mut provisional = req(shadow_session, "cfg0", vec![partial]);
+        provisional.mid_turn = true;
+        transform(
+            &store,
+            &provisional,
+            &pctx("git:proj", "/nonexistent-docs", 3),
+        )
+        .unwrap();
+        assert!(store
+            .load(shadow_session)
+            .unwrap()
+            .meta
+            .block_identity_by_mid
+            .get("tail")
+            .is_none());
+        transform(
+            &store,
+            &req(shadow_session, "cfg0", vec![complete]),
+            &pctx("git:proj", "/nonexistent-docs", 4),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .load(shadow_session)
+                .unwrap()
+                .meta
+                .block_identity_by_mid
+                .get("tail")
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

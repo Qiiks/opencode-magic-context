@@ -1093,6 +1093,9 @@ struct ShadowPassInputs {
     cache_ttl: String,
     #[serde(default)]
     provider_error: Option<String>,
+    /// True only for shadow passes whose newest assistant is still streaming.
+    #[serde(default)]
+    mid_turn: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -6013,6 +6016,7 @@ impl McHandler {
             tail_delta: None,
             usage,
             provider_error: parsed.pass_inputs.provider_error.clone(),
+            mid_turn: parsed.pass_inputs.mid_turn,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
             declared_trim: parsed.declared_trim.clone(),
@@ -6044,6 +6048,18 @@ impl McHandler {
         };
         let result = match transform_with_projection(&store, &transform_request, &producer_ctx) {
             Ok(result) => result,
+            Err(transform::TransformError::IdentityDrift(mid)) => {
+                return HandlerOutcome::Error {
+                    code: "shadow_identity_drift".to_string(),
+                    message: format!("CK message block identity drift for mid {mid}"),
+                }
+            }
+            Err(e) if e.is_deterministic_reject() => {
+                return HandlerOutcome::Error {
+                    code: "shadow_validation_reject".to_string(),
+                    message: e.to_string(),
+                }
+            }
             Err(e) => {
                 return HandlerOutcome::Error {
                     code: "shadow_transform_failed".to_string(),
@@ -14015,6 +14031,7 @@ mod tests {
         history_budget_tokens: f64,
         cache_ttl: String,
         provider_error: String,
+        mid_turn: bool,
     }
 
     #[allow(dead_code)]
@@ -14161,7 +14178,8 @@ mod tests {
             "model_key": "ts/model",
             "usage": { "input_tokens": 45_000, "limit": 50_000 },
             "effective_execute_threshold": 65.0,
-            "cache_ttl": "5m"
+            "cache_ttl": "5m",
+            "mid_turn": false
         })
     }
 
@@ -14223,6 +14241,7 @@ mod tests {
             "compartments": compartments,
             "memories": [],
             "memory_mutations": [],
+            "user_profile": [],
         });
         if complete {
             let object = batch.as_object_mut().unwrap();
@@ -14389,6 +14408,70 @@ mod tests {
             )
             .await;
         assert_eq!(error_code(duplicate), "shadow_seq_mismatch");
+    }
+
+    #[tokio::test]
+    async fn paged_shadow_seed_profiles_reach_store_and_shadow_m0() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
+        let session = "shadow:paged-profile";
+        handler.bind_route(8, binding(project.to_str().unwrap(), session));
+        assert!(matches!(
+            handler
+                .dispatch_value(8, json!({ "kind": "shadow_reset", "session_id": session }))
+                .await,
+            HandlerOutcome::Response(_)
+        ));
+
+        let mut first = paged_seed_batch(session, "profile-seed", 1, 0, 0, 3, vec![]);
+        first["user_profile"] = json!(["prefers root cause"]);
+        let mut second = paged_seed_batch(
+            session,
+            "profile-seed",
+            1,
+            0,
+            1,
+            3,
+            vec![shadow_compartment(0, "first compartment")],
+        );
+        second["user_profile"] = json!(["x < y & z"]);
+        let final_batch = paged_seed_batch(session, "profile-seed", 1, 0, 2, 3, vec![]);
+
+        assert!(matches!(
+            handler.dispatch_value(8, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        assert!(store.load_shadow_user_profile(session).unwrap().is_empty());
+        assert!(matches!(
+            handler.dispatch_value(8, second).await,
+            HandlerOutcome::Response(_)
+        ));
+        assert!(store.load_shadow_user_profile(session).unwrap().is_empty());
+        assert!(matches!(
+            handler.dispatch_value(8, final_batch).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        let profile = store.load_shadow_user_profile(session).unwrap();
+        assert_eq!(profile, vec!["prefers root cause", "x < y & z"]);
+        let composed = crate::m0_compose::compose_m0_from_store(
+            &store,
+            &crate::m0_compose::M0ComposeInputs {
+                session_id: session,
+                project_path: session,
+                project_directory: project.to_str().unwrap(),
+                now_ms: 0,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+                memory_enabled: true,
+            },
+            |_| 0,
+        )
+        .unwrap();
+        assert_eq!(
+            composed.m0_bytes,
+            "<user-profile>\n- prefers root cause\n- x &lt; y &amp; z\n</user-profile>\n\n<session-history>\n## 0-0 · c0\nfirst compartment-p1\n</session-history>"
+        );
     }
 
     #[tokio::test]

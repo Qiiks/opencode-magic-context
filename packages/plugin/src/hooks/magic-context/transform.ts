@@ -2113,6 +2113,7 @@ export function createTransform(deps: TransformDeps) {
                         effective_execute_threshold: boundaryExecuteThreshold,
                         history_budget_tokens: historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
                         cache_ttl: sessionMeta.cacheTtl,
+                        mid_turn: midTurn,
                     },
                     tsDecision: shadowDecision,
                     declaredTrimBefore: shadowCapture.declaredTrimBefore,
