@@ -4,6 +4,7 @@ import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     buildLkgPrefix,
     captureLkgSlot,
+    projectLkgEntry,
     replayLkg,
     validateLkgEntry,
     validateLkgSeam,
@@ -37,6 +38,49 @@ function assistant(id: string, created: number, parts: unknown[] = []): MessageL
 }
 
 describe("LKG transform replay", () => {
+    test("projects only anchor fields without retaining message parts", () => {
+        const input = [
+            user("u0", 1),
+            assistant("a1", 2, [
+                {
+                    type: "tool",
+                    providerExecuted: false,
+                    state: { status: "running" },
+                    nested: { large: true },
+                },
+            ]),
+            user("u1", 3),
+        ];
+        const projected = projectLkgEntry(input);
+        expect(projected).toEqual([
+            {
+                id: "u0",
+                role: "user",
+                synthetic: false,
+                timeCreated: 1,
+                finish: undefined,
+                hasIncompleteTool: false,
+            },
+            {
+                id: "a1",
+                role: "assistant",
+                synthetic: false,
+                timeCreated: 2,
+                finish: "stop",
+                hasIncompleteTool: true,
+            },
+            {
+                id: "u1",
+                role: "user",
+                synthetic: false,
+                timeCreated: 3,
+                finish: undefined,
+                hasIncompleteTool: false,
+            },
+        ]);
+        expect("parts" in (projected[1] as object)).toBe(false);
+    });
+
     test("captures only the prefix through an early anchor and serves a pristine tail", () => {
         resetLkgSlotsForTest();
         const input = [

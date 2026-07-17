@@ -1,5 +1,8 @@
 import { performance } from "node:perf_hooks";
-import { captureLkgSlot } from "../src/hooks/magic-context/lkg-replay";
+import {
+    captureLkgSlot,
+    projectLkgEntry,
+} from "../src/hooks/magic-context/lkg-replay";
 import { resetLkgSlotsForTest } from "../src/hooks/magic-context/lkg-slot";
 
 type BenchMessage = {
@@ -30,27 +33,32 @@ const samples = 25;
 for (const [label, bytes, count] of [["2MB", 2 * 1024 * 1024, 100], ["6MB", 6 * 1024 * 1024, 500]] as const) {
     const input = makeCorpus(bytes, count);
     const output = structuredClone(input);
-    const timings: number[] = [];
+    const projectionTimings: number[] = [];
+    const captureTimings: number[] = [];
     let peakRssDelta = 0;
     for (let sample = 0; sample < samples; sample += 1) {
         resetLkgSlotsForTest();
         const before = process.memoryUsage().rss;
-        const started = performance.now();
+        const projectionStarted = performance.now();
+        const projected = projectLkgEntry(input);
+        projectionTimings.push(performance.now() - projectionStarted);
+        const captureStarted = performance.now();
         captureLkgSlot({
             sessionId: "bench",
-            input,
+            input: projected,
             output,
             modelKey: "test/bench",
             providerKey: "test",
-            capturedAt: started,
+            capturedAt: captureStarted,
         });
-        timings.push(performance.now() - started);
+        captureTimings.push(performance.now() - captureStarted);
         peakRssDelta = Math.max(peakRssDelta, process.memoryUsage().rss - before);
     }
     console.log(JSON.stringify({
         corpus: label,
         messages: count,
-        p95CaptureMs: Number(percentile(timings, 0.95).toFixed(3)),
+        p95EntryProjectionMs: Number(percentile(projectionTimings, 0.95).toFixed(3)),
+        p95CaptureMs: Number(percentile(captureTimings, 0.95).toFixed(3)),
         peakRssDeltaMiB: Number((peakRssDelta / 1024 / 1024).toFixed(3)),
     }));
 }

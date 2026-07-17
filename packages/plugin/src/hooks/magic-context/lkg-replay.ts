@@ -38,9 +38,65 @@ export function resolveLkgModelKeys(messages: MessageLike[]): LkgModelKeys {
     return { modelKey: null, providerKey: null };
 }
 
+export interface LkgEntryProjection {
+    id: string | null;
+    role: string | undefined;
+    synthetic: boolean;
+    timeCreated: number | null;
+    finish: unknown;
+    hasIncompleteTool: boolean;
+}
+
+export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
+    return messages.map((message) => {
+        const info = messageInfo(message);
+        const time = info.time;
+        const timeRecord =
+            time && typeof time === "object" ? (time as Record<string, unknown>) : null;
+        const timeCandidates = [
+            timeRecord?.created,
+            info.timeCreated,
+            info.time_created,
+            info.createdAt,
+            info.created_at,
+        ];
+        let timeCreated: number | null = null;
+        for (const value of timeCandidates) {
+            if (typeof value === "number" && Number.isFinite(value)) {
+                timeCreated = value;
+                break;
+            }
+        }
+        let hasIncompleteTool = false;
+        for (const rawPart of messageParts(message)) {
+            if (!rawPart || typeof rawPart !== "object") continue;
+            const part = rawPart as Record<string, unknown>;
+            if (part.type !== "tool" || part.providerExecuted === true) continue;
+            const state = part.state;
+            const status =
+                state && typeof state === "object"
+                    ? (state as Record<string, unknown>).status
+                    : undefined;
+            if (status !== "completed") {
+                hasIncompleteTool = true;
+                break;
+            }
+        }
+        const id = info.id;
+        return {
+            id: typeof id === "string" && id.length > 0 ? id : null,
+            role: typeof info.role === "string" ? info.role : undefined,
+            synthetic: info.synthetic === true,
+            timeCreated,
+            finish: info.finish,
+            hasIncompleteTool,
+        };
+    });
+}
+
 export interface LkgCaptureInput {
     sessionId: string;
-    input: MessageLike[];
+    input: LkgEntryProjection[] | MessageLike[];
     output: MessageLike[];
     modelKey: string | null;
     providerKey: string | null;
@@ -67,33 +123,6 @@ function messageParts(message: MessageLike): unknown[] {
     return Array.isArray(message.parts) ? message.parts : [];
 }
 
-function messageRole(message: MessageLike): string | undefined {
-    const infoRole = recordValue(messageInfo(message), "role");
-    if (typeof infoRole === "string") return infoRole;
-    const role = recordValue(message, "role");
-    return typeof role === "string" ? role : undefined;
-}
-
-function messageId(message: MessageLike): string | null {
-    const id = recordValue(messageInfo(message), "id") ?? recordValue(message, "id");
-    return typeof id === "string" && id.length > 0 ? id : null;
-}
-
-function messageTime(message: MessageLike): number | null {
-    const info = messageInfo(message);
-    const candidates = [
-        info.timeCreated,
-        info.time_created,
-        info.createdAt,
-        info.created_at,
-        (info.time as Record<string, unknown> | undefined)?.created,
-    ];
-    for (const value of candidates) {
-        if (typeof value === "number" && Number.isFinite(value)) return value;
-    }
-    return null;
-}
-
 function isSynthetic(message: MessageLike): boolean {
     return recordValue(messageInfo(message), "synthetic") === true;
 }
@@ -116,54 +145,61 @@ function isSyntheticOutput(message: MessageLike): boolean {
     return isSynthetic(message) || hasSyntheticParts(message);
 }
 
-function isRealUser(message: MessageLike): boolean {
-    const synthetic = recordValue(messageInfo(message), "synthetic");
-    if (synthetic !== undefined && typeof synthetic !== "boolean") return false;
-    return messageRole(message) === "user" && synthetic !== true && messageId(message) !== null;
+function messageRole(message: MessageLike): string | undefined {
+    const infoRole = recordValue(messageInfo(message), "role");
+    if (typeof infoRole === "string") return infoRole;
+    const role = recordValue(message, "role");
+    return typeof role === "string" ? role : undefined;
 }
 
-function latestAssistant(messages: MessageLike[]): MessageLike | null {
+function messageId(message: MessageLike): string | null {
+    const id = recordValue(messageInfo(message), "id") ?? recordValue(message, "id");
+    return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+function latestAssistant(messages: LkgEntryProjection[]): LkgEntryProjection | null {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
-        if (messageRole(messages[index]) === "assistant") return messages[index];
+        if (messages[index].role === "assistant") return messages[index];
     }
     return null;
 }
 
-function hasUnexecutedTool(message: MessageLike): boolean {
-    for (const rawPart of messageParts(message)) {
-        if (!rawPart || typeof rawPart !== "object") continue;
-        const part = rawPart as Record<string, unknown>;
-        if (part.type !== "tool") continue;
-        if (part.providerExecuted !== true) {
-            const state = part.state;
-            if (!state || typeof state !== "object") return true;
-            if ((state as Record<string, unknown>).status !== "completed") return true;
-        }
-    }
-    return false;
+function isRealUser(message: LkgEntryProjection): boolean {
+    return message.role === "user" && !message.synthetic && message.id !== null;
 }
 
-function assistantIsActive(message: MessageLike): boolean {
-    const finish = recordValue(message.info, "finish");
-    return finish === "tool-calls" || hasUnexecutedTool(message);
+function assistantIsActive(message: LkgEntryProjection): boolean {
+    return message.finish === "tool-calls" || message.hasIncompleteTool;
 }
 
-export function findLkgAnchor(messages: MessageLike[]): number | null {
+export function findLkgAnchor(messages: LkgEntryProjection[]): number | null {
     const assistant = latestAssistant(messages);
-    const assistantTime = assistant ? messageTime(assistant) : null;
+    const assistantTime = assistant?.timeCreated ?? null;
     if (assistant && assistantTime === null) return null;
     let anchor = -1;
     for (let index = messages.length - 1; index >= 0; index -= 1) {
         const message = messages[index];
         if (!isRealUser(message)) continue;
         if (assistant && assistantIsActive(assistant)) {
-            const userTime = messageTime(message);
-            if (assistantTime === null || userTime === null || userTime <= assistantTime) continue;
+            if (
+                assistantTime === null ||
+                message.timeCreated === null ||
+                message.timeCreated <= assistantTime
+            ) {
+                continue;
+            }
         }
         anchor = index;
         break;
     }
     return anchor >= 0 ? anchor : null;
+}
+
+function asEntryProjection(input: LkgEntryProjection[] | MessageLike[]): LkgEntryProjection[] {
+    if (input.length === 0 || "hasIncompleteTool" in (input[0] as object)) {
+        return input as LkgEntryProjection[];
+    }
+    return projectLkgEntry(input as MessageLike[]);
 }
 
 function outputMessageIsPostAnchor(
@@ -196,7 +232,7 @@ function outputMessageIsPostAnchor(
 }
 
 export function buildLkgPrefix(
-    input: MessageLike[],
+    input: LkgEntryProjection[] | MessageLike[],
     output: MessageLike[],
 ): {
     anchorIndex: number;
@@ -204,14 +240,15 @@ export function buildLkgPrefix(
     inputIdSeq: string[];
     prefix: MessageLike[];
 } | null {
-    const anchorIndex = findLkgAnchor(input);
+    const projected = asEntryProjection(input);
+    const anchorIndex = findLkgAnchor(projected);
     if (anchorIndex === null) return null;
-    const inputIds = input.map(messageId);
-    if (inputIds.some((id) => id === null)) return null;
-    const ids = inputIds as string[];
-    if (new Set(ids).size !== ids.length) return null;
-    const anchorMessageId = ids[anchorIndex];
-    const inputIndexById = new Map(ids.map((id, index) => [id, index]));
+    const ids = projected.map((message) => message.id);
+    if (ids.some((id) => id === null)) return null;
+    const validIds = ids as string[];
+    if (new Set(validIds).size !== validIds.length) return null;
+    const anchorMessageId = validIds[anchorIndex];
+    const inputIndexById = new Map(validIds.map((id, index) => [id, index]));
     const prefix: MessageLike[] = [];
     for (const message of output) {
         const postAnchor = outputMessageIsPostAnchor(message, inputIndexById, anchorIndex);
@@ -230,7 +267,7 @@ export function buildLkgPrefix(
     return {
         anchorIndex,
         anchorMessageId,
-        inputIdSeq: ids.slice(0, anchorIndex + 1),
+        inputIdSeq: validIds.slice(0, anchorIndex + 1),
         prefix,
     };
 }

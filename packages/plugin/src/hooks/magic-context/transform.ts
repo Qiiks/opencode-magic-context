@@ -73,7 +73,7 @@ import {
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
 } from "./inject-compartments";
-import { captureLkgSlot, resolveLkgModelKeys } from "./lkg-replay";
+import { captureLkgSlot, projectLkgEntry, resolveLkgModelKeys } from "./lkg-replay";
 import { dropSlot } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
@@ -462,16 +462,7 @@ export function createTransform(deps: TransformDeps) {
         const startTime = performance.now();
         const messages = output.messages as MessageLike[];
         const passOutcome = createPassOutcome();
-        let lkgInput: MessageLike[];
-        try {
-            lkgInput = structuredClone(messages) as MessageLike[];
-        } catch {
-            lkgInput = messages.map((message) => ({
-                info: { ...message.info },
-                parts: [...message.parts],
-            })) as MessageLike[];
-            passOutcome.record("capture-input-clone-failure");
-        }
+        const lkgInput = projectLkgEntry(messages);
         const sessionId = findSessionId(messages);
         if (!sessionId) {
             return;
@@ -1909,7 +1900,7 @@ export function createTransform(deps: TransformDeps) {
         }
 
         if (passOutcome.captureEligible) {
-            const keys = resolveLkgModelKeys(lkgInput);
+            const keys = resolveLkgModelKeys(messages);
             const modelKey = modelForBudget
                 ? `${modelForBudget.providerID}/${modelForBudget.modelID}`
                 : keys.modelKey;
