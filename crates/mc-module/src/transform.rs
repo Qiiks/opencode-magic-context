@@ -4296,12 +4296,12 @@ fn strip_reasoning_from_merged_assistants_with_exemption(
             kept_reasoning_in_run = false;
             continue;
         }
-        if mutation_exempt_mid == message.meta.harness_id.as_deref() {
+        let first_in_run = !prev_assistant;
+        if mutation_exempt_mid == message.meta.harness_id.as_deref() && first_in_run {
             prev_assistant = true;
             continue;
         }
 
-        let first_in_run = !prev_assistant;
         if first_in_run {
             kept_reasoning_in_run = false;
         }
@@ -4309,7 +4309,7 @@ fn strip_reasoning_from_merged_assistants_with_exemption(
         let mut keep_index = None;
         if first_in_run && !kept_reasoning_in_run {
             for (idx, block) in message.content.iter().enumerate() {
-                if is_empty_text_block(block) {
+                if is_reasoning_ignored_block(block) {
                     continue;
                 }
                 if is_reasoning_block(block) {
@@ -4351,7 +4351,8 @@ fn is_reasoning_block(block: &CkWireBlock) -> bool {
 }
 
 /// Anthropic verifies the latest assistant reasoning blocks against ingress bytes. Profiles
-/// that can reach an Anthropic-family endpoint therefore leave that message untouched.
+/// that can reach an Anthropic-family endpoint preserve a standalone latest assistant, while
+/// a latest assistant inside a merged run still follows the serializer healing rule.
 fn latest_assistant_mutation_exempt_mid(
     messages: &[CkIngressMessage],
     profile: Option<SerializerProfile>,
@@ -4372,6 +4373,27 @@ fn latest_assistant_mutation_exempt_mid(
 
 fn is_empty_text_block(block: &CkWireBlock) -> bool {
     matches!(&block.kind, ck_wire::CkKind::Text { text } if text.is_empty())
+}
+
+fn is_reasoning_ignored_block(block: &CkWireBlock) -> bool {
+    if is_empty_text_block(block) {
+        return true;
+    }
+    matches!(
+        &block.kind,
+        ck_wire::CkKind::Opaque(opaque)
+            if matches!(
+                opaque.kind.as_str(),
+                "step-start"
+                    | "step-finish"
+                    | "snapshot"
+                    | "patch"
+                    | "agent"
+                    | "retry"
+                    | "subtask"
+                    | "compaction"
+            )
+    )
 }
 
 fn projection_blocks_by_mid(projection: &FlatProjection) -> BTreeMap<&str, Vec<&FlatBlock>> {
@@ -6269,12 +6291,39 @@ mod tests {
                 &mut served,
                 Some("latest"),
             ),
+            1
+        );
+        assert!(matches!(
+            &served[1].content[0].kind,
+            ck_wire::CkKind::Text { text } if text.is_empty()
+        ));
+
+        let standalone = vec![
+            assistant("older", "older thinking", "older answer"),
+            CkWireMessage::from_parts(
+                "user",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: "new turn".to_string(),
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta::default(),
+            ),
+            assistant("latest", "latest thinking", "latest answer"),
+        ];
+        let mut standalone_served = standalone.clone();
+        assert_eq!(
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut standalone_served,
+                Some("latest"),
+            ),
             0
         );
         assert_eq!(
-            serde_json::to_vec(&served[1]).unwrap(),
-            serde_json::to_vec(&base[1]).unwrap(),
-            "the latest assistant with reasoning must remain byte-stable"
+            serde_json::to_vec(&standalone_served[2]).unwrap(),
+            serde_json::to_vec(&standalone[2]).unwrap(),
+            "a standalone latest assistant still uses the ingress exemption"
         );
 
         let ingress = base
@@ -6322,11 +6371,121 @@ mod tests {
             Some("latest"),
         )
         .unwrap();
-        assert_eq!(
+        assert!(matches!(
+            &protected[1].content[0].kind,
+            ck_wire::CkKind::Text { text } if text.is_empty()
+        ));
+        assert_ne!(
             serde_json::to_vec(&protected[1]).unwrap(),
             serde_json::to_vec(&request.messages[1].ck).unwrap(),
-            "latest assistant output must ignore overlays and healing"
+            "a merged latest assistant must follow the serializer healing rule"
         );
+    }
+
+    #[test]
+    fn beat_five_replay_tail_strips_reasoning_from_merged_latest_assistant() {
+        fn message(mid: &str, role: &str, reasoning: Option<&str>) -> CkWireMessage {
+            let mut content = Vec::new();
+            if let Some(text) = reasoning {
+                content.push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: text.to_string(),
+                    signature: Some(format!("sig-{mid}")),
+                }));
+            }
+            content.push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                id: format!("call-{mid}"),
+                name: "read".to_string(),
+                input: serde_json::json!({}),
+                provider_executed: false,
+            }));
+            content.push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolResult {
+                id: format!("call-{mid}"),
+                tool_name: "read".to_string(),
+                output: ck_wire::CkToolOutput::bare(ck_wire::CkOutputKind::Text {
+                    text: "ok".to_string(),
+                }),
+                provider_executed: false,
+            }));
+            CkWireMessage::from_parts(
+                role,
+                content,
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            )
+        }
+
+        let mut served = (0..60)
+            .map(|index| message(&format!("prefix-{index}"), "user", None))
+            .collect::<Vec<_>>();
+        served.push(message("tail-user", "user", None));
+        served.push(message("tail-61", "assistant", Some("first")));
+        served.push(message("tail-62", "assistant", Some("second")));
+        served.push(message("tail-63", "assistant", Some("third")));
+        served.push(message("tail-64", "assistant", Some("fourth")));
+        served.push(message("tail-65", "assistant", Some("fifth")));
+        served.push(message("tail-66", "assistant", Some("latest")));
+
+        assert_eq!(served.len(), 67);
+        assert_eq!(
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut served,
+                Some("tail-66"),
+            ),
+            5
+        );
+        assert!(matches!(
+            &served[61].content[0].kind,
+            ck_wire::CkKind::Reasoning { .. }
+        ));
+        for message in &served[62..] {
+            assert!(matches!(
+                &message.content[0].kind,
+                ck_wire::CkKind::Text { text } if text.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn reasoning_strip_ignores_opencode_step_metadata_before_thinking() {
+        let mut messages = vec![CkWireMessage::from_parts(
+            "assistant",
+            vec![
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(ck_wire::OpaqueBlock {
+                    source: serde_json::json!({"harness": "opencode"}),
+                    kind: "step-start".to_string(),
+                    raw: serde_json::json!({"type": "step-start"}),
+                    arc: None,
+                })),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "signed thinking".to_string(),
+                    signature: Some("sig".to_string()),
+                }),
+            ],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("metadata-latest".to_string()),
+                ..Default::default()
+            },
+        )];
+
+        assert_eq!(
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut messages,
+                None,
+            ),
+            0
+        );
+        assert!(matches!(
+            &messages[0].content[1].kind,
+            ck_wire::CkKind::Reasoning { .. }
+        ));
     }
 
     // ===== Module-integration tests: STORE STATE in → compose+core bytes out.
