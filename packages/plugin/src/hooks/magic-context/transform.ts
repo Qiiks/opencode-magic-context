@@ -1754,6 +1754,8 @@ export function createTransform(deps: TransformDeps) {
             targets,
             reasoningByMessage,
             messageTagNumbers,
+            tagger: deps.tagger,
+            ctxReduceCallable,
             batch,
             contextUsage,
             schedulerDecision,

@@ -34,8 +34,8 @@ import type { Database } from "../../shared/sqlite";
 import { Database as SqliteDb } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 
-/** Static placeholder — the real session-history comes from transform injection. */
-const MARKER_SUMMARY_TEXT =
+/** Static placeholder. The real session-history comes from transform injection. */
+export const MARKER_SUMMARY_TEXT =
     "[Compacted by magic-context — session history is managed by the plugin]";
 
 /**
@@ -50,7 +50,12 @@ const MARKER_SUMMARY_TEXT =
  *     `deferredHistoryRefreshSessions`
  */
 export type MarkerUpdateOutcome =
-    | { kind: "applied"; markerOrdinal: number }
+    | {
+          kind: "applied";
+          markerOrdinal: number;
+          summaryMessageId: string;
+          boundaryMessageId: string;
+      }
     | { kind: "already-current" }
     | {
           kind: "stale-skip";
@@ -299,7 +304,12 @@ export function applyDeferredCompactionMarker(
             sessionId,
             `compaction-marker drain: applied at ordinal ${pending.ordinal}, boundary user msg ${result.boundaryMessageId}`,
         );
-        return { kind: "applied", markerOrdinal: pending.ordinal };
+        return {
+            kind: "applied",
+            markerOrdinal: pending.ordinal,
+            summaryMessageId: result.summaryMessageId,
+            boundaryMessageId: result.boundaryMessageId,
+        };
     } catch (err) {
         // Thrown paths:
         //   - getWritableOpenCodeDb() (attached DB missing/locked)
