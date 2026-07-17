@@ -206,6 +206,15 @@ pub struct TransformRequest {
     /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
     pub tool_present: bool,
+    /// Ask the module to include an OpenCode-native rendering alongside canonical CK.
+    /// Missing input is deliberately false so existing responses remain byte-identical.
+    #[serde(default)]
+    pub serve_native: bool,
+    /// Optional OpenCode message-with-parts ingress used to retain provider-native fields
+    /// while encoding a served response. CK-only callers may omit it; native serving still
+    /// produces valid OpenCode messages, but cannot replay fields that were not supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_messages: Option<Vec<Value>>,
     /// Caller-owned identity for the full raw array. The module treats it as opaque and
     /// only echoes it on success-shaped responses so consumers can validate cached bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +263,10 @@ struct TransformRequestWire {
     #[serde(default)]
     tool_present: bool,
     #[serde(default)]
+    serve_native: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_messages: Option<Vec<Value>>,
+    #[serde(default)]
     full_array_fingerprint: Option<String>,
     #[serde(default)]
     messages: Vec<CkIngressMessage>,
@@ -293,6 +306,8 @@ impl<'de> Deserialize<'de> for TransformRequest {
             session_id: wire.session_id,
             render_config: wire.render_config,
             tool_present: wire.tool_present,
+            serve_native: wire.serve_native,
+            native_messages: wire.native_messages,
             full_array_fingerprint: wire.full_array_fingerprint,
             messages,
             tail_delta: wire.tail_delta,
@@ -387,6 +402,10 @@ pub struct TransformResponse {
     /// `Some`, even when legitimately empty.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ck_messages: Option<Vec<CkWireMessage>>,
+    /// OpenCode message-with-parts output, present only when the request opted into native
+    /// serving and selected the `opencode-aisdk` serializer profile.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub native_messages: Option<Vec<Value>>,
     /// Host-delivery instructions are additive and profile-gated. The module does not
     /// persist delivery because the host owns the channel-2 lease and deduplication.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,6 +434,7 @@ impl TransformResponse {
             coverage_ordinal: None,
             historian: None,
             ck_messages: None,
+            native_messages: None,
             host_directives: None,
         }
     }
@@ -437,6 +457,7 @@ impl TransformResponse {
             coverage_ordinal: None,
             historian: None,
             ck_messages: Some(ck_messages),
+            native_messages: None,
             host_directives: None,
         }
     }
@@ -1692,6 +1713,7 @@ fn apply_once(
             coverage_ordinal: meta.coverage_ordinal,
             historian: None,
             ck_messages: Some(ck_messages),
+            native_messages: None,
             host_directives,
         },
     })
@@ -4816,6 +4838,8 @@ mod tests {
             session_id: session.to_string(),
             render_config: cfg.to_string(),
             tool_present: false,
+            serve_native: false,
+            native_messages: None,
             full_array_fingerprint: None,
             messages,
             tail_delta: None,
@@ -5361,8 +5385,7 @@ mod tests {
             .unwrap()
             .meta
             .block_identity_by_mid
-            .get("owned")
-            .is_some());
+            .contains_key("owned"));
 
         // Shadow sends carry mid_turn, so the same partial form is never pinned.
         let shadow_session = "shadow:identity-provisional";
@@ -5374,13 +5397,12 @@ mod tests {
             &pctx("git:proj", "/nonexistent-docs", 3),
         )
         .unwrap();
-        assert!(store
+        assert!(!store
             .load(shadow_session)
             .unwrap()
             .meta
             .block_identity_by_mid
-            .get("tail")
-            .is_none());
+            .contains_key("tail"));
         transform(
             &store,
             &req(shadow_session, "cfg0", vec![complete]),

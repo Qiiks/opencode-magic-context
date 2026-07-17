@@ -70,6 +70,14 @@ impl DecodeSidecar {
             .and_then(|mid| self.messages.get(mid.as_str()))
     }
 
+    pub fn synthetic_message_for_index(&self, index: usize) -> Option<&HarnessMessageMeta> {
+        self.order
+            .iter()
+            .filter_map(|mid| self.messages.get(mid.as_str()))
+            .filter(|meta| is_synthetic_message(meta))
+            .nth(index)
+    }
+
     pub fn inherit_pin(&self, stable_key: &str) -> Option<String> {
         self.mid_pins.get(stable_key).cloned()
     }
@@ -136,5 +144,21 @@ pub fn meta_for_ck<'a>(
         .harness_id
         .as_deref()
         .and_then(|mid| sidecar.message_by_mid(mid))
-        .or_else(|| sidecar.message_for_index(index))
+        .or_else(|| {
+            (!msg.meta.synthetic)
+                .then(|| sidecar.message_for_index(index))
+                .flatten()
+        })
+}
+
+fn is_synthetic_message(meta: &HarnessMessageMeta) -> bool {
+    let Some(parts) = meta.raw.get("parts").and_then(Value::as_array) else {
+        return false;
+    };
+    !parts.is_empty()
+        && parts.iter().all(|part| {
+            part.get("synthetic")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
 }

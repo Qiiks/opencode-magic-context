@@ -1504,6 +1504,8 @@ mod tests {
             session_id: "ses".to_string(),
             render_config: "cfg".to_string(),
             tool_present: false,
+            serve_native: false,
+            native_messages: None,
             full_array_fingerprint: None,
             messages,
             tail_delta: None,
