@@ -5,7 +5,12 @@ import {
   getSessionCacheStatsFromDb,
   truncate,
 } from "../../lib/api";
-import { severityColorClass } from "../../lib/cache-format";
+import {
+  cacheCauseColor,
+  cacheCauseLabel,
+  cacheCauseTooltip,
+  severityColorClass,
+} from "../../lib/cache-format";
 import type { DbCacheEvent, Harness, SessionCacheStats } from "../../lib/types";
 import HarnessBadge from "../HarnessBadge";
 import CacheTimeline from "../shared/CacheTimeline";
@@ -875,15 +880,18 @@ export default function CacheDiagnostics() {
                         </div>
                       </div>
                       <Show when={last.cause ?? first.cause}>
-                        <div
-                          style={{
-                            "margin-top": "6px",
-                            "font-size": "11px",
-                            color: "var(--amber)",
-                          }}
-                        >
-                          Cause: {last.cause ?? first.cause}
-                        </div>
+                        {(cause) => (
+                          <div
+                            style={{
+                              "margin-top": "6px",
+                              "font-size": "11px",
+                              color: `var(--${cacheCauseColor(cause())})`,
+                            }}
+                            title={cacheCauseTooltip(cause())}
+                          >
+                            Cause: {cacheCauseLabel(cause())}
+                          </div>
+                        )}
                       </Show>
                       <Show when={isExpanded()}>
                         <div class="cache-turn-expanded">
@@ -963,15 +971,18 @@ export default function CacheDiagnostics() {
                                     </div>
                                   </div>
                                   <Show when={event.cause}>
-                                    <div
-                                      style={{
-                                        "margin-top": "4px",
-                                        "font-size": "11px",
-                                        color: "var(--amber)",
-                                      }}
-                                    >
-                                      Cause: {event.cause}
-                                    </div>
+                                    {(cause) => (
+                                      <div
+                                        style={{
+                                          "margin-top": "4px",
+                                          "font-size": "11px",
+                                          color: `var(--${cacheCauseColor(cause())})`,
+                                        }}
+                                        title={cacheCauseTooltip(cause())}
+                                      >
+                                        Cause: {cacheCauseLabel(cause())}
+                                      </div>
+                                    )}
                                   </Show>
                                 </div>
                               );

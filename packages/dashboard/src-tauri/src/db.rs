@@ -1497,9 +1497,18 @@ fn build_db_cache_events_with_decisions(
             chronological[i].message_id.clone(),
         );
         let decision_row = transform_decisions.get(&decision_key);
+        let has_prior_transform_decision = chronological[..i].iter().any(|prior| {
+            transform_decisions.contains_key(&(
+                prior.harness,
+                prior.session_id.clone(),
+                prior.message_id.clone(),
+            ))
+        });
         let cause_from_decision = || {
             transform_decision_cause(decision_row).or_else(|| {
-                if decision_row.is_none()
+                if decision_row.is_none() && has_prior_transform_decision {
+                    Some("mc_transform_missing".to_string())
+                } else if decision_row.is_none()
                     && chronological[i].harness.has_magic_context_plugin_state()
                 {
                     Some("Provider-side (not Magic Context)".to_string())
@@ -7448,6 +7457,47 @@ mod cache_turn_tests {
             events[1].cause.as_deref(),
             Some("Provider-side (not Magic Context)")
         );
+    }
+
+    #[test]
+    fn missing_transform_decision_after_mc_activity_is_fail_open_cause() {
+        let rows = vec![
+            raw(
+                Harness::Opencode,
+                "m1",
+                "s1",
+                100,
+                2,
+                200_000,
+                1_000,
+                201_102,
+                Some("tool-calls"),
+            ),
+            raw(
+                Harness::Opencode,
+                "m2",
+                "s1",
+                200,
+                205_000,
+                0,
+                0,
+                205_500,
+                Some("stop"),
+            ),
+        ];
+        let mut decisions = HashMap::new();
+        decisions.insert(
+            (Harness::Opencode, "s1".to_string(), "m1".to_string()),
+            TransformDecisionCause {
+                decision: "defer".to_string(),
+                materialize_reason: None,
+                emergency: false,
+            },
+        );
+
+        let events = build_db_cache_events_with_decisions(rows, true, Some(decisions));
+        assert_eq!(events[1].severity, "full_bust");
+        assert_eq!(events[1].cause.as_deref(), Some("mc_transform_missing"));
     }
 
     #[test]
