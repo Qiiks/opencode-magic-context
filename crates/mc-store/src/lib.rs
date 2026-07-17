@@ -840,6 +840,22 @@ const MIGRATIONS: &[Migration] = &[
             ON pending_agent_drops(session_id, command_id, id);
     ",
     },
+    Migration {
+        version: 22,
+        // Recomp command outcomes are kept separately from the wrapup ledger because the
+        // two operations have different disposition vocabularies but identical replay needs.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_recomp_commands (
+            session_id   TEXT NOT NULL,
+            command_id   TEXT NOT NULL,
+            disposition  TEXT NOT NULL CHECK (disposition IN ('started', 'already_in_progress', 'nothing_to_do')),
+            created_at   INTEGER NOT NULL,
+            PRIMARY KEY (session_id, command_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_recomp_commands_session_created
+            ON mc_recomp_commands(session_id, created_at, command_id);
+    ",
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1234,6 +1250,16 @@ pub struct ModuleMeta {
     /// project-shared memory or preference.
     #[serde(default)]
     pub last_todo_state: Option<String>,
+    /// Message id that owns the last captured todo state. Host-side todo forwarding uses
+    /// this to make retries of one tool result harmless without suppressing newer states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_todo_state_owner_message_id: Option<String>,
+    /// SHA-256 of the normalized todo state, used with the owner id for replay detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_todo_state_hash: Option<String>,
+    /// Set by session.flush and consumed by the next eligible transform as a SOFT refresh.
+    #[serde(default)]
+    pub soft_refresh_pending: bool,
     /// This session's `Today's date: ...` guidance line. Because it changes with the
     /// wall clock, we update it only during a pass that already rewrites cached content.
     #[serde(default)]
@@ -1526,6 +1552,18 @@ pub struct WrapupCommandRow {
     pub rounds: usize,
     pub summary: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecompCommandRow {
+    pub disposition: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStateSetOutcome {
+    Updated { row_version: u64 },
+    Noop,
 }
 
 /// A stored compartment row (the m0/m1 history source). `sequence` is the
@@ -2160,6 +2198,7 @@ fn session_has_durable_state(
              UNION ALL SELECT 1 FROM mc_temporal_marks WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_overlay_frontiers WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_wrapup_commands WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_recomp_commands WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_pass_trace WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_chunk_transcripts WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_notes WHERE session_id = ?1
@@ -3095,6 +3134,118 @@ impl McStore {
                 out.push(row?);
             }
             Ok(out)
+        })?)
+    }
+
+    /// Set the normalized todo snapshot with replay-safe owner/hash semantics. A cache row
+    /// CAS makes a retry harmless even when a transform commits between the read and update.
+    pub fn set_todo_state(
+        &self,
+        session_id: &str,
+        state_json: &str,
+        owner_message_id: &str,
+        state_hash: &str,
+    ) -> Result<TodoStateSetOutcome, McStoreError> {
+        let mut last_conflict = None;
+        for _ in 0..8 {
+            let loaded = self.load(session_id)?;
+            if loaded.meta.last_todo_state_owner_message_id.as_deref() == Some(owner_message_id)
+                && loaded.meta.last_todo_state_hash.as_deref() == Some(state_hash)
+            {
+                return Ok(TodoStateSetOutcome::Noop);
+            }
+            let mut meta = loaded.meta;
+            meta.last_todo_state = Some(state_json.to_string());
+            meta.last_todo_state_owner_message_id = Some(owner_message_id.to_string());
+            meta.last_todo_state_hash = Some(state_hash.to_string());
+            match self.commit(session_id, loaded.row_version, &loaded.core, &meta) {
+                Ok(row_version) => {
+                    return Ok(TodoStateSetOutcome::Updated { row_version });
+                }
+                Err(error @ McStoreError::CasConflict { .. }) => last_conflict = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_conflict.unwrap_or_else(|| {
+            McStoreError::Serde("todo state update exceeded CAS retry limit".to_string())
+        }))
+    }
+
+    /// Arm the durable one-shot refresh consumed by the next eligible transform pass.
+    pub fn arm_soft_refresh(&self, session_id: &str) -> Result<bool, McStoreError> {
+        let mut last_conflict = None;
+        for _ in 0..8 {
+            let loaded = self.load(session_id)?;
+            if loaded.meta.soft_refresh_pending {
+                return Ok(true);
+            }
+            let mut meta = loaded.meta;
+            meta.soft_refresh_pending = true;
+            match self.commit(session_id, loaded.row_version, &loaded.core, &meta) {
+                Ok(_) => return Ok(true),
+                Err(error @ McStoreError::CasConflict { .. }) => last_conflict = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_conflict.unwrap_or_else(|| {
+            McStoreError::Serde("soft refresh arm exceeded CAS retry limit".to_string())
+        }))
+    }
+
+    pub fn load_recomp_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<Option<RecompCommandRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT disposition, created_at FROM mc_recomp_commands
+                 WHERE session_id = ?1 AND command_id = ?2",
+                params![session_id, command_id],
+                |row| {
+                    Ok(RecompCommandRow {
+                        disposition: row.get(0)?,
+                        created_at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+        })?)
+    }
+
+    pub fn record_recomp_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        disposition: &str,
+        created_at: i64,
+    ) -> Result<RecompCommandRow, McStoreError> {
+        if !matches!(
+            disposition,
+            "started" | "already_in_progress" | "nothing_to_do"
+        ) {
+            return Err(McStoreError::Serde(format!(
+                "invalid recomp disposition {disposition:?}"
+            )));
+        }
+        Ok(self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO mc_recomp_commands
+                 (session_id, command_id, disposition, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, command_id, disposition, created_at],
+            )?;
+            tx.query_row(
+                "SELECT disposition, created_at FROM mc_recomp_commands
+                 WHERE session_id = ?1 AND command_id = ?2",
+                params![session_id, command_id],
+                |row| {
+                    Ok(RecompCommandRow {
+                        disposition: row.get(0)?,
+                        created_at: row.get(1)?,
+                    })
+                },
+            )
         })?)
     }
 
@@ -7662,6 +7813,54 @@ mod tests {
             .load_wrapup_command("session", "other")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn todo_state_set_and_soft_refresh_are_replay_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let state = r#"[{"content":"one","status":"pending","priority":"medium"}]"#;
+        let first = store
+            .set_todo_state("session", state, "m1", "hash-1")
+            .unwrap();
+        assert!(matches!(
+            first,
+            TodoStateSetOutcome::Updated { row_version: 1 }
+        ));
+        assert!(matches!(
+            store.set_todo_state("session", state, "m1", "hash-1"),
+            Ok(TodoStateSetOutcome::Noop)
+        ));
+        let changed_owner = store
+            .set_todo_state("session", state, "m2", "hash-1")
+            .unwrap();
+        assert!(matches!(
+            changed_owner,
+            TodoStateSetOutcome::Updated { row_version: 2 }
+        ));
+        assert!(matches!(
+            store.set_todo_state("session", "[]", "m2", "hash-2"),
+            Ok(TodoStateSetOutcome::Updated { row_version: 3 })
+        ));
+
+        assert!(store.arm_soft_refresh("session").unwrap());
+        let armed = store.load("session").unwrap();
+        assert!(armed.meta.soft_refresh_pending);
+        assert!(store.arm_soft_refresh("session").unwrap());
+        let still_armed = store.load("session").unwrap();
+        assert_eq!(still_armed.row_version, armed.row_version);
+
+        let first_recomp = store
+            .record_recomp_command("session", "recomp-1", "nothing_to_do", 10)
+            .unwrap();
+        let replay = store
+            .record_recomp_command("session", "recomp-1", "started", 20)
+            .unwrap();
+        assert_eq!(replay, first_recomp);
+        assert_eq!(
+            store.load_recomp_command("session", "recomp-1").unwrap(),
+            Some(first_recomp)
+        );
     }
 
     #[test]
