@@ -209,6 +209,7 @@ function buildTransformBody(args: {
     passInputs: Record<string, unknown>;
     usage: Record<string, number>;
     modelKey: string | null;
+    providerId: string | null;
     midTurn: boolean;
     declaredTrim?: unknown;
 }): Record<string, unknown> {
@@ -226,8 +227,10 @@ function buildTransformBody(args: {
         provider_error: args.passInputs.provider_error,
         mid_turn: args.midTurn,
         model_key: args.modelKey,
+        provider_id: args.providerId,
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
         history_budget_tokens: args.passInputs.history_budget_tokens,
+        clear_reasoning_age: args.passInputs.clear_reasoning_age,
         cache_ttl: args.passInputs.cache_ttl,
         is_subagent: args.passInputs.is_subagent,
         pass_inputs: args.passInputs,
@@ -414,9 +417,11 @@ export function createRustModeTransform(
             const passInputs: Record<string, unknown> = {
                 now_ms: Date.now(),
                 model_key: modelKey,
+                provider_id: model?.providerID ?? null,
                 usage: passUsage(usage, contextLimit),
                 effective_execute_threshold: threshold,
                 history_budget_tokens: historyBudgetTokens,
+                clear_reasoning_age: deps.clearReasoningAge,
                 cache_ttl: sessionMeta.cacheTtl,
                 mid_turn: midTurn,
                 is_subagent: sessionMeta.isSubagent,
@@ -476,6 +481,7 @@ export function createRustModeTransform(
                 passInputs,
                 usage: passUsage(usage, contextLimit),
                 modelKey: modelKey ?? null,
+                providerId: model?.providerID ?? null,
                 midTurn,
             });
             const pages = buildPagedModuleTransformPayloads(body);

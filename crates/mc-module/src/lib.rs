@@ -1153,6 +1153,8 @@ struct ShadowPassInputs {
     #[serde(default)]
     model_key: Option<String>,
     #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
     usage: Option<ShadowUsageWire>,
     #[serde(
         alias = "effective_execute_threshold",
@@ -1161,6 +1163,8 @@ struct ShadowPassInputs {
     effective_execute_threshold: f64,
     #[serde(default)]
     history_budget_tokens: Option<f64>,
+    #[serde(default = "default_clear_reasoning_age")]
+    clear_reasoning_age: u64,
     #[serde(default = "default_cache_ttl")]
     cache_ttl: String,
     #[serde(default)]
@@ -1353,6 +1357,10 @@ struct FacadeScope {
 
 fn default_cache_ttl() -> String {
     "5m".to_string()
+}
+
+fn default_clear_reasoning_age() -> u64 {
+    50
 }
 
 fn default_importance() -> i32 {
@@ -5094,7 +5102,7 @@ impl McHandler {
                 parsed.messages.iter().map(|m| m.ck.clone()).collect(),
                 parsed.full_array_fingerprint.clone(),
             );
-            attach_native_messages(&mut response, &parsed);
+            attach_native_messages(&mut response, &parsed, 0);
             return respond(serde_json::to_value(response).unwrap_or(Value::Null));
         }
         let parsed = Arc::new(parsed);
@@ -5341,7 +5349,11 @@ impl McHandler {
                 .remove(&parsed.session_id);
         }
         response.historian = Some(diagnostics);
-        attach_native_messages(&mut response, &parsed);
+        let reasoning_watermark = store
+            .load(&parsed.session_id)
+            .map(|state| state.meta.reasoning_cleared_through_ordinal)
+            .unwrap_or(0);
+        attach_native_messages(&mut response, &parsed, reasoning_watermark);
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
         // Management requests carry identity but not raw history. A successful full pass
@@ -6456,6 +6468,9 @@ impl McHandler {
             serializer_profile,
             session_id: binding.session.clone(),
             render_config: parsed.render_config.clone().unwrap_or_default(),
+            provider_id: parsed.pass_inputs.provider_id.clone(),
+            model_key: parsed.pass_inputs.model_key.clone(),
+            clear_reasoning_age: parsed.pass_inputs.clear_reasoning_age,
             tool_present: false,
             serve_native: false,
             native_messages: None,
@@ -7287,7 +7302,11 @@ fn serve_native_unsupported_profile_error(profile: &str) -> HandlerOutcome {
     }
 }
 
-fn attach_native_messages(response: &mut transform::TransformResponse, request: &TransformRequest) {
+fn attach_native_messages(
+    response: &mut transform::TransformResponse,
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+) {
     if !request.serve_native {
         return;
     }
@@ -7297,11 +7316,23 @@ fn attach_native_messages(response: &mut transform::TransformResponse, request: 
         .map(codec::decode_opencode)
         .map(|decoded| decoded.sidecar)
         .unwrap_or_else(|| codec::DecodeSidecar::new("opencode"));
-    response.native_messages = Some(codec::encode_opencode_with_session(
+    let mut native_messages = codec::encode_opencode_with_session(
         response.messages(),
         &sidecar,
         Some(&request.session_id),
-    ));
+    );
+    if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
+        transform::clear_served_native_reasoning(
+            profile,
+            transform::request_accepts_empty_content(request),
+            &mut native_messages,
+            response.messages(),
+            &request.messages,
+            reasoning_watermark,
+            request.mid_turn,
+        );
+    }
+    response.native_messages = Some(native_messages);
 }
 
 fn state_import_validation_error(error: StateImportValidationError) -> HandlerOutcome {

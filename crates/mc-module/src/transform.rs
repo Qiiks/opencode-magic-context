@@ -78,6 +78,7 @@ const USER_HINT_TOKEN_CAP: usize = 24;
 const USER_HINT_RESULT_LIMIT: usize = 3;
 const USER_HINT_MIN_MATCHED_TOKENS: usize = 2;
 const USER_HINT_NORMALIZED_SCORE_FLOOR: f64 = 0.35;
+const DEFAULT_CLEAR_REASONING_AGE: u64 = 50;
 
 #[cfg(test)]
 thread_local! {
@@ -202,6 +203,20 @@ pub struct TransformRequest {
     pub serializer_profile: String,
     pub session_id: String,
     pub render_config: String,
+    /// Canonical provider id used by the native serializer gate. Empty sentinels are
+    /// safe only for the OpenCode Anthropic adapter, matching TS `modelAcceptsEmptyContent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Provider/model key retained for older plugin senders that predate the explicit
+    /// provider field. The canonical `anthropic/...` prefix is the same provider gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_key: Option<String>,
+    /// Number of message ordinals kept as recent reasoning before the OpenCode
+    /// native serve pass clears older assistant reasoning. This mirrors the TS
+    /// `clear_reasoning_age` setting; the module uses absolute ordinals because
+    /// its CK ingress does not carry TS tag numbers.
+    #[serde(default = "default_clear_reasoning_age")]
+    pub clear_reasoning_age: u64,
     /// Whether this request advertises the canonical reduction tool. Missing input is
     /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
@@ -250,6 +265,10 @@ fn default_wire_version() -> u32 {
     2
 }
 
+fn default_clear_reasoning_age() -> u64 {
+    DEFAULT_CLEAR_REASONING_AGE
+}
+
 #[derive(Deserialize)]
 struct TransformRequestWire {
     #[serde(default)]
@@ -260,6 +279,12 @@ struct TransformRequestWire {
     serializer_profile: Option<String>,
     session_id: String,
     render_config: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_key: Option<String>,
+    #[serde(default = "default_clear_reasoning_age")]
+    clear_reasoning_age: u64,
     #[serde(default)]
     tool_present: bool,
     #[serde(default)]
@@ -305,6 +330,9 @@ impl<'de> Deserialize<'de> for TransformRequest {
             serializer_profile: wire.serializer_profile.unwrap_or_default(),
             session_id: wire.session_id,
             render_config: wire.render_config,
+            provider_id: wire.provider_id,
+            model_key: wire.model_key,
+            clear_reasoning_age: wire.clear_reasoning_age,
             tool_present: wire.tool_present,
             serve_native: wire.serve_native,
             native_messages: wire.native_messages,
@@ -812,7 +840,7 @@ fn apply_once(
 
     let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
     let mutation_exempt_mid =
-        latest_assistant_mutation_exempt_mid(&req.messages, serializer_profile);
+        latest_assistant_mutation_exempt_mid(&req.messages, serializer_profile, req.mid_turn);
     let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
     let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
     let loaded = transform_snapshot.loaded;
@@ -1279,6 +1307,14 @@ fn apply_once(
         plan,
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
     );
+    if let Some(cutoff) = reasoning_clear_cutoff(
+        req,
+        serializer_profile,
+        is_bust_pass,
+        meta.reasoning_cleared_through_ordinal,
+    ) {
+        meta.reasoning_cleared_through_ordinal = meta.reasoning_cleared_through_ordinal.max(cutoff);
+    }
     if loaded.meta.soft_refresh_pending && is_bust_pass {
         meta.soft_refresh_pending = false;
     }
@@ -2565,6 +2601,7 @@ fn pending_passthrough_result(
     let mutation_exempt_mid = latest_assistant_mutation_exempt_mid(
         &req.messages,
         SerializerProfile::parse(&req.serializer_profile),
+        req.mid_turn,
     );
     let blocks_by_mid = projection_blocks_by_mid(&projection);
     let mut response = TransformResponse::passthrough(
@@ -4350,13 +4387,31 @@ fn is_reasoning_block(block: &CkWireBlock) -> bool {
     )
 }
 
-/// Anthropic verifies the latest assistant reasoning blocks against ingress bytes. Profiles
-/// that can reach an Anthropic-family endpoint preserve a standalone latest assistant, while
-/// a latest assistant inside a merged run still follows the serializer healing rule.
+/// The TypeScript D2 contract for OpenCode clearing is:
+///
+/// * only assistant messages older than `clear_reasoning_age` are eligible;
+/// * the age cutoff is measured from the newest absolute message tag. CK ingress
+///   has no tag map, so this module uses its durable absolute message ordinals;
+/// * a completed historical assistant is eligible even when it is the newest
+///   assistant in the served tail. The old ingress exemption must not resurrect
+///   reasoning that D2 cleared;
+/// * an in-flight newest assistant is protected when `mid_turn` is true;
+/// * canonical OpenCode Anthropic serialization receives an empty text sentinel,
+///   not a rewritten signed reasoning block. The sentinel preserves part shape,
+///   and the serializer removes it before provider dispatch;
+/// * the cutoff is persisted in ModuleMeta and replayed on every later pass.
+///
+/// Anthropic verifies the latest assistant reasoning blocks against ingress bytes. Claude Code
+/// keeps its verbatim-tail behavior. OpenCode keeps an ingress exemption only for a genuinely
+/// live in-flight assistant; clearing has precedence for historical messages.
 fn latest_assistant_mutation_exempt_mid(
     messages: &[CkIngressMessage],
     profile: Option<SerializerProfile>,
+    mid_turn: bool,
 ) -> Option<&str> {
+    if profile == Some(SerializerProfile::OpencodeAiSdk) && !mid_turn {
+        return None;
+    }
     if !matches!(
         profile,
         Some(SerializerProfile::ClaudeCodeAnthropic | SerializerProfile::OpencodeAiSdk)
@@ -4376,6 +4431,191 @@ fn latest_assistant_mutation_exempt_mid(
                 .is_some_and(is_reasoning_block)
         })
         .map(|message| message.mid.as_str())
+}
+
+/// Match TS `modelAcceptsEmptyContent` for the OpenCode native request.
+///
+/// The explicit provider id is preferred. Older plugin senders already supplied a model key,
+/// so `anthropic/...` is accepted as a compatibility fallback. Native OpenCode metadata is the
+/// final fallback because it carries the same provider identity on assistant and user records.
+pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
+    if req.provider_id.as_deref() == Some("anthropic") {
+        return true;
+    }
+    if req
+        .model_key
+        .as_deref()
+        .and_then(|key| key.split_once('/').map(|(provider, _)| provider))
+        == Some("anthropic")
+    {
+        return true;
+    }
+    let Some(native_messages) = req.native_messages.as_deref() else {
+        return false;
+    };
+    native_messages.iter().rev().any(|message| {
+        let info = message.get("info").unwrap_or(message);
+        info.get("providerID").and_then(Value::as_str) == Some("anthropic")
+            || info
+                .get("model")
+                .and_then(|model| model.get("providerID"))
+                .and_then(Value::as_str)
+                == Some("anthropic")
+            || message.get("providerID").and_then(Value::as_str) == Some("anthropic")
+    })
+}
+
+/// Compute the next durable D2 reasoning watermark on a cache-busting pass or the
+/// one-time native bootstrap when no watermark exists yet.
+///
+/// TS computes `maxTag - clearReasoningAge` after heuristic execution. The module does not
+/// receive TS tag numbers, but it does receive stable absolute message ordinals from the same
+/// OpenCode database. Using those ordinals gives the same monotone age boundary and avoids
+/// deriving a moving decision on defer passes. A watermark advances only when an eligible
+/// assistant actually contains typed reasoning, matching TS's persisted-watermark behavior.
+fn reasoning_clear_cutoff(
+    req: &TransformRequest,
+    profile: Option<SerializerProfile>,
+    is_bust_pass: bool,
+    persisted_watermark: u64,
+) -> Option<u64> {
+    if profile != Some(SerializerProfile::OpencodeAiSdk)
+        || !request_accepts_empty_content(req)
+        || !req.serve_native
+        || (!is_bust_pass && persisted_watermark > 0)
+        || req.mid_turn
+    {
+        return None;
+    }
+
+    let max_ordinal = req
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+        .map(|message| message.ordinal)
+        .max()?;
+    let cutoff = max_ordinal.saturating_sub(req.clear_reasoning_age);
+    if cutoff == 0 {
+        return None;
+    }
+
+    req.messages
+        .iter()
+        .filter(|message| {
+            !message.ck.meta.synthetic
+                && message.ck.role == "assistant"
+                && message.ordinal <= cutoff
+        })
+        .any(|message| {
+            message
+                .ck
+                .content
+                .iter()
+                .any(|block| matches!(&block.kind, ck_wire::CkKind::Reasoning { .. }))
+        })
+        .then_some(cutoff)
+}
+
+/// Apply the final OpenCode D2 replay to native message parts.
+///
+/// The CK transform deliberately leaves ingress reasoning available to identity and block
+/// fingerprint checks. Native serving is the provider boundary, so this pass replaces only
+/// eligible historical typed reasoning with empty text sentinels after the codec has finished.
+/// That ordering is important: the codec's latest-assistant ingress shortcut cannot reintroduce
+/// a signed block after this function runs. The canonical OpenCode Anthropic adapter removes
+/// these sentinels before dispatch, so no rewritten text or stale signature reaches Anthropic.
+pub(crate) fn clear_served_native_reasoning(
+    profile: SerializerProfile,
+    provider_accepts_empty_content: bool,
+    native_messages: &mut [Value],
+    served_messages: &[CkWireMessage],
+    ingress_messages: &[CkIngressMessage],
+    watermark: u64,
+    mid_turn: bool,
+) -> usize {
+    if profile != SerializerProfile::OpencodeAiSdk
+        || !provider_accepts_empty_content
+        || watermark == 0
+    {
+        return 0;
+    }
+
+    let served_ids = served_messages
+        .iter()
+        .filter(|message| !message.meta.synthetic && message.role == "assistant")
+        .filter_map(|message| message.meta.harness_id.as_deref())
+        .collect::<HashSet<_>>();
+    if served_ids.is_empty() {
+        return 0;
+    }
+
+    let mut ordinal_by_mid = HashMap::new();
+    let mut newest_assistant_mid = None;
+    let mut newest_assistant_ordinal = 0;
+    for message in ingress_messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+    {
+        ordinal_by_mid.insert(message.mid.as_str(), message.ordinal);
+        if message.ck.role == "assistant" && message.ordinal >= newest_assistant_ordinal {
+            newest_assistant_ordinal = message.ordinal;
+            newest_assistant_mid = Some(message.mid.as_str());
+        }
+    }
+
+    let mut cleared = 0;
+    for raw_message in native_messages {
+        let info = raw_message.get("info").unwrap_or(raw_message);
+        let Some(mid) = info
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| raw_message.get("id").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        if !served_ids.contains(mid)
+            || info.get("role").and_then(Value::as_str) != Some("assistant")
+        {
+            continue;
+        }
+        let Some(&ordinal) = ordinal_by_mid.get(mid) else {
+            continue;
+        };
+        if ordinal > watermark || (mid_turn && newest_assistant_mid == Some(mid)) {
+            continue;
+        }
+
+        let Some(parts) = raw_message.get_mut("parts").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            let Some(part_type) = part.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            if !matches!(part_type, "reasoning" | "thinking")
+                || (!part.get("thinking").is_some() && !part.get("text").is_some())
+            {
+                continue;
+            }
+            *part = empty_reasoning_sentinel(part);
+            cleared += 1;
+        }
+    }
+    cleared
+}
+
+fn empty_reasoning_sentinel(part: &Value) -> Value {
+    let mut sentinel = serde_json::Map::new();
+    sentinel.insert("type".to_string(), Value::String("text".to_string()));
+    sentinel.insert("text".to_string(), Value::String(String::new()));
+    if let Some(object) = part.as_object() {
+        for key in ["cache_control", "cacheControl"] {
+            if let Some(value) = object.get(key) {
+                sentinel.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    Value::Object(sentinel)
 }
 
 fn is_empty_text_block(block: &CkWireBlock) -> bool {
@@ -4985,6 +5225,9 @@ mod tests {
             serializer_profile: "owned-llmrunner".to_string(),
             session_id: session.to_string(),
             render_config: cfg.to_string(),
+            provider_id: None,
+            model_key: None,
+            clear_reasoning_age: DEFAULT_CLEAR_REASONING_AGE,
             tool_present: false,
             serve_native: false,
             native_messages: None,
@@ -6292,7 +6535,11 @@ mod tests {
         }];
 
         assert_eq!(
-            latest_assistant_mutation_exempt_mid(&ingress, Some(SerializerProfile::OpencodeAiSdk),),
+            latest_assistant_mutation_exempt_mid(
+                &ingress,
+                Some(SerializerProfile::OpencodeAiSdk),
+                false,
+            ),
             None
         );
 
@@ -6445,6 +6692,241 @@ mod tests {
             serde_json::to_vec(&request.messages[1].ck).unwrap(),
             "a merged latest assistant must follow the serializer healing rule"
         );
+    }
+
+    #[test]
+    fn opencode_d2_watermark_persists_and_defer_does_not_recompute_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let assistant = CkWireMessage::from_parts(
+            "assistant",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "old thinking".to_string(),
+                signature: Some("old signature".to_string()),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("assistant".to_string()),
+                ..Default::default()
+            },
+        );
+        let user = CkWireMessage::from_parts(
+            "user",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: "new prompt".to_string(),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("user".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut request = req(
+            "d2-watermark",
+            "cfg0",
+            vec![
+                CkIngressMessage {
+                    mid: "assistant".to_string(),
+                    ordinal: 1,
+                    ck: assistant,
+                },
+                CkIngressMessage {
+                    mid: "user".to_string(),
+                    ordinal: 10,
+                    ck: user,
+                },
+            ],
+        );
+        request.serializer_profile = SerializerProfile::OpencodeAiSdk.wire_id().to_string();
+        request.provider_id = Some("anthropic".to_string());
+        request.serve_native = true;
+        request.clear_reasoning_age = 5;
+
+        let first = transform(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        assert_eq!(
+            store
+                .load("d2-watermark")
+                .unwrap()
+                .meta
+                .reasoning_cleared_through_ordinal,
+            5
+        );
+        assert!(first.committed);
+
+        let second =
+            transform(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        assert_eq!(second.action, "SOFT+");
+        assert_eq!(
+            store
+                .load("d2-watermark")
+                .unwrap()
+                .meta
+                .reasoning_cleared_through_ordinal,
+            5,
+            "defer must replay a persisted boundary instead of moving it"
+        );
+        assert!(!second.committed);
+    }
+
+    #[test]
+    fn opencode_d2_clears_historical_reasoning_after_codec_and_replays_stably() {
+        fn assistant(mid: &str) -> CkWireMessage {
+            CkWireMessage::from_parts(
+                "assistant",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: format!("thinking-{mid}"),
+                    signature: Some(format!("signature-{mid}")),
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            )
+        }
+
+        let old = assistant("old");
+        let latest = assistant("latest");
+        let served = vec![old.clone(), latest.clone()];
+        let ingress = vec![
+            CkIngressMessage {
+                mid: "old".to_string(),
+                ordinal: 1,
+                ck: old,
+            },
+            CkIngressMessage {
+                mid: "latest".to_string(),
+                ordinal: 60,
+                ck: latest,
+            },
+        ];
+        let mut native = vec![
+            json!({
+                "info": { "id": "old", "role": "assistant" },
+                "parts": [{
+                    "type": "reasoning",
+                    "text": "thinking-old",
+                    "metadata": { "signature": "signature-old" }
+                }]
+            }),
+            json!({
+                "info": { "id": "latest", "role": "assistant" },
+                "parts": [{
+                    "type": "reasoning",
+                    "text": "thinking-latest",
+                    "metadata": { "signature": "signature-latest" }
+                }]
+            }),
+        ];
+
+        assert_eq!(
+            clear_served_native_reasoning(
+                SerializerProfile::OpencodeAiSdk,
+                true,
+                &mut native,
+                &served,
+                &ingress,
+                60,
+                false,
+            ),
+            2,
+            "a completed historical latest assistant is still age-eligible"
+        );
+        assert_eq!(native[0]["parts"][0], json!({ "type": "text", "text": "" }));
+        assert_eq!(native[1]["parts"][0], json!({ "type": "text", "text": "" }));
+        let first_pass = native.clone();
+        assert_eq!(
+            clear_served_native_reasoning(
+                SerializerProfile::OpencodeAiSdk,
+                true,
+                &mut native,
+                &served,
+                &ingress,
+                60,
+                false,
+            ),
+            0
+        );
+        assert_eq!(native, first_pass, "defer replay must be byte-stable");
+
+        let mut in_flight = vec![
+            json!({
+                "info": { "id": "old", "role": "assistant" },
+                "parts": [{ "type": "reasoning", "text": "thinking-old" }]
+            }),
+            json!({
+                "info": { "id": "latest", "role": "assistant" },
+                "parts": [{ "type": "reasoning", "text": "thinking-latest" }]
+            }),
+        ];
+        assert_eq!(
+            clear_served_native_reasoning(
+                SerializerProfile::OpencodeAiSdk,
+                true,
+                &mut in_flight,
+                &served,
+                &ingress,
+                60,
+                true,
+            ),
+            1
+        );
+        assert_eq!(in_flight[0]["parts"][0]["text"], "");
+        assert_eq!(in_flight[1]["parts"][0]["text"], "thinking-latest");
+    }
+
+    #[test]
+    fn reasoning_clearing_is_not_applicable_to_claude_or_owned_broca() {
+        let message = CkWireMessage::from_parts(
+            "assistant",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed thinking".to_string(),
+                signature: Some("signature".to_string()),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("assistant".to_string()),
+                ..Default::default()
+            },
+        );
+        let ingress = vec![CkIngressMessage {
+            mid: "assistant".to_string(),
+            ordinal: 1,
+            ck: message.clone(),
+        }];
+        for profile in [
+            SerializerProfile::ClaudeCodeAnthropic,
+            SerializerProfile::OwnedBroca,
+        ] {
+            let mut native = vec![json!({
+                "info": { "id": "assistant", "role": "assistant" },
+                "parts": [{
+                    "type": "reasoning",
+                    "text": "signed thinking",
+                    "metadata": { "signature": "signature" }
+                }]
+            })];
+            assert_eq!(
+                clear_served_native_reasoning(
+                    profile,
+                    false,
+                    &mut native,
+                    std::slice::from_ref(&message),
+                    &ingress,
+                    1,
+                    false,
+                ),
+                0
+            );
+            assert_eq!(
+                native[0]["parts"][0]["type"], "reasoning",
+                "{profile:?} keeps verbatim-tail reasoning"
+            );
+        }
     }
 
     #[test]
@@ -10035,7 +10517,9 @@ mod tests {
                 1,
             )
             .unwrap();
-        let pending = initial_store.load_pending_agent_drops("held-output").unwrap();
+        let pending = initial_store
+            .load_pending_agent_drops("held-output")
+            .unwrap();
         let loaded = initial_store.load("held-output").unwrap();
         let command_ids = vec!["command-a".to_string()];
         initial_store
@@ -12006,7 +12490,9 @@ mod tests {
             "reasoning target must never freeze"
         );
         assert!(
-            s.load_pending_agent_drops("reason-guard").unwrap().is_empty(),
+            s.load_pending_agent_drops("reason-guard")
+                .unwrap()
+                .is_empty(),
             "structurally unappliable drop must retire from the queue"
         );
         let joined = serde_json::to_string(&consumed.ck_messages).unwrap();
@@ -12054,7 +12540,13 @@ mod tests {
         // Active window: enough tagged blocks that the two oldest fall outside the
         // newest-20 protection set, so their drops actually consume.
         let messages: Vec<CkIngressMessage> = (1..=25)
-            .map(|n| item(Box::leak(format!("u{n}").into_boxed_str()), n, "droppable content"))
+            .map(|n| {
+                item(
+                    Box::leak(format!("u{n}").into_boxed_str()),
+                    n,
+                    "droppable content",
+                )
+            })
             .collect();
         let active = active_cc_req("rig-b", "cfg0", messages.clone());
         let warm = run(&s, &active, &spine());
@@ -12072,7 +12564,11 @@ mod tests {
         // Frozen bytes stay canonical bare.
         let frozen = s.load("rig-b").unwrap().core.frozen_units;
         for unit in frozen.iter() {
-            assert!(!unit.frozen_payload.contains('\u{a7}'), "{}", unit.frozen_payload);
+            assert!(
+                !unit.frozen_payload.contains('\u{a7}'),
+                "{}",
+                unit.frozen_payload
+            );
         }
         // False pass: hide the tool. Placeholders persist but must render BARE.
         let mut hidden = cc_req("rig-b", "cfg1", messages);

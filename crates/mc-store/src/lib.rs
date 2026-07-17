@@ -1376,6 +1376,11 @@ pub struct ModuleMeta {
     /// The most recent serializer profile observed on this durable conversation key.
     #[serde(default)]
     pub last_serializer_profile: String,
+    /// Highest absolute message ordinal whose old OpenCode reasoning was cleared.
+    /// The watermark is durable so a defer pass can replay the same empty sentinels
+    /// after OpenCode rebuilds the native message array from its database.
+    #[serde(default)]
+    pub reasoning_cleared_through_ordinal: u64,
     /// The request-local reduction surface state committed with the rendered identity.
     /// Missing legacy metadata is false, which preserves the dormant render path.
     #[serde(default)]
