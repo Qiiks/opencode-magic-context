@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { join } from "node:path";
 import {
     AdmissionClass,
@@ -13,47 +13,34 @@ import {
     SubcClient,
 } from "@cortexkit/subc-client";
 import { getCompartmentsByEndMessageId } from "../../features/magic-context/compartment-storage";
-import {
-    getMaxMemoryIdForProjects,
-    getMemoriesByProject,
-    getMemoriesByProjects,
-} from "../../features/magic-context/memory/storage-memory";
-import {
-    type ContextDatabase,
-    getCompartments,
-    getOrCreateSessionMeta,
-} from "../../features/magic-context/storage";
-import {
-    getMaxMemoryMutationIdForProjects,
-    getMemoryMutationsForRenderByProjects,
-} from "../../features/magic-context/storage-memory-mutation-log";
+import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getAutoSearchHintDecisions,
     getPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getActiveUserMemories } from "../../features/magic-context/user-memory/storage-user-memory";
-import {
-    computeWorkspaceEpochFingerprint,
-    expandWorkspaceIdentitySetWithAliases,
-    resolveWorkspaceIdentitySet,
-    resolveWorkspaceShareCategories,
-} from "../../features/magic-context/workspaces";
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import {
-    getRawSessionStoredMessageCount,
-    readRawSessionMessageOrdinalPage,
-    readRawSessionMessagePartsById,
-} from "./read-session-chunk";
+    buildModuleStateSyncPayload,
+    buildPagedModuleStateSyncPayloads,
+    type ModuleStateSyncPayload,
+} from "./module-state-sync";
+import {
+    buildPagedModuleTransformPayloads,
+    moduleWireBodyBytes,
+    resolveOrdinalsForModule,
+    toFlatModuleWireBody,
+} from "./module-wire";
+import { readRawSessionMessagePartsById } from "./read-session-chunk";
 import {
     isRawCompactionSummaryInfo,
     type RawMessageOrdinalAnchor,
     type RawMessageParts,
 } from "./read-session-raw";
 import type { MessageLike, TagNormalizationTarget } from "./tag-messages";
-import { formatDate } from "./temporal-awareness";
 
 const DEFAULT_MODULE_ID = "magic-context";
 function getDefaultConnectionFile(): string {
@@ -66,15 +53,9 @@ const SHADOW_SEND_TIMEOUT_MS = 15_000;
 const SHADOW_QUEUE_MAX_DEPTH = 2;
 const RESEED_COOLDOWN_MS = 30 * 60 * 1_000;
 const RESEED_ATTEMPT_CAP = 5;
-const SHADOW_ORDINAL_PAGE_SIZE = 500;
-const SHADOW_SEED_YIELD_EVERY_COMPARTMENTS = 10;
 const SHADOW_SEED_BUDGET_MS = 30_000;
 const SHADOW_SEED_BATCH_MAX_BYTES = 512 * 1024;
 const SHADOW_TRANSFORM_PAGE_MAX_BYTES = SHADOW_SEED_BATCH_MAX_BYTES;
-// Large array items in the transform payload are split across pages to stay under the
-// byte limit. Small chunks leave room for JSON escaping and continuation metadata.
-const SHADOW_TRANSFORM_ITEM_CHUNK_BYTES = 64 * 1024;
-const SHADOW_ITEM_CONTINUATION_KEY = "__shadow_item_continuation";
 const SHADOW_RESET_REASON_RING_SIZE = 8;
 const SHADOW_SEND_FAILURE_PARK_THRESHOLD = 3;
 const MAX_FACADE_FRAME_BYTES = 1024 * 1024;
@@ -96,6 +77,8 @@ export interface ShadowPassInputs {
     provider_error?: string;
     /** True when the newest assistant message is still streaming. */
     mid_turn: boolean;
+    /** Session-mode hint consumed by the module's session-mode machinery. */
+    is_subagent?: boolean;
 }
 
 export interface ShadowTransformDecision {
@@ -261,7 +244,7 @@ type ShadowSeedItem =
     | { kind: "user_profile"; value: string };
 
 function flatWireBodyBytes(payload: ShadowStateSyncPayload): number {
-    return Buffer.byteLength(JSON.stringify(toFlatWireBody(payload)));
+    return moduleWireBodyBytes(payload);
 }
 
 function buildPagedSeedPayloads(args: {
@@ -277,146 +260,7 @@ function buildPagedSeedPayloads(args: {
     lastTodoState: string;
     watermarks: ShadowWatermarks;
 }): ShadowStateSyncPayload[] {
-    const items: ShadowSeedItem[] = [
-        ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
-        ...args.memories.map((value) => ({ kind: "memory", value }) as const),
-        ...args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const),
-        ...(args.userProfile ?? []).map((value) => ({ kind: "user_profile", value }) as const),
-    ];
-    const makePayload = (input: {
-        index: number;
-        total: number;
-        complete: boolean;
-        compartments: unknown[];
-        memories: unknown[];
-        memoryMutations: unknown[];
-        userProfile: string[];
-    }): ShadowStateSyncPayload => ({
-        method: "state_sync",
-        params: {
-            shadow_generation: args.shadowGeneration,
-            expected_shadow_seq: args.expectedShadowSeq,
-            seed_id: args.seedId,
-            seed_generation: args.shadowGeneration,
-            seed_batch_index: input.index,
-            seed_batch_total: input.total,
-            seed_complete: input.complete,
-            compartments: input.compartments,
-            memories: input.memories,
-            memory_mutations: input.memoryMutations,
-            user_profile: input.userProfile,
-            ...(input.complete
-                ? {
-                      seed_boundary_id: args.seedBoundaryId,
-                      workspace: args.workspace,
-                      last_todo_state: args.lastTodoState,
-                      acked_watermarks: args.watermarks,
-                  }
-                : {}),
-        },
-        watermarks: args.watermarks,
-    });
-    const appendItem = (
-        batch: {
-            compartments: unknown[];
-            memories: unknown[];
-            memoryMutations: unknown[];
-            userProfile: string[];
-        },
-        item: ShadowSeedItem,
-    ): void => {
-        if (item.kind === "compartment") batch.compartments.push(item.value);
-        else if (item.kind === "memory") batch.memories.push(item.value);
-        else if (item.kind === "memory_mutation") batch.memoryMutations.push(item.value);
-        else batch.userProfile.push(item.value);
-    };
-
-    let assumedTotal = 1;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-        const batches: ShadowStateSyncPayload[] = [];
-        let current = { compartments: [], memories: [], memoryMutations: [], userProfile: [] } as {
-            compartments: unknown[];
-            memories: unknown[];
-            memoryMutations: unknown[];
-            userProfile: string[];
-        };
-        for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
-            const candidate = {
-                compartments: [...current.compartments],
-                memories: [...current.memories],
-                memoryMutations: [...current.memoryMutations],
-                userProfile: [...current.userProfile],
-            };
-            appendItem(candidate, items[itemIndex]);
-            const complete = itemIndex + 1 === items.length;
-            const candidatePayload = makePayload({
-                index: batches.length,
-                total: assumedTotal,
-                complete,
-                ...candidate,
-            });
-            if (flatWireBodyBytes(candidatePayload) <= SHADOW_SEED_BATCH_MAX_BYTES) {
-                current = candidate;
-                continue;
-            }
-            const currentHasItems =
-                current.compartments.length > 0 ||
-                current.memories.length > 0 ||
-                current.memoryMutations.length > 0 ||
-                current.userProfile.length > 0;
-            if (currentHasItems) {
-                batches.push(
-                    makePayload({
-                        index: batches.length,
-                        total: assumedTotal,
-                        complete: false,
-                        ...current,
-                    }),
-                );
-            }
-            current = { compartments: [], memories: [], memoryMutations: [], userProfile: [] };
-            appendItem(current, items[itemIndex]);
-            const itemOnlyPayload = makePayload({
-                index: batches.length,
-                total: assumedTotal,
-                complete: false,
-                ...current,
-            });
-            if (flatWireBodyBytes(itemOnlyPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
-                throw new Error("shadow seed item exceeds the 512 KiB batch limit");
-            }
-            if (complete) {
-                const itemWithTailPayload = makePayload({
-                    index: batches.length,
-                    total: assumedTotal,
-                    complete: true,
-                    ...current,
-                });
-                if (flatWireBodyBytes(itemWithTailPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
-                    batches.push(itemOnlyPayload);
-                    current = {
-                        compartments: [],
-                        memories: [],
-                        memoryMutations: [],
-                        userProfile: [],
-                    };
-                }
-            }
-        }
-        const finalPayload = makePayload({
-            index: batches.length,
-            total: assumedTotal,
-            complete: true,
-            ...current,
-        });
-        if (flatWireBodyBytes(finalPayload) > SHADOW_SEED_BATCH_MAX_BYTES) {
-            throw new Error("shadow seed scalar tail exceeds the 512 KiB batch limit");
-        }
-        batches.push(finalPayload);
-        if (batches.length === assumedTotal) return batches;
-        assumedTotal = batches.length;
-    }
-    throw new Error("shadow seed batch count did not stabilize");
+    return buildPagedModuleStateSyncPayloads(args) as ShadowStateSyncPayload[];
 }
 
 function emptyCounters(): ShadowSenderCounters {
@@ -646,134 +490,8 @@ export async function resolveOrdinalsForShadow(args: {
     memoAnchor?: RawMessageOrdinalAnchor | null;
     memoStoredCount?: number | null;
     memoCanonicalCount?: number;
-}): Promise<
-    | {
-          ok: true;
-          annotatedInput: unknown[];
-          memoGeneration: number;
-          memoAnchor: RawMessageOrdinalAnchor | null;
-          memoStoredCount: number;
-          memoCanonicalCount: number;
-          normalizations: ShadowNormalizationRecord[];
-      }
-    | { ok: false; reason: "unresolved" | "mismatch"; messageId?: string }
-> {
-    const memo = args.memo;
-    const generationChanged = args.memoGeneration !== args.generation;
-    if (generationChanged) memo.clear();
-
-    let anchor = generationChanged ? null : (args.memoAnchor ?? null);
-    let storedCount = generationChanged ? null : (args.memoStoredCount ?? null);
-    let canonicalCount = generationChanged ? 0 : (args.memoCanonicalCount ?? 0);
-    const priming = storedCount === null;
-    if (priming) {
-        memo.clear();
-        anchor = null;
-        canonicalCount = 0;
-    }
-
-    const newEntries: Array<ReturnType<typeof readRawSessionMessageOrdinalPage>[number]> = [];
-    let pageAnchor = anchor;
-    while (true) {
-        const page = readRawSessionMessageOrdinalPage(
-            args.sessionId,
-            pageAnchor,
-            SHADOW_ORDINAL_PAGE_SIZE,
-        );
-        if (page.length === 0) break;
-        newEntries.push(...page);
-        const last = page[page.length - 1];
-        pageAnchor = { timeCreated: last.timeCreated, id: last.id };
-        if (page.length < SHADOW_ORDINAL_PAGE_SIZE) break;
-        await yieldToEventLoop();
-    }
-
-    const currentStoredCount = getRawSessionStoredMessageCount(args.sessionId);
-    const expectedStoredCount = (storedCount ?? 0) + newEntries.length;
-    if (currentStoredCount !== expectedStoredCount) {
-        memo.clear();
-        return { ok: false, reason: "mismatch" };
-    }
-
-        for (const entry of newEntries) {
-            if (!entry.contributesOrdinal) continue;
-            canonicalCount += 1;
-            // A message can receive a temporary position before its database row is visible.
-            // When the row appears, compare its ID with the counted position even if metadata
-            // is incomplete, so a later read cannot preserve an incorrect temporary position.
-            const prior = memo.get(entry.id);
-            if (prior !== undefined && prior !== canonicalCount) {
-                memo.clear();
-                return { ok: false, reason: "mismatch", messageId: entry.id };
-            }
-            memo.set(entry.id, canonicalCount);
-        }
-    anchor = pageAnchor;
-    storedCount = currentStoredCount;
-
-    const normalizations: ShadowNormalizationRecord[] = [];
-    const visibleMessages = args.messages.filter((message) => {
-        if (!isRawCompactionSummaryInfo(message.info)) return true;
-        normalizations.push({
-            kind: "summary_message",
-            message_id: getMessageId(message),
-            part_index: -1,
-            field: "input",
-            removed: JSON.stringify(message),
-        });
-        return false;
-    });
-
-    // The transform captured this array before mutating the live messages. Annotate
-    // that private snapshot directly instead of cloning the full history again.
-    const annotated = visibleMessages as unknown as Array<Record<string, unknown>>;
-    const resolved: Array<number | undefined> = new Array(annotated.length);
-    let firstUnresolvedId: string | undefined;
-    for (let index = 0; index < annotated.length; index += 1) {
-        const messageId = getMessageId(visibleMessages[index]);
-        if (!messageId) return { ok: false, reason: "unresolved" };
-        const ordinal = memo.get(messageId);
-        if (ordinal === undefined && firstUnresolvedId === undefined) firstUnresolvedId = messageId;
-        resolved[index] = ordinal;
-    }
-
-    // OpenCode can persist the live assistant suffix after this snapshot is captured.
-    // Provisional suffix ordinals keep active passes flowing; when those rows appear,
-    // the incremental reader verifies that their persisted ordinals agree.
-    let suffixStart = annotated.length;
-    while (suffixStart > 0 && resolved[suffixStart - 1] === undefined) suffixStart -= 1;
-    for (let index = 0; index < suffixStart; index += 1) {
-        if (resolved[index] === undefined) {
-            return { ok: false, reason: "unresolved", messageId: firstUnresolvedId };
-        }
-    }
-    if (suffixStart < annotated.length) {
-        const base = suffixStart > 0 ? (resolved[suffixStart - 1] as number) : -1;
-        for (let index = suffixStart; index < annotated.length; index += 1) {
-            resolved[index] = base + (index - suffixStart) + 1;
-        }
-    }
-
-    for (let index = 0; index < annotated.length; index += 1) {
-        const messageId = getMessageId(visibleMessages[index]) as string;
-        const ordinal = resolved[index] as number;
-        const prior = memo.get(messageId);
-        if (prior !== undefined && prior !== ordinal) {
-            return { ok: false, reason: "mismatch", messageId };
-        }
-        memo.set(messageId, ordinal);
-        annotated[index].absolute_ordinal = ordinal;
-    }
-
-    return {
-        ok: true,
-        annotatedInput: annotated,
-        memoGeneration: args.generation,
-        memoAnchor: anchor,
-        memoStoredCount: storedCount,
-        memoCanonicalCount: canonicalCount,
-        normalizations,
-    };
+}): Promise<Awaited<ReturnType<typeof resolveOrdinalsForModule>>> {
+    return resolveOrdinalsForModule(args);
 }
 
 function ordinalForMessageId(args: {
@@ -890,169 +608,6 @@ function didDeclaredTrimAdvance(
     return before.flat_boundary_id !== after.flat_boundary_id;
 }
 
-function resolveShadowWorkspaceContext(
-    db: ContextDatabase,
-    projectPath?: string,
-): ShadowWorkspaceContext {
-    if (!projectPath) {
-        return {
-            workspace: null,
-            expandedIdentities: [],
-            ownIdentities: [],
-            shareCategories: null,
-        };
-    }
-    const identitySet = resolveWorkspaceIdentitySet(db, projectPath);
-    if (identitySet.identities.length <= 1) {
-        return {
-            workspace: null,
-            expandedIdentities: [projectPath],
-            ownIdentities: [projectPath],
-            shareCategories: null,
-        };
-    }
-    const expanded = expandWorkspaceIdentitySetWithAliases(db, identitySet.identities);
-    const ownIdentities = expanded.expandedIdentities.filter(
-        (identity) => expanded.canonicalIdentityByStoredPath.get(identity) === projectPath,
-    );
-    if (ownIdentities.length === 0) ownIdentities.push(projectPath);
-    const shareCategories = resolveWorkspaceShareCategories(db, projectPath) ?? [];
-    const members = [
-        projectPath,
-        ...expanded.expandedIdentities
-            .filter((identity) => identity !== projectPath)
-            .sort((left, right) => left.localeCompare(right)),
-    ];
-    return {
-        workspace: {
-            fingerprint: computeWorkspaceEpochFingerprint(db, identitySet.identities),
-            members: members.map((member) => ({
-                project_path: member,
-                share_categories: [...shareCategories],
-            })),
-        },
-        expandedIdentities: members,
-        ownIdentities,
-        shareCategories,
-    };
-}
-
-function loadWatermarks(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    projectPath?: string;
-    workspace: ShadowWorkspaceContext;
-}): ShadowWatermarks {
-    const sessionMeta = getOrCreateSessionMeta(args.db, args.sessionId);
-    const compartmentRow = args.db
-        .prepare(
-            "SELECT COALESCE(MAX(sequence), -1) AS max_sequence FROM compartments WHERE session_id = ?",
-        )
-        .get(args.sessionId) as { max_sequence?: number } | undefined;
-    const memoryId = args.projectPath
-        ? getMaxMemoryIdForProjects(
-              args.db,
-              args.workspace.expandedIdentities,
-              args.workspace.ownIdentities,
-              args.workspace.shareCategories,
-          )
-        : 0;
-    const m0Row = args.db
-        .prepare("SELECT COALESCE(MAX(id), 0) AS max_id FROM m0_mutation_log WHERE session_id = ?")
-        .get(args.sessionId) as { max_id?: number } | undefined;
-    const memoryMutationId = args.projectPath
-        ? (getMaxMemoryMutationIdForProjects(args.db, args.workspace.expandedIdentities) ?? 0)
-        : 0;
-    return {
-        compartment_sequence: compartmentRow?.max_sequence ?? -1,
-        memory_id: memoryId,
-        m0_mutation_id: m0Row?.max_id ?? 0,
-        memory_mutation_id: memoryMutationId,
-        last_todo_state_hash: stableHash(sessionMeta.lastTodoState ?? ""),
-    };
-}
-
-function watermarksEqual(left: ShadowWatermarks | null, right: ShadowWatermarks): boolean {
-    return (
-        left !== null &&
-        left.compartment_sequence === right.compartment_sequence &&
-        left.memory_id === right.memory_id &&
-        left.m0_mutation_id === right.m0_mutation_id &&
-        left.memory_mutation_id === right.memory_mutation_id &&
-        left.last_todo_state_hash === right.last_todo_state_hash
-    );
-}
-
-function serializeCompartment(args: {
-    compartment: ReturnType<typeof getCompartments>[number];
-    readRawById: (messageId: string) => RawMessageParts | null;
-    state: SessionQueueState;
-}): unknown | null | "mismatch" {
-    const startRaw = args.readRawById(args.compartment.startMessageId);
-    const endRaw = args.readRawById(args.compartment.endMessageId);
-    const startOrdinal = ordinalForMessageId({
-        raw: startRaw,
-        messageId: args.compartment.startMessageId,
-        declaredOrdinal: args.compartment.startMessage,
-        generation: args.state.shadowGeneration,
-        state: args.state,
-    });
-    const endOrdinal = ordinalForMessageId({
-        raw: endRaw,
-        messageId: args.compartment.endMessageId,
-        declaredOrdinal: args.compartment.endMessage,
-        generation: args.state.shadowGeneration,
-        state: args.state,
-    });
-    if (startOrdinal === "mismatch" || endOrdinal === "mismatch") return "mismatch";
-    if (startOrdinal === null || endOrdinal === null) return null;
-    const startCreatedAt = startRaw?.createdAt;
-    const endCreatedAt = endRaw?.createdAt;
-    const dateRange =
-        typeof startCreatedAt === "number" && typeof endCreatedAt === "number"
-            ? {
-                  start_date: formatDate(startCreatedAt),
-                  end_date: formatDate(endCreatedAt),
-              }
-            : {};
-    return {
-        sequence: args.compartment.sequence,
-        start_message: startOrdinal,
-        end_message: endOrdinal,
-        start_message_id: flatBlockIdForRawMessage(
-            args.compartment.startMessageId,
-            startRaw ?? undefined,
-            "start",
-        ),
-        end_message_id: flatBlockIdForRawMessage(
-            args.compartment.endMessageId,
-            endRaw ?? undefined,
-            "end",
-        ),
-        ...dateRange,
-        title: args.compartment.title,
-        content: args.compartment.content,
-        p1: args.compartment.p1,
-        p2: args.compartment.p2,
-        p3: args.compartment.p3,
-        p4: args.compartment.p4,
-        importance: args.compartment.importance,
-        episode_type: args.compartment.episodeType,
-        legacy: args.compartment.legacy,
-        created_at: args.compartment.createdAt,
-    };
-}
-
-function seedBoundaryFromSerializedCompartments(compartments: unknown[]): string | null {
-    const serialized = compartments.filter(isRecord).filter((compartment) =>
-        typeof compartment.sequence === "number" &&
-        typeof compartment.end_message_id === "string",
-    );
-    serialized.sort((left, right) => (left.sequence as number) - (right.sequence as number));
-    const tail = serialized.at(-1);
-    return typeof tail?.end_message_id === "string" ? tail.end_message_id : null;
-}
-
 async function buildStateSyncPayload(args: {
     state: SessionQueueState;
     pass: Pick<ShadowTransformPass, "db" | "sessionId" | "projectPath" | "passInputs"> & {
@@ -1066,183 +621,29 @@ async function buildStateSyncPayload(args: {
 }): Promise<
     ShadowStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" | "seed_budget"
 > {
-    const workspace = resolveShadowWorkspaceContext(args.pass.db, args.pass.projectPath);
-    const currentWatermarks = loadWatermarks({
-        db: args.pass.db,
-        sessionId: args.pass.sessionId,
-        projectPath: args.pass.projectPath,
-        workspace,
-    });
-    if (
-        !args.force &&
-        args.state.lastAckedWatermarks &&
-        currentWatermarks.m0_mutation_id > args.state.lastAckedWatermarks.m0_mutation_id
-    ) {
-        return "m0_mutation";
-    }
-    if (!args.force && watermarksEqual(args.state.lastAckedWatermarks, currentWatermarks)) {
-        return null;
-    }
-
-    const acked = args.force
-        ? {
-              compartment_sequence: -1,
-              memory_id: 0,
-              m0_mutation_id: 0,
-              memory_mutation_id: 0,
-              last_todo_state_hash: "",
-          }
-        : (args.state.lastAckedWatermarks ?? {
-              compartment_sequence: -1,
-              memory_id: 0,
-              m0_mutation_id: 0,
-              memory_mutation_id: 0,
-              last_todo_state_hash: "",
-          });
-    // State sync needs only compartment boundary messages. Cache point reads within
-    // this payload so adjacent compartments sharing a boundary read it once.
-    const rawById = new Map<string, RawMessageParts | null>();
-    const readRawById = (messageId: string): RawMessageParts | null => {
-        if (!rawById.has(messageId)) {
-            rawById.set(messageId, readRawSessionMessagePartsById(args.pass.sessionId, messageId));
-        }
-        return rawById.get(messageId) ?? null;
-    };
-    const compartments: unknown[] = [];
-    const yieldEvery = Math.max(
-        1,
-        args.yieldEveryCompartments ?? SHADOW_SEED_YIELD_EVERY_COMPARTMENTS,
-    );
-    let serializedCount = 0;
-    for (const compartment of getCompartments(args.pass.db, args.pass.sessionId)) {
-        if (compartment.sequence <= acked.compartment_sequence) continue;
-        args.beforeSerializeCompartment?.();
-        if (args.shouldAbortSeed?.()) return "seed_budget";
-        const serialized = serializeCompartment({
-            compartment,
-            readRawById,
-            state: args.state,
-        });
-        if (serialized === "mismatch") return "mismatch";
-        if (serialized === null) return "unresolved";
-        compartments.push(serialized);
-        serializedCount += 1;
-        if (serializedCount % yieldEvery === 0) {
-            await yieldToEventLoop();
-            if (args.shouldAbortSeed?.()) return "seed_budget";
-        }
-    }
-
-    const allMemories = args.pass.projectPath
-        ? workspace.workspace
-            ? getMemoriesByProjects(
-                  args.pass.db,
-                  workspace.expandedIdentities,
-                  ["active", "permanent"],
-                  args.pass.passInputs.now_ms,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : getMemoriesByProject(
-                  args.pass.db,
-                  args.pass.projectPath,
-                  ["active", "permanent"],
-                  args.pass.passInputs.now_ms,
-              )
-        : [];
-    const memories = allMemories
-        .filter((memory) => memory.id > acked.memory_id)
-        .map((memory) => ({
-            id: memory.id,
-            project_path: memory.projectPath,
-            category: memory.category,
-            content: memory.content,
-            normalized_hash: memory.normalizedHash,
-            importance: memory.importance,
-            scope: memory.scope,
-            shareable: memory.shareable,
-            source_session_id: memory.sourceSessionId,
-            source_type: memory.sourceType,
-            seen_count: memory.seenCount,
-            retrieval_count: memory.retrievalCount,
-            first_seen_at: memory.firstSeenAt,
-            created_at: memory.createdAt,
-            updated_at: memory.updatedAt,
-            last_seen_at: memory.lastSeenAt,
-            last_retrieved_at: memory.lastRetrievedAt,
-            status: memory.status,
-            expires_at: memory.expiresAt,
-            verification_status: memory.verificationStatus,
-            verified_at: memory.verifiedAt,
-            superseded_by_memory_id: memory.supersededByMemoryId,
-            merged_from: memory.mergedFrom,
-            metadata_json: memory.metadataJson,
-        }));
-
-    const renderedMemoryIds = allMemories.map((memory) => memory.id);
-    // Profile changes are not sent as incremental updates mid-session because sync
-    // tracking is scoped to session and project rows, not global profile rows. A full
-    // comparison flags one divergence, and the next complete sync applies the new profile.
-    const userProfile = getActiveUserMemories(args.pass.db).map((memory) => memory.content);
-    const memoryMutations = args.pass.projectPath
-        ? getMemoryMutationsForRenderByProjects(
-              args.pass.db,
-              workspace.expandedIdentities,
-              acked.memory_mutation_id,
-              renderedMemoryIds,
-          ).map((row) => ({
-              id: row.id,
-              project_path: row.projectPath,
-              mutation_type: row.mutationType,
-              target_memory_id: row.targetMemoryId,
-              superseded_by_id: row.supersededById,
-              category: row.category,
-              new_content: row.newContent,
-              queued_at: row.queuedAt,
-          }))
-        : [];
-    const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
-    const shadowGeneration = args.state.shadowGeneration;
-    const expectedShadowSeq = args.state.lastAckedSeq;
-    // Use the message boundary ID derived from the ranges in this payload, not a fresh storage
-    // read. Validation checks the final serialized range, so a concurrent marker read could see
-    // a newer range and pair this boundary ID with an older payload, causing a mismatch.
-    const seedBoundaryId =
-        args.state.seedPassPending && compartments.length > 0
-            ? seedBoundaryFromSerializedCompartments(compartments)
-            : null;
-    if (args.force) {
-        const wireBatches = buildPagedSeedPayloads({
-            shadowGeneration,
-            expectedShadowSeq,
-            seedId: args.seedId ?? randomUUID(),
-            seedBoundaryId,
-            compartments,
-            memories,
-            memoryMutations,
-            userProfile,
-            workspace: workspace.workspace,
-            lastTodoState: sessionMeta.lastTodoState ?? "",
-            watermarks: currentWatermarks,
-        });
-        return { ...wireBatches[0], wireBatches };
-    }
-    return {
-        method: "state_sync",
-        params: {
-            shadow_generation: shadowGeneration,
-            expected_shadow_seq: expectedShadowSeq,
-            seed_boundary_id: seedBoundaryId,
-            compartments,
-            memories,
-            memory_mutations: memoryMutations,
-            user_profile: userProfile,
-            workspace: workspace.workspace,
-            last_todo_state: sessionMeta.lastTodoState ?? "",
-            acked_watermarks: currentWatermarks,
+    const payload = await buildModuleStateSyncPayload({
+        state: args.state,
+        pass: {
+            db: args.pass.db,
+            sessionId: args.pass.sessionId,
+            projectPath: args.pass.projectPath,
+            nowMs: args.pass.passInputs.now_ms,
         },
-        watermarks: currentWatermarks,
-    } satisfies ShadowStateSyncPayload;
+        force: args.force,
+        seedId: args.seedId,
+        options: {
+            shouldAbortSeed: args.shouldAbortSeed,
+            beforeSerializeCompartment: args.beforeSerializeCompartment,
+            yieldEveryCompartments: args.yieldEveryCompartments,
+        },
+    });
+    return payload as
+        | ModuleStateSyncPayload
+        | null
+        | "m0_mutation"
+        | "mismatch"
+        | "unresolved"
+        | "seed_budget";
 }
 
 function extractAckValue(response: unknown): Record<string, unknown> {
@@ -1323,17 +724,8 @@ function isConnectionFailure(error: unknown): boolean {
     );
 }
 
-/**
- * Flatten a `{method, params}` payload into the wire shape the module expects.
- * The Rust handlers deserialize the WHOLE request value (serde_json::from_value
- * on ShadowStateSyncWire / ShadowTransformWire / ShadowResetWire), so op fields
- * must live at the top level beside `method` — a nested `params` object never
- * reaches the parser and hard-required fields like `shadow_generation` reject
- * with invalid_params. Builders keep the typed `{method, params}` shape for
- * testability; this is the single serialization point.
- */
 function toFlatWireBody(payload: { method: string; params: Record<string, unknown> }): unknown {
-    return { method: payload.method, ...payload.params };
+    return toFlatModuleWireBody(payload);
 }
 
 function buildShadowResetBody(args: { state: SessionQueueState; reason: string }): {
@@ -1389,151 +781,7 @@ const SHADOW_TRANSFORM_ARRAY_FIELDS = [
 ] as const;
 
 function buildPagedTransformPayloads(body: Record<string, unknown>): Record<string, unknown>[] {
-    if (Buffer.byteLength(JSON.stringify(body)) <= SHADOW_TRANSFORM_PAGE_MAX_BYTES) return [body];
-
-    const arrayFields = SHADOW_TRANSFORM_ARRAY_FIELDS.filter((field) =>
-        Array.isArray(body[field]),
-    );
-    if (arrayFields.length === 0) {
-        throw new Error("shadow transform body has no pageable message arrays");
-    }
-    const scalarFields = { ...body };
-    for (const field of arrayFields) delete scalarFields[field];
-    const transformPageId = randomUUID();
-    const items = arrayFields.flatMap((field) =>
-        (body[field] as unknown[]).map((value, itemIndex) => ({ field, value, itemIndex })),
-    );
-    const emptyArrays = (): Record<string, unknown[]> =>
-        Object.fromEntries(arrayFields.map((field) => [field, []]));
-    const makePage = (args: {
-        index: number;
-        total: number;
-        complete: boolean;
-        arrays: Record<string, unknown[]>;
-    }): Record<string, unknown> => {
-        const pageArrays = Object.fromEntries(
-            arrayFields.map((field) => [field, args.arrays[field] ?? []]),
-        );
-        const page: Record<string, unknown> = {
-            method: body.method,
-            session_id: body.session_id,
-            shadow_generation: body.shadow_generation,
-            transform_page_id: transformPageId,
-            transform_generation: body.shadow_generation,
-            transform_page_index: args.index,
-            transform_page_total: args.total,
-            transform_page_complete: args.complete,
-            transform_page_digest: shadowTransformPageDigest(pageArrays),
-            ...pageArrays,
-        };
-        if (args.complete) Object.assign(page, scalarFields);
-        return page;
-    };
-    const hasItems = (arrays: Record<string, unknown[]>): boolean =>
-        Object.values(arrays).some((values) => values.length > 0);
-
-    let assumedTotal = 1;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-        const pages: Record<string, unknown>[] = [];
-        let current = emptyArrays();
-        const appendUnit = (field: string, value: unknown): boolean => {
-            const candidate = { ...current, [field]: [...current[field], value] };
-            const candidatePage = makePage({
-                index: pages.length,
-                total: assumedTotal,
-                complete: false,
-                arrays: candidate,
-            });
-            if (Buffer.byteLength(JSON.stringify(candidatePage)) <= SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
-                current = candidate;
-                return true;
-            }
-            if (hasItems(current)) {
-                pages.push(
-                    makePage({
-                        index: pages.length,
-                        total: assumedTotal,
-                        complete: false,
-                        arrays: current,
-                    }),
-                );
-                current = emptyArrays();
-            }
-            const itemOnlyPage = makePage({
-                index: pages.length,
-                total: assumedTotal,
-                complete: false,
-                arrays: { ...current, [field]: [...current[field], value] },
-            });
-            if (Buffer.byteLength(JSON.stringify(itemOnlyPage)) > SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
-                return false;
-            }
-            current[field].push(value);
-            return true;
-        };
-
-        for (const item of items) {
-            if (appendUnit(item.field, item.value)) continue;
-
-            const serialized = JSON.stringify(item.value) ?? "null";
-            const bytes = Buffer.from(serialized, "utf8");
-            const chunks: string[] = [];
-            for (let start = 0; start < bytes.length; ) {
-                let end = Math.min(start + SHADOW_TRANSFORM_ITEM_CHUNK_BYTES, bytes.length);
-                while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
-                chunks.push(bytes.subarray(start, end).toString("utf8"));
-                start = end;
-            }
-            const chunkTotal = chunks.length;
-            for (const [chunkIndex, chunk] of chunks.entries()) {
-                const marker = {
-                    [SHADOW_ITEM_CONTINUATION_KEY]: {
-                        field: item.field,
-                        item_index: item.itemIndex,
-                        chunk_index: chunkIndex,
-                        chunk_total: chunkTotal,
-                    },
-                    chunk,
-                };
-                if (!appendUnit(item.field, marker)) {
-                    throw new Error("shadow transform continuation exceeds the 512 KiB page limit");
-                }
-            }
-        }
-
-        let finalPage = makePage({
-            index: pages.length,
-            total: assumedTotal,
-            complete: true,
-            arrays: current,
-        });
-        if (Buffer.byteLength(JSON.stringify(finalPage)) > SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
-            if (!hasItems(current)) {
-                throw new Error("shadow transform scalar tail exceeds the 512 KiB page limit");
-            }
-            pages.push(
-                makePage({
-                    index: pages.length,
-                    total: assumedTotal,
-                    complete: false,
-                    arrays: current,
-                }),
-            );
-            finalPage = makePage({
-                index: pages.length,
-                total: assumedTotal,
-                complete: true,
-                arrays: emptyArrays(),
-            });
-            if (Buffer.byteLength(JSON.stringify(finalPage)) > SHADOW_TRANSFORM_PAGE_MAX_BYTES) {
-                throw new Error("shadow transform scalar tail exceeds the 512 KiB page limit");
-            }
-        }
-        pages.push(finalPage);
-        if (pages.length === assumedTotal) return pages;
-        assumedTotal = pages.length;
-    }
-    throw new Error("shadow transform page count did not stabilize");
+    return buildPagedModuleTransformPayloads(body);
 }
 
 export function createShadowSender(
@@ -2234,10 +1482,11 @@ export function createShadowSender(
     };
 }
 
-class SubcShadowTransport implements ShadowTransport {
+export class SubcShadowTransport implements ShadowTransport {
     private readonly connectionFile: string;
     private readonly moduleId: string;
     private readonly requestTimeoutMs: number;
+    private readonly routeSessionPrefix: string;
     private client: SubcClient | null = null;
     private routes = new Map<string, RouteHandle>();
     private activeSession: string | null = null;
@@ -2249,16 +1498,24 @@ class SubcShadowTransport implements ShadowTransport {
         connectionFile?: string,
         moduleId = DEFAULT_MODULE_ID,
         requestTimeoutMs = SHADOW_SEND_TIMEOUT_MS,
+        routeSessionPrefix = "shadow:",
     ) {
         this.connectionFile = connectionFile ?? getDefaultConnectionFile();
         this.moduleId = moduleId;
         this.requestTimeoutMs = requestTimeoutMs;
+        this.routeSessionPrefix = routeSessionPrefix;
     }
 
     async call(args: {
         sessionId: string;
         projectRoot: string;
-        method: "shadow_reset" | "state_sync" | "shadow_transform";
+        method:
+            | "shadow_reset"
+            | "state_sync"
+            | "shadow_transform"
+            | "transform"
+            | "session.status"
+            | "todo_state.set";
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown> {
@@ -2320,7 +1577,7 @@ class SubcShadowTransport implements ShadowTransport {
         const identity: BindIdentity = {
             project_root: projectRoot,
             harness: getHarness(),
-            session: `shadow:${sessionId}`,
+            session: `${this.routeSessionPrefix}${sessionId}`,
         };
         const route = await client.routeOpen(target, identity);
         if (this.client !== client) {

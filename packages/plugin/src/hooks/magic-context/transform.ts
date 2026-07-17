@@ -84,6 +84,7 @@ import {
 import { readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
 import { extractInMemoryMessageViews } from "./read-session-raw";
+import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import { sendIgnoredMessage } from "./send-session-notification";
 import { modelAcceptsEmptyContent } from "./sentinel";
 import {
@@ -423,10 +424,25 @@ export interface TransformDeps {
     maybeAutoEmbedSession?: (sessionId: string) => void;
     /** Dev-only sender that mirrors transform events for comparison; undefined disables that debug path. */
     shadowSender?: ShadowSender;
+    /** Resolved project mode. Rust mode bypasses every TS mutation below. */
+    transformMode?: "ts" | "rust";
+    /** Module transport injected by the hook; tests use a deterministic mock. */
+    rustModeModuleClient?: RustModeModuleClient;
+    rustModeProjectRoot?: string;
+    onRustModeParked?: (sessionId: string, message: string) => void;
 }
 
 export function createTransform(deps: TransformDeps) {
     const loadedSessions = new Set<string>();
+    const rustModeTransform =
+        deps.transformMode === "rust" && deps.rustModeModuleClient
+            ? createRustModeTransform(deps, {
+                  moduleClient: deps.rustModeModuleClient,
+                  hostClient: deps.client,
+                  projectRoot: deps.rustModeProjectRoot ?? deps.directory,
+                  notifyParked: deps.onRustModeParked,
+              })
+            : undefined;
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
@@ -494,6 +510,18 @@ export function createTransform(deps: TransformDeps) {
         // event and runs reduced-mode once — harmless for these short sessions.)
         if (deps.internalChildSessions?.has(sessionId)) {
             sessionLog(sessionId, "transform skipped (internal magic-context child session)");
+            return;
+        }
+
+        // Rust mode is an authority adapter, not a second implementation of the
+        // TypeScript renderer. Internal children returned above retain their identity
+        // in both modes; every other rust-mode session is handed to the module here.
+        if (deps.transformMode === "rust") {
+            if (!rustModeTransform) {
+                sessionLog(sessionId, "rust transform unavailable; using raw passthrough");
+                return;
+            }
+            await rustModeTransform.run(sessionId, messages, output, sessionMeta);
             return;
         }
 
@@ -2114,6 +2142,7 @@ export function createTransform(deps: TransformDeps) {
                         history_budget_tokens: historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
                         cache_ttl: sessionMeta.cacheTtl,
                         mid_turn: midTurn,
+                        is_subagent: sessionMeta.isSubagent,
                     },
                     tsDecision: shadowDecision,
                     declaredTrimBefore: shadowCapture.declaredTrimBefore,

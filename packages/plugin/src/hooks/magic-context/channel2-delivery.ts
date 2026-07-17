@@ -67,6 +67,8 @@ export interface Channel2DeliveryDeps {
      */
     usableTokens?: number;
     oldestReclaimableToolTags?: readonly ToolReclaimHint[];
+    /** Module-owned directives are already predicate-validated; preserve their text verbatim. */
+    directiveText?: string;
 }
 
 /**
@@ -91,7 +93,10 @@ export async function maybeDeliverChannel2(
     // Revalidate before delivering. The `pending` intent was recorded at high
     // pressure during a transform pass; between then and this terminal
     // message.updated the agent may have run ctx_reduce (or a later turn shrank
-    // the reclaimable tail), so the ceiling condition may no longer hold.
+    // the reclaimable tail), so the ceiling condition may no longer hold. A
+    // module directive has already been validated against the module's durable
+    // pressure state, so its lease still uses this function but skips a second
+    // predicate evaluation that could discard the authoritative text.
     // Firing the synthetic nudge anyway would inject a stale "you have N tokens
     // to drop" message AND consume the one-per-session cap for nothing.
     //
@@ -103,13 +108,17 @@ export async function maybeDeliverChannel2(
     // - KNOWN baseline → re-run the FULL trigger predicate (floor AND the
     //   reclaimable ≥ usable/3 ratio — the same one that armed the intent),
     //   not just the floor. Predicate false → cancel to '' (re-armable).
-    if (deps.reclaimableTokens === undefined || deps.usableTokens === undefined) {
+    if (
+        deps.directiveText === undefined &&
+        (deps.reclaimableTokens === undefined || deps.usableTokens === undefined)
+    ) {
         return false;
     }
     if (
+        deps.directiveText === undefined &&
         !shouldTriggerChannel2({
-            reclaimableTokens: deps.reclaimableTokens,
-            usableTokens: deps.usableTokens,
+            reclaimableTokens: deps.reclaimableTokens as number,
+            usableTokens: deps.usableTokens as number,
         })
     ) {
         try {
@@ -136,12 +145,11 @@ export async function maybeDeliverChannel2(
 
     try {
         const promptContext = await resolvePromptContext(client, sessionId);
-        // reclaimableTokens is guaranteed defined here (unknown-baseline path
-        // returned above), so the wording always reflects a real measurement.
-        const reminder = buildChannel2Reminder(
-            deps.reclaimableTokens,
-            deps.oldestReclaimableToolTags,
-        );
+        // Module directives carry their own validated wording; host-triggered
+        // reminders use the measured reclaimable tail after the predicate above.
+        const reminder =
+            deps.directiveText ??
+            buildChannel2Reminder(deps.reclaimableTokens as number, deps.oldestReclaimableToolTags);
 
         const body: Record<string, unknown> = {
             noReply: false,

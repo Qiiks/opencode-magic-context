@@ -71,7 +71,8 @@ import {
     setRecompStarting,
     setRecompTerminal,
 } from "./recomp-orchestrator";
-import { createShadowSender } from "./shadow-sender";
+import type { RustModeModuleClient } from "./rust-mode-transform";
+import { createShadowSender, SubcShadowTransport } from "./shadow-sender";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -149,6 +150,8 @@ export interface MagicContextDeps {
             enabled: boolean;
         };
     };
+    /** Test seam for the Rust authority adapter; production creates the subc client. */
+    rustModeModuleClient?: RustModeModuleClient;
 }
 
 function notifyMagicContextDisabled(client: PluginContext["client"], reason: string): void {
@@ -596,8 +599,77 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
+    // Rust is authoritative for a session, so never arm the asynchronous
+    // comparison sender alongside the authority lane.
     const shadowSender =
-        deps.config.shadow_transform?.enabled === true ? createShadowSender() : undefined;
+        deps.config.transform_mode !== "rust" && deps.config.shadow_transform?.enabled === true
+            ? createShadowSender()
+            : undefined;
+    const rustModeModuleClient =
+        deps.rustModeModuleClient ??
+        (deps.config.transform_mode === "rust"
+            ? (() => {
+                  const transport = new SubcShadowTransport(undefined, undefined, undefined, "");
+                  const client: RustModeModuleClient = {
+                      call: (args) => transport.call(args),
+                      closeSession: (sessionId) => transport.closeSession(sessionId),
+                      getCompartmentsAfter: async (sessionId, afterSequence) => {
+                          const response = await transport.call({
+                              sessionId,
+                              projectRoot: deps.directory,
+                              method: "session.status",
+                              body: {
+                                  method: "session.status",
+                                  v: 1,
+                                  session_id: sessionId,
+                                  include_compartments_after_seq: afterSequence,
+                              },
+                          });
+                          const value =
+                              response && typeof response === "object" && "result" in response
+                                  ? (response as { result?: unknown }).result
+                                  : response;
+                          const record = value && typeof value === "object" ? value : {};
+                          const compartments =
+                              "compartments" in record && Array.isArray(record.compartments)
+                                  ? record.compartments
+                                  : [];
+                          const maxSequence =
+                              "max_sequence" in record && typeof record.max_sequence === "number"
+                                  ? record.max_sequence
+                                  : afterSequence;
+                          return { max_sequence: maxSequence, compartments };
+                      },
+                  };
+                  return client;
+              })()
+            : undefined);
+    const notifyRustModeParked = (sessionId: string, message: string): void => {
+        const client = deps.client as {
+            tui?: {
+                showToast?: (input: {
+                    body: {
+                        title: string;
+                        message: string;
+                        variant?: "warning" | "error" | "info" | "success";
+                        duration?: number;
+                    };
+                }) => Promise<unknown>;
+            };
+        };
+        void client.tui
+            ?.showToast?.({
+                body: {
+                    title: "Rust Magic Context paused",
+                    message,
+                    variant: "warning",
+                    duration: 8000,
+                },
+            })
+            .catch((error) =>
+                log(`[magic-context] rust park toast failed for ${sessionId}:`, error),
+            );
+    };
 
     const transform = createTransform({
         tagger: deps.tagger,
@@ -679,6 +751,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 : undefined,
         maybeAutoEmbedSession,
         shadowSender,
+        transformMode: deps.config.transform_mode,
+        rustModeModuleClient,
+        onRustModeParked: notifyRustModeParked,
     });
     const eventHandler = createEventHandler({
         contextUsageMap,
@@ -982,6 +1057,23 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         "tool.execute.after": createToolExecuteAfterHook({
             db,
             channel1StateBySession,
+            transformMode: deps.config.transform_mode,
+            todoStateSet:
+                deps.config.transform_mode === "rust" && rustModeModuleClient
+                    ? ({ sessionId, stateJson, ownerMessageId }) =>
+                          rustModeModuleClient.call({
+                              sessionId,
+                              projectRoot: deps.directory,
+                              method: "todo_state.set",
+                              body: {
+                                  method: "todo_state.set",
+                                  v: 1,
+                                  session_id: sessionId,
+                                  state_json: stateJson,
+                                  owner_message_id: ownerMessageId,
+                              },
+                          })
+                    : undefined,
         }),
     };
 }
