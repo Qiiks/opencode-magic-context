@@ -1546,6 +1546,13 @@ pub struct SessionStatusSnapshot {
     pub pass_trace: Option<PassTrace>,
 }
 
+/// A bounded chronological page of module-owned compartments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompartmentPage {
+    pub compartments: Vec<StoredCompartment>,
+    pub max_sequence: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrapupCommandRow {
     pub disposition: String,
@@ -4238,6 +4245,28 @@ impl McStore {
         Ok(rows)
     }
 
+    fn stored_compartment_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCompartment> {
+        Ok(StoredCompartment {
+            sequence: r.get(0)?,
+            start_message: r.get(1)?,
+            end_message: r.get(2)?,
+            start_message_id: r.get(3)?,
+            end_message_id: r.get(4)?,
+            start_date: r.get(5)?,
+            end_date: r.get(6)?,
+            title: r.get(7)?,
+            content: r.get(8)?,
+            p1: r.get(9)?,
+            p2: r.get(10)?,
+            p3: r.get(11)?,
+            p4: r.get(12)?,
+            importance: r.get::<_, Option<i64>>(13)?.unwrap_or(50) as i32,
+            episode_type: r.get(14)?,
+            legacy: r.get::<_, Option<i64>>(15)?.unwrap_or(0) as i32,
+            created_at: r.get(16)?,
+        })
+    }
+
     /// Read a session's compartments in chronological order (oldest first), the order
     /// the decay renderer expects (it indexes from newest internally).
     pub fn load_compartments(
@@ -4252,31 +4281,49 @@ impl McStore {
                  FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
             )?;
             let mapped = stmt
-                .query_map(params![session_id], |r| {
-                    Ok(StoredCompartment {
-                        sequence: r.get(0)?,
-                        start_message: r.get(1)?,
-                        end_message: r.get(2)?,
-                        start_message_id: r.get(3)?,
-                        end_message_id: r.get(4)?,
-                        start_date: r.get(5)?,
-                        end_date: r.get(6)?,
-                        title: r.get(7)?,
-                        content: r.get(8)?,
-                        p1: r.get(9)?,
-                        p2: r.get(10)?,
-                        p3: r.get(11)?,
-                        p4: r.get(12)?,
-                        importance: r.get::<_, Option<i64>>(13)?.unwrap_or(50) as i32,
-                        episode_type: r.get(14)?,
-                        legacy: r.get::<_, Option<i64>>(15)?.unwrap_or(0) as i32,
-                        created_at: r.get(16)?,
-                    })
-                })?
+                .query_map(params![session_id], Self::stored_compartment_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(mapped)
         })?;
         Ok(rows)
+    }
+
+    /// Read the next chronological compartment page and the highest sequence currently
+    /// published for the session. The caller supplies the protocol page cap.
+    pub fn load_compartments_after(
+        &self,
+        session_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<CompartmentPage, McStoreError> {
+        let page = self.inner.with_conn(|conn| {
+            let max_sequence = conn
+                .query_row(
+                    "SELECT MAX(sequence) FROM mc_compartments WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?
+                .map_or(after_sequence, |max| max.max(after_sequence));
+            let mut stmt = conn.prepare(
+                "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
+                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
+                        episode_type, legacy, created_at
+                 FROM mc_compartments
+                 WHERE session_id = ?1 AND sequence > ?2
+                 ORDER BY sequence ASC LIMIT ?3",
+            )?;
+            let compartments = stmt
+                .query_map(
+                    params![session_id, after_sequence, limit as i64],
+                    Self::stored_compartment_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CompartmentPage {
+                compartments,
+                max_sequence,
+            })
+        })?;
+        Ok(page)
     }
 
     /// Read the compartment rows and session revert epoch in one store snapshot for
@@ -4300,27 +4347,7 @@ impl McStore {
                  FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
             )?;
             let compartments = stmt
-                .query_map(params![session_id], |r| {
-                    Ok(StoredCompartment {
-                        sequence: r.get(0)?,
-                        start_message: r.get(1)?,
-                        end_message: r.get(2)?,
-                        start_message_id: r.get(3)?,
-                        end_message_id: r.get(4)?,
-                        start_date: r.get(5)?,
-                        end_date: r.get(6)?,
-                        title: r.get(7)?,
-                        content: r.get(8)?,
-                        p1: r.get(9)?,
-                        p2: r.get(10)?,
-                        p3: r.get(11)?,
-                        p4: r.get(12)?,
-                        importance: r.get::<_, Option<i64>>(13)?.unwrap_or(50) as i32,
-                        episode_type: r.get(14)?,
-                        legacy: r.get::<_, Option<i64>>(15)?.unwrap_or(0) as i32,
-                        created_at: r.get(16)?,
-                    })
-                })?
+                .query_map(params![session_id], Self::stored_compartment_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((meta_json, compartments))
         })?;
@@ -4398,6 +4425,93 @@ impl McStore {
             Ok(())
         })?;
         Ok(())
+    }
+
+    /// Reset the module cache to the never-minted boundary used by native recomp.
+    ///
+    /// This is the full-session form of the revert re-cut: compartments and their
+    /// recoverable transcripts are removed, while the cache row is replaced with a
+    /// fresh core/meta pair carrying a bumped revert epoch. The epoch and row-version
+    /// update share one fenced transaction, so an in-flight historian cannot publish
+    /// against the retired compartment set.
+    pub fn reset_session_for_recomp(
+        &self,
+        session_id: &str,
+        expected_row_version: Option<u64>,
+    ) -> Result<TruncateOutcome, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((current, meta_json)) = row else {
+                return Ok(TruncateTxnOutcome::CasConflict(0));
+            };
+            let cas_ok = match expected_row_version {
+                Some(version) => current == version as i64,
+                None => current == NO_ROW,
+            };
+            if !cas_ok {
+                return Ok(TruncateTxnOutcome::CasConflict(current.max(0) as u64));
+            }
+            let prior_meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+                Ok(meta) => meta,
+                Err(error) => return Ok(TruncateTxnOutcome::Serde(error.to_string())),
+            };
+            let next_epoch = prior_meta.revert_epoch.saturating_add(1);
+            let reset_meta = ModuleMeta {
+                revert_epoch: next_epoch,
+                last_recut: Some(format!(
+                    "native recomp reset all compartments; epoch {next_epoch}"
+                )),
+                ..ModuleMeta::default()
+            };
+            let core_json = match serde_json::to_string(&CoreState::default()) {
+                Ok(json) => json,
+                Err(error) => return Ok(TruncateTxnOutcome::Serde(error.to_string())),
+            };
+            let reset_meta_json = match serde_json::to_string(&reset_meta) {
+                Ok(json) => json,
+                Err(error) => return Ok(TruncateTxnOutcome::Serde(error.to_string())),
+            };
+            tx.execute(
+                "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_compartments WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            let next_version = current as u64 + 1;
+            tx.execute(
+                "UPDATE mc_cache_state
+                    SET row_version = ?2, core_state = ?3, meta = ?4
+                  WHERE session_id = ?1 AND row_version = ?5",
+                params![
+                    session_id,
+                    next_version as i64,
+                    core_json,
+                    reset_meta_json,
+                    current
+                ],
+            )?;
+            Ok(TruncateTxnOutcome::Committed(TruncateOutcome {
+                revert_epoch: next_epoch,
+                last_recut: reset_meta.last_recut,
+                row_version: next_version,
+            }))
+        })?;
+        match outcome {
+            TruncateTxnOutcome::Committed(outcome) => Ok(outcome),
+            TruncateTxnOutcome::CasConflict(found) => Err(McStoreError::CasConflict {
+                expected: expected_row_version,
+                found,
+            }),
+            TruncateTxnOutcome::Serde(error) => Err(McStoreError::Serde(error)),
+        }
     }
 
     /// Delete every compartment after `keep_through_seq` and bump the session revert

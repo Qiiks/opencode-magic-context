@@ -333,6 +333,15 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                     <box marginTop={1}>
                         <text fg={t().text}><b>History Compression</b></text>
                     </box>
+                    {typeof s().boundaryPresent === "boolean" && (
+                        <R t={t()} l="Boundary" v={s().boundaryPresent ? "present" : "absent"} />
+                    )}
+                    {s().coverageOrdinal !== undefined && (
+                        <R t={t()} l="Coverage ordinal" v={s().coverageOrdinal == null ? "none" : String(s().coverageOrdinal)} />
+                    )}
+                    {typeof s().boundaryPresent === "boolean" && (
+                        <R t={t()} l="Compartments" v={String(s().compartmentCount)} />
+                    )}
                     <R t={t()} l="History block" v={`~${fmt(s().historyBlockTokens)} tok`} />
                     {s().compressionBudget != null && (
                         <R t={t()} l="Budget" v={`~${fmt(s().compressionBudget!)} tok (${s().compressionUsage} used)`} />

@@ -6,8 +6,8 @@ import { createScheduler } from "../../features/magic-context/scheduler";
 import { createTagger } from "../../features/magic-context/tagger";
 import { createMagicContextHook } from "../../hooks/magic-context";
 import type { LiveSessionState } from "../../hooks/magic-context/live-session-state";
+import type { RustModeModuleClient } from "../../hooks/magic-context/rust-mode-transform";
 import type { PluginContext } from "../types";
-
 /**
  * Map the full plugin config down to the per-session hook config. Pure and
  * exported so it can be unit-tested directly — without a module-level
@@ -36,6 +36,7 @@ export function createSessionHooks(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;
     liveSessionState: LiveSessionState;
+    rustModeModuleClient?: RustModeModuleClient;
 }) {
     const { ctx, pluginConfig, liveSessionState } = args;
 
@@ -59,6 +60,7 @@ export function createSessionHooks(args: {
             scheduler,
             compactionHandler,
             liveSessionState,
+            rustModeModuleClient: args.rustModeModuleClient,
             config: buildMagicContextHookConfig(pluginConfig),
         }),
     };

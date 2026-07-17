@@ -393,14 +393,18 @@ export function createRustModeTransform(
                     projectRoot,
                     force: true,
                 });
-                response = responseValue(
-                    await callModule({
-                        sessionId,
-                        projectRoot,
-                        method: "transform",
-                        body,
-                    }),
-                );
+                response = undefined;
+                for (const page of buildPagedModuleTransformPayloads(body)) {
+                    response = responseValue(
+                        await callModule({
+                            sessionId,
+                            projectRoot,
+                            method: "transform",
+                            body: page,
+                        }),
+                    );
+                }
+                if (!response) throw new Error("rust module returned no retry transform response");
             }
             applyNativeMessagesVerbatim(output, response);
             state.initialized = true;

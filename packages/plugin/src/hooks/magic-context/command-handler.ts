@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import type { DreamerConfig, SidekickConfig } from "../../config/schema/magic-context";
+import type { ResolvedTransformMode } from "../../config/transform-mode";
 import {
     CANONICAL_DREAM_TASKS,
     type DreamTaskName,
@@ -17,6 +19,7 @@ import {
 } from "./compartment-runner-partial-recomp";
 import { executeFlush } from "./execute-flush";
 import { executeStatus } from "./execute-status";
+import type { RustModeModuleClient } from "./rust-mode-transform";
 import type { NotificationParams } from "./send-session-notification";
 import { sendUserPrompt } from "./send-session-notification";
 
@@ -183,6 +186,72 @@ function getLegacyCompartmentCount(db: Database, sessionId: string): number {
         // Older test/upgrade schemas may not have the v22 legacy column yet.
         return 0;
     }
+}
+
+function moduleResponseValue(response: unknown): Record<string, unknown> {
+    if (response && typeof response === "object") {
+        const value = response as Record<string, unknown>;
+        if (value.result && typeof value.result === "object") {
+            return value.result as Record<string, unknown>;
+        }
+        return value;
+    }
+    return {};
+}
+
+function rustCommandId(operation: string): string {
+    return `opencode-${operation}-${randomUUID()}`;
+}
+
+function formatRustOperationMessage(
+    operation: "wrapup" | "recomp",
+    value: Record<string, unknown>,
+): string {
+    const disposition = typeof value.disposition === "string" ? value.disposition : "failed";
+    const summary = typeof value.summary === "string" ? value.summary : "";
+    const rounds = typeof value.rounds === "number" ? value.rounds : 0;
+    if (operation === "wrapup") {
+        switch (disposition) {
+            case "completed":
+                return `## Magic Wrapup\n\n${summary || "Wrapup completed."}${summary && rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"})` : ""}`;
+            case "nothing_to_compact":
+                return `## Magic Wrapup\n\n${summary || "Nothing to compact."}`;
+            case "already_in_progress":
+                return `## Magic Wrapup — Skipped\n\n/ctx-wrapup is already running for this session${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"} complete)` : ""}. Wait for it to finish, then run /ctx-wrapup again if more history remains.`;
+            default:
+                return `## Magic Wrapup — Failed\n\n${summary || "Wrapup failed; try /ctx-wrapup again."}${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"})` : ""}`;
+        }
+    }
+    switch (disposition) {
+        case "started":
+            return "## Magic Recomp\n\nHistorian recomp started. Rebuilding compartments from raw session history now.";
+        case "already_in_progress":
+            return "## Magic Recomp — Skipped\n\nHistorian recomp is already running for this session. Wait for it to finish, then try /ctx-recomp again.";
+        case "nothing_to_do":
+            return "## Magic Recomp\n\nNothing to rebuild: this session has no published compartments.";
+        default:
+            return `## Magic Recomp — Failed\n\n${summary || "Historian recomp failed; try /ctx-recomp again."}`;
+    }
+}
+
+function formatRustStatusText(value: Record<string, unknown>): string {
+    const usage =
+        value.usage && typeof value.usage === "object"
+            ? (value.usage as Record<string, unknown>)
+            : {};
+    const tokens =
+        typeof usage.current_total_input_tokens === "number" ? usage.current_total_input_tokens : 0;
+    const limit = typeof usage.context_limit_tokens === "number" ? usage.context_limit_tokens : 0;
+    const coverage = value.coverage_ordinal == null ? "none" : String(value.coverage_ordinal);
+    const boundary = value.boundary_present === true ? "present" : "absent";
+    const compartments = typeof value.compartment_count === "number" ? value.compartment_count : 0;
+    return [
+        "### Module Cache",
+        `- Usage: ${tokens.toLocaleString()}${limit > 0 ? ` / ${limit.toLocaleString()} tokens` : " tokens"}`,
+        `- Boundary: ${boundary}`,
+        `- Coverage ordinal: ${coverage}`,
+        `- Compartments: ${compartments}`,
+    ].join("\n");
 }
 
 function executeRecompUpgradeStub(db: Database, sessionId: string): string {
@@ -433,6 +502,9 @@ export function createMagicContextCommandHandler(deps: {
     ) => Promise<void>;
     /** Configured toast lifetime (ms) forwarded into diagnostics logs. */
     toastDurationMs?: number;
+    transformMode?: ResolvedTransformMode;
+    rustModeModuleClient?: RustModeModuleClient;
+    projectRoot?: string;
     sidekick?: {
         config: SidekickConfig;
         projectPath: string;
@@ -477,6 +549,21 @@ export function createMagicContextCommandHandler(deps: {
     const isDreamCommand = (command: string): boolean => command === "ctx-dream";
     const isSessionUpgradeCommand = (command: string): boolean => command === "ctx-session-upgrade";
     const isEmbedCommand = (command: string): boolean => command === "ctx-embed";
+    const rustMode = deps.transformMode === "rust" && deps.rustModeModuleClient;
+    const callRust = async (
+        method: Parameters<RustModeModuleClient["call"]>[0]["method"],
+        body: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> => {
+        if (!rustMode) throw new Error("Rust module client is unavailable");
+        return moduleResponseValue(
+            await rustMode.call({
+                sessionId: body.session_id as string,
+                projectRoot: deps.projectRoot ?? process.cwd(),
+                method,
+                body,
+            }),
+        );
+    };
 
     return {
         "command.execute.before": async (
@@ -572,7 +659,23 @@ export function createMagicContextCommandHandler(deps: {
             }
 
             if (isFlush) {
-                result = executeFlush(deps.db, sessionId);
+                if (rustMode) {
+                    try {
+                        const value = await callRust("session.flush", {
+                            method: "session.flush",
+                            v: 1,
+                            session_id: sessionId,
+                        });
+                        result =
+                            value.armed === false
+                                ? "No pending operations to flush."
+                                : "Flushed: Changes take effect on next message.";
+                    } catch (error) {
+                        result = `Error: Failed to flush context operations. ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                } else {
+                    result = executeFlush(deps.db, sessionId);
+                }
                 deps.onFlush?.(sessionId);
                 if (isTuiConnected(sessionId)) {
                     pushNotification(
@@ -586,6 +689,18 @@ export function createMagicContextCommandHandler(deps: {
             }
 
             if (isStatus) {
+                let rustStatus: Record<string, unknown> | undefined;
+                if (rustMode) {
+                    try {
+                        rustStatus = await callRust("session.status", {
+                            method: "session.status",
+                            v: 1,
+                            session_id: sessionId,
+                        });
+                    } catch (error) {
+                        sessionLog(sessionId, "rust session.status failed:", error);
+                    }
+                }
                 if (isTuiConnected(sessionId)) {
                     // In TUI, push an RPC action so the TUI poller shows a native dialog
                     pushNotification("action", { action: "show-status-dialog" }, sessionId);
@@ -605,7 +720,9 @@ export function createMagicContextCommandHandler(deps: {
                     deps.executeThresholdTokens,
                     liveContextLimit,
                 );
-                result += result ? `\n\n${statusOutput}` : statusOutput;
+                const moduleStatus = rustStatus ? `\n\n${formatRustStatusText(rustStatus)}` : "";
+                const combinedStatus = `${statusOutput}${moduleStatus}`;
+                result += result ? `\n\n${combinedStatus}` : combinedStatus;
             }
 
             if (isWrapup) {
@@ -615,6 +732,25 @@ export function createMagicContextCommandHandler(deps: {
                         "## Magic Wrapup — Skipped\n\n/ctx-wrapup is only available in primary sessions.";
                 } else if (!parsed.ok) {
                     result = `## Magic Wrapup — Invalid Arguments\n\n${parsed.message}`;
+                } else if (rustMode) {
+                    const keep = Math.min(100, Math.max(5, parsed.messagesToKeep));
+                    await deps.sendNotification(
+                        sessionId,
+                        "## Magic Wrapup\n\nStarting wrapup…",
+                        {},
+                    );
+                    try {
+                        const value = await callRust("session.wrapup", {
+                            method: "session.wrapup",
+                            v: 1,
+                            session_id: sessionId,
+                            keep,
+                            command_id: rustCommandId("wrapup"),
+                        });
+                        result = formatRustOperationMessage("wrapup", value);
+                    } catch (error) {
+                        result = `## Magic Wrapup — Failed\n\n${error instanceof Error ? error.message : String(error)}`;
+                    }
                 } else if (!deps.executeWrapup) {
                     result =
                         "## Magic Wrapup\n\n/ctx-wrapup is unavailable because the historian handler is not configured.";
@@ -631,6 +767,18 @@ export function createMagicContextCommandHandler(deps: {
                     result = `## Magic Recomp — Invalid Arguments\n\n${parsedArgs.message}`;
                 } else if (parsedArgs.kind === "upgrade") {
                     result = executeRecompUpgradeStub(deps.db, sessionId);
+                } else if (rustMode) {
+                    try {
+                        const value = await callRust("session.recomp", {
+                            method: "session.recomp",
+                            v: 1,
+                            session_id: sessionId,
+                            command_id: rustCommandId("recomp"),
+                        });
+                        result = formatRustOperationMessage("recomp", value);
+                    } catch (error) {
+                        result = `## Magic Recomp — Failed\n\n${error instanceof Error ? error.message : String(error)}`;
+                    }
                 } else if (isTuiConnected(sessionId)) {
                     // In TUI, push an RPC action so the TUI poller shows a confirmation dialog.
                     // Partial-range args fall through to the full-recomp dialog for now — TUI

@@ -67,6 +67,9 @@ export interface SidebarSnapshot {
      * scheduler and transform paths.
      */
     executeThreshold: number;
+    /** Rust module cache boundary state, when the session uses Rust authority mode. */
+    boundaryPresent?: boolean;
+    coverageOrdinal?: number | null;
     newWorkTokens?: number | null;
     totalInputTokens?: number | null;
     /**

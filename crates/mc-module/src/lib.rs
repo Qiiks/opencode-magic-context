@@ -208,6 +208,8 @@ const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
 /// retried prompt resolves to the same keep watermark on both sides.
 const WRAPUP_KEEP_MIN: usize = 5;
 const WRAPUP_KEEP_MAX: usize = 100;
+/// Maximum number of newly published compartments returned by one status page.
+const SESSION_STATUS_COMPARTMENT_PAGE_LIMIT: usize = 50;
 /// After a historian abandon, suppress refires for this long so a persistently
 /// failing model does not burn a full summarization pass on every transform.
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
@@ -3834,11 +3836,69 @@ impl McHandler {
             }
         };
 
-        // The module currently has durable re-cut and import primitives, but no reachable
-        // operation that turns a raw transform snapshot into a complete recomp staging set.
-        // Returning nothing_to_do is honest; claiming started here would silently rebuild
-        // nothing and would violate the command's structural-rebuild contract.
-        match store.record_recomp_command(&session_id, command_id, "nothing_to_do", now_ms()) {
+        let loaded = match store.load(&session_id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let compartments = match store.load_compartments(&session_id) {
+            Ok(compartments) => compartments,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let never_minted = compartments.is_empty() && loaded.core.boundary_id.trim().is_empty();
+        if never_minted {
+            return match store.record_recomp_command(
+                &session_id,
+                command_id,
+                "nothing_to_do",
+                now_ms(),
+            ) {
+                Ok(row) => respond(json!({
+                    "ok": true,
+                    "disposition": row.disposition,
+                })),
+                Err(error) => HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                },
+            };
+        }
+
+        let _reset = match store.reset_session_for_recomp(&session_id, loaded.row_version) {
+            Ok(reset) => reset,
+            Err(error @ McStoreError::CasConflict { .. }) => {
+                // A transform may have committed between the status reads and the reset.
+                // The recomp latch remains held; ask the caller to retry rather than
+                // claiming a reset that did not use the observed cache version.
+                return HandlerOutcome::Error {
+                    code: "store_conflict".to_string(),
+                    message: error.to_string(),
+                };
+            }
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        // A transform generation is an in-memory fence for cached raw snapshots. Marking
+        // this session in-flight prevents an already assembled historian from acquiring
+        // a ready snapshot after the durable revert epoch has been bumped.
+        self.transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .begin(&session_id);
+        match store.record_recomp_command(&session_id, command_id, "started", now_ms()) {
             Ok(row) => respond(json!({
                 "ok": true,
                 "disposition": row.disposition,
@@ -3952,7 +4012,7 @@ impl McHandler {
         // text, and a retained delivered-command row needs coverage/row_version plus
         // the live wrapup latch to decide completion without a second op.
         let wrapup_active = wrapup_latch.map(|(_, rounds)| rounds);
-        respond(json!({
+        let mut response = json!({
             "ok": true,
             "summary": summary,
             "wrapup_active": wrapup_active.is_some(),
@@ -3962,7 +4022,59 @@ impl McHandler {
             "boundary_present": !loaded.core.boundary_id.trim().is_empty(),
             "compartment_count": compartment_count,
             "pending_drop_count": pending_drop_count,
-        }))
+            "usage": {
+                "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
+                "context_limit_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.context_limit_tokens),
+            },
+        });
+        if let Some(after_sequence) = request.get("include_compartments_after_seq") {
+            let Some(after_sequence) = after_sequence.as_i64().filter(|value| *value >= -1) else {
+                return invalid_params_error(
+                    "include_compartments_after_seq must be an integer >= -1",
+                );
+            };
+            let page = match store.load_compartments_after(
+                &session_id,
+                after_sequence,
+                SESSION_STATUS_COMPARTMENT_PAGE_LIMIT,
+            ) {
+                Ok(page) => page,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            let compartments = page
+                .compartments
+                .into_iter()
+                .map(|compartment| {
+                    json!({
+                        "sequence": compartment.sequence,
+                        "start_message": compartment.start_message,
+                        "end_message": compartment.end_message,
+                        "start_message_id": compartment.start_message_id,
+                        "end_message_id": compartment.end_message_id,
+                        "title": compartment.title,
+                        "content": compartment.content,
+                        "p1": compartment.p1,
+                        "p2": compartment.p2,
+                        "p3": compartment.p3,
+                        "p4": compartment.p4,
+                        "importance": compartment.importance,
+                        "episode_type": compartment.episode_type,
+                        "created_at": compartment.created_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let body = response
+                .as_object_mut()
+                .expect("session.status response is an object");
+            body.insert("compartments".to_string(), Value::Array(compartments));
+            body.insert("max_sequence".to_string(), json!(page.max_sequence));
+        }
+        respond(response)
     }
 
     fn wrapup_snapshot_is_current(
@@ -11837,6 +11949,118 @@ mod tests {
         )
         .await;
         assert_eq!(replay, recomp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_status_compartment_pages_are_bounded_and_contract_shaped() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .commit_state_import(
+                "ses",
+                "status-page-seed",
+                &(1..=55)
+                    .map(|sequence| {
+                        stored_comp(
+                            sequence,
+                            sequence,
+                            sequence,
+                            &format!("m{sequence}"),
+                            "body",
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                55,
+            )
+            .unwrap();
+
+        let body = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({
+                "method": "session.status",
+                "v": 1,
+                "session_id": "ses",
+                "include_compartments_after_seq": -1,
+            }),
+        ));
+        let compartments = body["compartments"].as_array().unwrap();
+        assert_eq!(compartments.len(), 50);
+        assert_eq!(compartments[0]["sequence"], json!(1));
+        assert_eq!(compartments[49]["sequence"], json!(50));
+        assert_eq!(body["max_sequence"], json!(55));
+        assert!(compartments[0].get("start_date").is_none());
+        assert!(compartments[0].get("legacy").is_none());
+
+        let tail = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({
+                "method": "session.status",
+                "v": 1,
+                "session_id": "ses",
+                "include_compartments_after_seq": 50,
+            }),
+        ));
+        assert_eq!(tail["compartments"].as_array().unwrap().len(), 5);
+        assert_eq!(tail["max_sequence"], json!(55));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recomp_resets_cache_boundary_and_replays_started() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .commit_state_import(
+                "ses",
+                "recomp-seed",
+                &[stored_comp(1, 1, 5, "m5", "seed")],
+                1,
+            )
+            .unwrap();
+        let before = store.load("ses").unwrap();
+        let mut core = before.core.clone();
+        core.boundary_id = "m5#0".to_string();
+        let mut meta = before.meta.clone();
+        meta.initialized = true;
+        meta.coverage_ordinal = Some(5);
+        store
+            .commit("ses", before.row_version, &core, &meta)
+            .unwrap();
+        let before_reset = store.load("ses").unwrap();
+
+        let first = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "session.recomp",
+                "v": 1,
+                "session_id": "ses",
+                "command_id": "recomp-reset",
+            }),
+        )
+        .await;
+        assert_eq!(first, json!({ "ok": true, "disposition": "started" }));
+        let after = store.load("ses").unwrap();
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        assert!(after.core.boundary_id.is_empty());
+        assert!(!after.meta.initialized);
+        assert!(after.meta.coverage_ordinal.is_none());
+        assert_eq!(after.meta.revert_epoch, before_reset.meta.revert_epoch + 1);
+        assert_eq!(
+            after.row_version,
+            Some(before_reset.row_version.unwrap() + 1)
+        );
+
+        let replay = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "session.recomp",
+                "v": 1,
+                "session_id": "ses",
+                "command_id": "recomp-reset",
+            }),
+        )
+        .await;
+        assert_eq!(replay, first);
+        assert_eq!(store.load("ses").unwrap().row_version, after.row_version);
     }
 
     #[tokio::test(flavor = "current_thread")]
