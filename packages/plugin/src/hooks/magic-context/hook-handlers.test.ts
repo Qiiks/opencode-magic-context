@@ -30,6 +30,39 @@ function createTestHook(db: Database): ReturnType<typeof createToolExecuteAfterH
 }
 
 describe("createToolExecuteAfterHook todo snapshots", () => {
+    test("rust mode forwards todo state to the module without changing TS capture", async () => {
+        const db = createTestDb();
+        try {
+            const calls: Array<{ sessionId: string; stateJson: string; ownerMessageId: string }> =
+                [];
+            const hook = createToolExecuteAfterHook({
+                db,
+                channel1StateBySession: new Map(),
+                transformMode: "rust",
+                todoStateSet: async (input) => {
+                    calls.push(input);
+                },
+            });
+            await hook({
+                tool: "todowrite",
+                sessionID: "ses-rust-todo",
+                args: {
+                    todos: [{ status: "pending", priority: "high", content: "Forward me" }],
+                    owner_message_id: "msg-owner",
+                },
+            });
+            expect(calls).toEqual([
+                {
+                    sessionId: "ses-rust-todo",
+                    stateJson: '[{"content":"Forward me","status":"pending","priority":"high"}]',
+                    ownerMessageId: "msg-owner",
+                },
+            ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("todowrite persists the latest todo state", async () => {
         const db = createTestDb();
         try {
