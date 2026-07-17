@@ -20,7 +20,10 @@ import {
 import { getHarness } from "../../shared/harness";
 import { isRecord } from "../../shared/record-type-guard";
 import { MODULE_PAGE_MAX_BYTES, moduleWireBodyBytes } from "./module-wire";
-import { readRawSessionMessagePartsById } from "./read-session-chunk";
+import {
+    readRawSessionMessageOrdinalById,
+    readRawSessionMessagePartsById,
+} from "./read-session-chunk";
 import type { RawMessageParts } from "./read-session-raw";
 import { formatDate } from "./temporal-awareness";
 
@@ -341,10 +344,15 @@ function flatBlockIdForRawMessage(
     return `${messageId}#${blockIndex}`;
 }
 
-function ordinalForMessageId(args: {
+/**
+ * Compartment rows retain ordinals from the TS storage basis, which can include
+ * synthetic summary rows. Resolve module boundaries from the summary-excluding
+ * basis so the shared memo compares one canonical value everywhere.
+ */
+export function canonicalOrdinalForMessageId(args: {
+    sessionId: string;
     raw: RawMessageParts | null;
     messageId: string;
-    declaredOrdinal: number;
     generation: number;
     state: ModuleStateSyncState;
 }): number | null | "mismatch" {
@@ -352,31 +360,34 @@ function ordinalForMessageId(args: {
         args.state.idOrdinalMemo.clear();
         args.state.idOrdinalMemoGeneration = args.generation;
     }
-    if (!args.raw || args.raw.id !== args.messageId || args.declaredOrdinal < 1) return null;
+    if (!args.raw || args.raw.id !== args.messageId) return null;
     const prior = args.state.idOrdinalMemo.get(args.messageId);
-    if (prior !== undefined && prior !== args.declaredOrdinal) return "mismatch";
-    args.state.idOrdinalMemo.set(args.messageId, args.declaredOrdinal);
-    return args.declaredOrdinal;
+    if (prior !== undefined) return prior;
+    const canonical = readRawSessionMessageOrdinalById(args.sessionId, args.messageId);
+    if (canonical === null || canonical < 1) return null;
+    args.state.idOrdinalMemo.set(args.messageId, canonical);
+    return canonical;
 }
 
 function serializeCompartment(args: {
     compartment: ReturnType<typeof getCompartments>[number];
+    sessionId: string;
     readRawById: (messageId: string) => RawMessageParts | null;
     state: ModuleStateSyncState;
 }): unknown | null | "mismatch" {
     const startRaw = args.readRawById(args.compartment.startMessageId);
     const endRaw = args.readRawById(args.compartment.endMessageId);
-    const startOrdinal = ordinalForMessageId({
+    const startOrdinal = canonicalOrdinalForMessageId({
+        sessionId: args.sessionId,
         raw: startRaw,
         messageId: args.compartment.startMessageId,
-        declaredOrdinal: args.compartment.startMessage,
         generation: args.state.shadowGeneration,
         state: args.state,
     });
-    const endOrdinal = ordinalForMessageId({
+    const endOrdinal = canonicalOrdinalForMessageId({
+        sessionId: args.sessionId,
         raw: endRaw,
         messageId: args.compartment.endMessageId,
-        declaredOrdinal: args.compartment.endMessage,
         generation: args.state.shadowGeneration,
         state: args.state,
     });
@@ -654,7 +665,12 @@ export async function buildModuleStateSyncPayload(args: {
         if (compartment.sequence <= acked.compartment_sequence) continue;
         args.options?.beforeSerializeCompartment?.();
         if (args.options?.shouldAbortSeed?.()) return "seed_budget";
-        const serialized = serializeCompartment({ compartment, readRawById, state: args.state });
+        const serialized = serializeCompartment({
+            compartment,
+            sessionId: args.pass.sessionId,
+            readRawById,
+            state: args.state,
+        });
         if (serialized === "mismatch") return "mismatch";
         if (serialized === null) return "unresolved";
         compartments.push(serialized);
@@ -834,6 +850,7 @@ export async function syncModuleState(args: {
 export const __moduleStateSyncTest = {
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
+    canonicalOrdinalForMessageId,
     loadModuleWatermarks,
     moduleWatermarksEqual,
     syncModuleState,

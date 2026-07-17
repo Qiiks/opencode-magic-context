@@ -27,6 +27,7 @@ import {
     type RawMessageParts,
     readRawSessionMessageByIdFromDb,
     readRawSessionMessageIdOrdinalsFromDb,
+    readRawSessionMessageOrdinalByIdFromDb,
     readRawSessionMessageOrdinalPageFromDb,
     readRawSessionMessagePageFromDb,
     readRawSessionMessagePartsByIdFromDb,
@@ -110,6 +111,7 @@ export interface RawMessageProvider {
     readMessagePage?: (afterOrdinal: number, limit: number, finalWatermark: number) => RawMessage[];
     readMessageById?: (messageId: string) => RawMessage | null;
     readMessagePartsById?: (messageId: string) => RawMessageParts | null;
+    readMessageOrdinalById?: (messageId: string) => number | null;
     readMessageIdOrdinals?: () => Map<string, number>;
     readMessageOrdinalPage?: (
         after: RawMessageOrdinalAnchor | null,
@@ -422,6 +424,44 @@ export function readRawSessionMessagePartsById(
     if (!openCodeDbExists()) return null;
     return withReadOnlySessionDb((db) =>
         readRawSessionMessagePartsByIdFromDb(db, sessionId, messageId),
+    );
+}
+
+export function readRawSessionMessageOrdinalById(
+    sessionId: string,
+    messageId: string,
+): number | null {
+    const provider = sessionProviders.get(sessionId);
+    if (provider?.readMessageOrdinalById) {
+        return provider.readMessageOrdinalById(messageId);
+    }
+    if (provider?.readMessageIdOrdinals) {
+        return provider.readMessageIdOrdinals().get(messageId) ?? null;
+    }
+    if (provider?.readMessageOrdinalPage) {
+        let after: RawMessageOrdinalAnchor | null = null;
+        let ordinal = 0;
+        while (true) {
+            const page = provider.readMessageOrdinalPage(after, 500);
+            if (page.length === 0) return null;
+            for (const entry of page) {
+                if (entry.contributesOrdinal) ordinal += 1;
+                if (entry.id === messageId) return entry.contributesOrdinal ? ordinal : null;
+            }
+            const last = page.at(-1);
+            if (!last || page.length < 500) return null;
+            after = { timeCreated: last.timeCreated, id: last.id };
+        }
+    }
+    if (provider?.readMessageById) {
+        return provider.readMessageById(messageId)?.ordinal ?? null;
+    }
+    if (provider) {
+        return provider.readMessages().find((message) => message.id === messageId)?.ordinal ?? null;
+    }
+    if (!openCodeDbExists()) return null;
+    return withReadOnlySessionDb((db) =>
+        readRawSessionMessageOrdinalByIdFromDb(db, sessionId, messageId),
     );
 }
 

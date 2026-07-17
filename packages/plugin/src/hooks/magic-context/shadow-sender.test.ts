@@ -1084,6 +1084,43 @@ describe("shadow sender", () => {
         }
     });
 
+    it("aligns declared trim ordinals with the canonical basis after a summary row", () => {
+        useTempDataHome("shadow-canonical-declared-trim-");
+        const sessionId = "s-canonical-declared-trim";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", text: "before" },
+            { id: "summary", role: "assistant", text: "summary", summary: true },
+            { id: "m2", role: "user", text: "boundary" },
+        ]);
+        const db = openDatabase();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 1,
+                startMessage: 3,
+                endMessage: 3,
+                startMessageId: "m2",
+                endMessageId: "m2",
+                title: "Boundary",
+                content: "content",
+            },
+        ]);
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "m2",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction-part",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 3,
+            targetEndMessageId: "m2",
+        });
+
+        expect(__shadowSenderTest.resolveDeclaredTrimForShadow({ db, sessionId })).toEqual(
+            expect.objectContaining({
+                boundary_absolute_ordinal: 2,
+                next_absolute_ordinal: 3,
+            }),
+        );
+    });
+
     it("seeds ordered active user-profile lines without reading project memories", async () => {
         useTempDataHome("shadow-profile-seed-");
         const db = openDatabase();

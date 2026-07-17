@@ -26,6 +26,7 @@ import { isRecord } from "../../shared/record-type-guard";
 import {
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
+    canonicalOrdinalForMessageId,
     type ModuleStateSyncPayload,
 } from "./module-state-sync";
 import {
@@ -34,7 +35,10 @@ import {
     resolveOrdinalsForModule,
     toFlatModuleWireBody,
 } from "./module-wire";
-import { readRawSessionMessagePartsById } from "./read-session-chunk";
+import {
+    readRawSessionMessageOrdinalById,
+    readRawSessionMessagePartsById,
+} from "./read-session-chunk";
 import {
     isRawCompactionSummaryInfo,
     type RawMessageOrdinalAnchor,
@@ -503,24 +507,6 @@ export async function resolveOrdinalsForShadow(args: {
     return resolveOrdinalsForModule(args);
 }
 
-function ordinalForMessageId(args: {
-    raw: RawMessageParts | null;
-    messageId: string;
-    declaredOrdinal: number;
-    generation: number;
-    state: SessionQueueState;
-}): number | null | "mismatch" {
-    if (args.state.idOrdinalMemoGeneration !== args.generation) {
-        args.state.idOrdinalMemo.clear();
-        args.state.idOrdinalMemoGeneration = args.generation;
-    }
-    if (!args.raw || args.raw.id !== args.messageId || args.declaredOrdinal < 1) return null;
-    const prior = args.state.idOrdinalMemo.get(args.messageId);
-    if (prior !== undefined && prior !== args.declaredOrdinal) return "mismatch";
-    args.state.idOrdinalMemo.set(args.messageId, args.declaredOrdinal);
-    return args.declaredOrdinal;
-}
-
 function flatBlockCountForRawMessage(message: RawMessageParts | undefined): number {
     if (!message) return 1;
     let count = 0;
@@ -578,6 +564,7 @@ export function flatBlockIdForRawMessage(
 export function resolveDeclaredTrimForShadow(args: {
     db: ContextDatabase;
     sessionId: string;
+    state?: SessionQueueState;
 }): ShadowDeclaredTrim | null {
     const marker = getPersistedCompactionMarkerState(args.db, args.sessionId);
     if (!marker || marker.boundaryOrdinal < 1) return null;
@@ -589,6 +576,16 @@ export function resolveDeclaredTrimForShadow(args: {
 
     const boundaryRaw = readRawSessionMessagePartsById(args.sessionId, targetEndMessageId);
     if (!boundaryRaw) return null;
+    const boundaryOrdinal = args.state
+        ? canonicalOrdinalForMessageId({
+              sessionId: args.sessionId,
+              raw: boundaryRaw,
+              messageId: targetEndMessageId,
+              generation: args.state.shadowGeneration,
+              state: args.state,
+          })
+        : readRawSessionMessageOrdinalById(args.sessionId, targetEndMessageId);
+    if (boundaryOrdinal === null || boundaryOrdinal === "mismatch") return null;
     const compartments = getCompartmentsByEndMessageId(args.db, args.sessionId, targetEndMessageId);
     const boundaryCompartment = compartments.find(
         (compartment) => compartment.endMessage === marker.boundaryOrdinal,
@@ -597,8 +594,8 @@ export function resolveDeclaredTrimForShadow(args: {
     const trim: ShadowDeclaredTrim = {
         flat_boundary_id: flatBlockIdForRawMessage(targetEndMessageId, boundaryRaw, "end"),
         boundary_bare_message_id: targetEndMessageId,
-        boundary_absolute_ordinal: marker.boundaryOrdinal,
-        next_absolute_ordinal: marker.boundaryOrdinal + 1,
+        boundary_absolute_ordinal: boundaryOrdinal,
+        next_absolute_ordinal: boundaryOrdinal + 1,
     };
     declaredTrimBySession.set(args.sessionId, { markerKey, trim });
     return trim;
@@ -1213,6 +1210,7 @@ export function createShadowSender(
             const declaredTrim = resolveDeclaredTrimForShadow({
                 db: pass.db,
                 sessionId: pass.sessionId,
+                state,
             });
             const denormalized = denormalizeShadowOutput({
                 db: pass.db,
