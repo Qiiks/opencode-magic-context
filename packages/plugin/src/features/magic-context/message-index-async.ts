@@ -1,4 +1,5 @@
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
+import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
@@ -195,14 +196,16 @@ export function scheduleReconciliation(
     }
     reconciliationScheduledSessions.add(sessionId);
 
-    defer(() => {
-        void reconcileSessionIndex(db, sessionId, readMessages)
-            .catch((error) => {
-                logIndexingError(sessionId, "reconciliation", error);
-            })
-            .finally(() => {
-                reconciliationScheduledSessions.delete(sessionId);
-            });
+    scheduleAfterBootQuiet(() => {
+        defer(() => {
+            void reconcileSessionIndex(db, sessionId, readMessages)
+                .catch((error) => {
+                    logIndexingError(sessionId, "reconciliation", error);
+                })
+                .finally(() => {
+                    reconciliationScheduledSessions.delete(sessionId);
+                });
+        });
     });
 }
 
@@ -280,15 +283,17 @@ export function scheduleClearAndReindex(
         if (key.startsWith(prefix)) completedIncrementalKeys.delete(key);
     }
 
-    defer(() => {
-        void runWithSessionLock(sessionId, () => {
-            clearIndexedMessages(db, sessionId);
-        })
-            .then(() => reconcileSessionIndex(db, sessionId, readMessages))
-            .catch((error) => {
-                reconciledSessions.delete(sessionId);
-                logIndexingError(sessionId, "clear and reindex", error);
-            });
+    scheduleAfterBootQuiet(() => {
+        defer(() => {
+            void runWithSessionLock(sessionId, () => {
+                clearIndexedMessages(db, sessionId);
+            })
+                .then(() => reconcileSessionIndex(db, sessionId, readMessages))
+                .catch((error) => {
+                    reconciledSessions.delete(sessionId);
+                    logIndexingError(sessionId, "clear and reindex", error);
+                });
+        });
     });
 }
 
