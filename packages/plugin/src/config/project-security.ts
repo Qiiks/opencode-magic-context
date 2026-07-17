@@ -201,6 +201,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    the trust boundary for embedding destinations.
  *  - `shadow_transform` — developer-only subc mirror lane. A repository must
  *    not enable extra local module traffic or comparison telemetry.
+ *  - `transform_mode` is intentionally allowed at project tier so a repository
+ *    can opt its own runtime into the experimental Rust pipeline. The resolver
+ *    requires trusted user-level `subc` configuration before Rust can activate.
  *  - `historian.model` / `historian.fallback_models` — historian model spend is
  *    user-level only; a cloned repo cannot force extra compaction cost.
  *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or

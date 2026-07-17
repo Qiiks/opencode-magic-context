@@ -10,6 +10,15 @@
       "description": "Enable magic context (default: true)",
       "type": "boolean"
     },
+    "transform_mode": {
+      "default": "ts",
+      "description": "Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); \"ts\" is the current TypeScript pipeline.",
+      "type": "string",
+      "enum": [
+        "ts",
+        "rust"
+      ]
+    },
     "auto_update": {
       "description": "Enable automatic npm self-update checks for the OpenCode plugin. Security: USER-only in config loader, so hostile project configs cannot suppress updates.",
       "type": "boolean"

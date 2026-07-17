@@ -9,6 +9,7 @@ import {
     type HistorianConfig,
     type SidekickConfig,
 } from "../../config/schema/magic-context";
+import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
@@ -143,6 +144,7 @@ export interface MagicContextDeps {
             enabled: boolean;
             min_chars: number;
         };
+        transform_mode?: ResolvedTransformMode;
         shadow_transform?: {
             enabled: boolean;
         };

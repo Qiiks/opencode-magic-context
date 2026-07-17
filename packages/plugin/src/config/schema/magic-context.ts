@@ -353,6 +353,8 @@ export interface ShadowEmbeddingConfig {
 
 export interface MagicContextConfig {
     enabled: boolean;
+    /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
+    transform_mode: "ts" | "rust";
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
      *  USER config only; project configs cannot disable it. Default: true. */
     auto_update?: boolean;
@@ -491,6 +493,12 @@ export interface MagicContextConfig {
 export const MagicContextConfigSchema = z
     .object({
         enabled: z.boolean().default(true).describe("Enable magic context (default: true)"),
+        transform_mode: z
+            .enum(["ts", "rust"])
+            .default("ts")
+            .describe(
+                'Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); "ts" is the current TypeScript pipeline.',
+            ),
         auto_update: z
             .boolean()
             .optional()
