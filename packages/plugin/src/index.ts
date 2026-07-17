@@ -30,6 +30,8 @@ import {
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
+import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
+import { SubcShadowTransport } from "./hooks/magic-context/shadow-sender";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./plugin/embedding-bootstrap";
@@ -146,11 +148,16 @@ const server: Plugin = async (ctx) => {
     }
 
     const liveSessionState = createLiveSessionState();
+    const rustModeModuleClient: RustModeModuleClient | undefined =
+        pluginConfig.transform_mode === "rust"
+            ? new SubcShadowTransport(undefined, undefined, undefined, "")
+            : undefined;
 
     const hooks = createSessionHooks({
         ctx,
         pluginConfig,
         liveSessionState,
+        rustModeModuleClient,
     });
 
     const tools = createToolRegistry({
@@ -280,6 +287,7 @@ const server: Plugin = async (ctx) => {
             config: pluginConfig,
             client: ctx.client,
             liveSessionState,
+            rustModeModuleClient,
         });
         rpcServer.start().catch((err) => {
             log(`[magic-context] RPC server failed to start: ${err}`);

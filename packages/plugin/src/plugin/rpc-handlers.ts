@@ -32,6 +32,7 @@ import {
     withReadOnlySessionDb,
 } from "../hooks/magic-context/read-session-db";
 import type { ManagedRecompContext } from "../hooks/magic-context/recomp-orchestrator";
+import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
 import {
     calibrateBuckets,
     resolveModelCalibration,
@@ -54,6 +55,17 @@ import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 // the next poll cold-starts from the persisted session_meta value's session by
 // re-folding once, which is the acceptable one-time cost design A accepts.
 const workMetricsCarryBySession = new Map<string, WorkMetricsCarry>();
+const RUST_STATUS_CACHE_TTL_MS = 2_000;
+export interface RustSessionStatus {
+    usage?: { current_total_input_tokens?: number; context_limit_tokens?: number };
+    boundary_present?: boolean;
+    coverage_ordinal?: number | null;
+    compartment_count?: number;
+    pending_drop_count?: number;
+    wrapup_active?: boolean;
+    wrapup_rounds?: number | null;
+}
+const rustStatusCache = new Map<string, { status: RustSessionStatus; cachedAt: number }>();
 
 /**
  * Lazily compute work-metrics for the sidebar. Returns the persisted fallback
@@ -92,6 +104,39 @@ function getDb(): Database | null {
         return openDatabase();
     } catch {
         return null;
+    }
+}
+
+async function loadRustSessionStatus(
+    client: RustModeModuleClient | undefined,
+    sessionId: string,
+    directory: string,
+): Promise<RustSessionStatus | undefined> {
+    if (!client) return undefined;
+    const cached = rustStatusCache.get(sessionId);
+    if (cached && Date.now() - cached.cachedAt < RUST_STATUS_CACHE_TTL_MS) {
+        return cached.status;
+    }
+    try {
+        const response = await client.call({
+            sessionId,
+            projectRoot: directory,
+            method: "session.status",
+            body: { method: "session.status", v: 1, session_id: sessionId },
+        });
+        const raw =
+            response && typeof response === "object" ? (response as Record<string, unknown>) : {};
+        const value =
+            raw.result && typeof raw.result === "object"
+                ? (raw.result as Record<string, unknown>)
+                : raw;
+        if (value.error || value.ok === false) return undefined;
+        const status = value as RustSessionStatus;
+        rustStatusCache.set(sessionId, { status, cachedAt: Date.now() });
+        return status;
+    } catch (error) {
+        log(`[rpc] Rust session.status unavailable for ${sessionId}:`, error);
+        return undefined;
     }
 }
 
@@ -146,6 +191,7 @@ export function buildSidebarSnapshot(
     // `liveSessionState.liveModelBySession`. When omitted (e.g. legacy test
     // callers), the snapshot falls back to the runtime default of 65%.
     config?: Record<string, unknown>,
+    moduleStatus?: RustSessionStatus,
 ): SidebarSnapshot {
     try {
         const projectIdentity = resolveProjectIdentity(directory);
@@ -160,6 +206,20 @@ export function buildSidebarSnapshot(
             ? Number(meta.last_context_percentage ?? meta.last_usage_percentage ?? 0)
             : 0;
         const inputTokens = meta ? Number(meta.last_input_tokens ?? 0) : 0;
+        const moduleUsage = moduleStatus?.usage;
+        const moduleInputTokens = moduleUsage?.current_total_input_tokens;
+        const moduleContextLimit = moduleUsage?.context_limit_tokens;
+        const effectiveInputTokens =
+            typeof moduleInputTokens === "number" && moduleInputTokens > 0
+                ? moduleInputTokens
+                : inputTokens;
+        const effectiveUsagePercentage =
+            typeof moduleInputTokens === "number" &&
+            moduleInputTokens > 0 &&
+            typeof moduleContextLimit === "number" &&
+            moduleContextLimit > 0
+                ? (moduleInputTokens / moduleContextLimit) * 100
+                : usagePercentage;
         // Work-metrics are computed lazily + incrementally HERE (the only
         // consumer), not in the transform hot path. The persisted session_meta
         // columns are a warm-start fallback used on cold start / DB-absent.
@@ -189,7 +249,10 @@ export function buildSidebarSnapshot(
                 "SELECT COUNT(*) as count FROM compartments WHERE session_id = ?",
             )
             .get(sessionId);
-        const compartmentCount = compartmentRow?.count ?? 0;
+        const compartmentCount =
+            typeof moduleStatus?.compartment_count === "number"
+                ? moduleStatus.compartment_count
+                : (compartmentRow?.count ?? 0);
 
         let memoryCount = 0;
         if (projectIdentity) {
@@ -211,6 +274,9 @@ export function buildSidebarSnapshot(
             pendingOpsCount = pendingRow?.count ?? 0;
         } catch {
             // pending_ops table may not exist
+        }
+        if (typeof moduleStatus?.pending_drop_count === "number") {
+            pendingOpsCount = moduleStatus.pending_drop_count;
         }
 
         let sessionNoteCount = 0;
@@ -334,9 +400,14 @@ export function buildSidebarSnapshot(
         }
 
         const contextLimit =
-            activeProviderID && activeModelID
-                ? resolveContextLimit(activeProviderID, activeModelID, { db, sessionID: sessionId })
-                : 0;
+            typeof moduleContextLimit === "number" && moduleContextLimit > 0
+                ? moduleContextLimit
+                : activeProviderID && activeModelID
+                  ? resolveContextLimit(activeProviderID, activeModelID, {
+                        db,
+                        sessionID: sessionId,
+                    })
+                  : 0;
 
         // Resolve the effective execute-threshold percentage for this
         // session's active model so the sidebar header can show
@@ -367,7 +438,7 @@ export function buildSidebarSnapshot(
 
         const calibration = resolveModelCalibration(activeProviderID, activeModelID);
         const calibrated = calibrateBuckets({
-            inputTokens,
+            inputTokens: effectiveInputTokens,
             systemLocal: systemPromptTokens,
             toolDefsLocal: measuredToolDefTokens,
             compartmentsLocal: compartmentTokens,
@@ -382,16 +453,16 @@ export function buildSidebarSnapshot(
 
         const fresh: SidebarSnapshot = {
             sessionId,
-            usagePercentage,
-            inputTokens,
+            usagePercentage: effectiveUsagePercentage,
+            inputTokens: effectiveInputTokens,
             contextLimit,
             systemPromptTokens: calibrated.systemTokens,
             compartmentCount,
             memoryCount,
             memoryBlockCount,
             pendingOpsCount,
-            historianRunning: compartmentInProgress,
-            compartmentInProgress,
+            historianRunning: moduleStatus?.wrapup_active === true || compartmentInProgress,
+            compartmentInProgress: moduleStatus?.wrapup_active === true || compartmentInProgress,
             sessionNoteCount,
             readySmartNoteCount,
             cacheTtl,
@@ -406,6 +477,8 @@ export function buildSidebarSnapshot(
             toolCallTokens: calibrated.toolCallTokens,
             toolDefinitionTokens: calibrated.toolDefinitionTokens,
             executeThreshold,
+            boundaryPresent: moduleStatus?.boundary_present,
+            coverageOrdinal: moduleStatus?.coverage_ordinal,
             newWorkTokens,
             totalInputTokens,
             recompProgress: (() => {
@@ -443,6 +516,7 @@ export function buildSidebarSnapshotRpcResponse(
     liveSessionState?: LiveSessionState,
     injectionBudgetTokens?: number,
     config?: Record<string, unknown>,
+    moduleStatus?: RustSessionStatus,
 ): Record<string, unknown> {
     try {
         return buildSidebarSnapshot(
@@ -452,6 +526,7 @@ export function buildSidebarSnapshotRpcResponse(
             liveSessionState,
             injectionBudgetTokens,
             config,
+            moduleStatus,
         ) as unknown as Record<string, unknown>;
     } catch {
         return { error: "sidebar snapshot unavailable" };
@@ -466,6 +541,7 @@ export function buildStatusDetail(
     config?: Record<string, unknown>,
     liveSessionState?: LiveSessionState,
     injectionBudgetTokens?: number,
+    moduleStatus?: RustSessionStatus,
 ): StatusDetail {
     const base = buildSidebarSnapshot(
         db,
@@ -474,6 +550,7 @@ export function buildStatusDetail(
         liveSessionState,
         injectionBudgetTokens,
         config,
+        moduleStatus,
     );
     const detail: StatusDetail = {
         ...base,
@@ -673,9 +750,10 @@ export function registerRpcHandlers(
         config: MagicContextConfig;
         client: unknown;
         liveSessionState: LiveSessionState;
+        rustModeModuleClient?: RustModeModuleClient;
     },
 ): void {
-    const { directory, config, liveSessionState } = args;
+    const { directory, config, liveSessionState, rustModeModuleClient } = args;
 
     // Read config as raw object for per-model resolution
     const rawConfig = config as unknown as Record<string, unknown>;
@@ -695,6 +773,10 @@ export function registerRpcHandlers(
         const dir = String(params.directory ?? directory);
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
+        const moduleStatus =
+            config.transform_mode === "rust"
+                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+                : undefined;
         return buildSidebarSnapshotRpcResponse(
             db,
             sessionId,
@@ -702,6 +784,7 @@ export function registerRpcHandlers(
             liveSessionState,
             injectionBudgetTokens,
             rawConfig,
+            moduleStatus,
         );
     });
 
@@ -711,6 +794,10 @@ export function registerRpcHandlers(
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
+        const moduleStatus =
+            config.transform_mode === "rust"
+                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+                : undefined;
         return buildStatusDetail(
             db,
             sessionId,
@@ -719,6 +806,7 @@ export function registerRpcHandlers(
             rawConfig,
             liveSessionState,
             injectionBudgetTokens,
+            moduleStatus,
         ) as unknown as Record<string, unknown>;
     });
 

@@ -116,7 +116,16 @@ export interface ShadowTransport {
     call(args: {
         sessionId: string;
         projectRoot: string;
-        method: "shadow_reset" | "state_sync" | "shadow_transform";
+        method:
+            | "shadow_reset"
+            | "state_sync"
+            | "shadow_transform"
+            | "transform"
+            | "session.status"
+            | "session.flush"
+            | "session.recomp"
+            | "session.wrapup"
+            | "todo_state.set";
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown>;
@@ -1515,6 +1524,9 @@ export class SubcShadowTransport implements ShadowTransport {
             | "shadow_transform"
             | "transform"
             | "session.status"
+            | "session.flush"
+            | "session.recomp"
+            | "session.wrapup"
             | "todo_state.set"
             | "agent_drops.append";
         body: unknown;

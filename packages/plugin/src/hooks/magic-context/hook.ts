@@ -873,6 +873,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         executeThresholdPercentage: deps.config.execute_threshold_percentage ?? 65,
         executeThresholdTokens: deps.config.execute_threshold_tokens,
         historyBudgetPercentage: deps.config.history_budget_percentage,
+        transformMode: deps.config.transform_mode,
+        rustModeModuleClient,
+        projectRoot: deps.directory,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
         getLiveModelKey: (sessionId) => {
             // Use DB fallback so /ctx-status shows the correct model-specific

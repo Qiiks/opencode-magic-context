@@ -676,6 +676,42 @@ const StatusDialog = props => {
     _$setProp(_el$45, "marginTop", 1);
     _$insertNode(_el$46, _el$47);
     _$insertNode(_el$47, _$createTextNode(`History Compression`));
+    _$insert(_el$37, (() => {
+      var _c$3 = _$memo(() => typeof s().boundaryPresent === "boolean");
+      return () => _c$3() && _$createComponent(R, {
+        get t() {
+          return t();
+        },
+        l: "Boundary",
+        get v() {
+          return s().boundaryPresent ? "present" : "absent";
+        }
+      });
+    })(), null);
+    _$insert(_el$37, (() => {
+      var _c$4 = _$memo(() => s().coverageOrdinal !== undefined);
+      return () => _c$4() && _$createComponent(R, {
+        get t() {
+          return t();
+        },
+        l: "Coverage ordinal",
+        get v() {
+          return _$memo(() => s().coverageOrdinal == null)() ? "none" : String(s().coverageOrdinal);
+        }
+      });
+    })(), null);
+    _$insert(_el$37, (() => {
+      var _c$5 = _$memo(() => typeof s().boundaryPresent === "boolean");
+      return () => _c$5() && _$createComponent(R, {
+        get t() {
+          return t();
+        },
+        l: "Compartments",
+        get v() {
+          return String(s().compartmentCount);
+        }
+      });
+    })(), null);
     _$insert(_el$37, _$createComponent(R, {
       get t() {
         return t();
@@ -686,8 +722,8 @@ const StatusDialog = props => {
       }
     }), null);
     _$insert(_el$37, (() => {
-      var _c$3 = _$memo(() => s().compressionBudget != null);
-      return () => _c$3() && _$createComponent(R, {
+      var _c$6 = _$memo(() => s().compressionBudget != null);
+      return () => _c$6() && _$createComponent(R, {
         get t() {
           return t();
         },
@@ -698,8 +734,8 @@ const StatusDialog = props => {
       });
     })(), null);
     _$insert(_el$37, (() => {
-      var _c$4 = _$memo(() => !!s().lastDreamerRunAt);
-      return () => _c$4() && _$createComponent(R, {
+      var _c$7 = _$memo(() => !!s().lastDreamerRunAt);
+      return () => _c$7() && _$createComponent(R, {
         get t() {
           return t();
         },
@@ -713,8 +749,8 @@ const StatusDialog = props => {
       });
     })(), null);
     _$insert(_el$4, (() => {
-      var _c$5 = _$memo(() => !!s().lastTransformError);
-      return () => _c$5() && (() => {
+      var _c$8 = _$memo(() => !!s().lastTransformError);
+      return () => _c$8() && (() => {
         var _el$62 = _$createElement("box"),
           _el$63 = _$createElement("text"),
           _el$64 = _$createTextNode(`⚠ `);

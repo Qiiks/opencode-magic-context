@@ -776,6 +776,9 @@ export interface ModuleStateSyncClient {
             | "state_sync"
             | "transform"
             | "session.status"
+            | "session.flush"
+            | "session.recomp"
+            | "session.wrapup"
             | "todo_state.set"
             | "agent_drops.append";
         body: unknown;

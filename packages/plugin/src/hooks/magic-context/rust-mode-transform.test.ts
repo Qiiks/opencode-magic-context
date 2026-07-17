@@ -146,6 +146,38 @@ describe("Rust mode authority adapter", () => {
         expect(secondOutput.messages).toBe(native);
     });
 
+    it("re-pages every transform payload after need_full_sync", async () => {
+        const sessionId = `rust-repage-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const messages = makeMessages(sessionId);
+        messages[0]!.parts = [{ type: "text", text: "x".repeat(600_000) }];
+        const native = [{ role: "assistant", parts: [] }];
+        const transformBodies: Array<Record<string, unknown>> = [];
+        let retryStarted = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                const page = body as Record<string, unknown>;
+                transformBodies.push(page);
+                if (!retryStarted && page.transform_page_complete === true) {
+                    retryStarted = true;
+                    return { status: "need_full_sync" };
+                }
+                return { native_messages: native };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const output = { messages: messages as unknown[] };
+        await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+        const pageIds = new Set(transformBodies.map((body) => body.transform_page_id));
+        expect(pageIds.size).toBe(2);
+        expect(transformBodies.length).toBeGreaterThan(2);
+        expect(output.messages).toBe(native);
+    });
+
     it("passes through raw input, parks after three failures, then probes on the fifth pass", async () => {
         const sessionId = `rust-failure-${Date.now()}`;
         sessions.push(sessionId);
