@@ -1,3 +1,4 @@
+import { setBootQuietPeriodForTests } from '@magic-context/core/plugin/boot-quiet';
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -976,6 +977,11 @@ describe("registerPiContextHandler", () => {
 	});
 
 	it("schedules first-touch message index reconciliation", async () => {
+		// Another test file in the same process may have activated the Pi entry,
+		// which arms the module-global boot-quiet gate and defers background
+		// lanes by two minutes. Reconciliation timing is what this test asserts,
+		// so neutralize the gate explicitly.
+		setBootQuietPeriodForTests(null);
 		const db = createTestDb();
 		try {
 			const fake = createFakePi();
@@ -989,8 +995,13 @@ describe("registerPiContextHandler", () => {
 			const messages = [userMessage("hello", 1)] as never[];
 
 			await handler({ messages }, fakeContext("ses-context") as never);
-			await new Promise((resolve) => setTimeout(resolve, 0));
-			await new Promise((resolve) => setTimeout(resolve, 0));
+			// The reconciliation runs asynchronously behind event-loop yields, so a
+			// fixed number of microtask hops is not enough under full-suite load.
+			// Poll with a wall-clock deadline instead of assuming a hop count.
+			const deadline = Date.now() + 5_000;
+			while (!isSessionReconciled("ses-context") && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
 
 			expect(isSessionReconciled("ses-context")).toBe(true);
 		} finally {
