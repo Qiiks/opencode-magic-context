@@ -4367,7 +4367,14 @@ fn latest_assistant_mutation_exempt_mid(
         .iter()
         .rev()
         .find(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
-        .filter(|message| message.ck.content.iter().any(is_reasoning_block))
+        .filter(|message| {
+            message
+                .ck
+                .content
+                .iter()
+                .find(|block| !is_reasoning_ignored_block(block))
+                .is_some_and(is_reasoning_block)
+        })
         .map(|message| message.mid.as_str())
 }
 
@@ -6242,6 +6249,64 @@ mod tests {
         ));
         assert!(matches!(
             &messages[1].content[0].kind,
+            ck_wire::CkKind::Text { text } if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn text_before_latest_reasoning_matches_ts_wire_shape() {
+        let assistant = CkWireMessage::from_parts(
+            "assistant",
+            vec![
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(ck_wire::OpaqueBlock {
+                    source: serde_json::json!({"harness": "opencode"}),
+                    kind: "step-start".to_string(),
+                    raw: serde_json::json!({"type": "step-start"}),
+                    arc: None,
+                })),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: "§18240§ answer".to_string(),
+                }),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "signed thinking".to_string(),
+                    signature: Some("sig".to_string()),
+                }),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                    provider_executed: false,
+                }),
+            ],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("msg_text_first".to_string()),
+                ..Default::default()
+            },
+        );
+        let ingress = vec![CkIngressMessage {
+            mid: "msg_text_first".to_string(),
+            ordinal: 1,
+            ck: assistant.clone(),
+        }];
+
+        assert_eq!(
+            latest_assistant_mutation_exempt_mid(&ingress, Some(SerializerProfile::OpencodeAiSdk),),
+            None
+        );
+
+        let mut served = vec![assistant];
+        assert_eq!(
+            apply_serializer_residuals(SerializerProfile::OpencodeAiSdk, &mut served),
+            1
+        );
+        assert!(matches!(
+            &served[0].content[1].kind,
+            ck_wire::CkKind::Text { text } if text == "§18240§ answer"
+        ));
+        assert!(matches!(
+            &served[0].content[2].kind,
             ck_wire::CkKind::Text { text } if text.is_empty()
         ));
     }

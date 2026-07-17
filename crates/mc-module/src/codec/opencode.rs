@@ -273,14 +273,39 @@ fn latest_reasoning_assistant_mid(messages: &[CkWireMessage]) -> Option<&str> {
         .rev()
         .find(|message| !message.meta.synthetic && message.role == "assistant")
         .filter(|message| {
-            message.content.iter().any(|block| {
-                matches!(
-                    &block.kind,
-                    CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
-                )
-            })
+            message
+                .content
+                .iter()
+                .find(|block| !is_reasoning_ignored_block(block))
+                .is_some_and(|block| {
+                    matches!(
+                        &block.kind,
+                        CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
+                    )
+                })
         })
         .and_then(|message| message.meta.harness_id.as_deref())
+}
+
+fn is_reasoning_ignored_block(block: &CkWireBlock) -> bool {
+    if matches!(&block.kind, CkKind::Text { text } if text.is_empty()) {
+        return true;
+    }
+    matches!(
+        &block.kind,
+        CkKind::Opaque(opaque)
+            if matches!(
+                opaque.kind.as_str(),
+                "step-start"
+                    | "step-finish"
+                    | "snapshot"
+                    | "patch"
+                    | "agent"
+                    | "retry"
+                    | "subtask"
+                    | "compaction"
+            )
+    )
 }
 
 fn decode_tool_part(
@@ -1003,5 +1028,36 @@ mod tests {
             served[1], raw[1],
             "latest signed assistant must retain ingress bytes"
         );
+    }
+
+    #[test]
+    fn text_before_latest_reasoning_uses_typed_wire_projection() {
+        let raw = vec![json!({
+            "info": { "id": "msg_text_first", "role": "assistant" },
+            "parts": [
+                { "type": "step-start" },
+                { "type": "text", "text": "answer" },
+                { "type": "reasoning", "text": "signed thinking", "metadata": { "signature": "sig" } }
+            ]
+        })];
+        let decoded = decode_opencode(&raw);
+        let mut output = decoded
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(latest_reasoning_assistant_mid(&output), None);
+        output[0].content[1].kind = CkKind::Text {
+            text: "§18240§ answer".to_string(),
+        };
+        output[0].content[2].kind = CkKind::Text {
+            text: String::new(),
+        };
+
+        let served = encode_opencode_with_session(&output, &decoded.sidecar, Some("ses_live"));
+        assert_eq!(served[0]["parts"][1]["text"], "§18240§ answer");
+        assert_eq!(served[0]["parts"][2]["type"], "text");
+        assert_eq!(served[0]["parts"][2]["text"], "");
     }
 }
