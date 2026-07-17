@@ -1451,6 +1451,9 @@ fn build_db_cache_events_with_decisions(
     // anthropic/openai/etc.; real busts land < 0.4. Recovery steps grow exactly
     // as predicted, so they classify stable with no separate "warming" state.)
     let mut seen_sessions: HashSet<(Harness, String)> = HashSet::new();
+    // Sessions where an earlier event in this window had a transform-decision
+    // row, i.e. Magic Context was demonstrably active before the current event.
+    let mut mc_active_sessions: HashSet<(Harness, String)> = HashSet::new();
     let mut last_finish_by_session: HashMap<(Harness, String), String> = HashMap::new();
     let mut current_turn_id_by_session: HashMap<(Harness, String), String> = HashMap::new();
     let mut prev_event_idx_by_session: HashMap<(Harness, String), usize> = HashMap::new();
@@ -1497,13 +1500,10 @@ fn build_db_cache_events_with_decisions(
             chronological[i].message_id.clone(),
         );
         let decision_row = transform_decisions.get(&decision_key);
-        let has_prior_transform_decision = chronological[..i].iter().any(|prior| {
-            transform_decisions.contains_key(&(
-                prior.harness,
-                prior.session_id.clone(),
-                prior.message_id.clone(),
-            ))
-        });
+        let has_prior_transform_decision = mc_active_sessions.contains(&session_key);
+        if decision_row.is_some() {
+            mc_active_sessions.insert(session_key.clone());
+        }
         let cause_from_decision = || {
             transform_decision_cause(decision_row).or_else(|| {
                 if decision_row.is_none() && has_prior_transform_decision {
