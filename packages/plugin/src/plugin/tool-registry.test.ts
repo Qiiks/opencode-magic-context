@@ -4,8 +4,10 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
-import { closeDatabase } from "../features/magic-context/storage";
+import { closeDatabase, openDatabase } from "../features/magic-context/storage";
+import type { RustToolBackends } from "./rust-tool-backends";
 import { createToolRegistry } from "./tool-registry";
 import type { PluginContext } from "./types";
 
@@ -35,10 +37,14 @@ function isolateDb(): void {
 // unused, so a minimal stub is sufficient.
 const ctx = { directory: process.cwd() } as unknown as PluginContext;
 
-function buildRegistry(config: Partial<MagicContextPluginConfig>): Record<string, unknown> {
+function buildRegistry(
+    config: Partial<MagicContextPluginConfig>,
+    rustToolBackends?: RustToolBackends,
+): Record<string, ToolDefinition> {
     return createToolRegistry({
         ctx,
         pluginConfig: { enabled: true, ...config } as MagicContextPluginConfig,
+        rustToolBackends,
     });
 }
 
@@ -48,6 +54,36 @@ describe("createToolRegistry — memory gating", () => {
         const tools = buildRegistry({});
         expect(Object.keys(tools)).toContain("ctx_memory");
         expect(Object.keys(tools)).toContain("ctx_search");
+    });
+
+    it("keeps ctx_note on context.db in rust mode", async () => {
+        isolateDb();
+        let moduleCalls = 0;
+        const tools = buildRegistry(
+            { transform_mode: "rust" },
+            {
+                reduce: async () => {
+                    moduleCalls += 1;
+                    return { ok: true, queued: 1 };
+                },
+                memorySync: () => {
+                    moduleCalls += 1;
+                },
+            },
+        );
+
+        const result = await tools.ctx_note.execute(
+            { action: "write", content: "Notes remain on the OpenCode leg." },
+            { sessionID: "ses-note-rust", directory: process.cwd() },
+        );
+        const db = openDatabase();
+        const row = db
+            ?.prepare("SELECT content FROM notes WHERE session_id = ?")
+            .get("ses-note-rust") as { content: string } | undefined;
+
+        expect(result).toContain("Saved session note");
+        expect(row?.content).toBe("Notes remain on the OpenCode leg.");
+        expect(moduleCalls).toBe(0);
     });
 
     it("omits ctx_memory when memory.enabled is false, but keeps ctx_search", () => {

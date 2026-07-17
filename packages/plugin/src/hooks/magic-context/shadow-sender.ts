@@ -1515,7 +1515,8 @@ export class SubcShadowTransport implements ShadowTransport {
             | "shadow_transform"
             | "transform"
             | "session.status"
-            | "todo_state.set";
+            | "todo_state.set"
+            | "agent_drops.append";
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown> {

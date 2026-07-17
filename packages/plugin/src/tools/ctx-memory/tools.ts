@@ -214,6 +214,14 @@ function getSourceType(deps: CtxMemoryToolDeps) {
     return deps.sourceType ?? "agent";
 }
 
+function requestRustMemorySync(deps: CtxMemoryToolDeps, sessionId: string): void {
+    try {
+        deps.rustToolBackends?.memorySync?.(sessionId);
+    } catch (error) {
+        sessionLog(sessionId, "rust memory sync trigger failed (ignored):", error);
+    }
+}
+
 interface MemoryProjectPathRow {
     project_path: string;
 }
@@ -404,6 +412,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 );
                 if (existingMemory) {
                     updateMemorySeenCount(deps.db, existingMemory.id);
+                    requestRustMemorySync(deps, toolContext.sessionID);
                     return `Memory already exists [ID: ${existingMemory.id}] in ${category} (seen count incremented).`;
                 }
 
@@ -426,6 +435,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     memoryId: insertResult.memory.id,
                     content,
                 });
+                requestRustMemorySync(deps, toolContext.sessionID);
 
                 return `Saved memory [ID: ${insertResult.memory.id}] in ${category}.`;
             }
@@ -501,6 +511,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     memoryId: memory.id,
                     content,
                 });
+                requestRustMemorySync(deps, toolContext.sessionID);
 
                 return `Updated memory [ID: ${memory.id}] in ${memory.category}.`;
             }
@@ -700,6 +711,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     memoryId: canonicalMemory.id,
                     content,
                 });
+                requestRustMemorySync(deps, toolContext.sessionID);
 
                 const supersededIds = sourceMemories
                     .map((memory) => memory.id)
@@ -757,6 +769,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         });
                     }
                 });
+                requestRustMemorySync(deps, toolContext.sessionID);
                 const idList = targets.map((t) => t.memoryId).join(", ");
                 const plural = targets.length > 1 ? "memories" : "memory";
                 return args.reason?.trim()

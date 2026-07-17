@@ -772,7 +772,12 @@ export interface ModuleStateSyncClient {
     call(args: {
         sessionId: string;
         projectRoot: string;
-        method: "state_sync" | "transform" | "session.status" | "todo_state.set";
+        method:
+            | "state_sync"
+            | "transform"
+            | "session.status"
+            | "todo_state.set"
+            | "agent_drops.append";
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown>;
