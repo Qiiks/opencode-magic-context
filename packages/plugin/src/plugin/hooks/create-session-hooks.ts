@@ -4,7 +4,7 @@ import { createCompactionHandler } from "../../features/magic-context/compaction
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { createScheduler } from "../../features/magic-context/scheduler";
 import { createTagger } from "../../features/magic-context/tagger";
-import { createMagicContextHook } from "../../hooks/magic-context";
+import { createMagicContextHook, createMagicContextHookAsync } from "../../hooks/magic-context";
 import type { LiveSessionState } from "../../hooks/magic-context/live-session-state";
 import type { RustModeModuleClient } from "../../hooks/magic-context/rust-mode-transform";
 import type { PluginContext } from "../types";
@@ -52,6 +52,42 @@ export function createSessionHooks(args: {
     });
     const compactionHandler = createCompactionHandler();
     const hookResult = createMagicContextHook({
+        client: ctx.client,
+        directory: ctx.directory,
+        tagger,
+        scheduler,
+        compactionHandler,
+        liveSessionState,
+        rustModeModuleClient: args.rustModeModuleClient,
+        config: buildMagicContextHookConfig(pluginConfig),
+    });
+
+    return {
+        magicContext: hookResult,
+        rustToolBackends: hookResult?.rustToolBackends,
+    };
+}
+
+export async function createSessionHooksAsync(args: {
+    ctx: PluginContext;
+    pluginConfig: MagicContextPluginConfig;
+    liveSessionState: LiveSessionState;
+    rustModeModuleClient?: RustModeModuleClient;
+}) {
+    const { ctx, pluginConfig, liveSessionState } = args;
+
+    if (pluginConfig.enabled !== true) {
+        return { magicContext: null, rustToolBackends: undefined };
+    }
+
+    const tagger = createTagger();
+    const scheduler = createScheduler({
+        executeThresholdPercentage:
+            pluginConfig.execute_threshold_percentage ?? DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+        executeThresholdTokens: pluginConfig.execute_threshold_tokens,
+    });
+    const compactionHandler = createCompactionHandler();
+    const hookResult = await createMagicContextHookAsync({
         client: ctx.client,
         directory: ctx.directory,
         tagger,

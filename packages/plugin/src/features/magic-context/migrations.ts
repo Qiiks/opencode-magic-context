@@ -23,6 +23,25 @@ interface Migration {
     up: (db: Database) => void;
 }
 
+const MIGRATION_LOCK_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const;
+
+export class MigrationLockBusyError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "MigrationLockBusyError";
+    }
+}
+
+function isSqliteLockError(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const candidate = error as { code?: unknown; message?: unknown };
+    if (candidate.code === "SQLITE_BUSY" || candidate.code === "SQLITE_LOCKED") return true;
+    return (
+        typeof candidate.message === "string" &&
+        /database is locked|sqlite_(busy|locked)/i.test(candidate.message)
+    );
+}
+
 function tableExists(db: Database, name: string): boolean {
     return Boolean(
         db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name),
@@ -2065,7 +2084,16 @@ export function isSiblingMigrationConflict(db: Database, error: unknown, version
  * advanced version instead of failing a deferred read-to-write lock upgrade.
  */
 export function runMigrations(db: Database): void {
-    ensureMigrationsTable(db);
+    try {
+        ensureMigrationsTable(db);
+    } catch (error) {
+        if (isSqliteLockError(error)) {
+            throw new MigrationLockBusyError(
+                `failed to prepare migration lock: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+        throw error;
+    }
 
     let loggedPlan = false;
     while (true) {
@@ -2099,6 +2127,11 @@ export function runMigrations(db: Database): void {
             if (!applied || !migration) break;
             log(`[migrations] applied v${migration.version}: ${migration.description}`);
         } catch (error) {
+            if (!migration && isSqliteLockError(error)) {
+                throw new MigrationLockBusyError(
+                    `failed to acquire migration write lock: ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
             if (migration && isSiblingMigrationConflict(db, error, migration.version)) {
                 // BEGIN IMMEDIATE prevents the normal race, but retain the narrow
                 // PK-conflict tolerance for unusual SQLite adapters or callers.
@@ -2125,5 +2158,41 @@ export function runMigrations(db: Database): void {
 
     if (loggedPlan) {
         log(`[migrations] schema version now: ${MIGRATIONS[MIGRATIONS.length - 1].version}`);
+    }
+}
+
+/**
+ * Run migrations without blocking the event loop while a sibling owns SQLite's
+ * write lock. Only failures from the lock/check phase are retried; migration
+ * body failures continue to fail closed immediately.
+ */
+export interface MigrationRetryOptions {
+    retryDelaysMs?: readonly number[];
+    sleep?: (delayMs: number) => Promise<void>;
+}
+
+export async function runMigrationsWithRetry(
+    db: Database,
+    options: MigrationRetryOptions = {},
+): Promise<void> {
+    const retryDelaysMs = options.retryDelaysMs ?? MIGRATION_LOCK_RETRY_DELAYS_MS;
+    const sleep =
+        options.sleep ??
+        ((delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+    const totalAttempts = retryDelaysMs.length + 1;
+    for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+        log(`[migrations] migration lock check attempt ${attempt}/${totalAttempts}`);
+        try {
+            runMigrations(db);
+            return;
+        } catch (error) {
+            if (!(error instanceof MigrationLockBusyError)) throw error;
+            const delayMs = retryDelaysMs[attempt - 1];
+            if (delayMs === undefined) throw error;
+            log(
+                `[migrations] migration write lock is busy; retrying attempt ${attempt + 1}/${totalAttempts} in ${delayMs}ms`,
+            );
+            await sleep(delayMs);
+        }
     }
 }

@@ -37,8 +37,10 @@ import {
     isDatabasePersisted,
     openDatabase,
 } from "../../features/magic-context/storage";
+import { openDatabaseAsync } from "../../features/magic-context/storage-db";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
+import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
@@ -153,6 +155,8 @@ export interface MagicContextDeps {
     };
     /** Test seam for the Rust authority adapter; production creates the subc client. */
     rustModeModuleClient?: RustModeModuleClient;
+    /** Test and async-boot seam for supplying a database already opened by the caller. */
+    openDatabaseForHook?: () => Database | null;
 }
 
 function notifyMagicContextDisabled(client: PluginContext["client"], reason: string): void {
@@ -194,7 +198,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>();
     let db: Database;
     try {
-        const opened = openDatabase();
+        const opened = deps.openDatabaseForHook ? deps.openDatabaseForHook() : openDatabase();
         if (!opened || !isDatabasePersisted(opened)) {
             const reason =
                 (opened ? getDatabasePersistenceError(opened) : null) ??
@@ -228,6 +232,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     }
 
     let lastScheduleCheckMs = 0;
+    let dreamQueueQuietScheduled = false;
 
     // Derive historian chunk budget from the historian model's own context window.
     // Historian is a single-shot summarizer, so its input is bounded by its OWN
@@ -827,6 +832,16 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     });
 
     const runDreamQueueInBackground = (): void => {
+        if (bootQuietRemainingMs() > 0) {
+            if (!dreamQueueQuietScheduled) {
+                dreamQueueQuietScheduled = true;
+                scheduleAfterBootQuiet(() => {
+                    dreamQueueQuietScheduled = false;
+                    runDreamQueueInBackground();
+                });
+            }
+            return;
+        }
         const dreaming = deps.config.dreamer;
         if (!dreaming || dreaming.disable === true) {
             return;
@@ -1112,4 +1127,26 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         enumerable: false,
     });
     return hooksWithBackends;
+}
+
+/**
+ * Async boot entry point. Migration lock retries must yield between attempts,
+ * while the hook itself remains synchronous once a database is available.
+ */
+export async function createMagicContextHookAsync(
+    deps: MagicContextDeps,
+): Promise<ReturnType<typeof createMagicContextHook>> {
+    let database: Database | null;
+    try {
+        database = await openDatabaseAsync();
+    } catch (error) {
+        const reason = getErrorMessage(error);
+        log("[magic-context] hook failed to open storage; disabling feature:", error);
+        notifyMagicContextDisabled(deps.client, reason);
+        return null;
+    }
+    return createMagicContextHook({
+        ...deps,
+        openDatabaseForHook: () => database,
+    });
 }
