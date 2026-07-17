@@ -589,6 +589,7 @@ struct OverlayComputation<'a, 'ctx> {
     temporal_rows: &'a mut Vec<TemporalMarkRow>,
     user_hint_rows: &'a mut Vec<UserHintRow>,
     overlay_frontier: Option<u64>,
+    mutation_exempt_mid: Option<&'a str>,
 }
 
 impl PendingOverlayDecisions {
@@ -607,6 +608,7 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
     channel1_appends: &'a [Channel1AppendRow],
+    mutation_exempt_mid: Option<&'a str>,
     context_limit_tokens: f64,
     input_tokens: f64,
 }
@@ -809,6 +811,8 @@ fn apply_once(
     }
 
     let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
+    let mutation_exempt_mid =
+        latest_assistant_mutation_exempt_mid(&req.messages, serializer_profile);
     let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
     let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
     let loaded = transform_snapshot.loaded;
@@ -1008,6 +1012,7 @@ fn apply_once(
             temporal_rows: &mut temporal_marks,
             user_hint_rows: &mut user_hints,
             overlay_frontier,
+            mutation_exempt_mid,
         })?;
     }
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
@@ -1137,11 +1142,26 @@ fn apply_once(
         PassClass::Defer
     };
     let tail_for_selection = tail_sel_items(&live, loaded.meta.coverage_ordinal);
-    let protected_block_ids = if cc_u1_active {
-        newest_active_tag_block_ids(&loaded.core, &loaded.meta, &projection, &tag_rows)
+    let mut protected_block_ids = if cc_u1_active {
+        newest_active_tag_block_ids(
+            &loaded.core,
+            &loaded.meta,
+            &projection,
+            &tag_rows,
+            mutation_exempt_mid,
+        )
     } else {
         HashSet::new()
     };
+    if let Some(mid) = mutation_exempt_mid {
+        protected_block_ids.extend(
+            projection
+                .blocks
+                .iter()
+                .filter(|block| block.mid == mid)
+                .map(|block| block.id.clone()),
+        );
+    }
     let selected_reductions = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
         // No per-request gate here: producer_gate already requires
@@ -1620,6 +1640,7 @@ fn apply_once(
                 projection: &projection,
                 tag_rows: &tag_rows,
                 channel1_appends: &channel1_appends,
+                mutation_exempt_mid,
                 context_limit_tokens,
                 input_tokens: usage_input_tokens,
             },
@@ -1640,6 +1661,7 @@ fn apply_once(
         req,
         tagging_active.then_some(&tag_overlay),
         tail_reclaim_enabled,
+        mutation_exempt_mid,
     )?;
 
     // Build the output before committing so a missing synthetic-todo anchor cannot
@@ -1689,6 +1711,7 @@ fn apply_once(
         meta: &meta,
         projection: &projection,
         tag_rows: &tag_rows,
+        mutation_exempt_mid,
         context_limit_tokens,
         input_tokens: usage_input_tokens,
         execute_threshold_percentage: ctx.execute_threshold_percentage,
@@ -2539,6 +2562,10 @@ fn pending_passthrough_result(
     tag_overlay: Option<&TagOverlayState>,
     surface_state: SurfaceState,
 ) -> TransformWithProjection {
+    let mutation_exempt_mid = latest_assistant_mutation_exempt_mid(
+        &req.messages,
+        SerializerProfile::parse(&req.serializer_profile),
+    );
     let blocks_by_mid = projection_blocks_by_mid(&projection);
     let mut response = TransformResponse::passthrough(
         req.messages
@@ -2552,6 +2579,7 @@ fn pending_passthrough_result(
                         blocks,
                         tag_overlay,
                         |_| false,
+                        mutation_exempt_mid == Some(message.mid.as_str()),
                     );
                 }
                 rendered
@@ -2653,12 +2681,17 @@ fn push_synthetic_todo_pair(out: &mut Vec<CkWireMessage>, meta: &ModuleMeta) {
     }
 }
 
-fn tag_mint_inputs(projection: &FlatProjection, core: &CoreState) -> Vec<TagMintInput> {
+fn tag_mint_inputs(
+    projection: &FlatProjection,
+    core: &CoreState,
+    mutation_exempt_mid: Option<&str>,
+) -> Vec<TagMintInput> {
     let frozen = frozen_red_targets(core);
     projection
         .blocks
         .iter()
         .filter(|block| !frozen.contains(&block.id))
+        .filter(|block| mutation_exempt_mid != Some(block.mid.as_str()))
         .filter_map(|block| {
             let (kind, source) = taggable_source(block)?;
             Some(TagMintInput {
@@ -2711,6 +2744,7 @@ fn newest_active_tag_block_ids(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     tag_rows: &[McTagRow],
+    mutation_exempt_mid: Option<&str>,
 ) -> HashSet<String> {
     const PROTECTED_TAG_COUNT: usize = 20;
 
@@ -2727,6 +2761,7 @@ fn newest_active_tag_block_ids(
             };
             if !is_tail(block.ordinal, meta.coverage_ordinal)
                 || frozen_red_payload(core, block.id()).is_some()
+                || mutation_exempt_mid == Some(block.mid.as_str())
             {
                 return false;
             }
@@ -2820,7 +2855,11 @@ fn apply_tag_overlay_to_message(
     blocks: &[&FlatBlock],
     overlay: Option<&TagOverlayState>,
     is_reduced: impl Fn(&FlatBlock) -> bool,
+    mutation_exempt: bool,
 ) {
+    if mutation_exempt {
+        return;
+    }
     let Some(overlay) = overlay else {
         return;
     };
@@ -3178,12 +3217,13 @@ fn compute_active_overlay_decisions(
         temporal_rows,
         user_hint_rows,
         overlay_frontier: frontier,
+        mutation_exempt_mid,
     } = input;
     let existing_tag_ids = tag_rows
         .iter()
         .map(|row| row.block_id.as_str())
         .collect::<HashSet<_>>();
-    let tag_mints = tag_mint_inputs(projection, core)
+    let tag_mints = tag_mint_inputs(projection, core, mutation_exempt_mid)
         .into_iter()
         .filter(|input| !existing_tag_ids.contains(input.block_id.as_str()))
         .collect::<Vec<_>>();
@@ -3215,6 +3255,7 @@ fn compute_active_overlay_decisions(
             && message.ck.role != "system"
             && message.ck.role != "tool"
             && (message.ck.role != "user" || is_authored_user_message(message))
+            && mutation_exempt_mid != Some(message.mid.as_str())
     }) {
         let is_new = frontier.is_none_or(|frontier| message.ordinal > frontier);
         if !is_authored_user_message(message) || !is_new {
@@ -3313,6 +3354,7 @@ fn compute_active_overlay_decisions(
 
     let user_hint = authored_tail
         .filter(|message| frontier.is_none_or(|frontier| message.ordinal > frontier))
+        .filter(|message| mutation_exempt_mid != Some(message.mid.as_str()))
         .and_then(|message| {
             let block = projection.blocks.iter().find(|block| {
                 block.mid == message.mid
@@ -3644,7 +3686,13 @@ fn maybe_append_channel1_nudge(
     input: Channel1NudgeInputs<'_, '_>,
     meta: &mut ModuleMeta,
 ) -> Option<Channel1AppendRow> {
-    let active_tags = active_tags_for_nudge(input.core, meta, input.projection, input.tag_rows);
+    let active_tags = active_tags_for_nudge(
+        input.core,
+        meta,
+        input.projection,
+        input.tag_rows,
+        input.mutation_exempt_mid,
+    );
     let live_tail_tokens = active_tags
         .iter()
         .map(|tag| tag.token_count.max(0))
@@ -3677,8 +3725,13 @@ fn maybe_append_channel1_nudge(
         .iter()
         .map(|row| row.block_id.as_str())
         .collect::<HashSet<_>>();
-    let block_id =
-        newest_tool_result_for_channel1(input.core, meta, input.projection, &existing_blocks)?;
+    let block_id = newest_tool_result_for_channel1(
+        input.core,
+        meta,
+        input.projection,
+        &existing_blocks,
+        input.mutation_exempt_mid,
+    )?;
     let hint = oldest_reclaimable_hint(&active_tags, working_window_tokens);
     let reminder = build_channel1_reminder(decision.level, decision.reclaimable_tokens, &hint);
     Some(Channel1AppendRow {
@@ -3693,6 +3746,7 @@ fn active_tags_for_nudge(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     tag_rows: &[McTagRow],
+    mutation_exempt_mid: Option<&str>,
 ) -> Vec<ActiveTagForNudge> {
     let tag_by_block = tag_rows
         .iter()
@@ -3703,6 +3757,7 @@ fn active_tags_for_nudge(
         taggable_kind(block).is_some()
             && is_tail(block.ordinal, meta.coverage_ordinal)
             && frozen_red_payload(core, block.id()).is_none()
+            && mutation_exempt_mid != Some(block.mid.as_str())
     }) {
         if let Some(row) = tag_by_block.get(block.id.as_str()) {
             out.push(ActiveTagForNudge {
@@ -3724,8 +3779,9 @@ fn active_tags_for_channel2(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     tag_rows: &[McTagRow],
+    mutation_exempt_mid: Option<&str>,
 ) -> Vec<ActiveTagForNudge> {
-    let stored = active_tags_for_nudge(core, meta, projection, tag_rows);
+    let stored = active_tags_for_nudge(core, meta, projection, tag_rows, mutation_exempt_mid);
     if !stored.is_empty() {
         return stored;
     }
@@ -3735,6 +3791,7 @@ fn active_tags_for_channel2(
         !block.synthetic
             && is_tail(block.ordinal, meta.coverage_ordinal)
             && frozen_red_payload(core, block.id()).is_none()
+            && mutation_exempt_mid != Some(block.mid.as_str())
     }) {
         let Some((kind, source)) = taggable_source(block) else {
             continue;
@@ -3755,6 +3812,7 @@ struct Channel2DirectiveInput<'a> {
     meta: &'a ModuleMeta,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
+    mutation_exempt_mid: Option<&'a str>,
     context_limit_tokens: f64,
     input_tokens: f64,
     execute_threshold_percentage: f64,
@@ -3773,8 +3831,13 @@ fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirective
         (input.context_limit_tokens * input.execute_threshold_percentage.clamp(1.0, 100.0) / 100.0)
             .round()
             .max(0.0) as i64;
-    let active_tags =
-        active_tags_for_channel2(input.core, input.meta, input.projection, input.tag_rows);
+    let active_tags = active_tags_for_channel2(
+        input.core,
+        input.meta,
+        input.projection,
+        input.tag_rows,
+        input.mutation_exempt_mid,
+    );
     let (reclaimable_tokens, live_tail_tokens) = channel2_token_aggregate(&active_tags);
     let usable_tokens =
         (working_window_tokens as f64 - input.input_tokens + live_tail_tokens as f64).max(0.0);
@@ -3944,6 +4007,7 @@ fn newest_tool_result_for_channel1(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     existing_blocks: &HashSet<&str>,
+    mutation_exempt_mid: Option<&str>,
 ) -> Option<String> {
     projection
         .blocks
@@ -3954,6 +4018,7 @@ fn newest_tool_result_for_channel1(
                 && is_tail(block.ordinal, meta.coverage_ordinal)
                 && frozen_red_payload(core, block.id()).is_none()
                 && !existing_blocks.contains(block.id.as_str())
+                && mutation_exempt_mid != Some(block.mid.as_str())
                 && tool_result_can_carry_channel1(&block.wire)
         })
         .max_by_key(|block| (block.ordinal, block.block_index))
@@ -4042,6 +4107,7 @@ fn build_output(
     req: &TransformRequest,
     tag_overlay: Option<&TagOverlayState>,
     synthetic_todo_enabled: bool,
+    mutation_exempt_mid: Option<&str>,
 ) -> Result<Vec<CkWireMessage>, TransformError> {
     let mut out = Vec::with_capacity(4 + req.messages.len());
     if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m0") {
@@ -4090,21 +4156,24 @@ fn build_output(
         if !is_tail(msg.ordinal, meta.coverage_ordinal) && !keep_leading_system {
             continue;
         }
+        let mutation_exempt = mutation_exempt_mid == Some(msg.mid.as_str());
         let rendered = if let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) {
-            let reduced: BTreeMap<usize, &str> = blocks
-                .iter()
-                // Render-time heal: a frozen unit targeting a reasoning block is
-                // ignored and the block serves its verbatim signed source bytes.
-                // Applying it would emit an unsigned typed reasoning block that
-                // Anthropic refuses to encode, so a historically poisoned unit
-                // would otherwise fence the session raw forever. The unit stays
-                // frozen (monotonicity untouched) but is permanently inert, and
-                // the exemption is deterministic on every pass.
-                .filter(|block| !is_reasoning_block(&block.wire))
-                .filter_map(|block| {
-                    frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
-                })
-                .collect();
+            let reduced: BTreeMap<usize, &str> = if mutation_exempt {
+                BTreeMap::new()
+            } else {
+                blocks
+                    .iter()
+                    // Render-time heal: if an immutable unit targets a reasoning block,
+                    // ignore it and serve the block's original signed bytes. Applying
+                    // the unit would produce an unsigned reasoning block that Anthropic
+                    // rejects, which would permanently block the session. The unit
+                    // remains frozen but becomes inert, and this behavior is deterministic.
+                    .filter(|block| !is_reasoning_block(&block.wire))
+                    .filter_map(|block| {
+                        frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
+                    })
+                    .collect()
+            };
             let mut rebuilt = msg.ck.clone();
             if !reduced.is_empty() {
                 rebuilt.mark_modified();
@@ -4128,13 +4197,27 @@ fn build_output(
                     }
                 }
             }
-            apply_tag_overlay_to_message(&mut rebuilt, msg, blocks, tag_overlay, |block| {
-                reduced.contains_key(&block.block_index)
-            });
+            if !mutation_exempt {
+                apply_tag_overlay_to_message(
+                    &mut rebuilt,
+                    msg,
+                    blocks,
+                    tag_overlay,
+                    |block| reduced.contains_key(&block.block_index),
+                    false,
+                );
+            }
             rebuilt
         } else {
             let mut rebuilt = msg.ck.clone();
-            apply_tag_overlay_to_message(&mut rebuilt, msg, &[], tag_overlay, |_| false);
+            apply_tag_overlay_to_message(
+                &mut rebuilt,
+                msg,
+                &[],
+                tag_overlay,
+                |_| false,
+                mutation_exempt,
+            );
             rebuilt
         };
         out.push(rendered);
@@ -4177,20 +4260,32 @@ fn build_output(
         );
     }
     if let Some(profile) = serializer_profile {
-        apply_serializer_residuals(profile, &mut out);
+        apply_serializer_residuals_with_exemption(profile, &mut out, mutation_exempt_mid);
     }
     Ok(out)
 }
 
+#[cfg(test)]
 fn apply_serializer_residuals(profile: SerializerProfile, messages: &mut [CkWireMessage]) -> usize {
+    apply_serializer_residuals_with_exemption(profile, messages, None)
+}
+
+fn apply_serializer_residuals_with_exemption(
+    profile: SerializerProfile,
+    messages: &mut [CkWireMessage],
+    mutation_exempt_mid: Option<&str>,
+) -> usize {
     if quirk_residual(profile).strips_reasoning_from_merged_assistants {
-        strip_reasoning_from_merged_assistants(messages)
+        strip_reasoning_from_merged_assistants_with_exemption(messages, mutation_exempt_mid)
     } else {
         0
     }
 }
 
-fn strip_reasoning_from_merged_assistants(messages: &mut [CkWireMessage]) -> usize {
+fn strip_reasoning_from_merged_assistants_with_exemption(
+    messages: &mut [CkWireMessage],
+    mutation_exempt_mid: Option<&str>,
+) -> usize {
     let mut stripped = 0;
     let mut prev_assistant = false;
     let mut kept_reasoning_in_run = false;
@@ -4199,6 +4294,10 @@ fn strip_reasoning_from_merged_assistants(messages: &mut [CkWireMessage]) -> usi
         if message.role != "assistant" {
             prev_assistant = false;
             kept_reasoning_in_run = false;
+            continue;
+        }
+        if mutation_exempt_mid == message.meta.harness_id.as_deref() {
+            prev_assistant = true;
             continue;
         }
 
@@ -4249,6 +4348,26 @@ fn is_reasoning_block(block: &CkWireBlock) -> bool {
         &block.kind,
         ck_wire::CkKind::Reasoning { .. } | ck_wire::CkKind::RedactedReasoning { .. }
     )
+}
+
+/// Anthropic verifies the latest assistant reasoning blocks against ingress bytes. Profiles
+/// that can reach an Anthropic-family endpoint therefore leave that message untouched.
+fn latest_assistant_mutation_exempt_mid(
+    messages: &[CkIngressMessage],
+    profile: Option<SerializerProfile>,
+) -> Option<&str> {
+    if !matches!(
+        profile,
+        Some(SerializerProfile::ClaudeCodeAnthropic | SerializerProfile::OpencodeAiSdk)
+    ) {
+        return None;
+    }
+    messages
+        .iter()
+        .rev()
+        .find(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
+        .filter(|message| message.ck.content.iter().any(is_reasoning_block))
+        .map(|message| message.mid.as_str())
 }
 
 fn is_empty_text_block(block: &CkWireBlock) -> bool {
@@ -6103,6 +6222,111 @@ mod tests {
             &messages[1].content[0].kind,
             ck_wire::CkKind::Text { text } if text.is_empty()
         ));
+    }
+
+    #[test]
+    fn latest_assistant_reasoning_is_exempt_from_opencode_healing() {
+        fn assistant(mid: &str, reasoning: &str, text: &str) -> CkWireMessage {
+            CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                        text: reasoning.to_string(),
+                        signature: Some(format!("sig-{mid}")),
+                    }),
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: text.to_string(),
+                    }),
+                ],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            )
+        }
+
+        let base = vec![
+            assistant("older", "older thinking", "older answer"),
+            assistant("latest", "latest thinking", "latest answer"),
+        ];
+        let mut fail_first = base.clone();
+        assert_eq!(
+            apply_serializer_residuals(SerializerProfile::OpencodeAiSdk, &mut fail_first),
+            1
+        );
+        assert_ne!(
+            serde_json::to_vec(&fail_first[1]).unwrap(),
+            serde_json::to_vec(&base[1]).unwrap(),
+            "the consecutive-assistant residual mutates the latest reasoning block"
+        );
+
+        let mut served = base.clone();
+        assert_eq!(
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut served,
+                Some("latest"),
+            ),
+            0
+        );
+        assert_eq!(
+            serde_json::to_vec(&served[1]).unwrap(),
+            serde_json::to_vec(&base[1]).unwrap(),
+            "the latest assistant with reasoning must remain byte-stable"
+        );
+
+        let ingress = base
+            .iter()
+            .enumerate()
+            .map(|(index, ck)| CkIngressMessage {
+                mid: ck.meta.harness_id.clone().unwrap(),
+                ordinal: index as u64 + 1,
+                ck: ck.clone(),
+            })
+            .collect::<Vec<_>>();
+        let request = profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "latest-assistant-output",
+            "cfg0",
+            ingress,
+        );
+        let projection = project_messages(&request.messages).unwrap();
+        let mut overlay = TagOverlayState::default();
+        overlay.tag_by_block_id.insert("latest#1".to_string(), 7);
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        let unprotected = build_output(
+            &core,
+            &meta,
+            &projection,
+            &request,
+            Some(&overlay),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            serde_json::to_vec(&unprotected[1]).unwrap(),
+            serde_json::to_vec(&request.messages[1].ck).unwrap(),
+            "the overlay and healing fixture must differ before the exemption"
+        );
+        let protected = build_output(
+            &core,
+            &meta,
+            &projection,
+            &request,
+            Some(&overlay),
+            false,
+            Some("latest"),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&protected[1]).unwrap(),
+            serde_json::to_vec(&request.messages[1].ck).unwrap(),
+            "latest assistant output must ignore overlays and healing"
+        );
     }
 
     // ===== Module-integration tests: STORE STATE in → compose+core bytes out.

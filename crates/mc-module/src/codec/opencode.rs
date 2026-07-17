@@ -231,6 +231,7 @@ fn encode_opencode_impl(
     session_id: Option<&str>,
     preserve_compaction: bool,
 ) -> Vec<MessageV2Json> {
+    let mutation_exempt_mid = latest_reasoning_assistant_mid(messages);
     let mut encoded = Vec::with_capacity(messages.len());
     let mut synthetic_index = 0;
     let mut index = 0;
@@ -255,12 +256,31 @@ fn encode_opencode_impl(
             meta_for_ck(sidecar, msg, index)
         };
         encoded.push(match meta {
+            Some(meta) if mutation_exempt_mid == Some(meta.mid.as_str()) => meta.raw.clone(),
             Some(meta) => encode_with_meta(msg, meta, preserve_compaction),
             None => encode_new_message(msg, session_id),
         });
         index += 1;
     }
     encoded
+}
+
+/// Anthropic verifies the latest assistant reasoning blocks against the original response.
+/// Returning its retained ingress value avoids re-encoding that message after transform.
+fn latest_reasoning_assistant_mid(messages: &[CkWireMessage]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| !message.meta.synthetic && message.role == "assistant")
+        .filter(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    &block.kind,
+                    CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
+                )
+            })
+        })
+        .and_then(|message| message.meta.harness_id.as_deref())
 }
 
 fn decode_tool_part(
@@ -928,5 +948,60 @@ mod tests {
         assert!(encoded_parts
             .iter()
             .all(|part| part.get("type").and_then(Value::as_str) != Some("compaction")));
+    }
+
+    #[test]
+    fn latest_assistant_reasoning_keeps_ingress_bytes_verbatim() {
+        let raw = vec![
+            json!({
+                "info": { "id": "msg_old", "role": "assistant" },
+                "parts": [
+                    { "type": "reasoning", "text": "old thinking", "metadata": { "signature": "old-sig" } },
+                    { "type": "text", "text": "old answer" }
+                ]
+            }),
+            json!({
+                "info": { "id": "msg_latest", "role": "assistant", "providerField": "keep" },
+                "parts": [
+                    { "type": "step-start", "step": 7 },
+                    { "type": "reasoning", "text": "latest thinking", "metadata": { "signature": "latest-sig" }, "providerField": "keep" },
+                    { "type": "text", "text": "latest answer" },
+                    { "type": "reasoning", "text": "latest second thinking", "metadata": { "signature": "latest-sig-2" } },
+                    { "type": "step-finish", "reason": "stop" }
+                ]
+            }),
+        ];
+        let decoded = decode_opencode(&raw);
+        let mut output = decoded
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        output[1].content.swap(0, 1);
+        let latest_text = output[1]
+            .content
+            .iter_mut()
+            .find(|block| matches!(&block.kind, CkKind::Text { .. }))
+            .unwrap();
+        latest_text.kind = CkKind::Text {
+            text: "mutated latest answer".to_string(),
+        };
+
+        let latest_meta = meta_for_ck(&decoded.sidecar, &output[1], 1).unwrap();
+        let naive = encode_with_meta(&output[1], latest_meta, true);
+        assert_ne!(
+            naive, raw[1],
+            "the mutation trigger must differ before the exemption"
+        );
+        assert_eq!(
+            naive["parts"][1]["type"], "step-start",
+            "naive index-based encode changes the signed reasoning part"
+        );
+
+        let served = encode_opencode_with_session(&output, &decoded.sidecar, Some("ses_live"));
+        assert_eq!(
+            served[1], raw[1],
+            "latest signed assistant must retain ingress bytes"
+        );
     }
 }
