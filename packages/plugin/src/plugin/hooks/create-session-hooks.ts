@@ -40,7 +40,7 @@ export function createSessionHooks(args: {
     const { ctx, pluginConfig, liveSessionState } = args;
 
     if (pluginConfig.enabled !== true) {
-        return { magicContext: null };
+        return { magicContext: null, rustToolBackends: undefined };
     }
 
     const tagger = createTagger();
@@ -50,16 +50,18 @@ export function createSessionHooks(args: {
         executeThresholdTokens: pluginConfig.execute_threshold_tokens,
     });
     const compactionHandler = createCompactionHandler();
+    const hookResult = createMagicContextHook({
+        client: ctx.client,
+        directory: ctx.directory,
+        tagger,
+        scheduler,
+        compactionHandler,
+        liveSessionState,
+        config: buildMagicContextHookConfig(pluginConfig),
+    });
 
     return {
-        magicContext: createMagicContextHook({
-            client: ctx.client,
-            directory: ctx.directory,
-            tagger,
-            scheduler,
-            compactionHandler,
-            liveSessionState,
-            config: buildMagicContextHookConfig(pluginConfig),
-        }),
+        magicContext: hookResult,
+        rustToolBackends: hookResult?.rustToolBackends,
     };
 }

@@ -430,6 +430,7 @@ export interface TransformDeps {
     rustModeModuleClient?: RustModeModuleClient;
     rustModeProjectRoot?: string;
     onRustModeParked?: (sessionId: string, message: string) => void;
+    rustMemorySyncRequestedSessions?: Set<string>;
 }
 
 export function createTransform(deps: TransformDeps) {
@@ -441,6 +442,7 @@ export function createTransform(deps: TransformDeps) {
                   hostClient: deps.client,
                   projectRoot: deps.rustModeProjectRoot ?? deps.directory,
                   notifyParked: deps.onRustModeParked,
+                  memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
               })
             : undefined;
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();

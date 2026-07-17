@@ -156,6 +156,7 @@ const server: Plugin = async (ctx) => {
     const tools = createToolRegistry({
         ctx,
         pluginConfig,
+        rustToolBackends: hooks.rustToolBackends,
     });
 
     // v22 deferred legacy-memory identity backfill. createSessionHooks() opens

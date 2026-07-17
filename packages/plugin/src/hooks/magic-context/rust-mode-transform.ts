@@ -61,6 +61,7 @@ export interface RustModeTransformOptions {
     projectRoot?: string;
     notifyParked?: (sessionId: string, message: string) => void;
     moduleTimeoutMs?: number;
+    memorySyncRequestedSessions?: Set<string>;
 }
 
 function cloneForModule<T>(value: T): T {
@@ -355,6 +356,19 @@ export function createRustModeTransform(
                 nowMs: Date.now(),
             };
             const projectRoot = options.projectRoot ?? directory;
+            if (options.memorySyncRequestedSessions?.delete(sessionId)) {
+                // A memory tool call can complete after the prior authority pass has
+                // acknowledged its watermarks. Rewind only memory watermarks so the
+                // next pass ships the mutation delta without reseeding compartments.
+                const watermarks = state.lastAckedWatermarks;
+                if (watermarks) {
+                    state.lastAckedWatermarks = {
+                        ...watermarks,
+                        memory_id: 0,
+                        memory_mutation_id: 0,
+                    };
+                }
+            }
             await syncModuleState({
                 client: { call: callModule },
                 state,

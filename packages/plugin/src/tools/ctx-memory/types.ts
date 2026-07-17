@@ -1,4 +1,5 @@
 import type { MemorySourceType } from "../../features/magic-context/memory";
+import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 
 // Actions a PRIMARY (non-dreamer) agent may run. Primary agents see active
@@ -49,4 +50,5 @@ export interface CtxMemoryToolDeps {
     embeddingEnabled?: boolean;
     allowedActions?: CtxMemoryAction[];
     sourceType?: MemorySourceType;
+    rustToolBackends?: RustToolBackends;
 }

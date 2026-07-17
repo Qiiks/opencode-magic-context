@@ -40,6 +40,7 @@ import {
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
+import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
@@ -605,6 +606,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         deps.config.transform_mode !== "rust" && deps.config.shadow_transform?.enabled === true
             ? createShadowSender()
             : undefined;
+    const rustMemorySyncRequestedSessions = new Set<string>();
     const rustModeModuleClient =
         deps.rustModeModuleClient ??
         (deps.config.transform_mode === "rust"
@@ -644,6 +646,27 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   return client;
               })()
             : undefined);
+    const rustToolBackends: RustToolBackends | undefined =
+        deps.config.transform_mode === "rust" && rustModeModuleClient
+            ? {
+                  reduce: ({ sessionId, projectRoot, drop, commandId }) =>
+                      rustModeModuleClient.call({
+                          sessionId,
+                          projectRoot,
+                          method: "agent_drops.append",
+                          body: {
+                              method: "agent_drops.append",
+                              v: 1,
+                              session_id: sessionId,
+                              drop,
+                              command_id: commandId,
+                          },
+                      }),
+                  memorySync: (sessionId: string) => {
+                      rustMemorySyncRequestedSessions.add(sessionId);
+                  },
+              }
+            : undefined;
     const notifyRustModeParked = (sessionId: string, message: string): void => {
         const client = deps.client as {
             tui?: {
@@ -753,6 +776,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         shadowSender,
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
+        rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
     });
     const eventHandler = createEventHandler({
@@ -795,6 +819,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             sessionDirectoryBySession.delete(sessionId);
             recompProgressBySession.delete(sessionId);
             internalChildSessions.delete(sessionId);
+            rustMemorySyncRequestedSessions.delete(sessionId);
             channel1StateBySession.delete(sessionId);
             shadowSender?.clearSession(sessionId);
             clearEmbedSessionState(sessionId);
@@ -998,7 +1023,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         protectedTags: deps.config.protected_tags,
     });
 
-    return {
+    const hooks = {
         "experimental.chat.messages.transform": transform,
         "experimental.chat.system.transform": systemPromptHashHandler,
         "experimental.text.complete": createTextCompleteHandler(),
@@ -1076,4 +1101,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     : undefined,
         }),
     };
+    const hooksWithBackends = hooks as typeof hooks & {
+        rustToolBackends?: RustToolBackends;
+    };
+    Object.defineProperty(hooksWithBackends, "rustToolBackends", {
+        value: rustToolBackends,
+        enumerable: false,
+    });
+    return hooksWithBackends;
 }

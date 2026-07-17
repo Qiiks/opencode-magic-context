@@ -261,6 +261,76 @@ describe("createCtxReduceTools", () => {
             );
         });
 
+        it("uses the raw drop string and stable call id in rust mode", async () => {
+            seedTags(db, [{ id: 3, sessionId: "ses-1" }]);
+            const calls: Array<{ drop: string; commandId: string; projectRoot: string }> = [];
+            const rustTools = createCtxReduceTools({
+                db,
+                protectedTags: 0,
+                rustToolBackends: {
+                    reduce: async (input) => {
+                        calls.push(input);
+                        return { ok: true, queued: 1 };
+                    },
+                },
+            });
+            const rustContext = {
+                sessionID: "ses-1",
+                directory: "/repo/project",
+                callID: "call-1",
+            };
+
+            const rustResult = await rustTools.ctx_reduce.execute({ drop: "3" }, rustContext);
+            const tsResult = await createCtxReduceTools({
+                db,
+                protectedTags: 0,
+            }).ctx_reduce.execute({ drop: "3" }, toolContext());
+
+            expect(rustResult).toBe(tsResult);
+            expect(calls[0]).toMatchObject({
+                drop: "3",
+                projectRoot: "/repo/project",
+            });
+            expect(calls[0]?.commandId).toBe("oc-ses-1-call-1");
+
+            await rustTools.ctx_reduce.execute({ drop: "3" }, rustContext as never);
+            expect(calls[1]?.commandId).toBe(calls[0]?.commandId);
+
+            await rustTools.ctx_reduce.execute({ drop: "3" }, {
+                ...rustContext,
+                callID: "call-2",
+            } as never);
+            expect(calls[2]?.commandId).not.toBe(calls[0]?.commandId);
+        });
+
+        it("returns the existing failure wording when the rust module rejects a drop", async () => {
+            const tools = createCtxReduceTools({
+                db,
+                protectedTags: 0,
+                rustToolBackends: {
+                    reduce: async () => {
+                        throw new Error("module unavailable");
+                    },
+                },
+            });
+
+            await expect(tools.ctx_reduce.execute({ drop: "3-5" }, toolContext())).resolves.toBe(
+                "Error: Failed to queue ctx_reduce operations. module unavailable",
+            );
+        });
+
+        it("keeps the TypeScript path when no rust backend is registered", async () => {
+            seedTags(db, [{ id: 3, sessionId: "ses-1" }]);
+
+            const result = await createCtxReduceTools({ db, protectedTags: 0 }).ctx_reduce.execute(
+                { drop: "3" },
+                toolContext(),
+            );
+
+            expect(result).toBe("Queued: drop §3§.");
+            expect(getPendingOps(db, "ses-1")).toHaveLength(1);
+        });
+
         it("rolls back partial queue writes on failure", async () => {
             seedTags(db, [
                 { id: 1, sessionId: "ses-1" },
