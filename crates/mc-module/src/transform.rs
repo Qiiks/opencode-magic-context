@@ -31,7 +31,9 @@ use crate::selection::{
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
     Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, ModuleMeta,
-    ModuleUsage, PendingRewriteState, StoredCompartment, TagMintInput,
+    ModuleUsage, PendingAgentDrop, PendingRewriteState, StoredCompartment, TagMintInput,
+    TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
+    UserHintDecisionInput, UserHintRow, SHADOW_SESSION_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,6 +67,23 @@ const CHANNEL1_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_PRESSURE_FLOOR: f64 = 0.8;
 const CHANNEL1_USABLE_FRACTION: f64 = 1.0 / 3.0;
+const CHANNEL2_MIN_RECLAIMABLE: i64 = 10_000;
+const CHANNEL2_USABLE_FRACTION: f64 = 1.0 / 3.0;
+const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
+const USER_HINT_QUERY_CHAR_CAP: usize = 500;
+const USER_HINT_FRAGMENT_CHAR_CAP: usize = 100;
+const USER_HINT_TOTAL_CHAR_CAP: usize = 600;
+const USER_HINT_CANDIDATE_LIMIT: usize = 100;
+const USER_HINT_TOKEN_CAP: usize = 24;
+const USER_HINT_RESULT_LIMIT: usize = 3;
+const USER_HINT_MIN_MATCHED_TOKENS: usize = 2;
+const USER_HINT_NORMALIZED_SCORE_FLOOR: f64 = 0.35;
+const DEFAULT_CLEAR_REASONING_AGE: u64 = 50;
+
+#[cfg(test)]
+thread_local! {
+    static USER_HINT_LEXICAL_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The m1 delta content + its byte-affecting digest. `revision` is a digest over ALL
 /// byte-affecting m1 render inputs such that `render` is a pure function of what the
@@ -184,6 +203,33 @@ pub struct TransformRequest {
     pub serializer_profile: String,
     pub session_id: String,
     pub render_config: String,
+    /// Canonical provider id used by the native serializer gate. Empty sentinels are
+    /// safe only for the OpenCode Anthropic adapter, matching TS `modelAcceptsEmptyContent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Provider/model key retained for older plugin senders that predate the explicit
+    /// provider field. The canonical `anthropic/...` prefix is the same provider gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_key: Option<String>,
+    /// Number of message ordinals kept as recent reasoning before the OpenCode
+    /// native serve pass clears older assistant reasoning. This mirrors the TS
+    /// `clear_reasoning_age` setting; the module uses absolute ordinals because
+    /// its CK ingress does not carry TS tag numbers.
+    #[serde(default = "default_clear_reasoning_age")]
+    pub clear_reasoning_age: u64,
+    /// Whether this request advertises the canonical reduction tool. Missing input is
+    /// deliberately false so older callers stay on the dormant byte path.
+    #[serde(default)]
+    pub tool_present: bool,
+    /// Ask the module to include an OpenCode-native rendering alongside canonical CK.
+    /// Missing input is deliberately false so existing responses remain byte-identical.
+    #[serde(default)]
+    pub serve_native: bool,
+    /// Optional OpenCode message-with-parts ingress used to retain provider-native fields
+    /// while encoding a served response. CK-only callers may omit it; native serving still
+    /// produces valid OpenCode messages, but cannot replay fields that were not supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_messages: Option<Vec<Value>>,
     /// Caller-owned identity for the full raw array. The module treats it as opaque and
     /// only echoes it on success-shaped responses so consumers can validate cached bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,12 +243,30 @@ pub struct TransformRequest {
     pub usage: Option<ModuleUsage>,
     #[serde(default)]
     pub provider_error: Option<String>,
+    /// Shadow-only evidence that the newest assistant tail is still streaming. When true,
+    /// identity enforcement leaves that tail provisional until a later completed pass.
+    #[serde(default)]
+    pub mid_turn: bool,
+    /// Proxy-observed completion time for the prior successful response on this exact
+    /// conversation key. It is request evidence only and never enters render identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_response_completed_at_ms: Option<u64>,
+    /// Proxy-observed wall-clock time at request INGRESS, before transform queueing.
+    /// The G2 gap pairs this with `prev_response_completed_at_ms`: module-side now_ms
+    /// runs after queue/blocking-arm latency (up to minutes under the emergency arms)
+    /// and would inflate every gap by that delay. Request evidence only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_observed_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
 }
 
 fn default_wire_version() -> u32 {
     2
+}
+
+fn default_clear_reasoning_age() -> u64 {
+    DEFAULT_CLEAR_REASONING_AGE
 }
 
 #[derive(Deserialize)]
@@ -215,6 +279,18 @@ struct TransformRequestWire {
     serializer_profile: Option<String>,
     session_id: String,
     render_config: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_key: Option<String>,
+    #[serde(default = "default_clear_reasoning_age")]
+    clear_reasoning_age: u64,
+    #[serde(default)]
+    tool_present: bool,
+    #[serde(default)]
+    serve_native: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_messages: Option<Vec<Value>>,
     #[serde(default)]
     full_array_fingerprint: Option<String>,
     #[serde(default)]
@@ -227,6 +303,12 @@ struct TransformRequestWire {
     usage: Option<ModuleUsage>,
     #[serde(default)]
     provider_error: Option<String>,
+    #[serde(default)]
+    mid_turn: bool,
+    #[serde(default)]
+    prev_response_completed_at_ms: Option<u64>,
+    #[serde(default)]
+    request_observed_at_ms: Option<u64>,
     #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
 }
@@ -248,11 +330,20 @@ impl<'de> Deserialize<'de> for TransformRequest {
             serializer_profile: wire.serializer_profile.unwrap_or_default(),
             session_id: wire.session_id,
             render_config: wire.render_config,
+            provider_id: wire.provider_id,
+            model_key: wire.model_key,
+            clear_reasoning_age: wire.clear_reasoning_age,
+            tool_present: wire.tool_present,
+            serve_native: wire.serve_native,
+            native_messages: wire.native_messages,
             full_array_fingerprint: wire.full_array_fingerprint,
             messages,
             tail_delta: wire.tail_delta,
             usage: wire.usage,
             provider_error: wire.provider_error,
+            mid_turn: wire.mid_turn,
+            prev_response_completed_at_ms: wire.prev_response_completed_at_ms,
+            request_observed_at_ms: wire.request_observed_at_ms,
             declared_trim: wire.declared_trim,
         })
     }
@@ -292,6 +383,26 @@ pub enum ServedFrom {
     DaemonLkg,
 }
 
+/// The coherent request-local reduction surface state reported to the forwarding layer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceState {
+    Inactive,
+    Transition,
+    Active,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Channel2NudgeDirective {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostDirectives {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel2_nudge: Option<Channel2NudgeDirective>,
+}
+
 /// A transform pass result. Diagnostics remain alongside the CK array, but the response
 /// messages themselves are bare CK messages: no request-only `mid` or `ordinal` sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -305,6 +416,7 @@ pub struct TransformResponse {
     pub reconcile_pending: bool,
     pub version: u64,
     pub row_version: u64,
+    pub surface_state: SurfaceState,
     pub committed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_ordinal: Option<u64>,
@@ -318,6 +430,14 @@ pub struct TransformResponse {
     /// `Some`, even when legitimately empty.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ck_messages: Option<Vec<CkWireMessage>>,
+    /// OpenCode message-with-parts output, present only when the request opted into native
+    /// serving and selected the `opencode-aisdk` serializer profile.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub native_messages: Option<Vec<Value>>,
+    /// Host-delivery instructions are additive and profile-gated. The module does not
+    /// persist delivery because the host owns the channel-2 lease and deduplication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_directives: Option<HostDirectives>,
 }
 
 impl TransformResponse {
@@ -337,10 +457,13 @@ impl TransformResponse {
             reconcile_pending: false,
             version: 0,
             row_version: 0,
+            surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
             historian: None,
             ck_messages: None,
+            native_messages: None,
+            host_directives: None,
         }
     }
 
@@ -357,10 +480,13 @@ impl TransformResponse {
             reconcile_pending: false,
             version: 0,
             row_version: 0,
+            surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
             historian: None,
             ck_messages: Some(ck_messages),
+            native_messages: None,
+            host_directives: None,
         }
     }
 }
@@ -451,6 +577,8 @@ impl Channel1Level {
 #[derive(Debug, Clone, Default)]
 struct TagOverlayState {
     tag_by_block_id: BTreeMap<String, i64>,
+    temporal_by_block_id: BTreeMap<String, String>,
+    user_hint_by_block_id: BTreeMap<String, String>,
     channel1_by_block_id: BTreeMap<String, String>,
 }
 
@@ -470,14 +598,45 @@ struct Channel1Decision {
     next_last_level: String,
 }
 
-struct Channel1NudgeInputs<'a, 'ctx> {
+#[derive(Debug, Default)]
+struct PendingOverlayDecisions {
+    max_seen_ordinal: Option<u64>,
+    tag_mints: Vec<TagMintInput>,
+    temporal_marks: Vec<TemporalMarkInput>,
+    user_hint: Option<UserHintDecisionInput>,
+    channel1_append: Option<Channel1AppendRow>,
+}
+
+struct OverlayComputation<'a, 'ctx> {
     store: &'a McStore,
     req: &'a TransformRequest,
+    ctx: &'a ProducerContext<'ctx>,
+    projection: &'a FlatProjection,
+    core: &'a CoreState,
+    tag_rows: &'a mut Vec<McTagRow>,
+    temporal_rows: &'a mut Vec<TemporalMarkRow>,
+    user_hint_rows: &'a mut Vec<UserHintRow>,
+    overlay_frontier: Option<u64>,
+    mutation_exempt_mid: Option<&'a str>,
+}
+
+impl PendingOverlayDecisions {
+    fn is_empty(&self) -> bool {
+        self.max_seen_ordinal.is_none()
+            && self.tag_mints.is_empty()
+            && self.temporal_marks.is_empty()
+            && self.user_hint.is_none()
+            && self.channel1_append.is_none()
+    }
+}
+
+struct Channel1NudgeInputs<'a, 'ctx> {
     ctx: &'a ProducerContext<'ctx>,
     core: &'a CoreState,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
     channel1_appends: &'a [Channel1AppendRow],
+    mutation_exempt_mid: Option<&'a str>,
     context_limit_tokens: f64,
     input_tokens: f64,
 }
@@ -501,6 +660,8 @@ pub enum TransformError {
     /// A stored coverage range overlaps, or the live array proves a present raw message
     /// would be trimmed without being covered by any compartment. Fail loud.
     CoverageGap(String),
+    /// The lexical hint query failed before a durable decision could be written.
+    Search(String),
     /// CK ingress rejected an unsupported or unpairable block before any partial projection.
     CkWire(CkWireError),
     /// Two flattened blocks produced the same `mid#block_index` id in one request.
@@ -533,6 +694,7 @@ impl std::fmt::Display for TransformError {
                 "decider re-supplied an already-frozen reduction target with different bytes"
             ),
             TransformError::CoverageGap(m) => write!(f, "{m}"),
+            TransformError::Search(m) => write!(f, "search: {m}"),
             TransformError::CkWire(e) => write!(f, "ck wire: {e}"),
             TransformError::DuplicateBlockId(id) => write!(f, "duplicate flattened block id: {id}"),
             TransformError::IdentityDrift(mid) => {
@@ -555,6 +717,15 @@ impl std::fmt::Display for TransformError {
     }
 }
 impl std::error::Error for TransformError {}
+
+impl TransformError {
+    /// These failures are deterministic for the same shadow payload. The sender can park a
+    /// poisoned shadow lineage instead of retrying it forever; store and search failures remain
+    /// retryable because their cause may be transient.
+    pub fn is_deterministic_reject(&self) -> bool {
+        !matches!(self, Self::Store(_) | Self::Search(_))
+    }
+}
 
 impl From<CkWireError> for TransformError {
     fn from(e: CkWireError) -> Self {
@@ -668,11 +839,25 @@ fn apply_once(
     }
 
     let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
-    let loaded = store.load(&req.session_id)?;
+    let mutation_exempt_mid =
+        latest_assistant_mutation_exempt_mid(&req.messages, serializer_profile, req.mid_turn);
+    let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
+    let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
+    let loaded = transform_snapshot.loaded;
+    let overlay_frontier = transform_snapshot.overlay_frontier;
+    let surface_transition = serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic)
+        && loaded.meta.cc_u1_active != cc_u1_active;
+    let surface_state = if surface_transition {
+        SurfaceState::Transition
+    } else if cc_u1_active {
+        SurfaceState::Active
+    } else {
+        SurfaceState::Inactive
+    };
 
     // Every module-owned byte-affecting epoch is folded before activation decisions. The
     // tagger is active only after its non-zero epoch is present in the session's committed
-    // render identity, so an established pre-flip session cannot acquire tags before the
+    // render identity, so an established dormant session cannot acquire tags before the
     // coordinating cache-breaking HARD fold has committed.
     let memory_render_epoch = if crate::MEMORY_RENDER_FORMAT_EPOCH != 0 {
         format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH)
@@ -689,11 +874,10 @@ fn apply_once(
         .filter(|epoch| *epoch != 0)
         .map(|epoch| format!("mpe{epoch}"))
         .unwrap_or_default();
-    let tagger_feature_epoch = serializer_profile
-        .map(crate::tagger_feature_epoch)
-        .filter(|epoch| *epoch != 0)
-        .map(|epoch| format!("tfe{epoch}"))
-        .unwrap_or_default();
+    let tagger_feature_epoch = match crate::tagger_feature_epoch(cc_u1_active) {
+        0 => String::new(),
+        epoch => format!("tfe{epoch}"),
+    };
     let effective_render_config = fold_m0_content_epoch(
         &req.render_config,
         &M0ContentEpoch {
@@ -706,17 +890,26 @@ fn apply_once(
             tagger_feature_epoch: tagger_feature_epoch.clone(),
         },
     );
-    let tagging_active = !tagger_feature_epoch.is_empty()
-        && loaded.meta.initialized
-        && loaded.meta.last_render_config == effective_render_config;
-    let tag_rows = if tagging_active {
-        mint_tags_for_projection(store, &req.session_id, &projection, ctx.now_ms)?;
-        store.load_tags_for_session(&req.session_id)?
+    let tagging_active = cc_u1_active && loaded.meta.cc_u1_active;
+    // Previously stored overlay rows may still replay when boundary-lineage validation
+    // later forces pass-through. Decisions from this request stay in memory until the
+    // final cache-state compare-and-swap accepts the pass.
+    // Tags are also the durable token-accounting source for host directives. Keeping them
+    // available on non-CC profiles is render-neutral: overlay bytes remain gated by
+    // `tagging_active`, while the OpenCode host can receive the same ceiling decision.
+    let mut tag_rows = transform_snapshot.tags;
+    let mut channel1_appends = if tagging_active {
+        transform_snapshot.channel1_appends
     } else {
         Vec::new()
     };
-    let mut channel1_appends = if tagging_active {
-        store.load_channel1_appends(&req.session_id)?
+    let mut user_hints = if tagging_active {
+        transform_snapshot.user_hints
+    } else {
+        Vec::new()
+    };
+    let mut temporal_marks = if tagging_active {
+        transform_snapshot.temporal_marks
     } else {
         Vec::new()
     };
@@ -767,8 +960,9 @@ fn apply_once(
                 "mc-module: pending_rewrite raw pass-through for {} fingerprint {}",
                 req.session_id, fingerprint
             );
-            let passthrough_overlay =
-                tagging_active.then(|| tag_overlay_state(&tag_rows, &channel1_appends));
+            let passthrough_overlay = tagging_active.then(|| {
+                tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
+            });
             return Ok(pending_passthrough_result(
                 projection,
                 req,
@@ -776,6 +970,7 @@ fn apply_once(
                 false,
                 trim_mismatch,
                 passthrough_overlay.as_ref(),
+                surface_state,
             ));
         }
 
@@ -807,8 +1002,8 @@ fn apply_once(
             "mc-module: armed pending_rewrite for {} fingerprint {} ambiguous={}",
             req.session_id, fingerprint, ambiguous
         );
-        let passthrough_overlay =
-            tagging_active.then(|| tag_overlay_state(&tag_rows, &channel1_appends));
+        let passthrough_overlay = tagging_active
+            .then(|| tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends));
         return Ok(pending_passthrough_result(
             projection,
             req,
@@ -816,13 +1011,38 @@ fn apply_once(
             true,
             trim_mismatch,
             passthrough_overlay.as_ref(),
+            surface_state,
         ));
     }
 
     let clear_pending_rewrite_on_present =
         loaded.meta.pending_rewrite.is_some() && boundary_present;
 
-    enforce_block_identity(&loaded.meta, &projection, &loaded.core)?;
+    let provisional_tail_mid = provisional_tail_mid(req);
+    enforce_block_identity(
+        &loaded.meta,
+        &projection,
+        &loaded.core,
+        provisional_tail_mid,
+    )?;
+    let mut pending_overlays = PendingOverlayDecisions::default();
+    if tagging_active
+        && !loaded.core.reconcile_pending
+        && (loaded.meta.pending_rewrite.is_none() || clear_pending_rewrite_on_present)
+    {
+        pending_overlays = compute_active_overlay_decisions(OverlayComputation {
+            store,
+            req,
+            ctx,
+            projection: &projection,
+            core: &loaded.core,
+            tag_rows: &mut tag_rows,
+            temporal_rows: &mut temporal_marks,
+            user_hint_rows: &mut user_hints,
+            overlay_frontier,
+            mutation_exempt_mid,
+        })?;
+    }
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
 
     // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
@@ -838,7 +1058,7 @@ fn apply_once(
     } else {
         0.0
     };
-    let scheduler_outcome = scheduler::decide(&SchedulerInputs {
+    let mut scheduler_outcome = scheduler::decide(&SchedulerInputs {
         config: scheduler_config(ctx.execute_threshold_percentage),
         usage: ContextUsage {
             percentage: usage_percentage,
@@ -861,12 +1081,19 @@ fn apply_once(
             .as_ref()
             .map(deferred_from_meta),
         boundary_bypass: BoundaryBypass {
-            explicit_bust: false,
+            explicit_bust: loaded.meta.soft_refresh_pending,
             subagent: false,
         },
         drain_latch: latch_from_meta(&loaded.meta),
         overflow_error_text: req.provider_error.clone(),
     });
+    // A flush requests work on the next pass, not a new m0 fold. Promote only a normal
+    // defer to Execute; mandatory bootstrap, epoch, and pressure decisions retain priority.
+    if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
+    {
+        scheduler_outcome.pass = scheduler::PassDecision::Execute;
+        scheduler_outcome.deferred_execute = None;
+    }
     // First-fold HARD trigger: a never-minted boundary (empty boundary_id) means no
     // compartment has ever folded into m0 (the fold is what mints the boundary). Once the
     // historian publishes the session's FIRST compartment, it cannot ride m1 as a SOFT
@@ -908,12 +1135,27 @@ fn apply_once(
     };
     let hard_fold_requested =
         first_fold_due || scheduler_outcome.idle_ttl_fired || system_absorb_hard_due;
-    // Tail mutations are disabled wholesale for profiles whose consumer keeps tail
-    // bytes verbatim (byte-splice legs): mutating a tail the consumer discards would
-    // freeze reclaims that never reached the real context. The producer gate is the
-    // single choke point for selection AND agent-drop consumption, so one AND covers
-    // both; todo capture/advance and the watermark stamps are gated separately below.
-    let tail_reclaim_enabled = serializer_profile.is_none_or(healing::tail_reclaim);
+    // These are the byte-changing reasons that are knowable before reduction selection:
+    // render epochs, TTL, reconcile rematerialization, emergency arming, and coverage
+    // folds. A reconcile flag with a returned boundary only clears state on a defer, so
+    // it is not a ride opportunity. The selection layer adds a different command's first
+    // application as a ride opportunity. Provider-side rejection and post-selection
+    // output drift are not knowable here; omitting them can delay a held batch to the
+    // next bust, but cannot create an extra bust.
+    let emergency_arm_engaged = matches!(
+        scheduler_outcome.pass,
+        scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
+    ) || scheduler_outcome.drain_latch.is_active();
+    let pass_already_busting = !loaded.meta.initialized
+        || render_config_changed
+        || hard_fold_requested
+        || reconcile_hard_due
+        || emergency_arm_engaged;
+    // Profile defaults remain conservative, while the request-local tool signal enables
+    // full-array tail reclaim for the Claude Code profile. A false request therefore
+    // retains the exact pre-capability behavior without changing the global profile table.
+    let tail_reclaim_enabled =
+        serializer_profile.is_none_or(|profile| healing::tail_reclaim(profile) || cc_u1_active);
     let producer_gate = tail_reclaim_enabled
         && producer_gate(
             scheduler_outcome.pass,
@@ -928,12 +1170,50 @@ fn apply_once(
         PassClass::Defer
     };
     let tail_for_selection = tail_sel_items(&live, loaded.meta.coverage_ordinal);
+    let mut protected_block_ids = if cc_u1_active {
+        newest_active_tag_block_ids(
+            &loaded.core,
+            &loaded.meta,
+            &projection,
+            &tag_rows,
+            mutation_exempt_mid,
+        )
+    } else {
+        HashSet::new()
+    };
+    if let Some(mid) = mutation_exempt_mid {
+        protected_block_ids.extend(
+            projection
+                .blocks
+                .iter()
+                .filter(|block| block.mid == mid)
+                .map(|block| block.id.clone()),
+        );
+    }
     let selected_reductions = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
+        // No per-request gate here: producer_gate already requires
+        // tail_reclaim_enabled, which is the profile default OR the request-local
+        // surface. Gating again on the request-local surface alone would starve
+        // the durable queue on profiles whose default is true (owned/Pi/OpenCode
+        // legs drain unconditionally).
         let agent_drop_ids = pending_agent_drops
             .iter()
             .map(|drop| drop.target_id.clone())
             .collect::<Vec<_>>();
+        let agent_drop_command_ids = pending_agent_drops
+            .iter()
+            .filter_map(|drop| {
+                drop.command_id
+                    .as_ref()
+                    .map(|command_id| (drop.target_id.clone(), command_id.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let first_applied_agent_drop_ids = pending_agent_drops
+            .iter()
+            .filter(|drop| drop.command_first_applied_at_ms.is_some())
+            .map(|drop| drop.target_id.clone())
+            .collect::<HashSet<_>>();
         select_reductions(
             &tail_for_selection,
             &frozen,
@@ -952,6 +1232,10 @@ fn apply_once(
                 prior_input_sample: loaded.meta.last_emergency_input_sample,
                 has_prior_drop: loaded.meta.has_prior_emergency_drop,
                 agent_drop_ids,
+                agent_drop_command_ids,
+                first_applied_agent_drop_ids,
+                pass_already_busting,
+                protected_block_ids: protected_block_ids.clone(),
             },
             &SelectionConfig {
                 smart_drops: ctx.smart_drops,
@@ -966,9 +1250,6 @@ fn apply_once(
     } else {
         ctx.injected_reductions.clone()
     };
-    let selected_reductions =
-        numbered_drop_placeholders_for_new_freezes(&loaded.core, &selected_reductions, &tag_rows);
-
     // Fail-loud monotonicity guard, BEFORE classify and on EVERY pass: a frozen
     // reduction target re-supplied with different bytes breaks the immutable contract,
     // and the set-membership trigger would silently skip it (already frozen) and serve
@@ -989,7 +1270,8 @@ fn apply_once(
         hard_fold_requested,
         boundary_present,
         reconcile_pending: loaded.core.reconcile_pending,
-        m1_revision_changed: current_m1_digest != loaded.meta.m1_revision,
+        m1_revision_changed: current_m1_digest != loaded.meta.m1_revision
+            || loaded.meta.soft_refresh_pending,
         reductions_pending: reductions_pending_now,
     });
 
@@ -1014,8 +1296,9 @@ fn apply_once(
             meta.pending_rewrite_last_failure = None;
         }
     }
-    apply_ingress_meta(&mut meta, req, &projection);
-    if !tagger_feature_epoch.is_empty() {
+    apply_ingress_meta(&mut meta, req, &projection, provisional_tail_mid);
+    meta.cc_u1_active = cc_u1_active;
+    if cc_u1_active {
         meta.last_serializer_profile = req.serializer_profile.clone();
     }
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
@@ -1024,6 +1307,17 @@ fn apply_once(
         plan,
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
     );
+    if let Some(cutoff) = reasoning_clear_cutoff(
+        req,
+        serializer_profile,
+        is_bust_pass,
+        meta.reasoning_cleared_through_ordinal,
+    ) {
+        meta.reasoning_cleared_through_ordinal = meta.reasoning_cleared_through_ordinal.max(cutoff);
+    }
+    if loaded.meta.soft_refresh_pending && is_bust_pass {
+        meta.soft_refresh_pending = false;
+    }
     if is_bust_pass {
         if let Some(guidance_date) = ctx.guidance_date.as_ref() {
             meta.guidance_date = guidance_date.clone();
@@ -1370,28 +1664,28 @@ fn apply_once(
     let result_action = action_str(&plan, &core);
 
     let mut tag_overlay = if tagging_active {
-        tag_overlay_state(&tag_rows, &channel1_appends)
+        tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
     } else {
         TagOverlayState::default()
     };
     if tagging_active {
         if let Some(row) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
-                store,
-                req,
                 ctx,
                 core: &core,
                 projection: &projection,
                 tag_rows: &tag_rows,
                 channel1_appends: &channel1_appends,
+                mutation_exempt_mid,
                 context_limit_tokens,
                 input_tokens: usage_input_tokens,
             },
             &mut meta,
-        )? {
+        ) {
             tag_overlay
                 .channel1_by_block_id
                 .insert(row.block_id.clone(), row.reminder_text.clone());
+            pending_overlays.channel1_append = Some(row.clone());
             channel1_appends.push(row);
         }
     }
@@ -1402,48 +1696,62 @@ fn apply_once(
         &projection,
         req,
         tagging_active.then_some(&tag_overlay),
+        tail_reclaim_enabled,
+        mutation_exempt_mid,
     )?;
 
     // Build the output before committing so a missing synthetic-todo anchor cannot
-    // persist an unusable frozen pair. Only commit when core or meta changed;
-    // otherwise reuse the previous row version without writing.
-    let changed = core != loaded.core || meta != loaded.meta;
-    let row_version = if changed {
+    // persist an unusable frozen pair. Pending rows are classified from the final plan:
+    // live unfrozen targets remain durable, while applied or retired targets are consumed.
+    let consumed_drop_ids = consumed_pending_drop_ids(
+        &pending_agent_drops,
+        &loaded.core,
+        &core,
+        &projection,
+        meta.coverage_ordinal,
+    );
+    let first_applied_command_ids =
+        first_applied_pending_command_ids(&pending_agent_drops, &loaded.core, &core);
+    let state_changed = core != loaded.core || meta != loaded.meta;
+    if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
-        let consumed_drop_ids = if is_bust_pass && producer_gate {
-            pending_agent_drops
-                .iter()
-                .map(|drop| drop.id)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        if consumed_drop_ids.is_empty() {
-            if let Some(revision) = commit_memory_revision.as_ref() {
-                store.commit_with_consumed_drops(
-                    &req.session_id,
-                    commit_expected,
-                    &core,
-                    &meta,
-                    &[],
-                    Some(revision),
-                )?
-            } else {
-                store.commit(&req.session_id, commit_expected, &core, &meta)?
-            }
-        } else {
-            store.commit_with_consumed_drops(
-                &req.session_id,
-                commit_expected,
-                &core,
-                &meta,
-                &consumed_drop_ids,
-                commit_memory_revision.as_ref(),
-            )?
-        }
+    }
+    let commit_required =
+        state_changed || !consumed_drop_ids.is_empty() || !pending_overlays.is_empty();
+    let row_version = if commit_required {
+        store.commit_transform(
+            &req.session_id,
+            TransformCommit {
+                expected: commit_expected,
+                core: &core,
+                meta: &meta,
+                consumed_drop_ids: &consumed_drop_ids,
+                first_applied_command_ids: &first_applied_command_ids,
+                memory_revision: commit_memory_revision.as_ref(),
+                overlays: TransformOverlayBatch {
+                    max_seen_ordinal: pending_overlays.max_seen_ordinal,
+                    tag_mints: &pending_overlays.tag_mints,
+                    temporal_marks: &pending_overlays.temporal_marks,
+                    user_hint: pending_overlays.user_hint.as_ref(),
+                    channel1_append: pending_overlays.channel1_append.as_ref(),
+                    created_at_ms: ctx.now_ms,
+                },
+            },
+        )?
     } else {
         loaded.row_version.unwrap_or(0)
     };
+    let host_directives = channel2_directive(Channel2DirectiveInput {
+        profile: serializer_profile,
+        core: &core,
+        meta: &meta,
+        projection: &projection,
+        tag_rows: &tag_rows,
+        mutation_exempt_mid,
+        context_limit_tokens,
+        input_tokens: usage_input_tokens,
+        execute_threshold_percentage: ctx.execute_threshold_percentage,
+    });
 
     Ok(TransformWithProjection {
         projection,
@@ -1459,20 +1767,38 @@ fn apply_once(
             reconcile_pending: core.reconcile_pending,
             version: core.version,
             row_version,
-            committed: changed,
+            surface_state,
+            committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
             historian: None,
             ck_messages: Some(ck_messages),
+            native_messages: None,
+            host_directives,
         },
     })
+}
+
+fn provisional_tail_mid(req: &TransformRequest) -> Option<&str> {
+    if !req.mid_turn || !req.session_id.starts_with(SHADOW_SESSION_PREFIX) {
+        return None;
+    }
+    req.messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
+        .max_by_key(|message| message.ordinal)
+        .map(|message| message.mid.as_str())
 }
 
 fn enforce_block_identity(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     core: &CoreState,
+    provisional_tail_mid: Option<&str>,
 ) -> Result<(), TransformError> {
     for (mid, vector) in &projection.identity_by_mid {
+        if provisional_tail_mid == Some(mid.as_str()) {
+            continue;
+        }
         if let Some(stored) = meta.block_identity_by_mid.get(mid) {
             if stored != vector {
                 return Err(TransformError::IdentityDrift(mid.clone()));
@@ -1495,6 +1821,9 @@ fn enforce_block_identity(
         let Some((mid, _)) = split_block_id(&target) else {
             continue;
         };
+        if provisional_tail_mid == Some(mid) {
+            continue;
+        }
         if live_mids.contains(mid) && !live_ids.contains(target.as_str()) {
             return Err(TransformError::FrozenRedTargetVanish(target));
         }
@@ -1502,8 +1831,21 @@ fn enforce_block_identity(
     Ok(())
 }
 
-fn apply_ingress_meta(meta: &mut ModuleMeta, req: &TransformRequest, projection: &FlatProjection) {
+fn apply_ingress_meta(
+    meta: &mut ModuleMeta,
+    req: &TransformRequest,
+    projection: &FlatProjection,
+    provisional_tail_mid: Option<&str>,
+) {
+    if let Some(mid) = provisional_tail_mid {
+        // Remove any stale pin for a tail that became streaming again. The next completed
+        // pass must establish identity from the stable block vector, not from a partial form.
+        meta.block_identity_by_mid.remove(mid);
+    }
     for (mid, vector) in &projection.identity_by_mid {
+        if provisional_tail_mid == Some(mid.as_str()) {
+            continue;
+        }
         meta.block_identity_by_mid
             .entry(mid.clone())
             .or_insert_with(|| vector.clone());
@@ -1751,32 +2093,73 @@ fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Add a durable tag reference only while a new drop payload is being frozen. Existing
-/// frozen units remain authoritative and replay byte-identically.
-fn numbered_drop_placeholders_for_new_freezes(
-    core: &CoreState,
-    reductions: &[ReductionDecision],
-    tag_rows: &[McTagRow],
-) -> Vec<ReductionDecision> {
-    let frozen = frozen_red_targets(core);
-    let tag_by_block = tag_rows
+/// Commands whose first application froze at least one previously unfrozen target.
+fn first_applied_pending_command_ids(
+    pending: &[PendingAgentDrop],
+    loaded_core: &CoreState,
+    final_core: &CoreState,
+) -> Vec<String> {
+    let frozen_before = frozen_red_targets(loaded_core);
+    let frozen_after = frozen_red_targets(final_core);
+    pending
         .iter()
-        .map(|row| (row.block_id.as_str(), row.tag_number))
-        .collect::<HashMap<_, _>>();
-    reductions
-        .iter()
-        .map(|reduction| {
-            let mut reduction = reduction.clone();
-            if reduction.kind == "drop"
-                && reduction.payload == "[dropped]"
-                && !frozen.contains(&reduction.target_id)
-            {
-                if let Some(tag_number) = tag_by_block.get(reduction.target_id.as_str()) {
-                    reduction.payload = format!("[dropped §{tag_number}§]");
-                }
-            }
-            reduction
+        .filter_map(|drop| {
+            let command_id = drop.command_id.as_ref()?;
+            let applied = !drop.command_first_applied_at_ms.is_some()
+                && !frozen_before.contains(&drop.target_id)
+                && frozen_after.contains(&drop.target_id);
+            applied.then(|| command_id.clone())
         })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Return only queue rows whose target was frozen by this plan or is no longer a live,
+/// unfrozen tail block. Every other row remains durable for a later eligible pass.
+fn consumed_pending_drop_ids(
+    pending: &[PendingAgentDrop],
+    loaded_core: &CoreState,
+    final_core: &CoreState,
+    projection: &FlatProjection,
+    final_coverage: Option<u64>,
+) -> Vec<i64> {
+    let frozen_before = frozen_red_targets(loaded_core);
+    let frozen_after = frozen_red_targets(final_core);
+    // Retirement must be PROVEN, not inferred from absence: the request array can be
+    // a transient subset of the session (interactive side-requests), so a target
+    // missing from this pass's projection may reappear on the next one. Consuming
+    // its row on absence would silently lose an acknowledged drop. A block that is
+    // PRESENT but at-or-under the coverage watermark is permanently retired
+    // (coverage only advances), and an already-frozen target is satisfied — those
+    // are the only non-applied rows safe to consume.
+    let covered = projection
+        .blocks
+        .iter()
+        .filter(|block| !block.synthetic && !is_tail(block.ordinal, final_coverage))
+        .map(|block| block.id.as_str())
+        .collect::<HashSet<_>>();
+    // A drop aimed at a reasoning block is structurally unappliable (reasoning is
+    // never a reduction target), proven from this pass's projection. Retiring the
+    // row here keeps the queue from carrying it forever.
+    let reasoning = projection
+        .blocks
+        .iter()
+        .filter(|block| is_reasoning_block(&block.wire))
+        .map(|block| block.id.as_str())
+        .collect::<HashSet<_>>();
+
+    pending
+        .iter()
+        .filter(|drop| {
+            let applied =
+                !frozen_before.contains(&drop.target_id) && frozen_after.contains(&drop.target_id);
+            let obsolete = frozen_before.contains(&drop.target_id)
+                || covered.contains(drop.target_id.as_str())
+                || reasoning.contains(drop.target_id.as_str());
+            applied || obsolete
+        })
+        .map(|drop| drop.id)
         .collect()
 }
 
@@ -1842,8 +2225,20 @@ fn new_reduction_units(
         .filter(|i| is_tail(i.ordinal(), coverage))
         .map(|i| i.id())
         .collect();
+    // Defense in depth behind the selector's own exclusion: refuse to mint a
+    // frozen unit whose target is a reasoning block. A placeholder-rewritten
+    // reasoning block loses its signature and can never re-encode for
+    // Anthropic, permanently fencing the session to raw.
+    let reasoning_targets: std::collections::HashSet<&str> = live
+        .iter()
+        .filter(|i| is_reasoning_block(&i.wire))
+        .map(|i| i.id())
+        .collect();
     let mut by_target: BTreeMap<String, FrozenUnit> = BTreeMap::new();
     for r in reductions {
+        if reasoning_targets.contains(r.target_id.as_str()) {
+            continue;
+        }
         if tail.contains(r.target_id.as_str()) && !frozen.contains(&r.target_id) {
             by_target
                 .entry(r.target_id.clone())
@@ -2201,7 +2596,13 @@ fn pending_passthrough_result(
     committed: bool,
     trim_mismatch: Option<TrimMismatch>,
     tag_overlay: Option<&TagOverlayState>,
+    surface_state: SurfaceState,
 ) -> TransformWithProjection {
+    let mutation_exempt_mid = latest_assistant_mutation_exempt_mid(
+        &req.messages,
+        SerializerProfile::parse(&req.serializer_profile),
+        req.mid_turn,
+    );
     let blocks_by_mid = projection_blocks_by_mid(&projection);
     let mut response = TransformResponse::passthrough(
         req.messages
@@ -2215,6 +2616,7 @@ fn pending_passthrough_result(
                         blocks,
                         tag_overlay,
                         |_| false,
+                        mutation_exempt_mid == Some(message.mid.as_str()),
                     );
                 }
                 rendered
@@ -2223,6 +2625,7 @@ fn pending_passthrough_result(
         req.full_array_fingerprint.clone(),
     );
     response.row_version = row_version;
+    response.surface_state = surface_state;
     response.committed = committed;
     TransformWithProjection {
         projection,
@@ -2315,15 +2718,17 @@ fn push_synthetic_todo_pair(out: &mut Vec<CkWireMessage>, meta: &ModuleMeta) {
     }
 }
 
-fn mint_tags_for_projection(
-    store: &McStore,
-    session_id: &str,
+fn tag_mint_inputs(
     projection: &FlatProjection,
-    now_ms: i64,
-) -> Result<(), TransformError> {
-    let inputs = projection
+    core: &CoreState,
+    mutation_exempt_mid: Option<&str>,
+) -> Vec<TagMintInput> {
+    let frozen = frozen_red_targets(core);
+    projection
         .blocks
         .iter()
+        .filter(|block| !frozen.contains(&block.id))
+        .filter(|block| mutation_exempt_mid != Some(block.mid.as_str()))
         .filter_map(|block| {
             let (kind, source) = taggable_source(block)?;
             Some(TagMintInput {
@@ -2333,11 +2738,7 @@ fn mint_tags_for_projection(
                 source_bytes: source.as_bytes().to_vec(),
             })
         })
-        .collect::<Vec<_>>();
-    if !inputs.is_empty() {
-        store.mint_or_get_tags(session_id, &inputs, now_ms)?;
-    }
-    Ok(())
+        .collect()
 }
 
 /// Return exactly the span the overlay can prefix. Mint scope and overlay scope share
@@ -2373,11 +2774,73 @@ fn taggable_kind(block: &FlatBlock) -> Option<TaggableKind> {
     taggable_source(block).map(|(kind, _)| kind)
 }
 
-fn tag_overlay_state(tag_rows: &[McTagRow], appends: &[Channel1AppendRow]) -> TagOverlayState {
+/// Compute the newest protected tags as exact block ids over the current canonical tail.
+/// Stored provenance must still match the live carrier before a row can occupy a slot.
+fn newest_active_tag_block_ids(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    tag_rows: &[McTagRow],
+    mutation_exempt_mid: Option<&str>,
+) -> HashSet<String> {
+    const PROTECTED_TAG_COUNT: usize = 20;
+
+    let block_by_id = projection
+        .blocks
+        .iter()
+        .map(|block| (block.id.as_str(), block))
+        .collect::<HashMap<_, _>>();
+    let mut active = tag_rows
+        .iter()
+        .filter(|row| {
+            let Some(block) = block_by_id.get(row.block_id.as_str()) else {
+                return false;
+            };
+            if !is_tail(block.ordinal, meta.coverage_ordinal)
+                || frozen_red_payload(core, block.id()).is_some()
+                || mutation_exempt_mid == Some(block.mid.as_str())
+            {
+                return false;
+            }
+            let Some((kind, source)) = taggable_source(block) else {
+                return false;
+            };
+            row.kind == kind.as_store_kind() && row.source_bytes == source.as_bytes()
+        })
+        .collect::<Vec<_>>();
+    active.sort_by(|left, right| {
+        right
+            .tag_number
+            .cmp(&left.tag_number)
+            .then_with(|| right.block_id.cmp(&left.block_id))
+    });
+    active
+        .into_iter()
+        .take(PROTECTED_TAG_COUNT)
+        .map(|row| row.block_id.clone())
+        .collect()
+}
+
+fn tag_overlay_state(
+    tag_rows: &[McTagRow],
+    temporal_marks: &[TemporalMarkRow],
+    user_hints: &[UserHintRow],
+    appends: &[Channel1AppendRow],
+) -> TagOverlayState {
     TagOverlayState {
         tag_by_block_id: tag_rows
             .iter()
             .map(|row| (row.block_id.clone(), row.tag_number))
+            .collect(),
+        temporal_by_block_id: temporal_marks
+            .iter()
+            .filter(|row| !row.marker_text.is_empty())
+            .map(|row| (row.block_id.clone(), row.marker_text.clone()))
+            .collect(),
+        user_hint_by_block_id: user_hints
+            .iter()
+            .filter(|row| !row.hint_text.is_empty())
+            .map(|row| (row.block_id.clone(), row.hint_text.clone()))
             .collect(),
         channel1_by_block_id: appends
             .iter()
@@ -2386,13 +2849,54 @@ fn tag_overlay_state(tag_rows: &[McTagRow], appends: &[Channel1AppendRow]) -> Ta
     }
 }
 
+/// Format a mint-time delta as the deterministic prefix used by the active overlay.
+pub fn temporal_gap_prefix(gap_ms: i64) -> Option<String> {
+    if gap_ms < TEMPORAL_AWARENESS_THRESHOLD_MS {
+        return None;
+    }
+
+    let seconds = gap_ms / 1_000;
+    let marker = if seconds < 60 * 60 {
+        format!("+{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        let hours = seconds / (60 * 60);
+        let minutes = (seconds - hours * 60 * 60) / 60;
+        if minutes == 0 {
+            format!("+{hours}h")
+        } else {
+            format!("+{hours}h {minutes}m")
+        }
+    } else if seconds < 7 * 24 * 60 * 60 {
+        let days = seconds / (24 * 60 * 60);
+        let hours = (seconds - days * 24 * 60 * 60) / (60 * 60);
+        if hours == 0 {
+            format!("+{days}d")
+        } else {
+            format!("+{days}d {hours}h")
+        }
+    } else {
+        let weeks = seconds / (7 * 24 * 60 * 60);
+        let days = (seconds - weeks * 7 * 24 * 60 * 60) / (24 * 60 * 60);
+        if days == 0 {
+            format!("+{weeks}w")
+        } else {
+            format!("+{weeks}w {days}d")
+        }
+    };
+    Some(format!("<!-- {marker} -->\n"))
+}
+
 fn apply_tag_overlay_to_message(
     message: &mut CkWireMessage,
     ingress: &CkIngressMessage,
     blocks: &[&FlatBlock],
     overlay: Option<&TagOverlayState>,
     is_reduced: impl Fn(&FlatBlock) -> bool,
+    mutation_exempt: bool,
 ) {
+    if mutation_exempt {
+        return;
+    }
     let Some(overlay) = overlay else {
         return;
     };
@@ -2405,25 +2909,38 @@ fn apply_tag_overlay_to_message(
             continue;
         }
         if !is_reduced(block) {
+            let target = &mut message.content[block.block_index];
+            let mut block_changed = false;
             if let Some(kind) = taggable_kind(block) {
                 if let Some(tag_number) = overlay.tag_by_block_id.get(&block.id) {
-                    modified |= apply_tag_prefix_to_block(
+                    block_changed |= apply_tag_prefix_to_block(
                         ingress.ck.role.as_str(),
-                        &mut message.content[block.block_index],
+                        target,
                         kind,
                         *tag_number,
                     );
-                } else {
-                    debug_assert!(
-                        false,
-                        "taggable block {} was not minted before render",
-                        block.id
-                    );
                 }
+                // A boundary-lineage alarm forces raw pass-through, so only tags stored
+                // before this request are available. Newly seen blocks wait for a normal
+                // accepted pass rather than consuming tag numbers on rejected lineage.
+            }
+            if let Some(prefix) = overlay.temporal_by_block_id.get(&block.id) {
+                block_changed |= prepend_temporal_to_block(target, prefix);
+            }
+            if let Some(hint) = overlay.user_hint_by_block_id.get(&block.id) {
+                block_changed |= append_user_hint_to_block(target, hint);
             }
             if let Some(reminder) = overlay.channel1_by_block_id.get(&block.id) {
-                modified |=
-                    append_channel1_to_block(&mut message.content[block.block_index], reminder);
+                block_changed |= append_channel1_to_block(target, reminder);
+            }
+            if block_changed {
+                // Overlay edits mutate the typed kind in place, but Serialize
+                // prefers a block's retained ingress bytes for lossless
+                // pass-through: an uncleared block silently serializes its
+                // pre-mutation form and the edit never reaches the wire. One
+                // clear site covers every overlay mutator.
+                target.mark_modified();
+                modified = true;
             }
         }
     }
@@ -2442,7 +2959,17 @@ fn apply_tag_prefix_to_block(
         (ck_wire::CkKind::Text { text }, TaggableKind::Message)
             if role == "user" || role == "assistant" =>
         {
-            let next = prepend_tag(tag_number, text);
+            // Models imitate the tag notation they see in history, sometimes at the
+            // start of a later line in one assistant completion. Strip only line-leading
+            // tokens outside code before applying the official tag; inline and prose
+            // references remain authored content. Mint provenance still hashes the
+            // verbatim ingress bytes.
+            let base = if role == "assistant" {
+                strip_leading_tag_imitations(text)
+            } else {
+                text.clone()
+            };
+            let next = prepend_tag(tag_number, &base);
             if *text != next {
                 *text = next;
                 return true;
@@ -2482,6 +3009,28 @@ fn prepend_tag_to_tool_output(output: &mut ck_wire::CkToolOutput, tag_number: i6
         | ck_wire::CkOutputKind::ExecutionDenied { .. } => {}
     }
     false
+}
+
+fn prepend_temporal_to_block(block: &mut CkWireBlock, prefix: &str) -> bool {
+    let ck_wire::CkKind::Text { text } = &mut block.kind else {
+        return false;
+    };
+    if text.starts_with(prefix) {
+        return false;
+    }
+    text.insert_str(0, prefix);
+    true
+}
+
+fn append_user_hint_to_block(block: &mut CkWireBlock, hint: &str) -> bool {
+    let ck_wire::CkKind::Text { text } = &mut block.kind else {
+        return false;
+    };
+    if text.ends_with(hint) {
+        return false;
+    }
+    text.push_str(hint);
+    true
 }
 
 fn append_channel1_to_block(block: &mut CkWireBlock, reminder: &str) -> bool {
@@ -2534,11 +3083,653 @@ fn strip_tag_prefix(value: &str, tag_number: i64) -> &str {
     value.strip_prefix(&tag_prefix(tag_number)).unwrap_or(value)
 }
 
+/// Strip runs of well-formed `§N§` tokens at the start of any non-code line.
+///
+/// The observed imitation class is line-leading, so this conservative boundary avoids
+/// rewriting genuine references such as `the tag §12§ was dropped`. Code fences and
+/// inline-code lines stay verbatim, and a token must be followed by whitespace or ASCII
+/// punctuation so malformed text is never partially consumed.
+fn strip_leading_tag_imitations(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut in_fenced_code = false;
+    let mut inline_code_delimiter = None;
+    for line in value.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fence = body.trim_start().starts_with("```");
+        if in_fenced_code || fence {
+            output.push_str(line);
+            if fence {
+                in_fenced_code = !in_fenced_code;
+                inline_code_delimiter = None;
+            }
+            continue;
+        }
+        if inline_code_delimiter.is_some() {
+            output.push_str(line);
+            update_inline_code_delimiter(body, &mut inline_code_delimiter);
+            continue;
+        }
+
+        let leading_whitespace = body.len() - body.trim_start_matches(char::is_whitespace).len();
+        let mut rest = &body[leading_whitespace..];
+        let mut stripped = false;
+        while let Some(after_close) = well_formed_tag_suffix(rest) {
+            stripped = true;
+            rest = after_close.trim_start_matches(char::is_whitespace);
+        }
+        if stripped {
+            output.push_str(rest);
+            if line.ends_with('\n') && !rest.is_empty() {
+                output.push('\n');
+            }
+        } else {
+            output.push_str(line);
+        }
+        update_inline_code_delimiter(body, &mut inline_code_delimiter);
+    }
+    output
+}
+
+fn update_inline_code_delimiter(line: &str, delimiter: &mut Option<usize>) {
+    let mut offset = 0usize;
+    while offset < line.len() {
+        let rest = &line[offset..];
+        let Some(backtick_offset) = rest.find('`') else {
+            break;
+        };
+        offset += backtick_offset;
+        let run = line[offset..]
+            .chars()
+            .take_while(|character| *character == '`')
+            .count();
+        match delimiter {
+            Some(expected) if *expected == run => *delimiter = None,
+            None => *delimiter = Some(run),
+            _ => {}
+        }
+        offset += run;
+    }
+}
+
+fn well_formed_tag_suffix(value: &str) -> Option<&str> {
+    let after_open = value.strip_prefix('\u{a7}')?;
+    let digits = after_open.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let after_close = after_open[digits..].strip_prefix('\u{a7}')?;
+    if after_close
+        .chars()
+        .next()
+        .is_some_and(|next| !next.is_whitespace() && !next.is_ascii_punctuation())
+    {
+        return None;
+    }
+    Some(after_close)
+}
+
+fn is_entire_system_reminder_wrapped(text: &str) -> bool {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut depth = 0usize;
+    let mut saw_wrapper = false;
+    let mut offset = 0usize;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        if rest.starts_with(OPEN) {
+            depth += 1;
+            saw_wrapper = true;
+            offset += OPEN.len();
+        } else if rest.starts_with(CLOSE) {
+            if depth == 0 {
+                return false;
+            }
+            depth -= 1;
+            offset += CLOSE.len();
+        } else {
+            let ch = rest.chars().next().expect("non-empty reminder remainder");
+            if depth == 0 && !ch.is_whitespace() {
+                return false;
+            }
+            offset += ch.len_utf8();
+        }
+    }
+    saw_wrapper && depth == 0
+}
+
+fn is_system_reminder_transport_message(message: &CkIngressMessage) -> bool {
+    if message.ck.role != "user" || message.ck.meta.synthetic || message.ck.content.is_empty() {
+        return false;
+    }
+    // CK intentionally has no transport-origin field for this Claude Code shape. The
+    // decoder preserves the reminder as an ordinary user text block, so the narrowest
+    // safe discriminator is a message made entirely of balanced reminder wrappers.
+    let mut saw_text = false;
+    for block in &message.ck.content {
+        let ck_wire::CkKind::Text { text } = &block.kind else {
+            return false;
+        };
+        saw_text = true;
+        if !is_entire_system_reminder_wrapped(text.trim()) {
+            return false;
+        }
+    }
+    saw_text
+}
+
+fn is_authored_user_message(message: &CkIngressMessage) -> bool {
+    message.ck.role == "user"
+        && !message.ck.meta.synthetic
+        && message
+            .ck
+            .content
+            .iter()
+            .any(|block| matches!(&block.kind, ck_wire::CkKind::Text { .. }))
+        && !is_system_reminder_transport_message(message)
+}
+
+fn eligible_authored_user_tail(req: &TransformRequest) -> Option<&CkIngressMessage> {
+    // Tool results are transport messages even when a provider carries them with role=user.
+    // Skip those carriers like synthetic and system messages, while an assistant tail still
+    // closes the authored-user eligibility window.
+    let tail = req.messages.iter().rev().find(|message| {
+        !message.ck.meta.synthetic
+            && message.ck.role != "system"
+            && message.ck.role != "tool"
+            && (message.ck.role != "user" || is_authored_user_message(message))
+    })?;
+    is_authored_user_message(tail).then_some(tail)
+}
+
+fn compute_active_overlay_decisions(
+    input: OverlayComputation<'_, '_>,
+) -> Result<PendingOverlayDecisions, TransformError> {
+    let OverlayComputation {
+        store,
+        req,
+        ctx,
+        projection,
+        core,
+        tag_rows,
+        temporal_rows,
+        user_hint_rows,
+        overlay_frontier: frontier,
+        mutation_exempt_mid,
+    } = input;
+    let existing_tag_ids = tag_rows
+        .iter()
+        .map(|row| row.block_id.as_str())
+        .collect::<HashSet<_>>();
+    let tag_mints = tag_mint_inputs(projection, core, mutation_exempt_mid)
+        .into_iter()
+        .filter(|input| !existing_tag_ids.contains(input.block_id.as_str()))
+        .collect::<Vec<_>>();
+    let next_tag = tag_rows.iter().map(|row| row.tag_number).max().unwrap_or(0);
+    for (offset, input) in tag_mints.iter().enumerate() {
+        tag_rows.push(McTagRow {
+            tag_number: next_tag + offset as i64 + 1,
+            block_id: input.block_id.clone(),
+            kind: input.kind.clone(),
+            token_count: input.token_count.max(0),
+            created_at_ms: ctx.now_ms,
+            source_bytes: input.source_bytes.clone(),
+        });
+    }
+
+    let mint_by_block = tag_rows
+        .iter()
+        .map(|row| (row.block_id.as_str(), row.created_at_ms))
+        .collect::<HashMap<_, _>>();
+    let mut decided_temporal = temporal_rows
+        .iter()
+        .map(|row| row.block_id.clone())
+        .collect::<HashSet<_>>();
+    let authored_tail = eligible_authored_user_tail(req);
+    let mut previous_new_user_mint = None;
+    let mut temporal_marks = Vec::new();
+    for message in req.messages.iter().filter(|message| {
+        !message.ck.meta.synthetic
+            && message.ck.role != "system"
+            && message.ck.role != "tool"
+            && (message.ck.role != "user" || is_authored_user_message(message))
+            && mutation_exempt_mid != Some(message.mid.as_str())
+    }) {
+        let is_new = frontier.is_none_or(|frontier| message.ordinal > frontier);
+        if !is_authored_user_message(message) || !is_new {
+            previous_new_user_mint = None;
+            continue;
+        }
+        let Some((block_id, current_mint)) = projection
+            .blocks
+            .iter()
+            .filter(|block| block.mid == message.mid)
+            .find_map(|block| {
+                matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
+                    .then(|| {
+                        mint_by_block
+                            .get(block.id.as_str())
+                            .copied()
+                            .map(|created_at| (block.id.clone(), created_at))
+                    })
+                    .flatten()
+            })
+        else {
+            previous_new_user_mint = None;
+            continue;
+        };
+        if decided_temporal.contains(block_id.as_str()) {
+            previous_new_user_mint = Some(current_mint);
+            continue;
+        }
+
+        let marker_text = if authored_tail.is_some_and(|tail| tail.mid == message.mid) {
+            // The gap pairs the proxy's INGRESS observation with its completion
+            // observation. Module-side now_ms would add queue plus blocking-arm
+            // latency to every gap, so a missing or invalid ingress time freezes
+            // the no-marker decision rather than guessing from a later clock.
+            let observed_now = u64::try_from(ctx.now_ms).unwrap_or(0);
+            req.request_observed_at_ms
+                .filter(|observed| *observed > 0 && *observed <= observed_now)
+                .and_then(|observed| {
+                    req.prev_response_completed_at_ms
+                        .filter(|completed| *completed > 0 && *completed < observed)
+                        .map(|completed| (observed, completed))
+                })
+                .and_then(|(observed, completed)| {
+                    i64::try_from(observed - completed)
+                        .ok()
+                        .and_then(temporal_gap_prefix)
+                })
+                .unwrap_or_default()
+        } else {
+            // Multiple newly observed consecutive user messages have no provider response
+            // boundary. Mint times are retained only for that rare between-users fallback.
+            previous_new_user_mint
+                .and_then(|previous| current_mint.checked_sub(previous))
+                .and_then(temporal_gap_prefix)
+                .unwrap_or_default()
+        };
+        temporal_marks.push(TemporalMarkInput {
+            ordinal: message.ordinal,
+            block_id: block_id.clone(),
+            marker_text: marker_text.clone(),
+        });
+        temporal_rows.push(TemporalMarkRow {
+            block_id: block_id.clone(),
+            marker_text,
+            created_at: ctx.now_ms,
+        });
+        decided_temporal.insert(block_id);
+        previous_new_user_mint = Some(current_mint);
+    }
+
+    // Do not advance the frontier past a user whose temporal decision could not be
+    // evaluated. A frozen reduction or another mint-ineligible shape must remain eligible
+    // for a later pass instead of silently making its marker impossible to mint.
+    let mut decided_frontier = frontier;
+    for message in req
+        .messages
+        .iter()
+        .filter(|message| is_authored_user_message(message))
+    {
+        if frontier.is_some_and(|current| message.ordinal <= current) {
+            continue;
+        }
+        let Some(block_id) = projection.blocks.iter().find_map(|block| {
+            (block.mid == message.mid && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
+                .then_some(block.id.as_str())
+        }) else {
+            break;
+        };
+        if !decided_temporal.contains(block_id) {
+            break;
+        }
+        decided_frontier = Some(message.ordinal);
+    }
+    let max_seen_ordinal =
+        decided_frontier.filter(|ordinal| frontier.is_none_or(|current| *ordinal > current));
+
+    let user_hint = authored_tail
+        .filter(|message| frontier.is_none_or(|frontier| message.ordinal > frontier))
+        .filter(|message| mutation_exempt_mid != Some(message.mid.as_str()))
+        .and_then(|message| {
+            let block = projection.blocks.iter().find(|block| {
+                block.mid == message.mid
+                    && block.role == "user"
+                    && matches!(block.wire.kind, ck_wire::CkKind::Text { .. })
+            })?;
+            if user_hint_rows.iter().any(|row| row.block_id == block.id) {
+                return None;
+            }
+            Some((message, block.id.clone()))
+        })
+        .map(|(message, block_id)| {
+            let query = user_hint_query(message);
+            let hint_text = if query.is_empty() {
+                String::new()
+            } else {
+                let results = run_user_hint_lexical_search(
+                    store,
+                    ctx.project_path,
+                    &req.session_id,
+                    &query,
+                    ctx.memory_enabled,
+                )?;
+                render_user_hint(&results).unwrap_or_default()
+            };
+            Ok::<_, TransformError>(UserHintDecisionInput {
+                ordinal: message.ordinal,
+                block_id,
+                hint_text,
+            })
+        })
+        .transpose()?;
+    if let Some(hint) = &user_hint {
+        user_hint_rows.push(UserHintRow {
+            block_id: hint.block_id.clone(),
+            hint_text: hint.hint_text.clone(),
+            created_at: ctx.now_ms,
+        });
+    }
+
+    Ok(PendingOverlayDecisions {
+        max_seen_ordinal,
+        tag_mints,
+        temporal_marks,
+        user_hint,
+        channel1_append: None,
+    })
+}
+
+fn lexical_tokens(text: &str) -> BTreeSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "and", "are", "but", "for", "from", "have", "into", "not", "that", "the", "this", "use",
+        "was", "with", "you", "your",
+    ];
+    // Unicode normalization is intentionally out of scope. Case folding and provider text
+    // token boundaries are sufficient for this conservative, non-semantic hint gate.
+    text.to_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.chars().count() >= 3 && !STOPWORDS.contains(token))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(USER_HINT_TOKEN_CAP)
+        .collect()
+}
+
+fn run_user_hint_lexical_search(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    query: &str,
+    include_memories: bool,
+) -> Result<Vec<crate::memory_tool::MemorySearchResult>, TransformError> {
+    #[cfg(test)]
+    USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(count.get() + 1));
+
+    struct Candidate {
+        result: crate::memory_tool::MemorySearchResult,
+        tokens: BTreeSet<String>,
+        recency: i64,
+    }
+
+    let query_tokens = lexical_tokens(query);
+    if query_tokens.len() < USER_HINT_MIN_MATCHED_TOKENS {
+        return Ok(Vec::new());
+    }
+    let mut candidates = Vec::new();
+    if include_memories {
+        for memory in
+            store.load_visible_memory_candidates(project_path, USER_HINT_CANDIDATE_LIMIT)?
+        {
+            candidates.push(Candidate {
+                tokens: lexical_tokens(&memory.content),
+                recency: memory.updated_at,
+                result: crate::memory_tool::MemorySearchResult {
+                    source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                    id: memory.id,
+                    snippet: memory.content,
+                    category: Some(memory.category),
+                    sequence: None,
+                    title: None,
+                    note_status: None,
+                    surface_condition: None,
+                },
+            });
+        }
+    }
+    for compartment in store.load_compartment_candidates(session_id, USER_HINT_CANDIDATE_LIMIT)? {
+        let body = [
+            Some(compartment.title.as_str()),
+            Some(compartment.content.as_str()),
+            compartment.p1.as_deref(),
+            compartment.p2.as_deref(),
+            compartment.p3.as_deref(),
+            compartment.p4.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+        candidates.push(Candidate {
+            tokens: lexical_tokens(&body),
+            recency: compartment.created_at,
+            result: crate::memory_tool::MemorySearchResult {
+                source_kind: crate::memory_tool::MemorySearchSourceKind::CompartmentBody,
+                id: compartment.sequence,
+                snippet: body,
+                category: None,
+                sequence: Some(compartment.sequence),
+                title: Some(compartment.title),
+                note_status: None,
+                surface_condition: None,
+            },
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut document_frequency = HashMap::new();
+    for token in &query_tokens {
+        let count = candidates
+            .iter()
+            .filter(|candidate| candidate.tokens.contains(token))
+            .count();
+        document_frequency.insert(token, count);
+    }
+    let pool_count = candidates.len();
+    let pool_size = pool_count as f64;
+    let total_query_weight = query_tokens
+        .iter()
+        .map(|token| {
+            let frequency = *document_frequency.get(token).unwrap_or(&0) as f64;
+            ((pool_size + 1.0) / (frequency + 1.0)).ln() + 1.0
+        })
+        .sum::<f64>();
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let matched = query_tokens
+                .iter()
+                .filter(|token| candidate.tokens.contains(*token))
+                .collect::<Vec<_>>();
+            if matched.len() < USER_HINT_MIN_MATCHED_TOKENS
+                || !matched.iter().any(|token| {
+                    document_frequency
+                        .get(*token)
+                        .is_some_and(|frequency| frequency.saturating_mul(2) < pool_count)
+                })
+            {
+                return None;
+            }
+            let score = matched
+                .iter()
+                .map(|token| {
+                    let frequency = *document_frequency.get(*token).unwrap_or(&0) as f64;
+                    ((pool_size + 1.0) / (frequency + 1.0)).ln() + 1.0
+                })
+                .sum::<f64>();
+            let normalized = score / total_query_weight.max(f64::EPSILON);
+            (normalized >= USER_HINT_NORMALIZED_SCORE_FLOOR).then_some((
+                normalized,
+                matched.len(),
+                candidate.recency,
+                candidate.result,
+            ))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.id.cmp(&right.3.id))
+    });
+    Ok(scored
+        .into_iter()
+        .take(USER_HINT_RESULT_LIMIT)
+        .map(|(_, _, _, result)| result)
+        .collect())
+}
+
+fn user_hint_query(message: &CkIngressMessage) -> String {
+    let raw = message
+        .ck
+        .content
+        .iter()
+        .filter_map(|block| match &block.kind {
+            ck_wire::CkKind::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let without_reminders = strip_system_reminder_wrappers(&raw);
+    let without_tags = strip_mc_tag_notation(&without_reminders);
+    let normalized = without_tags
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = normalized.chars();
+    let mut capped = chars
+        .by_ref()
+        .take(USER_HINT_QUERY_CHAR_CAP)
+        .collect::<String>();
+    if chars.next().is_some_and(|next| !next.is_whitespace())
+        && capped
+            .chars()
+            .last()
+            .is_some_and(|last| !last.is_whitespace())
+    {
+        if let Some(boundary) = capped.rfind(char::is_whitespace) {
+            capped.truncate(boundary);
+        } else {
+            capped.clear();
+        }
+    }
+    capped
+}
+
+fn strip_system_reminder_wrappers(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut output = String::new();
+    let mut depth = 0usize;
+    let mut offset = 0usize;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        if rest.starts_with(OPEN) {
+            depth += 1;
+            offset += OPEN.len();
+        } else if rest.starts_with(CLOSE) {
+            depth = depth.saturating_sub(1);
+            offset += CLOSE.len();
+        } else {
+            let ch = rest.chars().next().expect("non-empty remainder");
+            if depth == 0 {
+                output.push(ch);
+            }
+            offset += ch.len_utf8();
+        }
+    }
+    output
+}
+
+fn strip_mc_tag_notation(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(after_open) = rest.strip_prefix('\u{a7}') {
+            let digits = after_open.chars().take_while(char::is_ascii_digit).count();
+            if digits > 0 {
+                if let Some(after_close) = after_open[digits..].strip_prefix('\u{a7}') {
+                    rest = after_close.trim_start_matches(char::is_whitespace);
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().expect("non-empty remainder");
+        output.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    output
+}
+
+fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Option<String> {
+    if results.is_empty() {
+        return None;
+    }
+    let lines = results
+        .iter()
+        .take(USER_HINT_RESULT_LIMIT)
+        .map(|result| {
+            format!(
+                "- {}",
+                one_line_fragment(&result.snippet, USER_HINT_FRAGMENT_CHAR_CAP)
+            )
+        })
+        .filter(|line| line.len() > 2)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let hint = format!(
+        "\n\n<ctx-search-hint>\nYour memory may contain related fragments:\n{}\nIf relevant, run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>",
+        lines.join("\n")
+    );
+    debug_assert!(hint.chars().count() <= USER_HINT_TOTAL_CHAR_CAP);
+    Some(hint)
+}
+
+fn one_line_fragment(text: &str, limit: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= limit {
+        return normalized;
+    }
+    let mut truncated = normalized
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    truncated.push('…');
+    truncated
+}
+
 fn maybe_append_channel1_nudge(
     input: Channel1NudgeInputs<'_, '_>,
     meta: &mut ModuleMeta,
-) -> Result<Option<Channel1AppendRow>, TransformError> {
-    let active_tags = active_tags_for_nudge(input.core, meta, input.projection, input.tag_rows);
+) -> Option<Channel1AppendRow> {
+    let active_tags = active_tags_for_nudge(
+        input.core,
+        meta,
+        input.projection,
+        input.tag_rows,
+        input.mutation_exempt_mid,
+    );
     let live_tail_tokens = active_tags
         .iter()
         .map(|tag| tag.token_count.max(0))
@@ -2564,35 +3755,27 @@ fn maybe_append_channel1_nudge(
     let was_suppressed = meta.channel1_reduce_suppressed;
     meta.channel1_reduce_suppressed = false;
     if was_suppressed || !decision.fire {
-        return Ok(None);
+        return None;
     }
     let existing_blocks = input
         .channel1_appends
         .iter()
         .map(|row| row.block_id.as_str())
         .collect::<HashSet<_>>();
-    let Some(block_id) =
-        newest_tool_result_for_channel1(input.core, meta, input.projection, &existing_blocks)
-    else {
-        return Ok(None);
-    };
+    let block_id = newest_tool_result_for_channel1(
+        input.core,
+        meta,
+        input.projection,
+        &existing_blocks,
+        input.mutation_exempt_mid,
+    )?;
     let hint = oldest_reclaimable_hint(&active_tags, working_window_tokens);
     let reminder = build_channel1_reminder(decision.level, decision.reclaimable_tokens, &hint);
-    let inserted = input.store.append_channel1_nudge(
-        &input.req.session_id,
-        &block_id,
-        &reminder,
-        input.ctx.now_ms,
-    )?;
-    if inserted {
-        Ok(Some(Channel1AppendRow {
-            block_id,
-            reminder_text: reminder,
-            fired_at_ms: input.ctx.now_ms,
-        }))
-    } else {
-        Ok(None)
-    }
+    Some(Channel1AppendRow {
+        block_id,
+        reminder_text: reminder,
+        fired_at_ms: input.ctx.now_ms,
+    })
 }
 
 fn active_tags_for_nudge(
@@ -2600,6 +3783,7 @@ fn active_tags_for_nudge(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     tag_rows: &[McTagRow],
+    mutation_exempt_mid: Option<&str>,
 ) -> Vec<ActiveTagForNudge> {
     let tag_by_block = tag_rows
         .iter()
@@ -2610,6 +3794,7 @@ fn active_tags_for_nudge(
         taggable_kind(block).is_some()
             && is_tail(block.ordinal, meta.coverage_ordinal)
             && frozen_red_payload(core, block.id()).is_none()
+            && mutation_exempt_mid != Some(block.mid.as_str())
     }) {
         if let Some(row) = tag_by_block.get(block.id.as_str()) {
             out.push(ActiveTagForNudge {
@@ -2621,6 +3806,128 @@ fn active_tags_for_nudge(
     }
     out.sort_by_key(|tag| tag.tag_number);
     out
+}
+
+/// Reuse the durable CC tag accounting when present, and derive the same accounting basis
+/// from live CK text for profiles that historically did not mint overlay tags. The latter
+/// keeps OpenCode host directives useful without enabling CC-only prompt overlays.
+fn active_tags_for_channel2(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    tag_rows: &[McTagRow],
+    mutation_exempt_mid: Option<&str>,
+) -> Vec<ActiveTagForNudge> {
+    let stored = active_tags_for_nudge(core, meta, projection, tag_rows, mutation_exempt_mid);
+    if !stored.is_empty() {
+        return stored;
+    }
+    let mut next_tag = 1i64;
+    let mut derived = Vec::new();
+    for block in projection.blocks.iter().filter(|block| {
+        !block.synthetic
+            && is_tail(block.ordinal, meta.coverage_ordinal)
+            && frozen_red_payload(core, block.id()).is_none()
+            && mutation_exempt_mid != Some(block.mid.as_str())
+    }) {
+        let Some((kind, source)) = taggable_source(block) else {
+            continue;
+        };
+        derived.push(ActiveTagForNudge {
+            tag_number: next_tag,
+            kind: kind.as_store_kind().to_string(),
+            token_count: mc_tokenizer::estimate_tokens(source) as i64,
+        });
+        next_tag = next_tag.saturating_add(1);
+    }
+    derived
+}
+
+struct Channel2DirectiveInput<'a> {
+    profile: Option<SerializerProfile>,
+    core: &'a CoreState,
+    meta: &'a ModuleMeta,
+    projection: &'a FlatProjection,
+    tag_rows: &'a [McTagRow],
+    mutation_exempt_mid: Option<&'a str>,
+    context_limit_tokens: f64,
+    input_tokens: f64,
+    execute_threshold_percentage: f64,
+}
+
+fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirectives> {
+    // OpenCode is the host-delivery leg. CC and owned serializers retain their historic
+    // response shape; their host integrations own any channel-2 surface separately.
+    if input.profile != Some(SerializerProfile::OpencodeAiSdk)
+        || input.context_limit_tokens <= 0.0
+        || input.execute_threshold_percentage <= 0.0
+    {
+        return None;
+    }
+    let working_window_tokens =
+        (input.context_limit_tokens * input.execute_threshold_percentage.clamp(1.0, 100.0) / 100.0)
+            .round()
+            .max(0.0) as i64;
+    let active_tags = active_tags_for_channel2(
+        input.core,
+        input.meta,
+        input.projection,
+        input.tag_rows,
+        input.mutation_exempt_mid,
+    );
+    let (reclaimable_tokens, live_tail_tokens) = channel2_token_aggregate(&active_tags);
+    let usable_tokens =
+        (working_window_tokens as f64 - input.input_tokens + live_tail_tokens as f64).max(0.0);
+    let due = reclaimable_tokens >= CHANNEL2_MIN_RECLAIMABLE
+        && (usable_tokens == 0.0
+            || reclaimable_tokens as f64 >= usable_tokens * CHANNEL2_USABLE_FRACTION);
+    if !due {
+        return None;
+    }
+    let hint = oldest_channel2_hint(&active_tags);
+    Some(HostDirectives {
+        channel2_nudge: Some(Channel2NudgeDirective {
+            text: build_channel2_reminder(reclaimable_tokens, &hint),
+        }),
+    })
+}
+
+fn channel2_token_aggregate(active_tags: &[ActiveTagForNudge]) -> (i64, i64) {
+    let protected_cutoff =
+        (active_tags.len() > 20).then(|| active_tags[active_tags.len() - 20].tag_number);
+    let reclaimable = active_tags
+        .iter()
+        .filter(|tag| tag.kind == "tool_result")
+        .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
+        .map(|tag| tag.token_count.max(0))
+        .sum();
+    let live_tail = active_tags
+        .iter()
+        .filter(|tag| tag.kind != "tool_result")
+        .map(|tag| tag.token_count.max(0))
+        .sum();
+    (reclaimable, live_tail)
+}
+
+fn oldest_channel2_hint(active_tags: &[ActiveTagForNudge]) -> Vec<(i64, String)> {
+    let protected_cutoff =
+        (active_tags.len() > 20).then(|| active_tags[active_tags.len() - 20].tag_number);
+    active_tags
+        .iter()
+        .filter(|tag| tag.kind == "tool_result")
+        .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
+        .filter(|tag| tag.token_count >= 100)
+        .take(4)
+        .map(|tag| (tag.tag_number, "tool".to_string()))
+        .collect()
+}
+
+fn build_channel2_reminder(reclaimable_tokens: i64, hint: &[(i64, String)]) -> String {
+    let amount = approx_thousands(reclaimable_tokens);
+    let hint_text = format_reclaimable_hint(hint);
+    format!(
+        "<system-reminder>\nRoutine context housekeeping is near: a large span of this session will be comparted soon, and ~{amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce first so the archived span is the part that matters.{hint_text}\n</system-reminder>"
+    )
 }
 
 fn reclaimable_older_than_working_window(
@@ -2737,6 +4044,7 @@ fn newest_tool_result_for_channel1(
     meta: &ModuleMeta,
     projection: &FlatProjection,
     existing_blocks: &HashSet<&str>,
+    mutation_exempt_mid: Option<&str>,
 ) -> Option<String> {
     projection
         .blocks
@@ -2747,6 +4055,7 @@ fn newest_tool_result_for_channel1(
                 && is_tail(block.ordinal, meta.coverage_ordinal)
                 && frozen_red_payload(core, block.id()).is_none()
                 && !existing_blocks.contains(block.id.as_str())
+                && mutation_exempt_mid != Some(block.mid.as_str())
                 && tool_result_can_carry_channel1(&block.wire)
         })
         .max_by_key(|block| (block.ordinal, block.block_index))
@@ -2834,6 +4143,8 @@ fn build_output(
     projection: &FlatProjection,
     req: &TransformRequest,
     tag_overlay: Option<&TagOverlayState>,
+    synthetic_todo_enabled: bool,
+    mutation_exempt_mid: Option<&str>,
 ) -> Result<Vec<CkWireMessage>, TransformError> {
     let mut out = Vec::with_capacity(4 + req.messages.len());
     if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m0") {
@@ -2855,10 +4166,11 @@ fn build_output(
     // exact failure the position-freeze design prevents. (A None anchor also never
     // relocates on a bust: reanchor_kept_synthetic_todo_if_folded early-returns on None, so
     // the pair stays right after m0/m1 for its whole life until a Replace or Clear.)
-    if meta
-        .synthetic_todo
-        .as_ref()
-        .is_some_and(|pair| pair.anchor_mid.is_none())
+    if synthetic_todo_enabled
+        && meta
+            .synthetic_todo
+            .as_ref()
+            .is_some_and(|pair| pair.anchor_mid.is_none())
     {
         push_synthetic_todo_pair(&mut out, meta);
     }
@@ -2881,39 +4193,78 @@ fn build_output(
         if !is_tail(msg.ordinal, meta.coverage_ordinal) && !keep_leading_system {
             continue;
         }
+        let mutation_exempt = mutation_exempt_mid == Some(msg.mid.as_str());
         let rendered = if let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) {
-            let reduced: BTreeMap<usize, &str> = blocks
-                .iter()
-                .filter_map(|block| {
-                    frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
-                })
-                .collect();
+            let reduced: BTreeMap<usize, &str> = if mutation_exempt {
+                BTreeMap::new()
+            } else {
+                blocks
+                    .iter()
+                    // Render-time heal: if an immutable unit targets a reasoning block,
+                    // ignore it and serve the block's original signed bytes. Applying
+                    // the unit would produce an unsigned reasoning block that Anthropic
+                    // rejects, which would permanently block the session. The unit
+                    // remains frozen but becomes inert, and this behavior is deterministic.
+                    .filter(|block| !is_reasoning_block(&block.wire))
+                    .filter_map(|block| {
+                        frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
+                    })
+                    .collect()
+            };
             let mut rebuilt = msg.ck.clone();
             if !reduced.is_empty() {
                 rebuilt.mark_modified();
                 for block in blocks {
                     if let Some(payload) = reduced.get(&block.block_index) {
-                        rebuilt.content[block.block_index] =
-                            reduced_block(&block.wire, payload, block.file_path.as_deref());
+                        // Canonical frozen bytes never carry a tag number. The egress clone
+                        // may add the target's live number, while legacy numbered payloads
+                        // remain byte-identical because only exact `[dropped]` is overlaid.
+                        let display_payload = (*payload == "[dropped]")
+                            .then(|| {
+                                tag_overlay
+                                    .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
+                                    .map(|tag_number| format!("[dropped §{tag_number}§]"))
+                            })
+                            .flatten();
+                        rebuilt.content[block.block_index] = reduced_block(
+                            &block.wire,
+                            display_payload.as_deref().unwrap_or(payload),
+                            block.file_path.as_deref(),
+                        );
                     }
                 }
             }
-            apply_tag_overlay_to_message(&mut rebuilt, msg, blocks, tag_overlay, |block| {
-                reduced.contains_key(&block.block_index)
-            });
+            if !mutation_exempt {
+                apply_tag_overlay_to_message(
+                    &mut rebuilt,
+                    msg,
+                    blocks,
+                    tag_overlay,
+                    |block| reduced.contains_key(&block.block_index),
+                    false,
+                );
+            }
             rebuilt
         } else {
             let mut rebuilt = msg.ck.clone();
-            apply_tag_overlay_to_message(&mut rebuilt, msg, &[], tag_overlay, |_| false);
+            apply_tag_overlay_to_message(
+                &mut rebuilt,
+                msg,
+                &[],
+                tag_overlay,
+                |_| false,
+                mutation_exempt,
+            );
             rebuilt
         };
         out.push(rendered);
 
-        if meta
-            .synthetic_todo
-            .as_ref()
-            .and_then(|pair| pair.anchor_mid.as_deref())
-            == Some(msg.mid.as_str())
+        if synthetic_todo_enabled
+            && meta
+                .synthetic_todo
+                .as_ref()
+                .and_then(|pair| pair.anchor_mid.as_deref())
+                == Some(msg.mid.as_str())
         {
             push_synthetic_todo_pair(&mut out, meta);
             inserted_synthetic_todo = true;
@@ -2925,10 +4276,12 @@ fn build_output(
     // (a bust folds the anchor via reanchor_kept_synthetic_todo_if_folded, so reaching
     // here means the anchor vanished on a defer = a revert/drift invariant violation).
     // The None-anchor case was already emitted before the loop, so it is not re-checked.
-    if let Some(pair) = &meta.synthetic_todo {
-        if pair.anchor_mid.is_some() && !inserted_synthetic_todo {
-            let mid = pair.anchor_mid.clone().unwrap_or_default();
-            return Err(TransformError::SyntheticTodoAnchorMissing(mid));
+    if synthetic_todo_enabled {
+        if let Some(pair) = &meta.synthetic_todo {
+            if pair.anchor_mid.is_some() && !inserted_synthetic_todo {
+                let mid = pair.anchor_mid.clone().unwrap_or_default();
+                return Err(TransformError::SyntheticTodoAnchorMissing(mid));
+            }
         }
     }
     if serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic) {
@@ -2944,20 +4297,32 @@ fn build_output(
         );
     }
     if let Some(profile) = serializer_profile {
-        apply_serializer_residuals(profile, &mut out);
+        apply_serializer_residuals_with_exemption(profile, &mut out, mutation_exempt_mid);
     }
     Ok(out)
 }
 
+#[cfg(test)]
 fn apply_serializer_residuals(profile: SerializerProfile, messages: &mut [CkWireMessage]) -> usize {
+    apply_serializer_residuals_with_exemption(profile, messages, None)
+}
+
+fn apply_serializer_residuals_with_exemption(
+    profile: SerializerProfile,
+    messages: &mut [CkWireMessage],
+    mutation_exempt_mid: Option<&str>,
+) -> usize {
     if quirk_residual(profile).strips_reasoning_from_merged_assistants {
-        strip_reasoning_from_merged_assistants(messages)
+        strip_reasoning_from_merged_assistants_with_exemption(messages, mutation_exempt_mid)
     } else {
         0
     }
 }
 
-fn strip_reasoning_from_merged_assistants(messages: &mut [CkWireMessage]) -> usize {
+fn strip_reasoning_from_merged_assistants_with_exemption(
+    messages: &mut [CkWireMessage],
+    mutation_exempt_mid: Option<&str>,
+) -> usize {
     let mut stripped = 0;
     let mut prev_assistant = false;
     let mut kept_reasoning_in_run = false;
@@ -2968,8 +4333,12 @@ fn strip_reasoning_from_merged_assistants(messages: &mut [CkWireMessage]) -> usi
             kept_reasoning_in_run = false;
             continue;
         }
-
         let first_in_run = !prev_assistant;
+        if mutation_exempt_mid == message.meta.harness_id.as_deref() && first_in_run {
+            prev_assistant = true;
+            continue;
+        }
+
         if first_in_run {
             kept_reasoning_in_run = false;
         }
@@ -2977,7 +4346,7 @@ fn strip_reasoning_from_merged_assistants(messages: &mut [CkWireMessage]) -> usi
         let mut keep_index = None;
         if first_in_run && !kept_reasoning_in_run {
             for (idx, block) in message.content.iter().enumerate() {
-                if is_empty_text_block(block) {
+                if is_reasoning_ignored_block(block) {
                     continue;
                 }
                 if is_reasoning_block(block) {
@@ -3018,8 +4387,281 @@ fn is_reasoning_block(block: &CkWireBlock) -> bool {
     )
 }
 
+/// The TypeScript D2 contract for OpenCode clearing is:
+///
+/// * only assistant messages older than `clear_reasoning_age` are eligible;
+/// * the age cutoff is measured from the newest absolute message tag. CK ingress
+///   has no tag map, so this module uses its durable absolute message ordinals;
+/// * a completed historical assistant is eligible even when it is the newest
+///   assistant in the served tail. The old ingress exemption must not resurrect
+///   reasoning that D2 cleared;
+/// * an in-flight newest assistant is protected when `mid_turn` is true;
+/// * canonical OpenCode Anthropic serialization receives an empty text sentinel,
+///   not a rewritten signed reasoning block. The sentinel preserves part shape,
+///   and the serializer removes it before provider dispatch;
+/// * the cutoff is persisted in ModuleMeta and replayed on every later pass.
+///
+/// Anthropic verifies the latest assistant reasoning blocks against ingress bytes. Claude Code
+/// keeps its verbatim-tail behavior. OpenCode keeps an ingress exemption only for a genuinely
+/// live in-flight assistant; clearing has precedence for historical messages.
+fn latest_assistant_mutation_exempt_mid(
+    messages: &[CkIngressMessage],
+    profile: Option<SerializerProfile>,
+    mid_turn: bool,
+) -> Option<&str> {
+    if profile == Some(SerializerProfile::OpencodeAiSdk) && !mid_turn {
+        return None;
+    }
+    if !matches!(
+        profile,
+        Some(SerializerProfile::ClaudeCodeAnthropic | SerializerProfile::OpencodeAiSdk)
+    ) {
+        return None;
+    }
+    messages
+        .iter()
+        .rev()
+        .find(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
+        .filter(|message| {
+            message
+                .ck
+                .content
+                .iter()
+                .find(|block| !is_reasoning_ignored_block(block))
+                .is_some_and(is_reasoning_block)
+        })
+        .map(|message| message.mid.as_str())
+}
+
+/// Match TS `modelAcceptsEmptyContent` for the OpenCode native request.
+///
+/// The explicit provider id is preferred. Older plugin senders already supplied a model key,
+/// so `anthropic/...` is accepted as a compatibility fallback. Native OpenCode metadata is the
+/// final fallback because it carries the same provider identity on assistant and user records.
+pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
+    if req.provider_id.as_deref() == Some("anthropic") {
+        return true;
+    }
+    if req
+        .model_key
+        .as_deref()
+        .and_then(|key| key.split_once('/').map(|(provider, _)| provider))
+        == Some("anthropic")
+    {
+        return true;
+    }
+    let Some(native_messages) = req.native_messages.as_deref() else {
+        return false;
+    };
+    native_messages.iter().rev().any(|message| {
+        let info = message.get("info").unwrap_or(message);
+        info.get("providerID").and_then(Value::as_str) == Some("anthropic")
+            || info
+                .get("model")
+                .and_then(|model| model.get("providerID"))
+                .and_then(Value::as_str)
+                == Some("anthropic")
+            || message.get("providerID").and_then(Value::as_str) == Some("anthropic")
+    })
+}
+
+/// Compute the next durable D2 reasoning watermark on a cache-busting pass or the
+/// one-time native bootstrap when no watermark exists yet.
+///
+/// TS computes `maxTag - clearReasoningAge` after heuristic execution. The module does not
+/// receive TS tag numbers, but it does receive stable absolute message ordinals from the same
+/// OpenCode database. Using those ordinals gives the same monotone age boundary and avoids
+/// deriving a moving decision on defer passes. A watermark advances only when an eligible
+/// assistant actually contains typed reasoning, matching TS's persisted-watermark behavior.
+fn reasoning_clear_cutoff(
+    req: &TransformRequest,
+    profile: Option<SerializerProfile>,
+    is_bust_pass: bool,
+    persisted_watermark: u64,
+) -> Option<u64> {
+    if profile != Some(SerializerProfile::OpencodeAiSdk)
+        || !request_accepts_empty_content(req)
+        || !req.serve_native
+        || (!is_bust_pass && persisted_watermark > 0)
+        || req.mid_turn
+    {
+        return None;
+    }
+
+    let max_ordinal = req
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+        .map(|message| message.ordinal)
+        .max()?;
+    let cutoff = max_ordinal.saturating_sub(req.clear_reasoning_age);
+    if cutoff == 0 {
+        return None;
+    }
+
+    req.messages
+        .iter()
+        .filter(|message| {
+            !message.ck.meta.synthetic
+                && message.ck.role == "assistant"
+                && message.ordinal <= cutoff
+        })
+        .any(|message| {
+            message
+                .ck
+                .content
+                .iter()
+                .any(|block| matches!(&block.kind, ck_wire::CkKind::Reasoning { .. }))
+        })
+        .then_some(cutoff)
+}
+
+/// Apply the final OpenCode D2 replay to native message parts.
+///
+/// The CK transform deliberately leaves ingress reasoning available to identity and block
+/// fingerprint checks. Native serving is the provider boundary, so this pass replaces only
+/// eligible historical typed reasoning with empty typed-reasoning shells after the codec has
+/// finished.
+/// That ordering is important: the codec's latest-assistant ingress shortcut cannot reintroduce
+/// a signed block after this function runs. The canonical OpenCode Anthropic adapter removes
+/// these sentinels before dispatch, so no rewritten text or stale signature reaches Anthropic.
+pub(crate) fn clear_served_native_reasoning(
+    profile: SerializerProfile,
+    provider_accepts_empty_content: bool,
+    native_messages: &mut [Value],
+    served_messages: &[CkWireMessage],
+    ingress_messages: &[CkIngressMessage],
+    watermark: u64,
+    mid_turn: bool,
+) -> usize {
+    if profile != SerializerProfile::OpencodeAiSdk
+        || !provider_accepts_empty_content
+        || watermark == 0
+    {
+        return 0;
+    }
+
+    let served_ids = served_messages
+        .iter()
+        .filter(|message| !message.meta.synthetic && message.role == "assistant")
+        .filter_map(|message| message.meta.harness_id.as_deref())
+        .collect::<HashSet<_>>();
+    if served_ids.is_empty() {
+        return 0;
+    }
+
+    let mut ordinal_by_mid = HashMap::new();
+    let mut newest_assistant_mid = None;
+    let mut newest_assistant_ordinal = 0;
+    for message in ingress_messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+    {
+        ordinal_by_mid.insert(message.mid.as_str(), message.ordinal);
+        if message.ck.role == "assistant" && message.ordinal >= newest_assistant_ordinal {
+            newest_assistant_ordinal = message.ordinal;
+            newest_assistant_mid = Some(message.mid.as_str());
+        }
+    }
+
+    let mut cleared = 0;
+    for raw_message in native_messages {
+        let info = raw_message.get("info").unwrap_or(raw_message);
+        let Some(mid) = info
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| raw_message.get("id").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        if !served_ids.contains(mid)
+            || info.get("role").and_then(Value::as_str) != Some("assistant")
+        {
+            continue;
+        }
+        let Some(&ordinal) = ordinal_by_mid.get(mid) else {
+            continue;
+        };
+        if ordinal > watermark || (mid_turn && newest_assistant_mid == Some(mid)) {
+            continue;
+        }
+
+        let Some(parts) = raw_message.get_mut("parts").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            let Some(part_type) = part.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            if !matches!(part_type, "reasoning" | "thinking")
+                || (!part.get("thinking").is_some() && !part.get("text").is_some())
+            {
+                continue;
+            }
+            if is_empty_reasoning_sentinel(part) {
+                continue;
+            }
+            *part = empty_reasoning_sentinel(part);
+            cleared += 1;
+        }
+    }
+    cleared
+}
+
+fn empty_reasoning_sentinel(part: &Value) -> Value {
+    let mut sentinel = serde_json::Map::new();
+    let Some(object) = part.as_object() else {
+        return Value::Object(sentinel);
+    };
+    let part_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("reasoning");
+    sentinel.insert("type".to_string(), Value::String(part_type.to_string()));
+    if object.contains_key("thinking") && !object.contains_key("text") {
+        sentinel.insert("thinking".to_string(), Value::String(String::new()));
+    } else {
+        sentinel.insert("text".to_string(), Value::String(String::new()));
+    }
+    Value::Object(sentinel)
+}
+
+fn is_empty_reasoning_sentinel(part: &Value) -> bool {
+    let Some(object) = part.as_object() else {
+        return false;
+    };
+    if object.len() != 2 || !object.contains_key("type") {
+        return false;
+    }
+    object
+        .get("text")
+        .or_else(|| object.get("thinking"))
+        .is_some_and(|value| value.as_str() == Some(""))
+}
+
 fn is_empty_text_block(block: &CkWireBlock) -> bool {
     matches!(&block.kind, ck_wire::CkKind::Text { text } if text.is_empty())
+}
+
+fn is_reasoning_ignored_block(block: &CkWireBlock) -> bool {
+    if is_empty_text_block(block) {
+        return true;
+    }
+    matches!(
+        &block.kind,
+        ck_wire::CkKind::Opaque(opaque)
+            if matches!(
+                opaque.kind.as_str(),
+                "step-start"
+                    | "step-finish"
+                    | "snapshot"
+                    | "patch"
+                    | "agent"
+                    | "retry"
+                    | "subtask"
+                    | "compaction"
+            )
+    )
 }
 
 fn projection_blocks_by_mid(projection: &FlatProjection) -> BTreeMap<&str, Vec<&FlatBlock>> {
@@ -3085,11 +4727,8 @@ mod tests {
         .unwrap()
     }
 
-    fn with_tagging_enabled<T>(f: impl FnOnce() -> T) -> T {
-        crate::healing::set_tagging_enabled_for_tests(Some(true));
-        let out = f();
-        crate::healing::set_tagging_enabled_for_tests(None);
-        out
+    fn run_active_surface_test<T>(f: impl FnOnce() -> T) -> T {
+        f()
     }
 
     fn text_message(id: &str, text: &str) -> CkWireMessage {
@@ -3112,6 +4751,421 @@ mod tests {
             mid: id.to_string(),
             ordinal,
             ck: text_message(id, bytes),
+        }
+    }
+
+    /// Build the omitted-wire and explicit-false forms of one request through the
+    /// SAME wire deserialization path, differing only in tool_present presence.
+    fn wire_pair_absent_and_explicit_false(
+        base: TransformRequest,
+    ) -> (TransformRequest, TransformRequest) {
+        let mut explicit_value = serde_json::to_value(&base).unwrap();
+        explicit_value
+            .as_object_mut()
+            .unwrap()
+            .insert("tool_present".to_string(), serde_json::Value::Bool(false));
+        let explicit: TransformRequest = serde_json::from_value(explicit_value).unwrap();
+        let mut absent_value = serde_json::to_value(&base).unwrap();
+        absent_value.as_object_mut().unwrap().remove("tool_present");
+        let absent: TransformRequest = serde_json::from_value(absent_value).unwrap();
+        (absent, explicit)
+    }
+
+    /// Build an ingress message THROUGH WIRE DESERIALIZATION, the way real traffic
+    /// arrives. Deserialized messages retain `original` pass-through bytes on the
+    /// message AND every block; typed-constructor fixtures (`from_parts`/`bare`)
+    /// don't, which is exactly how an output-overlay bug can hide from a fixture
+    /// while dropping bytes on the wire.
+    fn wire_item(role: &str, id: &str, ordinal: u64, texts: &[&str]) -> CkIngressMessage {
+        let content: Vec<Value> = texts
+            .iter()
+            .map(|text| json!({ "kind": { "type": "text", "text": text } }))
+            .collect();
+        let ck: CkWireMessage = serde_json::from_value(json!({
+            "role": role,
+            "content": content,
+            "meta": { "harness_id": id },
+        }))
+        .unwrap();
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck,
+        }
+    }
+
+    /// Mirror of the first live rig drive's beat shape: a CC session whose first
+    /// user message carries several text blocks (system-reminder wrappers around
+    /// the prompt), followed by an assistant reply and a fresh user turn, all
+    /// built through wire deserialization so blocks retain pass-through bytes.
+    /// The drive observed zero tag prefixes on the second active pass.
+    #[test]
+    fn rig_shape_second_active_pass_tags_wire_deserialized_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mb = wire_item(
+            "user",
+            "ccm-0",
+            0,
+            &[
+                "<system-reminder>\ncontext block\n</system-reminder>\n\n",
+                "You are in a test drive. Reply with exactly: BEAT1-OK.",
+                "<system-reminder>\nagents\n</system-reminder>",
+                "<system-reminder>\nskills\n</system-reminder>\n",
+                "You are in a test drive. Reply with exactly: BEAT1-OK.",
+            ],
+        );
+        let beat1 = active_cc_req("rig", "cfg0", vec![mb.clone()]);
+        let transition = run(&s, &beat1, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+
+        let beat2 = active_cc_req(
+            "rig",
+            "cfg0",
+            vec![
+                mb,
+                wire_item("assistant", "ccm-1", 1, &["BEAT1-OK"]),
+                wire_item(
+                    "user",
+                    "ccm-2",
+                    2,
+                    &["Call the ctx_search tool exactly once."],
+                ),
+            ],
+        );
+        // The live drive paused ~434s between beats, so the second pass classified
+        // HARD via the idle-TTL trigger (default cache_ttl 5m). The TTL predicate
+        // needs an observed prior response time to arm; without it the pass stays
+        // SOFT-class and this fixture would not cover the drive's actual shape.
+        let mut ttl_ctx = pctx("git:proj", "/nonexistent-docs", 434_000);
+        ttl_ctx.observed_last_response_at_ms = Some(1);
+        ttl_ctx.injected_reductions = spine().to_vec();
+        let second = transform(&s, &beat2, &ttl_ctx).unwrap();
+        assert_eq!(
+            second.action, "HARD",
+            "idle-TTL fold must fire past cache_ttl"
+        );
+        assert_eq!(second.surface_state, SurfaceState::Active);
+        let joined = serde_json::to_string(&second.ck_messages).unwrap();
+        assert!(
+            joined.contains("\u{a7}1\u{a7}"),
+            "second active pass emitted no tag prefixes: {joined}"
+        );
+        assert!(
+            joined.contains("\u{a7}7\u{a7}"),
+            "new user turn missing its tag: {joined}"
+        );
+    }
+
+    /// Wire-deserialized tool-result ingress message. `output_json` is the raw
+    /// CkToolOutput JSON so each output variant (text / error_text / content) can
+    /// be exercised with retained pass-through bytes on the block.
+    fn wire_tool_result(id: &str, ordinal: u64, output_json: Value) -> CkIngressMessage {
+        let ck: CkWireMessage = serde_json::from_value(json!({
+            "role": "user",
+            "content": [{ "kind": {
+                "type": "tool_result",
+                "id": format!("call_{id}"),
+                "tool_name": "probe",
+                "provider_executed": false,
+                "output": output_json,
+            }}],
+            "meta": { "harness_id": id },
+        }))
+        .unwrap();
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck,
+        }
+    }
+
+    /// Wire-deserialized assistant tool-call message pairing a later tool result.
+    fn wire_tool_call(id: &str, ordinal: u64, call_id: &str) -> CkIngressMessage {
+        let ck: CkWireMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [{ "kind": {
+                "type": "tool_call",
+                "id": call_id,
+                "name": "probe",
+                "input": {},
+            }}],
+            "meta": { "harness_id": id },
+        }))
+        .unwrap();
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck,
+        }
+    }
+
+    /// Drive one session to the second active pass (tags emitting) over the given
+    /// tail and return the serialized output for byte-level assertions.
+    fn second_active_pass_json(session: &str, messages: Vec<CkIngressMessage>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let req = active_cc_req(session, "cfg0", messages);
+        let transition = run(&s, &req, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        let second = run(&s, &req, &spine());
+        assert_eq!(second.surface_state, SurfaceState::Active);
+        serde_json::to_string(&second.ck_messages).unwrap()
+    }
+
+    /// Every tool-result output variant the overlay can prefix must survive
+    /// serialization when the fixture arrives through wire deserialization
+    /// (retained pass-through bytes on the block). Each case fails if the
+    /// overlay stops clearing the mutated block's retained bytes.
+    #[test]
+    fn wire_tool_result_text_variant_tags_survive_serialization() {
+        let joined = second_active_pass_json(
+            "wire-tr-text",
+            vec![
+                wire_tool_call("a1", 1, "call_t1"),
+                wire_tool_result(
+                    "t1",
+                    2,
+                    json!({ "kind": { "type": "text", "text": "plain output" } }),
+                ),
+            ],
+        );
+        assert!(
+            joined.contains("\u{a7}1\u{a7} plain output"),
+            "text output lost its tag: {joined}"
+        );
+    }
+
+    #[test]
+    fn wire_tool_result_error_text_variant_tags_survive_serialization() {
+        let joined = second_active_pass_json(
+            "wire-tr-err",
+            vec![
+                wire_tool_call("a1", 1, "call_t1"),
+                wire_tool_result(
+                    "t1",
+                    2,
+                    json!({ "kind": { "type": "error_text", "text": "boom" } }),
+                ),
+            ],
+        );
+        assert!(
+            joined.contains("\u{a7}1\u{a7} boom"),
+            "error_text output lost its tag: {joined}"
+        );
+    }
+
+    #[test]
+    fn wire_tool_result_content_variant_tags_survive_serialization() {
+        let joined = second_active_pass_json(
+            "wire-tr-content",
+            vec![
+                wire_tool_call("a1", 1, "call_t1"),
+                wire_tool_result(
+                    "t1",
+                    2,
+                    json!({ "kind": { "type": "content", "blocks": [
+                        { "kind": { "type": "text", "text": "nested text" } },
+                    ]}}),
+                ),
+            ],
+        );
+        assert!(
+            joined.contains("\u{a7}1\u{a7} nested text"),
+            "content-variant output lost its tag: {joined}"
+        );
+    }
+
+    #[test]
+    fn wire_channel1_append_survives_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![
+            wire_tool_call("a1", 1, "call_t1"),
+            wire_tool_result(
+                "t1",
+                2,
+                json!({ "kind": { "type": "text", "text": "tool output" } }),
+            ),
+        ];
+        let req = active_cc_req("wire-ch1", "cfg0", messages);
+        let transition = run(&s, &req, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        run(&s, &req, &spine());
+        s.seed_channel1_append_for_test("wire-ch1", "t1#0", "reminder: reduce spent outputs", 5)
+            .unwrap();
+        // Ingress always carries the ORIGINAL bytes (tags exist only on the
+        // provider wire; raw ingress bytes are identity), so the same request
+        // replays and the append rides the shared overlay clear site.
+        let third = run(&s, &req, &spine());
+        let joined = serde_json::to_string(&third.ck_messages).unwrap();
+        assert!(
+            joined.contains("reminder: reduce spent outputs"),
+            "channel-1 append lost on wire-deserialized block: {joined}"
+        );
+    }
+
+    /// Mixed-message canary: a mutated block must canonicalize while its untouched
+    /// sibling keeps its retained pass-through bytes VERBATIM, including unknown
+    /// fields serde would drop, and message-level provenance survives.
+    #[test]
+    fn overlay_canonicalizes_only_the_mutated_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let ck: CkWireMessage = serde_json::from_value(json!({
+            "role": "user",
+            "content": [
+                { "kind": { "type": "text", "text": "taggable prompt" } },
+                { "kind": { "type": "opaque", "source": "provider", "kind": "server_tool",
+                    "raw": { "some": "provider-native" } },
+                  "sentinel_unknown_field": "must-survive-verbatim" },
+            ],
+            "provider_extras": { "anthropic": { "probe": "message-provenance" } },
+            "meta": { "harness_id": "mixed-0" },
+        }))
+        .unwrap();
+        let item = CkIngressMessage {
+            mid: "mixed-0".to_string(),
+            ordinal: 0,
+            ck,
+        };
+        let req = active_cc_req("wire-mixed", "cfg0", vec![item]);
+        let transition = run(&s, &req, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        let second = run(&s, &req, &spine());
+        let joined = serde_json::to_string(&second.ck_messages).unwrap();
+        assert!(
+            joined.contains("\u{a7}1\u{a7} taggable prompt"),
+            "mutated block missing its tag: {joined}"
+        );
+        assert!(
+            joined.contains("sentinel_unknown_field"),
+            "untouched sibling lost retained unknown field: {joined}"
+        );
+        assert!(
+            joined.contains("must-survive-verbatim"),
+            "untouched sibling bytes not verbatim: {joined}"
+        );
+        assert!(
+            joined.contains("message-provenance"),
+            "message provenance lost: {joined}"
+        );
+    }
+
+    /// Models copy the tag notation they see in history onto their own replies.
+    /// The overlay must strip those imitation prefixes on assistant text at any
+    /// line start while preserving mid-prose references on ACTIVE passes. False
+    /// passes serve the ingress bytes untouched.
+    #[test]
+    fn assistant_tag_imitation_prefixes_strip_on_active_passes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![
+            wire_item("user", "ccm-0", 0, &["say BEAT3-OK"]),
+            wire_item(
+                "assistant",
+                "ccm-1",
+                1,
+                &["preamble\n§39§ §39§ BEAT3-OK\nI dropped §12§."],
+            ),
+        ];
+        let req = active_cc_req("imitation", "cfg0", messages.clone());
+        let transition = run(&s, &req, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        let second = run(&s, &req, &spine());
+        let joined = serde_json::to_string(&second.ck_messages).unwrap();
+        assert_eq!(
+            tail_bytes(&second, "ccm-1"),
+            "§2§ preamble\nBEAT3-OK\nI dropped §12§.",
+            "line-leading imitations must strip, official tag applies, mid-prose reference survives: {joined}"
+        );
+        assert!(
+            !joined.contains("\u{a7}39\u{a7}"),
+            "model-authored leading prefixes must not reach the wire on active passes: {joined}"
+        );
+
+        // False pass on the same session: ingress bytes verbatim (no strip, no tags).
+        let mut inactive = cc_req("imitation", "cfg0", messages);
+        inactive.tool_present = false;
+        let off = run(&s, &inactive, &spine());
+        let joined_off = serde_json::to_string(&off.ck_messages).unwrap();
+        assert!(
+            joined_off.contains("\u{a7}39\u{a7} \u{a7}39\u{a7} BEAT3-OK"),
+            "false passes must serve model-authored bytes verbatim: {joined_off}"
+        );
+    }
+
+    /// The strip's inter-prefix separator class is full whitespace: models copy
+    /// imitation prefixes separated by spaces, tabs, or newlines, and a leaked
+    /// separator would put the imitation back on the wire behind the official
+    /// tag. Malformed shapes and mid-prose references must stay verbatim.
+    #[test]
+    fn strip_leading_tag_imitations_covers_whitespace_and_preserves_malformed() {
+        // Multi-prefix runs across every separator class strip completely.
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7} \u{a7}40\u{a7} BEAT"),
+            "BEAT"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7}\t\u{a7}40\u{a7}\tBEAT"),
+            "BEAT"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7}\n\u{a7}40\u{a7}\nBEAT"),
+            "BEAT"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7} \n\t \u{a7}40\u{a7} BEAT"),
+            "BEAT"
+        );
+        // Malformed leading shapes are NOT well-formed prefixes: verbatim.
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39 BEAT"),
+            "\u{a7}39 BEAT"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}\u{a7} BEAT"),
+            "\u{a7}\u{a7} BEAT"
+        );
+        // Mid-prose references stay: the strip is anchored to the head.
+        assert_eq!(
+            strip_leading_tag_imitations("I dropped \u{a7}12\u{a7} earlier"),
+            "I dropped \u{a7}12\u{a7} earlier"
+        );
+        assert_eq!(
+            strip_leading_tag_imitations("\u{a7}39\u{a7}BEAT"),
+            "\u{a7}39\u{a7}BEAT",
+            "a token without a separator is not an imitation"
+        );
+    }
+
+    #[test]
+    fn assistant_tag_imitations_strip_on_later_lines_but_not_code() {
+        let value = "preamble\n\u{a7}22\u{a7} Delta\n`\u{a7}23\u{a7} inline`\n```rust\n\u{a7}24\u{a7} fenced\n```\n\u{a7}25\u{a7} Echo";
+        assert_eq!(
+            strip_leading_tag_imitations(value),
+            "preamble\nDelta\n`\u{a7}23\u{a7} inline`\n```rust\n\u{a7}24\u{a7} fenced\n```\nEcho"
+        );
+    }
+
+    fn two_block_item(id: &str, ordinal: u64, first: &str, second: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: id.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: first.to_string(),
+                    }),
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: second.to_string(),
+                    }),
+                ],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta::default(),
+            ),
         }
     }
 
@@ -3192,11 +5246,20 @@ mod tests {
             serializer_profile: "owned-llmrunner".to_string(),
             session_id: session.to_string(),
             render_config: cfg.to_string(),
+            provider_id: None,
+            model_key: None,
+            clear_reasoning_age: DEFAULT_CLEAR_REASONING_AGE,
+            tool_present: false,
+            serve_native: false,
+            native_messages: None,
             full_array_fingerprint: None,
             messages,
             tail_delta: None,
             usage: None,
             provider_error: None,
+            mid_turn: false,
+            prev_response_completed_at_ms: None,
+            request_observed_at_ms: None,
             declared_trim: None,
         }
     }
@@ -3264,6 +5327,17 @@ mod tests {
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.smart_drops = true;
         ctx
+    }
+
+    fn seed_unrelated_hint_candidates(store: &McStore) {
+        for (id, content) in [
+            (9_998, "unrelated fixture material"),
+            (9_999, "separate archive subject"),
+        ] {
+            store
+                .seed_memory(id, "git:proj", "CONSTRAINTS", content, 50)
+                .unwrap();
+        }
     }
 
     fn with_usage(
@@ -3381,6 +5455,30 @@ mod tests {
         )
     }
 
+    fn opaque_result_carrier(mid: &str, ordinal: u64, role: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                role,
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(
+                    ck_wire::OpaqueBlock {
+                        source: json!({ "type": "tool_result" }),
+                        kind: "tool_result".to_string(),
+                        raw: json!({ "output": "transport" }),
+                        arc: None,
+                    },
+                ))],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
     fn tool_result_with_output(
         mid: &str,
         ordinal: u64,
@@ -3493,7 +5591,7 @@ mod tests {
 
     /// Cross-repo drift pin for the shared CK wire fixture. Three parties ride
     /// this exact byte shape (llm-runner produces it, this module parses it,
-    /// ai-proxy produces it), and each repo vendors its own copy — so a
+    /// the thalamus gateway produces it), and each repo vendors its own copy, so a
     /// one-sided regeneration would leave every repo locally green while the
     /// wire silently drifts. Each repo pins the fixture's sha256; a regen
     /// fails the pin everywhere until each consumer deliberately re-vendors
@@ -3626,6 +5724,114 @@ mod tests {
                 .expect("live media message must pass through");
             assert_eq!(serde_json::to_value(replayed).unwrap(), media_wire);
         }
+    }
+
+    fn assistant_form(mid: &str, ordinal: u64, texts: &[&str]) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                texts
+                    .iter()
+                    .map(|text| {
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                            text: (*text).to_string(),
+                        })
+                    })
+                    .collect(),
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn shadow_mid_turn_tail_stays_provisional_and_reset_recovers_identity_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "shadow:identity-recovery";
+        let partial = assistant_form("tail", 1, &["partial"]);
+        let complete = assistant_form("tail", 1, &["partial", "completed"]);
+
+        // This is the production failure shape when a streaming form is pinned first.
+        let pinned = req(session, "cfg0", vec![partial.clone()]);
+        transform(&store, &pinned, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        let drift = req(session, "cfg0", vec![complete.clone()]);
+        assert!(matches!(
+            transform(&store, &drift, &pctx("git:proj", "/nonexistent-docs", 1)),
+            Err(TransformError::IdentityDrift(mid)) if mid == "tail"
+        ));
+
+        let reset = store.reset_shadow_session(session, session).unwrap();
+        assert!(reset.shadow_seq == 0);
+        assert!(store
+            .load(session)
+            .unwrap()
+            .meta
+            .block_identity_by_mid
+            .is_empty());
+        transform(&store, &drift, &pctx("git:proj", "/nonexistent-docs", 2)).unwrap();
+
+        // The exemption is shadow-only; a non-shadow request remains byte-for-byte strict even
+        // if an unexpected caller supplies the mid_turn field.
+        let owned_session = "owned:identity-provisional";
+        let mut owned_mid_turn = req(
+            owned_session,
+            "cfg0",
+            vec![assistant_form("owned", 1, &["partial"])],
+        );
+        owned_mid_turn.mid_turn = true;
+        transform(
+            &store,
+            &owned_mid_turn,
+            &pctx("git:proj", "/nonexistent-docs", 3),
+        )
+        .unwrap();
+        assert!(store
+            .load(owned_session)
+            .unwrap()
+            .meta
+            .block_identity_by_mid
+            .contains_key("owned"));
+
+        // Shadow sends carry mid_turn, so the same partial form is never pinned.
+        let shadow_session = "shadow:identity-provisional";
+        let mut provisional = req(shadow_session, "cfg0", vec![partial]);
+        provisional.mid_turn = true;
+        transform(
+            &store,
+            &provisional,
+            &pctx("git:proj", "/nonexistent-docs", 3),
+        )
+        .unwrap();
+        assert!(!store
+            .load(shadow_session)
+            .unwrap()
+            .meta
+            .block_identity_by_mid
+            .contains_key("tail"));
+        transform(
+            &store,
+            &req(shadow_session, "cfg0", vec![complete]),
+            &pctx("git:proj", "/nonexistent-docs", 4),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .load(shadow_session)
+                .unwrap()
+                .meta
+                .block_identity_by_mid
+                .get("tail")
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -3834,7 +6040,7 @@ mod tests {
     fn agent_drop_ids_freeze_add_only_through_flat_ids() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        let request = req("agent-drop", "cfg0", vec![item("a", 1, "drop me")]);
+        let request = active_cc_req("agent-drop", "cfg0", vec![item("a", 1, "drop me")]);
         s.append_pending_agent_drops("agent-drop", &["a#0".to_string()], 1)
             .unwrap();
         let r = run(&s, &request, &spine());
@@ -4308,6 +6514,551 @@ mod tests {
         assert!(matches!(
             &messages[1].content[0].kind,
             ck_wire::CkKind::Text { text } if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn text_before_latest_reasoning_matches_ts_wire_shape() {
+        let assistant = CkWireMessage::from_parts(
+            "assistant",
+            vec![
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(ck_wire::OpaqueBlock {
+                    source: serde_json::json!({"harness": "opencode"}),
+                    kind: "step-start".to_string(),
+                    raw: serde_json::json!({"type": "step-start"}),
+                    arc: None,
+                })),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: "§18240§ answer".to_string(),
+                }),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "signed thinking".to_string(),
+                    signature: Some("sig".to_string()),
+                }),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                    provider_executed: false,
+                }),
+            ],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("msg_text_first".to_string()),
+                ..Default::default()
+            },
+        );
+        let ingress = vec![CkIngressMessage {
+            mid: "msg_text_first".to_string(),
+            ordinal: 1,
+            ck: assistant.clone(),
+        }];
+
+        assert_eq!(
+            latest_assistant_mutation_exempt_mid(
+                &ingress,
+                Some(SerializerProfile::OpencodeAiSdk),
+                false,
+            ),
+            None
+        );
+
+        let mut served = vec![assistant];
+        assert_eq!(
+            apply_serializer_residuals(SerializerProfile::OpencodeAiSdk, &mut served),
+            1
+        );
+        assert!(matches!(
+            &served[0].content[1].kind,
+            ck_wire::CkKind::Text { text } if text == "§18240§ answer"
+        ));
+        assert!(matches!(
+            &served[0].content[2].kind,
+            ck_wire::CkKind::Text { text } if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn latest_assistant_reasoning_is_exempt_from_opencode_healing() {
+        fn assistant(mid: &str, reasoning: &str, text: &str) -> CkWireMessage {
+            CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                        text: reasoning.to_string(),
+                        signature: Some(format!("sig-{mid}")),
+                    }),
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: text.to_string(),
+                    }),
+                ],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            )
+        }
+
+        let base = vec![
+            assistant("older", "older thinking", "older answer"),
+            assistant("latest", "latest thinking", "latest answer"),
+        ];
+        let mut fail_first = base.clone();
+        assert_eq!(
+            apply_serializer_residuals(SerializerProfile::OpencodeAiSdk, &mut fail_first),
+            1
+        );
+        assert_ne!(
+            serde_json::to_vec(&fail_first[1]).unwrap(),
+            serde_json::to_vec(&base[1]).unwrap(),
+            "the consecutive-assistant residual mutates the latest reasoning block"
+        );
+
+        let mut served = base.clone();
+        assert_eq!(
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut served,
+                Some("latest"),
+            ),
+            1
+        );
+        assert!(matches!(
+            &served[1].content[0].kind,
+            ck_wire::CkKind::Text { text } if text.is_empty()
+        ));
+
+        let standalone = vec![
+            assistant("older", "older thinking", "older answer"),
+            CkWireMessage::from_parts(
+                "user",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: "new turn".to_string(),
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta::default(),
+            ),
+            assistant("latest", "latest thinking", "latest answer"),
+        ];
+        let mut standalone_served = standalone.clone();
+        assert_eq!(
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut standalone_served,
+                Some("latest"),
+            ),
+            0
+        );
+        assert_eq!(
+            serde_json::to_vec(&standalone_served[2]).unwrap(),
+            serde_json::to_vec(&standalone[2]).unwrap(),
+            "a standalone latest assistant still uses the ingress exemption"
+        );
+
+        let ingress = base
+            .iter()
+            .enumerate()
+            .map(|(index, ck)| CkIngressMessage {
+                mid: ck.meta.harness_id.clone().unwrap(),
+                ordinal: index as u64 + 1,
+                ck: ck.clone(),
+            })
+            .collect::<Vec<_>>();
+        let request = profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "latest-assistant-output",
+            "cfg0",
+            ingress,
+        );
+        let projection = project_messages(&request.messages).unwrap();
+        let mut overlay = TagOverlayState::default();
+        overlay.tag_by_block_id.insert("latest#1".to_string(), 7);
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        let unprotected = build_output(
+            &core,
+            &meta,
+            &projection,
+            &request,
+            Some(&overlay),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            serde_json::to_vec(&unprotected[1]).unwrap(),
+            serde_json::to_vec(&request.messages[1].ck).unwrap(),
+            "the overlay and healing fixture must differ before the exemption"
+        );
+        let protected = build_output(
+            &core,
+            &meta,
+            &projection,
+            &request,
+            Some(&overlay),
+            false,
+            Some("latest"),
+        )
+        .unwrap();
+        assert!(matches!(
+            &protected[1].content[0].kind,
+            ck_wire::CkKind::Text { text } if text.is_empty()
+        ));
+        assert_ne!(
+            serde_json::to_vec(&protected[1]).unwrap(),
+            serde_json::to_vec(&request.messages[1].ck).unwrap(),
+            "a merged latest assistant must follow the serializer healing rule"
+        );
+    }
+
+    #[test]
+    fn opencode_d2_watermark_persists_and_defer_does_not_recompute_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let assistant = CkWireMessage::from_parts(
+            "assistant",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "old thinking".to_string(),
+                signature: Some("old signature".to_string()),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("assistant".to_string()),
+                ..Default::default()
+            },
+        );
+        let user = CkWireMessage::from_parts(
+            "user",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: "new prompt".to_string(),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("user".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut request = req(
+            "d2-watermark",
+            "cfg0",
+            vec![
+                CkIngressMessage {
+                    mid: "assistant".to_string(),
+                    ordinal: 1,
+                    ck: assistant,
+                },
+                CkIngressMessage {
+                    mid: "user".to_string(),
+                    ordinal: 10,
+                    ck: user,
+                },
+            ],
+        );
+        request.serializer_profile = SerializerProfile::OpencodeAiSdk.wire_id().to_string();
+        request.provider_id = Some("anthropic".to_string());
+        request.serve_native = true;
+        request.clear_reasoning_age = 5;
+
+        let first = transform(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        assert_eq!(
+            store
+                .load("d2-watermark")
+                .unwrap()
+                .meta
+                .reasoning_cleared_through_ordinal,
+            5
+        );
+        assert!(first.committed);
+
+        let second =
+            transform(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        assert_eq!(second.action, "SOFT+");
+        assert_eq!(
+            store
+                .load("d2-watermark")
+                .unwrap()
+                .meta
+                .reasoning_cleared_through_ordinal,
+            5,
+            "defer must replay a persisted boundary instead of moving it"
+        );
+        assert!(!second.committed);
+    }
+
+    #[test]
+    fn opencode_d2_clears_historical_reasoning_after_codec_and_replays_stably() {
+        fn assistant(mid: &str) -> CkWireMessage {
+            CkWireMessage::from_parts(
+                "assistant",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: format!("thinking-{mid}"),
+                    signature: Some(format!("signature-{mid}")),
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            )
+        }
+
+        let old = assistant("old");
+        let latest = assistant("latest");
+        let served = vec![old.clone(), latest.clone()];
+        let ingress = vec![
+            CkIngressMessage {
+                mid: "old".to_string(),
+                ordinal: 1,
+                ck: old,
+            },
+            CkIngressMessage {
+                mid: "latest".to_string(),
+                ordinal: 60,
+                ck: latest,
+            },
+        ];
+        let mut native = vec![
+            json!({
+                "info": { "id": "old", "role": "assistant" },
+                "parts": [{
+                    "type": "reasoning",
+                    "text": "thinking-old",
+                    "metadata": { "signature": "signature-old" }
+                }]
+            }),
+            json!({
+                "info": { "id": "latest", "role": "assistant" },
+                "parts": [{
+                    "type": "reasoning",
+                    "text": "thinking-latest",
+                    "metadata": { "signature": "signature-latest" }
+                }]
+            }),
+        ];
+
+        assert_eq!(
+            clear_served_native_reasoning(
+                SerializerProfile::OpencodeAiSdk,
+                true,
+                &mut native,
+                &served,
+                &ingress,
+                60,
+                false,
+            ),
+            2,
+            "a completed historical latest assistant is still age-eligible"
+        );
+        assert_eq!(
+            native[0]["parts"][0],
+            json!({ "type": "reasoning", "text": "" })
+        );
+        assert_eq!(
+            native[1]["parts"][0],
+            json!({ "type": "reasoning", "text": "" })
+        );
+        let first_pass = native.clone();
+        assert_eq!(
+            clear_served_native_reasoning(
+                SerializerProfile::OpencodeAiSdk,
+                true,
+                &mut native,
+                &served,
+                &ingress,
+                60,
+                false,
+            ),
+            0
+        );
+        assert_eq!(native, first_pass, "defer replay must be byte-stable");
+
+        let mut in_flight = vec![
+            json!({
+                "info": { "id": "old", "role": "assistant" },
+                "parts": [{ "type": "reasoning", "text": "thinking-old" }]
+            }),
+            json!({
+                "info": { "id": "latest", "role": "assistant" },
+                "parts": [{ "type": "reasoning", "text": "thinking-latest" }]
+            }),
+        ];
+        assert_eq!(
+            clear_served_native_reasoning(
+                SerializerProfile::OpencodeAiSdk,
+                true,
+                &mut in_flight,
+                &served,
+                &ingress,
+                60,
+                true,
+            ),
+            1
+        );
+        assert_eq!(in_flight[0]["parts"][0]["text"], "");
+        assert_eq!(in_flight[1]["parts"][0]["text"], "thinking-latest");
+    }
+
+    #[test]
+    fn reasoning_clearing_is_not_applicable_to_claude_or_owned_broca() {
+        let message = CkWireMessage::from_parts(
+            "assistant",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed thinking".to_string(),
+                signature: Some("signature".to_string()),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("assistant".to_string()),
+                ..Default::default()
+            },
+        );
+        let ingress = vec![CkIngressMessage {
+            mid: "assistant".to_string(),
+            ordinal: 1,
+            ck: message.clone(),
+        }];
+        for profile in [
+            SerializerProfile::ClaudeCodeAnthropic,
+            SerializerProfile::OwnedBroca,
+        ] {
+            let mut native = vec![json!({
+                "info": { "id": "assistant", "role": "assistant" },
+                "parts": [{
+                    "type": "reasoning",
+                    "text": "signed thinking",
+                    "metadata": { "signature": "signature" }
+                }]
+            })];
+            assert_eq!(
+                clear_served_native_reasoning(
+                    profile,
+                    false,
+                    &mut native,
+                    std::slice::from_ref(&message),
+                    &ingress,
+                    1,
+                    false,
+                ),
+                0
+            );
+            assert_eq!(
+                native[0]["parts"][0]["type"], "reasoning",
+                "{profile:?} keeps verbatim-tail reasoning"
+            );
+        }
+    }
+
+    #[test]
+    fn beat_five_replay_tail_strips_reasoning_from_merged_latest_assistant() {
+        fn message(mid: &str, role: &str, reasoning: Option<&str>) -> CkWireMessage {
+            let mut content = Vec::new();
+            if let Some(text) = reasoning {
+                content.push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: text.to_string(),
+                    signature: Some(format!("sig-{mid}")),
+                }));
+            }
+            content.push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                id: format!("call-{mid}"),
+                name: "read".to_string(),
+                input: serde_json::json!({}),
+                provider_executed: false,
+            }));
+            content.push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolResult {
+                id: format!("call-{mid}"),
+                tool_name: "read".to_string(),
+                output: ck_wire::CkToolOutput::bare(ck_wire::CkOutputKind::Text {
+                    text: "ok".to_string(),
+                }),
+                provider_executed: false,
+            }));
+            CkWireMessage::from_parts(
+                role,
+                content,
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            )
+        }
+
+        let mut served = (0..60)
+            .map(|index| message(&format!("prefix-{index}"), "user", None))
+            .collect::<Vec<_>>();
+        served.push(message("tail-user", "user", None));
+        served.push(message("tail-61", "assistant", Some("first")));
+        served.push(message("tail-62", "assistant", Some("second")));
+        served.push(message("tail-63", "assistant", Some("third")));
+        served.push(message("tail-64", "assistant", Some("fourth")));
+        served.push(message("tail-65", "assistant", Some("fifth")));
+        served.push(message("tail-66", "assistant", Some("latest")));
+
+        assert_eq!(served.len(), 67);
+        assert_eq!(
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut served,
+                Some("tail-66"),
+            ),
+            5
+        );
+        assert!(matches!(
+            &served[61].content[0].kind,
+            ck_wire::CkKind::Reasoning { .. }
+        ));
+        for message in &served[62..] {
+            assert!(matches!(
+                &message.content[0].kind,
+                ck_wire::CkKind::Text { text } if text.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn reasoning_strip_ignores_opencode_step_metadata_before_thinking() {
+        let mut messages = vec![CkWireMessage::from_parts(
+            "assistant",
+            vec![
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(ck_wire::OpaqueBlock {
+                    source: serde_json::json!({"harness": "opencode"}),
+                    kind: "step-start".to_string(),
+                    raw: serde_json::json!({"type": "step-start"}),
+                    arc: None,
+                })),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "signed thinking".to_string(),
+                    signature: Some("sig".to_string()),
+                }),
+            ],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("metadata-latest".to_string()),
+                ..Default::default()
+            },
+        )];
+
+        assert_eq!(
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut messages,
+                None,
+            ),
+            0
+        );
+        assert!(matches!(
+            &messages[0].content[1].kind,
+            ck_wire::CkKind::Reasoning { .. }
         ));
     }
 
@@ -6320,6 +9071,7 @@ mod tests {
         assert!(meta.last_recut.is_none());
         assert_eq!(meta.historian.expected_revert_epoch, 0);
         assert!(meta.synthetic_todo.is_none());
+        assert!(!meta.cc_u1_active);
         assert!(meta.initialized);
     }
 
@@ -6388,7 +9140,7 @@ mod tests {
     fn tagger_flip_hards_before_committed_identity_can_render_tags() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        let request = req("flip", "cfg0", vec![item("m1", 1, "hello")]);
+        let mut request = cc_req("flip", "cfg0", vec![item("m1", 1, "hello")]);
 
         let before_flip = run(&s, &request, &spine());
         assert_eq!(before_flip.action, "HARD");
@@ -6400,7 +9152,7 @@ mod tests {
             .last_render_config
             .contains("tfe:"));
 
-        crate::healing::set_tagging_enabled_for_tests(Some(true));
+        request.tool_present = true;
         let transition = run(&s, &request, &spine());
         assert_eq!(transition.action, "HARD");
         assert_eq!(tail_bytes(&transition, "m1"), "hello");
@@ -6410,43 +9162,12 @@ mod tests {
             .unwrap()
             .meta
             .last_render_config
-            .contains("tfe:4:tfe1"));
+            .contains("tfe:4:tfe3"));
 
         let after_commit = run(&s, &request, &spine());
         assert_eq!(after_commit.action, "SOFT+");
         assert_eq!(tail_bytes(&after_commit, "m1"), "§1§ hello");
         assert_eq!(s.load_tags_for_session("flip").unwrap().len(), 1);
-        crate::healing::set_tagging_enabled_for_tests(None);
-    }
-
-    #[test]
-    fn drop_placeholder_uses_tag_number_only_for_new_tagged_freezes() {
-        let tagged = reduce("tagged#0", "drop", "[dropped]");
-        let untagged = reduce("untagged#0", "drop", "[dropped]");
-        let rows = vec![McTagRow {
-            tag_number: 7,
-            block_id: "tagged#0".to_string(),
-            kind: "message".to_string(),
-            token_count: 1,
-            created_at_ms: 10,
-            source_bytes: b"source".to_vec(),
-        }];
-
-        let numbered = numbered_drop_placeholders_for_new_freezes(
-            &CoreState::default(),
-            &[tagged.clone(), untagged],
-            &rows,
-        );
-        assert_eq!(numbered[0].payload, "[dropped §7§]");
-        assert_eq!(numbered[1].payload, "[dropped]");
-
-        let frozen = CoreState {
-            frozen_units: vec![red_unit("tagged#0", "drop", "[dropped]")],
-            ..Default::default()
-        };
-        let replay = numbered_drop_placeholders_for_new_freezes(&frozen, &[tagged], &rows);
-        assert_eq!(replay[0].payload, "[dropped]");
-        assert_eq!(frozen_red_payload(&frozen, "tagged#0"), Some("[dropped]"));
     }
 
     #[test]
@@ -6480,8 +9201,817 @@ mod tests {
     }
 
     #[test]
+    fn temporal_gap_format_matches_typescript_goldens() {
+        let fixtures = [
+            (0, None),
+            (299_999, None),
+            (300_000, Some("<!-- +5m -->\n")),
+            (12 * 60 * 1_000, Some("<!-- +12m -->\n")),
+            ((2 * 60 * 60 + 15 * 60) * 1_000, Some("<!-- +2h 15m -->\n")),
+            (24 * 60 * 60 * 1_000, Some("<!-- +1d -->\n")),
+            (
+                (3 * 24 * 60 * 60 + 4 * 60 * 60) * 1_000,
+                Some("<!-- +3d 4h -->\n"),
+            ),
+            (7 * 24 * 60 * 60 * 1_000, Some("<!-- +1w -->\n")),
+            (
+                (2 * 7 * 24 * 60 * 60 + 3 * 24 * 60 * 60) * 1_000,
+                Some("<!-- +2w 3d -->\n"),
+            ),
+        ];
+        for (gap_ms, expected) in fixtures {
+            assert_eq!(temporal_gap_prefix(gap_ms).as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn temporal_gap_overlay_replays_and_false_window_is_verbatim() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first_messages = vec![wire_item("user", "m1", 1, &["start"])];
+            let first_request = active_cc_req("temporal", "cfg0", first_messages.clone());
+            transform(
+                &s,
+                &first_request,
+                &pctx("git:proj", "/nonexistent-docs", 1_000),
+            )
+            .unwrap();
+            transform(
+                &s,
+                &first_request,
+                &pctx("git:proj", "/nonexistent-docs", 1_000),
+            )
+            .unwrap();
+
+            let mut with_assistant = first_messages;
+            with_assistant.push(wire_item("assistant", "m2", 2, &["answer"]));
+            let assistant_request = active_cc_req("temporal", "cfg0", with_assistant.clone());
+            transform(
+                &s,
+                &assistant_request,
+                &pctx("git:proj", "/nonexistent-docs", 10_000),
+            )
+            .unwrap();
+
+            let mut complete = with_assistant;
+            complete.push(wire_item("user", "m3", 3, &["question"]));
+            let mut active = active_cc_req("temporal", "cfg0", complete.clone());
+            active.prev_response_completed_at_ms = Some(10_000);
+            // Ingress-time basis: the module clock runs 2h LATER than the proxy's
+            // ingress observation (queue plus blocking-arm delay). A now-basis
+            // implementation would render +2h here instead of +12m.
+            active.request_observed_at_ms = Some(730_000);
+            let first = transform(
+                &s,
+                &active,
+                &pctx("git:proj", "/nonexistent-docs", 7_930_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&first, "m3"), "<!-- +12m -->\n§3§ question");
+            active.prev_response_completed_at_ms = Some(800_000);
+            let replay = transform(
+                &s,
+                &active,
+                &pctx("git:proj", "/nonexistent-docs", 8_000_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&replay, "m3"), tail_bytes(&first, "m3"));
+
+            let dormant = cc_req("temporal", "cfg0", complete);
+            let false_window = transform(
+                &s,
+                &dormant,
+                &pctx("git:proj", "/nonexistent-docs", 1_000_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&false_window, "m3"), "question");
+        });
+    }
+
+    #[test]
+    fn temporal_gap_trailing_role_system_reminder_keeps_authored_user_eligible() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first = active_cc_req(
+                "temporal-system-tail",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["start"])],
+            );
+            run(&s, &first, &spine());
+            run(&s, &first, &spine());
+
+            let mut request = active_cc_req(
+                "temporal-system-tail",
+                "cfg0",
+                vec![
+                    first.messages[0].clone(),
+                    wire_item("assistant", "m2", 2, &["answer"]),
+                    wire_item("user", "m3", 3, &["question"]),
+                    system_item("reminder", 4, "transport reminder"),
+                ],
+            );
+            request.prev_response_completed_at_ms = Some(10_000);
+            request.request_observed_at_ms = Some(730_000);
+            let response = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 730_000),
+            )
+            .unwrap();
+            assert_eq!(
+                tail_bytes(&response, "m3"),
+                "<!-- +12m -->\n§3§ question",
+                "role=system reminders are skipped when resolving the authored tail"
+            );
+        });
+    }
+
+    #[test]
+    fn temporal_gap_standalone_system_reminder_user_is_transport() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first = active_cc_req(
+                "temporal-user-reminder",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["start"])],
+            );
+            run(&s, &first, &spine());
+            run(&s, &first, &spine());
+
+            let mut request = active_cc_req(
+                "temporal-user-reminder",
+                "cfg0",
+                vec![
+                    first.messages[0].clone(),
+                    wire_item("assistant", "m2", 2, &["answer"]),
+                    wire_item("user", "m3", 3, &["question"]),
+                    wire_item(
+                        "user",
+                        "reminder",
+                        4,
+                        &["<system-reminder>background work finished</system-reminder>"],
+                    ),
+                ],
+            );
+            request.prev_response_completed_at_ms = Some(10_000);
+            request.request_observed_at_ms = Some(730_000);
+            let response = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 730_000),
+            )
+            .unwrap();
+            assert_eq!(
+                tail_bytes(&response, "m3"),
+                "<!-- +12m -->\n§3§ question",
+                "a standalone reminder-shaped user message is transport, not an authored tail"
+            );
+        });
+    }
+
+    #[test]
+    fn temporal_gap_frontier_stays_before_a_mint_ineligible_user() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let request = active_cc_req(
+                "temporal-frontier",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["question"])],
+            );
+            run(&s, &request, &spine());
+
+            let loaded = s.load("temporal-frontier").unwrap();
+            let mut core = loaded.core.clone();
+            core.frozen_units
+                .push(red_unit("m1#0", "drop", "[dropped]"));
+            s.commit("temporal-frontier", loaded.row_version, &core, &loaded.meta)
+                .unwrap();
+
+            let mut gap_request = request.clone();
+            gap_request.prev_response_completed_at_ms = Some(100_000);
+            gap_request.request_observed_at_ms = Some(700_000);
+            let skipped = transform(
+                &s,
+                &gap_request,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&skipped, "m1"), "[dropped]");
+            assert!(s
+                .load_temporal_marks("temporal-frontier")
+                .unwrap()
+                .is_empty());
+            assert_eq!(s.overlay_watermark("temporal-frontier").unwrap(), None);
+
+            let loaded = s.load("temporal-frontier").unwrap();
+            let mut core = loaded.core.clone();
+            core.frozen_units
+                .retain(|unit| !unit.key.starts_with("red:"));
+            s.commit("temporal-frontier", loaded.row_version, &core, &loaded.meta)
+                .unwrap();
+            let minted = transform(
+                &s,
+                &gap_request,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&minted, "m1"), "<!-- +10m -->\n§1§ question");
+            assert_eq!(s.overlay_watermark("temporal-frontier").unwrap(), Some(1));
+        });
+    }
+
+    #[test]
+    fn sparse_temporal_decision_stays_frozen_when_an_older_ordinal_returns() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first_messages = vec![wire_item("user", "m1", 1, &["start"])];
+            let first_request = active_cc_req("temporal-sparse", "cfg0", first_messages.clone());
+            run(&s, &first_request, &spine());
+            run(&s, &first_request, &spine());
+
+            let sparse = vec![
+                first_messages[0].clone(),
+                wire_item("user", "m3", 3, &["later"]),
+            ];
+            let sparse_request = active_cc_req("temporal-sparse", "cfg0", sparse.clone());
+            let first = transform(
+                &s,
+                &sparse_request,
+                &pctx("git:proj", "/nonexistent-docs", 721_000),
+            )
+            .unwrap();
+            let frozen = tail_bytes(&first, "m3").to_string();
+            assert_eq!(frozen, "§2§ later");
+
+            let restored = active_cc_req(
+                "temporal-sparse",
+                "cfg0",
+                vec![
+                    sparse[0].clone(),
+                    wire_item("assistant", "m2", 2, &["restored"]),
+                    sparse[1].clone(),
+                ],
+            );
+            let replay = transform(
+                &s,
+                &restored,
+                &pctx("git:proj", "/nonexistent-docs", 1_500_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&replay, "m3").as_bytes(), frozen.as_bytes());
+            assert!(s
+                .load_temporal_marks("temporal-sparse")
+                .unwrap()
+                .iter()
+                .all(|row| row.block_id != "m2#0"));
+
+            let near = active_cc_req(
+                "temporal-sparse",
+                "cfg0",
+                vec![
+                    sparse[0].clone(),
+                    restored.messages[1].clone(),
+                    sparse[1].clone(),
+                    wire_item("user", "m4", 4, &["nearby"]),
+                ],
+            );
+            let near_response =
+                transform(&s, &near, &pctx("git:proj", "/nonexistent-docs", 721_100)).unwrap();
+            assert_eq!(tail_bytes(&near_response, "m4"), "§4§ nearby");
+            let empty = s
+                .load_temporal_marks("temporal-sparse")
+                .unwrap()
+                .into_iter()
+                .find(|row| row.block_id == "m4#0")
+                .expect("empty temporal decision");
+            assert!(empty.marker_text.is_empty());
+
+            let false_window = transform(
+                &s,
+                &cc_req("temporal-sparse", "cfg0", near.messages),
+                &pctx("git:proj", "/nonexistent-docs", 2_000_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&false_window, "m3"), "later");
+            assert_eq!(tail_bytes(&false_window, "m4"), "nearby");
+        });
+    }
+
+    #[test]
+    fn temporal_gap_midlife_activation_has_zero_gaps() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let messages = vec![
+                wire_item("user", "m1", 1, &["old question"]),
+                wire_item("assistant", "m2", 2, &["old answer"]),
+                wire_item("user", "m3", 3, &["current question"]),
+            ];
+            let request = active_cc_req("temporal-midlife", "cfg0", messages);
+            transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 600_000),
+            )
+            .unwrap();
+            let active = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 600_000),
+            )
+            .unwrap();
+            assert_eq!(tail_bytes(&active, "m3"), "§3§ current question");
+        });
+    }
+
+    #[test]
+    fn temporal_gap_invalid_or_missing_observation_freezes_no_marker() {
+        run_active_surface_test(|| {
+            for (session, observed) in [
+                ("temporal-absent", None),
+                ("temporal-zero", Some(0)),
+                ("temporal-equal", Some(600_000)),
+                ("temporal-future", Some(600_001)),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let s = store(dir.path());
+                let mut request = active_cc_req(
+                    session,
+                    "cfg0",
+                    vec![wire_item("user", "m0", 0, &["question"])],
+                );
+                request.prev_response_completed_at_ms = observed;
+                run(&s, &request, &spine());
+                let response = transform(
+                    &s,
+                    &request,
+                    &pctx("git:proj", "/nonexistent-docs", 600_000),
+                )
+                .unwrap();
+                assert_eq!(tail_bytes(&response, "m0"), "§1§ question");
+                assert_eq!(s.load_temporal_marks(session).unwrap()[0].marker_text, "");
+            }
+        });
+    }
+
+    #[test]
+    fn v2_request_tolerates_absent_previous_response_completion() {
+        let parsed: TransformRequest = serde_json::from_value(serde_json::json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "claude-code-anthropic",
+            "session_id": "parse-gap",
+            "render_config": "cfg",
+            "messages": []
+        }))
+        .unwrap();
+        assert_eq!(parsed.prev_response_completed_at_ms, None);
+    }
+
+    #[test]
+    fn user_hint_query_strips_tags_reminders_and_caps_input() {
+        let long_tail = "x".repeat(600);
+        let message = wire_item(
+            "user",
+            "query",
+            1,
+            &[
+                "§12§ keep <system-reminder>drop <system-reminder>nested</system-reminder> tail</system-reminder> words",
+                &long_tail,
+            ],
+        );
+        let query = user_hint_query(&message);
+        assert_eq!(query, "keep words");
+        assert!(!query.contains("§12§"));
+        assert!(!query.contains("drop"));
+        assert!(query.chars().count() < USER_HINT_QUERY_CHAR_CAP);
+    }
+
+    #[test]
+    fn user_hint_is_computed_once_replayed_and_inactive_is_verbatim() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership uses borrowing safely",
+                70,
+            )
+            .unwrap();
+            seed_unrelated_hint_candidates(&s);
+            let messages = vec![wire_item("user", "m1", 1, &["rust ownership"])];
+            let request = active_cc_req("user-hint", "cfg0", messages.clone());
+            run(&s, &request, &spine());
+            let first = run(&s, &request, &spine());
+            let expected_hint = "\n\n<ctx-search-hint>\nYour memory may contain related fragments:\n- rust ownership uses borrowing safely\nIf relevant, run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>";
+            assert_eq!(
+                tail_bytes(&first, "m1"),
+                format!("§1§ rust ownership{expected_hint}")
+            );
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+
+            let replay = run(&s, &request, &spine());
+            assert_eq!(tail_bytes(&replay, "m1"), tail_bytes(&first, "m1"));
+            assert_eq!(
+                USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get),
+                1,
+                "a durable row bypasses the lexical query on replay"
+            );
+            assert_eq!(s.load_user_hints("user-hint").unwrap().len(), 1);
+
+            let dormant = cc_req("user-hint", "cfg0", messages);
+            let false_window = run(&s, &dormant, &spine());
+            assert_eq!(tail_bytes(&false_window, "m1"), "rust ownership");
+        });
+    }
+
+    #[test]
+    fn empty_user_hint_decision_skips_future_queries() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let request = active_cc_req(
+                "empty-user-hint",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["no matching fragment"])],
+            );
+            run(&s, &request, &spine());
+            let first = run(&s, &request, &spine());
+            assert_eq!(tail_bytes(&first, "m1"), "§1§ no matching fragment");
+            let decisions = s.load_user_hints("empty-user-hint").unwrap();
+            assert_eq!(decisions.len(), 1);
+            assert!(decisions[0].hint_text.is_empty());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+
+            run(&s, &request, &spine());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+        });
+    }
+
+    #[test]
+    fn buried_user_does_not_mint_a_hint_or_backfill_later() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "newer prompt carries related durable context",
+                70,
+            )
+            .unwrap();
+            let both = vec![
+                wire_item("user", "m1", 1, &["older prompt"]),
+                wire_item("user", "m2", 2, &["newer prompt"]),
+                wire_item("assistant", "m3", 3, &["trailing answer"]),
+            ];
+            let request = active_cc_req("hint-frontier", "cfg0", both);
+            run(&s, &request, &spine());
+            run(&s, &request, &spine());
+            assert!(s.load_user_hints("hint-frontier").unwrap().is_empty());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
+            assert_eq!(s.overlay_watermark("hint-frontier").unwrap(), Some(2));
+
+            let older_only = active_cc_req(
+                "hint-frontier",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["older prompt"])],
+            );
+            let response = run(&s, &older_only, &spine());
+            assert_eq!(tail_bytes(&response, "m1"), "§1§ older prompt");
+            assert!(s.load_user_hints("hint-frontier").unwrap().is_empty());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
+        });
+    }
+
+    #[test]
+    fn ordinal_zero_user_is_eligible_on_a_fresh_frontier() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership uses borrowing safely",
+                70,
+            )
+            .unwrap();
+            seed_unrelated_hint_candidates(&s);
+            let request = active_cc_req(
+                "zero-frontier",
+                "cfg0",
+                vec![wire_item("user", "m0", 0, &["rust ownership"])],
+            );
+            run(&s, &request, &spine());
+            let active = run(&s, &request, &spine());
+            assert!(tail_bytes(&active, "m0").contains("<ctx-search-hint>"));
+            assert_eq!(s.overlay_watermark("zero-frontier").unwrap(), Some(0));
+            assert_eq!(
+                s.load_user_hints("zero-frontier").unwrap()[0].block_id,
+                "m0#0"
+            );
+        });
+    }
+
+    #[test]
+    fn authored_tail_skips_tool_result_blocks_for_both_wire_roles() {
+        let user = wire_item("user", "m1", 1, &["authored"]);
+        let role_tool = active_cc_req(
+            "tool-tail",
+            "cfg0",
+            vec![
+                user.clone(),
+                tool_result("result-tool", 2, "call", "output"),
+            ],
+        );
+        assert_eq!(eligible_authored_user_tail(&role_tool).unwrap().mid, "m1");
+
+        let role_user = active_cc_req(
+            "user-result-tail",
+            "cfg0",
+            vec![
+                user,
+                wire_tool_result(
+                    "result-user",
+                    2,
+                    json!({ "kind": { "type": "text", "text": "output" } }),
+                ),
+            ],
+        );
+        assert_eq!(eligible_authored_user_tail(&role_user).unwrap().mid, "m1");
+        assert!(!is_authored_user_message(&role_user.messages[1]));
+    }
+
+    #[test]
+    fn trailing_tool_role_transport_keeps_authored_user_eligible() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            store
+                .seed_memory(
+                    1,
+                    "git:proj",
+                    "CONSTRAINTS",
+                    "rust ownership uses borrowing safely",
+                    70,
+                )
+                .unwrap();
+            seed_unrelated_hint_candidates(&store);
+            let request = active_cc_req(
+                "tool-role-tail",
+                "cfg0",
+                vec![
+                    wire_item("user", "m1", 1, &["rust ownership"]),
+                    wire_item("tool", "result", 2, &["transport output"]),
+                ],
+            );
+            run(&store, &request, &spine());
+            let response = run(&store, &request, &spine());
+            assert!(tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
+            assert_eq!(store.overlay_watermark("tool-role-tail").unwrap(), Some(1));
+        });
+    }
+
+    #[test]
+    fn user_role_result_carrier_neither_targets_overlays_nor_burns_frontier() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            store
+                .seed_memory(
+                    1,
+                    "git:proj",
+                    "CONSTRAINTS",
+                    "rust ownership uses borrowing safely",
+                    70,
+                )
+                .unwrap();
+            seed_unrelated_hint_candidates(&store);
+            let mut request = active_cc_req(
+                "user-result-tail",
+                "cfg0",
+                vec![
+                    wire_item("user", "m1", 1, &["rust ownership"]),
+                    opaque_result_carrier("result", 2, "user"),
+                ],
+            );
+            request.prev_response_completed_at_ms = Some(1);
+            run(&store, &request, &spine());
+            let response = transform(
+                &store,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap();
+            assert!(tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
+            assert_eq!(
+                store.overlay_watermark("user-result-tail").unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                store
+                    .load_temporal_marks("user-result-tail")
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.block_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["m1#0"]
+            );
+            let result = response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("result"))
+                .expect("result carrier remains in the tail");
+            assert!(matches!(
+                &result.content[0].kind,
+                ck_wire::CkKind::Opaque(opaque) if opaque.raw == json!({ "output": "transport" })
+            ));
+        });
+    }
+
+    #[test]
+    fn lexical_hint_scoring_requires_two_specific_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        for id in 1..=30 {
+            let content = if id == 1 {
+                "rust ownership borrowing safely across async tasks".to_string()
+            } else if id == 2 {
+                "quasar appears in an otherwise unrelated archive".to_string()
+            } else {
+                format!("fixture memory {id} about ordinary unrelated material")
+            };
+            s.seed_memory(id, "git:proj", "CONSTRAINTS", &content, 50)
+                .unwrap();
+        }
+
+        let related =
+            run_user_hint_lexical_search(&s, "git:proj", "lexical", "rust ownership", true)
+                .unwrap();
+        assert_eq!(related[0].id, 1);
+        let unrelated =
+            run_user_hint_lexical_search(&s, "git:proj", "lexical", "galaxy telescope", true)
+                .unwrap();
+        assert!(unrelated.is_empty());
+        let one_common_token =
+            run_user_hint_lexical_search(&s, "git:proj", "lexical", "quasar deployment", true)
+                .unwrap();
+        assert!(one_common_token.is_empty());
+        let ubiquitous_tokens =
+            run_user_hint_lexical_search(&s, "git:proj", "lexical", "fixture memory", true)
+                .unwrap();
+        assert!(
+            ubiquitous_tokens.is_empty(),
+            "matches need at least one token present in less than half the candidate pool"
+        );
+    }
+
+    #[test]
+    fn user_hint_query_drops_a_token_split_by_the_character_cap() {
+        let complete_prefix = "word ".repeat(99);
+        let split = format!("{complete_prefix}partialtoken suffix");
+        let query = user_hint_query(&wire_item("user", "m1", 1, &[&split]));
+        assert_eq!(query, complete_prefix.trim_end());
+        assert!(!query.contains("parti"));
+    }
+
+    #[test]
+    fn user_hint_targets_first_text_after_media() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "media prompt has a remembered fragment",
+                70,
+            )
+            .unwrap();
+            seed_unrelated_hint_candidates(&s);
+            let mut message = wire_item("user", "m1", 1, &["media prompt"]);
+            message.ck.content.insert(
+                0,
+                CkWireBlock::bare(ck_wire::CkKind::Media(ck_wire::MediaBlock {
+                    kind: ck_wire::MediaKind::Image,
+                    media_type: "image/png".to_string(),
+                    filename: None,
+                    source: serde_json::json!({"type": "base64", "data": "AA=="}),
+                })),
+            );
+            let request = active_cc_req("media-hint", "cfg0", vec![message]);
+            run(&s, &request, &spine());
+            let response = run(&s, &request, &spine());
+            let rendered = response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("m1"))
+                .unwrap();
+            let ck_wire::CkKind::Text { text } = &rendered.content[1].kind else {
+                panic!("second block must remain text");
+            };
+            assert!(text.starts_with("§1§ media prompt"));
+            assert!(text.contains("<ctx-search-hint>"));
+            assert_eq!(s.load_user_hints("media-hint").unwrap()[0].block_id, "m1#1");
+        });
+    }
+
+    #[test]
+    fn pending_rewrite_passthrough_replays_only_existing_overlays() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "foreign prompt has durable context",
+                70,
+            )
+            .unwrap();
+            s.seed_memory(
+                2,
+                "git:proj",
+                "CONSTRAINTS",
+                "unrelated fixture material",
+                50,
+            )
+            .unwrap();
+            s.replace_compartments("pending-hint", &[comp(1, 1, 2, "t2#0", "summary")])
+                .unwrap();
+            let present = active_cc_req(
+                "pending-hint",
+                "cfg0",
+                vec![
+                    wire_item("assistant", "t2", 2, &["covered"]),
+                    wire_item("assistant", "t3", 3, &["tail"]),
+                ],
+            );
+            run(&s, &present, &spine());
+            run(&s, &present, &spine());
+            let mut loaded = s.load("pending-hint").unwrap();
+            loaded.meta.pending_rewrite = Some(PendingRewriteState {
+                armed_at_ms: 1,
+                absent_shape_fingerprint: "held".to_string(),
+                absent_request_count: 1,
+                last_present_at_ms: Some(1),
+            });
+            s.commit(
+                "pending-hint",
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
+
+            let absent = active_cc_req(
+                "pending-hint",
+                "cfg0",
+                vec![wire_item("user", "foreign", 50, &["foreign prompt"])],
+            );
+            let response = run(&s, &absent, &spine());
+            assert_eq!(response.action, "PASSTHROUGH");
+            assert!(!tail_bytes(&response, "foreign").contains("<ctx-search-hint>"));
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
+            assert!(s.load_user_hints("pending-hint").unwrap().is_empty());
+            assert_eq!(s.overlay_watermark("pending-hint").unwrap(), None);
+
+            let accepted = active_cc_req(
+                "pending-hint",
+                "cfg0",
+                vec![
+                    present.messages[0].clone(),
+                    present.messages[1].clone(),
+                    wire_item("user", "foreign", 50, &["foreign prompt"]),
+                ],
+            );
+            let active = run(&s, &accepted, &spine());
+            assert!(tail_bytes(&active, "foreign").contains("<ctx-search-hint>"));
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+            assert_eq!(
+                s.load_user_hints("pending-hint").unwrap()[0].block_id,
+                "foreign#0"
+            );
+        });
+    }
+
+    #[test]
     fn mint_scope_matches_overlay_scope_and_captures_exact_source() {
-        with_tagging_enabled(|| {
+        run_active_surface_test(|| {
             let content_text = ck_wire::ResultBlock {
                 kind: ck_wire::ResultBlockKind::Text {
                     text: "  content §9§".to_string(),
@@ -6545,7 +10075,7 @@ mod tests {
                     ck_wire::CkOutputKind::Content { blocks: Vec::new() },
                 ),
             ];
-            let request = req("scope", "cfg0", messages.clone());
+            let request = active_cc_req("scope", "cfg0", messages.clone());
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
             run(&s, &request, &spine());
@@ -6575,8 +10105,8 @@ mod tests {
     }
 
     #[test]
-    fn tag_minting_is_deterministic_monotonic_and_survives_rejected_pass() {
-        with_tagging_enabled(|| {
+    fn tag_minting_is_deterministic_and_rejected_pass_is_speculative() {
+        run_active_surface_test(|| {
             let messages = vec![
                 item("m1", 1, "hello"),
                 assistant_tool_call("call", 2, "c1"),
@@ -6584,9 +10114,17 @@ mod tests {
             ];
             let dir_a = tempfile::tempdir().unwrap();
             let store_a = store(dir_a.path());
-            run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
+            run(
+                &store_a,
+                &active_cc_req("mint", "cfg0", messages.clone()),
+                &spine(),
+            );
             assert!(store_a.load_tags_for_session("mint").unwrap().is_empty());
-            run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
+            run(
+                &store_a,
+                &active_cc_req("mint", "cfg0", messages.clone()),
+                &spine(),
+            );
             let first = store_a.load_tags_for_session("mint").unwrap();
             assert_eq!(
                 first
@@ -6595,23 +10133,31 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![(1, "m1#0", "message"), (2, "result#0", "tool_result")]
             );
-            run(&store_a, &req("mint", "cfg0", messages.clone()), &spine());
+            run(
+                &store_a,
+                &active_cc_req("mint", "cfg0", messages.clone()),
+                &spine(),
+            );
             assert_eq!(store_a.load_tags_for_session("mint").unwrap(), first);
 
             let dir_b = tempfile::tempdir().unwrap();
             let store_b = store(dir_b.path());
-            run(&store_b, &req("mint", "cfg0", messages.clone()), &spine());
-            run(&store_b, &req("mint", "cfg0", messages), &spine());
+            run(
+                &store_b,
+                &active_cc_req("mint", "cfg0", messages.clone()),
+                &spine(),
+            );
+            run(&store_b, &active_cc_req("mint", "cfg0", messages), &spine());
             assert_eq!(store_b.load_tags_for_session("mint").unwrap(), first);
 
             let dir_c = tempfile::tempdir().unwrap();
             let store_c = store(dir_c.path());
-            let stable = req("reject", "cfg0", vec![item("m1", 1, "old")]);
+            let stable = active_cc_req("reject", "cfg0", vec![item("m1", 1, "old")]);
             run(&store_c, &stable, &spine());
             run(&store_c, &stable, &spine());
             let err = transform(
                 &store_c,
-                &req(
+                &active_cc_req(
                     "reject",
                     "cfg0",
                     vec![item("m1", 1, "changed identity"), item("m2", 2, "new")],
@@ -6625,17 +10171,113 @@ mod tests {
                 tags.iter()
                     .map(|row| row.block_id.as_str())
                     .collect::<Vec<_>>(),
-                vec!["m1#0", "m2#0"]
+                vec!["m1#0"]
             );
         });
     }
 
     #[test]
-    fn tag_overlay_replays_stably_and_new_tail_gets_next_number() {
-        with_tagging_enabled(|| {
+    fn boundary_rejection_leaves_all_overlay_decisions_uncommitted() {
+        run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
-            let first_req = req("stable", "cfg0", vec![item("m1", 1, "alpha")]);
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership durable context",
+                70,
+            )
+            .unwrap();
+            s.seed_memory(
+                2,
+                "git:proj",
+                "CONSTRAINTS",
+                "unrelated fixture material",
+                50,
+            )
+            .unwrap();
+            let baseline = active_cc_req(
+                "overlay-reject",
+                "cfg0",
+                vec![wire_item("user", "m1", 1, &["baseline prompt"])],
+            );
+            run(&s, &baseline, &spine());
+            run(&s, &baseline, &spine());
+            let tags_before = s.load_tags_for_session("overlay-reject").unwrap();
+            let hints_before = s.load_user_hints("overlay-reject").unwrap();
+            let temporal_before = s.load_temporal_marks("overlay-reject").unwrap();
+            let channel1_before = s.load_channel1_appends("overlay-reject").unwrap();
+            let frontier_before = s.overlay_watermark("overlay-reject").unwrap();
+
+            s.replace_compartments(
+                "overlay-reject",
+                &[comp(1, 3, 3, "m3#0", "only the last message")],
+            )
+            .unwrap();
+            let mut rejected = active_cc_req(
+                "overlay-reject",
+                "cfg0",
+                vec![
+                    baseline.messages[0].clone(),
+                    wire_item("assistant", "m2", 2, &["answer"]),
+                    wire_item("user", "m3", 3, &["rust ownership"]),
+                ],
+            );
+            rejected.prev_response_completed_at_ms = Some(1);
+            let error = transform(
+                &s,
+                &rejected,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap_err();
+            assert!(matches!(error, TransformError::CoverageGap(_)));
+            assert_eq!(
+                s.load_tags_for_session("overlay-reject").unwrap(),
+                tags_before
+            );
+            assert_eq!(s.load_user_hints("overlay-reject").unwrap(), hints_before);
+            assert_eq!(
+                s.load_temporal_marks("overlay-reject").unwrap(),
+                temporal_before
+            );
+            assert_eq!(
+                s.overlay_watermark("overlay-reject").unwrap(),
+                frontier_before
+            );
+            assert_eq!(
+                s.load_channel1_appends("overlay-reject").unwrap(),
+                channel1_before
+            );
+
+            s.replace_compartments("overlay-reject", &[comp(1, 1, 3, "m3#0", "complete range")])
+                .unwrap();
+            transform(
+                &s,
+                &rejected,
+                &pctx("git:proj", "/nonexistent-docs", 700_000),
+            )
+            .unwrap();
+            assert!(s
+                .load_user_hints("overlay-reject")
+                .unwrap()
+                .iter()
+                .any(|row| row.block_id == "m3#0" && !row.hint_text.is_empty()));
+            assert_eq!(s.overlay_watermark("overlay-reject").unwrap(), Some(3));
+            assert!(s
+                .load_temporal_marks("overlay-reject")
+                .unwrap()
+                .iter()
+                .any(|row| row.block_id == "m3#0"));
+        });
+    }
+
+    #[test]
+    fn tag_overlay_replays_stably_and_new_tail_gets_next_number() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let first_req = active_cc_req("stable", "cfg0", vec![item("m1", 1, "alpha")]);
             let transition = run(&s, &first_req, &spine());
             assert_eq!(tail_bytes(&transition, "m1"), "alpha");
             let first = run(&s, &first_req, &spine());
@@ -6645,7 +10287,7 @@ mod tests {
 
             let extended = run(
                 &s,
-                &req(
+                &active_cc_req(
                     "stable",
                     "cfg0",
                     vec![item("m1", 1, "alpha"), item("m2", 2, "beta")],
@@ -6659,12 +10301,12 @@ mod tests {
 
     #[test]
     fn reduced_block_renders_placeholder_without_tag_prefix() {
-        with_tagging_enabled(|| {
+        run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
             s.replace_compartments("drop-tag", &[comp(1, 1, 1, "a", "SUMMARY")])
                 .unwrap();
-            let request = req(
+            let request = active_cc_req(
                 "drop-tag",
                 "cfg0",
                 vec![
@@ -6686,7 +10328,7 @@ mod tests {
 
     #[test]
     fn channel1_nudge_replays_and_suppresses_refire() {
-        with_tagging_enabled(|| {
+        run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
             let huge = "word ".repeat(20_000);
@@ -6696,7 +10338,7 @@ mod tests {
                 assistant_tool_call("call2", 3, "c2"),
                 tool_result("result2", 4, "c2", &huge),
             ];
-            let request = with_usage(req("nudge", "cfg0", messages.clone()), 900, 1024);
+            let request = with_usage(active_cc_req("nudge", "cfg0", messages.clone()), 900, 1024);
             run(&s, &request, &spine());
             let first = run(&s, &request, &spine());
             let first_result = tail_bytes(&first, "result2").to_string();
@@ -6716,13 +10358,797 @@ mod tests {
             extended_messages.push(tool_result("result3", 6, "c3", &huge));
             let suppressed = run(
                 &s,
-                &with_usage(req("nudge", "cfg0", extended_messages), 900, 1024),
+                &with_usage(active_cc_req("nudge", "cfg0", extended_messages), 900, 1024),
                 &spine(),
             );
             assert!(tail_bytes(&suppressed, "result2").contains("<system-reminder>"));
             assert!(!tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
         });
+    }
+
+    #[test]
+    fn subc_reversibility_false_pass_has_no_tag_bytes_in_any_durable_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .replace_compartments("false-bytes", &[comp(1, 1, 1, "a", "summary")])
+            .unwrap();
+        let request = cc_req(
+            "false-bytes",
+            "cfg0",
+            vec![item("a", 1, "covered"), item("b", 2, "live")],
+        );
+
+        let response = run(&store, &request, &spine());
+        let loaded = store.load("false-bytes").unwrap();
+        let compartments = store.load_compartments("false-bytes").unwrap();
+        assert!(!compartments.is_empty());
+        for durable_or_output in [
+            serde_json::to_string(&request).unwrap(),
+            serde_json::to_string(&response).unwrap(),
+            serde_json::to_string(&loaded.core).unwrap(),
+            serde_json::to_string(&loaded.meta).unwrap(),
+            format!("{compartments:?}"),
+        ] {
+            assert!(!durable_or_output.contains('§'), "{durable_or_output}");
+        }
+        assert!(store
+            .load_tags_for_session("false-bytes")
+            .unwrap()
+            .is_empty());
+        assert_eq!(response.surface_state, SurfaceState::Inactive);
+    }
+
+    #[test]
+    fn subc_reversibility_surface_flip_coordinates_exactly_one_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![item("m1", 1, "hello")];
+        let mut inactive = cc_req("surface-flip", "profile␟tf0␟gno-reduce", messages.clone());
+        let initial = run(&store, &inactive, &spine());
+        assert_eq!(initial.action, "HARD");
+        assert_eq!(initial.surface_state, SurfaceState::Inactive);
+
+        let active = active_cc_req("surface-flip", "profile␟tf1␟gfull", messages.clone());
+        let on_transition = run(&store, &active, &spine());
+        assert_eq!(on_transition.action, "HARD");
+        assert_eq!(on_transition.surface_state, SurfaceState::Transition);
+        let on_config = store.load("surface-flip").unwrap().meta.last_render_config;
+        assert!(on_config.contains("tf1"));
+        assert!(on_config.contains("gfull"));
+        assert!(on_config.contains("tfe:4:tfe3"));
+        let on_steady = run(&store, &active, &spine());
+        assert_ne!(on_steady.action, "HARD");
+        assert_eq!(on_steady.surface_state, SurfaceState::Active);
+
+        inactive.render_config = "profile␟tf0␟gno-reduce".to_string();
+        let off_transition = run(&store, &inactive, &spine());
+        assert_eq!(off_transition.action, "HARD");
+        assert_eq!(off_transition.surface_state, SurfaceState::Transition);
+        let off_config = store.load("surface-flip").unwrap().meta.last_render_config;
+        assert!(off_config.contains("tf0"));
+        assert!(off_config.contains("gno-reduce"));
+        assert!(!off_config.contains("tfe:"));
+        let off_steady = run(&store, &inactive, &spine());
+        assert_ne!(off_steady.action, "HARD");
+        assert_eq!(off_steady.surface_state, SurfaceState::Inactive);
+
+        assert!(active.tool_present && !inactive.tool_present);
+    }
+
+    #[test]
+    fn subc_reversibility_pending_drop_survives_an_entire_false_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = (1..=30)
+            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, "old live content"))
+            .collect::<Vec<_>>();
+        let mut inactive = cc_req("false-window", "cfg0", messages.clone());
+        run(&store, &inactive, &spine());
+        store
+            .append_pending_agent_drops("false-window", &["m1#0".to_string()], 1)
+            .unwrap();
+
+        for pass in 1..=4 {
+            inactive.render_config = format!("cfg{pass}");
+            let response = run(&store, &with_usage(inactive.clone(), 99, 100), &spine());
+            assert_eq!(response.action, "HARD");
+            assert_eq!(
+                frozen_red_payload(&store.load("false-window").unwrap().core, "m1#0"),
+                None
+            );
+            assert_eq!(
+                store
+                    .load_pending_agent_drops("false-window")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        let active = active_cc_req("false-window", &inactive.render_config, messages);
+        let applied = run(&store, &active, &spine());
+        assert_eq!(applied.action, "HARD");
+        assert_eq!(
+            frozen_red_payload(&store.load("false-window").unwrap().core, "m1#0"),
+            Some("[dropped]")
+        );
+        assert!(store
+            .load_pending_agent_drops("false-window")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn subc_reversibility_true_reduction_stays_canonical_after_false_flip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .replace_compartments("canonical-flip", &[comp(1, 1, 1, "a", "summary")])
+            .unwrap();
+        let active = active_cc_req(
+            "canonical-flip",
+            "cfg0",
+            vec![item("a", 1, "covered"), item("m1", 2, "drop me")],
+        );
+        run(&store, &active, &spine());
+        run(&store, &active, &spine());
+        let reduced = run(&store, &active, &[reduce("m1#0", "drop", "[dropped]")]);
+        assert_eq!(tail_bytes(&reduced, "m1"), "[dropped §2§]");
+        assert_eq!(
+            frozen_red_payload(&store.load("canonical-flip").unwrap().core, "m1#0"),
+            Some("[dropped]")
+        );
+
+        let inactive = cc_req(
+            "canonical-flip",
+            "cfg0",
+            vec![item("a", 1, "covered"), item("m1", 2, "drop me")],
+        );
+        let transition = run(&store, &inactive, &spine());
+        assert_eq!(transition.action, "HARD");
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        assert_eq!(tail_bytes(&transition, "m1"), "[dropped]");
+        let loaded = store.load("canonical-flip").unwrap();
+        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), Some("[dropped]"));
+        assert!(loaded
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:m1#0"));
+    }
+
+    #[test]
+    fn held_agent_remainder_keeps_full_rendered_output_byte_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial_store = store(dir.path());
+        let messages = vec![
+            item("covered", 0, "covered"),
+            item("first", 1, "first"),
+            item("held", 2, "held"),
+        ];
+        initial_store
+            .replace_compartments("held-output", &[comp(1, 0, 0, "covered", "summary")])
+            .unwrap();
+        let stable_request = active_cc_req("held-output", "cfg0", messages.clone());
+        run(&initial_store, &stable_request, &spine());
+        let baseline = run(&initial_store, &stable_request, &spine());
+        let baseline_bytes = serde_json::to_vec(&baseline.ck_messages).unwrap();
+
+        initial_store
+            .append_pending_agent_drops_with_command(
+                "held-output",
+                Some("command-a"),
+                &["first#0".to_string(), "held#0".to_string()],
+                1,
+            )
+            .unwrap();
+        let pending = initial_store
+            .load_pending_agent_drops("held-output")
+            .unwrap();
+        let loaded = initial_store.load("held-output").unwrap();
+        let command_ids = vec!["command-a".to_string()];
+        initial_store
+            .commit_transform(
+                "held-output",
+                TransformCommit {
+                    expected: loaded.row_version,
+                    core: &loaded.core,
+                    meta: &loaded.meta,
+                    consumed_drop_ids: &[pending[0].id],
+                    first_applied_command_ids: &command_ids,
+                    memory_revision: None,
+                    overlays: TransformOverlayBatch::default(),
+                },
+            )
+            .unwrap();
+        drop(initial_store);
+        let store_after_restart = store(dir.path());
+
+        for pass in 0..3 {
+            let response = run(
+                &store_after_restart,
+                &with_usage(stable_request.clone(), 70, 100),
+                &spine(),
+            );
+            assert_eq!(
+                serde_json::to_vec(&response.ck_messages).unwrap(),
+                baseline_bytes,
+                "held work must not rewrite the full rendered array on stable pass {pass}"
+            );
+            assert!(
+                frozen_red_payload(
+                    &store_after_restart.load("held-output").unwrap().core,
+                    "held#0",
+                )
+                .is_none(),
+                "a held remainder must remain unfrozen until a ride opportunity"
+            );
+        }
+    }
+
+    #[test]
+    fn another_command_rides_held_remainder_in_one_full_array_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut messages = vec![
+            item("covered", 0, "covered"),
+            item("a-held", 1, "a held"),
+            item("b-first", 2, "b first"),
+            item("a-first", 3, "a first"),
+        ];
+        store
+            .replace_compartments("ride-output", &[comp(1, 0, 0, "covered", "summary")])
+            .unwrap();
+        messages.extend((4..=22).map(|ordinal| {
+            item(
+                &format!("filler-{ordinal}"),
+                ordinal,
+                &format!("filler {ordinal}"),
+            )
+        }));
+        let stable_request = active_cc_req("ride-output", "cfg0", messages.clone());
+        run(&store, &stable_request, &spine());
+        let baseline = run(&store, &stable_request, &spine());
+        let baseline_bytes = serde_json::to_vec(&baseline.ck_messages).unwrap();
+
+        store
+            .append_pending_agent_drops_with_command(
+                "ride-output",
+                Some("command-a"),
+                &["a-first#0".to_string(), "a-held#0".to_string()],
+                1,
+            )
+            .unwrap();
+        let pending_a = store.load_pending_agent_drops("ride-output").unwrap();
+        let loaded = store.load("ride-output").unwrap();
+        let command_a = vec!["command-a".to_string()];
+        store
+            .commit_transform(
+                "ride-output",
+                TransformCommit {
+                    expected: loaded.row_version,
+                    core: &loaded.core,
+                    meta: &loaded.meta,
+                    consumed_drop_ids: &[pending_a[0].id],
+                    first_applied_command_ids: &command_a,
+                    memory_revision: None,
+                    overlays: TransformOverlayBatch::default(),
+                },
+            )
+            .unwrap();
+        store
+            .append_pending_agent_drops_with_command(
+                "ride-output",
+                Some("command-b"),
+                &["b-first#0".to_string()],
+                2,
+            )
+            .unwrap();
+
+        let ride = run(
+            &store,
+            &with_usage(stable_request.clone(), 70, 100),
+            &spine(),
+        );
+        assert_eq!(ride.action, "SOFT", "ride response: {ride:?}");
+        let ride_bytes = serde_json::to_vec(&ride.ck_messages).unwrap();
+        assert_ne!(
+            ride_bytes, baseline_bytes,
+            "the ride pass must be the one bust"
+        );
+        let frozen = store.load("ride-output").unwrap().core;
+        assert!(frozen_red_payload(&frozen, "a-held#0").is_some());
+        assert!(frozen_red_payload(&frozen, "b-first#0").is_some());
+
+        let replay = run(&store, &with_usage(stable_request, 70, 100), &spine());
+        let replay_bytes = serde_json::to_vec(&replay.ck_messages).unwrap();
+        assert_eq!(replay_bytes, ride_bytes);
+        let distinct_byte_changing_passes = [baseline_bytes, ride_bytes, replay_bytes]
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count();
+        assert!(
+            distinct_byte_changing_passes <= 2,
+            "two commands may cause at most two self-caused busts"
+        );
+    }
+
+    #[test]
+    fn newest_tag_block_set_isolates_protected_and_applied_pending_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // The protected set is the newest 20 ACTIVE tags as exact block ids.
+        // This fixture is built so every cheaper implementation class fails at
+        // the rank-20 boundary itself, not just at the extremes:
+        //   - ACTIVE numbers have holes: m23#0 is stale-provenance and three
+        //     "ghost" rows hold the TOP numbers (26-28) for blocks absent from
+        //     the array, so any numeric-threshold cutoff (from the active max
+        //     or the global max) lands on the wrong rows.
+        //   - Ordinal 24 carries TWO tagged blocks (m24#0, m24#1), so
+        //     one-block-per-ordinal counting shifts the boundary by one.
+        // Active numbers: {1..22, 24, 25} (24 rows). Newest 20 by number:
+        // {5..22, 24, 25} — the boundary pair is number 5 (rank 20, protected)
+        // vs number 4 (rank 21, applied), and both carry pending drops.
+        let mut messages = (1..=24)
+            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
+            .collect::<Vec<_>>();
+        messages[23] = two_block_item("m24", 24, "text 24", "attachment 24");
+
+        let mut tags = (1..=24)
+            .map(|ordinal| TagMintInput {
+                block_id: format!("m{ordinal}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: if ordinal == 23 {
+                    // Stale provenance: stored bytes no longer match the live
+                    // carrier, so this row must not occupy a protected slot.
+                    b"text from a previous life".to_vec()
+                } else {
+                    format!("text {ordinal}").into_bytes()
+                },
+            })
+            .collect::<Vec<_>>();
+        tags.push(TagMintInput {
+            block_id: "m24#1".to_string(),
+            kind: "message".to_string(),
+            token_count: 1,
+            source_bytes: b"attachment 24".to_vec(),
+        });
+        for ghost in 1..=3 {
+            tags.push(TagMintInput {
+                block_id: format!("ghost{ghost}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: b"ghost".to_vec(),
+            });
+        }
+        store.seed_tags_for_test("protected", &tags, 1).unwrap();
+        store
+            .append_pending_agent_drops_with_command(
+                "protected",
+                Some("range-command"),
+                &["m4#0".to_string(), "m5#0".to_string(), "m24#1".to_string()],
+                99,
+            )
+            .unwrap();
+
+        let response = run(
+            &store,
+            &active_cc_req("protected", "cfg0", messages),
+            &spine(),
+        );
+        assert_eq!(response.action, "HARD");
+        let loaded = store.load("protected").unwrap();
+        // Rank 21 (number 4) is just outside the protected set: applied.
+        assert_eq!(frozen_red_payload(&loaded.core, "m4#0"), Some("[dropped]"));
+        // Rank 20 (number 5) is the last protected slot: retained. Under a
+        // threshold cutoff (active-max 25 - 20, or global-max 28 - 20) or
+        // one-per-ordinal counting this row loses protection and applies.
+        assert_eq!(frozen_red_payload(&loaded.core, "m5#0"), None);
+        // The second block on ordinal 24 is itself active and protected; an
+        // implementation that counts one block per ordinal applies this drop.
+        assert_eq!(frozen_red_payload(&loaded.core, "m24#1"), None);
+        let mut retained = store
+            .load_pending_agent_drops("protected")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.target_id)
+            .collect::<Vec<_>>();
+        retained.sort();
+        assert_eq!(retained, vec!["m24#1".to_string(), "m5#0".to_string()]);
+        let pending = store.load_pending_agent_drops("protected").unwrap();
+        assert!(pending.iter().all(|row| {
+            row.command_id.as_deref() == Some("range-command")
+                && row.command_first_applied_at_ms.is_some()
+        }));
+        let replay = store
+            .append_pending_agent_drops_with_command(
+                "protected",
+                Some("range-command"),
+                &["m5#0".to_string(), "m24#1".to_string()],
+                100,
+            )
+            .unwrap();
+        assert_eq!(replay.queued, 0);
+        assert!(replay.duplicate);
+        assert_eq!(
+            store.load_pending_agent_drops("protected").unwrap(),
+            pending
+        );
+    }
+
+    #[test]
+    fn frozen_row_does_not_consume_a_protection_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // 21 tagged live blocks, numbers 1..21. m21#0 is frozen by an earlier
+        // active pass, so the ACTIVE set is exactly m1..m20 — all 20 fit the
+        // protected window and the oldest row's pending drop must be retained.
+        // If frozen rows still consumed slots, m21 would take one, m1 would
+        // fall to rank 21, and its drop would apply.
+        let messages = (1..=21)
+            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
+            .collect::<Vec<_>>();
+        let tags = (1..=21)
+            .map(|ordinal| TagMintInput {
+                block_id: format!("m{ordinal}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: format!("text {ordinal}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("slot-free", &tags, 1).unwrap();
+
+        // Pass 1 bootstraps, then the freeze is seeded directly in durable state
+        // (selection itself refuses to reduce a protected newest tag, so a
+        // pre-existing freeze — e.g. from an earlier phase with more tags — is
+        // the realistic way a high-ranked block arrives already frozen).
+        let request = active_cc_req("slot-free", "cfg0", messages);
+        run(&store, &request, &spine());
+        let seeded = store.load("slot-free").unwrap();
+        let mut core = seeded.core.clone();
+        core.frozen_units
+            .push(red_unit("m21#0", "drop", "[dropped]"));
+        store
+            .commit("slot-free", seeded.row_version, &core, &seeded.meta)
+            .unwrap();
+        assert_eq!(
+            frozen_red_payload(&store.load("slot-free").unwrap().core, "m21#0"),
+            Some("[dropped]"),
+            "precondition: m21#0 frozen before the tested pass"
+        );
+
+        // Pass 2 (tested): a render-config change forces a producing HARD so the
+        // pending row is genuinely selected against the protected set — a defer
+        // pass would retain it regardless and prove nothing.
+        store
+            .append_pending_agent_drops("slot-free", &["m1#0".to_string()], 99)
+            .unwrap();
+        let producing = active_cc_req(
+            "slot-free",
+            "cfg1",
+            (1..=21)
+                .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
+                .collect::<Vec<_>>(),
+        );
+        let tested = run(&store, &producing, &spine());
+        assert_eq!(tested.action, "HARD", "tested pass must produce");
+        let loaded = store.load("slot-free").unwrap();
+        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), None);
+        let pending = store.load_pending_agent_drops("slot-free").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target_id, "m1#0");
+    }
+
+    #[test]
+    fn newest_tag_block_set_excludes_stale_provenance_from_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // Exactly 21 tagged live blocks. The NEWEST row (m21#0) has stale
+        // provenance. Under exact semantics it cannot hold a slot, so the
+        // protected 20 are m20..m1 and a pending drop on m1#0 (rank 21 by
+        // number, rank 20 among ACTIVE rows) is PROTECTED. An implementation
+        // that skips the provenance re-check frees m1#0 and applies the drop.
+        let messages = (1..=21)
+            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
+            .collect::<Vec<_>>();
+        let tags = (1..=21)
+            .map(|ordinal| TagMintInput {
+                block_id: format!("m{ordinal}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: if ordinal == 21 {
+                    b"stale bytes".to_vec()
+                } else {
+                    format!("text {ordinal}").into_bytes()
+                },
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("stale-slot", &tags, 1).unwrap();
+        store
+            .append_pending_agent_drops("stale-slot", &["m1#0".to_string()], 2)
+            .unwrap();
+
+        let response = run(
+            &store,
+            &active_cc_req("stale-slot", "cfg0", messages),
+            &spine(),
+        );
+        assert_eq!(response.action, "HARD");
+        let loaded = store.load("stale-slot").unwrap();
+        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), None);
+        let pending = store.load_pending_agent_drops("stale-slot").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target_id, "m1#0");
+    }
+
+    #[test]
+    fn dormant_forced_hard_retains_pending_then_active_hard_applies_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![item("a", 1, "drop me")];
+        let inactive = cc_req("dormant-hard", "cfg0", messages.clone());
+        run(&store, &inactive, &spine());
+        store
+            .append_pending_agent_drops("dormant-hard", &["a#0".to_string()], 1)
+            .unwrap();
+        let forced = cc_req("dormant-hard", "cfg1", messages.clone());
+        let dormant = run(&store, &forced, &spine());
+        assert_eq!(dormant.action, "HARD");
+        assert_eq!(
+            frozen_red_payload(&store.load("dormant-hard").unwrap().core, "a#0"),
+            None
+        );
+        assert_eq!(
+            store
+                .load_pending_agent_drops("dormant-hard")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let active = run(
+            &store,
+            &active_cc_req("dormant-hard", "cfg1", messages),
+            &spine(),
+        );
+        assert_eq!(active.action, "HARD");
+        assert_eq!(
+            frozen_red_payload(&store.load("dormant-hard").unwrap().core, "a#0"),
+            Some("[dropped]")
+        );
+        assert!(store
+            .load_pending_agent_drops("dormant-hard")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn obsolete_pending_row_commits_consumption_without_core_or_meta_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // "gone" is PRESENT in the array but covered by the compartment boundary:
+        // provably retired (coverage only advances), so its pending row is
+        // consumable even though nothing else about the pass changes state.
+        store
+            .replace_compartments("consume-only", &[comp(1, 1, 1, "gone", "summary")])
+            .unwrap();
+        let request = cc_req(
+            "consume-only",
+            "cfg0",
+            vec![item("gone", 1, "folded away"), item("live", 2, "hello")],
+        );
+        run(&store, &request, &spine());
+        store
+            .append_pending_agent_drops("consume-only", &["gone#0".to_string()], 1)
+            .unwrap();
+        let before = store.load("consume-only").unwrap();
+
+        let response = run(&store, &request, &spine());
+        let after = store.load("consume-only").unwrap();
+        assert_eq!(response.action, "SOFT+");
+        assert!(response.committed);
+        assert_eq!(after.core, before.core);
+        assert_eq!(after.meta, before.meta);
+        assert_eq!(
+            after.row_version,
+            before.row_version.map(|version| version + 1)
+        );
+        assert!(store
+            .load_pending_agent_drops("consume-only")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn absent_target_pending_row_survives_subset_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let full = active_cc_req(
+            "subset-safety",
+            "cfg0",
+            vec![item("a", 1, "first"), item("m9", 9, "drop me")],
+        );
+        run(&store, &full, &spine());
+        store
+            .append_pending_agent_drops("subset-safety", &["m9#0".to_string()], 1)
+            .unwrap();
+
+        // An interactive side-request arrives as a SUBSET of the session: the
+        // pending target is absent from this pass entirely. Absence proves
+        // nothing (the full array returns next pass), so the row must survive.
+        let subset = active_cc_req("subset-safety", "cfg0", vec![item("a", 1, "first")]);
+        run(&store, &subset, &spine());
+        let survived = store.load_pending_agent_drops("subset-safety").unwrap();
+        assert_eq!(survived.len(), 1, "absent-target row must not be consumed");
+        assert_eq!(survived[0].target_id, "m9#0");
+
+        // The full array returns: the target is live-tail again and its row is
+        // still queued for the next producing pass (drop application itself is
+        // covered by the dormant/active drain tests).
+        run(&store, &full, &spine());
+        let requeued = store.load_pending_agent_drops("subset-safety").unwrap();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].target_id, "m9#0");
+    }
+
+    #[test]
+    fn owned_profile_drains_pending_drops_without_request_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // Owned-leg consumers never send the reduction-surface field; their
+        // profile default alone must keep the durable queue draining.
+        let request = req(
+            "owned-drain",
+            "cfg0",
+            vec![item("a", 1, "first"), item("m2", 2, "drop me")],
+        );
+        run(&store, &request, &spine());
+        store
+            .append_pending_agent_drops("owned-drain", &["m2#0".to_string()], 1)
+            .unwrap();
+
+        let producing = req(
+            "owned-drain",
+            "cfg1",
+            vec![item("a", 1, "first"), item("m2", 2, "drop me")],
+        );
+        let response = run(&store, &producing, &spine());
+        assert_eq!(tail_bytes(&response, "m2"), "[dropped]");
+        assert!(
+            store
+                .load_pending_agent_drops("owned-drain")
+                .unwrap()
+                .is_empty(),
+            "profile-default tail reclaim must drain the queue"
+        );
+    }
+
+    #[test]
+    fn mixed_legacy_numbered_and_new_canonical_freezes_replay_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .replace_compartments("mixed-freezes", &[comp(1, 1, 1, "a", "summary")])
+            .unwrap();
+        let request = active_cc_req(
+            "mixed-freezes",
+            "cfg0",
+            vec![
+                item("a", 1, "covered"),
+                item("m1", 2, "legacy"),
+                item("m2", 3, "new"),
+            ],
+        );
+        run(&store, &request, &spine());
+        run(&store, &request, &spine());
+
+        let mut loaded = store.load("mixed-freezes").unwrap();
+        loaded
+            .core
+            .frozen_units
+            .push(red_unit("m1#0", "drop", "[dropped §7§]"));
+        store
+            .commit(
+                "mixed-freezes",
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
+
+        let response = run(&store, &request, &[reduce("m2#0", "drop", "[dropped]")]);
+        assert_eq!(tail_bytes(&response, "m1"), "[dropped §7§]");
+        assert_eq!(tail_bytes(&response, "m2"), "[dropped §3§]");
+        let durable = store.load("mixed-freezes").unwrap().core;
+        assert_eq!(frozen_red_payload(&durable, "m1#0"), Some("[dropped §7§]"));
+        assert_eq!(frozen_red_payload(&durable, "m2#0"), Some("[dropped]"));
+    }
+
+    #[test]
+    fn absent_tool_matches_explicit_false_across_profile_pass_matrix() {
+        for profile in [
+            SerializerProfile::ClaudeCodeAnthropic,
+            SerializerProfile::OwnedBroca,
+            SerializerProfile::Pi,
+            SerializerProfile::OpencodeAiSdk,
+        ] {
+            let left_dir = tempfile::tempdir().unwrap();
+            let right_dir = tempfile::tempdir().unwrap();
+            let left = store(left_dir.path());
+            let right = store(right_dir.path());
+            let initial = vec![comp(1, 1, 1, "a", "first")];
+            left.replace_compartments("identity", &initial).unwrap();
+            right.replace_compartments("identity", &initial).unwrap();
+            let messages = vec![
+                item("a", 1, "one"),
+                item("b", 2, "two"),
+                item("c", 3, "three"),
+            ];
+            // Both arms must deserialize from the wire (a direct struct skips the
+            // original-value retention that wire requests carry), but they must be
+            // constructed INDEPENDENTLY: the explicit arm's JSON carries a literal
+            // tool_present:false, the absent arm's JSON omits the key entirely.
+            // Cloning the deserialized absent request instead would inherit
+            // whatever default serde applied, making the comparison tautological
+            // under a wrong default.
+            let (absent, explicit) = wire_pair_absent_and_explicit_false(profile_req(
+                profile,
+                "identity",
+                "cfg0",
+                messages.clone(),
+            ));
+
+            for expected_action in ["HARD", "SOFT+"] {
+                let left_response = run(&left, &absent, &spine());
+                let right_response = run(&right, &explicit, &spine());
+                assert_eq!(left_response.action, expected_action, "{profile:?}");
+                assert_eq!(
+                    serde_json::to_value(left_response).unwrap(),
+                    serde_json::to_value(right_response).unwrap(),
+                    "{profile:?}"
+                );
+            }
+
+            let extended = vec![comp(1, 1, 1, "a", "first"), comp(2, 2, 2, "b", "second")];
+            left.replace_compartments("identity", &extended).unwrap();
+            right.replace_compartments("identity", &extended).unwrap();
+            let left_soft = run(&left, &absent, &spine());
+            let right_soft = run(&right, &explicit, &spine());
+            assert_eq!(left_soft.action, "SOFT", "{profile:?}");
+            assert_eq!(
+                serde_json::to_value(left_soft).unwrap(),
+                serde_json::to_value(right_soft).unwrap(),
+                "{profile:?}"
+            );
+
+            // Rebuild BOTH arms independently for the fold leg too: mutating one
+            // and cloning the other would reintroduce the shared-default hazard.
+            let (absent, explicit_fold) = wire_pair_absent_and_explicit_false(profile_req(
+                profile,
+                "identity",
+                "cfg1",
+                messages.clone(),
+            ));
+            let left_fold = run(&left, &absent, &spine());
+            let right_fold = run(&right, &explicit_fold, &spine());
+            assert_eq!(left_fold.action, "HARD", "{profile:?}");
+            assert_eq!(
+                serde_json::to_value(left_fold).unwrap(),
+                serde_json::to_value(right_fold).unwrap(),
+                "{profile:?}"
+            );
+            assert_eq!(
+                left.load("identity").unwrap().core,
+                right.load("identity").unwrap().core
+            );
+            assert_eq!(
+                left.load("identity").unwrap().meta,
+                right.load("identity").unwrap().meta
+            );
+        }
     }
 
     #[test]
@@ -7181,6 +11607,16 @@ mod tests {
         )
     }
 
+    fn active_cc_req(
+        session: &str,
+        cfg: &str,
+        messages: Vec<CkIngressMessage>,
+    ) -> TransformRequest {
+        let mut request = cc_req(session, cfg, messages);
+        request.tool_present = true;
+        request
+    }
+
     fn effective_render_config_with_epochs(
         store: &McStore,
         cfg: &str,
@@ -7379,6 +11815,7 @@ mod tests {
                 compartments: &compartments,
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: Value::Null,
@@ -7741,6 +12178,95 @@ mod tests {
     }
 
     #[test]
+    fn staged_epoch_bump_takes_exactly_one_hard_when_client_config_frozen() {
+        assert_eq!(crate::TAGGER_FEATURE_EPOCH, 3);
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let r1 = "pe1/tf1/gfull";
+        let messages = vec![wire_item("user", "m1", 1, &["stable bytes"])];
+        let request = active_cc_req("staged-tfe", r1, messages);
+
+        run(&s, &request, &spine());
+        run(&s, &request, &spine());
+        let mut loaded = s.load("staged-tfe").unwrap();
+        loaded.meta.last_render_config = effective_render_config_with_epochs(
+            &s,
+            r1,
+            format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+            format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
+            format!(
+                "mpe{}",
+                crate::profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic)
+            ),
+            "tfe2".to_string(),
+        );
+        s.commit("staged-tfe", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        // The consumer base string stays frozen while the module epoch moves. Epoch pins
+        // are status assertions, not extra wire tokens; changing both identities would
+        // coordinate two folds instead of the one fold owned by the module upgrade.
+        let pass_a = run(&s, &request, &spine());
+        assert_eq!(pass_a.action, "HARD");
+        let expected_tfe3 = effective_render_config_with_epochs(
+            &s,
+            r1,
+            format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
+            format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
+            format!(
+                "mpe{}",
+                crate::profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic)
+            ),
+            "tfe3".to_string(),
+        );
+        assert_eq!(
+            s.load("staged-tfe").unwrap().meta.last_render_config,
+            expected_tfe3
+        );
+
+        let pass_b = run(&s, &request, &spine());
+        assert_ne!(pass_b.action, "HARD");
+        assert_eq!(
+            serde_json::to_vec(pass_a.messages()).unwrap(),
+            serde_json::to_vec(pass_b.messages()).unwrap()
+        );
+
+        let r2_request = active_cc_req("staged-tfe", "pe1/tf2/gfull", request.messages.clone());
+        let pass_c = run(&s, &r2_request, &spine());
+        assert_eq!(
+            pass_c.action, "HARD",
+            "the opaque client base is independently identity-bearing"
+        );
+    }
+
+    #[test]
+    fn inactive_surface_omits_tagger_epoch_and_keeps_render_identity() {
+        assert_eq!(crate::tagger_feature_epoch(false), 0);
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = cc_req(
+            "inactive-tfe",
+            "pe1/tf1/gfull",
+            vec![wire_item("user", "m1", 1, &["raw bytes"])],
+        );
+        let first = run(&s, &request, &spine());
+        let first_config = s.load("inactive-tfe").unwrap().meta.last_render_config;
+        assert!(!first_config.contains("tfe:"));
+
+        let replay = run(&s, &request, &spine());
+        assert_ne!(replay.action, "HARD");
+        assert_eq!(
+            s.load("inactive-tfe").unwrap().meta.last_render_config,
+            first_config
+        );
+        assert_eq!(
+            serde_json::to_vec(first.messages()).unwrap(),
+            serde_json::to_vec(replay.messages()).unwrap()
+        );
+        assert_eq!(tail_bytes(&replay, "m1"), "raw bytes");
+    }
+
+    #[test]
     fn profile_epoch_fold_hards_epoch_zero_cc_state_once() {
         assert_eq!(crate::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 1);
         let dir = tempfile::tempdir().unwrap();
@@ -7938,5 +12464,148 @@ mod tests {
             );
             assert!(!steady.committed);
         }
+    }
+
+    #[test]
+    fn reasoning_blocks_are_never_reduction_targets_and_poisoned_units_heal() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+
+        fn reasoning_item(mid: &str, ordinal: u64) -> CkIngressMessage {
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    vec![
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                            text: format!("signed thinking {mid}"),
+                            signature: Some(format!("sig-{mid}")),
+                        }),
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                            text: format!("answer {mid}"),
+                        }),
+                    ],
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        let messages = vec![
+            item("u1", 1, "question"),
+            reasoning_item("a1", 2),
+            item("u2", 3, "live tail"),
+        ];
+
+        // An agent drop aimed at the reasoning block must not freeze, and its
+        // pending row must retire as structurally unappliable.
+        let active = active_cc_req("reason-guard", "cfg0", messages.clone());
+        run(&s, &active, &spine());
+        s.append_pending_agent_drops("reason-guard", &["a1#0".to_string()], 1)
+            .unwrap();
+        let busted = active_cc_req("reason-guard", "cfg1", messages.clone());
+        let consumed = run(&s, &busted, &spine());
+        assert_eq!(consumed.action, "HARD");
+        let loaded = s.load("reason-guard").unwrap();
+        assert!(
+            !frozen_red_targets(&loaded.core).contains("a1#0"),
+            "reasoning target must never freeze"
+        );
+        assert!(
+            s.load_pending_agent_drops("reason-guard")
+                .unwrap()
+                .is_empty(),
+            "structurally unappliable drop must retire from the queue"
+        );
+        let joined = serde_json::to_string(&consumed.ck_messages).unwrap();
+        assert!(joined.contains("signed thinking a1"), "{joined}");
+        assert!(joined.contains("sig-a1"), "{joined}");
+
+        // A historically poisoned unit (minted by an older binary) heals at
+        // render: the block serves verbatim signed bytes on every pass while the
+        // unit stays frozen and inert.
+        let mut poisoned = s.load("reason-guard").unwrap();
+        poisoned
+            .core
+            .frozen_units
+            .push(red_unit("a1#0", "drop", "[dropped]"));
+        s.commit_transform(
+            "reason-guard",
+            TransformCommit {
+                expected: poisoned.row_version,
+                core: &poisoned.core,
+                meta: &poisoned.meta,
+                consumed_drop_ids: &[],
+                first_applied_command_ids: &[],
+                memory_revision: None,
+                overlays: TransformOverlayBatch::default(),
+            },
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let pass = run(&s, &busted, &spine());
+            let bytes = serde_json::to_string(&pass.ck_messages).unwrap();
+            assert!(bytes.contains("signed thinking a1"), "{bytes}");
+            assert!(bytes.contains("sig-a1"), "{bytes}");
+            assert!(!bytes.contains("[dropped]"), "{bytes}");
+        }
+        assert!(
+            frozen_red_targets(&s.load("reason-guard").unwrap().core).contains("a1#0"),
+            "the poisoned unit stays frozen (monotonicity untouched), only inert"
+        );
+    }
+
+    #[test]
+    fn rig_repro_consumed_drops_render_bare_on_false_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // Active window: enough tagged blocks that the two oldest fall outside the
+        // newest-20 protection set, so their drops actually consume.
+        let messages: Vec<CkIngressMessage> = (1..=25)
+            .map(|n| {
+                item(
+                    Box::leak(format!("u{n}").into_boxed_str()),
+                    n,
+                    "droppable content",
+                )
+            })
+            .collect();
+        let active = active_cc_req("rig-b", "cfg0", messages.clone());
+        let warm = run(&s, &active, &spine());
+        assert_eq!(warm.action, "HARD");
+        s.append_pending_agent_drops("rig-b", &["u1#0".to_string(), "u2#0".to_string()], 1)
+            .unwrap();
+        // Drops drain only on bust-gated passes; a config change forces the HARD
+        // that consumes them, mirroring how the rig's drops were consumed.
+        let active_busted = active_cc_req("rig-b", "cfg1", messages.clone());
+        let consumed = run(&s, &active_busted, &spine());
+        assert_eq!(consumed.action, "HARD");
+        // While active the numbered egress overlay is expected.
+        let active_joined = serde_json::to_string(&consumed.ck_messages).unwrap();
+        assert!(active_joined.contains("[dropped \u{a7}"), "{active_joined}");
+        // Frozen bytes stay canonical bare.
+        let frozen = s.load("rig-b").unwrap().core.frozen_units;
+        for unit in frozen.iter() {
+            assert!(
+                !unit.frozen_payload.contains('\u{a7}'),
+                "{}",
+                unit.frozen_payload
+            );
+        }
+        // False pass: hide the tool. Placeholders persist but must render BARE.
+        let mut hidden = cc_req("rig-b", "cfg1", messages);
+        hidden.tool_present = false;
+        let transition = run(&s, &hidden, &spine());
+        let false_joined = serde_json::to_string(&transition.ck_messages).unwrap();
+        assert!(false_joined.contains("[dropped]"), "{false_joined}");
+        assert!(!false_joined.contains('\u{a7}'), "{false_joined}");
+        let steady = run(&s, &hidden, &spine());
+        let steady_joined = serde_json::to_string(&steady.ck_messages).unwrap();
+        assert!(!steady_joined.contains('\u{a7}'), "{steady_joined}");
     }
 }

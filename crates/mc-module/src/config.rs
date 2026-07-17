@@ -27,6 +27,11 @@ pub struct McModuleConfig {
     pub memory_enabled: bool,
     pub smart_drops: bool,
     pub cache_ttl: String,
+    /// Kill switch for the shadow byte-compare lane, honored module-side so a
+    /// runaway shadow loop can be stopped by a config flip plus module bounce
+    /// without restarting any harness process (plugin senders are constructed
+    /// once per session hook and hold the old flag until their host restarts).
+    pub shadow_enabled: bool,
 }
 
 impl Default for McModuleConfig {
@@ -36,6 +41,7 @@ impl Default for McModuleConfig {
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
             memory_enabled: true,
             smart_drops: false,
+            shadow_enabled: true,
             cache_ttl: "5m".to_string(),
         }
     }
@@ -156,6 +162,12 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = user.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
         }
+        if let Some(enabled) = user
+            .pointer("/shadow_transform/enabled")
+            .and_then(Value::as_bool)
+        {
+            cfg.shadow_enabled = enabled;
+        }
         if let Some(enabled) = user.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;
         }
@@ -273,6 +285,20 @@ pub fn strip_jsonc(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shadow_transform_flag_parses_and_defaults_on() {
+        let cfg = merge_tiers(None, None);
+        assert!(cfg.shadow_enabled);
+        let user: Value =
+            serde_json::from_str(r#"{ "shadow_transform": { "enabled": false } }"#).unwrap();
+        let cfg = merge_tiers(Some(&user), None);
+        assert!(!cfg.shadow_enabled);
+        let user: Value =
+            serde_json::from_str(r#"{ "shadow_transform": { "enabled": true } }"#).unwrap();
+        let cfg = merge_tiers(Some(&user), None);
+        assert!(cfg.shadow_enabled);
+    }
     use super::*;
 
     #[test]

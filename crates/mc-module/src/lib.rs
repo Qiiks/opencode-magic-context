@@ -39,22 +39,24 @@ pub mod selection;
 pub mod session_resolver;
 pub mod transform;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
 use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
-    HistorianPhase, InsertMemoryInput, McStore, NoteInput, ShadowDivergenceRecord,
-    ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest,
-    ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StoredChunkTranscript, StoredCompartment,
-    StoredMemoryMutation, StoredNote,
+    validate_state_import_compartments, HistorianPhase, InsertMemoryInput, McStore, McStoreError,
+    NoteInput, RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowMemoryMutationRow,
+    ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow,
+    ShadowWorkspaceRow, StateImportError, StateImportPreflight, StateImportValidationError,
+    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
+    TodoStateSetOutcome, WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -126,7 +128,7 @@ pub enum BindingError {
 /// Canonical module id (overridable via `SUBC_MODULE_ID_ENV` at boot).
 pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
-/// Render-config epoch members, co-owned with byte-splice-consumer codecs (ai-proxy).
+/// Render-config epoch members, co-owned with the byte-splice consumer (thalamus gateway).
 /// Consumers fold these into the opaque render_config string they populate per
 /// request; the module compares render_config as opaque bytes against durable state
 /// and forces a HARD fold on any change. Bumping an epoch here is therefore the
@@ -146,8 +148,11 @@ pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages.
 pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 1;
-/// Bumps when the visible tagging surface changes (tag prefixes shipping is 0 -> 1).
-pub const TAGGER_FEATURE_EPOCH: u32 = 0;
+/// Bumps when any active tag overlay changes provider-visible bytes. Epoch 3 freezes
+/// temporal-marker decisions in durable rows instead of deriving them from each request array.
+/// Every change requires one cache-breaking fold before the new overlay can render. Inactive
+/// requests omit the component and retain their identity.
+pub const TAGGER_FEATURE_EPOCH: u32 = 3;
 
 /// The module-owned rendered-prefix format epoch for a serializer profile.
 ///
@@ -163,23 +168,17 @@ pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     }
 }
 
-/// The tagger epoch folded for this profile. The gate and epoch must both be enabled:
-/// this makes a partial deploy inert rather than allowing tag bytes without a new render
-/// identity.
-#[cfg(not(test))]
-pub const fn tagger_feature_epoch(profile: SerializerProfile) -> u32 {
-    if healing::tagging_enabled(profile) {
-        TAGGER_FEATURE_EPOCH
-    } else {
-        0
-    }
+/// Normalize the request-local Claude Code surface signal once. Every behavior tied to
+/// the reduction tool consumes this value rather than maintaining an independent gate.
+pub const fn cc_u1_active(profile: Option<SerializerProfile>, tool_present: bool) -> bool {
+    matches!(profile, Some(SerializerProfile::ClaudeCodeAnthropic)) && tool_present
 }
 
-/// Tests exercise the future non-zero fold while the production epoch remains zero.
-#[cfg(test)]
-pub fn tagger_feature_epoch(profile: SerializerProfile) -> u32 {
-    if healing::tagging_enabled(profile) {
-        1
+/// The tagger component of the effective render identity. A false request contributes
+/// no component, preserving the render identity used before the capability existed.
+pub const fn tagger_feature_epoch(cc_u1_active: bool) -> u32 {
+    if cc_u1_active {
+        TAGGER_FEATURE_EPOCH
     } else {
         0
     }
@@ -194,6 +193,7 @@ const GUIDANCE_TEXT: &str = include_str!("../assets/guidance_primary.txt");
 /// variant that matches the live tool surface; the two variants have different
 /// content hashes, so a surface widening folds the prefix by construction.
 const GUIDANCE_TEXT_NO_REDUCE: &str = include_str!("../assets/guidance_no_reduce.txt");
+const CTX_REDUCE_ACKNOWLEDGEMENT: &str = "Queued for context compaction.";
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
@@ -203,6 +203,13 @@ const DEFAULT_MIN_COMMIT_CLUSTERS: usize = 3;
 const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
 /// Secondary assembler guard; TS trigger sizing is authoritative, this only rejects tiny chunks.
 const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
+/// Thalamus clamps the prompt argument to the same range before forwarding it.
+/// Changing either bound requires a coordinated module and Thalamus update so a
+/// retried prompt resolves to the same keep watermark on both sides.
+const WRAPUP_KEEP_MIN: usize = 5;
+const WRAPUP_KEEP_MAX: usize = 100;
+/// Maximum number of newly published compartments returned by one status page.
+const SESSION_STATUS_COMPARTMENT_PAGE_LIMIT: usize = 50;
 /// After a historian abandon, suppress refires for this long so a persistently
 /// failing model does not burn a full summarization pass on every transform.
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
@@ -213,6 +220,42 @@ const SHADOW_COMPARE_PREFIX_LIMIT: usize = 4096;
 const SHADOW_SEED_MAX_ID_BYTES: usize = 128;
 const SHADOW_SEED_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const SHADOW_SEED_MAX_PENDING: usize = 64;
+// These limits are shared by authority and shadow transform pages. The names retain the
+// shadow prefix because the wire was introduced by that lane, but the coordinator is
+// intentionally handler-wide so a real-session sender cannot bypass the same budget.
+const SHADOW_TRANSFORM_PAGE_MAX_BYTES: usize = 512 * 1024;
+const SHADOW_TRANSFORM_PAGE_MAX_STAGED_BYTES: usize = 128 * 1024 * 1024;
+const SHADOW_TRANSFORM_PAGE_MAX_PENDING: usize = 64;
+const SHADOW_TRANSFORM_PAGE_MAX_ID_BYTES: usize = 128;
+const SHADOW_ITEM_CONTINUATION_KEY: &str = "__shadow_item_continuation";
+const TRANSFORM_PAGE_FIELDS: [&str; 6] = [
+    "transform_page_id",
+    "transform_generation",
+    "transform_page_index",
+    "transform_page_total",
+    "transform_page_complete",
+    "transform_page_digest",
+];
+const TRANSFORM_PAGE_ARRAY_FIELDS: [&str; 6] = [
+    "input",
+    "messages",
+    "native_messages",
+    "ts_output",
+    "ts_ck_messages",
+    "normalizations",
+];
+const STATE_IMPORT_MAX_ID_BYTES: usize = 128;
+const STATE_IMPORT_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
+const STATE_IMPORT_MAX_PENDING: usize = 64;
+const STATE_IMPORT_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
+const TRANSFORM_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const ACTIVE_SNAPSHOT_LEASE_BUDGET_BYTES: usize = TRANSFORM_SNAPSHOT_BUDGET_BYTES;
+const MAX_ACTIVE_SNAPSHOT_LEASES: usize = 8;
+/// InFlight snapshot markers have no byte charge, so they need their own count bound:
+/// a marker is minted per transform start and only replaced on success, so unique
+/// failing sessions would otherwise accumulate for the process lifetime.
+const MAX_IN_FLIGHT_SNAPSHOT_ENTRIES: usize = 4_096;
+const WRAPUP_REQUEST_MARGIN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
 struct ShadowStateSyncWire {
@@ -239,11 +282,62 @@ struct ShadowStateSyncWire {
     #[serde(default)]
     memory_mutations: Vec<ShadowMemoryMutationWire>,
     #[serde(default)]
+    user_profile: Vec<String>,
+    #[serde(default)]
     workspace: Option<ShadowWorkspaceWire>,
     #[serde(default)]
     last_todo_state: Option<String>,
     #[serde(default)]
     acked_watermarks: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateSyncLane {
+    Authority,
+    Shadow,
+}
+
+impl StateSyncLane {
+    const fn is_shadow(self) -> bool {
+        matches!(self, Self::Shadow)
+    }
+}
+
+/// State-sync errors use the shared subc code/message envelope. Authority callers receive
+/// the durable sequence as JSON in the message so a fresh process can adopt it and rebuild
+/// its watermarks. Shadow callers retain the reset-on-mismatch error shape because a stale
+/// mirror may be poisoned rather than merely restarted.
+fn state_sync_seq_mismatch_error(lane: StateSyncLane, expected: u64, found: u64) -> HandlerOutcome {
+    if lane.is_shadow() {
+        HandlerOutcome::Error {
+            code: "shadow_seq_mismatch".to_string(),
+            message: format!(
+                "expected_shadow_seq {expected} did not match durable shadow_seq {found}"
+            ),
+        }
+    } else {
+        HandlerOutcome::Error {
+            code: "authority_seq_mismatch".to_string(),
+            message: json!({
+                "code": "authority_seq_mismatch",
+                "expected_authority_seq": expected,
+                "durable_authority_seq": found,
+            })
+            .to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformLane {
+    Authority,
+    Shadow,
+}
+
+impl TransformLane {
+    const fn is_shadow(self) -> bool {
+        matches!(self, Self::Shadow)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +348,64 @@ struct ShadowResetWire {
     shadow_generation: Option<u64>,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StateImportWire {
+    v: u64,
+    session_id: String,
+    import_id: String,
+    batch_seq: usize,
+    batch_count: usize,
+    compartments: Vec<StateImportCompartmentWire>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StateImportCompartmentWire {
+    seq: i64,
+    start_message: i64,
+    end_message: i64,
+    end_message_id: String,
+    title: String,
+    p1: String,
+    #[serde(default)]
+    p2: Option<String>,
+    #[serde(default)]
+    p3: Option<String>,
+    #[serde(default)]
+    p4: Option<String>,
+    #[serde(default = "default_importance")]
+    importance: i32,
+    #[serde(default)]
+    episode_type: Option<String>,
+    #[serde(default)]
+    start_date: Option<String>,
+    #[serde(default)]
+    end_date: Option<String>,
+}
+
+impl StateImportCompartmentWire {
+    fn into_stored(self, created_at: i64) -> StoredCompartment {
+        StoredCompartment {
+            sequence: self.seq,
+            start_message: self.start_message,
+            end_message: self.end_message,
+            end_message_id: self.end_message_id,
+            start_date: self.start_date,
+            end_date: self.end_date,
+            title: self.title,
+            content: self.p1.clone(),
+            p1: Some(self.p1),
+            p2: self.p2,
+            p3: self.p3,
+            p4: self.p4,
+            importance: self.importance,
+            episode_type: self.episode_type,
+            legacy: 0,
+            created_at,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -386,6 +538,583 @@ impl ShadowSeedCoordinator {
     }
 }
 
+#[derive(Debug)]
+struct PendingTransformPage {
+    transform_id: String,
+    generation: u64,
+    total: usize,
+    next_index: usize,
+    digests: Vec<String>,
+    pages: Vec<Value>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+enum TransformPagePhase {
+    Idle,
+    Collecting(PendingTransformPage),
+    Applying { transform_id: String, bytes: usize },
+}
+
+#[derive(Debug)]
+struct CompletedTransformPage {
+    transform_id: String,
+    generation: u64,
+    final_digest: String,
+    result: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct TransformPageSession {
+    phase: TransformPagePhase,
+    completed: Option<CompletedTransformPage>,
+}
+
+impl Default for TransformPageSession {
+    fn default() -> Self {
+        Self {
+            phase: TransformPagePhase::Idle,
+            completed: None,
+        }
+    }
+}
+
+/// Authority and shadow transform pages share this coordinator so every session has one
+/// in-flight attempt and every sender contributes to the same bounded staging budget.
+#[derive(Debug)]
+struct TransformPageCoordinator {
+    sessions: HashMap<String, TransformPageSession>,
+    total_staged_bytes: usize,
+    pending_transform_count: usize,
+    max_staged_bytes: usize,
+    max_pending_transforms: usize,
+}
+
+impl Default for TransformPageCoordinator {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            total_staged_bytes: 0,
+            pending_transform_count: 0,
+            max_staged_bytes: SHADOW_TRANSFORM_PAGE_MAX_STAGED_BYTES,
+            max_pending_transforms: SHADOW_TRANSFORM_PAGE_MAX_PENDING,
+        }
+    }
+}
+
+enum TransformPageStageAction {
+    Ack(usize),
+    Apply {
+        pages: Vec<Value>,
+        transform_id: String,
+        generation: u64,
+        final_digest: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformPageStageError {
+    AttemptMismatch,
+    DigestMismatch,
+    OrderMismatch,
+    BufferOverflow,
+    InProgress,
+}
+
+impl TransformPageCoordinator {
+    fn phase_bytes(phase: &TransformPagePhase) -> usize {
+        match phase {
+            TransformPagePhase::Collecting(pending) => pending.bytes,
+            TransformPagePhase::Applying { bytes, .. } => *bytes,
+            TransformPagePhase::Idle => 0,
+        }
+    }
+
+    fn is_pending(phase: &TransformPagePhase) -> bool {
+        !matches!(phase, TransformPagePhase::Idle)
+    }
+
+    fn release_phase(&mut self, phase: &TransformPagePhase) {
+        if Self::is_pending(phase) {
+            self.pending_transform_count = self.pending_transform_count.saturating_sub(1);
+            self.total_staged_bytes = self
+                .total_staged_bytes
+                .saturating_sub(Self::phase_bytes(phase));
+        }
+    }
+
+    fn discard(&mut self, session_id: &str) {
+        let phase = self.sessions.get_mut(session_id).map(|session| {
+            session.completed = None;
+            std::mem::replace(&mut session.phase, TransformPagePhase::Idle)
+        });
+        if let Some(phase) = phase {
+            self.release_phase(&phase);
+        }
+    }
+
+    fn set_phase(&mut self, session_id: &str, phase: TransformPagePhase) {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .phase = phase;
+    }
+
+    fn completed(&self, session_id: &str, transform_id: &str) -> Option<&CompletedTransformPage> {
+        self.sessions
+            .get(session_id)
+            .and_then(|session| session.completed.as_ref())
+            .filter(|completed| completed.transform_id == transform_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage(
+        &mut self,
+        session_id: &str,
+        transform_id: String,
+        generation: u64,
+        page_index: usize,
+        page_total: usize,
+        page_digest: String,
+        page: Value,
+        page_bytes: usize,
+        page_complete: bool,
+    ) -> Result<TransformPageStageAction, TransformPageStageError> {
+        if self.pending_transform_count >= self.max_pending_transforms
+            && !self.sessions.contains_key(session_id)
+        {
+            return Err(TransformPageStageError::BufferOverflow);
+        }
+        let phase = {
+            let session = self.sessions.entry(session_id.to_string()).or_default();
+            std::mem::replace(&mut session.phase, TransformPagePhase::Idle)
+        };
+        match phase {
+            TransformPagePhase::Idle => {
+                if page_index != 0 {
+                    return Err(TransformPageStageError::AttemptMismatch);
+                }
+                if page_bytes > self.max_staged_bytes
+                    || self
+                        .total_staged_bytes
+                        .checked_add(page_bytes)
+                        .is_none_or(|bytes| bytes > self.max_staged_bytes)
+                {
+                    return Err(TransformPageStageError::BufferOverflow);
+                }
+                self.total_staged_bytes += page_bytes;
+                self.pending_transform_count += 1;
+                if page_complete {
+                    self.set_phase(
+                        session_id,
+                        TransformPagePhase::Applying {
+                            transform_id: transform_id.clone(),
+                            bytes: page_bytes,
+                        },
+                    );
+                    Ok(TransformPageStageAction::Apply {
+                        pages: vec![page],
+                        transform_id,
+                        generation,
+                        final_digest: page_digest,
+                    })
+                } else {
+                    self.set_phase(
+                        session_id,
+                        TransformPagePhase::Collecting(PendingTransformPage {
+                            transform_id,
+                            generation,
+                            total: page_total,
+                            next_index: 1,
+                            digests: vec![page_digest],
+                            pages: vec![page],
+                            bytes: page_bytes,
+                        }),
+                    );
+                    Ok(TransformPageStageAction::Ack(1))
+                }
+            }
+            TransformPagePhase::Applying {
+                transform_id: active,
+                bytes,
+            } => {
+                self.set_phase(
+                    session_id,
+                    TransformPagePhase::Applying {
+                        transform_id: active,
+                        bytes,
+                    },
+                );
+                Err(TransformPageStageError::InProgress)
+            }
+            TransformPagePhase::Collecting(mut pending) => {
+                if pending.transform_id != transform_id
+                    || pending.generation != generation
+                    || pending.total != page_total
+                {
+                    self.release_phase(&TransformPagePhase::Collecting(pending));
+                    return Err(TransformPageStageError::AttemptMismatch);
+                }
+                if page_index < pending.next_index {
+                    let matches = pending
+                        .digests
+                        .get(page_index)
+                        .is_some_and(|accepted| accepted == &page_digest);
+                    let next_index = pending.next_index;
+                    if !matches {
+                        self.release_phase(&TransformPagePhase::Collecting(pending));
+                        return Err(TransformPageStageError::DigestMismatch);
+                    }
+                    self.set_phase(session_id, TransformPagePhase::Collecting(pending));
+                    return Ok(TransformPageStageAction::Ack(next_index));
+                }
+                if page_index > pending.next_index {
+                    self.release_phase(&TransformPagePhase::Collecting(pending));
+                    return Err(TransformPageStageError::OrderMismatch);
+                }
+                let next_bytes = pending.bytes.checked_add(page_bytes);
+                let total_bytes = self.total_staged_bytes.checked_add(page_bytes);
+                if next_bytes.is_none_or(|bytes| bytes > self.max_staged_bytes)
+                    || total_bytes.is_none_or(|bytes| bytes > self.max_staged_bytes)
+                {
+                    self.release_phase(&TransformPagePhase::Collecting(pending));
+                    return Err(TransformPageStageError::BufferOverflow);
+                }
+                pending.bytes = next_bytes.unwrap_or(usize::MAX);
+                self.total_staged_bytes = total_bytes.unwrap_or(usize::MAX);
+                pending.next_index += 1;
+                pending.digests.push(page_digest.clone());
+                pending.pages.push(page);
+                if page_complete {
+                    let bytes = pending.bytes;
+                    let pages = std::mem::take(&mut pending.pages);
+                    let active_id = pending.transform_id.clone();
+                    let active_generation = pending.generation;
+                    self.set_phase(
+                        session_id,
+                        TransformPagePhase::Applying {
+                            transform_id: active_id.clone(),
+                            bytes,
+                        },
+                    );
+                    Ok(TransformPageStageAction::Apply {
+                        pages,
+                        transform_id: active_id,
+                        generation: active_generation,
+                        final_digest: page_digest,
+                    })
+                } else {
+                    let next_index = pending.next_index;
+                    self.set_phase(session_id, TransformPagePhase::Collecting(pending));
+                    Ok(TransformPageStageAction::Ack(next_index))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingStateImport {
+    import_id: String,
+    batch_count: usize,
+    next_seq: usize,
+    digests: Vec<String>,
+    compartments: Vec<StoredCompartment>,
+    bytes: usize,
+    last_activity: Instant,
+}
+
+#[derive(Debug)]
+enum StateImportPhase {
+    Collecting(PendingStateImport),
+    Applying { import_id: String, bytes: usize },
+}
+
+#[derive(Debug)]
+struct StateImportCoordinator {
+    sessions: HashMap<String, StateImportPhase>,
+    total_staged_bytes: usize,
+    pending_import_count: usize,
+    max_staged_bytes: usize,
+    max_pending_imports: usize,
+    stale_after: Duration,
+}
+
+impl Default for StateImportCoordinator {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            total_staged_bytes: 0,
+            pending_import_count: 0,
+            max_staged_bytes: STATE_IMPORT_MAX_STAGED_BYTES,
+            max_pending_imports: STATE_IMPORT_MAX_PENDING,
+            stale_after: STATE_IMPORT_STALE_AFTER,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StateImportStageOutcome {
+    Staged(usize),
+    Apply {
+        import_id: String,
+        compartments: Vec<StoredCompartment>,
+    },
+}
+
+#[derive(Debug)]
+enum StateImportStageError {
+    Protocol {
+        code: &'static str,
+        message: &'static str,
+    },
+    Validation(StateImportValidationError),
+}
+
+impl StateImportCoordinator {
+    fn phase_bytes(phase: &StateImportPhase) -> usize {
+        match phase {
+            StateImportPhase::Collecting(pending) => pending.bytes,
+            StateImportPhase::Applying { bytes, .. } => *bytes,
+        }
+    }
+
+    fn discard(&mut self, session_id: &str) {
+        if let Some(phase) = self.sessions.remove(session_id) {
+            self.pending_import_count = self.pending_import_count.saturating_sub(1);
+            self.total_staged_bytes = self
+                .total_staged_bytes
+                .saturating_sub(Self::phase_bytes(&phase));
+        }
+    }
+
+    fn evict_stale(&mut self, now: Instant) {
+        let stale = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, phase)| match phase {
+                StateImportPhase::Collecting(pending)
+                    if now.saturating_duration_since(pending.last_activity) >= self.stale_after =>
+                {
+                    Some(session_id.clone())
+                }
+                StateImportPhase::Collecting(_) | StateImportPhase::Applying { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        for session_id in stale {
+            self.discard(&session_id);
+        }
+    }
+
+    fn complete(&mut self, session_id: &str, import_id: &str) {
+        if self.sessions.get(session_id).is_some_and(|phase| {
+            matches!(
+                phase,
+                StateImportPhase::Applying {
+                    import_id: active,
+                    ..
+                } if active == import_id
+            )
+        }) {
+            self.discard(session_id);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage(
+        &mut self,
+        session_id: &str,
+        import_id: String,
+        batch_seq: usize,
+        batch_count: usize,
+        batch_digest: String,
+        batch_bytes: usize,
+        compartments: Vec<StoredCompartment>,
+        now: Instant,
+    ) -> Result<StateImportStageOutcome, StateImportStageError> {
+        self.evict_stale(now);
+        let phase = self.sessions.remove(session_id);
+        match phase {
+            Some(StateImportPhase::Applying {
+                import_id: active,
+                bytes,
+            }) => {
+                self.sessions.insert(
+                    session_id.to_string(),
+                    StateImportPhase::Applying {
+                        import_id: active,
+                        bytes,
+                    },
+                );
+                Err(StateImportStageError::Protocol {
+                    code: "state_import_in_progress",
+                    message: "the final state import batch is being applied",
+                })
+            }
+            Some(StateImportPhase::Collecting(mut pending)) => {
+                if pending.import_id != import_id || pending.batch_count != batch_count {
+                    self.total_staged_bytes = self.total_staged_bytes.saturating_sub(pending.bytes);
+                    self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_attempt_mismatch",
+                        message: "the import id or batch count changed during staging",
+                    });
+                }
+                if batch_seq < pending.next_seq {
+                    let matches = pending
+                        .digests
+                        .get(batch_seq)
+                        .is_some_and(|accepted| accepted == &batch_digest);
+                    let staged = pending.compartments.len();
+                    if matches {
+                        pending.last_activity = now;
+                        self.sessions.insert(
+                            session_id.to_string(),
+                            StateImportPhase::Collecting(pending),
+                        );
+                        return Ok(StateImportStageOutcome::Staged(staged));
+                    }
+                    self.total_staged_bytes = self.total_staged_bytes.saturating_sub(pending.bytes);
+                    self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_digest_mismatch",
+                        message: "a redriven state import batch changed content",
+                    });
+                }
+                if batch_seq > pending.next_seq {
+                    self.total_staged_bytes = self.total_staged_bytes.saturating_sub(pending.bytes);
+                    self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                    return Err(StateImportStageError::Protocol {
+                        code: "batch_seq_mismatch",
+                        message: "state import batches must arrive contiguously",
+                    });
+                }
+                if let Some(previous) = pending.compartments.last() {
+                    if let Some(current) = compartments.first() {
+                        if current.sequence <= previous.sequence {
+                            self.total_staged_bytes =
+                                self.total_staged_bytes.saturating_sub(pending.bytes);
+                            self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                            return Err(StateImportStageError::Validation(
+                                StateImportValidationError::SeqNotIncreasing {
+                                    previous: previous.sequence,
+                                    current: current.sequence,
+                                },
+                            ));
+                        }
+                        if current.start_message <= previous.end_message {
+                            self.total_staged_bytes =
+                                self.total_staged_bytes.saturating_sub(pending.bytes);
+                            self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                            return Err(StateImportStageError::Validation(
+                                StateImportValidationError::RangesOverlap {
+                                    previous: previous.sequence,
+                                    current: current.sequence,
+                                },
+                            ));
+                        }
+                    }
+                }
+                let next_bytes = pending.bytes.checked_add(batch_bytes);
+                let next_total = self.total_staged_bytes.checked_add(batch_bytes);
+                if next_bytes.is_none_or(|bytes| bytes > self.max_staged_bytes)
+                    || next_total.is_none_or(|bytes| bytes > self.max_staged_bytes)
+                {
+                    self.total_staged_bytes = self.total_staged_bytes.saturating_sub(pending.bytes);
+                    self.pending_import_count = self.pending_import_count.saturating_sub(1);
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_buffer_overflow",
+                        message: "state import staging exceeded the handler-wide byte cap",
+                    });
+                }
+                pending.bytes = next_bytes.unwrap_or(usize::MAX);
+                self.total_staged_bytes = next_total.unwrap_or(usize::MAX);
+                pending.next_seq += 1;
+                pending.digests.push(batch_digest);
+                pending.compartments.extend(compartments);
+                pending.last_activity = now;
+                let staged = pending.compartments.len();
+                if batch_seq + 1 == batch_count {
+                    let bytes = pending.bytes;
+                    let compartments = pending.compartments;
+                    self.sessions.insert(
+                        session_id.to_string(),
+                        StateImportPhase::Applying {
+                            import_id: import_id.clone(),
+                            bytes,
+                        },
+                    );
+                    Ok(StateImportStageOutcome::Apply {
+                        import_id,
+                        compartments,
+                    })
+                } else {
+                    self.sessions.insert(
+                        session_id.to_string(),
+                        StateImportPhase::Collecting(pending),
+                    );
+                    Ok(StateImportStageOutcome::Staged(staged))
+                }
+            }
+            None => {
+                if batch_seq != 0 {
+                    return Err(StateImportStageError::Protocol {
+                        code: "batch_seq_mismatch",
+                        message: "the first state import batch must have batch_seq 0",
+                    });
+                }
+                if self.pending_import_count >= self.max_pending_imports {
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_capacity",
+                        message: "too many state imports are already pending",
+                    });
+                }
+                if batch_bytes > self.max_staged_bytes
+                    || self
+                        .total_staged_bytes
+                        .checked_add(batch_bytes)
+                        .is_none_or(|bytes| bytes > self.max_staged_bytes)
+                {
+                    return Err(StateImportStageError::Protocol {
+                        code: "state_import_buffer_overflow",
+                        message: "state import staging exceeded the handler-wide byte cap",
+                    });
+                }
+                self.pending_import_count += 1;
+                self.total_staged_bytes += batch_bytes;
+                let staged = compartments.len();
+                if batch_count == 1 {
+                    self.sessions.insert(
+                        session_id.to_string(),
+                        StateImportPhase::Applying {
+                            import_id: import_id.clone(),
+                            bytes: batch_bytes,
+                        },
+                    );
+                    Ok(StateImportStageOutcome::Apply {
+                        import_id,
+                        compartments,
+                    })
+                } else {
+                    self.sessions.insert(
+                        session_id.to_string(),
+                        StateImportPhase::Collecting(PendingStateImport {
+                            import_id,
+                            batch_count,
+                            next_seq: 1,
+                            digests: vec![batch_digest],
+                            compartments,
+                            bytes: batch_bytes,
+                            last_activity: now,
+                        }),
+                    );
+                    Ok(StateImportStageOutcome::Staged(staged))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ShadowTransformWire {
     #[serde(default)]
@@ -424,6 +1153,8 @@ struct ShadowPassInputs {
     #[serde(default)]
     model_key: Option<String>,
     #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
     usage: Option<ShadowUsageWire>,
     #[serde(
         alias = "effective_execute_threshold",
@@ -432,10 +1163,15 @@ struct ShadowPassInputs {
     effective_execute_threshold: f64,
     #[serde(default)]
     history_budget_tokens: Option<f64>,
+    #[serde(default = "default_clear_reasoning_age")]
+    clear_reasoning_age: u64,
     #[serde(default = "default_cache_ttl")]
     cache_ttl: String,
     #[serde(default)]
     provider_error: Option<String>,
+    /// True only for shadow passes whose newest assistant is still streaming.
+    #[serde(default)]
+    mid_turn: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -623,6 +1359,10 @@ fn default_cache_ttl() -> String {
     "5m".to_string()
 }
 
+fn default_clear_reasoning_age() -> u64 {
+    50
+}
+
 fn default_importance() -> i32 {
     50
 }
@@ -719,6 +1459,227 @@ impl ShadowMemoryMutationWire {
     }
 }
 
+enum TransformSnapshot {
+    InFlight {
+        generation: u64,
+    },
+    Ready {
+        generation: u64,
+        request: Arc<TransformRequest>,
+        revert_epoch: u64,
+        retained_bytes: usize,
+    },
+}
+
+struct SnapshotLeaseBudget {
+    bytes: usize,
+    count: usize,
+    max_bytes: usize,
+    max_count: usize,
+}
+
+struct SnapshotLease {
+    generation: u64,
+    request: Arc<TransformRequest>,
+    revert_epoch: u64,
+    retained_bytes: usize,
+    budget: Arc<Mutex<SnapshotLeaseBudget>>,
+}
+
+impl Drop for SnapshotLease {
+    fn drop(&mut self) {
+        let mut budget = self.budget.lock().expect("snapshot lease budget mutex");
+        budget.bytes = budget.bytes.saturating_sub(self.retained_bytes);
+        budget.count = budget.count.saturating_sub(1);
+    }
+}
+
+enum TransformSnapshotLookup {
+    Missing,
+    InFlight,
+    LeaseBudgetExceeded,
+    Ready(SnapshotLease),
+}
+
+struct TransformSnapshotCache {
+    entries: HashMap<String, TransformSnapshot>,
+    ready_lru: VecDeque<String>,
+    /// Insertion-ordered InFlight sessions. Failed or rejected transforms never
+    /// reach `finish_ready`, so without its own bound this class of entry would
+    /// grow with every unique failing session for the process lifetime.
+    in_flight_lru: VecDeque<String>,
+    ready_bytes: usize,
+    next_generation: u64,
+    max_ready_bytes: usize,
+    max_in_flight_entries: usize,
+    // Map eviction cannot reclaim requests held by active wrapups. This shared budget
+    // follows those Arc leases independently until their RAII guards are dropped.
+    active_leases: Arc<Mutex<SnapshotLeaseBudget>>,
+}
+
+impl TransformSnapshotCache {
+    fn new(max_ready_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ready_lru: VecDeque::new(),
+            in_flight_lru: VecDeque::new(),
+            ready_bytes: 0,
+            next_generation: 0,
+            max_ready_bytes,
+            max_in_flight_entries: MAX_IN_FLIGHT_SNAPSHOT_ENTRIES,
+            active_leases: Arc::new(Mutex::new(SnapshotLeaseBudget {
+                bytes: 0,
+                count: 0,
+                max_bytes: ACTIVE_SNAPSHOT_LEASE_BUDGET_BYTES,
+                max_count: MAX_ACTIVE_SNAPSHOT_LEASES,
+            })),
+        }
+    }
+
+    fn remove_ready_charge(&mut self, session_id: &str) {
+        if let Some(TransformSnapshot::Ready { retained_bytes, .. }) = self.entries.get(session_id)
+        {
+            self.ready_bytes = self.ready_bytes.saturating_sub(*retained_bytes);
+        }
+        self.ready_lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn begin(&mut self, session_id: &str) -> u64 {
+        self.remove_ready_charge(session_id);
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        self.entries.insert(
+            session_id.to_string(),
+            TransformSnapshot::InFlight { generation },
+        );
+        self.in_flight_lru
+            .retain(|candidate| candidate != session_id);
+        self.in_flight_lru.push_back(session_id.to_string());
+        // Evicting an InFlight entry to Missing is correctness-safe: wrapup refuses
+        // Missing, and finish_ready's generation match refuses to resurrect an
+        // evicted session's stale snapshot.
+        while self.in_flight_lru.len() > self.max_in_flight_entries {
+            let Some(oldest) = self.in_flight_lru.pop_front() else {
+                break;
+            };
+            if matches!(
+                self.entries.get(&oldest),
+                Some(TransformSnapshot::InFlight { .. })
+            ) {
+                self.entries.remove(&oldest);
+            }
+        }
+        generation
+    }
+
+    fn finish_ready(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        request: Arc<TransformRequest>,
+        revert_epoch: u64,
+        retained_bytes: usize,
+    ) {
+        let matches_current = matches!(
+            self.entries.get(session_id),
+            Some(TransformSnapshot::InFlight { generation: current }) if *current == generation
+        );
+        if !matches_current {
+            return;
+        }
+        self.in_flight_lru
+            .retain(|candidate| candidate != session_id);
+        if retained_bytes > self.max_ready_bytes {
+            self.entries.remove(session_id);
+            return;
+        }
+
+        self.entries.insert(
+            session_id.to_string(),
+            TransformSnapshot::Ready {
+                generation,
+                request,
+                revert_epoch,
+                retained_bytes,
+            },
+        );
+        self.ready_lru.push_back(session_id.to_string());
+        self.ready_bytes = self.ready_bytes.saturating_add(retained_bytes);
+        while self.ready_bytes > self.max_ready_bytes {
+            let Some(oldest) = self.ready_lru.pop_front() else {
+                break;
+            };
+            if let Some(TransformSnapshot::Ready { retained_bytes, .. }) =
+                self.entries.remove(&oldest)
+            {
+                self.ready_bytes = self.ready_bytes.saturating_sub(retained_bytes);
+            }
+        }
+    }
+
+    fn get(&mut self, session_id: &str) -> TransformSnapshotLookup {
+        match self.entries.get(session_id) {
+            Some(TransformSnapshot::InFlight { .. }) => TransformSnapshotLookup::InFlight,
+            Some(TransformSnapshot::Ready {
+                generation,
+                request,
+                revert_epoch,
+                retained_bytes,
+            }) => {
+                let mut budget = self
+                    .active_leases
+                    .lock()
+                    .expect("snapshot lease budget mutex");
+                let Some(next_bytes) = budget.bytes.checked_add(*retained_bytes) else {
+                    return TransformSnapshotLookup::LeaseBudgetExceeded;
+                };
+                if budget.count >= budget.max_count || next_bytes > budget.max_bytes {
+                    return TransformSnapshotLookup::LeaseBudgetExceeded;
+                }
+                budget.bytes = next_bytes;
+                budget.count += 1;
+                let ready = SnapshotLease {
+                    generation: *generation,
+                    request: Arc::clone(request),
+                    revert_epoch: *revert_epoch,
+                    retained_bytes: *retained_bytes,
+                    budget: Arc::clone(&self.active_leases),
+                };
+                drop(budget);
+                self.ready_lru.retain(|candidate| candidate != session_id);
+                self.ready_lru.push_back(session_id.to_string());
+                TransformSnapshotLookup::Ready(ready)
+            }
+            None => TransformSnapshotLookup::Missing,
+        }
+    }
+
+    fn ready_generation_matches(&self, session_id: &str, generation: u64) -> bool {
+        matches!(
+            self.entries.get(session_id),
+            Some(TransformSnapshot::Ready { generation: current, .. }) if *current == generation
+        )
+    }
+
+    fn generation_present_in_flight_or_ready(&self, session_id: &str, generation: u64) -> bool {
+        matches!(
+            self.entries.get(session_id),
+            Some(TransformSnapshot::InFlight { generation: current })
+                | Some(TransformSnapshot::Ready {
+                    generation: current,
+                    ..
+                }) if *current == generation
+        )
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        self.remove_ready_charge(session_id);
+        self.in_flight_lru
+            .retain(|candidate| candidate != session_id);
+        self.entries.remove(session_id);
+    }
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -730,6 +1691,9 @@ pub struct McHandler {
     fixed_config: Option<McModuleConfig>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     live_historian_sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
+    wrapup_sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
+    recomp_sessions: Arc<Mutex<HashSet<String>>>,
+    transform_snapshots: Arc<Mutex<TransformSnapshotCache>>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
     #[cfg(test)]
@@ -741,6 +1705,15 @@ pub struct McHandler {
     /// deterministically.
     #[cfg(test)]
     between_transform_and_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    wrapup_operation_budget: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    unknown_module_retry_delay: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    status_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    connect_failure_commit_hook: ConnectFailureCommitHook,
+    #[cfg(test)]
+    publication_fence_write_hook: ConnectFailureCommitHook,
     /// Route channel → its session binding. Populated at `on_bind`, removed at
     /// `on_route_gone`. The SDK validates the route handle's epoch before dispatching a
     /// request, so a channel key cannot resolve a stale route. A `Mutex<HashMap>` (not a
@@ -748,6 +1721,8 @@ pub struct McHandler {
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
     shadow_seeds: Mutex<ShadowSeedCoordinator>,
+    transform_pages: Mutex<TransformPageCoordinator>,
+    state_imports: Mutex<StateImportCoordinator>,
 }
 
 #[async_trait]
@@ -845,6 +1820,191 @@ enum PreparedHistorianAction {
     FireReady(Box<PreparedHistorianFiring>),
 }
 
+struct HistorianPrepareContext {
+    now: i64,
+    snapshot_generation: u64,
+}
+
+struct WrapupPrepareContext {
+    now: i64,
+    allow_unknown_module_retry: bool,
+}
+
+#[derive(Clone)]
+struct LiveWrapupSession {
+    token: Arc<()>,
+    rounds: usize,
+}
+
+struct WrapupSessionGuard {
+    sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
+    session_id: String,
+    token: Arc<()>,
+}
+
+impl WrapupSessionGuard {
+    fn set_rounds(&self, rounds: usize) {
+        let mut sessions = self.sessions.lock().expect("wrapup sessions mutex");
+        if let Some(session) = sessions
+            .get_mut(&self.session_id)
+            .filter(|session| Arc::ptr_eq(&session.token, &self.token))
+        {
+            session.rounds = rounds;
+        }
+    }
+}
+
+impl Drop for WrapupSessionGuard {
+    fn drop(&mut self) {
+        let mut sessions = self.sessions.lock().expect("wrapup sessions mutex");
+        let matches_current = sessions
+            .get(&self.session_id)
+            .is_some_and(|session| Arc::ptr_eq(&session.token, &self.token));
+        if matches_current {
+            sessions.remove(&self.session_id);
+        }
+    }
+}
+
+enum PreparedWrapupAction {
+    Busy(LiveHistorianCompletionWait),
+    Nothing(String),
+    FireReady(Box<HistorianFiringTask>),
+    Failed(String),
+}
+
+struct TerminalWrapupResponse {
+    disposition: &'static str,
+    rounds: usize,
+    summary: String,
+    reason: Option<&'static str>,
+    detail: Option<String>,
+    include_rounds_without_command: bool,
+}
+
+#[derive(Debug)]
+enum WrapupFiringError {
+    Retryable(RetryableWrapupReason, String),
+    UnknownModule(String),
+    Terminal {
+        reason: &'static str,
+        detail: String,
+    },
+}
+
+const TERMINAL_WRAPUP_FAILURE_PREFIX: &str = "mc-terminal-wrapup-failure:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryableWrapupReason {
+    BackoffActive,
+    SnapshotUnavailable,
+    SnapshotStale,
+    BudgetExhausted,
+}
+
+impl RetryableWrapupReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BackoffActive => "backoff_active",
+            Self::SnapshotUnavailable => "snapshot_unavailable",
+            Self::SnapshotStale => "snapshot_stale",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
+fn terminal_wrapup_failure_summary(reason: &str, summary: &str, detail: &str) -> String {
+    format!(
+        "{TERMINAL_WRAPUP_FAILURE_PREFIX}{}",
+        json!({ "reason": reason, "summary": summary, "detail": detail })
+    )
+}
+
+fn terminal_wrapup_failure_fields(summary: &str) -> Option<(String, String, String)> {
+    let encoded = summary.strip_prefix(TERMINAL_WRAPUP_FAILURE_PREFIX)?;
+    let value: Value = serde_json::from_str(encoded).ok()?;
+    Some((
+        value.get("reason")?.as_str()?.to_string(),
+        value.get("summary")?.as_str()?.to_string(),
+        value.get("detail")?.as_str()?.to_string(),
+    ))
+}
+
+type ConnectFailureCommitHook = Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
+struct WrapupSnapshotPublicationFence {
+    snapshots: Arc<Mutex<TransformSnapshotCache>>,
+    session_id: String,
+    generation: u64,
+    #[cfg(test)]
+    after_store_publish: ConnectFailureCommitHook,
+}
+
+impl historian::HistorianPublicationFence for WrapupSnapshotPublicationFence {
+    fn publish(
+        &self,
+        store: &McStore,
+        request: mc_store::HistorianPublishRequest<'_>,
+    ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
+        // Validation and the bounded local SQLite write share this lock so a transform
+        // cannot retire the cached raw snapshot between the check and additive writes.
+        let snapshots = self.snapshots.lock().expect("transform snapshots mutex");
+        if !snapshots.ready_generation_matches(&self.session_id, self.generation) {
+            return Err(mc_store::HistorianPublishError::FenceRejected {
+                reason: "transform snapshot generation changed before publication".to_string(),
+            });
+        }
+        let published = store.publish_historian_chunk(request);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_store_publish
+            .lock()
+            .expect("publication fence write hook mutex")
+            .as_mut()
+        {
+            hook();
+        }
+        published
+    }
+}
+
+struct ReattachSnapshotPublicationFence {
+    snapshots: Arc<Mutex<TransformSnapshotCache>>,
+    session_id: String,
+    generation: u64,
+    #[cfg(test)]
+    after_store_publish: ConnectFailureCommitHook,
+}
+
+impl historian::HistorianPublicationFence for ReattachSnapshotPublicationFence {
+    fn publish(
+        &self,
+        store: &McStore,
+        request: mc_store::HistorianPublishRequest<'_>,
+    ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
+        // Keep the cache check and database write under one lock. A later transform
+        // then cannot replace the messages selected by this request before the
+        // corresponding history rows are stored.
+        let snapshots = self.snapshots.lock().expect("transform snapshots mutex");
+        if !snapshots.generation_present_in_flight_or_ready(&self.session_id, self.generation) {
+            return Err(mc_store::HistorianPublishError::FenceRejected {
+                reason: "transform snapshot state changed after reattach started".to_string(),
+            });
+        }
+        let published = store.publish_historian_chunk(request);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_store_publish
+            .lock()
+            .expect("publication fence write hook mutex")
+            .as_mut()
+        {
+            hook();
+        }
+        published
+    }
+}
+
 struct HistorianFiringTask {
     store: Arc<McStore>,
     session_id: String,
@@ -853,6 +2013,8 @@ struct HistorianFiringTask {
     project_slug: String,
     firing: AssembledHistorianFiring,
     live_guard: SessionSetGuard,
+    connect_failure_commit_hook: ConnectFailureCommitHook,
+    publication_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -898,6 +2060,11 @@ impl McHandler {
             fixed_config: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
+            wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
+            recomp_sessions: Arc::new(Mutex::new(HashSet::new())),
+            transform_snapshots: Arc::new(Mutex::new(TransformSnapshotCache::new(
+                TRANSFORM_SNAPSHOT_BUDGET_BYTES,
+            ))),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -906,8 +2073,19 @@ impl McHandler {
             reduction_injection: Mutex::new(HashMap::new()),
             #[cfg(test)]
             between_transform_and_prepare: Mutex::new(None),
+            #[cfg(test)]
+            wrapup_operation_budget: Mutex::new(None),
+            #[cfg(test)]
+            unknown_module_retry_delay: Mutex::new(None),
+            #[cfg(test)]
+            status_snapshot_hook: Mutex::new(None),
+            connect_failure_commit_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
+            transform_pages: Mutex::new(TransformPageCoordinator::default()),
+            state_imports: Mutex::new(StateImportCoordinator::default()),
         }
     }
 
@@ -922,6 +2100,7 @@ impl McHandler {
                 memory_enabled: true,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
+                shadow_enabled: true,
             },
         )
     }
@@ -952,13 +2131,26 @@ impl McHandler {
             fixed_config: Some(config),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
+            wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
+            recomp_sessions: Arc::new(Mutex::new(HashSet::new())),
+            transform_snapshots: Arc::new(Mutex::new(TransformSnapshotCache::new(
+                TRANSFORM_SNAPSHOT_BUDGET_BYTES,
+            ))),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             guidance_now_ms: Mutex::new(None),
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
+            wrapup_operation_budget: Mutex::new(None),
+            unknown_module_retry_delay: Mutex::new(None),
+            status_snapshot_hook: Mutex::new(None),
+            connect_failure_commit_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
+            transform_pages: Mutex::new(TransformPageCoordinator::default()),
+            state_imports: Mutex::new(StateImportCoordinator::default()),
         }
     }
 
@@ -981,6 +2173,18 @@ impl McHandler {
                 .lock()
                 .expect("shadow seed mutex")
                 .evict(&session_id);
+            self.transform_pages
+                .lock()
+                .expect("transform page mutex")
+                .discard(&session_id);
+            self.state_imports
+                .lock()
+                .expect("state import mutex")
+                .discard(&session_id);
+            self.transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .remove(&session_id);
         }
     }
 
@@ -998,6 +2202,22 @@ impl McHandler {
             .sessions
             .get(session_id)
             .is_some_and(|state| ShadowSeedCoordinator::is_pending(&state.phase))
+    }
+
+    fn discard_transform_pages(&self, session_id: &str) {
+        self.transform_pages
+            .lock()
+            .expect("transform page mutex")
+            .discard(session_id);
+    }
+
+    fn transform_page_in_progress(&self, session_id: &str) -> bool {
+        self.transform_pages
+            .lock()
+            .expect("transform page mutex")
+            .sessions
+            .get(session_id)
+            .is_some_and(|state| TransformPageCoordinator::is_pending(&state.phase))
     }
 
     /// Remove a route and evict process-local session state after its final binding closes.
@@ -1020,6 +2240,18 @@ impl McHandler {
                 .lock()
                 .expect("shadow seed mutex")
                 .evict(&session);
+            self.transform_pages
+                .lock()
+                .expect("transform page mutex")
+                .discard(&session);
+            self.state_imports
+                .lock()
+                .expect("state import mutex")
+                .discard(&session);
+            self.transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .remove(&session);
         }
     }
 
@@ -1070,6 +2302,33 @@ impl McHandler {
                 code: "shadow_binding_required".to_string(),
                 message: "shadow ops require a route bound as shadow:<real_session>".to_string(),
             });
+        }
+        Ok(binding)
+    }
+
+    fn state_sync_binding(
+        &self,
+        channel: u16,
+        request_session: Option<&str>,
+    ) -> Result<SessionBinding, HandlerOutcome> {
+        let binding = self
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .get(&channel)
+            .cloned()
+            .ok_or_else(|| HandlerOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: "state sync on a channel with no session binding".to_string(),
+            })?;
+        if let Some(request_session) = request_session {
+            if binding.session != request_session {
+                return Err(HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                });
+            }
         }
         Ok(binding)
     }
@@ -1243,7 +2502,7 @@ impl McHandler {
 
     /// Return the channel binding without comparing a request session. MCP facade routes
     /// bind the `session` slot to an instance token, not to the durable conversation key;
-    /// facade handlers must resolve that token through ai-proxy before touching the store.
+    /// facade handlers must resolve that token through the thalamus gateway before touching the store.
     fn facade_binding(&self, channel: u16) -> Result<SessionBinding, BindingError> {
         self.bindings
             .lock()
@@ -1251,6 +2510,31 @@ impl McHandler {
             .get(&channel)
             .cloned()
             .ok_or(BindingError::Unbound)
+    }
+
+    /// Check whether the shadow lane is enabled. The cached configuration value is checked
+    /// on every dispatch, so toggling it and restarting this module can stop mirror traffic
+    /// without restarting the full harness. Authority state sync is separate because it
+    /// updates the module's internal transform state.
+    fn shadow_lane_enabled(&self) -> bool {
+        // effective_config honors the test seam, so tests never read the real
+        // user config file (a developer's live kill-switch flip must not turn
+        // the suite's shadow coverage off).
+        self.effective_config(Path::new("/")).shadow_enabled
+    }
+
+    fn state_sync_targets_shadow(&self, channel: u16, request: &Value) -> bool {
+        request
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(is_shadow_session)
+            .unwrap_or_else(|| {
+                self.bindings
+                    .lock()
+                    .expect("bindings mutex")
+                    .get(&channel)
+                    .is_some_and(|binding| is_shadow_session(&binding.session))
+            })
     }
 
     fn effective_config(&self, project_root: &Path) -> McModuleConfig {
@@ -1387,10 +2671,42 @@ impl McHandler {
         })
     }
 
+    fn try_claim_recomp_session(&self, session_id: &str) -> Result<StringSetGuard, ()> {
+        let mut sessions = self.recomp_sessions.lock().expect("recomp sessions mutex");
+        if !sessions.insert(session_id.to_string()) {
+            return Err(());
+        }
+        Ok(StringSetGuard {
+            sessions: Arc::clone(&self.recomp_sessions),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn try_claim_wrapup_session(&self, session_id: &str) -> Result<WrapupSessionGuard, usize> {
+        let mut sessions = self.wrapup_sessions.lock().expect("wrapup sessions mutex");
+        if let Some(session) = sessions.get(session_id) {
+            return Err(session.rounds);
+        }
+        let token = Arc::new(());
+        sessions.insert(
+            session_id.to_string(),
+            LiveWrapupSession {
+                token: Arc::clone(&token),
+                rounds: 0,
+            },
+        );
+        Ok(WrapupSessionGuard {
+            sessions: Arc::clone(&self.wrapup_sessions),
+            session_id: session_id.to_string(),
+            token,
+        })
+    }
+
     fn maybe_spawn_reattach(
         &self,
         store: Arc<McStore>,
         parsed: &TransformRequest,
+        snapshot_generation: u64,
         project_path: String,
         projection: &crate::ck_wire::FlatProjection,
         now: i64,
@@ -1431,6 +2747,13 @@ impl McHandler {
 
         match phase {
             HistorianPhase::AwaitingProducer => {
+                let publication_fence = Arc::new(ReattachSnapshotPublicationFence {
+                    snapshots: Arc::clone(&self.transform_snapshots),
+                    session_id: session_id.clone(),
+                    generation: snapshot_generation,
+                    #[cfg(test)]
+                    after_store_publish: Arc::clone(&self.publication_fence_write_hook),
+                });
                 let factory = Arc::clone(&self.producer_factory);
                 let project_root = PathBuf::from(&project_path);
                 let live: Vec<_> = projection
@@ -1498,6 +2821,7 @@ impl McHandler {
                                 now_ms: now,
                                 failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
                                 completion_now_ms: now_ms,
+                                publication_fence: Some(publication_fence.as_ref()),
                             },
                         )
                         .await
@@ -1535,8 +2859,12 @@ impl McHandler {
         binding: &SessionBinding,
         project_path: &str,
         projection: &crate::ck_wire::FlatProjection,
-        now: i64,
+        prepare: HistorianPrepareContext,
     ) -> PreparedHistorianAction {
+        let HistorianPrepareContext {
+            now,
+            snapshot_generation,
+        } = prepare;
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -1580,6 +2908,7 @@ impl McHandler {
                 .maybe_spawn_reattach(
                     Arc::clone(&store),
                     parsed,
+                    snapshot_generation,
                     project_path.to_string(),
                     projection,
                     now,
@@ -1814,7 +3143,114 @@ impl McHandler {
                 project_slug,
                 firing,
                 live_guard,
+                connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
+                // Organic pressure firings assemble and publish in one continuous drive
+                // while the live-session guard is held. They do not depend on a cached raw
+                // snapshot, so a transform-snapshot generation fence would reject valid work.
+                publication_fence: None,
             },
+        }))
+    }
+
+    fn prepare_wrapup_fire(
+        &self,
+        store: Arc<McStore>,
+        parsed: &TransformRequest,
+        binding: &SessionBinding,
+        projection: &crate::ck_wire::FlatProjection,
+        boundary: &boundary::BoundaryResolution,
+        context: WrapupPrepareContext,
+    ) -> PreparedWrapupAction {
+        let WrapupPrepareContext {
+            now,
+            allow_unknown_module_retry,
+        } = context;
+        let loaded = match store.load(&parsed.session_id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return PreparedWrapupAction::Failed(format!("state load failed: {error}"))
+            }
+        };
+        if loaded.meta.pending_rewrite.is_some() {
+            return PreparedWrapupAction::Failed("a boundary rewrite is pending".to_string());
+        }
+        if let Some(completion) = self.live_historian_completion_wait(&parsed.session_id) {
+            return PreparedWrapupAction::Busy(completion);
+        }
+        if loaded.meta.historian.state != HistorianPhase::Idle {
+            return PreparedWrapupAction::Failed(format!(
+                "historian recovery is required from {}",
+                loaded.meta.historian.state.as_str()
+            ));
+        }
+        if !allow_unknown_module_retry {
+            if let Some(until) = loaded.meta.historian.failure_backoff_at_ms {
+                if until > now {
+                    return PreparedWrapupAction::Failed(format!(
+                        "historian failure backoff active for {} ms",
+                        until.saturating_sub(now)
+                    ));
+                }
+            }
+        }
+
+        let cfg = self.effective_config(&binding.project_root);
+        if cfg.model_chain.is_empty() {
+            return PreparedWrapupAction::Failed("no historian models are configured".to_string());
+        }
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .cloned()
+            .collect::<Vec<_>>();
+        let project_path = binding.project_root.to_string_lossy().to_string();
+        let project_slug = project_slug(&binding.project_root);
+        let assemble = assemble_historian_firing(
+            &store,
+            &parsed.messages,
+            &live,
+            HistorianAssemblerConfig {
+                session_id: parsed.session_id.clone(),
+                project_path: project_path.clone(),
+                project_slug: project_slug.clone(),
+                model_chain: cfg.model_chain,
+                token_budget: DEFAULT_HISTORIAN_CHUNK_TOKENS,
+                boundary: boundary.clone(),
+                memory_enabled: cfg.memory_enabled,
+                extraction_free: false,
+                in_emergency: false,
+                // Explicit wrapup is the only reclaim mechanism on this surface, so a
+                // small final chunk must not be rejected by the substance floor.
+                fold_is_only_reclaim: true,
+                failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
+                min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
+            },
+            now,
+        );
+        let firing = match assemble {
+            Ok(AssembleHistorianFiringOutcome::Fire(firing)) => *firing,
+            Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
+                return PreparedWrapupAction::Nothing(format!("{reason:?}"))
+            }
+            Err(error) => return PreparedWrapupAction::Failed(format!("assembly failed: {error}")),
+        };
+        let live_guard = match self.try_claim_live_historian_session(&parsed.session_id) {
+            LiveHistorianSessionClaim::Acquired(guard) => guard,
+            LiveHistorianSessionClaim::Busy(completion) => {
+                return PreparedWrapupAction::Busy(completion)
+            }
+        };
+        PreparedWrapupAction::FireReady(Box::new(HistorianFiringTask {
+            store,
+            session_id: parsed.session_id.clone(),
+            project_path,
+            project_root: binding.project_root.clone(),
+            project_slug,
+            firing,
+            live_guard,
+            connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
+            publication_fence: None,
         }))
     }
 
@@ -1863,14 +3299,17 @@ impl McHandler {
             project_slug,
             firing,
             live_guard,
+            connect_failure_commit_hook,
+            publication_fence,
         } = task;
         let _guard = live_guard;
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
         match factory.connect(&project_root).await {
             Ok(mut producer) => {
-                let request =
+                let mut request =
                     firing.as_fire_request(&store, &session_id, &project_path, &project_slug);
+                request.publication_fence = publication_fence.as_deref();
                 run_historian_firing(&mut *producer, request).await
             }
             Err(err) => {
@@ -1879,13 +3318,19 @@ impl McHandler {
                     configured_failure_backoff_at_ms,
                     now_ms(),
                 );
-                record_historian_connect_failure(
+                let backoff_error = record_historian_connect_failure(
                     &store,
                     &session_id,
                     failure_backoff_at_ms,
                     &format!("producer connect: {err}"),
-                );
-                Err(historian::HistorianDriveError::Producer(err))
+                    &connect_failure_commit_hook,
+                )
+                .err()
+                .map(Box::new);
+                Err(historian::HistorianDriveError::ProducerConnect {
+                    source: Box::new(err),
+                    backoff_error,
+                })
             }
         }
     }
@@ -1933,6 +3378,131 @@ impl McHandler {
             .is_ok()
     }
 
+    fn wrapup_operation_budget(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = *self
+            .wrapup_operation_budget
+            .lock()
+            .expect("wrapup operation budget mutex")
+        {
+            return budget;
+        }
+        historian::MAX_WRAPUP_REQUEST_BUDGET
+            .checked_sub(WRAPUP_REQUEST_MARGIN)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn unknown_module_retry_delay(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(delay) = *self
+            .unknown_module_retry_delay
+            .lock()
+            .expect("unknown module retry delay mutex")
+        {
+            return delay;
+        }
+        Duration::from_secs(30)
+    }
+
+    fn remaining_wrapup_budget(deadline: Instant) -> Option<Duration> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    async fn run_wrapup_firing(
+        &self,
+        task: HistorianFiringTask,
+        deadline: Instant,
+    ) -> Result<historian::HistorianDriveOutcome, WrapupFiringError> {
+        let Some(remaining) = Self::remaining_wrapup_budget(deadline) else {
+            return Err(WrapupFiringError::Retryable(
+                RetryableWrapupReason::BudgetExhausted,
+                "wrapup request budget expired before historian round".to_string(),
+            ));
+        };
+        let wait = historian::wrapup_round_wait_budget().min(remaining);
+        let factory = Arc::clone(&self.producer_factory);
+        let handle = tokio::spawn(Self::execute_historian_firing_task(factory, task));
+        match tokio::time::timeout(wait, handle).await {
+            Ok(Ok(Ok(outcome))) => Ok(outcome),
+            Ok(Ok(Err(error))) => {
+                if matches!(&error, historian::HistorianDriveError::NoModels) {
+                    return Err(WrapupFiringError::Terminal {
+                        reason: "no_models",
+                        detail: error.to_string(),
+                    });
+                }
+                if matches!(
+                    &error,
+                    historian::HistorianDriveError::Producer(error)
+                        if error.is_unknown_module()
+                ) || matches!(
+                    &error,
+                    historian::HistorianDriveError::ProducerConnect { source, .. }
+                        if source.is_unknown_module()
+                ) {
+                    return Err(WrapupFiringError::UnknownModule(error.to_string()));
+                }
+                let reason = match &error {
+                    historian::HistorianDriveError::State(
+                        historian::HistorianStateError::Publish(
+                            mc_store::HistorianPublishError::CasConflict { .. }
+                            | mc_store::HistorianPublishError::FenceRejected { .. },
+                        ),
+                    )
+                    | historian::HistorianDriveError::State(
+                        historian::HistorianStateError::Store(McStoreError::CasConflict { .. }),
+                    ) => RetryableWrapupReason::SnapshotStale,
+                    historian::HistorianDriveError::ProducerConnect {
+                        backoff_error: None,
+                        ..
+                    }
+                    | historian::HistorianDriveError::Producer(_)
+                    | historian::HistorianDriveError::Validation(_) => {
+                        RetryableWrapupReason::BackoffActive
+                    }
+                    historian::HistorianDriveError::ProducerConnect {
+                        backoff_error: Some(_),
+                        ..
+                    } => RetryableWrapupReason::SnapshotUnavailable,
+                    _ => RetryableWrapupReason::SnapshotUnavailable,
+                };
+                Err(WrapupFiringError::Retryable(reason, error.to_string()))
+            }
+            Ok(Err(error)) => Err(WrapupFiringError::Retryable(
+                RetryableWrapupReason::SnapshotUnavailable,
+                format!("historian task failed: {error}"),
+            )),
+            Err(_) if Instant::now() >= deadline => Err(WrapupFiringError::Retryable(
+                RetryableWrapupReason::BudgetExhausted,
+                "wrapup request budget expired during historian round".to_string(),
+            )),
+            Err(_) => Err(WrapupFiringError::Retryable(
+                RetryableWrapupReason::SnapshotUnavailable,
+                "historian round timed out after 600 seconds".to_string(),
+            )),
+        }
+    }
+
+    async fn await_wrapup_historian_completion(
+        &self,
+        completion: LiveHistorianCompletionWait,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let Some(remaining) = Self::remaining_wrapup_budget(deadline) else {
+            return Err("wrapup request budget expired before joining historian".to_string());
+        };
+        let wait = historian::completion_wait_budget().min(remaining);
+        match tokio::time::timeout(wait, completion).await {
+            Ok(()) => Ok(()),
+            Err(_) if Instant::now() >= deadline => {
+                Err("wrapup request budget expired while joining historian".to_string())
+            }
+            Err(_) => Err("timed out while joining the active historian run".to_string()),
+        }
+    }
+
     fn spawn_historian_firing(&self, task: HistorianFiringTask) {
         let factory = Arc::clone(&self.producer_factory);
         tokio::spawn(async move {
@@ -1947,44 +3517,205 @@ impl McHandler {
         });
     }
 
-    fn handle_agent_drops_value(&self, channel: u16, request: Value) -> HandlerOutcome {
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
-            None => {
-                return HandlerOutcome::Error {
-                    code: "store_unavailable".to_string(),
-                    message: "store not opened (no HELLO_ACK storage seam)".to_string(),
+    fn handle_state_import_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let raw_session_id = request
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let batch_bytes = match serde_json::to_vec(&request) {
+            Ok(bytes) if bytes.len() <= MAX_FACADE_FRAME_BYTES => bytes.len(),
+            Ok(_) => {
+                if let Some(session_id) = raw_session_id.as_deref() {
+                    self.state_imports
+                        .lock()
+                        .expect("state import mutex")
+                        .discard(session_id);
                 }
+                return invalid_params_error("request body exceeds the 1 MiB limit");
+            }
+            Err(error) => return invalid_params_error(error.to_string()),
+        };
+        let parsed: StateImportWire = match serde_json::from_value(request.clone()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                if let Some(session_id) = raw_session_id.as_deref() {
+                    self.state_imports
+                        .lock()
+                        .expect("state import mutex")
+                        .discard(session_id);
+                }
+                return invalid_params_error(error.to_string());
             }
         };
-        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
-            return HandlerOutcome::Error {
-                code: "bad_request".to_string(),
-                message: "ctx_reduce command requires session_id".to_string(),
-            };
+        let discard = |handler: &McHandler| {
+            handler
+                .state_imports
+                .lock()
+                .expect("state import mutex")
+                .discard(&parsed.session_id);
         };
-        let binding = match self.resolve_binding(channel, session_id) {
+        if parsed.v != 1 {
+            discard(self);
+            return HandlerOutcome::Error {
+                code: "state_import_version".to_string(),
+                message: "state_import requires v=1".to_string(),
+            };
+        }
+        if parsed.session_id.trim().is_empty() {
+            discard(self);
+            return invalid_params_error("state_import requires a nonempty session_id");
+        }
+        if parsed.import_id.is_empty() || parsed.import_id.len() > STATE_IMPORT_MAX_ID_BYTES {
+            discard(self);
+            return invalid_params_error(format!(
+                "import_id must contain 1..={STATE_IMPORT_MAX_ID_BYTES} bytes"
+            ));
+        }
+        if parsed.batch_count == 0 || parsed.batch_seq >= parsed.batch_count {
+            discard(self);
+            return HandlerOutcome::Error {
+                code: "batch_seq_mismatch".to_string(),
+                message: "batch_seq must be inside a nonempty batch_count".to_string(),
+            };
+        }
+
+        let binding = match self.resolve_binding(channel, &parsed.session_id) {
             Ok(binding) => binding,
-            Err(e) => {
-                return match e {
-                    BindingError::Unbound => HandlerOutcome::Error {
-                        code: "route_unbound".to_string(),
-                        message: "ctx_reduce on a channel with no session binding".to_string(),
-                    },
-                    BindingError::SessionMismatch => HandlerOutcome::Error {
-                        code: "session_mismatch".to_string(),
-                        message: "request session_id does not match the channel's bound session"
-                            .to_string(),
-                    },
+            Err(BindingError::Unbound) => {
+                discard(self);
+                return HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: "state_import on a channel with no session binding".to_string(),
+                };
+            }
+            Err(BindingError::SessionMismatch) => {
+                discard(self);
+                return HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
                 };
             }
         };
         if is_shadow_session(&binding.session) {
+            discard(self);
             return HandlerOutcome::Error {
                 code: "non_shadow_op_on_shadow_binding".to_string(),
-                message: "ctx_reduce is not accepted on shadow:<real_session> routes".to_string(),
+                message: "state_import is not accepted on shadow routes".to_string(),
             };
         }
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => {
+                discard(self);
+                return store_unavailable_error();
+            }
+        };
+        match store.preflight_state_import(&parsed.session_id, &parsed.import_id) {
+            Ok(StateImportPreflight::Duplicate { imported }) => {
+                discard(self);
+                return respond(json!({
+                    "ok": true,
+                    "imported": imported,
+                    "duplicate": true,
+                }));
+            }
+            Ok(StateImportPreflight::Ready) => {}
+            Err(StateImportError::SessionNotEmpty) => {
+                discard(self);
+                return HandlerOutcome::Error {
+                    code: "session_not_empty".to_string(),
+                    message: "state_import only accepts a session with no durable state"
+                        .to_string(),
+                };
+            }
+            Err(error) => {
+                discard(self);
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                };
+            }
+        }
+
+        let created_at = now_ms();
+        let compartments = parsed
+            .compartments
+            .into_iter()
+            .map(|compartment| compartment.into_stored(created_at))
+            .collect::<Vec<_>>();
+        if let Err(error) = validate_state_import_compartments(&compartments) {
+            discard(self);
+            return state_import_validation_error(error);
+        }
+        let digest = sha256_hex(canonical_value(&request).as_bytes());
+        let action = self
+            .state_imports
+            .lock()
+            .expect("state import mutex")
+            .stage(
+                &parsed.session_id,
+                parsed.import_id,
+                parsed.batch_seq,
+                parsed.batch_count,
+                digest,
+                batch_bytes,
+                compartments,
+                Instant::now(),
+            );
+        match action {
+            Ok(StateImportStageOutcome::Staged(staged)) => {
+                respond(json!({ "ok": true, "staged": staged }))
+            }
+            Ok(StateImportStageOutcome::Apply {
+                import_id,
+                compartments,
+            }) => {
+                let outcome = store.commit_state_import(
+                    &parsed.session_id,
+                    &import_id,
+                    &compartments,
+                    created_at,
+                );
+                self.state_imports
+                    .lock()
+                    .expect("state import mutex")
+                    .complete(&parsed.session_id, &import_id);
+                match outcome {
+                    Ok(result) => respond(json!({
+                        "ok": true,
+                        "imported": result.imported,
+                        "duplicate": result.duplicate,
+                    })),
+                    Err(StateImportError::SessionNotEmpty) => HandlerOutcome::Error {
+                        code: "session_not_empty".to_string(),
+                        message: "state_import only accepts a session with no durable state"
+                            .to_string(),
+                    },
+                    Err(StateImportError::Validation(error)) => {
+                        state_import_validation_error(error)
+                    }
+                    Err(StateImportError::Store(error)) => HandlerOutcome::Error {
+                        code: "store_write_failed".to_string(),
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Err(StateImportStageError::Validation(error)) => state_import_validation_error(error),
+            Err(StateImportStageError::Protocol { code, message }) => HandlerOutcome::Error {
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+        }
+    }
+
+    fn handle_agent_drops_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "agent_drops.append requires session_id".to_string(),
+            };
+        };
         let command_id = match command_id_from_agent_drops_request(&request) {
             Ok(command_id) => command_id,
             Err(message) => {
@@ -1994,49 +3725,76 @@ impl McHandler {
                 }
             }
         };
-        let mut drop_ids = drop_ids_from_command(&request);
-        // Raw-string form ("1-3", "§1§,99"): canonicalize server-side with the same
-        // parser the MCP facade uses, so range/§ syntax is owned here and consumers
-        // (the thalamus response-tee) never re-implement it. Tag numbers that don't
-        // resolve to a known tag are skipped: the tee replays what the model said,
-        // and the model can name stale or foreign numbers.
-        if let Some(raw) = request.get("drop").and_then(Value::as_str) {
-            let numbers = match parse_tag_range_string(raw) {
-                Ok(numbers) => numbers,
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "bad_request".to_string(),
-                        message: format!("invalid drop range syntax: {error}"),
-                    }
-                }
+        let Some(raw_drop) = request.get("drop").and_then(Value::as_str) else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "'drop' must be a nonempty string".to_string(),
             };
-            let tags = match store.load_tags_for_session(session_id) {
-                Ok(tags) => tags,
-                Err(e) => {
-                    return HandlerOutcome::Error {
-                        code: "store_write_failed".to_string(),
-                        message: e.to_string(),
-                    }
-                }
+        };
+        if raw_drop.trim().is_empty() {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "'drop' must be a nonempty string".to_string(),
             };
-            let by_number = tags
-                .iter()
-                .map(|row| (row.tag_number, &row.block_id))
-                .collect::<HashMap<_, _>>();
-            for number in numbers {
-                if let Some(block_id) = by_number.get(&(number as i64)) {
-                    drop_ids.push((*block_id).clone());
+        }
+        let numbers = match parse_tag_range_string(raw_drop) {
+            Ok(numbers) => numbers,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message: format!("invalid drop range syntax: {error}"),
                 }
             }
-            drop_ids.sort();
-            drop_ids.dedup();
+        };
+        let binding = match self.resolve_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(BindingError::Unbound) => {
+                return HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: "agent_drops.append on a channel with no session binding".to_string(),
+                }
+            }
+            Err(BindingError::SessionMismatch) => {
+                return HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                }
+            }
+        };
+        if is_shadow_session(&binding.session) {
+            return HandlerOutcome::Error {
+                code: "non_shadow_op_on_shadow_binding".to_string(),
+                message: "agent_drops.append is not accepted on shadow routes".to_string(),
+            };
         }
-        if drop_ids.is_empty() && command_id.is_none() {
-            return respond(json!({ "ok": true, "queued": 0 }));
-        }
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+        let tags = match store.load_tags_for_session(session_id) {
+            Ok(tags) => tags,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let by_number = tags
+            .iter()
+            .map(|row| (row.tag_number, &row.block_id))
+            .collect::<HashMap<_, _>>();
+        let mut drop_ids = numbers
+            .into_iter()
+            .filter_map(|number| by_number.get(&(number as i64)).map(|id| (*id).clone()))
+            .collect::<Vec<_>>();
+        drop_ids.sort();
+        drop_ids.dedup();
+
         match store.append_pending_agent_drops_with_command(
             session_id,
-            command_id.as_deref(),
+            Some(&command_id),
             &drop_ids,
             now_ms(),
         ) {
@@ -2044,10 +3802,1066 @@ impl McHandler {
                 respond(json!({ "ok": true, "queued": 0, "duplicate": true }))
             }
             Ok(outcome) => respond(json!({ "ok": true, "queued": outcome.queued })),
-            Err(e) => HandlerOutcome::Error {
+            Err(error) => HandlerOutcome::Error {
                 code: "store_write_failed".to_string(),
-                message: e.to_string(),
+                message: error.to_string(),
             },
+        }
+    }
+
+    fn management_binding(
+        &self,
+        channel: u16,
+        request: &Value,
+        operation: &str,
+    ) -> Result<(String, SessionBinding), HandlerOutcome> {
+        if request.get("v").and_then(Value::as_u64) != Some(1) {
+            return Err(HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: format!("{operation} requires v=1"),
+            });
+        }
+        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            return Err(HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: format!("{operation} requires session_id"),
+            });
+        };
+        if session_id.trim().is_empty() {
+            return Err(HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: format!("{operation} requires a nonempty session_id"),
+            });
+        }
+        let binding = match self.resolve_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(BindingError::Unbound) => {
+                return Err(HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: format!("{operation} on a channel with no session binding"),
+                })
+            }
+            Err(BindingError::SessionMismatch) => {
+                return Err(HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                })
+            }
+        };
+        if is_shadow_session(&binding.session) {
+            return Err(HandlerOutcome::Error {
+                code: "non_shadow_op_on_shadow_binding".to_string(),
+                message: format!("{operation} is not accepted on shadow routes"),
+            });
+        }
+        Ok((session_id.to_string(), binding))
+    }
+
+    fn handle_todo_state_set_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, _binding) =
+            match self.management_binding(channel, request, "todo_state.set") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let Some(state_json) = request.get("state_json").and_then(Value::as_str) else {
+            return invalid_params_error("todo_state.set requires state_json");
+        };
+        if state_json.len() > MAX_FACADE_FRAME_BYTES {
+            return invalid_params_error("state_json exceeds the 1 MiB limit");
+        }
+        let Some(owner_message_id) = request.get("owner_message_id").and_then(Value::as_str) else {
+            return invalid_params_error("todo_state.set requires owner_message_id");
+        };
+        if owner_message_id.is_empty() || owner_message_id.len() > 128 {
+            return invalid_params_error("owner_message_id must contain 1..=128 bytes");
+        }
+        let Some(normalized) = crate::injection::normalize_todo_state_json(state_json) else {
+            return invalid_params_error("state_json must be a JSON todo array");
+        };
+        let state_hash = sha256_hex(normalized.as_bytes());
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        match store.set_todo_state(&session_id, &normalized, owner_message_id, &state_hash) {
+            Ok(TodoStateSetOutcome::Updated { .. }) | Ok(TodoStateSetOutcome::Noop) => {
+                respond(json!({ "ok": true }))
+            }
+            Err(error) => HandlerOutcome::Error {
+                code: "store_write_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_session_flush_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, _binding) =
+            match self.management_binding(channel, request, "session.flush") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        match store.arm_soft_refresh(&session_id) {
+            Ok(armed) => respond(json!({ "ok": true, "armed": armed })),
+            Err(error) => HandlerOutcome::Error {
+                code: "store_write_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_session_recomp_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, _binding) =
+            match self.management_binding(channel, request, "session.recomp") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let Some(command_id) = request.get("command_id").and_then(Value::as_str) else {
+            return invalid_params_error("session.recomp requires command_id");
+        };
+        if command_id.is_empty() || command_id.len() > 128 {
+            return invalid_params_error("command_id must contain 1..=128 bytes");
+        }
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        match store.load_recomp_command(&session_id, command_id) {
+            Ok(Some(row)) => {
+                return respond(json!({
+                    "ok": true,
+                    "disposition": row.disposition,
+                }))
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        }
+        let _guard = match self.try_claim_recomp_session(&session_id) {
+            Ok(guard) => guard,
+            Err(()) => {
+                return respond(json!({
+                    "ok": true,
+                    "disposition": "already_in_progress",
+                }))
+            }
+        };
+
+        let loaded = match store.load(&session_id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let compartments = match store.load_compartments(&session_id) {
+            Ok(compartments) => compartments,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let never_minted = compartments.is_empty() && loaded.core.boundary_id.trim().is_empty();
+        if never_minted {
+            return match store.record_recomp_command(
+                &session_id,
+                command_id,
+                "nothing_to_do",
+                now_ms(),
+            ) {
+                Ok(row) => respond(json!({
+                    "ok": true,
+                    "disposition": row.disposition,
+                })),
+                Err(error) => HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                },
+            };
+        }
+
+        let _reset = match store.reset_session_for_recomp(&session_id, loaded.row_version) {
+            Ok(reset) => reset,
+            Err(error @ McStoreError::CasConflict { .. }) => {
+                // A transform may have committed between the status reads and the reset.
+                // The recomp latch remains held; ask the caller to retry rather than
+                // claiming a reset that did not use the observed cache version.
+                return HandlerOutcome::Error {
+                    code: "store_conflict".to_string(),
+                    message: error.to_string(),
+                };
+            }
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        // A transform generation is an in-memory fence for cached raw snapshots. Marking
+        // this session in-flight prevents an already assembled historian from acquiring
+        // a ready snapshot after the durable revert epoch has been bumped.
+        self.transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .begin(&session_id);
+        match store.record_recomp_command(&session_id, command_id, "started", now_ms()) {
+            Ok(row) => respond(json!({
+                "ok": true,
+                "disposition": row.disposition,
+            })),
+            Err(error) => HandlerOutcome::Error {
+                code: "store_write_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_session_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, _binding) =
+            match self.management_binding(channel, request, "session.status") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        let sample_wrapup_latch = || {
+            self.wrapup_sessions
+                .lock()
+                .expect("wrapup sessions mutex")
+                .get(&session_id)
+                .map(|session| (Arc::as_ptr(&session.token) as usize, session.rounds))
+        };
+        let latch_before = sample_wrapup_latch();
+        let mut snapshot = match store.load_session_status_snapshot(&session_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        #[cfg(test)]
+        if let Some(hook) = self
+            .status_snapshot_hook
+            .lock()
+            .expect("status snapshot hook mutex")
+            .take()
+        {
+            hook();
+        }
+        let mut wrapup_latch = sample_wrapup_latch();
+        if latch_before != wrapup_latch {
+            // Holding the latch mutex across SQLite I/O would block wrapup progress. A single
+            // bounded re-read instead places the durable snapshot after the observed latch edge.
+            snapshot = match store.load_session_status_snapshot(&session_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            wrapup_latch = sample_wrapup_latch();
+        }
+        let loaded = snapshot.loaded;
+        let compartment_count = snapshot.compartment_count;
+        let pending_drop_count = snapshot.pending_drop_count;
+        let tag_count = snapshot.tag_count;
+        let pass_trace = snapshot.pass_trace;
+        let coverage = loaded
+            .meta
+            .coverage_ordinal
+            .map(|ordinal| ordinal.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let boundary = if loaded.core.boundary_id.trim().is_empty() {
+            "absent"
+        } else {
+            "present"
+        };
+        let surface = if loaded.meta.cc_u1_active {
+            "active"
+        } else {
+            "inactive"
+        };
+        let historian = historian_status_summary(&loaded.meta.historian);
+        let newest_pass_at = pass_trace
+            .as_ref()
+            .map(|trace| {
+                trace
+                    .last_received_at_ms
+                    .max(trace.last_completed_at_ms)
+                    .max(trace.last_reject_at_ms.unwrap_or(0))
+            })
+            .unwrap_or(0)
+            .max(loaded.meta.last_committed_pass_at_ms);
+        let short_session = session_id.chars().take(12).collect::<String>();
+        let age = format_traffic_age(newest_pass_at, now_ms());
+        // Status can outlive the caller's current lineage. Naming the subject and its
+        // durable traffic age makes a stale read visible instead of silently ambiguous.
+        let summary = sanitize_status_text(
+            &format!(
+                "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, last historian: {historian}, surface {surface}",
+                compartment_count,
+                plural_word(compartment_count, "compartment"),
+                pending_drop_count,
+                plural_word(pending_drop_count, "drop"),
+                tag_count,
+                plural_word(tag_count, "tag"),
+            ),
+            500,
+        );
+        // Structured fields beside the prose: reconcilers must never parse summary
+        // text, and a retained delivered-command row needs coverage/row_version plus
+        // the live wrapup latch to decide completion without a second op.
+        let wrapup_active = wrapup_latch.map(|(_, rounds)| rounds);
+        let mut response = json!({
+            "ok": true,
+            "summary": summary,
+            "wrapup_active": wrapup_active.is_some(),
+            "wrapup_rounds": wrapup_active,
+            "coverage_ordinal": loaded.meta.coverage_ordinal,
+            "row_version": loaded.row_version,
+            "boundary_present": !loaded.core.boundary_id.trim().is_empty(),
+            "compartment_count": compartment_count,
+            "pending_drop_count": pending_drop_count,
+            "usage": {
+                "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
+                "context_limit_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.context_limit_tokens),
+            },
+        });
+        if let Some(after_sequence) = request.get("include_compartments_after_seq") {
+            let Some(after_sequence) = after_sequence.as_i64().filter(|value| *value >= -1) else {
+                return invalid_params_error(
+                    "include_compartments_after_seq must be an integer >= -1",
+                );
+            };
+            let page = match store.load_compartments_after(
+                &session_id,
+                after_sequence,
+                SESSION_STATUS_COMPARTMENT_PAGE_LIMIT,
+            ) {
+                Ok(page) => page,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            let compartments = page
+                .compartments
+                .into_iter()
+                .map(|compartment| {
+                    json!({
+                        "sequence": compartment.sequence,
+                        "start_message": compartment.start_message,
+                        "end_message": compartment.end_message,
+                        "start_message_id": compartment.start_message_id,
+                        "end_message_id": compartment.end_message_id,
+                        "title": compartment.title,
+                        "content": compartment.content,
+                        "p1": compartment.p1,
+                        "p2": compartment.p2,
+                        "p3": compartment.p3,
+                        "p4": compartment.p4,
+                        "importance": compartment.importance,
+                        "episode_type": compartment.episode_type,
+                        "created_at": compartment.created_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let body = response
+                .as_object_mut()
+                .expect("session.status response is an object");
+            body.insert("compartments".to_string(), Value::Array(compartments));
+            body.insert("max_sequence".to_string(), json!(page.max_sequence));
+        }
+        respond(response)
+    }
+
+    fn wrapup_snapshot_is_current(
+        &self,
+        store: &McStore,
+        session_id: &str,
+        generation: u64,
+        revert_epoch: u64,
+    ) -> Result<bool, McStoreError> {
+        let generation_current = self
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .ready_generation_matches(session_id, generation);
+        if !generation_current {
+            return Ok(false);
+        }
+        Ok(store.load(session_id)?.meta.revert_epoch == revert_epoch)
+    }
+
+    fn retryable_wrapup_response(
+        reason: RetryableWrapupReason,
+        summary: impl Into<String>,
+    ) -> HandlerOutcome {
+        respond(json!({
+            "ok": false,
+            "disposition": "retryable",
+            "reason": reason.as_str(),
+            "summary": summary.into(),
+        }))
+    }
+
+    fn terminal_wrapup_response(
+        &self,
+        store: &McStore,
+        session_id: &str,
+        command_id: Option<&str>,
+        expected_generation: u64,
+        expected_revert_epoch: u64,
+        response: TerminalWrapupResponse,
+    ) -> HandlerOutcome {
+        let TerminalWrapupResponse {
+            disposition,
+            rounds,
+            summary,
+            reason,
+            detail,
+            include_rounds_without_command,
+        } = response;
+        debug_assert!(matches!(
+            disposition,
+            "completed" | "nothing_to_compact" | "failed"
+        ));
+        let ok = disposition != "failed";
+        let (disposition, rounds, summary) = if let Some(command_id) = command_id {
+            // The generation check and fenced SQLite insert share this short critical
+            // section. The local write is bounded and prevents a transform from starting
+            // after validation but before its terminal ledger row becomes durable.
+            let snapshots = self
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            if !snapshots.ready_generation_matches(session_id, expected_generation) {
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::SnapshotStale,
+                    "wrapup snapshot changed before terminal result recording",
+                );
+            }
+            let current = match store.load(session_id) {
+                Ok(current) if current.meta.revert_epoch == expected_revert_epoch => current,
+                Ok(_) => {
+                    return Self::retryable_wrapup_response(
+                        RetryableWrapupReason::SnapshotStale,
+                        "wrapup state changed before terminal result recording",
+                    )
+                }
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            let ledger_summary = if disposition == "failed" {
+                terminal_wrapup_failure_summary(
+                    reason.unwrap_or("unknown"),
+                    &summary,
+                    detail.as_deref().unwrap_or("terminal wrapup failure"),
+                )
+            } else {
+                summary.clone()
+            };
+            match store.record_wrapup_command_if_current(WrapupCommandRecord {
+                session_id,
+                command_id,
+                disposition,
+                rounds,
+                summary: &ledger_summary,
+                created_at: now_ms(),
+                expected_row_version: current.row_version,
+                expected_revert_epoch,
+            }) {
+                Ok(RecordWrapupCommandOutcome::Recorded(row)) => {
+                    if disposition == "failed" {
+                        (row.disposition, row.rounds, summary)
+                    } else {
+                        (row.disposition, row.rounds, row.summary)
+                    }
+                }
+                Ok(RecordWrapupCommandOutcome::Stale { .. }) => {
+                    return Self::retryable_wrapup_response(
+                        RetryableWrapupReason::SnapshotStale,
+                        "wrapup state changed before terminal result recording",
+                    )
+                }
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_commit_failed".to_string(),
+                        message: format!("could not record terminal wrapup result: {error}"),
+                    }
+                }
+            }
+        } else {
+            (disposition.to_string(), rounds, summary)
+        };
+        let mut payload = json!({
+            "ok": ok,
+            "disposition": disposition,
+            "summary": summary,
+        });
+        if let Some(reason) = reason {
+            payload["reason"] = json!(reason);
+        }
+        if let Some(detail) = detail {
+            payload["detail"] = json!(detail);
+        }
+        if command_id.is_some() || include_rounds_without_command {
+            payload["rounds"] = json!(rounds);
+        }
+        respond(payload)
+    }
+
+    fn replayed_wrapup_response(row: mc_store::WrapupCommandRow) -> HandlerOutcome {
+        if row.disposition == "failed" {
+            if let Some((reason, summary, detail)) = terminal_wrapup_failure_fields(&row.summary) {
+                return respond(json!({
+                    "ok": false,
+                    "disposition": "failed",
+                    "rounds": row.rounds,
+                    "summary": summary,
+                    "reason": reason,
+                    "detail": detail,
+                    "replayed": true,
+                }));
+            }
+        }
+        respond(json!({
+            "ok": row.disposition != "failed",
+            "disposition": row.disposition,
+            "rounds": row.rounds,
+            "summary": row.summary,
+            "replayed": true,
+        }))
+    }
+
+    async fn handle_session_wrapup_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let deadline = Instant::now()
+            .checked_add(self.wrapup_operation_budget())
+            .unwrap_or_else(Instant::now);
+        let (session_id, binding) =
+            match self.management_binding(channel, request, "session.wrapup") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let command_id = match request.get("command_id") {
+            None => None,
+            Some(value) => match value.as_str() {
+                // Empty ids are rejected so every retrying caller cannot collide on one
+                // shared durable ledger key.
+                Some(command_id) if !command_id.is_empty() && command_id.len() <= 128 => {
+                    Some(command_id)
+                }
+                _ => return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message:
+                        "session.wrapup command_id must be a nonempty string of at most 128 bytes"
+                            .to_string(),
+                },
+            },
+        };
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+        if let Some(command_id) = command_id {
+            match store.load_wrapup_command(&session_id, command_id) {
+                // Rows written by the current terminal-failure path carry a marker in their
+                // summary, while older failed rows remain eligible for a successful retry.
+                Ok(Some(row))
+                    if row.disposition == "failed"
+                        && terminal_wrapup_failure_fields(&row.summary).is_none() => {}
+                Ok(Some(row)) => return Self::replayed_wrapup_response(row),
+                Ok(None) => {}
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            }
+        }
+        let keep = match request.get("keep") {
+            None => 20,
+            // Any signed integer clamps into [WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX]; a negative
+            // keep is a clamp input, not an error, matching the boundary-side contract.
+            Some(value) => match value.as_i64() {
+                Some(value) => usize::try_from(value.max(0))
+                    .unwrap_or(usize::MAX)
+                    .clamp(WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX),
+                None => {
+                    return HandlerOutcome::Error {
+                        code: "bad_request".to_string(),
+                        message: "session.wrapup keep must be an integer".to_string(),
+                    }
+                }
+            },
+        };
+
+        // The module owns the only store writer, so a process-local per-session latch is
+        // sufficient to prevent duplicate producer drives. Durable historian state still
+        // protects publication if the process exits while a round is running.
+        let wrapup_guard = match self.try_claim_wrapup_session(&session_id) {
+            Ok(guard) => guard,
+            Err(rounds) => {
+                return respond(json!({
+                    "ok": true,
+                    "disposition": "already_in_progress",
+                    "rounds": rounds,
+                    "summary": format!("wrapup already in progress, {rounds} rounds done"),
+                }))
+            }
+        };
+
+        let entry_state = match store.load(&session_id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let entry_now = now_ms();
+        if let Some(until) = entry_state.meta.historian.failure_backoff_at_ms {
+            if until > entry_now {
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::BackoffActive,
+                    format!(
+                        "historian failure backoff active for {} ms",
+                        until.saturating_sub(entry_now)
+                    ),
+                );
+            }
+        }
+
+        let snapshot = self
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .get(&session_id);
+        let ready = match snapshot {
+            TransformSnapshotLookup::Ready(ready) => ready,
+            TransformSnapshotLookup::LeaseBudgetExceeded => {
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::SnapshotUnavailable,
+                    "too many concurrent wrapups",
+                )
+            }
+            TransformSnapshotLookup::Missing | TransformSnapshotLookup::InFlight => {
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::SnapshotUnavailable,
+                    "wrapup unavailable until a full session transform has been observed",
+                )
+            }
+        };
+        let parsed = Arc::clone(&ready.request);
+        let initial_snapshot = match store.load_historian_assembly_snapshot(&session_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        if ready.revert_epoch != initial_snapshot.revert_epoch {
+            return Self::retryable_wrapup_response(
+                RetryableWrapupReason::SnapshotStale,
+                "wrapup unavailable until a full session transform has been observed",
+            );
+        }
+        let projection = match crate::ck_wire::project_messages(&parsed.messages) {
+            Ok(projection) => projection,
+            Err(error) => {
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::SnapshotUnavailable,
+                    format!("wrapup boundary assembly failed: {error}"),
+                )
+            }
+        };
+        let boundary_messages = wrapup_boundary_messages(&parsed, &projection);
+        let initial_compartments = initial_snapshot.compartments;
+        let initial_end = initial_compartments
+            .iter()
+            .map(|compartment| compartment.end_message as u64)
+            .max();
+        let plan = boundary::resolve_wrapup_boundary(&boundary_messages, initial_end, keep);
+        let target = plan.target_protected_start_ordinal;
+        match self.wrapup_snapshot_is_current(
+            &store,
+            &session_id,
+            ready.generation,
+            ready.revert_epoch,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Self::retryable_wrapup_response(
+                    RetryableWrapupReason::SnapshotStale,
+                    "wrapup unavailable until a full session transform has been observed",
+                )
+            }
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        }
+        if plan.raw_messages_above_last_compartment <= keep
+            || !wrapup_has_remaining_messages(&parsed.messages, initial_end, target)
+        {
+            return self.terminal_wrapup_response(
+                &store,
+                &session_id,
+                command_id,
+                ready.generation,
+                ready.revert_epoch,
+                TerminalWrapupResponse {
+                    disposition: "nothing_to_compact",
+                    rounds: 0,
+                    summary: format!(
+                        "nothing to compact; {} raw messages already fit within the keep watermark of {keep}",
+                        plan.raw_messages_above_last_compartment,
+                    ),
+                    reason: None,
+                    detail: None,
+                    include_rounds_without_command: true,
+                },
+            );
+        }
+
+        let mut rounds = 0usize;
+        let mut failure: Option<(RetryableWrapupReason, String)> = None;
+        let mut terminal_failure: Option<(&'static str, String)> = None;
+        // This observation is local to the current runner loop execution. A runner that is
+        // still starting gets one bounded chance before a repeated route absence becomes terminal.
+        let mut unknown_module_observed_at = None;
+        while rounds < historian::MAX_WRAPUP_ROUNDS {
+            if Self::remaining_wrapup_budget(deadline).is_none() {
+                failure = Some((
+                    RetryableWrapupReason::BudgetExhausted,
+                    "wrapup request budget expired before the next round".to_string(),
+                ));
+                break;
+            }
+            if !self
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .ready_generation_matches(&session_id, ready.generation)
+            {
+                failure = Some((
+                    RetryableWrapupReason::SnapshotStale,
+                    "wrapup unavailable because a newer full session transform started".to_string(),
+                ));
+                break;
+            }
+            let current_state = match store.load(&session_id) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+            if current_state.meta.revert_epoch != ready.revert_epoch {
+                failure = Some((
+                    RetryableWrapupReason::SnapshotStale,
+                    "wrapup unavailable until a full session transform has been observed"
+                        .to_string(),
+                ));
+                break;
+            }
+            let round_now = now_ms();
+            if unknown_module_observed_at.is_none() {
+                if let Some(until) = current_state.meta.historian.failure_backoff_at_ms {
+                    if until > round_now {
+                        failure = Some((
+                            RetryableWrapupReason::BackoffActive,
+                            format!(
+                                "historian failure backoff active for {} ms",
+                                until.saturating_sub(round_now)
+                            ),
+                        ));
+                        break;
+                    }
+                }
+            }
+            let current_end = match store.load_compartments(&session_id) {
+                Ok(compartments) => compartments
+                    .iter()
+                    .map(|compartment| compartment.end_message as u64)
+                    .max(),
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+            if !wrapup_has_remaining_messages(&parsed.messages, current_end, target) {
+                break;
+            }
+            // Assembly re-reads one historian snapshot for this round. The firing carries
+            // that snapshot's revert epoch, and publication loads the current row version
+            // immediately before its store CAS, so a transform re-cut during production is
+            // rejected at publication rather than publishing against retired state.
+            let prepared = self.prepare_wrapup_fire(
+                Arc::clone(&store),
+                &parsed,
+                &binding,
+                &projection,
+                &plan.boundary,
+                WrapupPrepareContext {
+                    now: round_now,
+                    allow_unknown_module_retry: unknown_module_observed_at.is_some(),
+                },
+            );
+            // Assembly performs store reads, so verify the raw-history generation again
+            // before joining or driving the action it produced. A transform that started
+            // during assembly must invalidate this round.
+            if !self
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .ready_generation_matches(&session_id, ready.generation)
+            {
+                failure = Some((
+                    RetryableWrapupReason::SnapshotStale,
+                    "wrapup unavailable because a newer full session transform started".to_string(),
+                ));
+                break;
+            }
+            match prepared {
+                PreparedWrapupAction::Busy(completion) => {
+                    if let Err(reason) = self
+                        .await_wrapup_historian_completion(completion, deadline)
+                        .await
+                    {
+                        let retry_reason = if reason.contains("request budget expired") {
+                            RetryableWrapupReason::BudgetExhausted
+                        } else {
+                            RetryableWrapupReason::SnapshotUnavailable
+                        };
+                        failure = Some((retry_reason, reason));
+                        break;
+                    }
+                }
+                PreparedWrapupAction::Nothing(reason) => {
+                    failure = Some((
+                        RetryableWrapupReason::SnapshotUnavailable,
+                        format!("historian made no forward progress: {reason}"),
+                    ));
+                    break;
+                }
+                PreparedWrapupAction::Failed(reason) => {
+                    if reason == "no historian models are configured" {
+                        terminal_failure = Some(("no_models", reason));
+                        break;
+                    }
+                    let retry_reason = if reason.contains("backoff") {
+                        RetryableWrapupReason::BackoffActive
+                    } else {
+                        RetryableWrapupReason::SnapshotUnavailable
+                    };
+                    failure = Some((retry_reason, reason));
+                    break;
+                }
+                PreparedWrapupAction::FireReady(task) => {
+                    let mut task = *task;
+                    task.publication_fence = Some(Arc::new(WrapupSnapshotPublicationFence {
+                        snapshots: Arc::clone(&self.transform_snapshots),
+                        session_id: session_id.clone(),
+                        generation: ready.generation,
+                        #[cfg(test)]
+                        after_store_publish: Arc::clone(&self.publication_fence_write_hook),
+                    }));
+                    match self.run_wrapup_firing(task, deadline).await {
+                        Ok(historian::HistorianDriveOutcome::Completed(_)) => {
+                            let after_end = store.load_compartments(&session_id).ok().and_then(
+                                |compartments| {
+                                    compartments
+                                        .iter()
+                                        .map(|compartment| compartment.end_message as u64)
+                                        .max()
+                                },
+                            );
+                            if after_end <= current_end {
+                                failure = Some((
+                                    RetryableWrapupReason::SnapshotUnavailable,
+                                    "historian completed without advancing the compartment boundary"
+                                        .to_string(),
+                                ));
+                                break;
+                            }
+                            rounds += 1;
+                            wrapup_guard.set_rounds(rounds);
+                        }
+                        Ok(historian::HistorianDriveOutcome::Busy(_)) => {
+                            failure = Some((
+                                RetryableWrapupReason::SnapshotUnavailable,
+                                "historian became busy before the round started".to_string(),
+                            ));
+                            break;
+                        }
+                        Err(WrapupFiringError::Retryable(reason, detail)) => {
+                            failure = Some((reason, detail));
+                            break;
+                        }
+                        Err(WrapupFiringError::Terminal { reason, detail }) => {
+                            terminal_failure = Some((reason, detail));
+                            break;
+                        }
+                        Err(WrapupFiringError::UnknownModule(detail)) => {
+                            if unknown_module_observed_at.is_some() {
+                                terminal_failure = Some(("runner_module_unavailable", detail));
+                                break;
+                            }
+                            unknown_module_observed_at = Some(Instant::now());
+                            let delay = self.unknown_module_retry_delay();
+                            let Some(remaining) = Self::remaining_wrapup_budget(deadline) else {
+                                failure = Some((
+                                    RetryableWrapupReason::BudgetExhausted,
+                                    "wrapup request budget expired before retrying an unavailable runner module"
+                                        .to_string(),
+                                ));
+                                break;
+                            };
+                            if delay > remaining {
+                                failure = Some((
+                                    RetryableWrapupReason::BudgetExhausted,
+                                    "wrapup request budget expired before retrying an unavailable runner module"
+                                        .to_string(),
+                                ));
+                                break;
+                            }
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        let final_compartments = match store.load_compartments(&session_id) {
+            Ok(compartments) => compartments,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let final_end = final_compartments
+            .iter()
+            .map(|compartment| compartment.end_message as u64)
+            .max();
+        let compacted_messages = parsed
+            .messages
+            .iter()
+            .filter(|message| !message.ck.meta.synthetic)
+            .filter(|message| initial_end.is_none_or(|end| message.ordinal > end))
+            .filter(|message| final_end.is_some_and(|end| message.ordinal <= end))
+            .count();
+        let compartments_created = final_compartments
+            .len()
+            .saturating_sub(initial_compartments.len());
+        let remaining = wrapup_has_remaining_messages(&parsed.messages, final_end, target);
+        if let Some((reason, detail)) = terminal_failure {
+            return self.terminal_wrapup_response(
+                &store,
+                &session_id,
+                command_id,
+                ready.generation,
+                ready.revert_epoch,
+                TerminalWrapupResponse {
+                    disposition: "failed",
+                    rounds,
+                    summary: format!(
+                        "compacted {compacted_messages} messages into {compartments_created} compartments; wrapup stopped permanently"
+                    ),
+                    reason: Some(reason),
+                    detail: Some(detail),
+                    include_rounds_without_command: true,
+                },
+            );
+        }
+        if failure.is_none() && remaining {
+            failure = Some((
+                RetryableWrapupReason::SnapshotUnavailable,
+                format!(
+                    "stopped at the {}-round cap before the keep watermark",
+                    historian::MAX_WRAPUP_ROUNDS
+                ),
+            ));
+        }
+        let effect = "takes effect on your next message";
+        match failure {
+            Some((reason, detail)) => Self::retryable_wrapup_response(
+                reason,
+                format!(
+                    "compacted {compacted_messages} messages into {compartments_created} compartments; {detail}; {effect}"
+                ),
+            ),
+            None if rounds == 0 => self.terminal_wrapup_response(
+                &store,
+                &session_id,
+                command_id,
+                ready.generation,
+                ready.revert_epoch,
+                TerminalWrapupResponse {
+                    disposition: "nothing_to_compact",
+                    rounds: 0,
+                     summary:
+                         "nothing to compact; the tail is already within the keep watermark"
+                             .to_string(),
+                     reason: None,
+                     detail: None,
+                     include_rounds_without_command: true,
+                },
+            ),
+            None => self.terminal_wrapup_response(
+                &store,
+                &session_id,
+                command_id,
+                ready.generation,
+                ready.revert_epoch,
+                TerminalWrapupResponse {
+                    disposition: "completed",
+                    rounds,
+                     summary: format!(
+                         "compacted {compacted_messages} messages into {compartments_created} compartments; {effect}"
+                     ),
+                     reason: None,
+                     detail: None,
+                     include_rounds_without_command: true,
+                },
+            ),
         }
     }
 
@@ -2076,6 +4890,37 @@ impl McHandler {
             };
         }
 
+        let tool_present = match request.get("tool_present") {
+            None => false,
+            Some(value) => match value.as_bool() {
+                Some(value) => value,
+                None => {
+                    return HandlerOutcome::Error {
+                        code: "bad_request".to_string(),
+                        message: "guidance.get tool_present must be a boolean".to_string(),
+                    }
+                }
+            },
+        };
+        let profile = match request.get("serializer_profile").and_then(Value::as_str) {
+            None => Some(SerializerProfile::ClaudeCodeAnthropic),
+            Some(value) => match SerializerProfile::parse(value) {
+                Some(profile) => Some(profile),
+                None => return unknown_serializer_profile_error(),
+            },
+        };
+        let active = cc_u1_active(profile, tool_present);
+        let expected_variant = if active { "full" } else { "no_reduce" };
+        if let Some(variant) = request.get("variant").and_then(Value::as_str) {
+            if variant != expected_variant {
+                return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message: format!(
+                        "guidance variant {variant:?} contradicts tool_present={tool_present}"
+                    ),
+                };
+            }
+        }
         let date_line = match self.guidance_date_for_session(&store, session_id) {
             Ok(date) => date,
             Err(error) => {
@@ -2085,19 +4930,22 @@ impl McHandler {
                 }
             }
         };
-        // Default is the full five-tool block; variant="no_reduce" serves the surface
-        // without ctx_reduce/tag discipline for consumers whose tool policy hides it.
-        let text = match request.get("variant").and_then(Value::as_str) {
-            None | Some("full") => GUIDANCE_TEXT,
-            Some("no_reduce") => GUIDANCE_TEXT_NO_REDUCE,
-            Some(other) => {
-                return HandlerOutcome::Error {
-                    code: "bad_request".to_string(),
-                    message: format!("unknown guidance variant: {other}"),
-                }
-            }
+        let base_text = if active {
+            GUIDANCE_TEXT
+        } else {
+            GUIDANCE_TEXT_NO_REDUCE
         };
-        let bytes = guidance_bytes_for(text, &date_line);
+        let language_text = request
+            .get("language")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|language| !language.is_empty());
+        let language_directive = language_text.and_then(primary_language_directive);
+        let localized_text = language_directive
+            .as_deref()
+            .map(|directive| format!("{base_text}\n\n{directive}"));
+        let text_for_bytes = localized_text.as_deref().unwrap_or(base_text);
+        let bytes = guidance_bytes_for(text_for_bytes, &date_line);
         respond(json!({
             "ok": true,
             "bytes": bytes,
@@ -2106,7 +4954,7 @@ impl McHandler {
             // date line changes every day, so content_hash excludes it; otherwise a
             // date-only change would trigger cache refreshes even when guidance is
             // unchanged.
-            "content_hash": sha256_hex(text.as_bytes()),
+            "content_hash": sha256_hex(text_for_bytes.as_bytes()),
         }))
     }
 
@@ -2213,6 +5061,16 @@ impl McHandler {
     }
 
     async fn handle_transform_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        self.handle_transform_unpaged_value(channel, request, false)
+            .await
+    }
+
+    async fn handle_transform_unpaged_value(
+        &self,
+        channel: u16,
+        request: Value,
+        from_page_apply: bool,
+    ) -> HandlerOutcome {
         let parsed: TransformRequest = match serde_json::from_value(request.clone()) {
             Ok(req) => req,
             Err(e) => {
@@ -2222,8 +5080,12 @@ impl McHandler {
                 }
             }
         };
-        if SerializerProfile::parse(&parsed.serializer_profile).is_none() {
+        let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile);
+        if serializer_profile.is_none() {
             return unknown_serializer_profile_error();
+        }
+        if parsed.serve_native && serializer_profile != Some(SerializerProfile::OpencodeAiSdk) {
+            return serve_native_unsupported_profile_error(&parsed.serializer_profile);
         }
         if parsed.tail_delta.is_some() {
             return need_full_sync_response(parsed.full_array_fingerprint.clone());
@@ -2236,14 +5098,14 @@ impl McHandler {
             .session_id
             .starts_with(historian::MC_CHILD_SESSION_PREFIX)
         {
-            return respond(
-                serde_json::to_value(transform::TransformResponse::passthrough(
-                    parsed.messages.into_iter().map(|m| m.ck).collect(),
-                    parsed.full_array_fingerprint,
-                ))
-                .unwrap_or(Value::Null),
+            let mut response = transform::TransformResponse::passthrough(
+                parsed.messages.iter().map(|m| m.ck.clone()).collect(),
+                parsed.full_array_fingerprint.clone(),
             );
+            attach_native_messages(&mut response, &parsed, 0);
+            return respond(serde_json::to_value(response).unwrap_or(Value::Null));
         }
+        let parsed = Arc::new(parsed);
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
             None => {
@@ -2276,6 +5138,20 @@ impl McHandler {
                     .to_string(),
             };
         }
+        if !from_page_apply && self.transform_page_in_progress(&binding.session) {
+            return HandlerOutcome::Error {
+                code: "authority_transform_page_in_progress".to_string(),
+                message: "transform is blocked until all transform pages arrive".to_string(),
+            };
+        }
+        // A newer full transform invalidates the prior wrapup snapshot before any store
+        // mutation. If this pass later rejects, wrapup must not pair old raw bytes with
+        // the state that the rejected pass may already have re-cut.
+        let snapshot_generation = self
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .begin(&parsed.session_id);
         let project_path = binding.project_root.to_string_lossy().to_string();
         let pass_now = now_ms();
         // This trace is intentionally outside the fenced cache-state commit: a rejected
@@ -2343,7 +5219,10 @@ impl McHandler {
                 &binding,
                 &project_path,
                 &result.projection,
-                pass_now,
+                HistorianPrepareContext {
+                    now: pass_now,
+                    snapshot_generation,
+                },
             ) {
                 PreparedHistorianAction::Complete(diagnostics) => diagnostics,
                 PreparedHistorianAction::Busy {
@@ -2365,7 +5244,10 @@ impl McHandler {
                             &binding,
                             &project_path,
                             &result.projection,
-                            pass_now,
+                            HistorianPrepareContext {
+                                now: pass_now,
+                                snapshot_generation,
+                            },
                         ) {
                             PreparedHistorianAction::Complete(diagnostics) => diagnostics,
                             PreparedHistorianAction::Busy { diagnostics, .. } => diagnostics,
@@ -2424,7 +5306,10 @@ impl McHandler {
                 &binding,
                 &project_path,
                 &result.projection,
-                pass_now,
+                HistorianPrepareContext {
+                    now: pass_now,
+                    snapshot_generation,
+                },
             ) {
                 PreparedHistorianAction::Complete(diagnostics) => diagnostics,
                 PreparedHistorianAction::Busy { diagnostics, .. } => diagnostics,
@@ -2464,8 +5349,31 @@ impl McHandler {
                 .remove(&parsed.session_id);
         }
         response.historian = Some(diagnostics);
+        let reasoning_watermark = store
+            .load(&parsed.session_id)
+            .map(|state| state.meta.reasoning_cleared_through_ordinal)
+            .unwrap_or(0);
+        attach_native_messages(&mut response, &parsed, reasoning_watermark);
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
+        // Management requests carry identity but not raw history. A successful full pass
+        // retains its decoded request together with the durable revert epoch it observed.
+        // Serialization accounts the payload bytes for the cross-session LRU bound.
+        let retained_bytes = serde_json::to_vec(parsed.as_ref())
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if let Ok(loaded) = store.load(&parsed.session_id) {
+            self.transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .finish_ready(
+                    &parsed.session_id,
+                    snapshot_generation,
+                    Arc::clone(&parsed),
+                    loaded.meta.revert_epoch,
+                    retained_bytes,
+                );
+        }
         respond(serde_json::to_value(response).unwrap_or(Value::Null))
     }
 
@@ -2474,7 +5382,7 @@ impl McHandler {
         self.handle_transform_value(channel, request).await
     }
 
-    fn handle_shadow_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+    fn handle_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         const ENVELOPE_FIELDS: [&str; 5] = [
             "seed_id",
             "seed_generation",
@@ -2490,16 +5398,21 @@ impl McHandler {
             Ok(req) => req,
             Err(error) => {
                 if envelope_fields_present > 0 {
-                    if let Ok(binding) = self.shadow_binding(channel, None) {
+                    if let Ok(binding) = self.state_sync_binding(channel, None) {
                         self.discard_shadow_seed(&binding.session);
                     }
                 }
                 return invalid_params_error(error.to_string());
             }
         };
-        let binding = match self.shadow_binding(channel, parsed.session_id.as_deref()) {
+        let binding = match self.state_sync_binding(channel, parsed.session_id.as_deref()) {
             Ok(binding) => binding,
             Err(outcome) => return outcome,
+        };
+        let lane = if is_shadow_session(&binding.session) {
+            StateSyncLane::Shadow
+        } else {
+            StateSyncLane::Authority
         };
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
@@ -2527,7 +5440,7 @@ impl McHandler {
                     Some(ShadowSeedPhase::Idle) | None => None,
                 }
             };
-            let outcome = self.apply_shadow_state_sync_wire(&binding, &store, parsed);
+            let outcome = self.apply_state_sync_wire(&binding, &store, parsed, lane);
             if let Some((generation, expected_seq)) = awaiting_attempt {
                 let mut seeds = self.shadow_seeds.lock().expect("shadow seed mutex");
                 let still_same_attempt =
@@ -2656,13 +5569,11 @@ impl McHandler {
                 };
             }
             if loaded.meta.shadow_seq != parsed.expected_shadow_seq {
-                return HandlerOutcome::Error {
-                    code: "shadow_seq_mismatch".to_string(),
-                    message: format!(
-                        "expected_shadow_seq {} did not match durable shadow_seq {}",
-                        parsed.expected_shadow_seq, loaded.meta.shadow_seq
-                    ),
-                };
+                return state_sync_seq_mismatch_error(
+                    lane,
+                    parsed.expected_shadow_seq,
+                    loaded.meta.shadow_seq,
+                );
             }
         }
 
@@ -2683,6 +5594,18 @@ impl McHandler {
             let phase = {
                 let state = seeds.sessions.entry(binding.session.clone()).or_default();
                 std::mem::replace(&mut state.phase, ShadowSeedPhase::Idle)
+            };
+            // Authority callers can send a paged initial feed without a separate reset.
+            // Their bound real session already owns the current generation, so arm the
+            // same bounded collector automatically for the first batch.
+            let phase = match phase {
+                ShadowSeedPhase::Idle if !lane.is_shadow() && batch_index == 0 => {
+                    ShadowSeedPhase::AwaitingSeed {
+                        generation: seed_generation,
+                        expected_seq: parsed.expected_shadow_seq,
+                    }
+                }
+                phase => phase,
             };
             match phase {
                 ShadowSeedPhase::Idle => {
@@ -2864,7 +5787,7 @@ impl McHandler {
                 total,
             } => {
                 let assembled = assemble_shadow_seed(batches, generation, expected_seq);
-                let outcome = self.apply_shadow_state_sync_wire(&binding, &store, assembled);
+                let outcome = self.apply_state_sync_wire(&binding, &store, assembled, lane);
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
                     HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
@@ -2905,11 +5828,12 @@ impl McHandler {
         }
     }
 
-    fn apply_shadow_state_sync_wire(
+    fn apply_state_sync_wire(
         &self,
         binding: &SessionBinding,
         store: &McStore,
         parsed: ShadowStateSyncWire,
+        lane: StateSyncLane,
     ) -> HandlerOutcome {
         let compartments: Vec<StoredCompartment> = parsed
             .compartments
@@ -2917,22 +5841,41 @@ impl McHandler {
             .map(StoredCompartment::from)
             .collect();
         let has_workspace = parsed.workspace.is_some();
-        let (workspace, member_paths) =
-            match prepare_shadow_workspace(&binding.session, parsed.workspace) {
-                Ok(prepared) => prepared,
-                Err(error) => return invalid_params_error(error),
-            };
-        let root_path = shadow_project_path(&binding.session);
+        // The route binding supplies the key for the authority transform. Incoming memory
+        // rows may contain the plugin's stable project identity, so this mapper translates
+        // that identity to the bound key before writing the regular tables.
+        let root_path = if lane.is_shadow() {
+            shadow_project_path(&binding.session)
+        } else {
+            binding.project_root.to_string_lossy().to_string()
+        };
+        let (workspace, member_paths) = match if lane.is_shadow() {
+            prepare_shadow_workspace(&binding.session, parsed.workspace)
+        } else {
+            prepare_authority_workspace(&root_path, parsed.workspace)
+        } {
+            Ok(prepared) => prepared,
+            Err(error) => return invalid_params_error(error),
+        };
         let memories: Vec<ShadowMemoryRow> = match parsed
             .memories
             .into_iter()
             .map(|memory| {
-                let project_path = shadow_source_path(
-                    memory.project_path.as_deref(),
-                    &root_path,
-                    &member_paths,
-                    has_workspace,
-                )?;
+                let project_path = if lane.is_shadow() {
+                    shadow_source_path(
+                        memory.project_path.as_deref(),
+                        &root_path,
+                        &member_paths,
+                        has_workspace,
+                    )?
+                } else {
+                    authority_source_path(
+                        memory.project_path.as_deref(),
+                        &root_path,
+                        &member_paths,
+                        has_workspace,
+                    )?
+                };
                 Ok(memory.into_row(project_path))
             })
             .collect::<Result<Vec<_>, String>>()
@@ -2944,12 +5887,21 @@ impl McHandler {
             .memory_mutations
             .into_iter()
             .map(|mutation| {
-                let project_path = shadow_source_path(
-                    mutation.project_path.as_deref(),
-                    &root_path,
-                    &member_paths,
-                    has_workspace,
-                )?;
+                let project_path = if lane.is_shadow() {
+                    shadow_source_path(
+                        mutation.project_path.as_deref(),
+                        &root_path,
+                        &member_paths,
+                        has_workspace,
+                    )?
+                } else {
+                    authority_source_path(
+                        mutation.project_path.as_deref(),
+                        &root_path,
+                        &member_paths,
+                        has_workspace,
+                    )?
+                };
                 Ok(mutation.into_row(project_path))
             })
             .collect::<Result<Vec<_>, String>>()
@@ -2968,19 +5920,38 @@ impl McHandler {
                 "last_todo_state": parsed.last_todo_state.is_some(),
             })
         });
-        match store.apply_shadow_state_sync(ShadowStateSyncRequest {
-            session_id: &binding.session,
-            shadow_project_path: &root_path,
-            shadow_generation: parsed.shadow_generation,
-            expected_shadow_seq: parsed.expected_shadow_seq,
-            seed_boundary_id: parsed.seed_boundary_id.as_deref(),
-            compartments: &compartments,
-            memories: &memories,
-            memory_mutations: &memory_mutations,
-            workspace: workspace.as_ref(),
-            last_todo_state: parsed.last_todo_state,
-            acked_watermarks,
-        }) {
+        let result = if lane.is_shadow() {
+            store.apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: &binding.session,
+                shadow_project_path: &root_path,
+                shadow_generation: parsed.shadow_generation,
+                expected_shadow_seq: parsed.expected_shadow_seq,
+                seed_boundary_id: parsed.seed_boundary_id.as_deref(),
+                compartments: &compartments,
+                memories: &memories,
+                memory_mutations: &memory_mutations,
+                user_profile: &parsed.user_profile,
+                workspace: workspace.as_ref(),
+                last_todo_state: parsed.last_todo_state,
+                acked_watermarks,
+            })
+        } else {
+            store.apply_authority_state_sync(ShadowStateSyncRequest {
+                session_id: &binding.session,
+                shadow_project_path: &root_path,
+                shadow_generation: parsed.shadow_generation,
+                expected_shadow_seq: parsed.expected_shadow_seq,
+                seed_boundary_id: parsed.seed_boundary_id.as_deref(),
+                compartments: &compartments,
+                memories: &memories,
+                memory_mutations: &memory_mutations,
+                user_profile: &parsed.user_profile,
+                workspace: workspace.as_ref(),
+                last_todo_state: parsed.last_todo_state,
+                acked_watermarks,
+            })
+        };
+        match result {
             Ok(result) => respond(json!({
                 "ok": true,
                 "shadow_generation": result.shadow_generation,
@@ -3001,6 +5972,9 @@ impl McHandler {
                     "expected_shadow_seq {expected} did not match current shadow_seq {found}"
                 ),
             },
+            Err(ShadowStateSyncError::AuthoritySeqMismatch { expected, found }) => {
+                state_sync_seq_mismatch_error(StateSyncLane::Authority, expected, found)
+            }
             Err(ShadowStateSyncError::InvalidSeedBoundary { declared, detail }) => {
                 HandlerOutcome::Error {
                     code: "shadow_seed_boundary_mismatch".to_string(),
@@ -3027,6 +6001,7 @@ impl McHandler {
             Some(store) => Arc::clone(store),
             None => return store_unavailable_error(),
         };
+        self.discard_transform_pages(&binding.session);
         match store.reset_shadow_session(&binding.session, &shadow_project_path(&binding.session)) {
             Ok(result) => {
                 let armed = self
@@ -3060,7 +6035,333 @@ impl McHandler {
         }
     }
 
+    async fn handle_transform_page_value(
+        &self,
+        channel: u16,
+        request: Value,
+        lane: TransformLane,
+    ) -> HandlerOutcome {
+        let present = TRANSFORM_PAGE_FIELDS
+            .iter()
+            .filter(|field| request.get(**field).is_some())
+            .count();
+        let session_id = request.get("session_id").and_then(Value::as_str);
+        // This accessor intentionally accepts both real and shadow bindings. The lane is
+        // checked below, after the route identity is resolved, so authority pages cannot be
+        // accidentally forced through shadow-only binding validation.
+        let binding = match self.state_sync_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(outcome) => return outcome,
+        };
+        let bound_lane = if is_shadow_session(&binding.session) {
+            TransformLane::Shadow
+        } else {
+            TransformLane::Authority
+        };
+        if bound_lane != lane {
+            return if lane.is_shadow() {
+                HandlerOutcome::Error {
+                    code: "shadow_binding_required".to_string(),
+                    message: "shadow ops require a route bound as shadow:<real_session>"
+                        .to_string(),
+                }
+            } else {
+                HandlerOutcome::Error {
+                    code: "plain_transform_on_shadow_binding".to_string(),
+                    message: "use shadow_transform for routes bound as shadow:<real_session>"
+                        .to_string(),
+                }
+            };
+        }
+        if present != TRANSFORM_PAGE_FIELDS.len() {
+            self.discard_transform_pages(&binding.session);
+            return invalid_params_error("transform page envelope must be all-or-none");
+        }
+        let transform_id = match request.get("transform_page_id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() && id.len() <= SHADOW_TRANSFORM_PAGE_MAX_ID_BYTES => {
+                id.to_string()
+            }
+            _ => {
+                self.discard_transform_pages(&binding.session);
+                return invalid_params_error(format!(
+                    "transform_page_id must contain 1..={SHADOW_TRANSFORM_PAGE_MAX_ID_BYTES} bytes"
+                ));
+            }
+        };
+        let Some(generation) = request.get("transform_generation").and_then(Value::as_u64) else {
+            self.discard_transform_pages(&binding.session);
+            return invalid_params_error("transform_generation must be an unsigned integer");
+        };
+        let Some(page_index) = request.get("transform_page_index").and_then(Value::as_u64) else {
+            self.discard_transform_pages(&binding.session);
+            return invalid_params_error("transform_page_index must be an unsigned integer");
+        };
+        let Some(page_total) = request.get("transform_page_total").and_then(Value::as_u64) else {
+            self.discard_transform_pages(&binding.session);
+            return invalid_params_error("transform_page_total must be an unsigned integer");
+        };
+        let Some(page_complete) = request
+            .get("transform_page_complete")
+            .and_then(Value::as_bool)
+        else {
+            self.discard_transform_pages(&binding.session);
+            return invalid_params_error("transform_page_complete must be a boolean");
+        };
+        let Some(page_digest) = request.get("transform_page_digest").and_then(Value::as_str) else {
+            self.discard_transform_pages(&binding.session);
+            return invalid_params_error("transform_page_digest must be a string");
+        };
+        let page_index = usize::try_from(page_index).unwrap_or(usize::MAX);
+        let page_total = usize::try_from(page_total).unwrap_or(usize::MAX);
+        if page_total == 0 || page_index >= page_total {
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "protocol_mismatch",
+                "transform page index/total is invalid",
+            );
+        }
+        if page_complete != (page_index + 1 == page_total) {
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "protocol_mismatch",
+                "transform page completion disagrees with the final page index",
+            );
+        }
+        if !page_complete
+            && request.as_object().is_some_and(|object| {
+                object.keys().any(|key| {
+                    !["method", "session_id", "shadow_generation"]
+                        .into_iter()
+                        .chain(TRANSFORM_PAGE_FIELDS)
+                        .chain(TRANSFORM_PAGE_ARRAY_FIELDS)
+                        .any(|allowed| allowed == key.as_str())
+                })
+            })
+        {
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "protocol_mismatch",
+                "non-final transform pages may carry only message arrays",
+            );
+        }
+        if transform_page_content_digest(&request) != page_digest {
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "digest_mismatch",
+                "transform page content digest did not match the supplied digest",
+            );
+        }
+        let page_bytes = match serde_json::to_vec(&request) {
+            Ok(bytes) => bytes.len(),
+            Err(error) => {
+                self.discard_transform_pages(&binding.session);
+                return invalid_params_error(error.to_string());
+            }
+        };
+        if page_bytes > SHADOW_TRANSFORM_PAGE_MAX_BYTES {
+            self.discard_transform_pages(&binding.session);
+            return transform_page_error(
+                lane,
+                "buffer_overflow",
+                "transform page exceeded the 512 KiB page cap",
+            );
+        }
+        let store = match self.store.get() {
+            Some(store) => Arc::clone(store),
+            None => return store_unavailable_error(),
+        };
+        if lane.is_shadow() {
+            if request.get("shadow_generation").and_then(Value::as_u64) != Some(generation) {
+                self.discard_transform_pages(&binding.session);
+                return transform_page_error(
+                    lane,
+                    "attempt_mismatch",
+                    "shadow_generation must match transform_generation",
+                );
+            }
+            if page_index == 0 {
+                let loaded = match store.load(&binding.session) {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        self.discard_transform_pages(&binding.session);
+                        return HandlerOutcome::Error {
+                            code: "store_load_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                };
+                if loaded.meta.shadow_generation != generation
+                    || loaded.meta.shadow_generation
+                        != request
+                            .get("shadow_generation")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default()
+                {
+                    self.discard_transform_pages(&binding.session);
+                    return transform_page_error(
+                        lane,
+                        "attempt_mismatch",
+                        "transform page generation did not match durable shadow generation",
+                    );
+                }
+            }
+        }
+        {
+            let transforms = self.transform_pages.lock().expect("transform page mutex");
+            if let Some(completed) = transforms.completed(&binding.session, &transform_id) {
+                if completed.generation == generation
+                    && page_complete
+                    && completed.final_digest == page_digest
+                {
+                    return HandlerOutcome::Response(completed.result.clone());
+                }
+                return transform_page_error(
+                    lane,
+                    "digest_mismatch",
+                    "completed transform page content changed",
+                );
+            }
+        }
+        let action = {
+            let mut transforms = self.transform_pages.lock().expect("transform page mutex");
+            match transforms.stage(
+                &binding.session,
+                transform_id,
+                generation,
+                page_index,
+                page_total,
+                page_digest.to_string(),
+                request,
+                page_bytes,
+                page_complete,
+            ) {
+                Ok(action) => action,
+                Err(error) => {
+                    let (suffix, message) = match error {
+                        TransformPageStageError::AttemptMismatch => (
+                            "attempt_mismatch",
+                            "transform page generation or envelope changed during collection",
+                        ),
+                        TransformPageStageError::DigestMismatch => {
+                            ("digest_mismatch", "redriven transform page content changed")
+                        }
+                        TransformPageStageError::OrderMismatch => (
+                            "order_mismatch",
+                            "transform pages must arrive in strict index order",
+                        ),
+                        TransformPageStageError::BufferOverflow => (
+                            "buffer_overflow",
+                            "transform page staging exceeded the handler-wide byte cap",
+                        ),
+                        TransformPageStageError::InProgress => {
+                            ("in_progress", "the final transform page is being applied")
+                        }
+                    };
+                    return transform_page_error(lane, suffix, message);
+                }
+            }
+        };
+        match action {
+            TransformPageStageAction::Ack(next_expected_index) => respond(json!({
+                "ok": true,
+                "staged": true,
+                "next_expected_index": next_expected_index,
+            })),
+            TransformPageStageAction::Apply {
+                pages,
+                transform_id,
+                generation,
+                final_digest,
+            } => {
+                let assembled = match assemble_transform_pages(pages) {
+                    Ok(assembled) => assembled,
+                    Err(message) => {
+                        self.discard_transform_pages(&binding.session);
+                        return transform_page_error(lane, "protocol_mismatch", message);
+                    }
+                };
+                let outcome = match lane {
+                    TransformLane::Authority => {
+                        self.handle_transform_unpaged_value(channel, assembled, true)
+                            .await
+                    }
+                    TransformLane::Shadow => {
+                        self.handle_shadow_transform_unpaged_value(channel, assembled, true)
+                            .await
+                    }
+                };
+                let completed_result = match &outcome {
+                    HandlerOutcome::Response(bytes) => Some(bytes.clone()),
+                    HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
+                };
+                let mut transforms = self.transform_pages.lock().expect("transform page mutex");
+                let phase = {
+                    let session = transforms
+                        .sessions
+                        .entry(binding.session.clone())
+                        .or_default();
+                    std::mem::replace(&mut session.phase, TransformPagePhase::Idle)
+                };
+                match phase {
+                    TransformPagePhase::Applying {
+                        transform_id: applying_id,
+                        bytes,
+                    } if applying_id == transform_id => {
+                        transforms.release_phase(&TransformPagePhase::Applying {
+                            transform_id: applying_id,
+                            bytes,
+                        });
+                        if let Some(result) = completed_result {
+                            transforms
+                                .sessions
+                                .entry(binding.session.clone())
+                                .or_default()
+                                .completed = Some(CompletedTransformPage {
+                                transform_id,
+                                generation,
+                                final_digest,
+                                result,
+                            });
+                        }
+                    }
+                    current => transforms.set_phase(&binding.session, current),
+                }
+                outcome
+            }
+        }
+    }
+
     async fn handle_shadow_transform_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        const PAGE_FIELDS: [&str; 6] = [
+            "transform_page_id",
+            "transform_generation",
+            "transform_page_index",
+            "transform_page_total",
+            "transform_page_complete",
+            "transform_page_digest",
+        ];
+        if PAGE_FIELDS
+            .iter()
+            .any(|field| request.get(*field).is_some())
+        {
+            return self
+                .handle_transform_page_value(channel, request, TransformLane::Shadow)
+                .await;
+        }
+        self.handle_shadow_transform_unpaged_value(channel, request, false)
+            .await
+    }
+
+    async fn handle_shadow_transform_unpaged_value(
+        &self,
+        channel: u16,
+        request: Value,
+        from_page_apply: bool,
+    ) -> HandlerOutcome {
         let parsed: ShadowTransformWire = match serde_json::from_value(request.clone()) {
             Ok(req) => req,
             Err(e) => return invalid_params_error(e.to_string()),
@@ -3069,6 +6370,12 @@ impl McHandler {
             Ok(binding) => binding,
             Err(outcome) => return outcome,
         };
+        if !from_page_apply && self.transform_page_in_progress(&binding.session) {
+            return HandlerOutcome::Error {
+                code: "transform_page_in_progress".to_string(),
+                message: "shadow_transform is blocked until all transform pages arrive".to_string(),
+            };
+        }
         if self.shadow_seed_in_progress(&binding.session) {
             return HandlerOutcome::Error {
                 code: "shadow_seed_in_progress".to_string(),
@@ -3161,11 +6468,20 @@ impl McHandler {
             serializer_profile,
             session_id: binding.session.clone(),
             render_config: parsed.render_config.clone().unwrap_or_default(),
+            provider_id: parsed.pass_inputs.provider_id.clone(),
+            model_key: parsed.pass_inputs.model_key.clone(),
+            clear_reasoning_age: parsed.pass_inputs.clear_reasoning_age,
+            tool_present: false,
+            serve_native: false,
+            native_messages: None,
             full_array_fingerprint: parsed.full_array_fingerprint.clone(),
             messages: shadow_input,
             tail_delta: None,
             usage,
             provider_error: parsed.pass_inputs.provider_error.clone(),
+            mid_turn: parsed.pass_inputs.mid_turn,
+            prev_response_completed_at_ms: None,
+            request_observed_at_ms: None,
             declared_trim: parsed.declared_trim.clone(),
         };
         let shadow_project = shadow_project_path(&binding.session);
@@ -3195,6 +6511,18 @@ impl McHandler {
         };
         let result = match transform_with_projection(&store, &transform_request, &producer_ctx) {
             Ok(result) => result,
+            Err(transform::TransformError::IdentityDrift(mid)) => {
+                return HandlerOutcome::Error {
+                    code: "shadow_identity_drift".to_string(),
+                    message: format!("CK message block identity drift for mid {mid}"),
+                }
+            }
+            Err(e) if e.is_deterministic_reject() => {
+                return HandlerOutcome::Error {
+                    code: "shadow_validation_reject".to_string(),
+                    message: e.to_string(),
+                }
+            }
             Err(e) => {
                 return HandlerOutcome::Error {
                     code: "shadow_transform_failed".to_string(),
@@ -3341,82 +6669,10 @@ impl McHandler {
         }
     }
 
-    async fn handle_ctx_reduce_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(args) = facade_arguments(request) else {
-            return invalid_params_error("ctx_reduce arguments must be an object");
-        };
-        let Some(drop_arg) = non_empty_string_arg(args, "drop") else {
-            return tool_error_result("Error: 'drop' must be provided.");
-        };
-        let facade_scope = match self.resolve_facade_scope(channel).await {
-            Ok(scope) => scope,
-            Err(outcome) => return outcome,
-        };
-        let store = match self.store.get() {
-            Some(store) => store,
-            None => return store_unavailable_error(),
-        };
-        let session_id = facade_scope.conversation_key.as_str();
-        let loaded = match store.load(session_id) {
-            Ok(loaded) => loaded,
-            Err(error) => return tool_error_result(format!("Error: {error}")),
-        };
-        let Some(profile) = SerializerProfile::parse(&loaded.meta.last_serializer_profile) else {
-            return tagging_inactive_error();
-        };
-        if !healing::tagging_enabled(profile) {
-            return tagging_inactive_error();
-        }
-        if !healing::tail_reclaim(profile) {
-            return reduce_unavailable_for_profile_error();
-        }
-
-        let requested = match parse_tag_range_string(drop_arg) {
-            Ok(ids) => ids,
-            Err(error) => {
-                return tool_error_result(format!("Error: Invalid range syntax. {error}"))
-            }
-        };
-        let tags = match store.load_tags_for_session(session_id) {
-            Ok(tags) => tags,
-            Err(error) => return tool_error_result(format!("Error: {error}")),
-        };
-        let by_number = tags
-            .iter()
-            .map(|row| (row.tag_number, row))
-            .collect::<HashMap<_, _>>();
-        let mut block_ids = Vec::new();
-        let mut queued_numbers = Vec::new();
-        let mut unknown_numbers = Vec::new();
-        for tag_number in requested {
-            match by_number.get(&(tag_number as i64)) {
-                Some(row) => {
-                    block_ids.push(row.block_id.clone());
-                    queued_numbers.push(tag_number as i64);
-                }
-                None => unknown_numbers.push(tag_number as i64),
-            }
-        }
-        let inserted = if block_ids.is_empty() {
-            0
-        } else {
-            match store.append_pending_agent_drops(session_id, &block_ids, now_ms()) {
-                Ok(count) => count,
-                Err(error) => return tool_error_result(format!("Error: {error}")),
-            }
-        };
-        if inserted > 0 {
-            suppress_channel1_after_ctx_reduce(store, session_id);
-        }
-        mcp_text_result(
-            render_ctx_reduce_response(
-                inserted,
-                queued_numbers.len(),
-                &queued_numbers,
-                &unknown_numbers,
-            ),
-            false,
-        )
+    async fn handle_ctx_reduce_facade(&self, _channel: u16, _request: &Value) -> HandlerOutcome {
+        // The MCP-facing route is acknowledgement-only. Destructive delivery is owned by
+        // the response observer, so this path must return before identity or storage work.
+        mcp_text_result(CTX_REDUCE_ACKNOWLEDGEMENT.to_string(), false)
     }
 
     async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -3848,8 +7104,8 @@ impl ModuleHandler for McHandler {
     }
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        if body.len() > MAX_FACADE_FRAME_BYTES {
-            return invalid_params_error("request body exceeds the 1 MiB limit");
+        if let Err(outcome) = enforce_request_byte_cap(&body) {
+            return outcome;
         }
         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
         self.dispatch_value(ctx.route_handle().channel, request)
@@ -3874,13 +7130,55 @@ impl McHandler {
                 "guidance.get" => self.handle_guidance_value(channel, &request),
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
-                "transform" => self.handle_transform_value(channel, request).await,
-                "state_sync" => self.handle_shadow_state_sync_value(channel, request),
+                "transform" => {
+                    if has_transform_page_fields(&request) {
+                        self.handle_transform_page_value(channel, request, TransformLane::Authority)
+                            .await
+                    } else {
+                        self.handle_transform_value(channel, request).await
+                    }
+                }
+                "state_sync" => {
+                    // State sync is shared by both the authority and shadow lanes. Only the
+                    // shadow lane is controlled by the mirror kill switch; the authority lane
+                    // must keep receiving its own state updates when mirror traffic is stopped.
+                    if self.state_sync_targets_shadow(channel, &request)
+                        && !self.shadow_lane_enabled()
+                    {
+                        HandlerOutcome::Error {
+                            code: "shadow_disabled".to_string(),
+                            message: "shadow state sync is disabled by configuration".to_string(),
+                        }
+                    } else {
+                        let authority = self
+                            .bindings
+                            .lock()
+                            .expect("bindings mutex")
+                            .get(&channel)
+                            .is_some_and(|binding| !is_shadow_session(&binding.session));
+                        let outcome = self.handle_state_sync_value(channel, request);
+                        if authority {
+                            authority_state_sync_outcome(outcome)
+                        } else {
+                            outcome
+                        }
+                    }
+                }
+                "shadow_transform" | "shadow_reset" if !self.shadow_lane_enabled() => {
+                    HandlerOutcome::Error {
+                        code: "shadow_disabled".to_string(),
+                        message: "shadow lane is disabled by configuration".to_string(),
+                    }
+                }
                 "shadow_transform" => self.handle_shadow_transform_value(channel, request).await,
                 "shadow_reset" => self.handle_shadow_reset_value(channel, request),
-                "ctx_reduce" | "append_agent_drops" | "agent_drops.append" => {
-                    self.handle_agent_drops_value(channel, request)
-                }
+                "state_import" => self.handle_state_import_value(channel, request),
+                "agent_drops.append" => self.handle_agent_drops_value(channel, request),
+                "todo_state.set" => self.handle_todo_state_set_value(channel, &request),
+                "session.flush" => self.handle_session_flush_value(channel, &request),
+                "session.recomp" => self.handle_session_recomp_value(channel, &request),
+                "session.status" => self.handle_session_status_value(channel, &request),
+                "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
                 // Explicit wire-debugging echo. Opt-in only: echoing every
                 // unrecognized body would silently swallow misrouted requests
                 // (a caller can "succeed" against an echo while testing nothing),
@@ -3893,6 +7191,45 @@ impl McHandler {
             return self.handle_facade_value(channel, request).await;
         }
         unrecognized_request_error(&request)
+    }
+}
+
+// The wire validator uses the same field names and validation paths as the shadow lane.
+// Translate only rejected authority responses so diagnostics identify the lane that failed.
+fn authority_state_sync_outcome(outcome: HandlerOutcome) -> HandlerOutcome {
+    match outcome {
+        HandlerOutcome::Error { code, message } => HandlerOutcome::Error {
+            code: code.replace("shadow", "authority"),
+            message: message.replace("shadow", "authority"),
+        },
+        other => other,
+    }
+}
+
+fn has_transform_page_fields(request: &Value) -> bool {
+    TRANSFORM_PAGE_FIELDS
+        .iter()
+        .any(|field| request.get(*field).is_some())
+}
+
+fn transform_page_error(
+    lane: TransformLane,
+    suffix: &str,
+    message: impl Into<String>,
+) -> HandlerOutcome {
+    let code = if lane.is_shadow() && suffix == "in_progress" {
+        "transform_page_in_progress".to_string()
+    } else {
+        let prefix = if lane.is_shadow() {
+            "shadow"
+        } else {
+            "authority"
+        };
+        format!("{prefix}_transform_page_{suffix}")
+    };
+    HandlerOutcome::Error {
+        code,
+        message: message.into(),
     }
 }
 
@@ -3958,6 +7295,53 @@ fn unknown_serializer_profile_error() -> HandlerOutcome {
     }
 }
 
+fn serve_native_unsupported_profile_error(profile: &str) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "serve_native_unsupported_profile".to_string(),
+        message: format!("serve_native requires serializer_profile opencode-aisdk, got {profile}"),
+    }
+}
+
+fn attach_native_messages(
+    response: &mut transform::TransformResponse,
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+) {
+    if !request.serve_native {
+        return;
+    }
+    let sidecar = request
+        .native_messages
+        .as_deref()
+        .map(codec::decode_opencode)
+        .map(|decoded| decoded.sidecar)
+        .unwrap_or_else(|| codec::DecodeSidecar::new("opencode"));
+    let mut native_messages = codec::encode_opencode_with_session(
+        response.messages(),
+        &sidecar,
+        Some(&request.session_id),
+    );
+    if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
+        transform::clear_served_native_reasoning(
+            profile,
+            transform::request_accepts_empty_content(request),
+            &mut native_messages,
+            response.messages(),
+            &request.messages,
+            reasoning_watermark,
+            request.mid_turn,
+        );
+    }
+    response.native_messages = Some(native_messages);
+}
+
+fn state_import_validation_error(error: StateImportValidationError) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: error.code().to_string(),
+        message: error.to_string(),
+    }
+}
+
 fn need_full_sync_response(full_array_fingerprint: Option<String>) -> HandlerOutcome {
     respond(
         serde_json::to_value(transform::TransformResponse::need_full_sync(
@@ -3981,6 +7365,47 @@ fn guidance_bytes_for(text: &str, date_line: &str) -> String {
     format!("{text}\n{date_line}")
 }
 
+fn primary_language_directive(language: &str) -> Option<String> {
+    if language.len() != 2 || !language.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    let name = match language.to_ascii_lowercase().as_str() {
+        "ar" => "Arabic (العربية)",
+        "cs" => "Czech (Čeština)",
+        "da" => "Danish (Dansk)",
+        "de" => "German (Deutsch)",
+        "el" => "Greek (Ελληνικά)",
+        "en" => "English",
+        "es" => "Spanish (Español)",
+        "fi" => "Finnish (Suomi)",
+        "fr" => "French (Français)",
+        "he" => "Hebrew (עברית)",
+        "hi" => "Hindi (हिन्दी)",
+        "hu" => "Hungarian (Magyar)",
+        "id" => "Indonesian",
+        "it" => "Italian (Italiano)",
+        "ja" => "Japanese (日本語)",
+        "ko" => "Korean (한국어)",
+        "nl" => "Dutch (Nederlands)",
+        "no" => "Norwegian (Norsk)",
+        "pl" => "Polish (Polski)",
+        "pt" => "Portuguese (Português)",
+        "ro" => "Romanian (Română)",
+        "ru" => "Russian (Русский)",
+        "sk" => "Slovak (Slovenčina)",
+        "sv" => "Swedish (Svenska)",
+        "th" => "Thai (ไทย)",
+        "tr" => "Turkish (Türkçe)",
+        "uk" => "Ukrainian (Українська)",
+        "vi" => "Vietnamese (Tiếng Việt)",
+        "zh" => "Chinese (中文)",
+        _ => return None,
+    };
+    Some(format!(
+        "Use {name} for your natural-language replies to the user unless the user explicitly asks for another language. Keep code, identifiers, file paths, commands, logs, and quoted text verbatim."
+    ))
+}
+
 fn shadow_seed_content_digest(request: &Value) -> String {
     let mut content = request.clone();
     if let Some(object) = content.as_object_mut() {
@@ -3999,6 +7424,136 @@ fn shadow_seed_content_digest(request: &Value) -> String {
     sha256_hex(canonical_value(&content).as_bytes())
 }
 
+fn transform_page_content_digest(request: &Value) -> String {
+    let mut content = Map::new();
+    for field in TRANSFORM_PAGE_ARRAY_FIELDS {
+        if let Some(value) = request.get(field) {
+            content.insert(field.to_string(), value.clone());
+        }
+    }
+    sha256_hex(canonical_value(&Value::Object(content)).as_bytes())
+}
+
+fn assemble_transform_page_field(field: &str, values: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut assembled = Vec::new();
+    let mut index = 0usize;
+    while index < values.len() {
+        let Some(marker) = values[index]
+            .get(SHADOW_ITEM_CONTINUATION_KEY)
+            .and_then(Value::as_object)
+        else {
+            assembled.push(values[index].clone());
+            index += 1;
+            continue;
+        };
+        let marker_field = marker
+            .get("field")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "transform continuation marker is missing its field".to_string())?;
+        let item_index = marker
+            .get("item_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "transform continuation marker has an invalid item index".to_string())?;
+        let chunk_index = marker
+            .get("chunk_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                "transform continuation marker has an invalid chunk index".to_string()
+            })?;
+        let chunk_total = marker
+            .get("chunk_total")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                "transform continuation marker has an invalid chunk total".to_string()
+            })?;
+        if marker_field != field
+            || item_index != assembled.len()
+            || chunk_index != 0
+            || chunk_total == 0
+        {
+            return Err(
+                "transform continuation marker does not match its array position".to_string(),
+            );
+        }
+
+        let mut serialized = String::new();
+        for expected_chunk in 0..chunk_total {
+            let Some(chunk_value) = values.get(index + expected_chunk) else {
+                return Err(
+                    "transform continuation item ended before all chunks arrived".to_string(),
+                );
+            };
+            let Some(chunk_marker) = chunk_value
+                .get(SHADOW_ITEM_CONTINUATION_KEY)
+                .and_then(Value::as_object)
+            else {
+                return Err("transform continuation item was interrupted".to_string());
+            };
+            let same_item = chunk_marker.get("field").and_then(Value::as_str) == Some(field)
+                && chunk_marker.get("item_index").and_then(Value::as_u64)
+                    == Some(item_index as u64)
+                && chunk_marker.get("chunk_index").and_then(Value::as_u64)
+                    == Some(expected_chunk as u64)
+                && chunk_marker.get("chunk_total").and_then(Value::as_u64)
+                    == Some(chunk_total as u64);
+            if !same_item {
+                return Err("transform continuation chunks were reordered".to_string());
+            }
+            let chunk = chunk_value
+                .get("chunk")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "transform continuation marker is missing its chunk".to_string())?;
+            serialized.push_str(chunk);
+        }
+        let item = serde_json::from_str::<Value>(&serialized)
+            .map_err(|error| format!("transform continuation item was not valid JSON: {error}"))?;
+        assembled.push(item);
+        index += chunk_total;
+    }
+    Ok(assembled)
+}
+
+fn assemble_transform_pages(mut pages: Vec<Value>) -> Result<Value, String> {
+    let mut final_page = pages
+        .pop()
+        .ok_or_else(|| "transform page collection was empty".to_string())?;
+    if !final_page.is_object() {
+        return Err("transform page was not an object".to_string());
+    }
+    if let Some(object) = final_page.as_object_mut() {
+        for field in [
+            "transform_page_id",
+            "transform_generation",
+            "transform_page_index",
+            "transform_page_total",
+            "transform_page_complete",
+            "transform_page_digest",
+        ] {
+            object.remove(field);
+        }
+    }
+    for field in TRANSFORM_PAGE_ARRAY_FIELDS {
+        let had_field = final_page.get(field).is_some();
+        let mut values = Vec::new();
+        for page in pages.iter().chain(std::iter::once(&final_page)) {
+            if let Some(items) = page.get(field).and_then(Value::as_array) {
+                values.extend(items.iter().cloned());
+            }
+        }
+        if had_field || !values.is_empty() {
+            let values = assemble_transform_page_field(field, values)?;
+            let Some(object) = final_page.as_object_mut() else {
+                return Err("transform page was not an object".to_string());
+            };
+            object.insert(field.to_string(), Value::Array(values));
+        }
+    }
+    Ok(final_page)
+}
+
 fn assemble_shadow_seed(
     mut batches: Vec<ShadowStateSyncWire>,
     generation: u64,
@@ -4008,14 +7563,17 @@ fn assemble_shadow_seed(
     let mut compartments = Vec::new();
     let mut memories = Vec::new();
     let mut memory_mutations = Vec::new();
+    let mut user_profile = Vec::new();
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
         memories.append(&mut batch.memories);
         memory_mutations.append(&mut batch.memory_mutations);
+        user_profile.append(&mut batch.user_profile);
     }
     compartments.append(&mut final_batch.compartments);
     memories.append(&mut final_batch.memories);
     memory_mutations.append(&mut final_batch.memory_mutations);
+    user_profile.append(&mut final_batch.user_profile);
     ShadowStateSyncWire {
         session_id: final_batch.session_id,
         shadow_generation: generation,
@@ -4029,6 +7587,7 @@ fn assemble_shadow_seed(
         compartments,
         memories,
         memory_mutations,
+        user_profile,
         workspace: final_batch.workspace,
         last_todo_state: final_batch.last_todo_state,
         acked_watermarks: final_batch.acked_watermarks,
@@ -4073,6 +7632,56 @@ fn store_unavailable_error() -> HandlerOutcome {
 }
 
 const MAX_FACADE_FRAME_BYTES: usize = 1024 * 1024;
+/// Transform-class requests carry a session's full message array. The transport
+/// frame ceiling is 64 MiB; half that leaves headroom for envelope overhead while
+/// still admitting the largest observed live sessions (multi-MiB CK arrays with
+/// retained ingress bytes).
+const MAX_TRANSFORM_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
+/// Minimal probe deserialized from an oversized body ONLY to pick the right byte
+/// cap. serde ignores every other field, so this stays cheap relative to a full
+/// Value parse of a multi-MiB array.
+#[derive(Deserialize)]
+struct RequestMethodProbe {
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+impl RequestMethodProbe {
+    fn is_transform_class(&self) -> bool {
+        let named = |value: &Option<String>, name: &str| value.as_deref() == Some(name);
+        named(&self.kind, "transform")
+            || named(&self.method, "shadow_transform")
+            // Paged shadow seeds stay under the sender's 512 KiB batch budget by
+            // design, but a single stored compartment or memory row can exceed the
+            // facade cap on its own; the wider cap keeps such rows syncable.
+            || named(&self.method, "state_sync")
+    }
+}
+
+/// The facade byte budget exists for agent tool calls; transform-class requests
+/// legitimately carry a session's full message array (multi-MiB on large
+/// sessions), so they get the wider cap. Method sniffing on raw bytes avoids
+/// parsing multi-MiB JSON just to reject it.
+fn enforce_request_byte_cap(body: &[u8]) -> Result<(), HandlerOutcome> {
+    if body.len() <= MAX_FACADE_FRAME_BYTES {
+        return Ok(());
+    }
+    let transform_class = serde_json::from_slice::<RequestMethodProbe>(body)
+        .map(|probe| probe.is_transform_class())
+        .unwrap_or(false);
+    if transform_class {
+        if body.len() <= MAX_TRANSFORM_FRAME_BYTES {
+            return Ok(());
+        }
+        return Err(invalid_params_error(
+            "request body exceeds the 32 MiB transform limit",
+        ));
+    }
+    Err(invalid_params_error("request body exceeds the 1 MiB limit"))
+}
 const MAX_AGENT_DROPS_COMMAND_ID_BYTES: usize = 128;
 const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_NOTE_CONTENT_BYTES: usize = 64 * 1024;
@@ -4328,22 +7937,6 @@ fn join_i64s(ids: &[i64]) -> String {
         .join(", ")
 }
 
-fn tagging_inactive_error() -> HandlerOutcome {
-    HandlerOutcome::Error {
-        code: "tagging_inactive".to_string(),
-        message: "tagging not active for this session's profile".to_string(),
-    }
-}
-
-fn reduce_unavailable_for_profile_error() -> HandlerOutcome {
-    HandlerOutcome::Error {
-        code: "reduce_unavailable_for_profile".to_string(),
-        message:
-            "ctx_reduce is unavailable because this session's profile cannot apply tail mutations"
-                .to_string(),
-    }
-}
-
 fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
     const MAX_RANGE_ELEMENTS: u64 = 1000;
     let trimmed = input.replace('§', "").trim().to_string();
@@ -4407,104 +8000,20 @@ fn parse_tag_integer(raw: &str) -> Result<u64, String> {
     Ok(value)
 }
 
-fn format_tag_numbers(ids: &[i64]) -> String {
-    ids.iter()
-        .map(|id| format!("§{id}§"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn render_ctx_reduce_response(
-    inserted: usize,
-    valid_requested: usize,
-    queued_numbers: &[i64],
-    unknown_numbers: &[i64],
-) -> String {
-    let already_queued = valid_requested.saturating_sub(inserted);
-    let mut parts = Vec::new();
-    if inserted > 0 {
-        parts.push(format!(
-            "Queued: drop {}.",
-            format_tag_numbers(&queued_numbers[..inserted.min(queued_numbers.len())])
-        ));
-    } else if valid_requested > 0 {
-        parts.push(
-            "All requested tags were already queued or processed. No new action is needed."
-                .to_string(),
-        );
-    } else {
-        parts.push("No tags queued.".to_string());
-    }
-    if already_queued > 0 {
-        parts.push(format!(
-            "{already_queued} requested tag{} already queued and need no action.",
-            if already_queued == 1 {
-                " was"
-            } else {
-                "s were"
-            }
-        ));
-    }
-    if !unknown_numbers.is_empty() {
-        parts.push(format!(
-            "Unknown tag(s) {} skipped.",
-            format_tag_numbers(unknown_numbers)
-        ));
-    }
-    parts.join(" ")
-}
-
-fn suppress_channel1_after_ctx_reduce(store: &McStore, session_id: &str) {
-    let Ok(loaded) = store.load(session_id) else {
-        return;
-    };
-    let mut meta = loaded.meta.clone();
-    meta.channel1_reduce_suppressed = true;
-    meta.channel1_last_nudge_level = "urgent".to_string();
-    let tag_tokens = store
-        .load_tags_for_session(session_id)
-        .map(|tags| tags.iter().map(|tag| tag.token_count.max(0)).sum::<i64>())
-        .unwrap_or(0);
-    meta.channel1_last_nudge_undropped = meta.channel1_last_nudge_undropped.max(tag_tokens);
-    let _ = store.commit(session_id, loaded.row_version, &loaded.core, &meta);
-}
-
-fn drop_ids_from_command(request: &Value) -> Vec<String> {
-    let mut ids = Vec::new();
-    for key in ["drop_ids", "agent_drop_ids", "ids"] {
-        if let Some(values) = request.get(key).and_then(Value::as_array) {
-            ids.extend(
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(ToOwned::to_owned),
-            );
-        }
-    }
-    ids.sort();
-    ids.dedup();
-    ids
-}
-
-fn command_id_from_agent_drops_request(request: &Value) -> Result<Option<String>, String> {
-    let Some(value) = request.get("command_id") else {
-        return Ok(None);
-    };
-    let Some(command_id) = value.as_str() else {
-        return Err("'command_id' must be a string".to_string());
+fn command_id_from_agent_drops_request(request: &Value) -> Result<String, String> {
+    let Some(command_id) = request.get("command_id").and_then(Value::as_str) else {
+        return Err("'command_id' must be a nonempty string".to_string());
     };
     let command_id = command_id.trim();
     if command_id.is_empty() {
-        return Err("'command_id' must not be empty".to_string());
+        return Err("'command_id' must be a nonempty string".to_string());
     }
     if command_id.len() > MAX_AGENT_DROPS_COMMAND_ID_BYTES {
         return Err(format!(
             "'command_id' exceeds the {MAX_AGENT_DROPS_COMMAND_ID_BYTES}-byte limit"
         ));
     }
-    Ok(Some(command_id.to_string()))
+    Ok(command_id.to_string())
 }
 
 fn is_shadow_session(session_id: &str) -> bool {
@@ -4538,6 +8047,24 @@ fn shadow_source_path(
         .get(source_path)
         .cloned()
         .ok_or_else(|| format!("shadow memory project is not a workspace member: {source_path}"))
+}
+
+fn authority_source_path(
+    source_path: Option<&str>,
+    root_path: &str,
+    member_paths: &HashMap<String, String>,
+    has_workspace: bool,
+) -> Result<String, String> {
+    let Some(source_path) = source_path else {
+        return Ok(root_path.to_string());
+    };
+    if !has_workspace {
+        return Ok(root_path.to_string());
+    }
+    member_paths
+        .get(source_path)
+        .cloned()
+        .ok_or_else(|| format!("authority memory project is not a workspace member: {source_path}"))
 }
 
 fn prepare_shadow_workspace(
@@ -4595,6 +8122,71 @@ fn prepare_shadow_workspace(
     let name = format!(
         "shadow-workspace-{}-{}",
         sha256_hex(session_id.as_bytes()),
+        workspace.fingerprint
+    );
+    Ok((
+        Some(ShadowWorkspaceRow {
+            name,
+            share_categories,
+            members,
+        }),
+        member_paths,
+    ))
+}
+
+fn prepare_authority_workspace(
+    authority_project_path: &str,
+    workspace: Option<ShadowWorkspaceWire>,
+) -> Result<(Option<ShadowWorkspaceRow>, HashMap<String, String>), String> {
+    let Some(workspace) = workspace else {
+        return Ok((None, HashMap::new()));
+    };
+    let Some(owner) = workspace.members.first() else {
+        return Err("authority workspace must include its owning project first".to_string());
+    };
+    let share_categories = owner.share_categories.clone();
+    if workspace
+        .members
+        .iter()
+        .any(|member| member.share_categories != share_categories)
+    {
+        return Err(
+            "authority workspace members must carry one consistent share policy".to_string(),
+        );
+    }
+
+    let mut member_paths = HashMap::new();
+    let mut members = Vec::with_capacity(workspace.members.len());
+    for (index, member) in workspace.members.into_iter().enumerate() {
+        if member.project_path.is_empty() {
+            return Err("authority workspace member project_path must not be empty".to_string());
+        }
+        let stored_path = if index == 0 {
+            authority_project_path.to_string()
+        } else {
+            member.project_path.clone()
+        };
+        if member_paths
+            .insert(member.project_path.clone(), stored_path.clone())
+            .is_some()
+        {
+            return Err("authority workspace contains a duplicate member".to_string());
+        }
+        let display_name = Path::new(&member.project_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&member.project_path)
+            .to_string();
+        members.push(ShadowWorkspaceMemberRow {
+            project_path: stored_path,
+            display_name,
+            display_path: member.project_path,
+        });
+    }
+    let name = format!(
+        "authority-workspace-{}-{}",
+        sha256_hex(authority_project_path.as_bytes()),
         workspace.fingerprint
     );
     Ok((
@@ -4673,6 +8265,15 @@ fn rs_decision_class(action: &str) -> &'static str {
     }
 }
 
+fn comparable_decision_class(decision: &Value, rust_vocabulary: bool) -> Option<&str> {
+    if rust_vocabulary {
+        if let Some(action) = decision.get("action").and_then(Value::as_str) {
+            return Some(rs_decision_class(action));
+        }
+    }
+    decision.get("class").and_then(Value::as_str)
+}
+
 fn compare_shadow_outputs(
     ts_messages: &[crate::ck_wire::CkWireMessage],
     rs_messages: &[crate::ck_wire::CkWireMessage],
@@ -4683,16 +8284,16 @@ fn compare_shadow_outputs(
 ) -> CompareOutcome {
     let ts_canonical = canonical_messages(ts_messages);
     let rs_canonical = canonical_messages(rs_messages);
-    let decision_mismatch = ts_decision
-        .get("class")
-        .and_then(Value::as_str)
-        .is_some_and(|class| {
-            class
-                != rs_decision
-                    .get("class")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-        });
+    // TypeScript reports decision classes, while Rust reports action names. Map both to
+    // one vocabulary so Rust's SOFT+ action and TypeScript's defer class compare equally.
+    let decision_mismatch = match (
+        comparable_decision_class(ts_decision, false),
+        comparable_decision_class(rs_decision, true),
+    ) {
+        (Some(ts_class), Some(rs_class)) => ts_class != rs_class,
+        (Some(_), None) => true,
+        _ => false,
+    };
 
     if let Some(trim) = trim_mismatch {
         let first = first_message_hint(ts_messages, rs_messages);
@@ -5074,6 +8675,114 @@ fn sorted_strings(mut values: Vec<String>) -> Vec<String> {
     values
 }
 
+fn plural_word(count: usize, singular: &'static str) -> String {
+    if count == 1 {
+        singular.to_string()
+    } else {
+        format!("{singular}s")
+    }
+}
+
+fn format_traffic_age(observed_at_ms: i64, now: i64) -> String {
+    if observed_at_ms <= 0 {
+        return "unknown".to_string();
+    }
+    let elapsed_seconds = now.saturating_sub(observed_at_ms).max(0) / 1_000;
+    if elapsed_seconds < 60 {
+        format!("{elapsed_seconds}s ago")
+    } else if elapsed_seconds < 60 * 60 {
+        format!("{}m ago", elapsed_seconds / 60)
+    } else if elapsed_seconds < 24 * 60 * 60 {
+        format!("{}h ago", elapsed_seconds / (60 * 60))
+    } else {
+        format!("{}d ago", elapsed_seconds / (24 * 60 * 60))
+    }
+}
+
+fn sanitize_status_text(text: &str, limit: usize) -> String {
+    let controls_removed = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    controls_removed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(limit)
+        .collect()
+}
+
+fn compact_status_detail(detail: &str) -> String {
+    sanitize_status_text(detail, 120)
+}
+
+fn historian_status_summary(state: &mc_store::HistorianDurableState) -> String {
+    if state.state != HistorianPhase::Idle {
+        return format!("fire seq {} {}", state.firing_seq, state.state.as_str());
+    }
+    if let Some(reason) = state.last_no_fire.as_deref() {
+        return format!("no fire: {}", compact_status_detail(reason));
+    }
+    if let Some(reason) = state.last_failure.as_deref() {
+        return format!("failure: {}", compact_status_detail(reason));
+    }
+    if state.firing_seq > 0 {
+        return format!("published seq {}", state.firing_seq);
+    }
+    "none".to_string()
+}
+
+fn wrapup_has_remaining_messages(
+    messages: &[crate::ck_wire::CkIngressMessage],
+    last_compartment_end: Option<u64>,
+    protected_start: u64,
+) -> bool {
+    messages.iter().any(|message| {
+        !message.ck.meta.synthetic
+            && message.ordinal < protected_start
+            && last_compartment_end.is_none_or(|end| message.ordinal > end)
+    })
+}
+
+fn wrapup_boundary_messages(
+    parsed: &TransformRequest,
+    projection: &crate::ck_wire::FlatProjection,
+) -> Vec<BoundaryMsg> {
+    parsed
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+        .map(|message| BoundaryMsg {
+            message_ordinal: message.ordinal,
+            message_id: message.mid.clone(),
+            role: Role::from_provider(&message.ck.role),
+            blocks: projection
+                .blocks
+                .iter()
+                .filter(|block| block.mid == message.mid && !block.synthetic)
+                .map(|block| BoundaryBlock {
+                    id: block.id.clone(),
+                    ordinal: block.ordinal,
+                    kind: sel_kind_for_flat(block),
+                    provider_executed: block.provider_executed,
+                    byte_size: block.bytes.len(),
+                    arc_id: block.arc_id.clone(),
+                    original: block.bytes.clone(),
+                    rendered: None,
+                    ignored: false,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn boundary_messages(
     parsed: &TransformRequest,
     projection: &crate::ck_wire::FlatProjection,
@@ -5152,24 +8861,37 @@ fn record_historian_connect_failure(
     session_id: &str,
     failure_backoff_at_ms: i64,
     detail: &str,
-) {
-    let Ok(loaded) = store.load(session_id) else {
-        return;
-    };
-    let mut meta = loaded.meta.clone();
-    if meta.historian.state == HistorianPhase::Idle {
-        if meta.historian.last_failure.as_deref() == Some(detail) {
-            return;
+    before_commit: &ConnectFailureCommitHook,
+) -> Result<(), McStoreError> {
+    for attempt in 0..2 {
+        let loaded = store.load(session_id)?;
+        let mut meta = loaded.meta.clone();
+        if meta.historian.state == HistorianPhase::Idle {
+            // Connection failures happen before the historian transitions out of Idle, but
+            // they still need the same durable cooldown as failures after preparation.
+            meta.historian.last_failure = Some(detail.to_string());
+            meta.historian.failure_backoff_at_ms = Some(failure_backoff_at_ms);
+        } else {
+            meta.historian = historian::abandon_with_detail(
+                &meta.historian,
+                failure_backoff_at_ms,
+                Some(detail.to_string()),
+            );
         }
-        meta.historian.last_failure = Some(detail.to_string());
-    } else {
-        meta.historian = historian::abandon_with_detail(
-            &meta.historian,
-            failure_backoff_at_ms,
-            Some(detail.to_string()),
-        );
+        if let Some(hook) = before_commit
+            .lock()
+            .expect("connect failure commit hook mutex")
+            .as_mut()
+        {
+            hook();
+        }
+        match store.commit(session_id, loaded.row_version, &loaded.core, &meta) {
+            Ok(_) => return Ok(()),
+            Err(McStoreError::CasConflict { .. }) if attempt == 0 => continue,
+            Err(error) => return Err(error),
+        }
     }
-    let _ = store.commit(session_id, loaded.row_version, &loaded.core, &meta);
+    unreachable!("the connect-failure CAS loop returns from both attempts")
 }
 
 /// Resolve the storage descriptor: prefer the daemon-provided `ack.storage`, else
@@ -5345,10 +9067,17 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
                 Tool {
                     name: "ctx_reduce".to_string(),
                     description: Some(
-                        "Queue tagged context items for deferred discard on the next cache-busting pass".to_string(),
+                        "Acknowledge a tagged reduction request for asynchronous delivery".to_string(),
                     ),
                     execution_mode: ExecutionMode::Pure,
-                    schema: json!({ "type": "object" }),
+                    schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "drop": { "type": "string" }
+                        },
+                        "required": ["drop"],
+                        "additionalProperties": false
+                    }),
                 },
                 Tool {
                     name: "ctx_memory".to_string(),
@@ -5381,7 +9110,7 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
             sub_supervises: false,
         }],
         consumes: vec![ConsumerRole::ServiceClient {
-            of: vec!["ai-proxy".to_string()],
+            of: vec!["thalamus".to_string()],
         }],
         scheduled_tasks: Vec::new(),
         bindings: Bindings {
@@ -5406,7 +9135,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::ck_wire::{
-        CkIngressMessage, CkKind, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
+        CkIngressMessage, CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage,
+        HarnessMeta, ProviderExtras,
     };
     use historian_producer::{ProducerOutput, RunHandle, RunState};
     use mc_core::CoreState;
@@ -5492,7 +9222,7 @@ mod tests {
         assert_eq!(
             m.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["ai-proxy".to_string()]
+                of: vec!["thalamus".to_string()]
             }]
         );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
@@ -5615,7 +9345,7 @@ mod tests {
                 match outcome {
                     HandlerOutcome::Response(bytes) => {
                         // Optional: dump the raw TransformResponse bytes per pass so a
-                        // consumer (e.g. ai-proxy's plan_outcome harness) can consume the
+                        // consumer (e.g. the gateway plan_outcome harness) can consume the
                         // module's EXACT returned bytes (MC_REPLAY_OUT_DIR=<dir>).
                         if let Ok(out_dir) = std::env::var("MC_REPLAY_OUT_DIR") {
                             let _ = std::fs::create_dir_all(&out_dir);
@@ -5854,10 +9584,227 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_flight_snapshot_entries_are_count_bounded_and_cannot_resurrect() {
+        let mut cache = TransformSnapshotCache::new(1024);
+        cache.max_in_flight_entries = 8;
+        let request = |session_id: &str| {
+            let mut request = transform_request(vec![ck("m1", 1, "text")], 1, 200_000);
+            request.session_id = session_id.to_string();
+            Arc::new(request)
+        };
+        // Unique failing sessions: begin() without finish_ready, far past the cap.
+        let mut first_generation = 0;
+        for index in 0..64 {
+            let generation = cache.begin(&format!("failed-{index}"));
+            if index == 0 {
+                first_generation = generation;
+            }
+        }
+        assert!(
+            cache.entries.len() <= 8,
+            "InFlight entries must stay bounded"
+        );
+        assert!(cache.in_flight_lru.len() <= 8);
+        // Evicted sessions read Missing, and a late finish_ready for an evicted
+        // generation cannot resurrect a snapshot.
+        assert!(matches!(
+            cache.get("failed-0"),
+            TransformSnapshotLookup::Missing
+        ));
+        cache.finish_ready("failed-0", first_generation, request("failed-0"), 0, 16);
+        assert!(matches!(
+            cache.get("failed-0"),
+            TransformSnapshotLookup::Missing
+        ));
+        // Ready entries do not occupy InFlight slots: completing one frees its slot.
+        let generation = cache.begin("completes");
+        cache.finish_ready("completes", generation, request("completes"), 0, 16);
+        assert!(!cache
+            .in_flight_lru
+            .iter()
+            .any(|candidate| candidate == "completes"));
+        assert!(matches!(
+            cache.get("completes"),
+            TransformSnapshotLookup::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn request_byte_cap_widens_for_transform_class_only() {
+        let pad = |method: &str, key: &str, bytes: usize| {
+            format!(
+                "{{\"{key}\":\"{method}\",\"pad\":\"{}\"}}",
+                "x".repeat(bytes)
+            )
+            .into_bytes()
+        };
+        // Under the facade cap everything passes without parsing.
+        assert!(enforce_request_byte_cap(b"{}").is_ok());
+        // Oversized transform-class bodies pass up to the transform cap.
+        let two_mib = 2 * 1024 * 1024;
+        assert!(enforce_request_byte_cap(&pad("transform", "kind", two_mib)).is_ok());
+        assert!(enforce_request_byte_cap(&pad("shadow_transform", "method", two_mib)).is_ok());
+        assert!(enforce_request_byte_cap(&pad("state_sync", "method", two_mib)).is_ok());
+        // Oversized facade bodies still reject at 1 MiB.
+        assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
+        // Unparseable oversized bodies reject conservatively.
+        assert!(enforce_request_byte_cap(&vec![b'x'; two_mib]).is_err());
+        // The transform cap itself is still a hard ceiling.
+        assert!(
+            enforce_request_byte_cap(&pad("transform", "kind", MAX_TRANSFORM_FRAME_BYTES)).is_err()
+        );
+    }
+
+    #[test]
+    fn transform_snapshot_cache_is_generation_safe_and_lru_bounded() {
+        let request = |session_id: &str| {
+            let mut request = transform_request(vec![ck("m1", 1, "text")], 1, 200_000);
+            request.session_id = session_id.to_string();
+            Arc::new(request)
+        };
+        let mut cache = TransformSnapshotCache::new(10);
+        assert!(!cache.generation_present_in_flight_or_ready("a", 1));
+        let a = cache.begin("a");
+        assert!(cache.generation_present_in_flight_or_ready("a", a));
+        cache.finish_ready("a", a, request("a"), 1, 5);
+        assert!(cache.generation_present_in_flight_or_ready("a", a));
+        let b = cache.begin("b");
+        cache.finish_ready("b", b, request("b"), 2, 5);
+        assert!(matches!(cache.get("a"), TransformSnapshotLookup::Ready(_)));
+
+        let c = cache.begin("c");
+        cache.finish_ready("c", c, request("c"), 3, 5);
+        assert!(matches!(cache.get("b"), TransformSnapshotLookup::Missing));
+        assert!(matches!(cache.get("a"), TransformSnapshotLookup::Ready(_)));
+        assert!(matches!(cache.get("c"), TransformSnapshotLookup::Ready(_)));
+        assert_eq!(cache.ready_bytes, 10);
+
+        let stale = cache.begin("a");
+        let current = cache.begin("a");
+        cache.finish_ready("a", stale, request("stale"), 4, 1);
+        assert!(matches!(cache.get("a"), TransformSnapshotLookup::InFlight));
+        cache.finish_ready("a", current, request("a"), 5, 4);
+        assert!(cache.ready_generation_matches("a", current));
+        assert!(cache.ready_bytes <= cache.max_ready_bytes);
+
+        let oversized = cache.begin("oversized");
+        cache.finish_ready("oversized", oversized, request("oversized"), 0, 11);
+        assert!(matches!(
+            cache.get("oversized"),
+            TransformSnapshotLookup::Missing
+        ));
+    }
+
+    #[test]
+    fn snapshot_lease_budget_survives_cache_churn_and_releases_exact_charge() {
+        let request = |session_id: &str| {
+            let mut request = transform_request(vec![ck("m1", 1, "text")], 1, 200_000);
+            request.session_id = session_id.to_string();
+            Arc::new(request)
+        };
+        let mut cache = TransformSnapshotCache::new(10);
+        {
+            let mut budget = cache
+                .active_leases
+                .lock()
+                .expect("snapshot lease budget mutex");
+            budget.max_bytes = 10;
+            budget.max_count = 1;
+        }
+        let a = cache.begin("a");
+        cache.finish_ready("a", a, request("a"), 0, 5);
+        let b = cache.begin("b");
+        cache.finish_ready("b", b, request("b"), 0, 5);
+        let lease = match cache.get("a") {
+            TransformSnapshotLookup::Ready(lease) => lease,
+            _ => panic!("first lease must fit"),
+        };
+
+        // Churning the map can evict the map entry, but the leased Arc remains charged
+        // until its guard drops and neither accounting domain may exceed its own bound.
+        let c = cache.begin("c");
+        cache.finish_ready("c", c, request("c"), 0, 6);
+        assert!(cache.ready_bytes <= cache.max_ready_bytes);
+        assert!(matches!(
+            cache.get("c"),
+            TransformSnapshotLookup::LeaseBudgetExceeded
+        ));
+        {
+            let budget = cache
+                .active_leases
+                .lock()
+                .expect("snapshot lease budget mutex");
+            assert_eq!((budget.count, budget.bytes), (1, 5));
+            assert!(budget.count <= budget.max_count);
+            assert!(budget.bytes <= budget.max_bytes);
+        }
+        assert_eq!(lease.request.session_id, "a");
+        drop(lease);
+        {
+            let budget = cache
+                .active_leases
+                .lock()
+                .expect("snapshot lease budget mutex");
+            assert_eq!((budget.count, budget.bytes), (0, 0));
+        }
+        assert!(matches!(cache.get("c"), TransformSnapshotLookup::Ready(_)));
+    }
+
+    #[test]
+    fn snapshot_lease_budget_rejects_second_lease_on_bytes_alone() {
+        let request = |session_id: &str| {
+            let mut request = transform_request(vec![ck("m1", 1, "text")], 1, 200_000);
+            request.session_id = session_id.to_string();
+            Arc::new(request)
+        };
+        let mut cache = TransformSnapshotCache::new(16);
+        {
+            let mut budget = cache
+                .active_leases
+                .lock()
+                .expect("snapshot lease budget mutex");
+            budget.max_bytes = 9;
+            budget.max_count = 8;
+        }
+        let first_generation = cache.begin("first");
+        cache.finish_ready("first", first_generation, request("first"), 0, 5);
+        let second_generation = cache.begin("second");
+        cache.finish_ready("second", second_generation, request("second"), 0, 5);
+
+        let first = match cache.get("first") {
+            TransformSnapshotLookup::Ready(lease) => lease,
+            _ => panic!("first lease must fit within both budgets"),
+        };
+        assert!(matches!(
+            cache.get("second"),
+            TransformSnapshotLookup::LeaseBudgetExceeded
+        ));
+        {
+            let budget = cache
+                .active_leases
+                .lock()
+                .expect("snapshot lease budget mutex");
+            assert_eq!(budget.count, 1);
+            assert!(
+                budget.count < budget.max_count,
+                "the count cap must not decide this case"
+            );
+            assert_eq!(budget.bytes, 5);
+        }
+
+        drop(first);
+        assert!(matches!(
+            cache.get("second"),
+            TransformSnapshotLookup::Ready(_)
+        ));
+    }
+
     #[derive(Default)]
     struct ProducerState {
         connects: AtomicUsize,
         starts: AtomicUsize,
+        start_errors: Mutex<VecDeque<Result<RunHandle, HistorianProducerError>>>,
         binds: AtomicUsize,
         statuses: AtomicUsize,
         await_outputs: AtomicUsize,
@@ -5867,6 +9814,7 @@ mod tests {
         await_results: Mutex<VecDeque<Result<ProducerOutput, HistorianProducerError>>>,
         outputs: Mutex<VecDeque<String>>,
         prompts: Mutex<Vec<String>>,
+        on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     struct TestProducerFactory {
@@ -5919,6 +9867,15 @@ mod tests {
                 .lock()
                 .expect("prompts mutex")
                 .push(prompt.to_string());
+            if let Some(result) = self
+                .state
+                .start_errors
+                .lock()
+                .expect("start errors mutex")
+                .pop_front()
+            {
+                return result;
+            }
             self.state
                 .outputs
                 .lock()
@@ -5934,6 +9891,15 @@ mod tests {
             _run_id: &str,
         ) -> Result<ProducerOutput, HistorianProducerError> {
             self.state.await_outputs.fetch_add(1, Ordering::SeqCst);
+            if let Some(hook) = self
+                .state
+                .on_await_output
+                .lock()
+                .expect("await-output hook mutex")
+                .take()
+            {
+                hook();
+            }
             while self.state.block_output.load(Ordering::SeqCst) {
                 self.state.notify.notified().await;
             }
@@ -6007,6 +9973,7 @@ mod tests {
             memory_enabled: true,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
+            shadow_enabled: true,
         }
     }
 
@@ -6031,6 +9998,79 @@ mod tests {
         ck_with_role(mid, ordinal, "user", text)
     }
 
+    fn ck_reasoning(mid: &str, ordinal: u64, text: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(CkKind::Reasoning {
+                    text: text.to_string(),
+                    signature: Some(format!("signature-{mid}")),
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn assistant_tool_call(mid: &str, ordinal: u64) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(CkKind::ToolCall {
+                    id: if mid.starts_with("call-") {
+                        mid.to_string()
+                    } else {
+                        format!("call-{mid}")
+                    },
+                    name: "bash".to_string(),
+                    input: json!({ "command": "printf output" }),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn tool_result(mid: &str, ordinal: u64, text: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "tool",
+                vec![CkWireBlock::bare(CkKind::ToolResult {
+                    id: mid
+                        .strip_prefix("result-")
+                        .map(|suffix| format!("call-{suffix}"))
+                        .unwrap_or_else(|| format!("call-{mid}")),
+                    tool_name: "bash".to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: text.to_string(),
+                    }),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
     fn stored_comp(seq: i64, start: i64, end: i64, end_mid: &str, p1: &str) -> StoredCompartment {
         StoredCompartment {
             sequence: seq,
@@ -6043,6 +10083,40 @@ mod tests {
             importance: 50,
             ..Default::default()
         }
+    }
+
+    fn imported_compartment(
+        seq: i64,
+        start_message: i64,
+        end_message: i64,
+        end_message_id: &str,
+        p1: &str,
+    ) -> Value {
+        json!({
+            "seq": seq,
+            "start_message": start_message,
+            "end_message": end_message,
+            "end_message_id": end_message_id,
+            "title": format!("Imported {seq}"),
+            "p1": p1,
+        })
+    }
+
+    fn state_import_request(
+        import_id: &str,
+        batch_seq: usize,
+        batch_count: usize,
+        compartments: Vec<Value>,
+    ) -> Value {
+        json!({
+            "kind": "state_import",
+            "v": 1,
+            "session_id": "ses",
+            "import_id": import_id,
+            "batch_seq": batch_seq,
+            "batch_count": batch_count,
+            "compartments": compartments,
+        })
     }
 
     fn big_messages_from(start_ordinal: u64) -> Vec<CkIngressMessage> {
@@ -6236,6 +10310,158 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn serve_native_false_is_response_byte_identical_for_all_profiles() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        for profile in [
+            "owned-llmrunner",
+            "owned-broca",
+            "claude-code-anthropic",
+            "opencode-aisdk",
+            "pi",
+        ] {
+            let session_id = format!("{}serve-native-false", historian::MC_CHILD_SESSION_PREFIX);
+            let mut absent = request(vec![ck("m1", 1, "hello")]);
+            absent["session_id"] = json!(session_id);
+            absent["serializer_profile"] = json!(profile);
+            let mut explicit_false = absent.clone();
+            explicit_false["serve_native"] = json!(false);
+            let absent_response = call_transform_request(&handler, absent).await;
+            let explicit_response = call_transform_request(&handler, explicit_false).await;
+            assert_eq!(
+                serde_json::to_vec(&absent_response).unwrap(),
+                serde_json::to_vec(&explicit_response).unwrap(),
+                "profile {profile} changed the legacy response when serve_native=false"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_native_rejects_non_opencode_profiles() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut request = request(vec![ck("m1", 1, "hello")]);
+        request["serve_native"] = json!(true);
+        let outcome = call_transform_outcome(&handler, request).await;
+        assert_eq!(error_code(outcome), "serve_native_unsupported_profile");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_native_adds_opencode_messages_without_changing_ck_response() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut request = request(vec![ck("m1", 1, "hello")]);
+        request["serializer_profile"] = json!("opencode-aisdk");
+        request["serve_native"] = json!(true);
+        request["native_messages"] = json!([
+            {
+                "info": {
+                    "id": "m1",
+                    "sessionID": "ses",
+                    "role": "user",
+                    "customInfo": "preserve-me"
+                },
+                "parts": [{ "type": "text", "text": "hello", "customPart": 7 }]
+            }
+        ]);
+
+        let first = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(first["status"], "ok");
+        assert_eq!(
+            first["native_messages"].as_array().unwrap().last().unwrap(),
+            &request["native_messages"][0]
+        );
+        assert!(first["native_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| { message["parts"][0]["synthetic"] == json!(true) }));
+        assert!(first.get("ck_messages").is_some());
+
+        let second = call_transform_request(&handler, request).await;
+        assert_eq!(second["status"], "ok");
+        assert_eq!(second["action"], "SOFT+");
+        assert_eq!(
+            second["native_messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["info"]["customInfo"],
+            "preserve-me"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_shaped_opencode_reasoning_clear_attaches_on_the_same_pass() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut request = request(vec![
+            ck_reasoning("assistant-old", 1, "signed historical thinking"),
+            ck("user-new", 100, "new prompt"),
+        ]);
+        request["serializer_profile"] = json!("opencode-aisdk");
+        request["serve_native"] = json!(true);
+        // This is the current built-plugin wire shape: provider_id and clear_reasoning_age
+        // are absent, so the module must use native OpenCode metadata as its fallback.
+        request["native_messages"] = json!([
+            {
+                "info": {
+                    "id": "assistant-old",
+                    "role": "assistant",
+                    "providerID": "anthropic",
+                    "modelID": "claude-opus-4-8"
+                },
+                "parts": [{
+                    "type": "reasoning",
+                    "text": "signed historical thinking",
+                    "time": { "start": 1, "end": 2 },
+                    "metadata": { "anthropic": { "signature": "signature-assistant-old" } }
+                }]
+            },
+            {
+                "info": {
+                    "id": "user-new",
+                    "role": "user",
+                    "model": { "providerID": "anthropic", "modelID": "claude-opus-4-8" }
+                },
+                "parts": [{ "type": "text", "text": "new prompt" }]
+            }
+        ]);
+
+        let parsed: TransformRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(
+            SerializerProfile::parse(&parsed.serializer_profile),
+            Some(SerializerProfile::OpencodeAiSdk)
+        );
+        assert!(parsed.provider_id.is_none());
+        assert_eq!(parsed.clear_reasoning_age, 50);
+        assert!(transform::request_accepts_empty_content(&parsed));
+
+        let response = call_transform_request(&handler, request).await;
+        assert_eq!(response["status"], "ok");
+        assert_eq!(
+            store
+                .load("ses")
+                .unwrap()
+                .meta
+                .reasoning_cleared_through_ordinal,
+            50,
+            "the attach load must observe the watermark committed by this pass"
+        );
+        let old = response["native_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["info"]["id"] == json!("assistant-old"))
+            .expect("served assistant must retain its harness id");
+        assert_eq!(
+            old["parts"][0],
+            json!({ "type": "reasoning", "text": "" }),
+            "clear preserves the typed reasoning shell while dropping signed metadata"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn v2_wire_echoes_fingerprint_on_normal_and_child_passthrough() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -6267,6 +10493,61 @@ mod tests {
         assert_eq!(child["action"], "PASSTHROUGH");
         assert_eq!(child["ck_messages"].as_array().unwrap().len(), 1);
         assert_eq!(child["ck_messages"][0]["role"], "user");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel2_host_directive_is_deterministic_due_gated_and_profile_scoped() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let output = "tool output ".repeat(8_000);
+        let mut messages = Vec::new();
+        for index in 0..25u64 {
+            let call_mid = format!("call-{index}");
+            let result_mid = format!("result-{index}");
+            messages.push(assistant_tool_call(&call_mid, index * 2 + 1));
+            messages.push(tool_result(&result_mid, index * 2 + 2, &output));
+        }
+        let opencode_request = json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "opencode-aisdk",
+            "session_id": "ses",
+            "render_config": "cfg0",
+            "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
+            "messages": messages,
+        });
+        let first = call_transform_request(&handler, opencode_request.clone()).await;
+        let first_text = first["host_directives"]["channel2_nudge"]["text"]
+            .as_str()
+            .expect("due OpenCode pass must carry channel2 text");
+        assert!(first_text.contains("Routine context housekeeping is near"));
+        let second = call_transform_request(&handler, opencode_request).await;
+        assert_eq!(
+            second["host_directives"]["channel2_nudge"]["text"],
+            first_text
+        );
+
+        let mut not_due = request_with_usage(vec![ck("short", 1, "small")], 10_000, 100_000);
+        not_due["serializer_profile"] = json!("opencode-aisdk");
+        let not_due_response = call_transform_request(&handler, not_due).await;
+        assert!(not_due_response.get("host_directives").is_none());
+
+        handler.bind_route(8, binding("/tmp/cc", "cc-ses"));
+        let mut cc_request = json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "claude-code-anthropic",
+            "tool_present": true,
+            "session_id": "cc-ses",
+            "render_config": "cfg0",
+            "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
+            "messages": first["ck_messages"],
+        });
+        // The CC response is used only to prove the additive directive remains profile-gated;
+        // its transformed messages are not a request fixture for the OpenCode lane.
+        cc_request["messages"] = json!([ck("cc-short", 1, "small")]);
+        let cc_response = call_transform_request_on_channel(&handler, 8, cc_request).await;
+        assert!(cc_response.get("host_directives").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6428,7 +10709,7 @@ mod tests {
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         let full = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         let trimmed = call_dispatch_request(
@@ -6454,6 +10735,44 @@ mod tests {
             )
             .await;
         assert_eq!(error_code(unknown), "bad_request");
+        let contradictory = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "guidance.get",
+                    "session_id": "ses",
+                    "tool_present": false,
+                    "variant": "full"
+                }),
+            )
+            .await;
+        assert_eq!(error_code(contradictory), "bad_request");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guidance_language_directive_is_present_in_both_serializer_variants() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        for request in [
+            json!({
+                "kind": "guidance.get",
+                "session_id": "ses",
+                "serializer_profile": "claude-code-anthropic",
+                "tool_present": true,
+                "language": "tr",
+            }),
+            json!({
+                "kind": "guidance.get",
+                "session_id": "ses",
+                "serializer_profile": "opencode-aisdk",
+                "language": "tr",
+            }),
+        ] {
+            let response = call_dispatch_request(&handler, request).await;
+            let bytes = response["bytes"].as_str().unwrap();
+            assert!(bytes.contains("Use Turkish (Türkçe) for your natural-language replies"));
+            assert_eq!(response["hash"], json!(sha256_hex(bytes.as_bytes())));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6467,7 +10786,7 @@ mod tests {
 
         let first = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         let first_bytes = first["bytes"].as_str().unwrap().to_string();
@@ -6483,7 +10802,7 @@ mod tests {
         );
         let repeated = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         assert_eq!(repeated["bytes"], first["bytes"]);
@@ -6491,7 +10810,7 @@ mod tests {
 
         let still_frozen = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         assert_eq!(still_frozen["bytes"], first["bytes"]);
@@ -6503,7 +10822,7 @@ mod tests {
         let _ = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
         let advanced = call_dispatch_request(
             &handler,
-            json!({ "kind": "guidance.get", "session_id": "ses" }),
+            json!({ "kind": "guidance.get", "session_id": "ses", "tool_present": true }),
         )
         .await;
         assert!(advanced["bytes"]
@@ -6519,7 +10838,10 @@ mod tests {
             "Today's date: Sun Jan 03 2016".to_string(),
         );
         let other = match handler
-            .dispatch_value(8, json!({ "kind": "guidance.get", "session_id": "other" }))
+            .dispatch_value(
+                8,
+                json!({ "kind": "guidance.get", "session_id": "other", "tool_present": true }),
+            )
             .await
         {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -6967,8 +11289,8 @@ mod tests {
         assert_eq!(echo_body["ok"], json!(true));
         assert_eq!(echo_body["echo"]["kind"], "echo");
 
-        let reduce = call_facade(&handler, "ctx_reduce", json!({ "drop": "1-3" })).await;
-        assert_eq!(error_code(reduce), "tagging_inactive");
+        let reduce = tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1-3" })).await);
+        assert_eq!(reduce, CTX_REDUCE_ACKNOWLEDGEMENT);
     }
 
     #[test]
@@ -6980,86 +11302,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_ctx_reduce_parses_ranges_resolves_tags_and_dedups_queue() {
-        crate::healing::set_tagging_enabled_for_tests(Some(true));
+    async fn facade_ctx_reduce_is_inert_before_resolution_or_storage() {
         let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(8, binding(project.to_str().unwrap(), "token"));
-
-        let messages = vec![ck("m1", 1, "one"), ck("m2", 2, "two")];
-        let transition = call_transform(&handler, messages.clone()).await;
-        assert_eq!(transition["status"], "ok");
-        assert!(store.load_tags_for_session("ses").unwrap().is_empty());
-        let transformed = call_transform(&handler, messages).await;
-        assert_eq!(transformed["status"], "ok");
-        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 2);
-
-        let mixed = tool_text(
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "§1§,99" })).await,
+        let resolver = FakeSessionResolver::with(&[("unresolvable", FakeResolve::None)]);
+        let handler = McHandler::with_producer_factory_config_resolver(
+            Arc::new(TestProducerFactory { state: producer }),
+            default_test_config(),
+            resolver.clone(),
         );
-        assert!(mixed.contains("Queued: drop §1§."), "{mixed}");
-        assert!(mixed.contains("Unknown tag(s) §99§ skipped."), "{mixed}");
-        let queued = store.load_pending_agent_drops("ses").unwrap();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].target_id, "m1#0");
+        handler.bind_route(8, binding("/path/that/does/not/exist", "unresolvable"));
 
-        let duplicate = tool_text(
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "1" })).await,
+        let response = tool_text(
+            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "not parsed" }))
+                .await,
         );
-        assert!(duplicate.contains("already queued"), "{duplicate}");
-        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
-
-        let malformed = tool_body(
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "3-1" })).await,
+        assert_eq!(response, CTX_REDUCE_ACKNOWLEDGEMENT);
+        assert!(
+            resolver.calls().is_empty(),
+            "the inert facade must not resolve tokens"
         );
-        assert_eq!(malformed["isError"], json!(true));
-        assert!(malformed["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid range syntax"));
-
-        let unbounded = tool_body(
-            call_facade_on_channel(
-                &handler,
-                8,
-                "ctx_reduce",
-                json!({ "drop": "0-18446744073709551615" }),
-            )
-            .await,
+        assert!(
+            handler.store.get().is_none(),
+            "the inert facade must not open or read storage"
         );
-        assert_eq!(unbounded["isError"], json!(true));
-        assert!(unbounded["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid range syntax"));
-        crate::healing::set_tagging_enabled_for_tests(None);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn facade_ctx_reduce_rejects_profiles_that_cannot_drain_tail_mutations() {
-        crate::healing::set_tagging_enabled_for_tests(Some(true));
-        let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(8, binding(project.to_str().unwrap(), "token"));
-
-        let messages = vec![ck("m1", 1, "one")];
-        let mut cc_request = request(messages.clone());
-        cc_request["serializer_profile"] = json!("claude-code-anthropic");
-        let first = call_transform_request(&handler, cc_request.clone()).await;
-        assert_eq!(first["status"], "ok");
-        let second = call_transform_request(&handler, cc_request).await;
-        assert_eq!(second["status"], "ok");
-        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 1);
-
-        let rejected =
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "1" })).await;
-        assert_eq!(error_code(rejected), "reduce_unavailable_for_profile");
-        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
-        crate::healing::set_tagging_enabled_for_tests(None);
+    #[test]
+    fn ctx_reduce_manifest_schema_is_closed_and_requires_drop() {
+        let manifest = manifest("magic-context");
+        let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+            panic!("tool provider manifest entry");
+        };
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "ctx_reduce")
+            .expect("ctx_reduce manifest entry");
+        assert_eq!(
+            tool.schema,
+            json!({
+                "type": "object",
+                "properties": { "drop": { "type": "string" } },
+                "required": ["drop"],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]
@@ -7384,6 +11670,8 @@ mod tests {
         assert_eq!(response["status"], "need_full_sync");
         assert_eq!(response["served_from"], "transform");
         assert_eq!(response["full_array_fingerprint"], "fp-delta");
+        assert_eq!(response["surface_state"], "inactive");
+        assert!(response["row_version"].is_u64());
         // The array field must be ABSENT, not empty: the consumer discriminates
         // structurally on presence, and an empty array would be a third
         // ambiguous state between "transformed to nothing" and "re-send".
@@ -7403,6 +11691,51 @@ mod tests {
         .await;
         assert_eq!(response["status"], "ok");
         assert!(response.get("full_array_fingerprint").is_none());
+        assert_eq!(response["surface_state"], "inactive");
+        assert!(response["row_version"].is_u64());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transform_ok_wire_reports_each_surface_state_and_row_version() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut request = request(vec![ck("m1", 1, "hello")]);
+        request["serializer_profile"] = json!("claude-code-anthropic");
+
+        let inactive = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(inactive["surface_state"], "inactive");
+        let v_inactive = inactive["row_version"].as_u64().expect("row_version u64");
+
+        request["tool_present"] = json!(true);
+        let on_transition = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(on_transition["surface_state"], "transition");
+        let v_on = on_transition["row_version"]
+            .as_u64()
+            .expect("row_version u64");
+        // The surface flip rides a committing HARD, so the version must advance.
+        assert!(v_on > v_inactive, "flip-on HARD must bump row_version");
+
+        let active = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(active["surface_state"], "active");
+        let v_active = active["row_version"].as_u64().expect("row_version u64");
+        // Steady-state replay commits nothing: equal versions are legitimate,
+        // regression (a lower version) never is.
+        assert!(v_active >= v_on, "row_version must be nondecreasing");
+
+        request["tool_present"] = json!(false);
+        let off_transition = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(off_transition["surface_state"], "transition");
+        let v_off = off_transition["row_version"]
+            .as_u64()
+            .expect("row_version u64");
+        assert!(v_off > v_active, "flip-off HARD must bump row_version");
+
+        let inactive_again = call_transform_request(&handler, request).await;
+        assert_eq!(inactive_again["surface_state"], "inactive");
+        let v_final = inactive_again["row_version"]
+            .as_u64()
+            .expect("row_version u64");
+        assert!(v_final >= v_off, "row_version must be nondecreasing");
     }
 
     async fn call_transform_with_usage(
@@ -7418,27 +11751,121 @@ mod tests {
         .await
     }
 
-    fn queue_drop_command(handler: &McHandler, target_id: &str) -> Value {
-        match handler.handle_agent_drops_value(
-            7,
-            json!({
-                "kind": "ctx_reduce",
-                "session_id": "ses",
-                "drop_ids": [target_id],
-            }),
-        ) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
-            other => panic!("unexpected handler outcome: {other:?}"),
+    fn mint_drop_tag(store: &McStore, target_id: &str) {
+        store
+            .seed_tags_for_test(
+                "ses",
+                &[TagMintInput {
+                    block_id: target_id.to_string(),
+                    kind: "message".to_string(),
+                    token_count: 1,
+                    source_bytes: b"source".to_vec(),
+                }],
+                1,
+            )
+            .unwrap();
+    }
+
+    fn wrapup_messages(count: u64, words_per_message: usize) -> Vec<CkIngressMessage> {
+        (1..=count)
+            .map(|ordinal| {
+                ck_with_role(
+                    &format!("m{ordinal}"),
+                    ordinal,
+                    if ordinal % 2 == 0 {
+                        "assistant"
+                    } else {
+                        "user"
+                    },
+                    &format!("message {ordinal} {}", "word ".repeat(words_per_message)),
+                )
+            })
+            .collect()
+    }
+
+    fn cache_wrapup_messages(handler: &McHandler, messages: Vec<CkIngressMessage>) {
+        cache_wrapup_messages_for_session(handler, "ses", messages);
+    }
+
+    fn cache_wrapup_messages_for_session(
+        handler: &McHandler,
+        session_id: &str,
+        messages: Vec<CkIngressMessage>,
+    ) {
+        let mut parsed = transform_request(messages, 1, 200_000);
+        parsed.session_id = session_id.to_string();
+        parsed.serializer_profile = SerializerProfile::ClaudeCodeAnthropic.wire_id().to_string();
+        let retained_bytes = serde_json::to_vec(&parsed).unwrap().len();
+        let revert_epoch = handler
+            .store
+            .get()
+            .unwrap()
+            .load(session_id)
+            .unwrap()
+            .meta
+            .revert_epoch;
+        let mut snapshots = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex");
+        let generation = snapshots.begin(session_id);
+        snapshots.finish_ready(
+            session_id,
+            generation,
+            Arc::new(parsed),
+            revert_epoch,
+            retained_bytes,
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct HistorianAdditiveRows {
+        compartment_count: usize,
+        max_compartment_seq: i64,
+        transcript_count: usize,
+        max_transcript_seq: i64,
+        fact_count: usize,
+        max_fact_id: i64,
+        publication_floor_ordinal: Option<u64>,
+    }
+
+    fn historian_additive_rows(
+        store: &McStore,
+        session_id: &str,
+        project_path: &Path,
+    ) -> HistorianAdditiveRows {
+        let compartments = store.load_compartments(session_id).unwrap();
+        let transcripts = store
+            .load_chunk_transcripts_for_range(session_id, 0, i64::MAX)
+            .unwrap();
+        let project_path = project_path.to_string_lossy().to_string();
+        let facts = store.load_active_memories(&project_path, 0).unwrap();
+        HistorianAdditiveRows {
+            compartment_count: compartments.len(),
+            max_compartment_seq: store.max_compartment_seq(session_id).unwrap(),
+            transcript_count: transcripts.len(),
+            max_transcript_seq: transcripts
+                .iter()
+                .map(|transcript| transcript.compartment_seq)
+                .max()
+                .unwrap_or(0),
+            fact_count: facts.len(),
+            max_fact_id: store.max_memory_id(&[project_path]).unwrap(),
+            publication_floor_ordinal: store
+                .load(session_id)
+                .unwrap()
+                .meta
+                .publication_floor_ordinal,
         }
     }
 
-    fn queue_drop_command_with_id(handler: &McHandler, target_id: &str, command_id: &str) -> Value {
+    fn queue_drop_command_with_id(handler: &McHandler, command_id: &str) -> Value {
         match handler.handle_agent_drops_value(
             7,
             json!({
-                "kind": "ctx_reduce",
+                "method": "agent_drops.append",
                 "session_id": "ses",
-                "drop_ids": [target_id],
+                "drop": "1",
                 "command_id": command_id,
             }),
         ) {
@@ -7455,6 +11882,13 @@ mod tests {
     fn historian_output(start: u64, end: u64, p1: &str) -> String {
         format!(
             r#"<output><compartments><compartment start="{start}" end="{end}" title="autonomous arc" episode_type="feature" importance="60"><p1>{p1}</p1><p2>short summary</p2><p3>arc</p3><p4 /></compartment></compartments><meta><messages_processed>{start}-{end}</messages_processed><unprocessed_from>{}</unprocessed_from></meta></output>"#,
+            end + 1
+        )
+    }
+
+    fn historian_output_with_fact(start: u64, end: u64, fact: &str) -> String {
+        format!(
+            r#"<output><compartments><compartment start="{start}" end="{end}" title="autonomous arc" episode_type="feature" importance="60"><p1>autonomous summary</p1><p2>short summary</p2><p3>arc</p3><p4 /></compartment></compartments><facts><PROJECT_RULES>* {fact}</PROJECT_RULES></facts><meta><messages_processed>{start}-{end}</messages_processed><unprocessed_from>{}</unprocessed_from></meta></output>"#,
             end + 1
         )
     }
@@ -7621,16 +12055,661 @@ mod tests {
         assert!(m0_text(&second).contains("autonomous summary"));
     }
 
-    #[test]
-    fn ctx_reduce_without_command_id_keeps_drop_ids_response() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_two_batches_bootstrap_hard_folds_and_mints_tail_anchor() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
 
-        let first = queue_drop_command(&handler, "a#0");
-        assert_eq!(first, json!({ "ok": true, "queued": 1 }));
-        let repeat = queue_drop_command(&handler, "a#0");
-        assert_eq!(repeat, json!({ "ok": true, "queued": 0 }));
-        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+        let staged = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "bundle-a",
+                0,
+                2,
+                vec![imported_compartment(10, 1, 10, "m10#0", "summary one")],
+            ),
+        )
+        .await;
+        assert_eq!(staged, json!({ "ok": true, "staged": 1 }));
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+
+        let committed = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "bundle-a",
+                1,
+                2,
+                vec![imported_compartment(20, 11, 20, "m20#0", "summary two")],
+            ),
+        )
+        .await;
+        assert_eq!(
+            committed,
+            json!({ "ok": true, "imported": 2, "duplicate": false })
+        );
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 2);
+        assert!(store.has_compartments("ses").unwrap());
+        let before_fold = store.load("ses").unwrap();
+        assert!(before_fold.core.boundary_id.is_empty());
+        assert!(before_fold.row_version.is_none());
+
+        let response =
+            call_transform_request(&handler, request_with_usage(big_messages(), 1_000, 50_000))
+                .await;
+        assert_eq!(response["action"], "HARD");
+        assert_eq!(response["boundary_id"], "m20#0");
+        let after_fold = store.load("ses").unwrap();
+        assert_eq!(after_fold.core.boundary_id, "m20#0");
+        assert!(after_fold.row_version.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_refuses_nonempty_session_without_writes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let bootstrap = store.load("ses").unwrap();
+        store
+            .commit("ses", None, &bootstrap.core, &bootstrap.meta)
+            .unwrap();
+        let before = store.load("ses").unwrap().row_version;
+
+        let outcome = handler
+            .dispatch_value(
+                7,
+                state_import_request(
+                    "bundle-a",
+                    0,
+                    1,
+                    vec![imported_compartment(1, 1, 1, "m1#0", "summary")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(outcome), "session_not_empty");
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_id_is_durable_and_wins_before_nonempty_check() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let request = state_import_request(
+            "bundle-a",
+            0,
+            1,
+            vec![imported_compartment(1, 1, 1, "m1#0", "summary")],
+        );
+        let first = call_dispatch_request(&handler, request.clone()).await;
+        assert_eq!(
+            first,
+            json!({ "ok": true, "imported": 1, "duplicate": false })
+        );
+
+        let bootstrap = store.load("ses").unwrap();
+        let row_version = store
+            .commit("ses", None, &bootstrap.core, &bootstrap.meta)
+            .unwrap();
+        let duplicate = call_dispatch_request(&handler, request).await;
+        assert_eq!(
+            duplicate,
+            json!({ "ok": true, "imported": 1, "duplicate": true })
+        );
+        assert_eq!(store.load("ses").unwrap().row_version, Some(row_version));
+
+        let different = handler
+            .dispatch_value(
+                7,
+                state_import_request(
+                    "bundle-b",
+                    0,
+                    1,
+                    vec![imported_compartment(1, 1, 1, "m1#0", "other")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(different), "session_not_empty");
+        assert_eq!(store.load("ses").unwrap().row_version, Some(row_version));
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].content,
+            "summary"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_batch_gap_and_staleness_evict_partial_attempts() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let staged = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "gap",
+                0,
+                3,
+                vec![imported_compartment(1, 1, 1, "m1#0", "first")],
+            ),
+        )
+        .await;
+        assert_eq!(staged["staged"], 1);
+        let gap = handler
+            .dispatch_value(
+                7,
+                state_import_request(
+                    "gap",
+                    2,
+                    3,
+                    vec![imported_compartment(3, 3, 3, "m3#0", "third")],
+                ),
+            )
+            .await;
+        assert_eq!(error_code(gap), "batch_seq_mismatch");
+
+        let restaged = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "stale",
+                0,
+                2,
+                vec![imported_compartment(1, 1, 1, "m1#0", "first")],
+            ),
+        )
+        .await;
+        assert_eq!(restaged["staged"], 1, "gap rejection released the session");
+        handler
+            .state_imports
+            .lock()
+            .expect("state import mutex")
+            .stale_after = Duration::ZERO;
+        let imported = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "fresh",
+                0,
+                1,
+                vec![imported_compartment(5, 1, 5, "m5#0", "replacement")],
+            ),
+        )
+        .await;
+        assert_eq!(
+            imported,
+            json!({ "ok": true, "imported": 1, "duplicate": false })
+        );
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].content,
+            "replacement"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_structural_rejections_name_rules_and_leave_session_empty() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let cases = vec![
+            (
+                "overlap",
+                vec![
+                    imported_compartment(1, 1, 5, "m5#0", "first"),
+                    imported_compartment(2, 5, 8, "m8#0", "second"),
+                ],
+                "ranges_overlap",
+            ),
+            (
+                "seq",
+                vec![
+                    imported_compartment(2, 1, 2, "m2#0", "first"),
+                    imported_compartment(1, 3, 4, "m4#0", "second"),
+                ],
+                "seq_not_increasing",
+            ),
+            (
+                "empty-p1",
+                vec![imported_compartment(1, 1, 1, "m1#0", "   ")],
+                "p1_empty",
+            ),
+            (
+                "bad-id",
+                vec![imported_compartment(1, 1, 1, "m1", "summary")],
+                "end_message_id_invalid",
+            ),
+            (
+                "bad-range",
+                vec![imported_compartment(1, 2, 1, "m1#0", "summary")],
+                "range_invalid",
+            ),
+        ];
+        for (import_id, compartments, expected_code) in cases {
+            let outcome = handler
+                .dispatch_value(7, state_import_request(import_id, 0, 1, compartments))
+                .await;
+            assert_eq!(error_code(outcome), expected_code, "{import_id}");
+            assert!(store.load_compartments("ses").unwrap().is_empty());
+            assert!(store.load("ses").unwrap().row_version.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_p1_only_shape_defaults_and_renders() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let imported = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "legacy-p1-only",
+                0,
+                1,
+                vec![imported_compartment(
+                    1,
+                    1,
+                    10,
+                    "m10#0",
+                    "P1-ONLY-IMPORTED-SUMMARY",
+                )],
+            ),
+        )
+        .await;
+        assert_eq!(imported["imported"], 1);
+        let row = &store.load_compartments("ses").unwrap()[0];
+        assert_eq!(row.p1.as_deref(), Some("P1-ONLY-IMPORTED-SUMMARY"));
+        assert_eq!(row.p2, None);
+        assert_eq!(row.p3, None);
+        assert_eq!(row.p4, None);
+        assert_eq!(row.importance, 50);
+
+        let response =
+            call_transform_request(&handler, request_with_usage(big_messages(), 1_000, 50_000))
+                .await;
+        assert_eq!(response["action"], "HARD");
+        assert!(m0_text(&response).contains("P1-ONLY-IMPORTED-SUMMARY"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn management_drop_alias_routes_are_rejected() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        for alias in ["ctx_reduce", "append_agent_drops"] {
+            let outcome = handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": alias,
+                        "session_id": "ses",
+                        "drop": "1",
+                        "command_id": "command"
+                    }),
+                )
+                .await;
+            assert_eq!(error_code(outcome), "unrecognized_request_shape", "{alias}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn management_todo_flush_and_recomp_contracts_are_replay_safe() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let todo = json!({
+            "method": "todo_state.set",
+            "v": 1,
+            "session_id": "ses",
+            "state_json": "[{\"content\":\"ship module\",\"status\":\"in_progress\",\"priority\":\"high\"}]",
+            "owner_message_id": "m1",
+        });
+        assert_eq!(
+            call_dispatch_request(&handler, todo.clone()).await,
+            json!({ "ok": true })
+        );
+        let first = store.load("ses").unwrap();
+        assert_eq!(
+            first.meta.last_todo_state_owner_message_id.as_deref(),
+            Some("m1")
+        );
+        assert!(first.meta.last_todo_state_hash.is_some());
+        let first_version = first.row_version;
+        assert_eq!(
+            call_dispatch_request(&handler, todo).await,
+            json!({ "ok": true })
+        );
+        assert_eq!(store.load("ses").unwrap().row_version, first_version);
+
+        let flush = call_dispatch_request(
+            &handler,
+            json!({ "method": "session.flush", "v": 1, "session_id": "ses" }),
+        )
+        .await;
+        assert_eq!(flush, json!({ "ok": true, "armed": true }));
+        let flushed = store.load("ses").unwrap();
+        assert!(flushed.meta.soft_refresh_pending);
+
+        let recomp = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "session.recomp",
+                "v": 1,
+                "session_id": "ses",
+                "command_id": "recomp-1",
+            }),
+        )
+        .await;
+        assert_eq!(
+            recomp,
+            json!({ "ok": true, "disposition": "nothing_to_do" })
+        );
+        let replay = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "session.recomp",
+                "v": 1,
+                "session_id": "ses",
+                "command_id": "recomp-1",
+            }),
+        )
+        .await;
+        assert_eq!(replay, recomp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_status_compartment_pages_are_bounded_and_contract_shaped() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .commit_state_import(
+                "ses",
+                "status-page-seed",
+                &(1..=55)
+                    .map(|sequence| {
+                        stored_comp(
+                            sequence,
+                            sequence,
+                            sequence,
+                            &format!("m{sequence}"),
+                            "body",
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                55,
+            )
+            .unwrap();
+
+        let body = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({
+                "method": "session.status",
+                "v": 1,
+                "session_id": "ses",
+                "include_compartments_after_seq": -1,
+            }),
+        ));
+        let compartments = body["compartments"].as_array().unwrap();
+        assert_eq!(compartments.len(), 50);
+        assert_eq!(compartments[0]["sequence"], json!(1));
+        assert_eq!(compartments[49]["sequence"], json!(50));
+        assert_eq!(body["max_sequence"], json!(55));
+        assert!(compartments[0].get("start_date").is_none());
+        assert!(compartments[0].get("legacy").is_none());
+
+        let tail = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({
+                "method": "session.status",
+                "v": 1,
+                "session_id": "ses",
+                "include_compartments_after_seq": 50,
+            }),
+        ));
+        assert_eq!(tail["compartments"].as_array().unwrap().len(), 5);
+        assert_eq!(tail["max_sequence"], json!(55));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recomp_resets_cache_boundary_and_replays_started() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .commit_state_import(
+                "ses",
+                "recomp-seed",
+                &[stored_comp(1, 1, 5, "m5", "seed")],
+                1,
+            )
+            .unwrap();
+        let before = store.load("ses").unwrap();
+        let mut core = before.core.clone();
+        core.boundary_id = "m5#0".to_string();
+        let mut meta = before.meta.clone();
+        meta.initialized = true;
+        meta.coverage_ordinal = Some(5);
+        store
+            .commit("ses", before.row_version, &core, &meta)
+            .unwrap();
+        let before_reset = store.load("ses").unwrap();
+
+        let first = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "session.recomp",
+                "v": 1,
+                "session_id": "ses",
+                "command_id": "recomp-reset",
+            }),
+        )
+        .await;
+        assert_eq!(first, json!({ "ok": true, "disposition": "started" }));
+        let after = store.load("ses").unwrap();
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        assert!(after.core.boundary_id.is_empty());
+        assert!(!after.meta.initialized);
+        assert!(after.meta.coverage_ordinal.is_none());
+        assert_eq!(after.meta.revert_epoch, before_reset.meta.revert_epoch + 1);
+        assert_eq!(
+            after.row_version,
+            Some(before_reset.row_version.unwrap() + 1)
+        );
+
+        let replay = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "session.recomp",
+                "v": 1,
+                "session_id": "ses",
+                "command_id": "recomp-reset",
+            }),
+        )
+        .await;
+        assert_eq!(replay, first);
+        assert_eq!(store.load("ses").unwrap().row_version, after.row_version);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_flush_consumes_once_as_soft_without_forcing_hard() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .commit_state_import(
+                "ses",
+                "flush-seed",
+                &[stored_comp(1, 1, 1, "m1", "seed")],
+                1,
+            )
+            .unwrap();
+        let first = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
+        assert_eq!(first["action"], "HARD");
+        let armed = call_dispatch_request(
+            &handler,
+            json!({ "method": "session.flush", "v": 1, "session_id": "ses" }),
+        )
+        .await;
+        assert_eq!(armed, json!({ "ok": true, "armed": true }));
+        let next = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
+        assert_eq!(next["action"], "SOFT");
+        assert!(!store.load("ses").unwrap().meta.soft_refresh_pending);
+        let replay = call_transform(&handler, vec![ck("m1", 1, "hello")]).await;
+        assert_ne!(replay["action"], "HARD");
+    }
+
+    #[test]
+    fn session_status_rejects_unbound_and_mismatched_routes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let request = json!({ "method": "session.status", "v": 1, "session_id": "ses" });
+
+        assert_eq!(
+            error_code(handler.handle_session_status_value(8, &request)),
+            "route_unbound"
+        );
+        let mismatch = json!({
+            "method": "session.status",
+            "v": 1,
+            "session_id": "other",
+        });
+        assert_eq!(
+            error_code(handler.handle_session_status_value(7, &mismatch)),
+            "session_mismatch"
+        );
+    }
+
+    #[test]
+    fn session_status_summarizes_seeded_store_with_identity_and_durable_age() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
+        let session_id = "ccm-8518e338-extra";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session_id));
+        store
+            .commit_state_import(
+                session_id,
+                "status-seed",
+                &[
+                    stored_comp(1, 1, 5, "m5", "first"),
+                    stored_comp(2, 6, 10, "m10", "second"),
+                ],
+                1,
+            )
+            .unwrap();
+        let loaded = store.load(session_id).unwrap();
+        let mut core = loaded.core.clone();
+        core.boundary_id = "m10#0".to_string();
+        let mut meta = loaded.meta.clone();
+        meta.coverage_ordinal = Some(10);
+        meta.cc_u1_active = true;
+        meta.last_committed_pass_at_ms = now_ms() - 125_000;
+        meta.historian.firing_seq = 3;
+        store
+            .commit(session_id, loaded.row_version, &core, &meta)
+            .unwrap();
+        store
+            .append_pending_agent_drops(session_id, &["m8#0".to_string()], 2)
+            .unwrap();
+        store
+            .seed_tags_for_test(
+                session_id,
+                &[
+                    TagMintInput {
+                        block_id: "m8#0".to_string(),
+                        kind: "message".to_string(),
+                        token_count: 2,
+                        source_bytes: b"eight".to_vec(),
+                    },
+                    TagMintInput {
+                        block_id: "m9#0".to_string(),
+                        kind: "message".to_string(),
+                        token_count: 2,
+                        source_bytes: b"nine".to_vec(),
+                    },
+                ],
+                2,
+            )
+            .unwrap();
+
+        let body = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": session_id }),
+        ));
+        let summary = body["summary"].as_str().unwrap();
+
+        assert!(summary.starts_with("session ccm-8518e338 (last active 2m ago):"));
+        assert!(summary.contains("2 compartments"));
+        assert!(summary.contains("coverage ordinal 10"));
+        assert!(summary.contains("boundary present"));
+        assert!(summary.contains("1 pending drop"));
+        assert!(summary.contains("2 tags"));
+        assert!(summary.contains("last historian: published seq 3"));
+        assert!(summary.ends_with("surface active"));
+    }
+
+    #[test]
+    fn session_status_rereads_when_wrapup_latch_changes_during_snapshot() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let handler = Arc::new(handler);
+        let hook_handler = Arc::clone(&handler);
+        let hook_store = Arc::clone(&store);
+        *handler
+            .status_snapshot_hook
+            .lock()
+            .expect("status snapshot hook mutex") = Some(Box::new(move || {
+            let loaded = hook_store.load("ses").unwrap();
+            let mut meta = loaded.meta.clone();
+            meta.coverage_ordinal = Some(7);
+            hook_store
+                .commit("ses", loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+            hook_handler
+                .wrapup_sessions
+                .lock()
+                .expect("wrapup sessions mutex")
+                .insert(
+                    "ses".to_string(),
+                    LiveWrapupSession {
+                        token: Arc::new(()),
+                        rounds: 3,
+                    },
+                );
+        }));
+
+        let body = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        assert_eq!(body["wrapup_active"], json!(true));
+        assert_eq!(body["wrapup_rounds"], json!(3));
+        assert_eq!(body["coverage_ordinal"], json!(7));
+        assert_eq!(body["row_version"], json!(1));
+    }
+
+    #[test]
+    fn session_status_sanitizes_controls_and_caps_summary() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.historian.last_failure = Some(format!("bad\0line\n{}", "x".repeat(2_000)));
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
+        let body = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        let summary = body["summary"].as_str().unwrap();
+        assert!(!summary.chars().any(char::is_control));
+        assert!(!summary.contains('\n'));
+        assert!(summary.chars().count() <= 500);
+    }
+
+    #[test]
+    fn agent_drops_append_rejects_missing_command_id() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        mint_drop_tag(&store, "a#0");
+
+        let outcome = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1",
+            }),
+        );
+        assert_eq!(error_code(outcome), "bad_request");
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[test]
@@ -7638,11 +12717,12 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
 
-        let first = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        mint_drop_tag(&store, "a#0");
+        let first = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(first, json!({ "ok": true, "queued": 1 }));
         let pending = store.load_pending_agent_drops("ses").unwrap();
 
-        let retry = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        let retry = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
     }
@@ -7651,21 +12731,25 @@ mod tests {
     async fn ctx_reduce_command_id_survives_transform_drain() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
-        let queued = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        mint_drop_tag(&store, "a#0");
+        let queued = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(queued, json!({ "ok": true, "queued": 1 }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
 
-        let response = call_transform(&handler, vec![ck("a", 1, "drop me")]).await;
+        let mut transform_request = request(vec![ck("a", 1, "drop me")]);
+        transform_request["serializer_profile"] = json!("claude-code-anthropic");
+        transform_request["tool_present"] = json!(true);
+        let response = call_transform_request(&handler, transform_request).await;
         assert!(serde_json::to_string(&response)
             .unwrap()
             .contains("[dropped]"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-        let retry = queue_drop_command_with_id(&handler, "a#0", "tool-use-1");
+        let retry = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-        let new_request = queue_drop_command_with_id(&handler, "a#0", "tool-use-2");
+        let new_request = queue_drop_command_with_id(&handler, "tool-use-2");
         assert_eq!(new_request, json!({ "ok": true, "queued": 1 }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
     }
@@ -7681,8 +12765,27 @@ mod tests {
                 json!({
                     "method": "agent_drops.append",
                     "session_id": "ses",
-                    "drop_ids": ["a#0"],
+                    "drop": "1",
                     "command_id": command_id,
+                }),
+            );
+            assert_eq!(error_code(outcome), "bad_request");
+        }
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_drops_append_rejects_missing_or_empty_raw_drop() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        for drop in [Value::Null, json!(""), json!("  "), json!(["1"])] {
+            let outcome = handler.handle_agent_drops_value(
+                7,
+                json!({
+                    "method": "agent_drops.append",
+                    "session_id": "ses",
+                    "drop": drop,
+                    "command_id": "command"
                 }),
             );
             assert_eq!(error_code(outcome), "bad_request");
@@ -7695,7 +12798,7 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         store
-            .mint_or_get_tags(
+            .seed_tags_for_test(
                 "ses",
                 &[
                     TagMintInput {
@@ -7723,6 +12826,7 @@ mod tests {
                 "method": "agent_drops.append",
                 "session_id": "ses",
                 "drop": "§1§-2, 99",
+                "command_id": "raw-1",
             }),
         ) {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -7739,6 +12843,7 @@ mod tests {
                 "method": "agent_drops.append",
                 "session_id": "ses",
                 "drop": "1-2",
+                "command_id": "raw-2",
             }),
         ) {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -7753,6 +12858,7 @@ mod tests {
                 "method": "agent_drops.append",
                 "session_id": "ses",
                 "drop": "3-1",
+                "command_id": "raw-bad",
             }),
         ) {
             HandlerOutcome::Error { code, .. } => assert_eq!(code, "bad_request"),
@@ -7766,7 +12872,7 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         store
-            .mint_or_get_tags(
+            .seed_tags_for_test(
                 "ses",
                 &[TagMintInput {
                     block_id: "a#0".to_string(),
@@ -7806,6 +12912,1343 @@ mod tests {
         };
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retryable_snapshot_conditions_do_not_poison_command_ids() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let missing_request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "missing-retry"
+        });
+        let missing = tool_body(handler.dispatch_value(7, missing_request.clone()).await);
+        assert_eq!(missing["disposition"], json!("retryable"));
+        assert_eq!(missing["reason"], json!("snapshot_unavailable"));
+        assert!(store
+            .load_wrapup_command("ses", "missing-retry")
+            .unwrap()
+            .is_none());
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let retry = tool_body(handler.dispatch_value(7, missing_request).await);
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
+        assert!(store
+            .load_wrapup_command("ses", "missing-retry")
+            .unwrap()
+            .is_some());
+
+        let mut malformed = transform_request(wrapup_messages(20, 40), 0, 200_000);
+        malformed.messages[0].mid = "reserved#mid".to_string();
+        let generation = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .begin("ses");
+        let revert_epoch = store.load("ses").unwrap().meta.revert_epoch;
+        handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .finish_ready("ses", generation, Arc::new(malformed), revert_epoch, 1);
+        let malformed_request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "malformed-retry"
+        });
+        let malformed_response =
+            tool_body(handler.dispatch_value(7, malformed_request.clone()).await);
+        assert_eq!(malformed_response["disposition"], json!("retryable"));
+        assert_eq!(malformed_response["reason"], json!("snapshot_unavailable"));
+        assert!(store
+            .load_wrapup_command("ses", "malformed-retry")
+            .unwrap()
+            .is_none());
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let retry = tool_body(handler.dispatch_value(7, malformed_request).await);
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
+        assert!(store
+            .load_wrapup_command("ses", "malformed-retry")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_no_models_is_terminal_and_retains_command() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        let (handler, store, _dir, _project) = handler_with_store(Arc::clone(&producer), config);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "no-models"
+        });
+
+        let response = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(response["ok"], json!(false), "{response}");
+        assert_eq!(response["disposition"], json!("failed"), "{response}");
+        assert_eq!(response["reason"], json!("no_models"), "{response}");
+        assert!(
+            response["rounds"].is_u64(),
+            "terminal failure carries rounds: {response}"
+        );
+        assert!(response["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no historian models"));
+        let row = store
+            .load_wrapup_command("ses", "no-models")
+            .unwrap()
+            .expect("terminal failure row");
+        assert_eq!(row.disposition, "failed");
+        assert_eq!(row.rounds, response["rounds"].as_u64().unwrap() as usize);
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+
+        let replay = tool_body(handler.dispatch_value(7, request).await);
+        assert_eq!(replay["ok"], json!(false), "{replay}");
+        assert_eq!(replay["reason"], json!("no_models"), "{replay}");
+        assert_eq!(replay["replayed"], json!(true));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_unknown_module_retries_once_then_is_terminal() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .start_errors
+            .lock()
+            .expect("start errors mutex")
+            .extend([
+                Err(HistorianProducerError::Subc(
+                    historian_producer::ProducerErrorBody::untagged(
+                        "unknown_module",
+                        "runner module broca is unavailable",
+                    ),
+                )),
+                Err(HistorianProducerError::Subc(
+                    historian_producer::ProducerErrorBody::untagged(
+                        "unknown_module",
+                        "runner module broca is unavailable",
+                    ),
+                )),
+            ]);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        *handler
+            .unknown_module_retry_delay
+            .lock()
+            .expect("unknown module retry delay mutex") = Some(Duration::ZERO);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "runner-missing"
+        });
+
+        let response = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(response["ok"], json!(false), "{response}");
+        assert_eq!(response["disposition"], json!("failed"), "{response}");
+        assert_eq!(
+            response["reason"],
+            json!("runner_module_unavailable"),
+            "{response}"
+        );
+        assert!(
+            response["rounds"].is_u64(),
+            "terminal failure carries rounds: {response}"
+        );
+        assert!(response["detail"]
+            .as_str()
+            .unwrap()
+            .contains("unknown_module"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store
+                .load_wrapup_command("ses", "runner-missing")
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "failed"
+        );
+
+        let replay = tool_body(handler.dispatch_value(7, request).await);
+        assert_eq!(replay["replayed"], json!(true));
+        assert_eq!(replay["reason"], json!("runner_module_unavailable"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_drives_to_keep_watermark_and_reinvoke_is_idle() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        assert!(body["summary"]
+            .as_str()
+            .unwrap()
+            .contains("takes effect on your next message"));
+        let starts = producer.starts.load(Ordering::SeqCst);
+        assert!((2..=historian::MAX_WRAPUP_ROUNDS).contains(&starts));
+        let final_end = store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert_eq!(final_end, 60);
+
+        let retry = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+        assert_eq!(retry["ok"], json!(true));
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
+        assert!(retry["summary"]
+            .as_str()
+            .unwrap()
+            .contains("nothing to compact"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_handler_contract_edges_hold() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+
+        // Empty command_id must reject: every retrying caller would otherwise share
+        // one durable ledger key.
+        let empty_id = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "session.wrapup",
+                    "v": 1,
+                    "session_id": "ses",
+                    "command_id": ""
+                }),
+            )
+            .await;
+        match empty_id {
+            HandlerOutcome::Error { code, message } => {
+                assert_eq!(code, "bad_request");
+                assert!(message.contains("nonempty"), "{message}");
+            }
+            other => panic!("empty command_id must reject, got {other:?}"),
+        }
+
+        // Negative keep is a clamp input, not an error: [WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX].
+        let negative_keep = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": -3
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(negative_keep["ok"], json!(true), "{negative_keep}");
+        assert_eq!(negative_keep["disposition"], json!("completed"));
+        // keep=-3 clamps to WRAPUP_KEEP_MIN=5: coverage must reach past keep=20's
+        // watermark (60), proving the clamp floor was used, not the default or a reject.
+        let final_end = _store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert!(
+            final_end > 60,
+            "keep must clamp to MIN=5, got end {final_end}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn already_in_progress_response_carries_rounds() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let guard = handler
+            .try_claim_wrapup_session("ses")
+            .expect("first claim");
+        let busy = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+        drop(guard);
+        assert_eq!(busy["disposition"], json!("already_in_progress"), "{busy}");
+        assert!(
+            busy["rounds"].is_u64(),
+            "machine contract: rounds must ride every disposition, got {busy}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_wrapup_command_replays_verbatim_without_a_second_drive() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "wrapup-one"
+        });
+
+        let first = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(first["disposition"], json!("completed"), "{first}");
+        let starts = producer.starts.load(Ordering::SeqCst);
+        let stored = store
+            .load_wrapup_command("ses", "wrapup-one")
+            .unwrap()
+            .expect("terminal command row");
+        assert_eq!(stored.disposition, first["disposition"].as_str().unwrap());
+        assert_eq!(json!(stored.rounds), first["rounds"]);
+        assert_eq!(stored.summary, first["summary"].as_str().unwrap());
+
+        let mut retry = request;
+        retry["keep"] = json!("ignored-on-replay");
+        let replay = tool_body(handler.dispatch_value(7, retry).await);
+        assert_eq!(replay["replayed"], json!(true));
+        assert_eq!(replay["disposition"], first["disposition"]);
+        assert_eq!(replay["rounds"], first["rounds"]);
+        assert_eq!(replay["summary"], first["summary"]);
+        assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+
+        let different = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "wrapup-two"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(different["disposition"], json!("nothing_to_compact"));
+        assert_eq!(different.get("replayed"), None);
+        assert!(store
+            .load_wrapup_command("ses", "wrapup-two")
+            .unwrap()
+            .is_some());
+        assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_failed_wrapup_row_is_replaced_and_response_loss_replays() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        store
+            .seed_legacy_wrapup_command_for_test(
+                "ses",
+                "legacy-failed",
+                "failed",
+                1,
+                "old failure",
+                17,
+            )
+            .unwrap();
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "keep": 5,
+            "command_id": "legacy-failed"
+        });
+
+        let first = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_ne!(first.get("replayed"), Some(&json!(true)), "{first}");
+        assert_eq!(first["disposition"], json!("completed"), "{first}");
+        let starts_after_lost_response = producer.starts.load(Ordering::SeqCst);
+        assert!(starts_after_lost_response > 0);
+        let stored = store
+            .load_wrapup_command("ses", "legacy-failed")
+            .unwrap()
+            .expect("successful result replaces the failed audit row");
+        assert_eq!(stored.disposition, "completed");
+        assert_eq!(stored.rounds, first["rounds"].as_u64().unwrap() as usize);
+        assert_eq!(stored.summary, first["summary"].as_str().unwrap());
+        assert!(stored.summary.ends_with("; replaced failed record from 17"));
+
+        // Simulate losing the first response. The same command id must replay the
+        // durable terminal result without opening another producer run.
+        let replay = tool_body(handler.dispatch_value(7, request).await);
+        assert_eq!(replay["replayed"], json!(true), "{replay}");
+        assert_eq!(replay["disposition"], first["disposition"]);
+        assert_eq!(replay["rounds"], first["rounds"]);
+        assert_eq!(replay["summary"], first["summary"]);
+        assert_eq!(
+            producer.starts.load(Ordering::SeqCst),
+            starts_after_lost_response
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_connect_failure_without_durable_backoff_is_snapshot_unavailable() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .connect_errors
+            .lock()
+            .expect("connect errors mutex")
+            .push_back(HistorianProducerError::Connect {
+                endpoint: "127.0.0.1:1".to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+            });
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let conflict_store = Arc::clone(&store);
+        *handler
+            .connect_failure_commit_hook
+            .lock()
+            .expect("connect failure commit hook mutex") = Some(Box::new(move || {
+            let loaded = conflict_store.load("ses").unwrap();
+            conflict_store
+                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+        }));
+
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 5,
+                        "command_id": "connect-conflict"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(response["disposition"], json!("retryable"), "{response}");
+        assert_eq!(response["reason"], json!("snapshot_unavailable"));
+        assert!(store
+            .load("ses")
+            .unwrap()
+            .meta
+            .historian
+            .failure_backoff_at_ms
+            .is_none());
+        assert!(store
+            .load_wrapup_command("ses", "connect-conflict")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_connect_failure_retries_one_cas_conflict_and_arms_backoff() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .connect_errors
+            .lock()
+            .expect("connect errors mutex")
+            .push_back(HistorianProducerError::Connect {
+                endpoint: "127.0.0.1:1".to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+            });
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let conflict_store = Arc::clone(&store);
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        *handler
+            .connect_failure_commit_hook
+            .lock()
+            .expect("connect failure commit hook mutex") = Some(Box::new(move || {
+            if hook_calls_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                let loaded = conflict_store.load("ses").unwrap();
+                conflict_store
+                    .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                    .unwrap();
+            }
+        }));
+
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 5,
+                        "command_id": "connect-retry"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(response["disposition"], json!("retryable"), "{response}");
+        assert_eq!(response["reason"], json!("backoff_active"));
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+        assert!(store
+            .load("ses")
+            .unwrap()
+            .meta
+            .historian
+            .failure_backoff_at_ms
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_publish_recut_is_retryable_and_never_recorded() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let hook_store = Arc::clone(&store);
+        *producer
+            .on_await_output
+            .lock()
+            .expect("await-output hook mutex") = Some(Box::new(move || {
+            let loaded = hook_store.load("ses").unwrap();
+            let mut meta = loaded.meta.clone();
+            meta.revert_epoch = meta.revert_epoch.saturating_add(1);
+            hook_store
+                .commit("ses", loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+        }));
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "keep": 5,
+            "command_id": "recut-retry"
+        });
+
+        let stale = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(stale["disposition"], json!("retryable"), "{stale}");
+        assert_eq!(stale["reason"], json!("snapshot_stale"));
+        assert!(store
+            .load_wrapup_command("ses", "recut-retry")
+            .unwrap()
+            .is_none());
+
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.historian.failure_backoff_at_ms = None;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let retry = tool_body(handler.dispatch_value(7, request).await);
+        assert!(matches!(
+            retry["disposition"].as_str(),
+            Some("completed" | "nothing_to_compact")
+        ));
+        assert!(store
+            .load_wrapup_command("ses", "recut-retry")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_generation_is_fenced_before_historian_additive_writes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let before = historian_additive_rows(&store, "ses", &project);
+        let hook_handler = Arc::clone(&handler);
+        let hook_producer = Arc::clone(&producer);
+        *producer
+            .on_await_output
+            .lock()
+            .expect("await-output hook mutex") = Some(Box::new(move || {
+            let prompt = hook_producer
+                .prompts
+                .lock()
+                .expect("prompts mutex")
+                .last()
+                .cloned()
+                .expect("producer prompt");
+            let (start, end) = prompt_ordinal_range(&prompt).expect("prompt ordinal range");
+            hook_producer
+                .await_results
+                .lock()
+                .expect("await results mutex")
+                .push_back(Ok(ProducerOutput {
+                    text: historian_output_with_fact(
+                        start,
+                        end,
+                        "A stale snapshot must not publish this fact.",
+                    ),
+                    length_capped: false,
+                }));
+            hook_handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .begin("ses");
+        }));
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 5,
+                        "command_id": "generation-retry"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(response["disposition"], json!("retryable"), "{response}");
+        assert_eq!(response["reason"], json!("snapshot_stale"));
+        assert!(store
+            .load_wrapup_command("ses", "generation-retry")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            historian_additive_rows(&store, "ses", &project),
+            before,
+            "the generation fence must run before compartments, transcripts, facts, or the publication floor change"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_publication_holds_snapshot_lock_through_store_write() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let before = historian_additive_rows(&store, "ses", &project);
+        let snapshots = Arc::clone(&handler.transform_snapshots);
+        let observed_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_lock_for_hook = Arc::clone(&observed_lock);
+        *handler
+            .publication_fence_write_hook
+            .lock()
+            .expect("publication fence write hook mutex") =
+            Some(Box::new(move || match snapshots.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    observed_lock_for_hook.store(true, Ordering::SeqCst);
+                }
+                Ok(_) => panic!("snapshot lock was released before the store write"),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("transform snapshots mutex poisoned")
+                }
+            }));
+
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert!(
+            matches!(
+                response["disposition"].as_str(),
+                Some("completed" | "nothing_to_compact")
+            ),
+            "{response}"
+        );
+        assert!(observed_lock.load(Ordering::SeqCst));
+        assert_ne!(historian_additive_rows(&store, "ses", &project), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fence_cleanup_uses_fenced_abandon_without_cooldown() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let before = historian_additive_rows(&store, "ses", &project);
+        let hook_handler = Arc::clone(&handler);
+        let hook_producer = Arc::clone(&producer);
+        *producer
+            .on_await_output
+            .lock()
+            .expect("await-output hook mutex") = Some(Box::new(move || {
+            let prompt = hook_producer
+                .prompts
+                .lock()
+                .expect("prompts mutex")
+                .last()
+                .cloned()
+                .expect("producer prompt");
+            let (start, end) = prompt_ordinal_range(&prompt).expect("prompt ordinal range");
+            hook_producer
+                .await_results
+                .lock()
+                .expect("await results mutex")
+                .push_back(Ok(ProducerOutput {
+                    text: historian_output_with_fact(start, end, "Atomic cleanup race fact."),
+                    length_capped: false,
+                }));
+            hook_handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .begin("ses");
+        }));
+        let abandon_hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let abandon_hook_calls_for_hook = Arc::clone(&abandon_hook_calls);
+        store.set_abandon_historian_hook(Box::new(move || {
+            abandon_hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let stale = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert_eq!(stale["disposition"], json!("retryable"), "{stale}");
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, None);
+        assert_eq!(
+            abandon_hook_calls.load(Ordering::SeqCst),
+            1,
+            "the in-transaction abandon hook must run before cleanup commits"
+        );
+        assert_eq!(historian_additive_rows(&store, "ses", &project), before);
+
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let starts_before_retry = producer.starts.load(Ordering::SeqCst);
+        let retry = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert!(
+            producer.starts.load(Ordering::SeqCst) > starts_before_retry,
+            "immediate retry was not admitted: {retry}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fence_rejection_leaves_no_backoff_and_immediate_retry_executes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        let hook_handler = Arc::clone(&handler);
+        let hook_producer = Arc::clone(&producer);
+        *producer
+            .on_await_output
+            .lock()
+            .expect("await-output hook mutex") = Some(Box::new(move || {
+            let prompt = hook_producer
+                .prompts
+                .lock()
+                .expect("prompts mutex")
+                .last()
+                .cloned()
+                .expect("producer prompt");
+            let (start, end) = prompt_ordinal_range(&prompt).expect("prompt ordinal range");
+            hook_producer
+                .await_results
+                .lock()
+                .expect("await results mutex")
+                .push_back(Ok(ProducerOutput {
+                    text: historian_output_with_fact(start, end, "Fence race fact."),
+                    length_capped: false,
+                }));
+            hook_handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .begin("ses");
+        }));
+        let stale = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert_eq!(stale["disposition"], json!("retryable"), "{stale}");
+        assert_eq!(stale["reason"], json!("snapshot_stale"));
+        // The fence race is not a producer failure: no cooldown may be armed, so an
+        // immediate retry with a fresh snapshot executes instead of backoff_active.
+        assert_eq!(
+            store
+                .load("ses")
+                .unwrap()
+                .meta
+                .historian
+                .failure_backoff_at_ms,
+            None,
+            "fence rejection must not arm the failure backoff"
+        );
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        // The retry must be ADMITTED (no cooldown at entry) and drive the producer.
+        // The mock's canned output no longer matches the window, so the retry may
+        // fail validation afterwards; being turned away at the door is the bug.
+        let starts_before_retry = producer.starts.load(Ordering::SeqCst);
+        let retry = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
+                )
+                .await,
+        );
+        assert!(
+            producer.starts.load(Ordering::SeqCst) > starts_before_retry,
+            "immediate retry must be admitted and drive the producer, got {retry}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_snapshot_lease_limit_rejects_then_releases_for_later_wrapup() {
+        const ACTIVE_LEASE_LIMIT: usize = 8;
+        assert_eq!(ACTIVE_LEASE_LIMIT, MAX_ACTIVE_SNAPSHOT_LEASES);
+
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let handler = Arc::new(handler);
+        for index in 0..=ACTIVE_LEASE_LIMIT {
+            let session_id = format!("lease-{index}");
+            let channel = 20 + index as u16;
+            handler.bind_route(
+                channel,
+                binding(project.to_str().unwrap(), session_id.as_str()),
+            );
+            cache_wrapup_messages_for_session(
+                &handler,
+                &session_id,
+                (1..=10)
+                    .map(|ordinal| {
+                        ck(
+                            &format!("{session_id}-m{ordinal}"),
+                            ordinal,
+                            "lease budget work",
+                        )
+                    })
+                    .collect(),
+            );
+        }
+
+        let mut blocked = Vec::new();
+        for index in 0..ACTIVE_LEASE_LIMIT {
+            let handler = Arc::clone(&handler);
+            blocked.push(tokio::spawn(async move {
+                handler
+                    .dispatch_value(
+                        20 + index as u16,
+                        json!({
+                            "method": "session.wrapup",
+                            "v": 1,
+                            "session_id": format!("lease-{index}"),
+                            "keep": 5
+                        }),
+                    )
+                    .await
+            }));
+            wait_for_count(&producer.starts, index + 1).await;
+        }
+
+        let overflow = tokio::time::timeout(
+            Duration::from_millis(100),
+            handler.dispatch_value(
+                20 + ACTIVE_LEASE_LIMIT as u16,
+                json!({
+                    "method": "session.wrapup",
+                    "v": 1,
+                    "session_id": format!("lease-{ACTIVE_LEASE_LIMIT}"),
+                    "keep": 5
+                }),
+            ),
+        )
+        .await
+        .expect("the lease over the global limit must reject before producer output");
+        let overflow = tool_body(overflow);
+        assert_eq!(overflow["disposition"], json!("retryable"), "{overflow}");
+        assert_eq!(overflow["reason"], json!("snapshot_unavailable"));
+        assert_eq!(overflow["summary"], "too many concurrent wrapups");
+        assert_eq!(producer.starts.load(Ordering::SeqCst), ACTIVE_LEASE_LIMIT);
+
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        for drive in blocked {
+            let response = tool_body(drive.await.unwrap());
+            assert_eq!(response["ok"], json!(true), "{response}");
+        }
+
+        let later = tool_body(
+            handler
+                .dispatch_value(
+                    20 + ACTIVE_LEASE_LIMIT as u16,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": format!("lease-{ACTIVE_LEASE_LIMIT}"),
+                        "keep": 5
+                    }),
+                )
+                .await,
+        );
+        assert!(
+            matches!(
+                later["disposition"].as_str(),
+                Some("completed" | "nothing_to_compact")
+            ),
+            "{later}"
+        );
+        assert_eq!(
+            producer.starts.load(Ordering::SeqCst),
+            ACTIVE_LEASE_LIMIT + 1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_session_wrapup_returns_progress_without_double_fire() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(
+            &handler,
+            (1..=10).map(|n| ck(&format!("m{n}"), n, "work")).collect(),
+        );
+        let handler = Arc::new(handler);
+        let first_handler = Arc::clone(&handler);
+        let first = tokio::spawn(async move {
+            first_handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
+                )
+                .await
+        });
+        wait_for_count(&producer.starts, 1).await;
+
+        let second = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 1,
+                        "command_id": "joined-command"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(second["ok"], json!(true));
+        assert_eq!(
+            second["summary"],
+            "wrapup already in progress, 0 rounds done"
+        );
+        assert_eq!(second["disposition"], json!("already_in_progress"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+        assert!(store
+            .load_wrapup_command("ses", "joined-command")
+            .unwrap()
+            .is_none());
+
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        let first = tool_body(first.await.unwrap());
+        assert_eq!(first["ok"], json!(true), "{first}");
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+
+        let later = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 1,
+                        "command_id": "joined-command"
+                    }),
+                )
+                .await,
+        );
+        assert_ne!(later["disposition"], json!("already_in_progress"));
+        assert!(store
+            .load_wrapup_command("ses", "joined-command")
+            .unwrap()
+            .is_some());
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_stops_at_the_five_round_cap() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(11, 36_000));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["ok"], json!(false), "{body}");
+        assert_eq!(body["disposition"], json!("retryable"));
+        assert_eq!(body["reason"], json!("snapshot_unavailable"));
+        assert!(body["summary"]
+            .as_str()
+            .unwrap()
+            .contains("stopped at the 5-round cap"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 5);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_stops_on_normal_producer_failure_state() {
+        let producer = Arc::new(ProducerState::default());
+        producer.await_results.lock().unwrap().extend([
+            Err(HistorianProducerError::TimedOut),
+            Err(HistorianProducerError::TimedOut),
+        ]);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(
+            &handler,
+            (1..=10).map(|n| ck(&format!("m{n}"), n, "work")).collect(),
+        );
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["ok"], json!(false), "{body}");
+        assert_eq!(body["disposition"], json!("retryable"));
+        assert_eq!(body["reason"], json!("backoff_active"));
+        assert!(body["summary"].as_str().unwrap().contains("producer"));
+        let durable = store.load("ses").unwrap().meta.historian;
+        assert_eq!(durable.state, HistorianPhase::Idle);
+        assert!(durable.last_failure.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_post_recut_transform_keeps_wrapup_snapshot_in_flight() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let loaded = store.load("ses").unwrap();
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        store
+            .replace_compartments(
+                "ses",
+                &[
+                    stored_comp(1, 1, 2, "m2", "first"),
+                    stored_comp(2, 3, 4, "m4", "second"),
+                ],
+            )
+            .unwrap();
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let generation = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .begin("ses");
+        let before = store.load("ses").unwrap();
+        let recut = store
+            .truncate_compartments_for_revert("ses", 1, before.row_version)
+            .unwrap();
+        assert_eq!(recut.revert_epoch, 1);
+        assert!(matches!(
+            handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .get("ses"),
+            TransformSnapshotLookup::InFlight
+        ));
+        assert!(generation > 0);
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+        assert_eq!(body["disposition"], json!("retryable"));
+        assert_eq!(body["reason"], json!("snapshot_unavailable"));
+        assert_eq!(
+            body["summary"],
+            "wrapup unavailable until a full session transform has been observed"
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_refuses_epoch_mismatch_and_lru_eviction_honestly() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.revert_epoch = 1;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let mismatch = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "stale-retry"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(mismatch["disposition"], json!("retryable"));
+        assert_eq!(mismatch["reason"], json!("snapshot_stale"));
+        assert_eq!(
+            mismatch["summary"],
+            "wrapup unavailable until a full session transform has been observed"
+        );
+        assert!(store
+            .load_wrapup_command("ses", "stale-retry")
+            .unwrap()
+            .is_none());
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let retry = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "stale-retry"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
+        assert!(store
+            .load_wrapup_command("ses", "stale-retry")
+            .unwrap()
+            .is_some());
+
+        handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .max_ready_bytes = 0;
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        let evicted = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+        assert_eq!(evicted["disposition"], json!("retryable"));
+        assert_eq!(evicted["reason"], json!("snapshot_unavailable"));
+        assert_eq!(
+            evicted["summary"],
+            "wrapup unavailable until a full session transform has been observed"
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_budget_bounds_busy_join_without_double_drive() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+        let transformed = call_transform(&handler, messages).await;
+        assert_eq!(transformed["historian"]["fired"], json!(true));
+        wait_for_count(&producer.starts, 1).await;
+        *handler
+            .wrapup_operation_budget
+            .lock()
+            .expect("wrapup operation budget mutex") = Some(Duration::from_millis(40));
+
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "keep": 5,
+            "command_id": "budget-retry"
+        });
+        let body = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(body["disposition"], json!("retryable"), "{body}");
+        assert_eq!(body["reason"], json!("budget_exhausted"));
+        assert!(store
+            .load_wrapup_command("ses", "budget-retry")
+            .unwrap()
+            .is_none());
+        assert!(body["summary"]
+            .as_str()
+            .unwrap()
+            .contains("wrapup request budget expired"));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        wait_for_idle(&store).await;
+        *handler
+            .wrapup_operation_budget
+            .lock()
+            .expect("wrapup operation budget mutex") = None;
+        let retry = tool_body(handler.dispatch_value(7, request).await);
+        assert!(matches!(
+            retry["disposition"].as_str(),
+            Some("completed" | "nothing_to_compact")
+        ));
+        assert!(store
+            .load_wrapup_command("ses", "budget-retry")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_refuses_active_historian_failure_backoff_at_entry() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(20, 40));
+        seed_abandoned_idle(
+            &store,
+            now_ms() + HISTORIAN_FAILURE_BACKOFF_MS,
+            "producer failed",
+        );
+
+        let request = json!({
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": "ses",
+            "command_id": "backoff-retry"
+        });
+        let body = tool_body(handler.dispatch_value(7, request.clone()).await);
+        assert_eq!(body["disposition"], json!("retryable"));
+        assert_eq!(body["reason"], json!("backoff_active"));
+        assert!(body["summary"]
+            .as_str()
+            .unwrap()
+            .contains("historian failure backoff active for"));
+        assert!(store
+            .load_wrapup_command("ses", "backoff-retry")
+            .unwrap()
+            .is_none());
+        assert_eq!(producer.connects.load(Ordering::SeqCst), 0);
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.historian.failure_backoff_at_ms = None;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let retry = tool_body(handler.dispatch_value(7, request).await);
+        assert_eq!(retry["disposition"], json!("nothing_to_compact"));
+        assert!(store
+            .load_wrapup_command("ses", "backoff-retry")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_coverage_beyond_cached_terminal_is_nothing_to_compact() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let loaded = store.load("ses").unwrap();
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        store
+            .replace_compartments("ses", &[stored_comp(1, 1, 10, "m10", "covered")])
+            .unwrap();
+        cache_wrapup_messages(
+            &handler,
+            vec![ck("m1", 1, "one"), ck("m2", 2, "two"), ck("m3", 3, "three")],
+        );
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+        assert_eq!(body["disposition"], json!("nothing_to_compact"));
+        assert_eq!(body["rounds"], json!(0));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8251,6 +14694,110 @@ mod tests {
         assert_eq!(producer.await_outputs.load(Ordering::SeqCst), 0);
     }
 
+    #[derive(Clone, Copy)]
+    enum ReattachGenerationCase {
+        SupersededBeforeReattachSpawn,
+        FinishedReadyWithSameGeneration,
+    }
+
+    async fn run_reattach_generation_case(
+        case: ReattachGenerationCase,
+    ) -> (
+        HistorianAdditiveRows,
+        HistorianAdditiveRows,
+        HistorianDurableState,
+        bool,
+    ) {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        producer
+            .outputs
+            .lock()
+            .unwrap()
+            .push_back(historian_output_with_fact(
+                1,
+                3,
+                "Reattached generation fact.",
+            ));
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = big_messages();
+        seed_awaiting(&store, &messages);
+        let before = historian_additive_rows(&store, "ses", &project);
+        let hook_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_ran_for_hook = Arc::clone(&hook_ran);
+        let snapshots = Arc::clone(&handler.transform_snapshots);
+        let store_for_hook = Arc::clone(&store);
+        let messages_for_hook = messages.clone();
+        *handler
+            .between_transform_and_prepare
+            .lock()
+            .expect("interleave hook mutex") = Some(Box::new(move || {
+            hook_ran_for_hook.store(true, Ordering::SeqCst);
+            let mut snapshots = snapshots.lock().expect("transform snapshots mutex");
+            match case {
+                ReattachGenerationCase::SupersededBeforeReattachSpawn => {
+                    snapshots.begin("ses");
+                }
+                ReattachGenerationCase::FinishedReadyWithSameGeneration => {
+                    // Move the cache record from pending to completed for the same numeric
+                    // version before publication. This proves publication accepts a completed
+                    // record when its version did not change.
+                    let parsed = transform_request(messages_for_hook, 1, 200_000);
+                    let retained_bytes = serde_json::to_vec(&parsed).unwrap().len();
+                    let revert_epoch = store_for_hook.load("ses").unwrap().meta.revert_epoch;
+                    snapshots.finish_ready(
+                        "ses",
+                        1,
+                        Arc::new(parsed),
+                        revert_epoch,
+                        retained_bytes,
+                    );
+                    assert!(matches!(
+                        snapshots.entries.get("ses"),
+                        Some(TransformSnapshot::Ready { generation: 1, .. })
+                    ));
+                }
+            }
+        }));
+
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["no_fire"], "reattaching");
+        wait_for_count(&producer.await_outputs, 1).await;
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        wait_for_idle(&store).await;
+
+        let after = historian_additive_rows(&store, "ses", &project);
+        let state = store.load("ses").unwrap().meta.historian;
+        (before, after, state, hook_ran.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reattach_snapshot_fence_rejects_pre_observation_supersession_and_accepts_ready() {
+        let (stale_before, stale_after, stale_state, stale_hook_ran) =
+            run_reattach_generation_case(ReattachGenerationCase::SupersededBeforeReattachSpawn)
+                .await;
+        assert!(stale_hook_ran, "the pre-reattach interleave hook must run");
+        assert_eq!(stale_after, stale_before);
+        assert_eq!(stale_state.state, HistorianPhase::Idle);
+        assert_eq!(stale_state.failure_backoff_at_ms, None);
+        assert_eq!(
+            stale_state.last_failure.as_deref(),
+            Some("publish rejected: transform snapshot state changed after reattach started")
+        );
+
+        let (control_before, control_after, control_state, control_hook_ran) =
+            run_reattach_generation_case(ReattachGenerationCase::FinishedReadyWithSameGeneration)
+                .await;
+        assert!(
+            control_hook_ran,
+            "the same-generation control hook must run"
+        );
+        assert_ne!(control_after, control_before);
+        assert_eq!(control_state.state, HistorianPhase::Idle);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handler_reattach_is_single_flight_and_latch_releases() {
         let producer = Arc::new(ProducerState::default());
@@ -8337,8 +14884,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handler_connect_failure_records_durable_detail_without_backoff_and_later_fire_clears_it(
-    ) {
+    async fn handler_connect_failure_records_backoff_and_later_fire_clears_it() {
         let producer = Arc::new(ProducerState::default());
         producer
             .connect_errors
@@ -8364,7 +14910,9 @@ mod tests {
         .await;
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
-        assert_eq!(state.failure_backoff_at_ms, None);
+        assert!(state
+            .failure_backoff_at_ms
+            .is_some_and(|until| until > now_ms()));
         assert!(
             state
                 .last_failure
@@ -8374,12 +14922,19 @@ mod tests {
         );
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
 
-        let second = call_transform(&handler, messages).await;
-        assert_eq!(second["historian"]["fired"], true);
+        let backed_off = call_transform(&handler, messages.clone()).await;
+        assert_eq!(backed_off["historian"]["fired"], false);
+        assert_eq!(backed_off["historian"]["no_fire"], "backoff");
+        assert_eq!(producer.connects.load(Ordering::SeqCst), 1);
+
+        expire_historian_backoff(&store);
+        let fresh = call_transform(&handler, messages).await;
+        assert_eq!(fresh["historian"]["fired"], true);
         wait_for_count(&producer.starts, 1).await;
         wait_for_idle(&store).await;
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.last_failure, None);
+        assert_eq!(state.failure_backoff_at_ms, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8558,6 +15113,7 @@ mod tests {
         compartments: Vec<StrictShadowCompartment>,
         memories: Vec<StrictShadowMemory>,
         memory_mutations: Vec<StrictShadowMemoryMutation>,
+        user_profile: Vec<String>,
         workspace: Option<StrictShadowWorkspace>,
         last_todo_state: String,
         acked_watermarks: StrictShadowWatermarks,
@@ -8672,6 +15228,7 @@ mod tests {
         history_budget_tokens: f64,
         cache_ttl: String,
         provider_error: String,
+        mid_turn: bool,
     }
 
     #[allow(dead_code)]
@@ -8794,6 +15351,7 @@ mod tests {
         assert_eq!(fixture.state_sync.compartments.len(), 2);
         assert_eq!(fixture.state_sync.memories.len(), 2);
         assert_eq!(fixture.state_sync.memory_mutations.len(), 1);
+        assert!(fixture.state_sync.user_profile.is_empty());
         assert_eq!(
             fixture
                 .state_sync
@@ -8817,7 +15375,8 @@ mod tests {
             "model_key": "ts/model",
             "usage": { "input_tokens": 45_000, "limit": 50_000 },
             "effective_execute_threshold": 65.0,
-            "cache_ttl": "5m"
+            "cache_ttl": "5m",
+            "mid_turn": false
         })
     }
 
@@ -8879,6 +15438,7 @@ mod tests {
             "compartments": compartments,
             "memories": [],
             "memory_mutations": [],
+            "user_profile": [],
         });
         if complete {
             let object = batch.as_object_mut().unwrap();
@@ -8888,6 +15448,65 @@ mod tests {
             object.insert("acked_watermarks".to_string(), json!({ "complete": true }));
         }
         batch
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paged_transform_page(
+        method: &str,
+        session: &str,
+        page_id: &str,
+        generation: u64,
+        index: usize,
+        total: usize,
+        complete: bool,
+        messages: Vec<Value>,
+    ) -> Value {
+        let mut page = json!({
+            "method": method,
+            "session_id": session,
+            "transform_page_id": page_id,
+            "transform_generation": generation,
+            "transform_page_index": index,
+            "transform_page_total": total,
+            "transform_page_complete": complete,
+            "messages": messages,
+        });
+        if method == "shadow_transform" {
+            page["shadow_generation"] = json!(generation);
+        }
+        if complete {
+            let object = page.as_object_mut().expect("transform page body");
+            if method == "transform" {
+                object.extend([
+                    ("kind".to_string(), json!("transform")),
+                    ("v".to_string(), json!(2)),
+                    ("serializer_profile".to_string(), json!("owned-llmrunner")),
+                    ("render_config".to_string(), json!("cfg0")),
+                    (
+                        "usage".to_string(),
+                        json!({
+                            "current_total_input_tokens": 45_000,
+                            "context_limit_tokens": 50_000,
+                        }),
+                    ),
+                ]);
+            } else {
+                object.extend([
+                    ("kind".to_string(), json!("shadow_transform")),
+                    ("shadow_generation".to_string(), json!(generation)),
+                    ("seed_pass".to_string(), json!(true)),
+                    ("pass_inputs".to_string(), shadow_pass_inputs()),
+                    ("ts_decision".to_string(), json!({ "class": "defer" })),
+                    ("declared_trim".to_string(), Value::Null),
+                    ("ts_ck_messages".to_string(), json!([])),
+                    ("input".to_string(), json!([])),
+                    ("ts_output".to_string(), json!([])),
+                    ("normalizations".to_string(), json!([])),
+                ]);
+            }
+        }
+        page["transform_page_digest"] = json!(transform_page_content_digest(&page));
+        page
     }
 
     fn seed_accounting(handler: &McHandler) -> (usize, usize) {
@@ -8922,6 +15541,534 @@ mod tests {
             .dispatch_value(7, json!({ "kind": "shadow_reset", "session_id": "ses" }))
             .await;
         assert_eq!(error_code(shadow_on_plain), "shadow_binding_required");
+    }
+
+    #[tokio::test]
+    async fn mirror_kill_switch_gates_shadow_lanes_but_not_authority_state_sync() {
+        let state = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.shadow_enabled = false;
+        let (handler, store, _dir, project) = handler_with_store(state, config);
+        let project_path = project.to_string_lossy().to_string();
+        let synced = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "compartments": [shadow_compartment(0, "authority summary")],
+                    "memories": [{
+                        "id": 42,
+                        "project_path": "git:authority-source",
+                        "category": "CONSTRAINTS",
+                        "content": "authority memory"
+                    }],
+                    "user_profile": ["authority profile"],
+                    "last_todo_state": "[]"
+                }),
+            )
+            .await;
+        assert!(matches!(synced, HandlerOutcome::Response(_)));
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].content,
+            "authority summary"
+        );
+        assert_eq!(
+            store
+                .load_active_memories(&project_path, 0)
+                .unwrap()
+                .iter()
+                .map(|memory| memory.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["authority memory"]
+        );
+        assert_eq!(
+            store.load_active_user_memories().unwrap(),
+            vec!["authority profile"]
+        );
+        let stale = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0
+                }),
+            )
+            .await;
+        let (stale_code, stale_message) = error_frame(stale);
+        assert_eq!(stale_code, "authority_seq_mismatch");
+        let details: Value = serde_json::from_str(&stale_message).unwrap();
+        assert_eq!(details["code"], "authority_seq_mismatch");
+        assert_eq!(details["durable_authority_seq"], 1);
+
+        handler.bind_route(8, binding(project.to_str().unwrap(), "shadow:ses"));
+        for method in ["state_sync", "shadow_transform", "shadow_reset"] {
+            let rejected = handler
+                .dispatch_value(8, json!({ "kind": method, "session_id": "shadow:ses" }))
+                .await;
+            assert_eq!(error_code(rejected), "shadow_disabled", "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn interleaved_authority_senders_keep_the_seq_fence() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
+        let request = || {
+            json!({
+                "kind": "state_sync",
+                "session_id": "ses",
+                "shadow_generation": 0,
+                "expected_shadow_seq": 0,
+                "compartments": [shadow_compartment(0, "first sender")],
+                "user_profile": [],
+            })
+        };
+
+        let (first, second) = tokio::join!(
+            handler.dispatch_value(7, request()),
+            handler.dispatch_value(7, request()),
+        );
+        let outcomes = [first, second];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, HandlerOutcome::Response(_)))
+                .count(),
+            1
+        );
+        let errors = outcomes
+            .into_iter()
+            .filter_map(|outcome| match outcome {
+                HandlerOutcome::Error { code, .. } => Some(code),
+                HandlerOutcome::Response(_) | HandlerOutcome::Streamed => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors, vec!["authority_seq_mismatch"]);
+        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn authority_state_sync_storage_feeds_real_transform_m0() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
+        let project_path = project.to_string_lossy().to_string();
+        let sync = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "seed_id": "authority-seed",
+                    "seed_generation": 0,
+                    "seed_batch_index": 0,
+                    "seed_batch_total": 1,
+                    "seed_complete": true,
+                    "seed_boundary_id": "m0#0",
+                    "workspace": null,
+                    "acked_watermarks": {},
+                    "compartments": [shadow_compartment(0, "authority summary")],
+                    "memories": [{
+                        "id": 42,
+                        "project_path": "git:authority-source",
+                        "category": "CONSTRAINTS",
+                        "content": "authority memory"
+                    }],
+                    "user_profile": ["authority profile"],
+                    "last_todo_state": "[]"
+                }),
+            )
+            .await;
+        assert!(matches!(sync, HandlerOutcome::Response(_)));
+
+        let response =
+            call_transform_request(&handler, request(vec![ck("m0", 0, "live authority input")]))
+                .await;
+        let m0 = m0_text(&response);
+        assert!(m0.contains("authority summary"), "{m0}");
+        assert!(m0.contains("authority memory"), "{m0}");
+        assert!(m0.contains("authority profile"), "{m0}");
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        assert_eq!(
+            store.load_active_memories(&project_path, 0).unwrap()[0].content,
+            "authority memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn paged_authority_transform_reassembles_and_executes_without_shadow_gate() {
+        let state = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.shadow_enabled = false;
+        let (handler, _store, _dir, _project) = handler_with_store(state, config);
+        let first = paged_transform_page(
+            "transform",
+            "ses",
+            "authority-page",
+            0,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "authority first").ck,
+            })],
+        );
+        let final_page = paged_transform_page(
+            "transform",
+            "ses",
+            "authority-page",
+            0,
+            1,
+            2,
+            true,
+            vec![json!({
+                "mid": "m1",
+                "ordinal": 1,
+                "ck": ck("m1", 1, "authority final").ck,
+            })],
+        );
+        let mut first = first;
+        first["native_messages"] = json!([{ "text": "a".repeat(280 * 1024) }]);
+        first["transform_page_digest"] = json!(transform_page_content_digest(&first));
+        let mut final_page = final_page;
+        final_page["native_messages"] = json!([{ "text": "b".repeat(280 * 1024) }]);
+        final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
+
+        let first_ack = handler.dispatch_value(7, first).await;
+        assert!(matches!(first_ack, HandlerOutcome::Response(_)));
+        let response = handler.dispatch_value(7, final_page).await;
+        let HandlerOutcome::Response(bytes) = response else {
+            panic!("authority page assembly should execute: {response:?}");
+        };
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(response["action"].is_string(), "{response}");
+    }
+
+    #[tokio::test]
+    async fn paged_authority_transform_rejections_discard_partial_assembly() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
+
+        let first = paged_transform_page(
+            "transform",
+            "ses",
+            "order-page",
+            0,
+            0,
+            3,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "first").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let newer = paged_transform_page(
+            "transform",
+            "ses",
+            "newer-page",
+            0,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "newer-m0",
+                "ordinal": 0,
+                "ck": ck("newer-m0", 0, "newer").ck,
+            })],
+        );
+        assert_eq!(
+            error_code(handler.dispatch_value(7, newer).await),
+            "authority_transform_page_attempt_mismatch"
+        );
+        let retry_first = paged_transform_page(
+            "transform",
+            "ses",
+            "order-page",
+            0,
+            0,
+            3,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "first").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, retry_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let gap = paged_transform_page(
+            "transform",
+            "ses",
+            "order-page",
+            0,
+            2,
+            3,
+            true,
+            vec![json!({
+                "mid": "m2",
+                "ordinal": 2,
+                "ck": ck("m2", 2, "gap").ck,
+            })],
+        );
+        assert_eq!(
+            error_code(handler.dispatch_value(7, gap).await),
+            "authority_transform_page_order_mismatch"
+        );
+
+        let replacement = paged_transform_page(
+            "transform",
+            "ses",
+            "replacement-page",
+            0,
+            0,
+            1,
+            true,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "replacement").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, replacement).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        let digest_first = paged_transform_page(
+            "transform",
+            "ses",
+            "digest-page",
+            0,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "digest-first").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, digest_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let mut changed_final = paged_transform_page(
+            "transform",
+            "ses",
+            "digest-page",
+            0,
+            1,
+            2,
+            true,
+            vec![json!({
+                "mid": "m1",
+                "ordinal": 1,
+                "ck": ck("m1", 1, "original-final").ck,
+            })],
+        );
+        changed_final["messages"] = json!([{
+            "mid": "m1",
+            "ordinal": 1,
+            "ck": ck("m1", 1, "changed-final").ck,
+        }]);
+        assert_eq!(
+            error_code(handler.dispatch_value(7, changed_final).await),
+            "authority_transform_page_digest_mismatch"
+        );
+
+        let generation_first = paged_transform_page(
+            "transform",
+            "ses",
+            "generation-page",
+            1,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "m0",
+                "ordinal": 0,
+                "ck": ck("m0", 0, "generation-first").ck,
+            })],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, generation_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let generation_changed = paged_transform_page(
+            "transform",
+            "ses",
+            "generation-page",
+            2,
+            1,
+            2,
+            true,
+            vec![json!({
+                "mid": "m1",
+                "ordinal": 1,
+                "ck": ck("m1", 1, "generation-final").ck,
+            })],
+        );
+        assert_eq!(
+            error_code(handler.dispatch_value(7, generation_changed).await),
+            "authority_transform_page_attempt_mismatch"
+        );
+
+        let partial_envelope = json!({
+            "method": "transform",
+            "session_id": "ses",
+            "transform_page_id": "partial",
+        });
+        assert_eq!(
+            error_code(handler.dispatch_value(7, partial_envelope).await),
+            "invalid_params"
+        );
+    }
+
+    #[tokio::test]
+    async fn paged_transform_sessions_are_isolated_and_shadow_pages_keep_the_gate() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "authority-a"));
+        handler.bind_route(9, binding(project.to_str().unwrap(), "authority-b"));
+
+        for (channel, session, mid, text) in [
+            (8, "authority-a", "a0", "authority a"),
+            (9, "authority-b", "b0", "authority b"),
+        ] {
+            let first = paged_transform_page(
+                "transform",
+                session,
+                &format!("page-{session}"),
+                0,
+                0,
+                2,
+                false,
+                vec![json!({
+                    "mid": mid,
+                    "ordinal": 0,
+                    "ck": ck(mid, 0, text).ck,
+                })],
+            );
+            assert!(matches!(
+                handler.dispatch_value(channel, first).await,
+                HandlerOutcome::Response(_)
+            ));
+        }
+        for (channel, session, mid, text) in [
+            (8, "authority-a", "a1", "authority a final"),
+            (9, "authority-b", "b1", "authority b final"),
+        ] {
+            let final_page = paged_transform_page(
+                "transform",
+                session,
+                &format!("page-{session}"),
+                0,
+                1,
+                2,
+                true,
+                vec![json!({
+                    "mid": mid,
+                    "ordinal": 1,
+                    "ck": ck(mid, 1, text).ck,
+                })],
+            );
+            let response = handler.dispatch_value(channel, final_page).await;
+            assert!(matches!(response, HandlerOutcome::Response(_)));
+        }
+
+        handler.bind_route(10, binding(project.to_str().unwrap(), "shadow:paged"));
+        assert!(matches!(
+            handler
+                .dispatch_value(
+                    10,
+                    json!({ "kind": "shadow_reset", "session_id": "shadow:paged" })
+                )
+                .await,
+            HandlerOutcome::Response(_)
+        ));
+        assert!(matches!(
+            handler
+                .dispatch_value(
+                    10,
+                    json!({
+                        "kind": "state_sync",
+                        "session_id": "shadow:paged",
+                        "shadow_generation": 1,
+                        "expected_shadow_seq": 0,
+                    }),
+                )
+                .await,
+            HandlerOutcome::Response(_)
+        ));
+        let shadow_first = paged_transform_page(
+            "shadow_transform",
+            "shadow:paged",
+            "shadow-page",
+            1,
+            0,
+            2,
+            false,
+            vec![json!({
+                "mid": "shadow-m0",
+                "ordinal": 0,
+                "ck": ck("shadow-m0", 0, "shadow input").ck,
+            })],
+        );
+        let shadow_final = paged_transform_page(
+            "shadow_transform",
+            "shadow:paged",
+            "shadow-page",
+            1,
+            1,
+            2,
+            true,
+            Vec::new(),
+        );
+        assert!(matches!(
+            handler.dispatch_value(10, shadow_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let shadow_response = handler.dispatch_value(10, shadow_final).await;
+        let HandlerOutcome::Response(bytes) = shadow_response else {
+            panic!("shadow page assembly should execute: {shadow_response:?}");
+        };
+        let shadow_response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(shadow_response["class"], "identical");
+
+        let mut disabled_config = default_test_config();
+        disabled_config.shadow_enabled = false;
+        let (disabled, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), disabled_config);
+        disabled.bind_route(8, binding(project.to_str().unwrap(), "shadow:paged"));
+        let shadow_page = paged_transform_page(
+            "shadow_transform",
+            "shadow:paged",
+            "shadow-page",
+            1,
+            0,
+            2,
+            false,
+            Vec::new(),
+        );
+        assert_eq!(
+            error_code(disabled.dispatch_value(8, shadow_page).await),
+            "shadow_disabled"
+        );
     }
 
     #[tokio::test]
@@ -8982,6 +16129,7 @@ mod tests {
                         "target_memory_id": 0,
                         "new_content": "zero memory updated"
                     }],
+                    "user_profile": ["prefers root cause", "x < y"],
                     "last_todo_state": "[]"
                 }),
             )
@@ -8999,6 +16147,10 @@ mod tests {
         assert_eq!(loaded.meta.coverage_compartment_seq, Some(0));
         assert_eq!(loaded.meta.folded_compartment_seq, 0);
         assert_eq!(loaded.meta.last_todo_state.as_deref(), Some("[]"));
+        assert_eq!(
+            store.load_shadow_user_profile("shadow:ses").unwrap(),
+            vec!["prefers root cause", "x < y"]
+        );
         let stored_compartments = store.load_compartments("shadow:ses").unwrap();
         assert_eq!(
             stored_compartments[0].start_date.as_deref(),
@@ -9040,6 +16192,70 @@ mod tests {
             )
             .await;
         assert_eq!(error_code(duplicate), "shadow_seq_mismatch");
+    }
+
+    #[tokio::test]
+    async fn paged_shadow_seed_profiles_reach_store_and_shadow_m0() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
+        let session = "shadow:paged-profile";
+        handler.bind_route(8, binding(project.to_str().unwrap(), session));
+        assert!(matches!(
+            handler
+                .dispatch_value(8, json!({ "kind": "shadow_reset", "session_id": session }))
+                .await,
+            HandlerOutcome::Response(_)
+        ));
+
+        let mut first = paged_seed_batch(session, "profile-seed", 1, 0, 0, 3, vec![]);
+        first["user_profile"] = json!(["prefers root cause"]);
+        let mut second = paged_seed_batch(
+            session,
+            "profile-seed",
+            1,
+            0,
+            1,
+            3,
+            vec![shadow_compartment(0, "first compartment")],
+        );
+        second["user_profile"] = json!(["x < y & z"]);
+        let final_batch = paged_seed_batch(session, "profile-seed", 1, 0, 2, 3, vec![]);
+
+        assert!(matches!(
+            handler.dispatch_value(8, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        assert!(store.load_shadow_user_profile(session).unwrap().is_empty());
+        assert!(matches!(
+            handler.dispatch_value(8, second).await,
+            HandlerOutcome::Response(_)
+        ));
+        assert!(store.load_shadow_user_profile(session).unwrap().is_empty());
+        assert!(matches!(
+            handler.dispatch_value(8, final_batch).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        let profile = store.load_shadow_user_profile(session).unwrap();
+        assert_eq!(profile, vec!["prefers root cause", "x < y & z"]);
+        let composed = crate::m0_compose::compose_m0_from_store(
+            &store,
+            &crate::m0_compose::M0ComposeInputs {
+                session_id: session,
+                project_path: session,
+                project_directory: project.to_str().unwrap(),
+                now_ms: 0,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+                memory_enabled: true,
+            },
+            |_| 0,
+        )
+        .unwrap();
+        assert_eq!(
+            composed.m0_bytes,
+            "<user-profile>\n- prefers root cause\n- x &lt; y &amp; z\n</user-profile>\n\n<session-history>\n## 0-0 · c0\nfirst compartment-p1\n</session-history>"
+        );
     }
 
     #[tokio::test]
@@ -9515,6 +16731,7 @@ mod tests {
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
+                user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
                 acked_watermarks: Value::Null,
@@ -9588,6 +16805,231 @@ mod tests {
             .await;
         assert!(matches!(fresh, HandlerOutcome::Response(_)));
         assert_eq!(store.load_compartments("shadow:ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn paged_shadow_transform_reassembles_to_the_unpaged_request() {
+        let original = json!({
+            "method": "shadow_transform",
+            "session_id": "shadow:large",
+            "shadow_generation": 4,
+            "seed_pass": false,
+            "input": [json!({ "id": "m1", "text": "a" }), json!({ "id": "m2", "text": "b" })],
+            "ts_output": [json!({ "id": "m1", "text": "a" })],
+            "normalizations": [json!({ "kind": "summary_message", "message_id": "s" })],
+            "pass_inputs": shadow_pass_inputs(),
+            "ts_decision": json!({ "class": "defer" }),
+            "declared_trim": Value::Null,
+        });
+        let page = |index: usize,
+                    total: usize,
+                    complete: bool,
+                    input: Vec<Value>,
+                    output: Vec<Value>,
+                    normalizations: Vec<Value>| {
+            let mut page = json!({
+                "method": "shadow_transform",
+                "session_id": "shadow:large",
+                "shadow_generation": 4,
+                "transform_page_id": "page-a",
+                "transform_generation": 4,
+                "transform_page_index": index,
+                "transform_page_total": total,
+                "transform_page_complete": complete,
+                "input": input,
+                "ts_output": output,
+                "normalizations": normalizations,
+            });
+            page["transform_page_digest"] = json!(transform_page_content_digest(&page));
+            if complete {
+                page["seed_pass"] = original["seed_pass"].clone();
+                page["pass_inputs"] = original["pass_inputs"].clone();
+                page["ts_decision"] = original["ts_decision"].clone();
+                page["declared_trim"] = original["declared_trim"].clone();
+            }
+            page
+        };
+        let assembled = assemble_transform_pages(vec![
+            page(
+                0,
+                2,
+                false,
+                vec![original["input"][0].clone()],
+                vec![],
+                vec![],
+            ),
+            page(
+                1,
+                2,
+                true,
+                vec![original["input"][1].clone()],
+                vec![original["ts_output"][0].clone()],
+                vec![original["normalizations"][0].clone()],
+            ),
+        ])
+        .expect("paged transform should assemble");
+        assert_eq!(assembled, original);
+    }
+
+    #[test]
+    fn paged_shadow_transform_reassembles_oversized_item_continuations() {
+        let item = Value::String("x".repeat(2 * 1024 * 1024));
+        let serialized = serde_json::to_string(&item).unwrap();
+        let chunk_size = 64 * 1024;
+        let chunk_total = serialized.len().div_ceil(chunk_size);
+        let mut pages = Vec::new();
+        for chunk_index in 0..chunk_total {
+            let start = chunk_index * chunk_size;
+            let end = std::cmp::min(start + chunk_size, serialized.len());
+            let mut page = json!({
+                "method": "shadow_transform",
+                "session_id": "shadow:oversized",
+                "shadow_generation": 4,
+                "transform_page_id": "oversized-page",
+                "transform_generation": 4,
+                "transform_page_index": chunk_index,
+                "transform_page_total": chunk_total,
+                "transform_page_complete": chunk_index + 1 == chunk_total,
+                "input": [{
+                    "__shadow_item_continuation": {
+                        "field": "input",
+                        "item_index": 0,
+                        "chunk_index": chunk_index,
+                        "chunk_total": chunk_total,
+                    },
+                    "chunk": &serialized[start..end],
+                }],
+                "ts_output": [],
+                "normalizations": [],
+            });
+            page["transform_page_digest"] = json!(transform_page_content_digest(&page));
+            if chunk_index + 1 == chunk_total {
+                page["pass_inputs"] = shadow_pass_inputs();
+                page["ts_decision"] = json!({ "class": "defer" });
+                page["declared_trim"] = Value::Null;
+            }
+            pages.push(page);
+        }
+
+        let assembled = assemble_transform_pages(pages).expect("continuation item should assemble");
+        assert_eq!(assembled["input"], json!([item]));
+    }
+
+    #[test]
+    fn paged_shadow_transform_generation_change_discards_partial_attempt() {
+        let mut coordinator = TransformPageCoordinator::default();
+        let page = |generation: u64, index: usize, complete: bool| {
+            let mut page = json!({
+                "method": "shadow_transform",
+                "session_id": "shadow:generation",
+                "shadow_generation": generation,
+                "transform_page_id": "generation-page",
+                "transform_generation": generation,
+                "transform_page_index": index,
+                "transform_page_total": 2,
+                "transform_page_complete": complete,
+                "input": [format!("page-{generation}-{index}")],
+            });
+            let digest = transform_page_content_digest(&page);
+            page["transform_page_digest"] = json!(digest.clone());
+            (page, digest)
+        };
+        let (first, first_digest) = page(1, 0, false);
+        let first_bytes = serde_json::to_vec(&first).unwrap().len();
+        assert!(matches!(
+            coordinator.stage(
+                "shadow:generation",
+                "generation-page".to_string(),
+                1,
+                0,
+                2,
+                first_digest,
+                first,
+                first_bytes,
+                false,
+            ),
+            Ok(TransformPageStageAction::Ack(1))
+        ));
+        let (stale, stale_digest) = page(2, 1, true);
+        let stale_bytes = serde_json::to_vec(&stale).unwrap().len();
+        assert!(matches!(
+            coordinator.stage(
+                "shadow:generation",
+                "generation-page".to_string(),
+                2,
+                1,
+                2,
+                stale_digest,
+                stale,
+                stale_bytes,
+                true,
+            ),
+            Err(TransformPageStageError::AttemptMismatch)
+        ));
+        assert_eq!(coordinator.pending_transform_count, 0);
+        assert_eq!(coordinator.total_staged_bytes, 0);
+    }
+
+    #[test]
+    fn paged_shadow_transform_aggregate_cap_discards_partial_attempt() {
+        let mut coordinator = TransformPageCoordinator::default();
+        let first = json!({
+            "method": "shadow_transform",
+            "session_id": "shadow:cap",
+            "shadow_generation": 1,
+            "transform_page_id": "cap",
+            "transform_generation": 1,
+            "transform_page_index": 0,
+            "transform_page_total": 2,
+            "transform_page_complete": false,
+            "input": ["first"],
+        });
+        let first_digest = transform_page_content_digest(&first);
+        let first_bytes = serde_json::to_vec(&first).unwrap().len();
+        coordinator.max_staged_bytes = first_bytes * 2 - 1;
+        assert!(matches!(
+            coordinator.stage(
+                "shadow:cap",
+                "cap".to_string(),
+                1,
+                0,
+                2,
+                first_digest,
+                first,
+                first_bytes,
+                false,
+            ),
+            Ok(TransformPageStageAction::Ack(1))
+        ));
+        let second = json!({
+            "method": "shadow_transform",
+            "session_id": "shadow:cap",
+            "shadow_generation": 1,
+            "transform_page_id": "cap",
+            "transform_generation": 1,
+            "transform_page_index": 1,
+            "transform_page_total": 2,
+            "transform_page_complete": true,
+            "input": ["second"],
+        });
+        let second_digest = transform_page_content_digest(&second);
+        let second_bytes = serde_json::to_vec(&second).unwrap().len();
+        assert!(matches!(
+            coordinator.stage(
+                "shadow:cap",
+                "cap".to_string(),
+                1,
+                1,
+                2,
+                second_digest,
+                second,
+                second_bytes,
+                true,
+            ),
+            Err(TransformPageStageError::BufferOverflow)
+        ));
+        assert_eq!(coordinator.pending_transform_count, 0);
+        assert_eq!(coordinator.total_staged_bytes, 0);
     }
 
     #[tokio::test]
@@ -9671,6 +17113,63 @@ mod tests {
         assert_eq!(
             store.load_shadow_divergences("shadow:ses").unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn shadow_decision_comparator_maps_ts_classes_to_rust_actions() {
+        let messages = vec![ck("same", 1, "same").ck];
+        let ts_defer = json!({ "class": "defer" });
+        let ts_soft = json!({ "class": "soft" });
+        let ts_hard = json!({ "class": "hard" });
+
+        assert_eq!(
+            compare_shadow_outputs(
+                &messages,
+                &messages,
+                &ts_defer,
+                &json!({ "action": "SOFT+", "class": "defer" }),
+                &[],
+                None,
+            )
+            .class,
+            "identical"
+        );
+        assert_eq!(
+            compare_shadow_outputs(
+                &messages,
+                &messages,
+                &ts_soft,
+                &json!({ "action": "SOFT", "class": "soft" }),
+                &[],
+                None,
+            )
+            .class,
+            "identical"
+        );
+        assert_eq!(
+            compare_shadow_outputs(
+                &messages,
+                &messages,
+                &ts_hard,
+                &json!({ "action": "HARD", "class": "hard" }),
+                &[],
+                None,
+            )
+            .class,
+            "identical"
+        );
+        assert_eq!(
+            compare_shadow_outputs(
+                &messages,
+                &messages,
+                &ts_soft,
+                &json!({ "action": "SOFT+", "class": "defer" }),
+                &[],
+                None,
+            )
+            .class,
+            "decision-mismatch"
         );
     }
 

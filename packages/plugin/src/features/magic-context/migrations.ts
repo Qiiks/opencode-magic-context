@@ -23,6 +23,25 @@ interface Migration {
     up: (db: Database) => void;
 }
 
+const MIGRATION_LOCK_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const;
+
+export class MigrationLockBusyError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "MigrationLockBusyError";
+    }
+}
+
+function isSqliteLockError(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const candidate = error as { code?: unknown; message?: unknown };
+    if (candidate.code === "SQLITE_BUSY" || candidate.code === "SQLITE_LOCKED") return true;
+    return (
+        typeof candidate.message === "string" &&
+        /database is locked|sqlite_(busy|locked)/i.test(candidate.message)
+    );
+}
+
 function tableExists(db: Database, name: string): boolean {
     return Boolean(
         db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name),
@@ -1916,6 +1935,80 @@ const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 53,
+        description: "add Synapse batch, shadow, and measurement storage",
+        up(db: Database): void {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS embedding_registrations (
+                    project_path TEXT PRIMARY KEY,
+                    provider_identity TEXT NOT NULL DEFAULT '',
+                    model_id TEXT NOT NULL DEFAULT '',
+                    chunk_model_id TEXT NOT NULL DEFAULT '',
+                    fingerprint TEXT NOT NULL DEFAULT '',
+                    table_epoch INTEGER NOT NULL DEFAULT 0,
+                    dims INTEGER NOT NULL DEFAULT 0,
+                    provenance_json TEXT NOT NULL DEFAULT '{}',
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS synapse_batch_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    project_path TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT '',
+                    manifest_json TEXT NOT NULL DEFAULT '{}',
+                    request_key TEXT NOT NULL DEFAULT '',
+                    job_id TEXT,
+                    cursor TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(session_id, request_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_synapse_batch_ledger_session
+                    ON synapse_batch_ledger(session_id, updated_at);
+                CREATE TABLE IF NOT EXISTS shadow_embedding_registrations (
+                    project_path TEXT NOT NULL,
+                    scope TEXT NOT NULL CHECK(scope IN ('memory', 'commit', 'chunk')),
+                    model_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    fingerprint TEXT NOT NULL DEFAULT '',
+                    table_epoch INTEGER NOT NULL DEFAULT 0,
+                    dims INTEGER NOT NULL DEFAULT 0,
+                    provenance_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(project_path, scope, model_id)
+                );
+                CREATE TABLE IF NOT EXISTS embedding_measurement_corpus (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    project_path TEXT NOT NULL DEFAULT '',
+                    dedup_key TEXT NOT NULL DEFAULT '',
+                    cohort_key TEXT NOT NULL DEFAULT '',
+                    query_text_hash TEXT NOT NULL DEFAULT '',
+                    primary_result_ids_json TEXT NOT NULL DEFAULT '[]',
+                    shadow_result_ids_json TEXT NOT NULL DEFAULT '[]',
+                    primary_latency_ms INTEGER,
+                    shadow_latency_ms INTEGER,
+                    primary_failed INTEGER NOT NULL DEFAULT 0,
+                    shadow_failed INTEGER NOT NULL DEFAULT 0,
+                    primary_model_id TEXT NOT NULL DEFAULT '',
+                    shadow_model_id TEXT NOT NULL DEFAULT '',
+                    primary_fingerprint TEXT NOT NULL DEFAULT '',
+                    shadow_fingerprint TEXT NOT NULL DEFAULT '',
+                    primary_epoch INTEGER NOT NULL DEFAULT 0,
+                    shadow_epoch INTEGER NOT NULL DEFAULT 0,
+                    corpus_hash TEXT NOT NULL DEFAULT '',
+                    coverage_json TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(dedup_key, cohort_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_embedding_measurement_session
+                    ON embedding_measurement_corpus(session_id, created_at);
+            `);
+        },
+    },
 ];
 
 /**
@@ -1991,7 +2084,16 @@ export function isSiblingMigrationConflict(db: Database, error: unknown, version
  * advanced version instead of failing a deferred read-to-write lock upgrade.
  */
 export function runMigrations(db: Database): void {
-    ensureMigrationsTable(db);
+    try {
+        ensureMigrationsTable(db);
+    } catch (error) {
+        if (isSqliteLockError(error)) {
+            throw new MigrationLockBusyError(
+                `failed to prepare migration lock: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+        throw error;
+    }
 
     let loggedPlan = false;
     while (true) {
@@ -2025,6 +2127,11 @@ export function runMigrations(db: Database): void {
             if (!applied || !migration) break;
             log(`[migrations] applied v${migration.version}: ${migration.description}`);
         } catch (error) {
+            if (!migration && isSqliteLockError(error)) {
+                throw new MigrationLockBusyError(
+                    `failed to acquire migration write lock: ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
             if (migration && isSiblingMigrationConflict(db, error, migration.version)) {
                 // BEGIN IMMEDIATE prevents the normal race, but retain the narrow
                 // PK-conflict tolerance for unusual SQLite adapters or callers.
@@ -2051,5 +2158,41 @@ export function runMigrations(db: Database): void {
 
     if (loggedPlan) {
         log(`[migrations] schema version now: ${MIGRATIONS[MIGRATIONS.length - 1].version}`);
+    }
+}
+
+/**
+ * Run migrations without blocking the event loop while a sibling owns SQLite's
+ * write lock. Only failures from the lock/check phase are retried; migration
+ * body failures continue to fail closed immediately.
+ */
+export interface MigrationRetryOptions {
+    retryDelaysMs?: readonly number[];
+    sleep?: (delayMs: number) => Promise<void>;
+}
+
+export async function runMigrationsWithRetry(
+    db: Database,
+    options: MigrationRetryOptions = {},
+): Promise<void> {
+    const retryDelaysMs = options.retryDelaysMs ?? MIGRATION_LOCK_RETRY_DELAYS_MS;
+    const sleep =
+        options.sleep ??
+        ((delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+    const totalAttempts = retryDelaysMs.length + 1;
+    for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+        log(`[migrations] migration lock check attempt ${attempt}/${totalAttempts}`);
+        try {
+            runMigrations(db);
+            return;
+        } catch (error) {
+            if (!(error instanceof MigrationLockBusyError)) throw error;
+            const delayMs = retryDelaysMs[attempt - 1];
+            if (delayMs === undefined) throw error;
+            log(
+                `[migrations] migration write lock is busy; retrying attempt ${attempt + 1}/${totalAttempts} in ${delayMs}ms`,
+            );
+            await sleep(delayMs);
+        }
     }
 }

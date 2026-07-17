@@ -41,7 +41,7 @@ const HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"] as const;
  * historian spend on the user's dime.
  */
 const AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"] as const;
-const EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider"] as const;
+const EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider", "fallback_provider"] as const;
 const PERCENTAGE_THRESHOLD_REASON =
     "security: a repository may only raise compaction thresholds above the user's effective value; it cannot force earlier historian work or cloned-repo cost escalation.";
 const TOKEN_THRESHOLD_REASON =
@@ -201,6 +201,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    the trust boundary for embedding destinations.
  *  - `shadow_transform` — developer-only subc mirror lane. A repository must
  *    not enable extra local module traffic or comparison telemetry.
+ *  - `transform_mode` is intentionally allowed at project tier so a repository
+ *    can opt its own runtime into the experimental Rust pipeline. The resolver
+ *    requires trusted user-level `subc` configuration before Rust can activate.
  *  - `historian.model` / `historian.fallback_models` — historian model spend is
  *    user-level only; a cloned repo cannot force extra compaction cost.
  *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
@@ -236,6 +239,15 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         warnings.push(
             "Ignoring shadow_transform from project config (security: this developer-only mirror lane is user-level only).",
         );
+    }
+
+    for (const field of ["subc", "shadow_embedding"] as const) {
+        if (field in projectRaw) {
+            delete projectRaw[field];
+            warnings.push(
+                `Ignoring ${field} from project config (security: daemon routing and developer-only embedding traffic are user-level settings).`,
+            );
+        }
     }
 
     const embedding = projectRaw.embedding;

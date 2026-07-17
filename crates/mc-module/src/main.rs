@@ -13,6 +13,13 @@ use mc_module::{manifest, McHandler, DEFAULT_MODULE_ID};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Fleet convention: a side-effect-free single-line --version, evaluated before
+    // any runtime argument so supervisors and test substrates can probe the binary
+    // without a connection file.
+    if std::env::args().skip(1).any(|arg| arg == "--version") {
+        println!("ck-mc {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())

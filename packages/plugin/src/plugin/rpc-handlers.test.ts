@@ -220,6 +220,50 @@ describe("buildSidebarSnapshot — context limit", () => {
     });
 });
 
+describe("buildSidebarSnapshot — Rust module status merge", () => {
+    test("uses module pressure, boundary, coverage, and compartment counts", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-sidebar-rust-status";
+            db.prepare(
+                `INSERT INTO session_meta (
+                    session_id, last_input_tokens, last_context_percentage,
+                    system_prompt_tokens, memory_block_cache, memory_block_count
+                ) VALUES (?, 1, 1, 5000, '', 0)`,
+            ).run(sessionId);
+
+            const snapshot = buildSidebarSnapshot(
+                db,
+                sessionId,
+                process.cwd(),
+                undefined,
+                4000,
+                undefined,
+                {
+                    usage: {
+                        current_total_input_tokens: 42_000,
+                        context_limit_tokens: 100_000,
+                    },
+                    boundary_present: true,
+                    coverage_ordinal: 17,
+                    compartment_count: 4,
+                    pending_drop_count: 2,
+                },
+            );
+
+            expect(snapshot.inputTokens).toBe(42_000);
+            expect(snapshot.usagePercentage).toBe(42);
+            expect(snapshot.contextLimit).toBe(100_000);
+            expect(snapshot.compartmentCount).toBe(4);
+            expect(snapshot.pendingOpsCount).toBe(2);
+            expect(snapshot.boundaryPresent).toBe(true);
+            expect(snapshot.coverageOrdinal).toBe(17);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("buildStatusDetail — history token reuse (council audit bg_51106601 #1)", () => {
     test("sets historyBlockTokens from compartmentTokens only (facts retired in v2)", () => {
         const db = createTestDb();

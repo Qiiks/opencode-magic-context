@@ -24,6 +24,11 @@ export interface EmbeddingProvider {
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
     ): Promise<(Float32Array | null)[]>;
+    /** Domain-item batch form for providers that can preserve item identity across retries. */
+    embedItems?(
+        items: readonly { id: string; text: string; contentSha256: string }[],
+        signal?: AbortSignal,
+    ): Promise<Map<string, Float32Array>>;
     dispose(): Promise<void>;
     isLoaded(): boolean;
 }

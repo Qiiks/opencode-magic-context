@@ -587,6 +587,48 @@ export function readRawSessionMessagePartsByIdFromDb(
     };
 }
 
+/**
+ * Resolve one message ID in the canonical raw-message ordinal space. Synthetic
+ * compaction summaries are excluded so this count matches every module wire
+ * ordinal and does not depend on the stored compartment basis.
+ */
+export function readRawSessionMessageOrdinalByIdFromDb(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+): number | null {
+    const row = db
+        .prepare(
+            `SELECT COUNT(candidate.id) AS ordinal
+             FROM message AS target
+             JOIN message AS candidate
+               ON candidate.session_id = target.session_id
+              AND NOT (
+                  CASE WHEN json_valid(candidate.data) = 1
+                       THEN COALESCE(json_extract(candidate.data, '$.summary'), 0)
+                       ELSE 0 END = 1
+                  AND CASE WHEN json_valid(candidate.data) = 1
+                           THEN COALESCE(json_extract(candidate.data, '$.finish'), '')
+                           ELSE '' END = 'stop'
+              )
+              AND (candidate.time_created < target.time_created
+                   OR (candidate.time_created = target.time_created AND candidate.id <= target.id))
+             WHERE target.session_id = ?
+               AND target.id = ?
+               AND NOT (
+                   CASE WHEN json_valid(target.data) = 1
+                        THEN COALESCE(json_extract(target.data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(target.data) = 1
+                            THEN COALESCE(json_extract(target.data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )`,
+        )
+        .get(sessionId, messageId) as OrdinalRow | null;
+    const ordinal = row?.ordinal;
+    return typeof ordinal === "number" && ordinal > 0 ? ordinal : null;
+}
+
 export function readRawSessionMessageByIdFromDb(
     db: Database,
     sessionId: string,

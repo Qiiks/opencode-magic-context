@@ -20,6 +20,7 @@ import {
 } from "./compartment-runner";
 import type { RecompProgress } from "./compartment-runner-types";
 import type { LiveSessionState } from "./live-session-state";
+import { dropSlot } from "./lkg-slot";
 import type { NotificationParams } from "./send-session-notification";
 
 /** Resolve the live session model as a "provider/modelID" key for the last-ditch
@@ -151,6 +152,7 @@ export function setRecompStarting(
     note: string,
     kind: "recomp" | "upgrade" | "embed" | "wrapup" = "recomp",
 ): void {
+    dropSlot(sessionId, "recomp-start");
     liveSessionState.recompProgressBySession.set(sessionId, {
         sessionId,
         kind,

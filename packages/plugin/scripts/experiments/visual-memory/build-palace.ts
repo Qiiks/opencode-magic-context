@@ -14,8 +14,9 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SOURCE_PATH = process.env.PALACE_SOURCE_PATH ?? "/tmp/visual-memory/trimmed-memories-source.txt";
+const REVIEW_RENDER = Boolean(process.env.PALACE_RENDER_DESPITE_VALIDATOR);
 const OUTPUT_DIR = process.env.PALACE_OUTPUT_DIR ?? "/tmp/visual-memory";
-const MAX_PALACE_CHARS = 70_000;
+const MAX_PALACE_CHARS = 27_000;
 const JETBRAINS_VARIANT = process.env.PALACE_RENDER_FONT === "jetbrains-mono-10";
 const RENDER_FONT = JETBRAINS_VARIANT ? "jetbrains-mono-10" : "spleen-5x8";
 const RENDER_STYLE = { aa: true, font: RENDER_FONT } as const;
@@ -26,13 +27,12 @@ const COVERAGE_PATH =
     process.env.PALACE_COVERAGE_PATH ??
     (JETBRAINS_VARIANT ? "/tmp/visual-memory/coverage-jb-layout.json" : join(HERE, "coverage.json"));
 const OUTPUT_PREFIX = process.env.PALACE_OUTPUT_PREFIX ?? (JETBRAINS_VARIANT ? "palace-jb-page" : "palace-page");
-const TITLE_SCALE = 2;
 const PATCH_SIZE = 28;
 const PAGE_WIDTH_PIXELS = 1_092;
 const PAGE_HEIGHT_PIXELS = 1_092;
 const BODY_INK = [18, 20, 24] as const;
 const PROHIBITION_INK = [148, 28, 35] as const;
-let extendedBorderPixels = 0;
+const ROOM_HEADER_MARKER = "▰";
 const CATEGORY_INK: Record<string, readonly [number, number, number]> = {
     PROJECT_RULES: [24, 58, 112],
     ARCHITECTURE: [0, 88, 92],
@@ -79,6 +79,11 @@ type CoverageRoom = {
 };
 type Coverage = {
     sourceMemoryCount: number;
+    renderedIds: number[];
+    droppedByTrimIds: number[];
+    droppedBySkipIds: number[];
+    renderedMemoryCount: number;
+    droppedMemoryCount: number;
     entryCount: number;
     mergeCount: number;
     representedMemoryCount: number;
@@ -135,11 +140,11 @@ type RgbImage = { pixels: Uint8Array; width: number; height: number };
 type Panel = GrayImage & {
     droppedChars: number;
     item: LayoutItem;
-    title?: GrayImage;
     redCells: Set<string>;
     lineTops: number[];
     bodyRows: Set<number>;
     composedHeight: number;
+    headerBar: boolean;
 };
 
 function sourceIds(source: string): number[] {
@@ -230,22 +235,6 @@ function crop(
     return { pixels, width, height };
 }
 
-function upscale2x(image: GrayImage): GrayImage {
-    const width = image.width * TITLE_SCALE;
-    const height = image.height * TITLE_SCALE;
-    const pixels = new Uint8Array(width * height);
-    for (let y = 0; y < image.height; y++) {
-        for (let x = 0; x < image.width; x++) {
-            const value = image.pixels[y * image.width + x] ?? 255;
-            const target = y * TITLE_SCALE * width + x * TITLE_SCALE;
-            pixels[target] = value;
-            pixels[target + 1] = value;
-            pixels[target + width] = value;
-            pixels[target + width + 1] = value;
-        }
-    }
-    return { pixels, width, height };
-}
 
 function prohibitionCells(lines: string[], context: string): Set<string> {
     const cells: Array<{ character: string; row: number; column: number }> = [];
@@ -274,10 +263,12 @@ function prohibitionCells(lines: string[], context: string): Set<string> {
                     break;
                 }
             }
-            assert.ok(
-                open >= 0,
-                `${context}: prohibition at row ${marker.row + 1} lacks following mechanism: ${lines[marker.row] ?? ""}`,
-            );
+            if (open < 0) {
+                const message = `${context}: prohibition at row ${marker.row + 1} lacks following mechanism: ${lines[marker.row] ?? ""}`;
+                if (!REVIEW_RENDER) assert.ok(open >= 0, message);
+                else console.warn(`[palace] ${message}; rendering review manifest anyway`);
+                continue;
+            }
             let depth = 0;
             let close = -1;
             for (let cursor = open; cursor < end; cursor++) {
@@ -289,7 +280,12 @@ function prohibitionCells(lines: string[], context: string): Set<string> {
                     break;
                 }
             }
-            assert.ok(close >= open, `prohibition at row ${marker.row + 1} has unclosed mechanism`);
+            if (close < open) {
+                const message = `prohibition at row ${marker.row + 1} has unclosed mechanism`;
+                if (!REVIEW_RENDER) assert.ok(close >= open, message);
+                else console.warn(`[palace] ${message}; rendering review manifest anyway`);
+                continue;
+            }
             for (let cursor = open; cursor <= close; cursor++) {
                 const cell = cells[cursor];
                 const lineWidth = cell ? [...(lines[cell.row] ?? "")].length : 0;
@@ -313,33 +309,6 @@ function blendInk(background: number, ink: number, gray: number): number {
     return Math.round(background - (coverage * (background - ink)) / 255);
 }
 
-function blitColoredInk(
-    target: RgbImage,
-    source: GrayImage,
-    left: number,
-    top: number,
-    color: readonly [number, number, number],
-): void {
-    assert.ok(left >= 0 && top >= 0, "negative blit offset");
-    assert.ok(
-        left + source.width <= target.width && top + source.height <= target.height,
-        "blit exceeds target",
-    );
-    for (let y = 0; y < source.height; y++) {
-        for (let x = 0; x < source.width; x++) {
-            const gray = source.pixels[y * source.width + x] ?? 255;
-            if (gray === 255) continue;
-            const index = ((top + y) * target.width + left + x) * 3;
-            for (let channel = 0; channel < 3; channel++) {
-                target.pixels[index + channel] = blendInk(
-                    target.pixels[index + channel] ?? 255,
-                    color[channel] ?? 0,
-                    gray,
-                );
-            }
-        }
-    }
-}
 
 function blitPanel(
     target: RgbImage,
@@ -353,17 +322,27 @@ function blitPanel(
     assert.ok(baseCategoryColor, `missing category color for ${panel.item.category}`);
     const rows = panel.height / cellHeight;
     const columns = panel.width / cellWidth;
+    const roomHeader = panel.item.kind === "room" && panel.headerBar;
+    if (roomHeader) {
+        const background = baseCategoryColor.map((channel) =>
+            Math.round(channel + (255 - channel) * 0.86),
+        );
+        for (let y = 0; y < cellHeight; y++) {
+            const targetY = top + y;
+            for (let x = 0; x < panel.width; x++) {
+                const index = (targetY * target.width + left + x) * 3;
+                for (let channel = 0; channel < 3; channel++) {
+                    target.pixels[index + channel] = background[channel] ?? 255;
+                }
+            }
+        }
+    }
     const colorFor = (
         row: number,
         column: number,
         red: boolean,
     ): readonly [number, number, number] => {
-        const border =
-            panel.item.kind === "category" ||
-            row === 0 ||
-            row === rows - 1 ||
-            column === 0 ||
-            column === columns - 1;
+        const header = panel.item.kind === "category" || (!panel.item.continuation && row === 0);
         const bannerCategories = panel.item.categories ?? [panel.item.category];
         const bannerCategory =
             bannerCategories.length > 1 && column >= columns / 2
@@ -371,7 +350,7 @@ function blitPanel(
                 : bannerCategories[0];
         const categoryColor =
             CATEGORY_INK[bannerCategory ?? panel.item.category] ?? baseCategoryColor;
-        return red ? PROHIBITION_INK : border ? categoryColor : BODY_INK;
+        return red ? PROHIBITION_INK : header ? categoryColor : BODY_INK;
     };
     for (let y = 0; y < panel.height; y++) {
         const row = Math.floor(y / cellHeight);
@@ -394,36 +373,6 @@ function blitPanel(
             }
         }
     }
-    for (const row of panel.bodyRows) {
-        const rowTop = panel.lineTops[row];
-        const nextTop = panel.lineTops[row + 1];
-        if (rowTop === undefined || nextTop === undefined || nextTop <= rowTop + cellHeight)
-            continue;
-        for (const column of [0, columns - 1]) {
-            const xStart = column * cellWidth;
-            for (let xOffset = 0; xOffset < cellWidth; xOffset++) {
-                let gray = 255;
-                for (let sourceY = row * cellHeight; sourceY < (row + 1) * cellHeight; sourceY++) {
-                    gray = Math.min(
-                        gray,
-                        panel.pixels[sourceY * panel.width + xStart + xOffset] ?? 255,
-                    );
-                }
-                if (gray === 255) continue;
-                for (let targetY = top + rowTop + cellHeight; targetY < top + nextTop; targetY++) {
-                    extendedBorderPixels++;
-                    const index = (targetY * target.width + left + xStart + xOffset) * 3;
-                    for (let channel = 0; channel < 3; channel++) {
-                        target.pixels[index + channel] = blendInk(
-                            target.pixels[index + channel] ?? 255,
-                            baseCategoryColor[channel] ?? 0,
-                            gray,
-                        );
-                    }
-                }
-            }
-        }
-    }
 }
 
 async function renderPanelText(
@@ -439,7 +388,7 @@ async function renderPanelText(
         maxHeightPx: 4_096,
         style: RENDER_STYLE,
     });
-    assert.equal(rendered.pages.length, 1, "masonry panel unexpectedly split across pages");
+    assert.equal(rendered.pages.length, 1, "newspaper panel unexpectedly split across pages");
     const page = rendered.pages[0];
     assert.ok(page, "renderer returned no masonry panel");
     const decoded = await decodeGrayPng(page.png);
@@ -455,14 +404,13 @@ function panelGeometry(
     if (item.kind === "category") {
         return { lineTops: [0], bodyRows: new Set(), composedHeight: cellHeight };
     }
-    const headerRows = item.continuation ? 1 : 2;
-    const bottomRow = lineCount - 1;
+    const headerRows = item.continuation ? 0 : 1;
     const lineTops: number[] = [];
     const bodyRows = new Set<number>();
     let top = 0;
     for (let row = 0; row < lineCount; row++) {
         lineTops.push(top);
-        const body = row >= headerRows && row < bottomRow;
+        const body = row >= headerRows;
         if (body) bodyRows.add(row);
         top += body ? bodyLinePitch : cellHeight;
     }
@@ -471,9 +419,10 @@ function panelGeometry(
 
 function extractItemLines(palaceLines: string[], item: LayoutItem, coverage: Coverage): string[] {
     if (item.kind === "category") {
+        const left = item.column * (coverage.layout.roomWidthChars + coverage.layout.columnGapChars);
         return [
             [...(palaceLines[item.startLine - 1] ?? "")]
-                .slice(0, coverage.layout.pageWidthChars)
+                .slice(left, left + coverage.layout.roomWidthChars)
                 .join(""),
         ];
     }
@@ -490,22 +439,54 @@ const palace = readFileSync(PALACE_PATH, "utf8");
 const coverage = JSON.parse(readFileSync(COVERAGE_PATH, "utf8")) as Coverage;
 const source = readFileSync(SOURCE_PATH, "utf8");
 const ids = sourceIds(source);
-const coveredIds = Object.keys(coverage.memories).map(Number);
+const renderedIds = coverage.renderedIds;
+const droppedByTrimIds = coverage.droppedByTrimIds;
+const droppedBySkipIds = coverage.droppedBySkipIds;
 const palaceLines = palace.endsWith("\n") ? palace.slice(0, -1).split("\n") : palace.split("\n");
 
 assert.ok(ids.length > 0, "source must contain at least one memory");
 assert.equal(new Set(ids).size, ids.length, "source memory ids must be unique");
+const uniqueRenderedIds = new Set(renderedIds);
+const uniqueTrimmedIds = new Set(droppedByTrimIds);
+const uniqueSkippedIds = new Set(droppedBySkipIds);
+assert.equal(uniqueRenderedIds.size, renderedIds.length, "rendered memory ids must be unique");
+assert.equal(uniqueTrimmedIds.size, droppedByTrimIds.length, "trimmed memory ids must be unique");
+assert.equal(uniqueSkippedIds.size, droppedBySkipIds.length, "skipped memory ids must be unique");
+assert.equal(
+    new Set([...renderedIds, ...droppedByTrimIds, ...droppedBySkipIds]).size,
+    ids.length,
+    "rendered and dropped ids must partition the source memories",
+);
 assert.deepEqual(
-    [...coveredIds].sort((a, b) => a - b),
+    [...new Set([...renderedIds, ...droppedByTrimIds, ...droppedBySkipIds])].sort((a, b) => a - b),
     [...ids].sort((a, b) => a - b),
-    "coverage sidecar must map every source memory id exactly once",
+    "rendered and dropped ids must match the source memories",
+);
+assert.deepEqual(
+    [...Object.keys(coverage.memories).map(Number)].sort((a, b) => a - b),
+    [...renderedIds].sort((a, b) => a - b),
+    "coverage placements must contain rendered ids only",
 );
 assert.equal(coverage.sourceMemoryCount, ids.length);
-assert.equal(coverage.entryCount + coverage.mergeCount, ids.length);
-assert.equal(coverage.representedMemoryCount, ids.length);
+assert.equal(coverage.renderedMemoryCount, renderedIds.length);
+assert.equal(coverage.droppedMemoryCount, droppedByTrimIds.length + droppedBySkipIds.length);
+assert.equal(coverage.entryCount + coverage.mergeCount, renderedIds.length);
+assert.equal(coverage.representedMemoryCount, coverage.renderedMemoryCount);
 assert.equal(coverage.palaceChars, palace.length);
 assert.ok(palace.length <= MAX_PALACE_CHARS, `palace exceeds ${MAX_PALACE_CHARS} chars`);
-assert.ok(!/#\d+/.test(palace), "palace surface must not render memory ids");
+if (/#\d+/.test(palace)) {
+    const message = "palace surface renders memory ids";
+    if (!REVIEW_RENDER) assert.fail(message);
+    console.warn(`[palace] ${message}; rendering review manifest anyway`);
+}
+assert.equal(coverage.layout.pages.length, 1, "palace must contain exactly one page");
+assert.equal(coverage.layout.pages[0]?.page, 1, "the fixed palace page must be page 1");
+assert.equal(coverage.layout.pageHeightPixels, PAGE_HEIGHT_PIXELS, "palace page height must be fixed");
+assert.equal(
+    coverage.layout.canvasHeightCells,
+    Math.floor(PAGE_HEIGHT_PIXELS / coverage.layout.bodyLinePitch),
+    "palace canvas height must be one fixed page",
+);
 assert.equal(palaceLines.length, coverage.layout.canvasHeightCells);
 const maxLineChars = Math.max(...palaceLines.map((line) => [...line].length));
 assert.equal(coverage.maxLineChars, maxLineChars);
@@ -513,10 +494,9 @@ assert.equal(
     maxLineChars,
     coverage.layout.columns * coverage.layout.roomWidthChars +
         (coverage.layout.columns - 1) * coverage.layout.columnGapChars,
-    "masonry text canvas width drifted",
+        "newspaper text canvas width drifted",
 );
 for (const room of coverage.rooms) {
-    assert.equal(room.border, room.peakImportance >= 70 ? "double" : "single");
     assert.equal(room.heightCells, room.endLine - room.startLine + 1);
 }
 
@@ -532,28 +512,14 @@ for (const item of coverage.layout.items) {
             `${item.category}\u0000${item.room ?? ""}\u0000${item.segment ?? 0}`,
         );
         assert.ok(room, `coverage room missing for ${item.category}/${item.room}`);
-        assert.ok(
-            lines.length >= (item.continuation ? 2 : 3),
-            `room ${room.name} lacks frame rows`,
-        );
+        assert.ok(lines.length >= (item.continuation ? 1 : 2), `room ${room.name} lacks header/body rows`);
         const redCells = prohibitionCells(lines, `${item.category}/${room.name}`);
-        let scaledTitle: GrayImage | undefined;
-        let titleDroppedChars = 0;
-        if (!item.continuation) {
-            const title = await renderPanelText(room.name, [...room.name].length);
-            scaledTitle = upscale2x(title);
-            titleDroppedChars = title.droppedChars;
-            const titleCells = Math.ceil(scaledTitle.width / renderCellWidth(RENDER_STYLE));
-            const titleStart = Math.floor((coverage.layout.roomWidthChars - titleCells) / 2);
-            const top = [...(lines[0] ?? "")];
-            for (let column = titleStart; column < titleStart + titleCells; column++) {
-                if (column > 0 && column < coverage.layout.roomWidthChars - 1) top[column] = " ";
-            }
-            lines[0] = top.join("");
-            const side = [...(lines[1] ?? "")][0] ?? "│";
-            lines[1] = `${side}${" ".repeat(coverage.layout.roomWidthChars - 2)}${side}`;
-        }
-        const panel = await renderPanelText(lines.join("\n"), coverage.layout.roomWidthChars);
+        const headerBar = !item.continuation && lines[0]?.startsWith(ROOM_HEADER_MARKER) === true;
+        const renderLines = headerBar
+            ? [lines[0]?.slice(ROOM_HEADER_MARKER.length) ?? "", ...lines.slice(1)]
+            : lines;
+        const titleDroppedChars = 0;
+        const panel = await renderPanelText(renderLines.join("\n"), coverage.layout.roomWidthChars);
         const geometry = panelGeometry(
             item,
             lines.length,
@@ -566,11 +532,11 @@ for (const item of coverage.layout.items) {
             ...geometry,
             droppedChars: panel.droppedChars + titleDroppedChars,
             item,
-            ...(scaledTitle ? { title: scaledTitle } : {}),
             redCells,
+            headerBar,
         });
     } else {
-        const panel = await renderPanelText(lines.join("\n"), coverage.layout.pageWidthChars);
+        const panel = await renderPanelText(lines.join("\n"), coverage.layout.roomWidthChars);
         droppedChars += panel.droppedChars;
         panels.push({
             ...panel,
@@ -583,6 +549,7 @@ for (const item of coverage.layout.items) {
             droppedChars: panel.droppedChars,
             item,
             redCells: new Set(),
+            headerBar: false,
         });
     }
 }
@@ -604,22 +571,21 @@ assert.ok(
     "author page width exceeds atlas capacity",
 );
 const columnWidthPixels = coverage.layout.roomWidthChars * cellWidth;
-const contentWidthPixels = coverage.layout.pageWidthChars * cellWidth;
+const contentWidthPixels =
+    (coverage.layout.pageWidthChars +
+        (coverage.layout.columns - 1) * coverage.layout.columnGapChars) *
+    cellWidth;
 const pageLeft = Math.floor((PAGE_WIDTH_PIXELS - contentWidthPixels) / 2);
 assert.ok(pageLeft >= 0, "palace content exceeds fixed page width");
-const pageCanvases = coverage.layout.pages.map((layoutPage, index) => {
-    const last = index === coverage.layout.pages.length - 1;
-    const usedHeight = layoutPage.heightPixels;
-    const height = last
-        ? Math.max(PATCH_SIZE, Math.ceil(usedHeight / PATCH_SIZE) * PATCH_SIZE)
-        : PAGE_HEIGHT_PIXELS;
-    assert.ok(height <= PAGE_HEIGHT_PIXELS, `page ${layoutPage.page} exceeds fixed geometry`);
+const pageCanvases = coverage.layout.pages.map((layoutPage) => {
+    assert.equal(layoutPage.heightPixels, PAGE_HEIGHT_PIXELS, "page height must be fixed");
+    assert.equal(layoutPage.heightCells, coverage.layout.canvasHeightCells, "page rows must be fixed");
     return {
         layout: layoutPage,
         image: {
-            pixels: new Uint8Array(PAGE_WIDTH_PIXELS * height * 3).fill(255),
+            pixels: new Uint8Array(PAGE_WIDTH_PIXELS * PAGE_HEIGHT_PIXELS * 3).fill(255),
             width: PAGE_WIDTH_PIXELS,
-            height,
+            height: PAGE_HEIGHT_PIXELS,
         } satisfies RgbImage,
         contentPixels: 0,
     };
@@ -628,14 +594,17 @@ for (const panel of panels) {
     const page = pageCanvases[panel.item.page - 1];
     assert.ok(page, `missing canvas for page ${panel.item.page}`);
     const expectedNativeHeight = (panel.item.endLine - panel.item.startLine + 1) * cellHeight;
-    const expectedWidth = panel.item.kind === "category" ? contentWidthPixels : columnWidthPixels;
-    assert.equal(panel.width, expectedWidth, "masonry panel width drifted");
+    const expectedWidth = columnWidthPixels;
+    assert.equal(panel.width, expectedWidth, "newspaper panel width drifted");
     assert.equal(
         panel.height,
         expectedNativeHeight,
-        `masonry panel height drifted for ${panel.item.category}/${panel.item.room ?? "banner"}`,
+        `newspaper panel height drifted for ${panel.item.category}/${panel.item.room ?? "banner"}`
     );
-    const left = pageLeft + panel.item.column * columnWidthPixels;
+    const left =
+        pageLeft +
+        panel.item.column *
+            (columnWidthPixels + coverage.layout.columnGapChars * cellWidth);
     assert.equal(
         panel.composedHeight,
         panel.item.heightPixels,
@@ -647,16 +616,9 @@ for (const panel of panels) {
         `panel exceeds page ${panel.item.page}`,
     );
     blitPanel(page.image, panel, left, top, cellWidth, cellHeight);
-    if (panel.title) {
-        const titleLeft = left + Math.floor((panel.width - panel.title.width) / 2);
-        const titleColor = CATEGORY_INK[panel.item.category];
-        assert.ok(titleColor, `missing title color for ${panel.item.category}`);
-        blitColoredInk(page.image, panel.title, titleLeft, top, titleColor);
-    }
     page.contentPixels += panel.width * panel.composedHeight;
 }
 assert.equal(droppedChars, 0, "glyph atlas dropped palace characters");
-assert.ok(extendedBorderPixels > 0, "body leading did not extend vertical room borders");
 const prohibitionCellCount = panels.reduce((total, panel) => total + panel.redCells.size, 0);
 assert.ok(prohibitionCellCount > 0, "prohibition palette was not exercised");
 
@@ -802,7 +764,7 @@ const report = {
     },
     composition: {
         approach:
-            "category-band masonry composed from grayscale room renders into deterministic RGB; nearest-neighbor 2x title overlays",
+            "importance-ordered single-page borderless newspaper flow composed from grayscale renders into deterministic RGB",
         font: RENDER_FONT,
         columns: coverage.layout.columns,
         columnWidthChars: coverage.layout.roomWidthChars,
@@ -818,14 +780,11 @@ const report = {
         sharedPairCount: coverage.layout.sharedPairCount,
         bodyLinePitch: coverage.layout.bodyLinePitch,
         addedLeadingPixelsAcrossRoomSegments: bodyLeadingPixels,
-        verticalBordersExtendedAcrossLeading: true,
-        extendedBorderPixels,
         leveling: {
             gapRowsBefore: coverage.layout.bandGapRowsBefore,
             gapRowsAfter: coverage.layout.bandGapRowsAfter,
             roomSplits: coverage.layout.roomSplitCount,
         },
-        titleScale: TITLE_SCALE,
         palette: CATEGORY_INK,
         prohibitionInk: PROHIBITION_INK,
         prohibitionCellCount,
@@ -833,6 +792,11 @@ const report = {
     },
     coverage: {
         sourceMemories: coverage.sourceMemoryCount,
+        renderedMemories: coverage.renderedMemoryCount,
+        droppedMemories: coverage.droppedMemoryCount,
+        renderedIds: coverage.renderedIds,
+        droppedByTrimIds: coverage.droppedByTrimIds,
+        droppedBySkipIds: coverage.droppedBySkipIds,
         entries: coverage.entryCount,
         merges: coverage.mergeCount,
         representedMemories: coverage.representedMemoryCount,

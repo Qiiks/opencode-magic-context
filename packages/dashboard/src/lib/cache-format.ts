@@ -18,6 +18,24 @@ export function severityColorClass(severity: string): string {
   }
 }
 
+const CACHE_CAUSE_LABELS: Record<string, string> = {
+  mc_transform_missing: "Magic Context transform did not run (fail-open pass)",
+};
+
+export function cacheCauseLabel(cause: string): string {
+  return CACHE_CAUSE_LABELS[cause] ?? cause;
+}
+
+export function cacheCauseColor(cause: string): string {
+  return cause === "mc_transform_missing" ? "red" : "amber";
+}
+
+export function cacheCauseTooltip(cause: string): string | undefined {
+  return cause === "mc_transform_missing"
+    ? "Magic Context returned the original messages after a transform failure, so the provider-side cache bust is attributed to a fail-open pass."
+    : undefined;
+}
+
 // Collapse ESTIMATED (max-prompt fallback) context limits to a single stable
 // value per session, so the timeline doesn't fragment into one box per step.
 //

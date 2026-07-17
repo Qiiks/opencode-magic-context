@@ -37,6 +37,7 @@ import {
     getSessionProperties,
 } from "./event-payloads";
 import { resolveSessionId as resolveEventSessionId } from "./event-resolvers";
+import { dropSlot } from "./lkg-slot";
 import {
     clearNoteNudgeTriggerAndCooldown,
     onNoteTrigger,
@@ -285,6 +286,7 @@ export function createEventHook(args: {
                     // watermark would make reasoning cleanup resume from the
                     // previous model's cutoff instead of starting fresh. Clear
                     // it for both forward and backward transitions.
+                    dropSlot(assistantInfo.sessionID, "model-change");
                     sessionLog(
                         assistantInfo.sessionID,
                         `model changed (${previous.providerID}/${previous.modelID} -> ${assistantInfo.providerID}/${assistantInfo.modelID}), clearing historian failure state and reasoning watermark`,
@@ -468,6 +470,12 @@ function maybeInjectChannel1Nudge(
 export function createToolExecuteAfterHook(args: {
     db: Parameters<typeof getOrCreateSessionMeta>[0];
     channel1StateBySession: Map<string, Channel1State>;
+    transformMode?: "ts" | "rust";
+    todoStateSet?: (input: {
+        sessionId: string;
+        stateJson: string;
+        ownerMessageId: string;
+    }) => Promise<unknown>;
 }) {
     return async (input: unknown, output?: unknown) => {
         const typedInput = input as { tool?: string; sessionID?: string; args?: unknown };
@@ -514,6 +522,36 @@ export function createToolExecuteAfterHook(args: {
                     updateSessionMeta(args.db, typedInput.sessionID, {
                         lastTodoState: normalizedTodos,
                     });
+                    if (args.transformMode === "rust" && args.todoStateSet) {
+                        const todoSessionId = typedInput.sessionID;
+                        const rawArgs =
+                            typedInput.args && typeof typedInput.args === "object"
+                                ? (typedInput.args as Record<string, unknown>)
+                                : {};
+                        const ownerMessageId =
+                            (typeof rawArgs.owner_message_id === "string" &&
+                                rawArgs.owner_message_id) ||
+                            (typeof rawArgs.message_id === "string" && rawArgs.message_id) ||
+                            (typeof (typedInput as { messageID?: unknown }).messageID ===
+                                "string" &&
+                                (typedInput as { messageID: string }).messageID) ||
+                            (typeof (typedInput as { callID?: unknown }).callID === "string" &&
+                                (typedInput as { callID: string }).callID) ||
+                            typedInput.sessionID;
+                        void args
+                            .todoStateSet({
+                                sessionId: todoSessionId,
+                                stateJson: normalizedTodos,
+                                ownerMessageId,
+                            })
+                            .catch((error) => {
+                                sessionLog(
+                                    todoSessionId,
+                                    "rust todo_state.set failed (ignored):",
+                                    error,
+                                );
+                            });
+                    }
                 }
             }
             if (

@@ -46,12 +46,15 @@ import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
 import type { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
+import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./boot-quiet";
 import type { PluginContext } from "./types";
 
 /** Check interval for dream schedule (15 minutes). */
 const DREAM_TIMER_INTERVAL_MS = 15 * 60 * 1000;
 /** Wall-clock budget for post-sweep commit backlog drain (matches indexer embed sweep). */
 const GIT_COMMIT_BACKLOG_DRAIN_MAX_MS = 5 * 60 * 1000;
+/** First maintenance passes are spread across 30 seconds after boot quiet ends. */
+const BOOT_PROJECT_JITTER_SLOT_MS = 1_000;
 
 /**
  * Per-project work registered with the timer. The timer is a process-wide
@@ -70,6 +73,8 @@ interface ProjectRegistration {
         since_days: number;
         max_commits: number;
     };
+    memoryEnabled?: boolean;
+    embeddingConfig?: { provider?: string };
     ensureRegistered: (directory: string, db: Database) => Promise<void>;
     /**
      * Per-registration retrospective raw-source provider factory. Each harness
@@ -95,6 +100,9 @@ interface ProjectRegistration {
 
 /** Singleton timer state. */
 let activeTimer: ReturnType<typeof setInterval> | null = null;
+const startupTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const startupJitters = new Map<string, number>();
+let nextStartupJitterSlot = 0;
 
 /** True when `directory` exists and is a directory. Any stat error (gone,
  *  permission, ENOENT) → false: a directory we can't read is treated as gone for
@@ -143,8 +151,8 @@ const registeredProjects = new Map<string, ProjectRegistration>();
  * timer. The timer itself is a singleton (we only need one setInterval per
  * process), but every registered project gets its per-directory work — git
  * commit indexing, dream schedule check, dream queue processing — on each
- * tick. The first registration also kicks off an immediate startup tick so
- * fresh installs and restarts don't wait 15 minutes for first-time indexing.
+ *  tick. The first registration schedules a quiet-period startup pass so
+ *  fresh installs do not create a writer burst during concurrent boot.
  *
  * Returns a cleanup that removes this project's registration. The timer
  * itself stops only when the last project unregisters.
@@ -152,13 +160,12 @@ const registeredProjects = new Map<string, ProjectRegistration>();
 export async function startDreamScheduleTimer(
     args: ProjectRegistration,
 ): Promise<(() => void) | undefined> {
+    beginBootQuietPeriod();
     const db = openTimerDatabaseOrNull("schedule timer registration");
     if (!db) return;
-    await args.ensureRegistered(args.directory, db);
-    const snapshot = getProjectEmbeddingSnapshot(args.projectIdentity);
     const dreamingEnabled = Boolean(args.dreamerConfig && args.dreamerConfig.disable !== true);
-    const embeddingSweepEnabled = snapshot?.enabled ?? false;
-    const commitIndexingEnabled = snapshot?.gitCommitEnabled ?? false;
+    const embeddingSweepEnabled = args.memoryEnabled === true;
+    const commitIndexingEnabled = args.gitCommitIndexing?.enabled === true;
 
     if (!dreamingEnabled && !embeddingSweepEnabled && !commitIndexingEnabled) {
         return;
@@ -166,7 +173,15 @@ export async function startDreamScheduleTimer(
 
     // Idempotent registration — re-registering the same directory replaces
     // the prior config (e.g., if config was reloaded for that project).
-    const isNewRegistration = !registeredProjects.has(args.directory);
+    const previousRegistration = registeredProjects.get(args.directory);
+    const isNewRegistration = previousRegistration === undefined;
+    if (previousRegistration && previousRegistration !== args) {
+        const pendingStartup = startupTimers.get(args.directory);
+        if (pendingStartup) {
+            clearTimeout(pendingStartup);
+            startupTimers.delete(args.directory);
+        }
+    }
     registeredProjects.set(args.directory, args);
 
     if (isNewRegistration) {
@@ -176,35 +191,40 @@ export async function startDreamScheduleTimer(
     }
 
     if (!activeTimer) {
-        // First registration in this process — start the timer and run an
-        // immediate startup tick so embedding backfill, commit indexing, and
-        // dream schedule checks don't wait 15 minutes after a fresh install.
+        // First registration in this process starts a quiet-period timer.
+        // Startup work is scheduled only after the quiet period and is
+        // staggered per project so a multi-project process does not create
+        // one writer burst.
         log(
             `[dreamer] started independent schedule timer (every ${DREAM_TIMER_INTERVAL_MS / 60_000}m)`,
         );
 
-        runTick("startup");
+        scheduleAfterBootQuiet(() => runTick("startup"));
 
         const timer = setInterval(() => runTick("interval"), DREAM_TIMER_INTERVAL_MS);
         if (typeof timer === "object" && "unref" in timer) {
             timer.unref();
         }
         activeTimer = timer;
-    } else if (isNewRegistration) {
-        // Timer is already running, but this is a brand-new project — give
-        // it the same "no 15-minute wait" treatment by sweeping just this
-        // project immediately. Existing projects keep their tick cadence.
-        void sweepProject(args, "startup", db);
+    } else if (isNewRegistration || previousRegistration !== args) {
+        scheduleInitialProjectRun(args, db);
     }
 
     return () => {
         registeredProjects.delete(args.directory);
+        const startupTimer = startupTimers.get(args.directory);
+        if (startupTimer) {
+            clearTimeout(startupTimer);
+            startupTimers.delete(args.directory);
+        }
         log(
             `[dreamer] unregistered project ${args.projectIdentity} (remaining=${registeredProjects.size})`,
         );
         if (registeredProjects.size === 0 && activeTimer) {
             clearInterval(activeTimer);
             activeTimer = null;
+            startupJitters.clear();
+            nextStartupJitterSlot = 0;
             log("[dreamer] stopped dream schedule timer (no projects left)");
         }
     };
@@ -225,26 +245,13 @@ function runTick(origin: "startup" | "interval"): void {
             // Desktop's "open all projects at once" workflow indexes every one,
             // not just whichever project happened to register the timer first.
             for (const reg of registeredProjects.values()) {
-                await reg.ensureRegistered(reg.directory, db);
-                const memorySnapshot = getProjectEmbeddingSnapshot(reg.projectIdentity);
-                if (memorySnapshot?.enabled) {
-                    const embeddedCount = await embedUnembeddedMemoriesForProject(
-                        db,
-                        reg.projectIdentity,
-                    );
-                    if (embeddedCount > 0) {
-                        log(
-                            `[magic-context] proactively embedded ${embeddedCount} ${embeddedCount === 1 ? "memory" : "memories"} for project ${reg.projectIdentity}`,
-                        );
-                    }
-                    // Compartment-chunk backfill is NOT driven from the timer: a
-                    // bounded batch per tick is a slow, bursty trickle that hammers
-                    // local embedding endpoints. New compartments embed on publish;
-                    // historical backfill runs on demand via /ctx-embed-history.
+                if (origin === "startup") {
+                    scheduleInitialProjectRun(reg, db);
+                } else {
+                    await runProjectMaintenance(reg, origin, db);
                 }
-
-                await sweepProject(reg, origin, db);
             }
+            if (origin === "startup") return;
             // Refresh planner stats once per tick (after per-project work).
             // Self-gating: a no-op unless a table's row count drifted enough to
             // warrant re-ANALYZE, and analysis_limit bounds any work it does.
@@ -253,6 +260,50 @@ function runTick(origin: "startup" | "interval"): void {
             log("[magic-context] timer-triggered maintenance check failed:", error);
         }
     })();
+}
+
+function startupJitterMs(directory: string): number {
+    const existing = startupJitters.get(directory);
+    if (existing !== undefined) return existing;
+    const slot = nextStartupJitterSlot;
+    nextStartupJitterSlot += 1;
+    const hash = [...directory].reduce(
+        (value, character) => (value * 33 + character.charCodeAt(0)) >>> 0,
+        5381,
+    );
+    const jitter = slot * BOOT_PROJECT_JITTER_SLOT_MS + (hash % BOOT_PROJECT_JITTER_SLOT_MS);
+    startupJitters.set(directory, jitter);
+    return jitter;
+}
+
+function scheduleInitialProjectRun(reg: ProjectRegistration, db: Database): void {
+    if (startupTimers.has(reg.directory)) return;
+    const timer = scheduleAfterBootQuiet(() => {
+        startupTimers.delete(reg.directory);
+        if (registeredProjects.get(reg.directory) !== reg) return;
+        void runProjectMaintenance(reg, "startup", db);
+    }, startupJitterMs(reg.directory));
+    startupTimers.set(reg.directory, timer);
+}
+
+async function runProjectMaintenance(
+    reg: ProjectRegistration,
+    origin: "startup" | "interval",
+    db: Database,
+): Promise<void> {
+    await reg.ensureRegistered(reg.directory, db);
+    const memorySnapshot = getProjectEmbeddingSnapshot(reg.projectIdentity);
+    if (memorySnapshot?.enabled) {
+        const embeddedCount = await embedUnembeddedMemoriesForProject(db, reg.projectIdentity);
+        if (embeddedCount > 0) {
+            log(
+                `[magic-context] proactively embedded ${embeddedCount} ${embeddedCount === 1 ? "memory" : "memories"} for project ${reg.projectIdentity}`,
+            );
+        }
+        // Compartment-chunk backfill remains demand-driven to avoid bursty
+        // requests to local embedding endpoints.
+    }
+    await sweepProject(reg, origin, db);
 }
 
 /**

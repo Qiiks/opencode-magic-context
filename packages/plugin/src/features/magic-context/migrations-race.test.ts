@@ -7,7 +7,12 @@ import { join } from "node:path";
 import { $ } from "bun";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { isSiblingMigrationConflict, runMigrations } from "./migrations";
+import {
+    isSiblingMigrationConflict,
+    MigrationLockBusyError,
+    runMigrations,
+    runMigrationsWithRetry,
+} from "./migrations";
 import { initializeDatabase } from "./storage-db";
 
 /**
@@ -54,8 +59,8 @@ describe("migration race tolerance", () => {
                 $`bun -e ${script}`.json() as Promise<{ version: number; table: boolean }>,
             ]);
 
-            expect(first).toEqual({ version: 52, table: true });
-            expect(second).toEqual({ version: 52, table: true });
+            expect(first).toEqual({ version: 53, table: true });
+            expect(second).toEqual({ version: 53, table: true });
 
             const verify = new Database(path);
             expect(
@@ -246,6 +251,95 @@ describe("migration race tolerance", () => {
         ).c;
         expect(after).toBe(before);
 
+        closeQuietly(db);
+    });
+
+    test("async migration-lock retry succeeds after a sibling releases its write lock", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "mc-migration-retry-"));
+        const path = join(dir, "context.db");
+        let holder: ReturnType<typeof Bun.spawn> | undefined;
+        try {
+            const setup = new Database(path);
+            initializeDatabase(setup);
+            runMigrations(setup);
+            setup.exec(
+                "DELETE FROM schema_migrations WHERE version >= 51; DROP TABLE tool_owner_backfill_state;",
+            );
+            closeQuietly(setup);
+
+            const holderScript = `
+                const { Database } = await import(${JSON.stringify(`file://${process.cwd()}/src/shared/sqlite.ts`)});
+                const db = new Database(${JSON.stringify(path)});
+                db.exec("PRAGMA busy_timeout=1; BEGIN IMMEDIATE;");
+                console.log("locked");
+                await new Promise((resolve) => setTimeout(resolve, 100));
+                db.exec("COMMIT");
+                db.close();
+            `;
+            holder = Bun.spawn(["bun", "-e", holderScript], { stdout: "pipe", stderr: "inherit" });
+            await holder.stdout?.getReader().read();
+
+            const db = new Database(path);
+            db.exec("PRAGMA busy_timeout=10");
+            await runMigrationsWithRetry(db, { retryDelaysMs: [100, 150] });
+            expect(
+                (
+                    db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as {
+                        version: number;
+                    }
+                ).version,
+            ).toBe(53);
+            closeQuietly(db);
+            await holder.exited;
+        } finally {
+            holder?.kill();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("async migration-lock retry exhausts and preserves fail-closed behavior", async () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+        db.exec(
+            "DELETE FROM schema_migrations WHERE version >= 51; DROP TABLE tool_owner_backfill_state;",
+        );
+        const originalPrepare = db.prepare.bind(db);
+        (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+            if (sql.toLowerCase().includes("select max(version)")) {
+                throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+            }
+            return originalPrepare(sql);
+        }) as typeof db.prepare;
+
+        await expect(
+            runMigrationsWithRetry(db, {
+                retryDelaysMs: [0, 0],
+                sleep: async () => {},
+            }),
+        ).rejects.toBeInstanceOf(MigrationLockBusyError);
+        closeQuietly(db);
+    });
+
+    test("non-lock migration failures are not retried", async () => {
+        const db = new Database(":memory:");
+        const originalPrepare = db.prepare.bind(db);
+        let versionReads = 0;
+        (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+            if (sql.toLowerCase().includes("select max(version)")) {
+                versionReads += 1;
+                throw new Error("synthetic migration failure");
+            }
+            return originalPrepare(sql);
+        }) as typeof db.prepare;
+
+        await expect(
+            runMigrationsWithRetry(db, {
+                retryDelaysMs: [0, 0, 0],
+                sleep: async () => {},
+            }),
+        ).rejects.toThrow("synthetic migration failure");
+        expect(versionReads).toBe(1);
         closeQuietly(db);
     });
 });

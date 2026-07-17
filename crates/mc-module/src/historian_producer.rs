@@ -358,6 +358,13 @@ impl HistorianProducerError {
         self.heuristic_decision().abort_or_overflow
     }
 
+    pub fn is_unknown_module(&self) -> bool {
+        matches!(
+            self,
+            HistorianProducerError::Subc(body) if body.code == "unknown_module"
+        )
+    }
+
     fn heuristic_decision(&self) -> DeprecatedHeuristicDecision {
         match self {
             HistorianProducerError::Subc(body) => DeprecatedHeuristicDecision {
@@ -1292,6 +1299,7 @@ mod tests {
             &connection_file,
             &ConnectionInfo {
                 schema: SCHEMA_VERSION,
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
                 endpoints: vec![Endpoint {
                     host: addr.ip().to_string(),
                     port: addr.port(),

@@ -309,6 +309,7 @@ export async function generateShadowWireFixture(): Promise<string> {
                 history_budget_tokens: 19_500,
                 cache_ttl: "ephemeral",
                 provider_error: "fixture provider warning",
+                mid_turn: false,
             },
             tsDecision: {
                 class: "hard",

@@ -1,6 +1,7 @@
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import {
     getLegacyOpenCodeMagicContextStorageDir,
     getMagicContextStorageDir,
@@ -10,7 +11,7 @@ import { log } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 
-import { runMigrations } from "./migrations";
+import { runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
     loadToolDefinitionMeasurements,
@@ -24,6 +25,7 @@ import { runToolOwnerBackfill } from "./tool-owner-backfill";
 export { ensureColumn, healAllNullColumns };
 
 const databases = new Map<string, Database>();
+const pendingAsyncOpens = new Map<string, Promise<Database | null>>();
 const persistenceByDatabase = new WeakMap<Database, boolean>();
 const persistenceErrorByDatabase = new WeakMap<Database, string>();
 const pathByDatabase = new WeakMap<Database, string>();
@@ -44,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 52;
+export const LATEST_SUPPORTED_VERSION = 53;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -350,6 +352,59 @@ export function runSqliteOptimize(db: Database): void {
     }
 }
 
+function finishDatabaseOpen(
+    db: Database,
+    dbPath: string,
+    explicitDbPath: boolean,
+    latestSupportedVersion: number,
+): Database | null {
+    if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
+        closeQuietly(db);
+        return null;
+    }
+    // Recover any Channel-2 ceiling-nudge lease left at `claimed` by a crash
+    // mid-delivery (see healWedgedChannel2Claims). Fresh opens and later
+    // cached-handle reuses both run this TTL-scoped heal so long-lived
+    // processes eventually unwind stuck stale claims without a restart.
+    healWedgedChannel2Claims(db);
+    // Initial boot-time backfill populates tool_owner_message_id on legacy tool
+    // tags. The module short-circuits when every session is already complete or
+    // skipped, so re-running it is cheap.
+    //
+    // The backfill is best-effort: missing OpenCode DB, transient
+    // SQLite errors, and per-session failures are logged but
+    // never fail-close the plugin. Lazy adoption covers rows the backfill could
+    // not reach.
+    if (!explicitDbPath) {
+        const runBackfill = () => {
+            try {
+                runToolOwnerBackfill(db);
+            } catch (error) {
+                log(
+                    `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
+                );
+            }
+        };
+        if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfill);
+        else runBackfill();
+    }
+    // Wire the persistence-backed tool-definition measurement store and
+    // rehydrate the in-memory map from any prior writes. Doing this here
+    // (after migrations) means migration v9 has already created the
+    // `tool_definition_measurements` table, so loadToolDefinitionMeasurements
+    // never hits a missing-table failure path.
+    setToolDefinitionDatabase(db);
+    loadToolDefinitionMeasurements(db);
+    // Tighten the DB + WAL/SHM sidecars to owner-only now that WAL mode has
+    // created the sidecars; best-effort, never fatal.
+    restrictDatabaseFilePermissions(dbPath);
+    databases.set(dbPath, db);
+    pathByDatabase.set(db, dbPath);
+    persistenceByDatabase.set(db, true);
+    persistenceErrorByDatabase.delete(db);
+    return db;
+}
+
 export function initializeDatabase(db: Database): void {
     // Install the busy timeout BEFORE any file-level PRAGMAs like WAL. Two
     // processes can cold-open the same DB at once (real OpenCode/Pi startup, or
@@ -613,6 +668,76 @@ export function initializeDatabase(db: Database): void {
       last_active_at INTEGER NOT NULL,
       PRIMARY KEY(project_path, scope, model_id)
     );
+
+    CREATE TABLE IF NOT EXISTS embedding_registrations (
+      project_path TEXT PRIMARY KEY,
+      provider_identity TEXT NOT NULL DEFAULT '',
+      model_id TEXT NOT NULL DEFAULT '',
+      chunk_model_id TEXT NOT NULL DEFAULT '',
+      fingerprint TEXT NOT NULL DEFAULT '',
+      table_epoch INTEGER NOT NULL DEFAULT 0,
+      dims INTEGER NOT NULL DEFAULT 0,
+      provenance_json TEXT NOT NULL DEFAULT '{}',
+      generation INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS synapse_batch_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      project_path TEXT NOT NULL DEFAULT '',
+      scope TEXT NOT NULL DEFAULT '',
+      manifest_json TEXT NOT NULL DEFAULT '{}',
+      request_key TEXT NOT NULL DEFAULT '',
+      job_id TEXT,
+      cursor TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(session_id, request_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_synapse_batch_ledger_session
+      ON synapse_batch_ledger(session_id, updated_at);
+
+    CREATE TABLE IF NOT EXISTS shadow_embedding_registrations (
+      project_path TEXT NOT NULL,
+      scope TEXT NOT NULL CHECK(scope IN ('memory', 'commit', 'chunk')),
+      model_id TEXT NOT NULL,
+      generation INTEGER NOT NULL DEFAULT 0,
+      fingerprint TEXT NOT NULL DEFAULT '',
+      table_epoch INTEGER NOT NULL DEFAULT 0,
+      dims INTEGER NOT NULL DEFAULT 0,
+      provenance_json TEXT NOT NULL DEFAULT '{}',
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(project_path, scope, model_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS embedding_measurement_corpus (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      project_path TEXT NOT NULL DEFAULT '',
+      dedup_key TEXT NOT NULL DEFAULT '',
+      cohort_key TEXT NOT NULL DEFAULT '',
+      query_text_hash TEXT NOT NULL DEFAULT '',
+      primary_result_ids_json TEXT NOT NULL DEFAULT '[]',
+      shadow_result_ids_json TEXT NOT NULL DEFAULT '[]',
+      primary_latency_ms INTEGER,
+      shadow_latency_ms INTEGER,
+      primary_failed INTEGER NOT NULL DEFAULT 0,
+      shadow_failed INTEGER NOT NULL DEFAULT 0,
+      primary_model_id TEXT NOT NULL DEFAULT '',
+      shadow_model_id TEXT NOT NULL DEFAULT '',
+      primary_fingerprint TEXT NOT NULL DEFAULT '',
+      shadow_fingerprint TEXT NOT NULL DEFAULT '',
+      primary_epoch INTEGER NOT NULL DEFAULT 0,
+      shadow_epoch INTEGER NOT NULL DEFAULT 0,
+      corpus_hash TEXT NOT NULL DEFAULT '',
+      coverage_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(dedup_key, cohort_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_embedding_measurement_session
+      ON embedding_measurement_corpus(session_id, created_at);
 
     CREATE TABLE IF NOT EXISTS memory_verifications (
       memory_id    INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -1539,50 +1664,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         }
         initializeDatabase(db);
         runMigrations(db);
-        if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
-            closeQuietly(db);
-            return null;
-        }
-        // Recover any Channel-2 ceiling-nudge lease left at `claimed` by a crash
-        // mid-delivery (see healWedgedChannel2Claims). Fresh opens and later
-        // cached-handle reuses both run this TTL-scoped heal so long-lived
-        // processes eventually unwind stuck stale claims without a restart.
-        healWedgedChannel2Claims(db);
-        // Tool-owner backfill (plan v3.3.1, Layer B). Runs once per
-        // boot to populate tool_owner_message_id on legacy tool tags.
-        // The backfill module short-circuits when no work is needed
-        // (every session has either backfilled rows or is already
-        // marked completed/skipped), so re-running is cheap.
-        //
-        // The backfill is best-effort: missing OpenCode DB, transient
-        // SQLite errors, and per-session failures are logged but
-        // never fail-close the plugin. Lazy adoption (Layer C) covers
-        // any rows the backfill couldn't reach.
-        if (!explicitDbPath) {
-            try {
-                runToolOwnerBackfill(db);
-            } catch (error) {
-                log(
-                    `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
-                );
-            }
-        }
-        // Wire the persistence-backed tool-definition measurement store and
-        // rehydrate the in-memory map from any prior writes. Doing this here
-        // (after migrations) means migration v9 has already created the
-        // `tool_definition_measurements` table, so loadToolDefinitionMeasurements
-        // never hits a missing-table failure path. See bug #2 in the v0.16+
-        // sidebar regression report.
-        setToolDefinitionDatabase(db);
-        loadToolDefinitionMeasurements(db);
-        // Tighten the DB + WAL/SHM sidecars to owner-only now that WAL mode has
-        // created the sidecars; best-effort, never fatal.
-        restrictDatabaseFilePermissions(dbPath);
-        databases.set(dbPath, db);
-        pathByDatabase.set(db, dbPath);
-        persistenceByDatabase.set(db, true);
-        persistenceErrorByDatabase.delete(db);
-        return db;
+        return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
     } catch (error) {
         const detail = getErrorMessage(error);
         log(`[magic-context] storage fatal: failed to open ${dbPath}: ${detail}`);
@@ -1591,6 +1673,61 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         throw new Error(
             `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
         );
+    }
+}
+
+/**
+ * Async boot variant of openDatabase. SQLite calls remain synchronous, but the
+ * bounded migration-lock waits yield to the host between attempts so a busy
+ * sibling cannot freeze plugin startup for the whole retry budget.
+ */
+export async function openDatabaseAsync(
+    dbPathOrOptions?: string | OpenDatabaseOptions,
+): Promise<Database | null> {
+    const options =
+        typeof dbPathOrOptions === "string" ? { dbPath: dbPathOrOptions } : dbPathOrOptions;
+    const explicitDbPath = options?.dbPath !== undefined;
+    const { dbDir, dbPath } = resolveDatabasePath(options?.dbPath);
+    const latestSupportedVersion = getRuntimeLatestSupportedVersion(options);
+    const existing = databases.get(dbPath);
+    if (existing) {
+        if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) return null;
+        if (!persistenceByDatabase.has(existing)) persistenceByDatabase.set(existing, true);
+        healWedgedChannel2Claims(existing);
+        return existing;
+    }
+
+    const pending = pendingAsyncOpens.get(dbPath);
+    if (pending) return pending;
+
+    const opening = (async (): Promise<Database | null> => {
+        let db: Database | undefined;
+        try {
+            if (!explicitDbPath) migrateLegacyStorageIfNeeded(dbPath, dbDir);
+            ensureSecureStorageDir(dbDir);
+
+            db = new Database(dbPath);
+            if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
+                closeQuietly(db);
+                return null;
+            }
+            initializeDatabase(db);
+            await runMigrationsWithRetry(db);
+            return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
+        } catch (error) {
+            if (db) closeQuietly(db);
+            const detail = getErrorMessage(error);
+            log(`[magic-context] storage fatal: failed to open ${dbPath}: ${detail}`);
+            throw new Error(
+                `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
+            );
+        }
+    })();
+    pendingAsyncOpens.set(dbPath, opening);
+    try {
+        return await opening;
+    } finally {
+        if (pendingAsyncOpens.get(dbPath) === opening) pendingAsyncOpens.delete(dbPath);
     }
 }
 
@@ -1605,6 +1742,7 @@ export function getDatabasePersistenceError(db: Database | null): string | null 
 }
 
 export function closeDatabase(): void {
+    pendingAsyncOpens.clear();
     for (const [key, db] of databases) {
         try {
             closeQuietly(db);

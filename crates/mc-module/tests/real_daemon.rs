@@ -450,6 +450,7 @@ fn write_empty_config(config_dir: &Path) {
 fn fast_consumer_options() -> ConsumerOptions {
     ConsumerOptions {
         handshake_timeout: Duration::from_secs(2),
+        call_timeout: Duration::from_secs(10),
         reconnect_backoff: RetryBackoff {
             base: Duration::from_millis(50),
             cap: Duration::from_millis(250),

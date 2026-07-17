@@ -4,10 +4,10 @@ import { createCompactionHandler } from "../../features/magic-context/compaction
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { createScheduler } from "../../features/magic-context/scheduler";
 import { createTagger } from "../../features/magic-context/tagger";
-import { createMagicContextHook } from "../../hooks/magic-context";
+import { createMagicContextHook, createMagicContextHookAsync } from "../../hooks/magic-context";
 import type { LiveSessionState } from "../../hooks/magic-context/live-session-state";
+import type { RustModeModuleClient } from "../../hooks/magic-context/rust-mode-transform";
 import type { PluginContext } from "../types";
-
 /**
  * Map the full plugin config down to the per-session hook config. Pure and
  * exported so it can be unit-tested directly — without a module-level
@@ -19,11 +19,11 @@ export function buildMagicContextHookConfig(pluginConfig: MagicContextPluginConf
     // Pass the WHOLE plugin config through and only override the fields that
     // need defaulting. This was a hand-maintained field-by-field mapping, which
     // silently dropped every hook-config field added after the mapping was
-    // written: `smart_drops`, `language`, `embedding`, and `shadow_transform`
-    // all read as undefined inside the hook even when set by the user, turning
-    // opted-in features off with no warning. The hook only consumes the fields
-    // its config type declares, so the extra top-level keys carried by the
-    // spread are inert.
+    // written: `smart_drops`, `language`, `embedding`, `shadow_transform`, and
+    // `transform_mode` all read as undefined inside the hook even when set by
+    // the user, turning opted-in features off with no warning. The hook only
+    // consumes the fields its config type declares, so the extra top-level keys
+    // carried by the spread are inert.
     return {
         ...pluginConfig,
         protected_tags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
@@ -36,11 +36,12 @@ export function createSessionHooks(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;
     liveSessionState: LiveSessionState;
+    rustModeModuleClient?: RustModeModuleClient;
 }) {
     const { ctx, pluginConfig, liveSessionState } = args;
 
     if (pluginConfig.enabled !== true) {
-        return { magicContext: null };
+        return { magicContext: null, rustToolBackends: undefined };
     }
 
     const tagger = createTagger();
@@ -50,16 +51,55 @@ export function createSessionHooks(args: {
         executeThresholdTokens: pluginConfig.execute_threshold_tokens,
     });
     const compactionHandler = createCompactionHandler();
+    const hookResult = createMagicContextHook({
+        client: ctx.client,
+        directory: ctx.directory,
+        tagger,
+        scheduler,
+        compactionHandler,
+        liveSessionState,
+        rustModeModuleClient: args.rustModeModuleClient,
+        config: buildMagicContextHookConfig(pluginConfig),
+    });
 
     return {
-        magicContext: createMagicContextHook({
-            client: ctx.client,
-            directory: ctx.directory,
-            tagger,
-            scheduler,
-            compactionHandler,
-            liveSessionState,
-            config: buildMagicContextHookConfig(pluginConfig),
-        }),
+        magicContext: hookResult,
+        rustToolBackends: hookResult?.rustToolBackends,
+    };
+}
+
+export async function createSessionHooksAsync(args: {
+    ctx: PluginContext;
+    pluginConfig: MagicContextPluginConfig;
+    liveSessionState: LiveSessionState;
+    rustModeModuleClient?: RustModeModuleClient;
+}) {
+    const { ctx, pluginConfig, liveSessionState } = args;
+
+    if (pluginConfig.enabled !== true) {
+        return { magicContext: null, rustToolBackends: undefined };
+    }
+
+    const tagger = createTagger();
+    const scheduler = createScheduler({
+        executeThresholdPercentage:
+            pluginConfig.execute_threshold_percentage ?? DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+        executeThresholdTokens: pluginConfig.execute_threshold_tokens,
+    });
+    const compactionHandler = createCompactionHandler();
+    const hookResult = await createMagicContextHookAsync({
+        client: ctx.client,
+        directory: ctx.directory,
+        tagger,
+        scheduler,
+        compactionHandler,
+        liveSessionState,
+        rustModeModuleClient: args.rustModeModuleClient,
+        config: buildMagicContextHookConfig(pluginConfig),
+    });
+
+    return {
+        magicContext: hookResult,
+        rustToolBackends: hookResult?.rustToolBackends,
     };
 }

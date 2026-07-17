@@ -16,13 +16,15 @@ import { createCtxReduceTools } from "../tools/ctx-reduce";
 import { createCtxSearchTools } from "../tools/ctx-search";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
+import type { RustToolBackends } from "./rust-tool-backends";
 import type { PluginContext } from "./types";
 
 export function createToolRegistry(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;
+    rustToolBackends?: RustToolBackends;
 }): Record<string, ToolDefinition> {
-    const { ctx, pluginConfig } = args;
+    const { ctx, pluginConfig, rustToolBackends } = args;
 
     if (pluginConfig.enabled !== true) {
         return {};
@@ -73,6 +75,7 @@ export function createToolRegistry(args: {
         ...createCtxReduceTools({
             db,
             protectedTags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
+            rustToolBackends,
         }),
         ...createCtxExpandTools({ db }),
         ...createCtxNoteTools({
@@ -96,6 +99,7 @@ export function createToolRegistry(args: {
                   // enumeration) stays dreamer-only (runtime-gated via
                   // toolContext.agent in tools.ts).
                   allowedActions: [...CTX_MEMORY_ACTIONS],
+                  rustToolBackends,
               })
             : {}),
     };

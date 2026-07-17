@@ -319,6 +319,14 @@ pub fn persist_historian_state(
     Ok(store.commit(session_id, loaded.row_version, &loaded.core, &meta)?)
 }
 
+pub trait HistorianPublicationFence: Send + Sync {
+    fn publish(
+        &self,
+        store: &McStore,
+        request: HistorianPublishRequest<'_>,
+    ) -> Result<HistorianPublishResult, HistorianPublishError>;
+}
+
 pub struct ValidatedPublishRequest<'a> {
     pub session_id: &'a str,
     pub project_path: &'a str,
@@ -332,6 +340,7 @@ pub struct ValidatedPublishRequest<'a> {
     /// Creation timestamp stamped on the appended compartment rows.
     pub created_at_ms: i64,
     pub failure_backoff_at_ms: i64,
+    pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
 /// Publish after re-checking the chunk fingerprint at the commit point. A mismatch
@@ -369,7 +378,7 @@ pub fn publish_validated_chunk(
         .collect();
     let facts: Vec<FactCandidate> = request.validated.facts.iter().map(to_store_fact).collect();
 
-    match store.publish_historian_chunk(HistorianPublishRequest {
+    let publish_request = HistorianPublishRequest {
         session_id: request.session_id,
         expected_row_version: request.expected_row_version,
         expected_revert_epoch: request.expected_revert_epoch,
@@ -379,8 +388,28 @@ pub fn publish_validated_chunk(
         facts: &facts,
         publication_floor_ordinal: request.publication_floor_ordinal,
         chunk_transcript: Some(request.chunk_transcript),
-    }) {
+    };
+    let publish_result = match request.publication_fence {
+        Some(fence) => fence.publish(store, publish_request),
+        None => store.publish_historian_chunk(publish_request),
+    };
+    match publish_result {
         Ok(result) => Ok(result),
+        Err(HistorianPublishError::FenceRejected { reason }) => {
+            // A fence rejection is a fast local race (the caller's snapshot was
+            // retired mid-round), not a producer failure: return the run to Idle
+            // with NO failure cooldown so an immediate retry on a fresh snapshot
+            // is admitted instead of reading backoff_active for a minute.
+            abandon_matching_run_without_cooldown(
+                store,
+                request.session_id,
+                request.predicate,
+                Some(format!("publish rejected: {reason}")),
+            )?;
+            Err(HistorianStateError::Publish(
+                HistorianPublishError::FenceRejected { reason },
+            ))
+        }
         Err(HistorianPublishError::CasConflict {
             expected,
             found,
@@ -489,6 +518,10 @@ pub enum HistorianDriveError {
     NoModels,
     State(HistorianStateError),
     Producer(HistorianProducerError),
+    ProducerConnect {
+        source: Box<HistorianProducerError>,
+        backoff_error: Option<Box<McStoreError>>,
+    },
     Validation(HistorianValidationError),
 }
 
@@ -498,6 +531,17 @@ impl fmt::Display for HistorianDriveError {
             HistorianDriveError::NoModels => write!(f, "historian model chain is empty"),
             HistorianDriveError::State(e) => write!(f, "state: {e}"),
             HistorianDriveError::Producer(e) => write!(f, "producer: {e}"),
+            HistorianDriveError::ProducerConnect {
+                source,
+                backoff_error: Some(error),
+            } => write!(
+                f,
+                "producer connect: {source}; durable backoff could not be recorded: {error}"
+            ),
+            HistorianDriveError::ProducerConnect {
+                source,
+                backoff_error: None,
+            } => write!(f, "producer connect: {source}"),
             HistorianDriveError::Validation(e) => write!(f, "validation: {e}"),
         }
     }
@@ -620,6 +664,7 @@ pub struct HistorianFireRequest<'a> {
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
     pub completion_now_ms: fn() -> i64,
+    pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
 pub struct HistorianReattachRequest<'a> {
@@ -635,6 +680,7 @@ pub struct HistorianReattachRequest<'a> {
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
     pub completion_now_ms: fn() -> i64,
+    pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
 /// Session-id prefix for the module's own producer (child) sessions. The transform
@@ -648,6 +694,23 @@ pub const MC_CHILD_SESSION_PREFIX: &str = "mc-historian:";
 /// Wait budget for a full historian run plus its one short timeout recovery re-drain.
 pub fn completion_wait_budget() -> Duration {
     Duration::from_secs(660)
+}
+
+/// Maximum producer rounds driven by one explicit session wrapup.
+pub const MAX_WRAPUP_ROUNDS: usize = 5;
+
+/// The per-attempt deadline a consumer sets, VERBATIM, for `session.wrapup` calls —
+/// margin included, no consumer-side arithmetic on top (the module owns the margin,
+/// mirroring `MAX_EMERGENCY_REQUEST_BUDGET`). Derivation: one busy-join at entry
+/// (bounded by [`completion_wait_budget`], 660s) plus [`MAX_WRAPUP_ROUNDS`] producer
+/// rounds at [`wrapup_round_wait_budget`] (5 x 600s) = 3660s worst case, plus margin.
+/// Bump this in the same commit as any change to those inputs and notify consumers.
+pub const MAX_WRAPUP_REQUEST_BUDGET: Duration = Duration::from_secs(3_800);
+
+/// Per-round wrapup wait bound. A timed-out producer keeps running under the normal
+/// historian guard so durable recovery remains identical to an incremental firing.
+pub fn wrapup_round_wait_budget() -> Duration {
+    Duration::from_secs(600)
 }
 
 /// The transform-call deadline a consumer sets, VERBATIM, for requests to this module —
@@ -1041,6 +1104,7 @@ where
             failure_started_at_ms: request.now_ms,
             failure_backoff_at_ms: request.failure_backoff_at_ms,
             completion_now_ms: request.completion_now_ms,
+            publication_fence: request.publication_fence,
         });
         producer.close().await;
         let row_version = match publish_result {
@@ -1189,6 +1253,7 @@ where
         failure_started_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
         completion_now_ms: request.completion_now_ms,
+        publication_fence: request.publication_fence,
     });
     producer.close().await;
     let row_version = publish_result?;
@@ -1215,6 +1280,7 @@ struct PublishOutputRequest<'a> {
     failure_started_at_ms: i64,
     failure_backoff_at_ms: i64,
     completion_now_ms: fn() -> i64,
+    publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
 fn publish_output_from_awaiting(
@@ -1235,6 +1301,7 @@ fn publish_output_from_awaiting(
         failure_started_at_ms,
         failure_backoff_at_ms,
         completion_now_ms,
+        publication_fence,
     } = request;
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
@@ -1303,6 +1370,7 @@ fn publish_output_from_awaiting(
             chunk_transcript,
             created_at_ms,
             failure_backoff_at_ms,
+            publication_fence,
         },
     )?;
     Ok(published.row_version)
@@ -1353,6 +1421,19 @@ fn idle_after_success(firing_seq: u64) -> HistorianDurableState {
     }
 }
 
+/// Abandon like `abandon_matching_run_with_detail` but WITHOUT arming the
+/// failure backoff: used when the publish was refused by a local fence rather
+/// than failing in the producer, so the next attempt should not wait out a
+/// model-failure cooldown.
+fn abandon_matching_run_without_cooldown(
+    store: &McStore,
+    session_id: &str,
+    predicate: &HistorianPublishPredicate,
+    detail: Option<String>,
+) -> Result<Option<u64>, HistorianStateError> {
+    Ok(store.abandon_historian_run_if_matching(session_id, predicate, None, detail.as_deref())?)
+}
+
 fn abandon_matching_run_with_detail(
     store: &McStore,
     session_id: &str,
@@ -1360,19 +1441,12 @@ fn abandon_matching_run_with_detail(
     failure_backoff_at_ms: i64,
     detail: Option<String>,
 ) -> Result<Option<u64>, HistorianStateError> {
-    let loaded = store.load(session_id)?;
-    let state = &loaded.meta.historian;
-    let matches = state.firing_seq == predicate.firing_seq
-        && state.producer_run_id.as_deref() == Some(predicate.producer_run_id.as_str())
-        && state.chunk_fingerprint == predicate.chunk_fingerprint;
-    if !matches || state.state == HistorianPhase::Idle {
-        return Ok(None);
-    }
-
-    let mut meta = loaded.meta.clone();
-    meta.historian = abandon_with_detail(state, failure_backoff_at_ms, detail);
-    let row_version = store.commit(session_id, loaded.row_version, &loaded.core, &meta)?;
-    Ok(Some(row_version))
+    Ok(store.abandon_historian_run_if_matching(
+        session_id,
+        predicate,
+        Some(failure_backoff_at_ms),
+        detail.as_deref(),
+    )?)
 }
 
 #[cfg(test)]
@@ -1429,11 +1503,20 @@ mod tests {
             serializer_profile: "owned-llmrunner".to_string(),
             session_id: "ses".to_string(),
             render_config: "cfg".to_string(),
+            provider_id: None,
+            model_key: None,
+            clear_reasoning_age: 50,
+            tool_present: false,
+            serve_native: false,
+            native_messages: None,
             full_array_fingerprint: None,
             messages,
             tail_delta: None,
             usage: None,
             provider_error: None,
+            mid_turn: false,
+            prev_response_completed_at_ms: None,
+            request_observed_at_ms: None,
             declared_trim: None,
         }
     }
@@ -1696,6 +1779,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         }
     }
 
@@ -1717,6 +1801,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         }
     }
 
@@ -2289,6 +2374,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         };
         let right_request = HistorianReattachRequest {
             store: &store,
@@ -2303,6 +2389,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         };
 
         let (left, right) = tokio::join!(
@@ -2729,6 +2816,7 @@ mod tests {
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
+            publication_fence: None,
         };
         let err = reattach_historian_producer(&mut producer, request)
             .await
@@ -3041,6 +3129,7 @@ mod tests {
                 chunk_transcript: "U: transcript",
                 created_at_ms: 123,
                 failure_backoff_at_ms: 0,
+                publication_fence: None,
             },
         )
         .expect("publish succeeds");
@@ -3141,6 +3230,11 @@ mod tests {
             .unwrap();
         let loaded = store.load("ses").unwrap();
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
+        let abandon_hook_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let abandon_hook_calls_for_hook = std::sync::Arc::clone(&abandon_hook_calls);
+        store.set_abandon_historian_hook(Box::new(move || {
+            abandon_hook_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
         let err = publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
@@ -3155,6 +3249,7 @@ mod tests {
                 chunk_transcript: "U: transcript",
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
+                publication_fence: None,
             },
         )
         .unwrap_err();
@@ -3166,6 +3261,11 @@ mod tests {
         let after = store.load("ses").unwrap().meta.historian;
         assert_eq!(after.state, HistorianPhase::Idle);
         assert_eq!(after.failure_backoff_at_ms, Some(999));
+        assert_eq!(
+            abandon_hook_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fingerprint cleanup must use the store's fenced abandon primitive"
+        );
         assert!(matches!(
             fire(&after, 6, 7, "new".into(), 0, 1000).unwrap(),
             FireOutcome::Fired(_)
@@ -3221,6 +3321,7 @@ mod tests {
                 chunk_transcript: "U: transcript",
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
+                publication_fence: None,
             },
         )
         .unwrap_err();

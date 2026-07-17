@@ -83,9 +83,9 @@ describe("storage-meta", () => {
             //#then
             // 2 transactions: outer clearSession + nested clearIndexedMessages
             expect(db.transaction).toHaveBeenCalledTimes(2);
-            // 24 prepares: includes every session-scoped table plus the nested
+            // 26 prepares: includes every session-scoped table plus the nested
             // message-index and compression-depth cleanup statements.
-            expect(db.prepare).toHaveBeenCalledTimes(24);
+            expect(db.prepare).toHaveBeenCalledTimes(26);
         });
     });
 });

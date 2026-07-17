@@ -465,6 +465,7 @@ impl AssembledHistorianFiring {
             now_ms: self.now_ms,
             failure_backoff_at_ms: self.failure_backoff_at_ms,
             completion_now_ms: crate::now_ms,
+            publication_fence: None,
         }
     }
 }

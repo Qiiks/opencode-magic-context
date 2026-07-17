@@ -114,6 +114,7 @@
         "queued_at": 1735689599000
       }
     ],
+    "user_profile": [],
     "seed_boundary_id": "message-2#2",
     "workspace": {
       "fingerprint": "b09c30fd5c913f0b993abafc7798be85dc74dcaf1c1df59a0216083f87164822",
@@ -230,7 +231,8 @@
       "effective_execute_threshold": 65,
       "history_budget_tokens": 19500,
       "cache_ttl": "ephemeral",
-      "provider_error": "fixture provider warning"
+      "provider_error": "fixture provider warning",
+      "mid_turn": false
     },
     "ts_decision": {
       "class": "hard",

@@ -151,9 +151,21 @@ pub struct SelectionContext {
     /// drop (0 if never), and whether any emergency drop has happened.
     pub prior_input_sample: f64,
     pub has_prior_drop: bool,
-    /// Agent-marked drop ids (the ctx_reduce §N§ signal), a caller-owned side input
-    /// (empty on the MITM leg). Canonical flat ids of the marked blocks.
+    /// Agent-marked drop ids (the ctx_reduce §N§ signal), a caller-owned side input.
+    /// Canonical flat ids of the marked blocks.
     pub agent_drop_ids: Vec<String>,
+    /// Agent-drop command ownership, keyed by canonical block id. Missing entries are
+    /// legacy rows queued without a command id.
+    pub agent_drop_command_ids: HashMap<String, String>,
+    /// Agent-drop ids whose command already made its first application. The marker is
+    /// durable at command scope, but selection needs the per-id projection.
+    pub first_applied_agent_drop_ids: HashSet<String>,
+    /// True when a byte-changing pass is already known before reduction selection.
+    /// Selection may also discover a different command's first application as a ride.
+    pub pass_already_busting: bool,
+    /// Dynamic newest-tag protection expressed as exact block ids. This applies to
+    /// automatic selectors and agent-marked drops alike.
+    pub protected_block_ids: HashSet<String>,
 }
 
 /// Which scheduler class this pass is — gates which selectors run.
@@ -460,15 +472,11 @@ fn expand_arc(
             });
         }
     }
-    for rid in &arc.reasoning_ids {
-        if !frozen.contains(rid) {
-            out.push(ReductionDecision {
-                target_id: rid.clone(),
-                kind: RedKind::Drop.as_str().to_string(),
-                payload: DROPPED_PLACEHOLDER.to_string(),
-            });
-        }
-    }
+    // Reasoning blocks are NEVER reduction targets: signed thinking is
+    // provider-verified content, and a placeholder-rewritten reasoning block can
+    // never re-encode for Anthropic (the signature is gone), which permanently
+    // fences the session to raw. The arc's reasoning stays verbatim; reclaim
+    // comes from the call/result blocks only.
 }
 
 // --- the five selectors: each returns the ARC-IDs (or block-ids) it targets ---
@@ -547,13 +555,28 @@ fn select_two_pass(arcs: &[&ToolArc], last_execute_ordinal: u64) -> HashSet<Stri
 /// input). These are already flat block ids; emitted directly as drops (arc-atomic
 /// isn't needed — the agent marks specific blocks). Frozen/absent filtered by caller.
 fn select_agent_drops(
-    agent_drop_ids: &[String],
+    ctx: &SelectionContext,
     live_ids: &HashSet<String>,
     frozen: &HashSet<String>,
     out: &mut Vec<ReductionDecision>,
 ) {
-    for id in agent_drop_ids {
-        if frozen.contains(id) || !live_ids.contains(id) {
+    for id in &ctx.agent_drop_ids {
+        if frozen.contains(id) || !live_ids.contains(id) || ctx.protected_block_ids.contains(id) {
+            continue;
+        }
+        let first_applied = ctx.first_applied_agent_drop_ids.contains(id);
+        let can_ride = ctx.pass_already_busting
+            || (first_applied
+                && ctx.agent_drop_ids.iter().any(|other| {
+                    other != id
+                        && !ctx.first_applied_agent_drop_ids.contains(other)
+                        && live_ids.contains(other)
+                        && !frozen.contains(other)
+                        && !ctx.protected_block_ids.contains(other)
+                        && ctx.agent_drop_command_ids.get(other)
+                            != ctx.agent_drop_command_ids.get(id)
+                }));
+        if first_applied && !can_ride {
             continue;
         }
         out.push(ReductionDecision {
@@ -683,7 +706,16 @@ pub fn select_reductions(
 
     let live_ids: HashSet<String> = items
         .iter()
-        .filter(|item| !matches!(item.kind, SelKind::Media | SelKind::Opaque))
+        .filter(|item| {
+            // Media/Opaque are pass-through carriers; Reasoning is signed
+            // provider-verified content whose rewrite can never re-encode.
+            // None of the three may ever become a reduction target, including
+            // via agent-directed ctx_reduce ids.
+            !matches!(
+                item.kind,
+                SelKind::Media | SelKind::Opaque | SelKind::Reasoning | SelKind::RedactedReasoning
+            )
+        })
         .map(|item| item.id.clone())
         .collect();
     let arcs = group_arcs(items, frozen_keys);
@@ -779,7 +811,11 @@ pub fn select_reductions(
 
     // ctx_reduce agent drops stay block-granular, but pass-through carriers are absent
     // from live_ids so Media and Opaque can never become reduction targets.
-    select_agent_drops(&ctx.agent_drop_ids, &live_ids, frozen_keys, &mut out);
+    select_agent_drops(ctx, &live_ids, frozen_keys, &mut out);
+
+    // Protection is block-specific, not an ordinal cutoff: remove protected targets from
+    // both automatic arc decisions and agent-directed decisions before the stable merge.
+    out.retain(|decision| !ctx.protected_block_ids.contains(&decision.target_id));
 
     // Deterministic merge: exactly one decision per target (drop > edit_marker >
     // skeleton), stable output order (by target_id).
@@ -925,6 +961,10 @@ mod tests {
             prior_input_sample: 0.0,
             has_prior_drop: false,
             agent_drop_ids: Vec::new(),
+            agent_drop_command_ids: HashMap::new(),
+            first_applied_agent_drop_ids: HashSet::new(),
+            pass_already_busting: false,
+            protected_block_ids: HashSet::new(),
         }
     }
 
@@ -1097,6 +1137,10 @@ mod tests {
                 prior_input_sample: case.ctx.prior_input_sample,
                 has_prior_drop: case.ctx.has_prior_drop,
                 agent_drop_ids: case.ctx.agent_drop_ids.clone(),
+                agent_drop_command_ids: HashMap::new(),
+                first_applied_agent_drop_ids: HashSet::new(),
+                pass_already_busting: false,
+                protected_block_ids: HashSet::new(),
             };
             let cfg = SelectionConfig {
                 smart_drops: case.smart_drops,
@@ -1177,8 +1221,34 @@ mod tests {
     }
 
     #[test]
-    fn arc_atomic_emission_call_result_reasoning() {
-        // A dropped arc emits decisions for the call, result, AND adjacent reasoning.
+    fn dynamic_block_protection_filters_automatic_and_agent_drop_decisions() {
+        let items = vec![
+            tool_call("c1", 1, "bash", serde_json::json!({}), 200),
+            tool_result("c1", 1, "bash", 200),
+            tool_call("c2", 2, "bash", serde_json::json!({}), 200),
+            tool_result("c2", 2, "bash", 200),
+        ];
+        let protected = result_block_id("c1");
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = 2;
+        ctx.agent_drop_ids = vec![protected.clone()];
+        ctx.protected_block_ids.insert(protected.clone());
+
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(out.iter().all(|decision| decision.target_id != protected));
+        assert!(
+            out.iter()
+                .any(|decision| decision.target_id == result_block_id("c2")),
+            "the unprotected automatic candidate must still be selected"
+        );
+    }
+
+    #[test]
+    fn arc_atomic_emission_targets_call_and_result_never_reasoning() {
+        // A dropped arc emits decisions for the call and result. The adjacent
+        // reasoning block stays verbatim: rewriting signed thinking discards the
+        // signature and the block can never re-encode for Anthropic, which
+        // permanently fences the session to raw serving.
         let items = vec![
             reasoning("c1", 1, 100),
             tool_call("c1", 1, "bash", serde_json::json!({}), 50),
@@ -1190,9 +1260,32 @@ mod tests {
         let ids: HashSet<&str> = out.iter().map(|d| d.target_id.as_str()).collect();
         assert!(
             ids.contains(call_block_id("c1").as_str())
-                && ids.contains(result_block_id("c1").as_str())
-                && ids.contains(reasoning_block_id("c1").as_str()),
+                && ids.contains(result_block_id("c1").as_str()),
             "{ids:?}"
+        );
+        assert!(
+            !ids.contains(reasoning_block_id("c1").as_str()),
+            "reasoning must never be a reduction target: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn agent_drop_on_reasoning_block_is_refused() {
+        // ctx_reduce ids aimed at reasoning blocks are filtered at the live-ids
+        // boundary, same as Media/Opaque pass-through carriers.
+        let items = vec![
+            reasoning("c1", 1, 100),
+            tool_call("c1", 1, "bash", serde_json::json!({}), 50),
+            tool_result("c1", 1, "bash", 300),
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = 1;
+        ctx.agent_drop_ids = vec![reasoning_block_id("c1")];
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(
+            out.iter()
+                .all(|d| d.target_id != reasoning_block_id("c1")),
+            "{out:?}"
         );
     }
 
@@ -1441,6 +1534,66 @@ mod tests {
         assert!(out
             .iter()
             .any(|d| d.target_id == result_block_id("c1") && d.kind == "drop"));
+    }
+
+    #[test]
+    fn held_agent_drop_never_trickles_when_the_window_slides() {
+        let items = vec![SelItem {
+            id: "held#0".to_string(),
+            ordinal: 1,
+            kind: SelKind::Text,
+            provider_executed: false,
+            byte_size: 100,
+            arc_id: None,
+        }];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.agent_drop_ids = vec!["held#0".to_string()];
+        ctx.agent_drop_command_ids
+            .insert("held#0".to_string(), "command-a".to_string());
+        ctx.first_applied_agent_drop_ids
+            .insert("held#0".to_string());
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(
+            out.is_empty(),
+            "a held row cannot create a stable-pass bust"
+        );
+    }
+
+    #[test]
+    fn different_command_first_application_is_a_single_ride_opportunity() {
+        let items = vec![
+            SelItem {
+                id: "held#0".to_string(),
+                ordinal: 1,
+                kind: SelKind::Text,
+                provider_executed: false,
+                byte_size: 100,
+                arc_id: None,
+            },
+            SelItem {
+                id: "new#0".to_string(),
+                ordinal: 2,
+                kind: SelKind::Text,
+                provider_executed: false,
+                byte_size: 100,
+                arc_id: None,
+            },
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.agent_drop_ids = vec!["held#0".to_string(), "new#0".to_string()];
+        ctx.agent_drop_command_ids
+            .insert("held#0".to_string(), "command-a".to_string());
+        ctx.agent_drop_command_ids
+            .insert("new#0".to_string(), "command-b".to_string());
+        ctx.first_applied_agent_drop_ids
+            .insert("held#0".to_string());
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert_eq!(
+            out.iter()
+                .map(|decision| decision.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["held#0", "new#0"]
+        );
     }
 
     #[test]

@@ -609,6 +609,245 @@ describe("createMagicContextCommandHandler", () => {
         });
     });
 
+    describe("Rust-mode command operations", () => {
+        it("routes flush to the module while retaining flush wording", async () => {
+            const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                transformMode: "rust",
+                rustModeModuleClient: {
+                    call: async (request) => {
+                        calls.push({
+                            method: request.method,
+                            body: request.body as Record<string, unknown>,
+                        });
+                        return { ok: true, armed: true };
+                    },
+                },
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-flush", sessionID: "ses-rust-flush", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-FLUSH_HANDLED__",
+            );
+
+            expect(calls).toHaveLength(1);
+            expect(calls[0]?.method).toBe("session.flush");
+            expect(calls[0]?.body).toMatchObject({
+                method: "session.flush",
+                v: 1,
+                session_id: "ses-rust-flush",
+            });
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-rust-flush",
+                "Flushed: Changes take effect on next message.",
+                {},
+            );
+        });
+
+        it("maps Rust wrapup and recomp dispositions while minting command ids", async () => {
+            const sendNotification = mock(async () => {});
+            const moduleCall = mock(
+                async (args: { method: string; body: Record<string, unknown> }) => {
+                    if (args.method === "session.wrapup") {
+                        return { disposition: "completed", rounds: 2, summary: "Wrapped up." };
+                    }
+                    return { disposition: "started" };
+                },
+            );
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                transformMode: "rust",
+                rustModeModuleClient: { call: moduleCall },
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-wrapup", sessionID: "ses-rust-wrapup", arguments: "250" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-WRAPUP_HANDLED__",
+            );
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-recomp", sessionID: "ses-rust-recomp", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-RECOMP_HANDLED__",
+            );
+
+            const calls = moduleCall.mock.calls as unknown as Array<
+                [{ method: string; body: Record<string, unknown> }]
+            >;
+            expect(calls[0]?.[0].method).toBe("session.wrapup");
+            expect(calls[0]?.[0].body.keep).toBe(100);
+            expect(calls[0]?.[0].body.command_id).toEqual(expect.any(String));
+            expect(calls[1]?.[0].method).toBe("session.recomp");
+            expect(calls[1]?.[0].body.command_id).toEqual(expect.any(String));
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-rust-wrapup",
+                expect.stringContaining("Wrapped up."),
+                {},
+            );
+        });
+
+        it("keeps /ctx-embed on the TypeScript subsystem in Rust mode", async () => {
+            const sendNotification = mock(async () => {});
+            const moduleCall = mock(async () => {
+                throw new Error("Rust module must not receive embed commands");
+            });
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                transformMode: "rust",
+                rustModeModuleClient: { call: moduleCall },
+                getEmbedStatusText: () => "embedding is ready",
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-embed", sessionID: "ses-rust-embed", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-EMBED_HANDLED__",
+            );
+            expect(moduleCall).not.toHaveBeenCalled();
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-rust-embed",
+                expect.stringContaining("embedding is ready"),
+                {},
+            );
+        });
+
+        it("merges structured module status into the desktop status output", async () => {
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                transformMode: "rust",
+                rustModeModuleClient: {
+                    call: async () => ({
+                        ok: true,
+                        usage: {
+                            current_total_input_tokens: 42_000,
+                            context_limit_tokens: 100_000,
+                        },
+                        boundary_present: true,
+                        coverage_ordinal: 17,
+                        compartment_count: 4,
+                    }),
+                },
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-status", sessionID: "ses-rust-status", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
+            );
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-rust-status",
+                expect.stringContaining("- Coverage ordinal: 17"),
+                {},
+            );
+        });
+
+        it("routes wrapup and recomp with bounded keep and command ids", async () => {
+            const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                transformMode: "rust",
+                rustModeModuleClient: {
+                    call: async (request) => {
+                        calls.push({
+                            method: request.method,
+                            body: request.body as Record<string, unknown>,
+                        });
+                        return request.method === "session.wrapup"
+                            ? { ok: true, disposition: "nothing_to_compact", rounds: 0 }
+                            : { ok: true, disposition: "started" };
+                    },
+                },
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-wrapup", sessionID: "ses-rust-ops", arguments: "999" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-WRAPUP_HANDLED__",
+            );
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-recomp", sessionID: "ses-rust-ops", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-RECOMP_HANDLED__",
+            );
+
+            expect(calls.map((call) => call.method)).toEqual(["session.wrapup", "session.recomp"]);
+            expect(calls[0]?.body.keep).toBe(100);
+            expect(typeof calls[0]?.body.command_id).toBe("string");
+            expect(typeof calls[1]?.body.command_id).toBe("string");
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-rust-ops",
+                expect.stringContaining("Nothing to compact"),
+                {},
+            );
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-rust-ops",
+                expect.stringContaining("Historian recomp started"),
+                {},
+            );
+        });
+
+        it("keeps ctx-embed on its TypeScript-owned path in Rust mode", async () => {
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                transformMode: "rust",
+                getEmbedStatusText: () => "Embedding is ready.",
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-embed", sessionID: "ses-rust-embed", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-EMBED_HANDLED__",
+            );
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-rust-embed",
+                "## Embedding Status\n\nEmbedding is ready.",
+                {},
+            );
+        });
+    });
+
     describe("ctx-session-upgrade", () => {
         it("runs the managed upgrade (recomp + migration) and throws the sentinel", async () => {
             insertLegacyCompartment(db, "ses-su-legacy");

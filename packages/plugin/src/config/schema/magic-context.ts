@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { z } from "zod";
 import { isValidLanguageCode } from "../../agents/language-directive";
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
@@ -214,14 +215,26 @@ export const HistorianConfigSchema = AgentOverrideConfigSchema.extend({
 }).optional();
 export type HistorianConfig = NonNullable<z.infer<typeof HistorianConfigSchema>>;
 
+const EmbeddingFallbackProviderSchema = z.enum(["local", "openai-compatible", "off"]);
+
+function expandConfigPath(value: string): string {
+    const trimmed = value.trim();
+    if (trimmed === "~") return homedir();
+    if (trimmed.startsWith("~/")) return `${homedir()}/${trimmed.slice(2)}`;
+    return trimmed;
+}
+
 const BaseEmbeddingConfigSchema = z
     .object({
         provider: z
-            .enum(["local", "openai-compatible", "off"])
+            .enum(["local", "openai-compatible", "off", "synapse"])
             .default("local")
             .describe(
-                "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'off' disables embeddings.",
+                "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings.",
             ),
+        fallback_provider: EmbeddingFallbackProviderSchema.optional().describe(
+            "Fallback provider for the Synapse lane. Required when provider is 'synapse'; local, openai-compatible, and off are valid.",
+        ),
         model: z
             .string()
             .optional()
@@ -259,7 +272,9 @@ const BaseEmbeddingConfigSchema = z
             ),
     })
     .superRefine((data, ctx) => {
-        if (data.provider === "openai-compatible" && !data.endpoint?.trim()) {
+        const validationProvider =
+            data.provider === "synapse" ? data.fallback_provider : data.provider;
+        if (validationProvider === "openai-compatible" && !data.endpoint?.trim()) {
             ctx.addIssue({
                 code: "custom",
                 path: ["endpoint"],
@@ -267,7 +282,7 @@ const BaseEmbeddingConfigSchema = z
             });
         }
 
-        if (data.provider === "openai-compatible" && !data.model?.trim()) {
+        if (validationProvider === "openai-compatible" && !data.model?.trim()) {
             ctx.addIssue({
                 code: "custom",
                 path: ["model"],
@@ -277,6 +292,26 @@ const BaseEmbeddingConfigSchema = z
     });
 
 export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) => {
+    if (data.provider === "synapse") {
+        const model = data.model?.trim();
+        const endpoint = data.endpoint?.trim();
+        const apiKey = data.api_key?.trim();
+        const inputType = data.input_type?.trim();
+        const queryInputType = data.query_input_type?.trim();
+        const truncate = data.truncate?.trim();
+        return {
+            provider: "synapse" as const,
+            ...(data.fallback_provider ? { fallback_provider: data.fallback_provider } : {}),
+            ...(model ? { model } : {}),
+            ...(endpoint ? { endpoint } : {}),
+            ...(apiKey ? { api_key: apiKey } : {}),
+            ...(inputType ? { input_type: inputType } : {}),
+            ...(queryInputType ? { query_input_type: queryInputType } : {}),
+            ...(truncate ? { truncate } : {}),
+            ...(data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {}),
+        };
+    }
+
     if (data.provider === "local") {
         return {
             provider: "local" as const,
@@ -306,9 +341,20 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
 });
 
 export type EmbeddingConfig = z.infer<typeof EmbeddingConfigSchema>;
+export type EmbeddingFallbackProvider = z.infer<typeof EmbeddingFallbackProviderSchema>;
+
+export interface SubcConfig {
+    connection_file: string;
+}
+
+export interface ShadowEmbeddingConfig {
+    enabled: boolean;
+}
 
 export interface MagicContextConfig {
     enabled: boolean;
+    /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
+    transform_mode: "ts" | "rust";
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
      *  USER config only; project configs cannot disable it. Default: true. */
     auto_update?: boolean;
@@ -402,6 +448,10 @@ export interface MagicContextConfig {
         min_chars: number;
     };
     embedding: EmbeddingConfig;
+    /** User-only connection settings for the Synapse daemon. */
+    subc?: SubcConfig;
+    /** Developer-only Synapse shadow lane switch. */
+    shadow_embedding?: ShadowEmbeddingConfig;
     memory: {
         enabled: boolean;
         injection_budget_tokens: number;
@@ -443,6 +493,12 @@ export interface MagicContextConfig {
 export const MagicContextConfigSchema = z
     .object({
         enabled: z.boolean().default(true).describe("Enable magic context (default: true)"),
+        transform_mode: z
+            .enum(["ts", "rust"])
+            .default("ts")
+            .describe(
+                'Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); "ts" is the current TypeScript pipeline.',
+            ),
         auto_update: z
             .boolean()
             .optional()
@@ -606,6 +662,26 @@ export const MagicContextConfigSchema = z
             provider: "local",
             model: DEFAULT_LOCAL_EMBEDDING_MODEL,
         }).describe("Embedding provider configuration"),
+        subc: z
+            .object({
+                connection_file: z
+                    .string()
+                    .trim()
+                    .min(1)
+                    .transform(expandConfigPath)
+                    .describe("Path to the owner-only subc connection file."),
+            })
+            .optional()
+            .describe("User-only Synapse daemon connection settings."),
+        shadow_embedding: z
+            .object({
+                enabled: z
+                    .boolean()
+                    .default(false)
+                    .describe("Developer-only Synapse shadow embedding lane switch."),
+            })
+            .default({ enabled: false })
+            .describe("Developer-only Synapse shadow embedding lane."),
         temporal_awareness: z
             .boolean()
             .default(true)

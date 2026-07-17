@@ -9,6 +9,7 @@ import {
     type HistorianConfig,
     type SidekickConfig,
 } from "../../config/schema/magic-context";
+import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
@@ -36,9 +37,12 @@ import {
     isDatabasePersisted,
     openDatabase,
 } from "../../features/magic-context/storage";
+import { openDatabaseAsync } from "../../features/magic-context/storage-db";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
+import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
+import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
@@ -62,6 +66,7 @@ import {
 } from "./event-resolvers";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
+import { dropSlot } from "./lkg-slot";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import {
@@ -70,7 +75,8 @@ import {
     setRecompStarting,
     setRecompTerminal,
 } from "./recomp-orchestrator";
-import { createShadowSender } from "./shadow-sender";
+import type { RustModeModuleClient } from "./rust-mode-transform";
+import { createShadowSender, SubcShadowTransport } from "./shadow-sender";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -129,7 +135,7 @@ export interface MagicContextDeps {
             };
         };
         embedding?: {
-            provider?: "local" | "openai-compatible" | "off";
+            provider?: "local" | "openai-compatible" | "off" | "synapse";
         };
         sidekick?: SidekickConfig;
         dreamer?: DreamerConfig;
@@ -143,10 +149,15 @@ export interface MagicContextDeps {
             enabled: boolean;
             min_chars: number;
         };
+        transform_mode?: ResolvedTransformMode;
         shadow_transform?: {
             enabled: boolean;
         };
     };
+    /** Test seam for the Rust authority adapter; production creates the subc client. */
+    rustModeModuleClient?: RustModeModuleClient;
+    /** Test and async-boot seam for supplying a database already opened by the caller. */
+    openDatabaseForHook?: () => Database | null;
 }
 
 function notifyMagicContextDisabled(client: PluginContext["client"], reason: string): void {
@@ -188,7 +199,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>();
     let db: Database;
     try {
-        const opened = openDatabase();
+        const opened = deps.openDatabaseForHook ? deps.openDatabaseForHook() : openDatabase();
         if (!opened || !isDatabasePersisted(opened)) {
             const reason =
                 (opened ? getDatabasePersistenceError(opened) : null) ??
@@ -222,6 +233,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     }
 
     let lastScheduleCheckMs = 0;
+    let dreamQueueQuietScheduled = false;
 
     // Derive historian chunk budget from the historian model's own context window.
     // Historian is a single-shot summarizer, so its input is bounded by its OWN
@@ -594,8 +606,99 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
+    // Rust is authoritative for a session, so never arm the asynchronous
+    // comparison sender alongside the authority lane.
     const shadowSender =
-        deps.config.shadow_transform?.enabled === true ? createShadowSender() : undefined;
+        deps.config.transform_mode !== "rust" && deps.config.shadow_transform?.enabled === true
+            ? createShadowSender()
+            : undefined;
+    const rustMemorySyncRequestedSessions = new Set<string>();
+    const rustModeModuleClient =
+        deps.rustModeModuleClient ??
+        (deps.config.transform_mode === "rust"
+            ? (() => {
+                  const transport = new SubcShadowTransport(undefined, undefined, undefined, "");
+                  const client: RustModeModuleClient = {
+                      call: (args) => transport.call(args),
+                      closeSession: (sessionId) => transport.closeSession(sessionId),
+                      getCompartmentsAfter: async (sessionId, afterSequence) => {
+                          const response = await transport.call({
+                              sessionId,
+                              projectRoot: deps.directory,
+                              method: "session.status",
+                              body: {
+                                  method: "session.status",
+                                  v: 1,
+                                  session_id: sessionId,
+                                  include_compartments_after_seq: afterSequence,
+                              },
+                          });
+                          const value =
+                              response && typeof response === "object" && "result" in response
+                                  ? (response as { result?: unknown }).result
+                                  : response;
+                          const record = value && typeof value === "object" ? value : {};
+                          const compartments =
+                              "compartments" in record && Array.isArray(record.compartments)
+                                  ? record.compartments
+                                  : [];
+                          const maxSequence =
+                              "max_sequence" in record && typeof record.max_sequence === "number"
+                                  ? record.max_sequence
+                                  : afterSequence;
+                          return { max_sequence: maxSequence, compartments };
+                      },
+                  };
+                  return client;
+              })()
+            : undefined);
+    const rustToolBackends: RustToolBackends | undefined =
+        deps.config.transform_mode === "rust" && rustModeModuleClient
+            ? {
+                  reduce: ({ sessionId, projectRoot, drop, commandId }) =>
+                      rustModeModuleClient.call({
+                          sessionId,
+                          projectRoot,
+                          method: "agent_drops.append",
+                          body: {
+                              method: "agent_drops.append",
+                              v: 1,
+                              session_id: sessionId,
+                              drop,
+                              command_id: commandId,
+                          },
+                      }),
+                  memorySync: (sessionId: string) => {
+                      rustMemorySyncRequestedSessions.add(sessionId);
+                  },
+              }
+            : undefined;
+    const notifyRustModeParked = (sessionId: string, message: string): void => {
+        const client = deps.client as {
+            tui?: {
+                showToast?: (input: {
+                    body: {
+                        title: string;
+                        message: string;
+                        variant?: "warning" | "error" | "info" | "success";
+                        duration?: number;
+                    };
+                }) => Promise<unknown>;
+            };
+        };
+        void client.tui
+            ?.showToast?.({
+                body: {
+                    title: "Rust Magic Context paused",
+                    message,
+                    variant: "warning",
+                    duration: 8000,
+                },
+            })
+            .catch((error) =>
+                log(`[magic-context] rust park toast failed for ${sessionId}:`, error),
+            );
+    };
 
     const transform = createTransform({
         tagger: deps.tagger,
@@ -677,6 +780,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 : undefined,
         maybeAutoEmbedSession,
         shadowSender,
+        transformMode: deps.config.transform_mode,
+        rustModeModuleClient,
+        rustMemorySyncRequestedSessions,
+        onRustModeParked: notifyRustModeParked,
     });
     const eventHandler = createEventHandler({
         contextUsageMap,
@@ -696,6 +803,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 deps.config.toast_duration_ms,
             ),
         onSessionCacheInvalidated: (sessionId: string) => {
+            dropSlot(sessionId, "session-cache-invalidated");
             clearInjectionCache(sessionId);
             deps.onSessionCacheInvalidated?.(sessionId);
         },
@@ -703,6 +811,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // these module/closure-scope maps don't accumulate entries over the
         // plugin's lifetime (Finding #3).
         onSessionDeleted: (sessionId: string) => {
+            dropSlot(sessionId, "session-deleted");
             systemPromptHash.clearSession(sessionId);
             // Prune every per-session map this hook closure owns. These
             // accumulate one entry per session for the plugin process lifetime
@@ -718,6 +827,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             sessionDirectoryBySession.delete(sessionId);
             recompProgressBySession.delete(sessionId);
             internalChildSessions.delete(sessionId);
+            rustMemorySyncRequestedSessions.delete(sessionId);
             channel1StateBySession.delete(sessionId);
             shadowSender?.clearSession(sessionId);
             clearEmbedSessionState(sessionId);
@@ -725,6 +835,16 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     });
 
     const runDreamQueueInBackground = (): void => {
+        if (bootQuietRemainingMs() > 0) {
+            if (!dreamQueueQuietScheduled) {
+                dreamQueueQuietScheduled = true;
+                scheduleAfterBootQuiet(() => {
+                    dreamQueueQuietScheduled = false;
+                    runDreamQueueInBackground();
+                });
+            }
+            return;
+        }
         const dreaming = deps.config.dreamer;
         if (!dreaming || dreaming.disable === true) {
             return;
@@ -771,6 +891,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         executeThresholdPercentage: deps.config.execute_threshold_percentage ?? 65,
         executeThresholdTokens: deps.config.execute_threshold_tokens,
         historyBudgetPercentage: deps.config.history_budget_percentage,
+        transformMode: deps.config.transform_mode,
+        rustModeModuleClient,
+        projectRoot: deps.directory,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
         getLiveModelKey: (sessionId) => {
             // Use DB fallback so /ctx-status shows the correct model-specific
@@ -921,7 +1044,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         protectedTags: deps.config.protected_tags,
     });
 
-    return {
+    const hooks = {
         "experimental.chat.messages.transform": transform,
         "experimental.chat.system.transform": systemPromptHashHandler,
         "experimental.text.complete": createTextCompleteHandler(),
@@ -980,6 +1103,53 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         "tool.execute.after": createToolExecuteAfterHook({
             db,
             channel1StateBySession,
+            transformMode: deps.config.transform_mode,
+            todoStateSet:
+                deps.config.transform_mode === "rust" && rustModeModuleClient
+                    ? ({ sessionId, stateJson, ownerMessageId }) =>
+                          rustModeModuleClient.call({
+                              sessionId,
+                              projectRoot: deps.directory,
+                              method: "todo_state.set",
+                              body: {
+                                  method: "todo_state.set",
+                                  v: 1,
+                                  session_id: sessionId,
+                                  state_json: stateJson,
+                                  owner_message_id: ownerMessageId,
+                              },
+                          })
+                    : undefined,
         }),
     };
+    const hooksWithBackends = hooks as typeof hooks & {
+        rustToolBackends?: RustToolBackends;
+    };
+    Object.defineProperty(hooksWithBackends, "rustToolBackends", {
+        value: rustToolBackends,
+        enumerable: false,
+    });
+    return hooksWithBackends;
+}
+
+/**
+ * Async boot entry point. Migration lock retries must yield between attempts,
+ * while the hook itself remains synchronous once a database is available.
+ */
+export async function createMagicContextHookAsync(
+    deps: MagicContextDeps,
+): Promise<ReturnType<typeof createMagicContextHook>> {
+    let database: Database | null;
+    try {
+        database = await openDatabaseAsync();
+    } catch (error) {
+        const reason = getErrorMessage(error);
+        log("[magic-context] hook failed to open storage; disabling feature:", error);
+        notifyMagicContextDisabled(deps.client, reason);
+        return null;
+    }
+    return createMagicContextHook({
+        ...deps,
+        openDatabaseForHook: () => database,
+    });
 }

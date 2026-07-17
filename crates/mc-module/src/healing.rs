@@ -6,9 +6,6 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[cfg(test)]
-use std::cell::Cell;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SerializerProfile {
     OwnedLlmRunner,
@@ -120,19 +117,12 @@ pub const fn coverage(profile: SerializerProfile) -> HealingCoverage {
     }
 }
 
-/// Whether the consumer applies the module's TAIL mutations to the real context.
+/// The profile-default tail-reclaim capability.
 ///
-/// A byte-splice consumer (the Claude Code leg) replaces only the summary PREFIX in
-/// the original request and keeps the tail bytes verbatim, so any module-side tail
-/// mutation would be silently discarded wire-side while the module freezes it
-/// durably: pressure accounting would believe tokens were reclaimed that the real
-/// context still carries (phantom reclaim). For such profiles every tail mutator is
-/// disabled — reduction selection, agent-drop DRAIN (append stays accepted; the
-/// queue is durable and drains if the session ever runs under a tail-reclaim
-/// profile, where the profile change is itself a HARD bust), synthetic-todo
-/// injection, and the emergency tail-eviction arms. The emergency FOLD arm stays
-/// on: prefix compaction is the byte-splice consumer's designed operation and its
-/// only >=95% reclaim.
+/// Full-array consumers apply both prefix and tail rewrites, so their profile default is
+/// true. Claude Code keeps a false default to preserve established sessions exactly; the
+/// transform derives its effective value per request from the canonical tool-presence
+/// signal. Prefix folding remains available regardless of the effective tail setting.
 pub const fn tail_reclaim(profile: SerializerProfile) -> bool {
     match profile {
         SerializerProfile::ClaudeCodeAnthropic => false,
@@ -141,34 +131,6 @@ pub const fn tail_reclaim(profile: SerializerProfile) -> bool {
         | SerializerProfile::Pi
         | SerializerProfile::OpencodeAiSdk => true,
     }
-}
-
-/// Whether §N§ tagging + agent-facing reduction surface is active for this profile.
-/// Flipped per-profile at the cutover-3 deploy window together with TAGGER_FEATURE_EPOCH.
-#[cfg(not(test))]
-pub const fn tagging_enabled(_profile: SerializerProfile) -> bool {
-    false
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test seam for U1 coverage: production keeps a const all-false gate, while unit
-    /// tests can exercise the pre-built code path without changing the deploy flip shape.
-    static TAGGING_ENABLED_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
-}
-
-/// Test-only injectable version of [`tagging_enabled`]. Keeping this under `cfg(test)`
-/// preserves the production const gate while allowing non-vacuous overlay tests.
-#[cfg(test)]
-pub fn tagging_enabled(_profile: SerializerProfile) -> bool {
-    TAGGING_ENABLED_OVERRIDE
-        .with(|value| value.get())
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-pub fn set_tagging_enabled_for_tests(enabled: Option<bool>) {
-    TAGGING_ENABLED_OVERRIDE.with(|value| value.set(enabled));
 }
 
 pub const fn quirk_residual(profile: SerializerProfile) -> QuirkResidual {

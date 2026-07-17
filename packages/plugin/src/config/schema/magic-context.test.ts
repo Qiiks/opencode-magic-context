@@ -14,6 +14,7 @@ describe("MagicContextConfigSchema", () => {
 
             expect(result).toMatchObject({
                 enabled: true,
+                transform_mode: "ts",
                 cache_ttl: "5m",
                 execute_threshold_percentage: 65,
                 protected_tags: 20,
@@ -45,6 +46,7 @@ describe("MagicContextConfigSchema", () => {
         it("parses an enabled config without stale reduction-specific keys", () => {
             const input = {
                 enabled: true,
+                transform_mode: "ts",
                 auto_update: false,
                 toast_duration_ms: 5000,
                 cache_ttl: "10m",
@@ -73,6 +75,9 @@ describe("MagicContextConfigSchema", () => {
                 },
                 smart_drops: false,
                 shadow_transform: {
+                    enabled: false,
+                },
+                shadow_embedding: {
                     enabled: false,
                 },
                 caveman_text_compression: {
@@ -163,6 +168,15 @@ describe("MagicContextConfigSchema", () => {
             expect(result.dreamer?.tasks.retrospective.schedule).toBe("0 5 * * *");
         });
 
+        it("parses both transform modes", () => {
+            expect(MagicContextConfigSchema.parse({ transform_mode: "ts" }).transform_mode).toBe(
+                "ts",
+            );
+            expect(MagicContextConfigSchema.parse({ transform_mode: "rust" }).transform_mode).toBe(
+                "rust",
+            );
+        });
+
         it("accepts optional auto_update user preference", () => {
             expect(MagicContextConfigSchema.parse({ auto_update: false }).auto_update).toBe(false);
             expect(MagicContextConfigSchema.parse({ auto_update: true }).auto_update).toBe(true);
@@ -190,6 +204,10 @@ describe("MagicContextConfigSchema", () => {
     });
 
     describe("validation", () => {
+        it("rejects an unknown transform mode", () => {
+            expect(() => MagicContextConfigSchema.parse({ transform_mode: "wasm" })).toThrow();
+        });
+
         it("rejects protected_tags greater than 100", () => {
             expect(() => MagicContextConfigSchema.parse({ protected_tags: 101 })).toThrow();
         });

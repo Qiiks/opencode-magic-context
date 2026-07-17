@@ -48,7 +48,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	applySqliteTuningPragmas,
-	openDatabase,
+	openDatabaseAsync,
 	setSqlitePragmaConfig,
 } from "@magic-context/core/features/magic-context/storage-db";
 import {
@@ -67,6 +67,10 @@ import {
 } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { normalizeTodoStateJson } from "@magic-context/core/hooks/magic-context/todo-view";
 import { maybeSendUpgradeReminder } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
+import {
+	beginBootQuietPeriod,
+	scheduleAfterBootQuiet,
+} from "@magic-context/core/plugin/boot-quiet";
 import {
 	ANNOUNCEMENT_FEATURES,
 	ANNOUNCEMENT_FOOTER,
@@ -607,13 +611,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		);
 		return;
 	}
+	beginBootQuietPeriod();
 
 	const storageDir = getMagicContextStorageDir();
 	const dbPath = join(storageDir, "context.db");
 
 	let db: ContextDatabase | null | undefined;
 	try {
-		db = openDatabase();
+		db = await openDatabaseAsync();
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		warn(
@@ -647,11 +652,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// v22 deferred legacy-memory identity backfill. openDatabase() has already
 	// run migrations; the runner is fire-and-forget and logs failures without
 	// blocking Pi startup.
-	runDeferredV22Backfill(db).catch((err) => {
-		warn(`[v22-backfill] background runner failed: ${err}`);
+	scheduleAfterBootQuiet(() => {
+		runDeferredV22Backfill(db).catch((err) => {
+			warn(`[v22-backfill] background runner failed: ${err}`);
+		});
 	});
 
-	setTimeout(() => {
+	scheduleAfterBootQuiet(() => {
 		void (async () => {
 			try {
 				const api = await loadDefaultPiSessionApi();

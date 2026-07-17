@@ -305,6 +305,48 @@ describe("createCtxMemoryTools", () => {
     });
 
     describe("#given write action", () => {
+        it("triggers one rust memory sync after a write while keeping the TS write authority", async () => {
+            const syncSessions: string[] = [];
+            const rustTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    memorySync: (sessionId) => syncSessions.push(sessionId),
+                },
+            });
+
+            const result = await rustTools.ctx_memory.execute(
+                {
+                    action: "write",
+                    category: "USER_DIRECTIVES",
+                    content: "Keep the context database authoritative.",
+                },
+                toolContext(),
+            );
+
+            expect(result).toContain("Saved memory [ID:");
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(1);
+            expect(syncSessions).toEqual(["ses-memory"]);
+
+            const tsTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+            });
+            await tsTools.ctx_memory.execute(
+                {
+                    action: "write",
+                    category: "USER_DIRECTIVES",
+                    content: "TS mode has no module sync trigger.",
+                },
+                toolContext(),
+            );
+            expect(syncSessions).toEqual(["ses-memory"]);
+        });
+
         it("creates a new memory with agent source type", async () => {
             const result = await tools.ctx_memory.execute(
                 {

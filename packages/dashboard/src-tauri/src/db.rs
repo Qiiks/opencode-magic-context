@@ -1451,6 +1451,9 @@ fn build_db_cache_events_with_decisions(
     // anthropic/openai/etc.; real busts land < 0.4. Recovery steps grow exactly
     // as predicted, so they classify stable with no separate "warming" state.)
     let mut seen_sessions: HashSet<(Harness, String)> = HashSet::new();
+    // Sessions where an earlier event in this window had a transform-decision
+    // row, i.e. Magic Context was demonstrably active before the current event.
+    let mut mc_active_sessions: HashSet<(Harness, String)> = HashSet::new();
     let mut last_finish_by_session: HashMap<(Harness, String), String> = HashMap::new();
     let mut current_turn_id_by_session: HashMap<(Harness, String), String> = HashMap::new();
     let mut prev_event_idx_by_session: HashMap<(Harness, String), usize> = HashMap::new();
@@ -1497,9 +1500,15 @@ fn build_db_cache_events_with_decisions(
             chronological[i].message_id.clone(),
         );
         let decision_row = transform_decisions.get(&decision_key);
+        let has_prior_transform_decision = mc_active_sessions.contains(&session_key);
+        if decision_row.is_some() {
+            mc_active_sessions.insert(session_key.clone());
+        }
         let cause_from_decision = || {
             transform_decision_cause(decision_row).or_else(|| {
-                if decision_row.is_none()
+                if decision_row.is_none() && has_prior_transform_decision {
+                    Some("mc_transform_missing".to_string())
+                } else if decision_row.is_none()
                     && chronological[i].harness.has_magic_context_plugin_state()
                 {
                     Some("Provider-side (not Magic Context)".to_string())
@@ -7448,6 +7457,47 @@ mod cache_turn_tests {
             events[1].cause.as_deref(),
             Some("Provider-side (not Magic Context)")
         );
+    }
+
+    #[test]
+    fn missing_transform_decision_after_mc_activity_is_fail_open_cause() {
+        let rows = vec![
+            raw(
+                Harness::Opencode,
+                "m1",
+                "s1",
+                100,
+                2,
+                200_000,
+                1_000,
+                201_102,
+                Some("tool-calls"),
+            ),
+            raw(
+                Harness::Opencode,
+                "m2",
+                "s1",
+                200,
+                205_000,
+                0,
+                0,
+                205_500,
+                Some("stop"),
+            ),
+        ];
+        let mut decisions = HashMap::new();
+        decisions.insert(
+            (Harness::Opencode, "s1".to_string(), "m1".to_string()),
+            TransformDecisionCause {
+                decision: "defer".to_string(),
+                materialize_reason: None,
+                emergency: false,
+            },
+        );
+
+        let events = build_db_cache_events_with_decisions(rows, true, Some(decisions));
+        assert_eq!(events[1].severity, "full_bust");
+        assert_eq!(events[1].cause.as_deref(), Some("mc_transform_missing"));
     }
 
     #[test]

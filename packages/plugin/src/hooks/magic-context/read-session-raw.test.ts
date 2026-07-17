@@ -6,6 +6,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     countRawSessionMessageOrdinalsFromDb,
     readRawSessionMessageIdOrdinalsFromDb,
+    readRawSessionMessageOrdinalByIdFromDb,
     readRawSessionMessagePageFromDb,
     readRawSessionMessagesFromDb,
 } from "./read-session-raw";
@@ -79,6 +80,10 @@ describe("raw session message id ordinals", () => {
             );
 
             expect(readRawSessionMessageIdOrdinalsFromDb(db, "session")).toEqual(fullReaderMap);
+            expect(readRawSessionMessageOrdinalByIdFromDb(db, "session", "m-user")).toBe(1);
+            expect(readRawSessionMessageOrdinalByIdFromDb(db, "session", "m-assistant")).toBe(2);
+            expect(readRawSessionMessageOrdinalByIdFromDb(db, "session", "m-summary")).toBeNull();
+            expect(readRawSessionMessageOrdinalByIdFromDb(db, "session", "missing")).toBeNull();
             expect([...fullReaderMap]).toEqual([
                 ["m-user", 1],
                 ["m-assistant", 2],

@@ -8,15 +8,7 @@ const CATEGORY_ORDER = [
     "CONSTRAINTS",
     "CONFIG_VALUES",
     "NAMING",
-    "KNOWN_ISSUES",
 ] as const;
-const BAND_GROUPS: ReadonlyArray<ReadonlyArray<(typeof CATEGORY_ORDER)[number]>> = [
-    ["PROJECT_RULES"],
-    ["ARCHITECTURE"],
-    ["CONSTRAINTS"],
-    ["CONFIG_VALUES"],
-    ["NAMING", "KNOWN_ISSUES"],
-];
 const LAYOUT_FONT =
     process.env.PALACE_LAYOUT_FONT === "jetbrains-mono-10" ? "jetbrains-mono-10" : "spleen-5x8";
 const CELL_WIDTH = LAYOUT_FONT === "jetbrains-mono-10" ? 6 : 5;
@@ -32,7 +24,10 @@ const BANNER_HEIGHT_PIXELS = CELL_HEIGHT;
 const BODY_LINE_PITCH = CELL_HEIGHT + 1;
 const PAGE_WIDTH_CHARS = COLUMN_COUNT * ROOM_WIDTH;
 const MAX_LINE_CHARS = PAGE_WIDTH_CHARS + (COLUMN_COUNT - 1) * COLUMN_GAP;
-const MAX_PALACE_CHARS = 70_000;
+const PAGE_HEIGHT_CELLS = Math.floor(PAGE_HEIGHT_PIXELS / BODY_LINE_PITCH);
+const PAGE_LINE_CAPACITY = COLUMN_COUNT * PAGE_HEIGHT_CELLS;
+const MAX_PALACE_CHARS = 27_000;
+export const ROOM_HEADER_MARKER = "▰";
 const SOURCE_PATH = "/tmp/visual-memory/trimmed-memories-source.txt";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ALTERNATE_LAYOUT = LAYOUT_FONT === "jetbrains-mono-10";
@@ -52,7 +47,11 @@ export type SpecEntry = {
     mergeInto?: number;
     importance: number;
 };
-export type SourceMemory = { id: number; category: Category };
+export type SourceMemory = {
+    id: number;
+    category: Category;
+    importance: number;
+};
 type Placement = {
     category: Category;
     room: string;
@@ -98,27 +97,25 @@ type LayoutItem = {
     heightPixels: number;
 };
 
-type Box = {
+type RoomPlan = {
     category: Category;
     name: string;
     lines: string[];
-    bodyLines: string[];
     entryBodyLines: Map<number, number>;
     relativeLines: Map<number, number>;
     entries: SpecEntry[];
     merges: SpecEntry[];
     peakImportance: number;
     sharedPairCount: number;
-    continuation: boolean;
-    segment: number;
-    heightPixels: number;
 };
+
+type StreamSlot = { column: number; row: number };
 
 function codepoints(value: string): number {
     return [...value].length;
 }
 
-export function parseSource(source: string): SourceMemory[] {
+export function parseSource(source: string, importanceById: ReadonlyMap<number, number>): SourceMemory[] {
     const memories: SourceMemory[] = [];
     let category: Category | undefined;
     for (const line of source.split("\n")) {
@@ -136,7 +133,11 @@ export function parseSource(source: string): SourceMemory[] {
         const id = line.match(/^#(\d+):/)?.[1];
         if (id) {
             if (!category) throw new Error(`memory ${id} is outside a category`);
-            memories.push({ id: Number(id), category });
+            const numericId = Number(id);
+            const importance = importanceById.get(numericId);
+            if (importance === undefined || !Number.isFinite(importance))
+                throw new Error(`source importance missing for ${id}`);
+            memories.push({ id: numericId, category, importance });
         }
     }
     return memories;
@@ -218,6 +219,25 @@ function compactCue(raw: string, room: string): string {
     return value.trim().replace(/^[-:;,]+|[-:;,]+$/g, "");
 }
 
+// Per-entry budget check for the authoring retry loop: the harness rejects and
+// re-prompts a category whose cues exceed the budget, so size enforcement is
+// mechanical rather than prose guidance in the prompt.
+export function cueBudgetViolations(
+    entries: SpecEntry[],
+    importanceById: Map<number, number>,
+): { id: number; length: number; budget: number }[] {
+    const violations: { id: number; length: number; budget: number }[] = [];
+    for (const entry of entries) {
+        if (entry.cue === undefined) continue;
+        const rendered = displayCue(entry);
+        const importance = importanceById.get(entry.id) ?? entry.importance;
+        const budget = importance >= 70 ? 90 : 50;
+        const length = codepoints(rendered);
+        if (length > budget) violations.push({ id: entry.id, length, budget });
+    }
+    return violations;
+}
+
 function displayCue(entry: SpecEntry): string {
     const raw = Array.isArray(entry.cue) ? entry.cue.join("; ") : (entry.cue ?? "");
     return compactCue(raw, entry.room);
@@ -229,14 +249,31 @@ function cueOutsideCode(value: string): string {
     return value.replace(/`[^`]*`/g, (anchor) => " ".repeat(anchor.length));
 }
 
-export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
+/**
+ * Cue length is an authoring diagnostic rather than a reason to reject a
+ * selected memory. Keep reporting it so trial reports can compare compression
+ * quality, but allow the renderer to apply the page's importance policy.
+ */
+function reportCueWarning(message: string, warnings: string[]): void {
+    warnings.push(message);
+    console.warn(`[palace] cue warning: ${message}`);
+}
+
+export function validate(source: SourceMemory[], specs: SpecEntry[]): string[] {
     if (source.length === 0) throw new Error("source contains no memories");
     if (new Set(source.map((memory) => memory.id)).size !== source.length)
         throw new Error("source contains duplicate memory ids");
+    for (const memory of source) {
+        if (!Number.isFinite(memory.importance))
+            throw new Error(`source importance missing for ${memory.id}`);
+    }
+    const defects: string[] = [];
     const sourceById = new Map(source.map((memory) => [memory.id, memory]));
     const specById = new Map<number, SpecEntry>();
     for (const spec of specs) {
-        if (specById.has(spec.id)) throw new Error(`duplicate spec id ${spec.id}`);
+        if (specById.has(spec.id)) {
+            throw new Error(`duplicate spec id ${spec.id}`);
+        }
         specById.set(spec.id, spec);
         const memory = sourceById.get(spec.id);
         if (!memory) throw new Error(`spec id ${spec.id} absent from source`);
@@ -250,6 +287,14 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
         if (cue && /#\d+/.test(cue)) throw new Error(`memory id leaked into cue ${spec.id}`);
         if (cue) {
             const renderedCue = displayCue(spec);
+            const cueBudget = memory.importance >= 70 ? 90 : 50;
+            const renderedCueLength = codepoints(renderedCue);
+            if (renderedCueLength > cueBudget) {
+                reportCueWarning(
+                    `cue over budget for ${spec.id}: ${renderedCueLength} chars (max ${cueBudget})`,
+                    defects,
+                );
+            }
             for (const hubWord of spec.room
                 .split(/[^A-Za-z0-9]+/)
                 .filter((word) => word.length >= 2)) {
@@ -262,25 +307,20 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
                 mechanismCue,
             );
             if (negativeRule && !mechanismCue.includes("⊘")) {
-                throw new Error(
-                    `negative rule missing polarity marker in cue ${spec.id}: ${renderedCue}`,
-                );
+                throw new Error(`negative rule missing polarity marker in cue ${spec.id}: ${renderedCue}`);
             }
             const polarityCount = mechanismCue.split("⊘").length - 1;
             const mechanismCount = mechanismCue.match(/\([^()]+\)/g)?.length ?? 0;
             if (polarityCount > mechanismCount) {
-                throw new Error(
-                    `polarity mechanism missing from rendered cue ${spec.id}: ${renderedCue}`,
-                );
+                throw new Error(`polarity mechanism missing from rendered cue ${spec.id}: ${renderedCue}`);
             }
             let marker = mechanismCue.indexOf("⊘");
             while (marker >= 0) {
                 const nextMarker = mechanismCue.indexOf("⊘", marker + 1);
                 const mechanism = mechanismCue.indexOf("(", marker + 1);
                 if (mechanism < 0 || (nextMarker >= 0 && mechanism > nextMarker)) {
-                    throw new Error(
-                        `polarity mechanism must follow marker ${spec.id}: ${renderedCue}`,
-                    );
+                    throw new Error(`polarity mechanism must follow marker ${spec.id}: ${renderedCue}`);
+                    break;
                 }
                 let depth = 0;
                 let close = -1;
@@ -332,9 +372,6 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
             }
         }
     }
-    const missing = source.filter((memory) => !specById.has(memory.id));
-    if (missing.length > 0)
-        throw new Error(`uncovered source ids: ${missing.map((item) => item.id).join(", ")}`);
     for (const spec of specs) {
         if (spec.mergeInto === undefined) continue;
         const target = specById.get(spec.mergeInto);
@@ -344,6 +381,7 @@ export function validate(source: SourceMemory[], specs: SpecEntry[]): void {
             throw new Error(`merge ${spec.id} crosses room/category`);
         }
     }
+    return defects;
 }
 
 function longestToken(entries: SpecEntry[]): number {
@@ -373,57 +411,22 @@ function appendEntry(body: string[], cue: string, width: number): number {
     return placement;
 }
 
-function frameBox(
-    name: string,
-    bodyLines: string[],
-    peakImportance: number,
-    continuation: boolean,
-): string[] {
-    const innerWidth = ROOM_WIDTH - 2;
-    const high = peakImportance >= 70;
-    const [tl, fill, tr, side, bl, br] = high
-        ? ["╔", "═", "╗", "║", "╚", "╝"]
-        : ["┌", "─", "┐", "│", "└", "┘"];
-    const bottom = `${bl}${fill.repeat(innerWidth)}${br}`;
-    if (continuation) {
-        const marker = " … ";
-        const remaining = innerWidth - codepoints(marker);
-        const top = `${tl}${fill.repeat(Math.floor(remaining / 2))}${marker}${fill.repeat(Math.ceil(remaining / 2))}${tr}`;
-        return [
-            top,
-            ...bodyLines.map((line) => `${side}${line.padEnd(innerWidth)}${side}`),
-            bottom,
-        ];
-    }
-    const titlePadding = innerWidth - codepoints(name);
-    const title = `${" ".repeat(Math.floor(titlePadding / 2))}${name}${" ".repeat(Math.ceil(titlePadding / 2))}`;
-    return [
-        `${tl}${fill.repeat(innerWidth)}${tr}`,
-        `${side}${title}${side}`,
-        ...bodyLines.map((line) => `${side}${line.padEnd(innerWidth)}${side}`),
-        bottom,
-    ];
-}
-
-function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Box {
-    const entries = allEntries
-        .filter((entry) => entry.mergeInto === undefined)
-        .sort((a, b) => a.id - b.id);
-    const merges = allEntries
-        .filter((entry) => entry.mergeInto !== undefined)
-        .sort((a, b) => a.id - b.id);
-    const innerWidth = ROOM_WIDTH - 2;
+function buildRoomPlan(category: Category, name: string, allEntries: SpecEntry[]): RoomPlan {
+    // Manifest order is the author's importance ranking; never sort entries by id.
+    const entries = allEntries.filter((entry) => entry.mergeInto === undefined);
+    const merges = allEntries.filter((entry) => entry.mergeInto !== undefined);
     const requiredTokenWidth = longestToken(entries);
-    if (requiredTokenWidth > innerWidth) {
-        throw new Error(`room ${name} has ${requiredTokenWidth}-char anchor (max ${innerWidth})`);
+    if (requiredTokenWidth > ROOM_WIDTH) {
+        throw new Error(`room ${name} has ${requiredTokenWidth}-char anchor (max ${ROOM_WIDTH})`);
     }
-    if (codepoints(name) * 2 > innerWidth) {
-        throw new Error(`2x room title ${name} exceeds ${innerWidth} cells`);
+    const header = `${ROOM_HEADER_MARKER} — ${name} —`;
+    if (codepoints(header) > ROOM_WIDTH) {
+        throw new Error(`room header ${name} exceeds ${ROOM_WIDTH} cells`);
     }
 
     const bodyLines: string[] = [];
     const entryBodyLines = new Map<number, number>();
-    const shortEntryLimit = Math.floor((innerWidth - 4) / 2);
+    const shortEntryLimit = Math.floor((ROOM_WIDTH - 4) / 2);
     let sharedPairCount = 0;
     for (let index = 0; index < entries.length; index++) {
         const entry = entries[index];
@@ -438,7 +441,7 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
             !nextCue.includes("⊘") &&
             codepoints(cue) <= shortEntryLimit &&
             codepoints(nextCue) <= shortEntryLimit &&
-            codepoints(shared) <= innerWidth
+            codepoints(shared) <= ROOM_WIDTH
         ) {
             const bodyLine = bodyLines.length;
             bodyLines.push(shared);
@@ -448,7 +451,7 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
             index++;
             continue;
         }
-        const bodyLine = appendEntry(bodyLines, cue, innerWidth);
+        const bodyLine = appendEntry(bodyLines, cue, ROOM_WIDTH);
         entryBodyLines.set(entry.id, bodyLine);
     }
     const peakImportance = Math.max(...allEntries.map((entry) => entry.importance));
@@ -456,7 +459,8 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
     for (const entry of entries) {
         const bodyLine = entryBodyLines.get(entry.id);
         if (bodyLine === undefined) throw new Error(`body line missing for ${entry.id}`);
-        relativeLines.set(entry.id, bodyLine + 2);
+        // The room header occupies line zero; palace lines are one-based.
+        relativeLines.set(entry.id, bodyLine + 1);
     }
     for (const merge of merges) {
         const targetLine =
@@ -467,83 +471,14 @@ function buildBox(category: Category, name: string, allEntries: SpecEntry[]): Bo
     return {
         category,
         name,
-        lines: frameBox(name, bodyLines, peakImportance, false),
-        bodyLines,
+        lines: [header, ...bodyLines],
         entryBodyLines,
         relativeLines,
         entries,
         merges,
         peakImportance,
         sharedPairCount,
-        continuation: false,
-        segment: 0,
-        heightPixels: 3 * CELL_HEIGHT + bodyLines.length * BODY_LINE_PITCH,
     };
-}
-
-function segmentBox(
-    box: Box,
-    start: number,
-    end: number,
-    continuation: boolean,
-    segment: number,
-): Box {
-    const bodyLines = box.bodyLines.slice(start, end);
-    const entries = box.entries.filter((entry) => {
-        const line = box.entryBodyLines.get(entry.id);
-        return line !== undefined && line >= start && line < end;
-    });
-    const entryIds = new Set(entries.map((entry) => entry.id));
-    const merges = box.merges.filter(
-        (merge) => merge.mergeInto !== undefined && entryIds.has(merge.mergeInto),
-    );
-    const entryBodyLines = new Map<number, number>();
-    const relativeLines = new Map<number, number>();
-    const headerLines = continuation ? 1 : 2;
-    for (const entry of entries) {
-        const originalLine = box.entryBodyLines.get(entry.id);
-        if (originalLine === undefined) throw new Error(`split body line missing for ${entry.id}`);
-        const bodyLine = originalLine - start;
-        entryBodyLines.set(entry.id, bodyLine);
-        relativeLines.set(entry.id, bodyLine + headerLines);
-    }
-    for (const merge of merges) {
-        const targetLine =
-            merge.mergeInto === undefined ? undefined : relativeLines.get(merge.mergeInto);
-        if (targetLine === undefined) throw new Error(`split merge target missing for ${merge.id}`);
-        relativeLines.set(merge.id, targetLine);
-    }
-    return {
-        ...box,
-        lines: frameBox(box.name, bodyLines, box.peakImportance, continuation),
-        bodyLines,
-        entryBodyLines,
-        relativeLines,
-        entries,
-        merges,
-        sharedPairCount: entries.length - new Set(entryBodyLines.values()).size,
-        continuation,
-        segment,
-        heightPixels:
-            (continuation ? 2 * CELL_HEIGHT : 3 * CELL_HEIGHT) + bodyLines.length * BODY_LINE_PITCH,
-    };
-}
-
-function splitBox(box: Box): [Box, Box] | undefined {
-    const boundaries = [
-        ...new Set(box.entries.map((entry) => box.entryBodyLines.get(entry.id) ?? 0)),
-    ]
-        .filter((line) => line > 0 && line < box.bodyLines.length)
-        .sort((a, b) => a - b);
-    if (boundaries.length === 0) return undefined;
-    const midpoint = box.bodyLines.length / 2;
-    const boundary = boundaries.reduce((best, candidate) =>
-        Math.abs(candidate - midpoint) < Math.abs(best - midpoint) ? candidate : best,
-    );
-    return [
-        segmentBox(box, 0, boundary, box.continuation, box.segment),
-        segmentBox(box, boundary, box.bodyLines.length, true, box.segment + 1),
-    ];
 }
 
 export function renderPalace(specs: SpecEntry[]): {
@@ -559,393 +494,412 @@ export function renderPalace(specs: SpecEntry[]): {
         heightPixels: number;
     }>;
     leveling: { gapRowsBefore: number; gapRowsAfter: number; splitCount: number };
+    droppedByTrimIds: number[];
+    droppedBySkipIds: number[];
 } {
-    const grouped = new Map<string, SpecEntry[]>();
+    type RoomInput = {
+        category: Category;
+        name: string;
+        entries: SpecEntry[];
+        categoryIndex: number;
+        manifestOrder: number;
+    };
+    type Allocation = { banner?: StreamSlot; gap?: StreamSlot; room: StreamSlot[]; end: StreamSlot };
+    const grouped = new Map<string, RoomInput>();
+    const MAX_RENDER_ITERATIONS = 1_000_000;
+    const MAX_SHARE_ITERATIONS = 1_000;
+    let iterations = 0;
+    const guard = (context: string): void => {
+        if (++iterations > MAX_RENDER_ITERATIONS) {
+            throw new Error(
+                `single-page placement exceeded ${MAX_RENDER_ITERATIONS} iterations while ${context}`,
+            );
+        }
+    };
+
+    const mergeTargetsArePresent = (entries: SpecEntry[]): boolean => {
+        const ids = new Set(entries.map((entry) => entry.id));
+        return entries.every((entry) => entry.mergeInto === undefined || ids.has(entry.mergeInto));
+    };
+
+    const nextManifestOrder = new Map<Category, number>();
     for (const spec of specs) {
+        guard("grouping manifest entries");
         const key = `${spec.category}\u0000${spec.room}`;
-        const list = grouped.get(key) ?? [];
-        list.push(spec);
-        grouped.set(key, list);
+        const categoryOrder = nextManifestOrder.get(spec.category) ?? 0;
+        const room =
+            grouped.get(key) ??
+            {
+                category: spec.category,
+                name: spec.room,
+                entries: [],
+                categoryIndex: CATEGORY_ORDER.indexOf(spec.category),
+                manifestOrder: categoryOrder,
+            };
+        if (!grouped.has(key)) nextManifestOrder.set(spec.category, categoryOrder + 1);
+        room.entries.push(spec);
+        grouped.set(key, room);
     }
 
-    const assignmentFor = (boxes: Box[]): number[] => {
-        let best: { columns: number[]; max: number; range: number; rowRange: number } | undefined;
-        const columns = Array<number>(boxes.length).fill(0);
-        const heights = Array<number>(COLUMN_COUNT).fill(0);
-        const rowHeights = Array<number>(COLUMN_COUNT).fill(0);
-        const visit = (index: number): void => {
-            if (index === boxes.length) {
-                const max = Math.max(...heights);
-                const range = max - Math.min(...heights);
-                const rowRange = Math.max(...rowHeights) - Math.min(...rowHeights);
-                if (
-                    !best ||
-                    max < best.max ||
-                    (max === best.max && rowRange < best.rowRange) ||
-                    (max === best.max && rowRange === best.rowRange && range < best.range)
-                ) {
-                    best = { columns: [...columns], max, range, rowRange };
-                }
-                return;
-            }
-            const box = boxes[index];
-            if (!box) return;
-            const lastColumn = index === 0 ? 1 : COLUMN_COUNT;
-            for (let column = 0; column < lastColumn; column++) {
-                columns[index] = column;
-                heights[column] += box.heightPixels;
-                rowHeights[column] += box.lines.length;
-                if (!best || Math.max(...heights) <= best.max) visit(index + 1);
-                heights[column] -= box.heightPixels;
-                rowHeights[column] -= box.lines.length;
-            }
-        };
-        visit(0);
-        if (!best) throw new Error("unable to assign masonry band");
-        return best.columns;
-    };
+    // The category order is the page's spatial order. Within a category, the best
+    // room leads while manifest order remains the tie-breaker and entry order.
+    const roomsByCategory = new Map<Category, RoomInput[]>();
+    for (const category of CATEGORY_ORDER) roomsByCategory.set(category, []);
+    for (const room of grouped.values()) roomsByCategory.get(room.category)?.push(room);
+    for (const category of CATEGORY_ORDER) {
+        const categoryRooms = roomsByCategory.get(category) ?? [];
+        categoryRooms.sort((left, right) => {
+            const leftPeak = Math.max(...left.entries.map((entry) => entry.importance));
+            const rightPeak = Math.max(...right.entries.map((entry) => entry.importance));
+            return rightPeak - leftPeak || left.manifestOrder - right.manifestOrder;
+        });
+    }
 
-    const levelBand = (
-        inputBoxes: Box[],
-        inputAssignment: number[],
-    ): {
-        boxes: Box[];
-        assignment: number[];
-        gapBefore: number;
-        gapAfter: number;
-        splits: number;
-    } => {
-        const boxes = [...inputBoxes];
-        const assignment = [...inputAssignment];
-        const heights = (): number[] => {
-            const result = Array<number>(COLUMN_COUNT).fill(0);
-            for (const [index, box] of boxes.entries())
-                result[assignment[index] ?? 0] += box.lines.length;
-            return result;
-        };
-        const initialHeights = heights();
-        const gapBefore = Math.max(...initialHeights) - Math.min(...initialHeights);
-        let splits = 0;
-        while (splits < COLUMN_COUNT) {
-            const current = heights();
-            const tallest = current.indexOf(Math.max(...current));
-            const shortest = current.indexOf(Math.min(...current));
-            const gap = current[tallest] - current[shortest];
-            if (gap <= 4) break;
-            let splitIndex = -1;
-            for (let index = boxes.length - 1; index >= 0; index--) {
-                if (assignment[index] === tallest) {
-                    splitIndex = index;
-                    break;
-                }
+    const plans = new Map<RoomInput, RoomPlan>();
+    const categoryDemand = new Map<Category, number>();
+    for (const category of CATEGORY_ORDER) {
+        const categoryRooms = roomsByCategory.get(category) ?? [];
+        let demand = categoryRooms.length > 0 ? 1 : 0;
+        for (const room of categoryRooms) {
+            guard(`measuring ${category}/${room.name} demand`);
+            if (!mergeTargetsArePresent(room.entries)) {
+                throw new Error(`room ${room.name} has a merge target outside its manifest order`);
             }
-            const candidate = splitIndex >= 0 ? boxes[splitIndex] : undefined;
-            const split = candidate ? splitBox(candidate) : undefined;
-            if (!candidate || !split) break;
-            const [first, continuation] = split;
-            const nextHeights = [...current];
-            nextHeights[tallest] += first.lines.length - candidate.lines.length;
-            nextHeights[shortest] += continuation.lines.length;
-            const nextGap = Math.max(...nextHeights) - Math.min(...nextHeights);
-            if (nextGap >= gap) break;
-            boxes.splice(splitIndex, 1, first, continuation);
-            assignment.splice(splitIndex, 1, tallest, shortest);
-            splits++;
+            const plan = buildRoomPlan(room.category, room.name, room.entries);
+            plans.set(room, plan);
+            // One blank line separates adjacent rooms unless the next room starts
+            // at a new column; that boundary exception is handled during placement.
+            demand += plan.lines.length;
         }
-        const finalHeights = heights();
-        return {
-            boxes,
-            assignment,
-            gapBefore,
-            gapAfter: Math.max(...finalHeights) - Math.min(...finalHeights),
-            splits,
-        };
-    };
+        if (categoryRooms.length > 1) demand += categoryRooms.length - 1;
+        categoryDemand.set(category, demand);
+    }
 
-    const subsetForCapacity = (
-        boxes: Box[],
-        capacity: number,
-    ): { indexes: number[]; columns: number[] } => {
-        let best:
-            | {
-                  indexes: number[];
-                  columns: number[];
-                  remainderMax: number;
-                  selectedMax: number;
-                  remainderRange: number;
-                  selectedHeight: number;
-                  maxRowGap: number;
-                  totalRowGap: number;
-              }
-            | undefined;
-        const limit = 1 << boxes.length;
-        for (let mask = 1; mask < limit - 1; mask++) {
-            const indexes = boxes
-                .map((_, index) => index)
-                .filter((index) => (mask & (1 << index)) !== 0);
-            const selected = indexes
-                .map((index) => boxes[index])
-                .filter((box): box is Box => Boolean(box));
-            const remainder = boxes.filter((_, index) => (mask & (1 << index)) === 0);
-            const columns = assignmentFor(selected);
-            const selectedLeveled = levelBand(selected, columns);
-            const selectedHeights = Array<number>(COLUMN_COUNT).fill(0);
-            for (const [index, box] of selectedLeveled.boxes.entries()) {
-                selectedHeights[selectedLeveled.assignment[index] ?? 0] += box.heightPixels;
-            }
-            const selectedMax = Math.max(...selectedHeights);
-            if (selectedMax > capacity) continue;
-            const remainderColumns = assignmentFor(remainder);
-            const remainderLeveled = levelBand(remainder, remainderColumns);
-            const remainderHeights = Array<number>(COLUMN_COUNT).fill(0);
-            for (const [index, box] of remainderLeveled.boxes.entries()) {
-                remainderHeights[remainderLeveled.assignment[index] ?? 0] += box.heightPixels;
-            }
-            const remainderMax = Math.max(...remainderHeights);
-            const remainderRange = remainderMax - Math.min(...remainderHeights);
-            const selectedHeight = selectedLeveled.boxes.reduce(
-                (total, box) => total + box.heightPixels,
-                0,
-            );
-            const selectedRowGap = selectedLeveled.gapAfter;
-            const remainderRowGap = remainderLeveled.gapAfter;
-            const maxRowGap = Math.max(selectedRowGap, remainderRowGap);
-            const totalRowGap = selectedRowGap + remainderRowGap;
-            if (
-                !best ||
-                maxRowGap < best.maxRowGap ||
-                (maxRowGap === best.maxRowGap && totalRowGap < best.totalRowGap) ||
-                (maxRowGap === best.maxRowGap &&
-                    totalRowGap === best.totalRowGap &&
-                    remainderMax < best.remainderMax) ||
-                (maxRowGap === best.maxRowGap &&
-                    totalRowGap === best.totalRowGap &&
-                    remainderMax === best.remainderMax &&
-                    selectedMax > best.selectedMax) ||
-                (maxRowGap === best.maxRowGap &&
-                    totalRowGap === best.totalRowGap &&
-                    remainderMax === best.remainderMax &&
-                    selectedMax === best.selectedMax &&
-                    remainderRange < best.remainderRange) ||
-                (maxRowGap === best.maxRowGap &&
-                    totalRowGap === best.totalRowGap &&
-                    remainderMax === best.remainderMax &&
-                    selectedMax === best.selectedMax &&
-                    remainderRange === best.remainderRange &&
-                    selectedHeight > best.selectedHeight)
-            ) {
-                best = {
-                    indexes,
-                    columns,
-                    remainderMax,
-                    selectedMax,
-                    remainderRange,
-                    selectedHeight,
-                    maxRowGap,
-                    totalRowGap,
-                };
+    const initialShare = Math.floor(PAGE_LINE_CAPACITY / CATEGORY_ORDER.length);
+    const categoryBudgets = new Map<Category, number>();
+    let unassignedLines = PAGE_LINE_CAPACITY - initialShare * CATEGORY_ORDER.length;
+    for (const category of CATEGORY_ORDER) {
+        const demand = categoryDemand.get(category) ?? 0;
+        if (demand < initialShare) {
+            categoryBudgets.set(category, demand);
+            unassignedLines += initialShare - demand;
+        } else {
+            categoryBudgets.set(category, initialShare);
+        }
+    }
+
+    // Redistribute short categories' unused share proportionally to categories
+    // that still have unmet demand. Repeating after each integer allocation lets
+    // small residual demands receive a line without starving larger categories.
+    for (let shareIteration = 0; unassignedLines > 0; shareIteration++) {
+        if (shareIteration >= MAX_SHARE_ITERATIONS) {
+            throw new Error(`category share redistribution exceeded ${MAX_SHARE_ITERATIONS} iterations`);
+        }
+        const unmet = CATEGORY_ORDER.map((category) => {
+            const budget = categoryBudgets.get(category) ?? 0;
+            const demand = categoryDemand.get(category) ?? 0;
+            return { category, budget, remaining: Math.max(0, demand - budget) };
+        }).filter((item) => item.remaining > 0);
+        if (unmet.length === 0) break;
+        const totalRemaining = unmet.reduce((total, item) => total + item.remaining, 0);
+        const pool = unassignedLines;
+        const allocations = unmet.map((item) => {
+            const exact = (pool * item.remaining) / totalRemaining;
+            return {
+                ...item,
+                extra: Math.min(item.remaining, Math.floor(exact)),
+                fraction: exact - Math.floor(exact),
+            };
+        });
+        let assigned = allocations.reduce((total, item) => total + item.extra, 0);
+        allocations.sort(
+            (left, right) =>
+                right.fraction - left.fraction ||
+                CATEGORY_ORDER.indexOf(left.category) - CATEGORY_ORDER.indexOf(right.category),
+        );
+        for (const allocation of allocations) {
+            if (assigned >= pool) break;
+            if (allocation.extra >= allocation.remaining) continue;
+            allocation.extra++;
+            assigned++;
+        }
+        for (const allocation of allocations) {
+            if (allocation.extra > 0) {
+                categoryBudgets.set(allocation.category, allocation.budget + allocation.extra);
             }
         }
-        if (!best) throw new Error(`no room fits ${capacity}-row page remainder`);
-        return { indexes: best.indexes, columns: best.columns };
-    };
+        if (assigned === 0) {
+            throw new Error("category share redistribution made no progress");
+        }
+        unassignedLines -= assigned;
+    }
 
-    const palaceLines: string[] = [];
-    const pageLines: string[][] = [[]];
-    const pagePixelHeights: number[] = [0];
+    const columns = Array.from({ length: COLUMN_COUNT }, () => Array<string>(PAGE_HEIGHT_CELLS).fill(""));
     const placements = new Map<number, Placement>();
     const roomSummaries: RoomSummary[] = [];
     const layoutItems: LayoutItem[] = [];
-    let gapRowsBefore = 0;
-    let gapRowsAfter = 0;
-    let splitCount = 0;
-    const categoryBanner = (categories: readonly Category[], continued: boolean): string => {
-        const label = ` <${categories.join(" + ")}${continued ? " CONT." : ""}> `;
-        const remaining = PAGE_WIDTH_CHARS - codepoints(label);
+    const droppedByTrimIds: number[] = [];
+    const droppedBySkipIds: number[] = [];
+    const droppedTrimSet = new Set<number>();
+    const droppedSkipSet = new Set<number>();
+    let cursor: StreamSlot = { column: 0, row: 0 };
+    let spilloverLines = 0;
+
+    const categoryBanner = (category: Category): string => {
+        const label = ` <${category}> `;
+        const remaining = ROOM_WIDTH - codepoints(label);
+        if (remaining < 0) throw new Error(`category banner exceeds column width: ${category}`);
         return `${"─".repeat(Math.floor(remaining / 2))}${label}${"─".repeat(Math.ceil(remaining / 2))}`;
     };
+    const addDropped = (id: number, kind: "trim" | "skip"): void => {
+        const set = kind === "trim" ? droppedTrimSet : droppedSkipSet;
+        const output = kind === "trim" ? droppedByTrimIds : droppedBySkipIds;
+        if (placements.has(id) || set.has(id)) return;
+        set.add(id);
+        output.push(id);
+    };
+    const isEnd = (slot: StreamSlot): boolean => slot.column >= COLUMN_COUNT;
+    const advance = (slot: StreamSlot): StreamSlot => {
+        const nextRow = slot.row + 1;
+        if (nextRow < PAGE_HEIGHT_CELLS) return { column: slot.column, row: nextRow };
+        return { column: slot.column + 1, row: 0 };
+    };
+    const segmentHeight = (lineCount: number, continuation: boolean): number => {
+        if (lineCount <= 0) return 0;
+        return continuation
+            ? lineCount * BODY_LINE_PITCH
+            : CELL_HEIGHT + Math.max(0, lineCount - 1) * BODY_LINE_PITCH;
+    };
+    const simulate = (
+        category: Category,
+        plan: RoomPlan,
+        includeBanner: boolean,
+        includeGap: boolean,
+        lineBudget: number,
+    ): Allocation | undefined => {
+        let next = { ...cursor };
+        let banner: StreamSlot | undefined;
+        if (includeBanner) {
+            if (isEnd(next)) return undefined;
+            banner = next;
+            next = advance(next);
+        }
 
-    for (const categories of BAND_GROUPS) {
-        const primaryCategory = categories[0];
-        if (!primaryCategory) throw new Error("empty band group");
-        let remaining = [...grouped.entries()]
-            .filter(([, entries]) => {
-                const category = entries[0]?.category;
-                return category ? categories.includes(category) : false;
-            })
-            .map(([key, entries]) => {
-                const category = entries[0]?.category;
-                if (!category) throw new Error(`empty room group ${key}`);
-                return buildBox(category, key.slice(category.length + 1), entries);
-            })
-            .sort((a, b) => {
-                const categoryOrder =
-                    CATEGORY_ORDER.indexOf(a.category) - CATEGORY_ORDER.indexOf(b.category);
-                if (categoryOrder !== 0) return categoryOrder;
-                return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
-            });
-        let continued = false;
-        while (remaining.length > 0) {
-            let pageIndex = pageLines.length - 1;
-            let available =
-                PAGE_HEIGHT_PIXELS - (pagePixelHeights[pageIndex] ?? 0) - BANNER_HEIGHT_PIXELS;
-            if (available <= 0) {
-                pageLines.push([]);
-                pagePixelHeights.push(0);
-                pageIndex++;
-                available = PAGE_HEIGHT_PIXELS - BANNER_HEIGHT_PIXELS;
+        let gap: StreamSlot | undefined;
+        let needsGap = includeGap && next.row > 0;
+        // Keep a blank/header unit together at the bottom of a column. If the
+        // header would cross the boundary, the room begins at the next column and
+        // therefore needs no leading blank.
+        if (needsGap && next.row >= PAGE_HEIGHT_CELLS - 2) {
+            next = advance(next);
+            needsGap = false;
+        }
+        if (!needsGap && next.row === PAGE_HEIGHT_CELLS - 1) next = advance(next);
+        if (isEnd(next)) return undefined;
+        if (needsGap) {
+            gap = next;
+            next = advance(next);
+        }
+        if (isEnd(next)) return undefined;
+        if (next.row === PAGE_HEIGHT_CELLS - 1) next = advance(next);
+        if (isEnd(next)) return undefined;
+
+        const fixedLines = (banner ? 1 : 0) + (gap ? 1 : 0);
+        if (fixedLines + plan.lines.length > lineBudget) return undefined;
+        const roomSlots: StreamSlot[] = [];
+        for (const line of plan.lines) {
+            guard(`simulating ${category}/${plan.name} flow`);
+            if (codepoints(line) > ROOM_WIDTH) {
+                throw new Error(`line in ${category}/${plan.name} exceeds ${ROOM_WIDTH} cells`);
             }
-            if (Math.min(...remaining.map((box) => box.heightPixels)) > available) {
-                pageLines.push([]);
-                pagePixelHeights.push(0);
-                continued = true;
+            roomSlots.push(next);
+            next = advance(next);
+            if (isEnd(next) && roomSlots.length < plan.lines.length) return undefined;
+        }
+        if (roomSlots.length < 2) return undefined;
+        return { ...(banner ? { banner } : {}), ...(gap ? { gap } : {}), room: roomSlots, end: next };
+    };
+    const writeSlot = (slot: StreamSlot, line: string, context: string): void => {
+        guard(`writing ${context}`);
+        const column = columns[slot.column];
+        if (!column) throw new Error(`missing column ${slot.column} while writing ${context}`);
+        if (slot.row < 0 || slot.row >= column.length) {
+            throw new Error(`line ${slot.row} is outside column ${slot.column} while writing ${context}`);
+        }
+        if (codepoints(line) > ROOM_WIDTH) throw new Error(`${context} exceeds ${ROOM_WIDTH} cells`);
+        column[slot.row] = line;
+    };
+    const recordCategory = (category: Category, slot: StreamSlot): void => {
+        writeSlot(slot, categoryBanner(category), `${category} banner`);
+        const line = slot.row + 1;
+        layoutItems.push({
+            kind: "category",
+            category,
+            categories: [category],
+            column: slot.column,
+            startLine: line,
+            endLine: line,
+            page: 1,
+            pageLine: line,
+            pageTopPixels: slot.row * BODY_LINE_PITCH,
+            heightPixels: CELL_HEIGHT,
+        });
+    };
+    const recordRoom = (room: RoomInput, plan: RoomPlan, allocation: Allocation): void => {
+        const segmentSlots = new Map<number, StreamSlot[]>();
+        for (const slot of allocation.room) {
+            const segment = segmentSlots.get(slot.column) ?? [];
+            segment.push(slot);
+            segmentSlots.set(slot.column, segment);
+        }
+        const segmentColumns = [...segmentSlots.keys()];
+        for (const [segmentIndex, column] of segmentColumns.entries()) {
+            guard(`recording ${room.category}/${room.name} segment`);
+            const slots = segmentSlots.get(column);
+            if (!slots || slots.length === 0) throw new Error(`empty segment for ${room.name}`);
+            const startLine = (slots[0]?.row ?? 0) + 1;
+            const endLine = (slots.at(-1)?.row ?? 0) + 1;
+            const continuation = segmentIndex > 0;
+            const segmentEntries = [...plan.entries, ...plan.merges].filter((entry) => {
+                const relativeLine = plan.relativeLines.get(entry.id);
+                const slot = relativeLine === undefined ? undefined : allocation.room[relativeLine];
+                return slot?.column === column;
+            });
+            const entryCount = segmentEntries.filter((entry) => entry.mergeInto === undefined).length;
+            const mergeCount = segmentEntries.length - entryCount;
+            const heightPixels = segmentHeight(slots.length, continuation);
+            const layoutItem: LayoutItem = {
+                kind: "room",
+                category: room.category,
+                room: room.name,
+                continuation,
+                segment: segmentIndex,
+                column,
+                startLine,
+                endLine,
+                page: 1,
+                pageLine: startLine,
+                pageTopPixels: (slots[0]?.row ?? 0) * BODY_LINE_PITCH,
+                heightPixels,
+            };
+            layoutItems.push(layoutItem);
+            roomSummaries.push({
+                category: room.category,
+                name: room.name,
+                entryCount,
+                mergeCount,
+                memoryCount: entryCount + mergeCount,
+                peakImportance: plan.peakImportance,
+                // Retained for sidecar compatibility; border characters are no longer emitted.
+                border: plan.peakImportance >= 70 ? "double" : "single",
+                column,
+                startLine,
+                endLine,
+                heightCells: slots.length,
+                sharedPairCount: segmentIndex === 0 ? plan.sharedPairCount : 0,
+                continuation,
+                segment: segmentIndex,
+                page: 1,
+                pageLine: startLine,
+                pageTopPixels: (slots[0]?.row ?? 0) * BODY_LINE_PITCH,
+                heightPixels,
+            });
+        }
+        for (const entry of [...plan.entries, ...plan.merges]) {
+            guard(`recording ${room.category}/${room.name} entries`);
+            const relativeLine = plan.relativeLines.get(entry.id);
+            if (relativeLine === undefined) throw new Error(`placement missing for ${entry.id}`);
+            const slot = allocation.room[relativeLine];
+            if (!slot) throw new Error(`room line ${relativeLine} missing for ${entry.id}`);
+            placements.set(entry.id, {
+                category: room.category,
+                room: room.name,
+                palaceLine: slot.row + 1,
+                palaceColumn: slot.column * (ROOM_WIDTH + COLUMN_GAP) + 1,
+                page: 1,
+                pageLine: slot.row + 1,
+                ...(entry.mergeInto === undefined ? {} : { mergedInto: entry.mergeInto }),
+            });
+        }
+    };
+
+    for (const category of CATEGORY_ORDER) {
+        const categoryRooms = roomsByCategory.get(category) ?? [];
+        if (categoryRooms.length === 0) continue;
+        let remainingBudget = (categoryBudgets.get(category) ?? 0) + spilloverLines;
+        spilloverLines = 0;
+        let categoryRendered = false;
+        for (const room of categoryRooms) {
+            guard(`selecting ${room.category}/${room.name}`);
+            const includeBanner = !categoryRendered;
+            const includeGap = categoryRendered;
+            const fullPlan = plans.get(room);
+            if (!fullPlan) throw new Error(`room plan missing for ${room.category}/${room.name}`);
+            const select = (entries: SpecEntry[]): { plan: RoomPlan; allocation: Allocation } | undefined => {
+                if (!mergeTargetsArePresent(entries)) return undefined;
+                const plan = entries === room.entries ? fullPlan : buildRoomPlan(room.category, room.name, entries);
+                const allocation = simulate(
+                    room.category,
+                    plan,
+                    includeBanner,
+                    includeGap,
+                    remainingBudget,
+                );
+                return allocation ? { plan, allocation } : undefined;
+            };
+            let selected = select(room.entries);
+            if (!selected) {
+                for (let keep = room.entries.length - 1; keep >= 1; keep--) {
+                    guard(`trimming ${room.category}/${room.name}`);
+                    selected = select(room.entries.slice(0, keep));
+                    if (selected) {
+                        for (const entry of room.entries.slice(keep)) addDropped(entry.id, "trim");
+                        break;
+                    }
+                }
+            }
+            if (!selected) {
+                for (const entry of room.entries) {
+                    guard(`dropping skipped ${room.category}/${room.name}`);
+                    addDropped(entry.id, "skip");
+                }
                 continue;
             }
-            const fullAssignment = assignmentFor(remaining);
-            const fullHeights = Array<number>(COLUMN_COUNT).fill(0);
-            for (const [index, box] of remaining.entries()) {
-                fullHeights[fullAssignment[index] ?? 0] += box.heightPixels;
+            if (selected.allocation.banner) recordCategory(category, selected.allocation.banner);
+            categoryRendered = true;
+            for (let index = 0; index < selected.plan.lines.length; index++) {
+                const slot = selected.allocation.room[index];
+                const line = selected.plan.lines[index];
+                if (!slot || line === undefined) throw new Error(`room line ${index} missing for ${room.name}`);
+                writeSlot(slot, line, `${room.category}/${room.name} room line`);
             }
-            let segmentBoxes: Box[];
-            let assignment: number[];
-            let selectedIndexes: number[];
-            if (Math.max(...fullHeights) <= available) {
-                segmentBoxes = remaining;
-                assignment = fullAssignment;
-                selectedIndexes = remaining.map((_, index) => index);
-            } else {
-                const subset = subsetForCapacity(remaining, available);
-                selectedIndexes = subset.indexes;
-                segmentBoxes = selectedIndexes
-                    .map((index) => remaining[index])
-                    .filter((box): box is Box => Boolean(box));
-                assignment = subset.columns;
+            recordRoom(room, selected.plan, selected.allocation);
+            const consumed =
+                (selected.allocation.banner ? 1 : 0) +
+                (selected.allocation.gap ? 1 : 0) +
+                selected.plan.lines.length;
+            if (consumed > remainingBudget) {
+                throw new Error(`category ${category} exceeded its line share`);
             }
-
-            const leveled = levelBand(segmentBoxes, assignment);
-            segmentBoxes = leveled.boxes;
-            assignment = leveled.assignment;
-            gapRowsBefore += leveled.gapBefore;
-            gapRowsAfter += leveled.gapAfter;
-            splitCount += leveled.splits;
-
-            const columns = Array.from({ length: COLUMN_COUNT }, () => [] as string[]);
-            const heights = Array<number>(COLUMN_COUNT).fill(0);
-            const pixelHeights = Array<number>(COLUMN_COUNT).fill(0);
-            for (const [index, box] of segmentBoxes.entries()) {
-                const column = assignment[index] ?? 0;
-                columns[column].push(...box.lines);
-                heights[column] += box.lines.length;
-                pixelHeights[column] += box.heightPixels;
-            }
-            const bandHeight = Math.max(...heights);
-            const bandHeightPixels = Math.max(...pixelHeights);
-            if (bandHeightPixels > available)
-                throw new Error(`leveled band exceeds page by ${bandHeightPixels - available}px`);
-            const page = pageIndex + 1;
-            const pageLine = (pageLines[pageIndex]?.length ?? 0) + 1;
-            const bannerLine = palaceLines.length + 1;
-            const bannerTopPixels = pagePixelHeights[pageIndex] ?? 0;
-            const banner = categoryBanner(categories, continued);
-            palaceLines.push(banner);
-            pageLines[pageIndex]?.push(banner);
-            layoutItems.push({
-                kind: "category",
-                category: primaryCategory,
-                categories: [...categories],
-                column: 0,
-                startLine: bannerLine,
-                endLine: bannerLine,
-                page,
-                pageLine,
-                pageTopPixels: bannerTopPixels,
-                heightPixels: BANNER_HEIGHT_PIXELS,
-            });
-
-            const bandStartLine = palaceLines.length + 1;
-            const bandPageLine = (pageLines[pageIndex]?.length ?? 0) + 1;
-            const columnRows = Array<number>(COLUMN_COUNT).fill(0);
-            const columnPixelRows = Array<number>(COLUMN_COUNT).fill(0);
-            for (const [index, box] of segmentBoxes.entries()) {
-                const column = assignment[index] ?? 0;
-                const row = columnRows[column] ?? 0;
-                columnRows[column] = row + box.lines.length;
-                const pixelRow = columnPixelRows[column] ?? 0;
-                columnPixelRows[column] = pixelRow + box.heightPixels;
-                const startLine = bandStartLine + row;
-                const roomPageLine = bandPageLine + row;
-                const roomPageTopPixels = bannerTopPixels + BANNER_HEIGHT_PIXELS + pixelRow;
-                for (const entry of [...box.entries, ...box.merges]) {
-                    const relativeLine = box.relativeLines.get(entry.id);
-                    if (relativeLine === undefined)
-                        throw new Error(`placement missing for ${entry.id}`);
-                    placements.set(entry.id, {
-                        category: box.category,
-                        room: box.name,
-                        palaceLine: startLine + relativeLine,
-                        palaceColumn: column * (ROOM_WIDTH + COLUMN_GAP) + 1,
-                        page,
-                        pageLine: roomPageLine + relativeLine,
-                        ...(entry.mergeInto === undefined ? {} : { mergedInto: entry.mergeInto }),
-                    });
-                }
-                roomSummaries.push({
-                    category: box.category,
-                    name: box.name,
-                    entryCount: box.entries.length,
-                    mergeCount: box.merges.length,
-                    memoryCount: box.entries.length + box.merges.length,
-                    peakImportance: box.peakImportance,
-                    border: box.peakImportance >= 70 ? "double" : "single",
-                    column,
-                    startLine,
-                    endLine: startLine + box.lines.length - 1,
-                    heightCells: box.lines.length,
-                    sharedPairCount: box.sharedPairCount,
-                    continuation: box.continuation,
-                    segment: box.segment,
-                    page,
-                    pageLine: roomPageLine,
-                    pageTopPixels: roomPageTopPixels,
-                    heightPixels: box.heightPixels,
-                });
-                layoutItems.push({
-                    kind: "room",
-                    category: box.category,
-                    room: box.name,
-                    continuation: box.continuation,
-                    segment: box.segment,
-                    column,
-                    startLine,
-                    endLine: startLine + box.lines.length - 1,
-                    page,
-                    pageLine: roomPageLine,
-                    pageTopPixels: roomPageTopPixels,
-                    heightPixels: box.heightPixels,
-                });
-            }
-
-            for (let row = 0; row < bandHeight; row++) {
-                const line = columns
-                    .map((column) => (column[row] ?? "").padEnd(ROOM_WIDTH))
-                    .join(" ".repeat(COLUMN_GAP))
-                    .trimEnd();
-                palaceLines.push(line);
-                pageLines[pageIndex]?.push(line);
-            }
-
-            pagePixelHeights[pageIndex] = bannerTopPixels + BANNER_HEIGHT_PIXELS + bandHeightPixels;
-
-            const selected = new Set(selectedIndexes);
-            remaining = remaining.filter((_, index) => !selected.has(index));
-            if (remaining.length > 0) {
-                pageLines.push([]);
-                pagePixelHeights.push(0);
-                continued = true;
-            }
+            remainingBudget -= consumed;
+            cursor = selected.allocation.end;
         }
+        // A category that cannot use its final partial room returns those lines
+        // as spill for the next category rather than leaving a silent hole.
+        spilloverLines += remainingBudget;
     }
 
+    const palaceLines = columns[0]?.map((_, row) =>
+        columns
+            .map((column) => (column[row] ?? "").padEnd(ROOM_WIDTH))
+            .join(" ".repeat(COLUMN_GAP)),
+    ) ?? [];
+    for (let row = 0; row < palaceLines.length; row++) {
+        guard("padding the fixed page canvas");
+        if (codepoints(palaceLines[row] ?? "") > MAX_LINE_CHARS) {
+            throw new Error(`line ${row + 1} exceeds ${MAX_LINE_CHARS} cells`);
+        }
+    }
     const palace = `${palaceLines.join("\n")}\n`;
     const longLines = palaceLines
         .map((line, index) => ({ line: index + 1, chars: codepoints(line) }))
@@ -956,26 +910,32 @@ export function renderPalace(specs: SpecEntry[]): {
     if (palace.length > MAX_PALACE_CHARS) {
         throw new Error(`palace has ${palace.length} chars (max ${MAX_PALACE_CHARS})`);
     }
-    if (/#\d+/.test(palace)) throw new Error("memory id leaked into palace.txt");
-    let startLine = 1;
-    const pages = pageLines.map((lines, index) => {
-        const page = {
-            page: index + 1,
-            startLine,
-            endLine: startLine + lines.length - 1,
-            heightCells: lines.length,
-            heightPixels: pagePixelHeights[index] ?? 0,
-        };
-        startLine += lines.length;
-        return page;
-    });
+    if (/#\d+/.test(palace)) {
+        const message = "memory id leaked into palace.txt";
+        if (!process.env.PALACE_RENDER_DESPITE_VALIDATOR) throw new Error(message);
+        console.warn(`[palace] ${message}; rendering review manifest anyway`);
+    }
     return {
         palace,
         placements,
         rooms: roomSummaries,
         layoutItems,
-        pages,
-        leveling: { gapRowsBefore, gapRowsAfter, splitCount },
+        pages: [
+            {
+                page: 1,
+                startLine: 1,
+                endLine: PAGE_HEIGHT_CELLS,
+                heightCells: PAGE_HEIGHT_CELLS,
+                heightPixels: PAGE_HEIGHT_PIXELS,
+            },
+        ],
+        leveling: {
+            gapRowsBefore: 0,
+            gapRowsAfter: 0,
+            splitCount: roomSummaries.filter((room) => room.continuation).length,
+        },
+        droppedByTrimIds,
+        droppedBySkipIds,
     };
 }
 
@@ -988,24 +948,93 @@ export function authorPalace(args: {
 }) {
     const palaceOutput = args.palaceOutput ?? PALACE_OUTPUT;
     const coverageOutput = args.coverageOutput ?? COVERAGE_OUTPUT;
-    validate(args.source, args.specs);
-    const { palace, placements, rooms, layoutItems, pages, leveling } = renderPalace(args.specs);
-    const cueLengths = args.specs
-        .filter((entry) => entry.mergeInto === undefined)
-        .map((entry) => codepoints(displayCue(entry)))
-        .sort((a, b) => a - b);
+    const reviewRender = Boolean(process.env.PALACE_RENDER_DESPITE_VALIDATOR);
+    if (reviewRender) {
+        // Review renders soft-break oversized unbreakable anchors before validation
+        // and measurement, so every downstream consumer sees the same widths.
+        const maxToken = ROOM_WIDTH - 6;
+        for (const entry of args.specs) {
+            if (entry.cue === undefined) continue;
+            const parts = Array.isArray(entry.cue) ? entry.cue : [entry.cue];
+            const softened = parts.map((part) =>
+                part
+                    .split(" ")
+                    .map((token) =>
+                        codepoints(token) > maxToken
+                            ? Array.from(token)
+                                  .reduce<string[]>((acc, ch) => {
+                                      const last = acc[acc.length - 1];
+                                      if (last === undefined || codepoints(last) >= maxToken - 1)
+                                          acc.push(ch);
+                                      else acc[acc.length - 1] = last + ch;
+                                      return acc;
+                                  }, [])
+                                  .join("- ")
+                            : token,
+                    )
+                    .join(" "),
+            );
+            entry.cue = Array.isArray(entry.cue) ? softened : softened[0];
+        }
+    }
+    let renderSpecs = args.specs;
+    try {
+        validate(args.source, args.specs);
+    } catch (error) {
+        if (!reviewRender) throw error;
+        console.warn(
+            `[palace] validator rejected review manifest: ${error instanceof Error ? error.message : String(error)}; rendering anyway`,
+        );
+        const seenIds = new Set<number>();
+        renderSpecs = args.specs.filter((entry) => {
+            if (seenIds.has(entry.id)) return false;
+            seenIds.add(entry.id);
+            return true;
+        });
+    }
+    const { palace, placements, rooms, layoutItems, pages, leveling, droppedByTrimIds, droppedBySkipIds: renderedSkipIds } =
+        renderPalace(renderSpecs);
+
+    const droppedBySkipIds = [...renderedSkipIds];
+    const droppedSkipSet = new Set(droppedBySkipIds);
+    const droppedTrimSet = new Set(droppedByTrimIds);
+    const renderedIds = [...placements.keys()];
+    const renderedSet = new Set(renderedIds);
+    for (const memory of args.source) {
+        if (
+            !renderedSet.has(memory.id) &&
+            !droppedTrimSet.has(memory.id) &&
+            !droppedSkipSet.has(memory.id)
+        ) {
+            droppedSkipSet.add(memory.id);
+            droppedBySkipIds.push(memory.id);
+        }
+    }
+    const renderedEntries = renderSpecs.filter(
+        (entry) => entry.mergeInto === undefined && placements.has(entry.id),
+    );
+    const renderedMerges = renderSpecs.filter(
+        (entry) => entry.mergeInto !== undefined && placements.has(entry.id),
+    );
+    const cueLengths = renderedEntries.map((entry) => codepoints(displayCue(entry))).sort((a, b) => a - b);
     const percentile = (value: number): number =>
         cueLengths[Math.round((cueLengths.length - 1) * value)] ?? 0;
-    const entryCount = args.specs.filter((entry) => entry.mergeInto === undefined).length;
-    const mergeCount = args.specs.length - entryCount;
+    const renderedMemoryCount = renderedIds.length;
+    const droppedMemoryCount = droppedByTrimIds.length + droppedBySkipIds.length;
+    const palaceLines = palace.endsWith("\n") ? palace.slice(0, -1).split("\n") : palace.split("\n");
     const coverage = {
         source: args.sourceLabel ?? SOURCE_PATH,
         sourceMemoryCount: args.source.length,
-        entryCount,
-        mergeCount,
-        representedMemoryCount: entryCount + mergeCount,
+        renderedIds,
+        droppedByTrimIds,
+        droppedBySkipIds,
+        renderedMemoryCount,
+        droppedMemoryCount,
+        entryCount: renderedEntries.length,
+        mergeCount: renderedMerges.length,
+        representedMemoryCount: renderedMemoryCount,
         palaceChars: palace.length,
-        maxLineChars: Math.max(...palace.trimEnd().split("\n").map(codepoints)),
+        maxLineChars: Math.max(...palaceLines.map(codepoints)),
         layout: {
             font: LAYOUT_FONT,
             cellWidth: CELL_WIDTH,
@@ -1014,7 +1043,7 @@ export function authorPalace(args: {
             roomWidthChars: ROOM_WIDTH,
             pageWidthChars: PAGE_WIDTH_CHARS,
             columnGapChars: COLUMN_GAP,
-            canvasHeightCells: palace.trimEnd().split("\n").length,
+            canvasHeightCells: PAGE_HEIGHT_CELLS,
             pageHeightPixels: PAGE_HEIGHT_PIXELS,
             bodyLinePitch: BODY_LINE_PITCH,
             pages,
@@ -1039,16 +1068,17 @@ export function authorPalace(args: {
                 .map(([id, placement]) => [String(id), placement]),
         ),
     };
-    if (placements.size !== args.source.length)
-        throw new Error(`coverage has ${placements.size}/${args.source.length}`);
     writeFileSync(palaceOutput, palace);
     writeFileSync(coverageOutput, `${JSON.stringify(coverage, null, 4)}\n`);
     return { palace, coverage };
 }
 
 function main(): void {
-    const source = parseSource(readFileSync(SOURCE_PATH, "utf8"));
     const specs = readSpecs();
+    const source = parseSource(
+        readFileSync(SOURCE_PATH, "utf8"),
+        new Map(specs.map((spec) => [spec.id, spec.importance])),
+    );
     const { palace, coverage } = authorPalace({ source, specs });
     console.log(
         JSON.stringify({

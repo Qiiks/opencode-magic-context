@@ -16,6 +16,7 @@ import { extractCompleteManifestBody } from "../../../src/features/magic-context
 
 import {
     authorPalace,
+    cueBudgetViolations,
     isExactToken,
     type Category,
     type SourceMemory,
@@ -27,7 +28,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const CORPUS_PATH = join(HERE, "corpus", "palace-corpus.json");
 const TRIALS_DIR = join(HERE, "trials");
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-const MAX_OUTPUT_TOKENS = 16_384;
+// Thinking models (deepseek-v4-pro, qwen3.5 on ollama-cloud) spend a large share of
+// the budget on reasoning before emitting content; 16k starved the big categories
+// into empty-content responses. 32k matches the historian producer's budget.
+const MAX_OUTPUT_TOKENS = 32_768;
 const ANCHOR_FIDELITY_FLOOR = 85;
 
 const CATEGORY_ORDER = [
@@ -36,7 +40,6 @@ const CATEGORY_ORDER = [
     "CONSTRAINTS",
     "CONFIG_VALUES",
     "NAMING",
-    "KNOWN_ISSUES",
 ] as const;
 
 const VALIDATOR_FAILURE_CLASSES = [
@@ -45,6 +48,7 @@ const VALIDATOR_FAILURE_CLASSES = [
     "memory ID leakage",
     "broken exact anchors",
     "unbalanced parentheses",
+    "cue over budget",
     "coverage",
     "other validator failures",
 ] as const;
@@ -94,6 +98,7 @@ type CellResult = {
     roomCount?: number;
     imageTokens?: number;
     utilizationPercent?: number;
+    pages?: number;
     renderError?: string;
     usage: TokenUsage[];
     cost?: number;
@@ -103,6 +108,7 @@ type Args = {
     models: string[];
     prompts: string[];
     rebuildCorpus: boolean;
+    reuseManifests: boolean;
 };
 
 function errorMessage(error: unknown): string {
@@ -124,7 +130,7 @@ function splitValues(value: string): string[] {
 }
 
 function parseArgs(argv = process.argv.slice(2)): Args {
-    const args: Args = { models: [], prompts: [], rebuildCorpus: false };
+    const args: Args = { models: [], prompts: [], rebuildCorpus: false, reuseManifests: false };
     for (let index = 0; index < argv.length; index++) {
         const argument = argv[index];
         const value = argv[index + 1];
@@ -141,8 +147,19 @@ function parseArgs(argv = process.argv.slice(2)): Args {
                 args.prompts.push(...splitValues(value));
                 index++;
                 break;
+            case "--think":
+                if (!value) usage();
+                setOllamaThink(value);
+                index++;
+                break;
             case "--rebuild-corpus":
                 args.rebuildCorpus = true;
+                break;
+            case "--reuse-manifests":
+                // Re-render from a previous run's saved raw-<category>.xml manifests
+                // without spending model quota on re-authoring. Categories with no
+                // saved manifest still author normally.
+                args.reuseManifests = true;
                 break;
             case "--help":
             case "-h":
@@ -346,7 +363,13 @@ function parseInteger(value: string, context: string): number {
 }
 
 function parseManifest(raw: string, expectedCategory: Category, importanceById: Map<number, number>): SpecEntry[] {
-    const text = raw.trim();
+    // Models intermittently wrap the manifest in a Markdown code fence despite
+    // the prompt's instruction. The fence carries no authoring signal (the XML
+    // inside is complete and valid), so unwrap it rather than burning a retry
+    // on a formatting tic.
+    let text = raw.trim();
+    const fence = text.match(/^```(?:xml)?\s*\n([\s\S]*?)\n?```\s*$/);
+    if (fence?.[1]) text = fence[1].trim();
     if (!text.startsWith("<palace")) throw new Error("palace manifest must begin with <palace");
     if (!text.endsWith("</palace>")) {
         try {
@@ -519,6 +542,56 @@ function resolveOllamaCloudKey(): string {
     return key;
 }
 
+// Ollama's native /api/chat honors think (false | "low" | "medium" | "high"),
+// which the OpenAI-compat endpoint does not expose reliably. Bounding thinking
+// matters: on the biggest categories unbounded thinking consumed the entire
+// output budget before any content, returning empty assistant text. The level
+// is a CLI knob (--think) so cells can A/B quality against thinking budget.
+const THINK_LEVELS = new Set(["false", "low", "medium", "high"]);
+let ollamaThink: false | string = "low";
+
+function setOllamaThink(value: string): void {
+    if (!THINK_LEVELS.has(value)) {
+        throw new Error(`--think must be one of ${[...THINK_LEVELS].join(", ")}`);
+    }
+    ollamaThink = value === "false" ? false : value;
+}
+
+async function callOllamaNativeChat(model: string, messages: ChatMessage[]): Promise<Completion> {
+    const response = await fetch("https://ollama.com/api/chat", {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${resolveOllamaCloudKey()}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            model,
+            messages,
+            think: ollamaThink,
+            stream: false,
+            options: { temperature: 0.1, num_predict: MAX_OUTPUT_TOKENS },
+        }),
+        signal: AbortSignal.timeout(10 * 60 * 1_000),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+        throw new Error(`ollama-cloud ${response.status}: ${text.replace(/\s+/g, " ").slice(0, 500)}`);
+    }
+    const payload = JSON.parse(text) as {
+        message?: { content?: string };
+        prompt_eval_count?: number;
+        eval_count?: number;
+    };
+    const content = payload.message?.content?.trim();
+    if (!content) throw new Error("ollama-cloud response has no assistant text");
+    const promptTokens = payload.prompt_eval_count ?? 0;
+    const completionTokens = payload.eval_count ?? 0;
+    return {
+        content,
+        usage: { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens },
+    };
+}
+
 async function callChatCompletions(
     endpoint: string,
     apiKey: string,
@@ -556,25 +629,19 @@ async function callChatCompletions(
 async function callModel(model: string, messages: ChatMessage[]): Promise<Completion> {
     if (model.startsWith(OLLAMA_CLOUD_PREFIX)) {
         const bareModel = model.slice(OLLAMA_CLOUD_PREFIX.length);
-        return callChatCompletions(
-            OLLAMA_CLOUD_ENDPOINT,
-            resolveOllamaCloudKey(),
-            "ollama-cloud",
-            bareModel,
-            messages,
-            {},
-        );
+        return callOllamaNativeChat(bareModel, messages);
     }
     return callChatCompletions(OPENROUTER_ENDPOINT, resolveOpenRouterKey(), "OpenRouter", model, messages, {
         ...(model === "google/gemini-3.5-flash" ? {} : { reasoning: { enabled: false } }),
     });
 }
 
-function safeName(value: string): string {
-    return value
-        .replace(extname(value), "")
-        .replace(/[^A-Za-z0-9._-]+/g, "-")
-        .replace(/^-+|-+$/g, "") || "unnamed";
+// Extension-stripping is for prompt FILE names only. Model ids must keep their
+// dots and suffixes verbatim: stripping extname collapsed glm-5.1 and glm-5.2
+// into the same trial directory and truncated kimi-k2.7-code to kimi-k2.
+function safeName(value: string, opts?: { stripExtension?: boolean }): string {
+    const base = opts?.stripExtension ? value.replace(extname(value), "") : value;
+    return base.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unnamed";
 }
 
 function promptPath(value: string): string {
@@ -617,8 +684,44 @@ async function runCategory(args: {
         parseError = errorMessage(error);
     }
     if (entries) {
+        const violations = cueBudgetViolations(entries, args.importanceById);
+        if (violations.length === 0) {
+            writeFileSync(rawPath, raw);
+            return { category: args.category, parse: "ok", entries, attempts: 1, usage };
+        }
+        // Budget violations reject the whole category once with per-id feedback;
+        // mechanical enforcement replaced the prose that flash imitated instead
+        // of obeying.
+        writeFileSync(rawPath.replace(/\.xml$/, ".attempt-1.xml"), raw);
+        const list = violations
+            .slice(0, 20)
+            .map((v) => `id ${v.id}: ${v.length} chars (max ${v.budget})`)
+            .join("; ");
+        try {
+            const completion = await callModel(args.model, [
+                ...baseMessages,
+                { role: "assistant", content: raw },
+                {
+                    role: "user",
+                    content: `REJECTED: ${violations.length} cue(s) exceed their hard character budget: ${list}. Budgets: importance >= 70 allows 90 chars, everything else 50 chars, counted on the rendered cue. Compress the flagged cues (drop path spines, keep anchors and one relation, use the strongest half) and return the complete corrected XML manifest. Do not change ids, rooms, or importance values.`,
+                },
+            ]);
+            raw = completion.content;
+            if (completion.usage) usage.push(completion.usage);
+        } catch (error) {
+            return { category: args.category, parse: "fail", attempts: 2, usage, error: errorMessage(error) };
+        }
         writeFileSync(rawPath, raw);
-        return { category: args.category, parse: "ok", entries, attempts: 1, usage };
+        try {
+            entries = parseManifest(raw, args.category, args.importanceById);
+            const still = cueBudgetViolations(entries, args.importanceById);
+            if (still.length > 0) {
+                console.warn(`[palace] ${args.category}: ${still.length} cue(s) still over budget after retry; keeping with warnings`);
+            }
+            return { category: args.category, parse: "retry", entries, attempts: 2, usage };
+        } catch (error) {
+            return { category: args.category, parse: "fail", attempts: 2, usage, error: errorMessage(error) };
+        }
     }
 
     writeFileSync(rawPath.replace(/\.xml$/, ".attempt-1.xml"), raw);
@@ -652,6 +755,7 @@ function classifyValidatorError(message: string): ValidatorFailureClass {
     if (/memory id leaked into cue/i.test(message)) return "memory ID leakage";
     if (/exact anchor .* missing from rendered cue/i.test(message)) return "broken exact anchors";
     if (/polarity mechanism is unclosed|unbalanced mechanism/i.test(message)) return "unbalanced parentheses";
+    if (/cue over budget/i.test(message)) return "cue over budget";
     if (/uncovered source ids|duplicate spec id|absent from source|category mismatch/i.test(message)) return "coverage";
     return "other validator failures";
 }
@@ -717,7 +821,11 @@ function renderPalaceCell(args: {
     try {
         authorPalace({
             source: args.corpus.memories.map(
-                (memory): SourceMemory => ({ id: memory.id, category: memory.category }),
+                (memory): SourceMemory => ({
+                    id: memory.id,
+                    category: memory.category,
+                    importance: memory.importance,
+                }),
             ),
             specs: args.specs,
             sourceLabel: CORPUS_PATH,
@@ -756,15 +864,33 @@ async function runCell(args: {
     corpus: PalaceCorpus;
     model: string;
     promptPath: string;
+    reuseManifests: boolean;
 }): Promise<CellResult> {
     const prompt = readFileSync(args.promptPath, "utf8");
-    const directory = join(TRIALS_DIR, `${safeName(basename(args.promptPath))}__${safeName(args.model)}`);
+    // Suffix the think mode so A/B arms (think:false vs think:low) write
+    // distinct directories instead of clobbering each other's artifacts.
+    const directory = join(
+        TRIALS_DIR,
+        `${safeName(basename(args.promptPath), { stripExtension: true })}__${safeName(args.model)}__think-${safeName(String(ollamaThink))}`,
+    );
     mkdirSync(directory, { recursive: true });
     const importanceById = new Map(args.corpus.memories.map((memory) => [memory.id, memory.importance]));
     const categoryRuns: CategoryRun[] = [];
     for (const category of CATEGORY_ORDER) {
         const memories = args.corpus.memories.filter((memory) => memory.category === category);
         if (memories.length === 0) continue;
+        if (args.reuseManifests) {
+            const rawPath = join(directory, `raw-${category.toLowerCase()}.xml`);
+            if (existsSync(rawPath)) {
+                try {
+                    const entries = parseManifest(readFileSync(rawPath, "utf8"), category, importanceById);
+                    categoryRuns.push({ category, parse: "ok", entries, attempts: 0, usage: [] });
+                    continue;
+                } catch {
+                    // A stale or malformed saved manifest falls through to authoring.
+                }
+            }
+        }
         categoryRuns.push(
             await runCategory({
                 model: args.model,
@@ -786,16 +912,25 @@ async function runCell(args: {
         renderError = "parse failure prevented fail-closed authoring";
     } else {
         try {
-            validate(
+            const validationDefects = validate(
                 args.corpus.memories.map(
-                    (memory): SourceMemory => ({ id: memory.id, category: memory.category }),
+                    (memory): SourceMemory => ({
+                        id: memory.id,
+                        category: memory.category,
+                        importance: memory.importance,
+                    }),
                 ),
                 specs,
             );
+            for (const defect of validationDefects) addValidatorFailure(failures, defect);
         } catch (error) {
             const message = errorMessage(error);
             addValidatorFailure(failures, message);
-            renderError = `validator: ${message}`;
+            // Dev-only escape hatch for eyeball passes: render the near-miss manifest
+            // anyway while keeping the failure in metrics so the verdict stays honest.
+            if (process.env.PALACE_RENDER_DESPITE_VALIDATOR !== "1") {
+                renderError = `validator: ${message}`;
+            }
         }
         if (!renderError) {
             const rendered = renderPalaceCell({ corpus: args.corpus, specs, outputDir: directory });
@@ -823,6 +958,7 @@ async function runCell(args: {
                   roomCount: new Set(specs.map((entry) => `${entry.category}\u0000${entry.room}`)).size,
                   imageTokens: metrics.imageTokens,
                   utilizationPercent: metrics.utilizationPercent,
+                  pages: metrics.pages,
               }
             : {}),
         ...(renderError ? { renderError } : {}),
@@ -844,8 +980,7 @@ function formatFailures(failures: Partial<Record<ValidatorFailureClass, number>>
 function cellVerdict(result: CellResult): "VIABLE" | "VIABLE-WITH-CAVEATS" | "NOT-VIABLE" {
     if (
         result.parse === "fail" ||
-        result.coverage.covered !== result.coverage.total ||
-        Object.keys(result.validatorFailures).length > 0 ||
+        Object.keys(result.validatorFailures).some((kind) => kind !== "cue over budget") ||
         result.renderError
     ) {
         return "NOT-VIABLE";
@@ -983,9 +1118,9 @@ function writeReport(results: CellResult[]): void {
         "",
         "## Verdict policy",
         "",
-        "A cell is **VIABLE** only when parsing, full validation, rendering, and full coverage succeed with at least " +
+        "A cell is **VIABLE** when parsing, validation, rendering, and the author's selected-memory manifest succeed with at least " +
             ANCHOR_FIDELITY_FLOOR +
-            "% anchor fidelity. A parse-recovered or low-anchor cell is **VIABLE-WITH-CAVEATS**. Any parse, validation, coverage, or rendering failure is **NOT-VIABLE**.",
+            "% anchor fidelity. Uncovered source memories are an intentional selection outcome. A parse-recovered or low-anchor cell is **VIABLE-WITH-CAVEATS**; cue-budget diagnostics are warnings. Any parse, hard-validation, or rendering failure is **NOT-VIABLE**.",
         "",
     );
     writeFileSync(join(TRIALS_DIR, "REPORT.md"), lines.join("\n"));
@@ -1009,7 +1144,14 @@ async function main(): Promise<void> {
         const candidatePrompt = promptPath(requestedPrompt);
         for (const model of args.models) {
             console.log(`running ${model} × ${basename(candidatePrompt)}`);
-            results.push(await runCell({ corpus, model, promptPath: candidatePrompt }));
+            results.push(
+                await runCell({
+                    corpus,
+                    model,
+                    promptPath: candidatePrompt,
+                    reuseManifests: args.reuseManifests,
+                }),
+            );
         }
     }
     writeReport(results);

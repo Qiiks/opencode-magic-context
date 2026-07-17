@@ -20,6 +20,7 @@ import {
     appendAutoSearchHintDecision,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { setRawMessageProvider } from "./read-session-chunk";
@@ -124,6 +125,7 @@ function basePass(args: {
     projectPath?: string;
     nowMs?: number;
     isSubagent?: boolean;
+    midTurn?: boolean;
 }): ShadowTransformPass {
     const inputMessages = args.inputMessages ?? [message(args.sessionId, "m1", "hello")];
     return {
@@ -142,6 +144,7 @@ function basePass(args: {
             effective_execute_threshold: 65,
             history_budget_tokens: 19_500,
             cache_ttl: "ephemeral",
+            mid_turn: args.midTurn ?? false,
         },
         tsDecision: { class: "defer", marker_state: { advanced_this_pass: false } },
         declaredTrimBefore: null,
@@ -170,6 +173,8 @@ class FakeTransport implements ShadowTransport {
     closedSessions: string[] = [];
     seedBoundaryFailuresRemaining = 0;
     rejectNextTransform = false;
+    transformFailuresRemaining = 0;
+    transformFailureCode = "shadow_identity_drift";
     quarantinedResponsesRemaining = 0;
     resetFailuresRemaining = 0;
     resetTimeoutAtCall = 0;
@@ -177,11 +182,19 @@ class FakeTransport implements ShadowTransport {
     resetCalls = 0;
     seq = 0;
     releaseReset: (() => void) | null = null;
+    releaseTransform: (() => void) | null = null;
     private resetGate: Promise<void> | null = null;
+    private transformGate: Promise<void> | null = null;
 
     blockFirstReset(): void {
         this.resetGate = new Promise((resolve) => {
             this.releaseReset = resolve;
+        });
+    }
+
+    blockFirstTransformPage(): void {
+        this.transformGate = new Promise((resolve) => {
+            this.releaseTransform = resolve;
         });
     }
 
@@ -196,6 +209,14 @@ class FakeTransport implements ShadowTransport {
         if (req.method === "shadow_reset" && this.resetGate) {
             await this.resetGate;
             this.resetGate = null;
+        }
+        if (req.method === "shadow_transform" && this.transformGate) {
+            const body = req.body as { transform_page_index?: number };
+            if (body.transform_page_index === 0) {
+                const gate = this.transformGate;
+                this.transformGate = null;
+                await gate;
+            }
         }
         if (req.method === "shadow_reset" && this.resetFailuresRemaining > 0) {
             this.resetFailuresRemaining -= 1;
@@ -220,6 +241,10 @@ class FakeTransport implements ShadowTransport {
         if (req.method === "shadow_transform" && this.rejectNextTransform) {
             this.rejectNextTransform = false;
             throw new SubcError("generation mismatch", "stale_generation");
+        }
+        if (req.method === "shadow_transform" && this.transformFailuresRemaining > 0) {
+            this.transformFailuresRemaining -= 1;
+            throw new SubcError("CK message block identity drift", this.transformFailureCode);
         }
         if (req.method === "shadow_reset") {
             this.seq = 0;
@@ -381,6 +406,71 @@ describe("shadow sender", () => {
         await new Promise((resolve) => setTimeout(resolve, 10));
 
         expect(transport.calls).toEqual([]);
+    });
+
+    it("parks after two consecutive deterministic reset reasons and sends nothing later", async () => {
+        const transport = new FakeTransport();
+        const sender = createShadowSender({ transport });
+        const sessionId = "s-park-repeat";
+
+        sender.resetSession(sessionId, "ordinal_mismatch");
+        await waitFor(() => transport.resetCalls === 1);
+        sender.resetSession(sessionId, "ordinal_mismatch");
+        await waitFor(() => sender.getStats(sessionId).parked === 1);
+
+        sender.resetSession(sessionId, "ordinal_mismatch");
+        expect(transport.resetCalls).toBe(1);
+        expect(sender.getStats(sessionId).parked).toBe(1);
+    });
+
+    it("parks repeated deterministic send failures and recovers after an explicit reset", async () => {
+        useTempDataHome("shadow-send-failure-park-");
+        const sessionId = "s-send-failure-park";
+        createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "hello" }]);
+        const db = openDatabase();
+        if (!db) throw new Error("test database failed to open");
+        const transport = new FakeTransport();
+        transport.transformFailuresRemaining = 3;
+        const sender = createShadowSender({ transport });
+
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+            sender.enqueue(basePass({ db, sessionId, nowMs: attempt }));
+            await waitFor(
+                () =>
+                    transport.calls.filter((call) => call.method === "shadow_transform").length ===
+                    attempt,
+            );
+        }
+        expect(sender.getStats(sessionId).parked).toBe(1);
+        expect(sender.getStats(sessionId).send_failures).toBe(3);
+
+        sender.enqueue(basePass({ db, sessionId, nowMs: 4 }));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(transport.calls.filter((call) => call.method === "shadow_transform")).toHaveLength(
+            3,
+        );
+
+        sender.resetSession(sessionId, "operator_reset");
+        await waitFor(() => transport.resetCalls === 2);
+        sender.enqueue(basePass({ db, sessionId, nowMs: 5 }));
+        await waitFor(
+            () => transport.calls.filter((call) => call.method === "shadow_transform").length === 4,
+        );
+        expect(sender.getStats(sessionId).parked).toBe(1);
+        expect(sender.getStats(sessionId).transforms_sent).toBe(1);
+    });
+
+    it("does not park repeated transient route reopen resets", async () => {
+        const transport = new FakeTransport();
+        const sender = createShadowSender({ transport });
+        const sessionId = "s-park-transient";
+
+        sender.resetSession(sessionId, "route_reopen");
+        await waitFor(() => transport.resetCalls === 1);
+        sender.resetSession(sessionId, "route_reopen");
+        await waitFor(() => transport.resetCalls === 2);
+
+        expect(sender.getStats(sessionId).parked).toBe(0);
     });
 
     it("strips only tag prefixes known from tagger state and exact ctx-search hint blocks", () => {
@@ -578,6 +668,103 @@ describe("shadow sender", () => {
                 2,
             );
             expect(sender.getStats(sessionId).transforms_sent).toBe(2);
+        } finally {
+            unregister();
+        }
+    });
+
+    it("self-heals a provisional ordinal when persistence agrees and resets once when it does not", async () => {
+        const sessionId = "s-ordinal-provisional";
+        let rows = [
+            { id: "m1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true },
+            { id: "m2", timeCreated: 2, contributesOrdinal: true, hasValidInfo: true },
+        ];
+        const unregister = setRawMessageProvider(sessionId, {
+            readMessages() {
+                throw new Error("ordinal tests must use incremental reads");
+            },
+            readMessageOrdinalPage(after, limit) {
+                return rows
+                    .filter(
+                        (row) =>
+                            !after ||
+                            row.timeCreated > after.timeCreated ||
+                            (row.timeCreated === after.timeCreated && row.id > after.id),
+                    )
+                    .slice(0, limit);
+            },
+            getStoredMessageCount: () => rows.length,
+        });
+        try {
+            const state = __shadowSenderTest.createSessionQueueState();
+            const provisional = [
+                message(sessionId, "m1", "one"),
+                message(sessionId, "m2", "two"),
+                message(sessionId, "m3", "live tail"),
+            ];
+            const first = await __shadowSenderTest.resolveOrdinalsForShadow({
+                sessionId,
+                messages: provisional,
+                generation: state.shadowGeneration,
+                memoGeneration: state.idOrdinalMemoGeneration,
+                memo: state.idOrdinalMemo,
+                memoStoredCount: state.idOrdinalMemoStoredCount,
+                memoAnchor: state.idOrdinalMemoAnchor,
+                memoCanonicalCount: state.idOrdinalMemoCanonicalCount,
+            });
+            expect(first).toEqual(expect.objectContaining({ ok: true }));
+            if (!first.ok) throw new Error("provisional ordinal setup failed");
+
+            rows = [...rows, { id: "m3", timeCreated: 3, contributesOrdinal: true, hasValidInfo: true }];
+            const healed = await __shadowSenderTest.resolveOrdinalsForShadow({
+                sessionId,
+                messages: provisional,
+                generation: state.shadowGeneration,
+                memoGeneration: first.memoGeneration,
+                memo: state.idOrdinalMemo,
+                memoStoredCount: first.memoStoredCount,
+                memoAnchor: first.memoAnchor,
+                memoCanonicalCount: first.memoCanonicalCount,
+            });
+            expect(healed).toEqual(
+                expect.objectContaining({
+                    ok: true,
+                    annotatedInput: [
+                        expect.objectContaining({ absolute_ordinal: 1 }),
+                        expect.objectContaining({ absolute_ordinal: 2 }),
+                        expect.objectContaining({ absolute_ordinal: 3 }),
+                    ],
+                }),
+            );
+
+            const resetTransport = new FakeTransport();
+            const sender = createShadowSender({ transport: resetTransport });
+            const db = openDatabase();
+            rows = [
+                { id: "m1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true },
+                { id: "m2", timeCreated: 2, contributesOrdinal: true, hasValidInfo: true },
+            ];
+            sender.enqueue(basePass({ db, sessionId, inputMessages: provisional, outputMessages: provisional }));
+            await waitFor(() => sender.getStats(sessionId).transforms_sent === 1);
+            rows = [
+                ...rows,
+                { id: "inserted", timeCreated: 2.5, contributesOrdinal: true, hasValidInfo: true },
+                { id: "m3", timeCreated: 3, contributesOrdinal: true, hasValidInfo: true },
+            ];
+            sender.enqueue(
+                basePass({
+                    db,
+                    sessionId,
+                    inputMessages: provisional,
+                    outputMessages: provisional,
+                    nowMs: 2,
+                }),
+            );
+            await waitFor(() => sender.getStats(sessionId).transforms_sent === 2);
+            expect(resetTransport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(
+                2,
+            );
+            expect(sender.getStats(sessionId).ordinal_mismatch).toBe(1);
         } finally {
             unregister();
         }
@@ -897,6 +1084,99 @@ describe("shadow sender", () => {
         }
     });
 
+    it("aligns declared trim ordinals with the canonical basis after a summary row", () => {
+        useTempDataHome("shadow-canonical-declared-trim-");
+        const sessionId = "s-canonical-declared-trim";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", text: "before" },
+            { id: "summary", role: "assistant", text: "summary", summary: true },
+            { id: "m2", role: "user", text: "boundary" },
+        ]);
+        const db = openDatabase();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 1,
+                startMessage: 3,
+                endMessage: 3,
+                startMessageId: "m2",
+                endMessageId: "m2",
+                title: "Boundary",
+                content: "content",
+            },
+        ]);
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "m2",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction-part",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 3,
+            targetEndMessageId: "m2",
+        });
+
+        expect(__shadowSenderTest.resolveDeclaredTrimForShadow({ db, sessionId })).toEqual(
+            expect.objectContaining({
+                boundary_absolute_ordinal: 2,
+                next_absolute_ordinal: 3,
+            }),
+        );
+    });
+
+    it("seeds ordered active user-profile lines without reading project memories", async () => {
+        useTempDataHome("shadow-profile-seed-");
+        const db = openDatabase();
+        insertUserMemory(db, "prefers root cause", []);
+        insertUserMemory(db, "x < y & z", []);
+        const state = __shadowSenderTest.createSessionQueueState();
+        const sync = await __shadowSenderTest.buildStateSyncPayload({
+            state,
+            pass: basePass({ db, sessionId: "s-profile-seed" }),
+            force: true,
+        });
+        expect(sync).toEqual(
+            expect.objectContaining({
+                params: expect.objectContaining({
+                    user_profile: ["prefers root cause", "x < y & z"],
+                }),
+            }),
+        );
+    });
+
+    it("keeps active profile lines in the real multi-batch seed wire shape", () => {
+        const profile = ["prefers root cause", "x < y & z"];
+        const batches = __shadowSenderTest.buildPagedSeedPayloads({
+            shadowGeneration: 7,
+            expectedShadowSeq: 11,
+            seedId: "profile-paged-seed",
+            seedBoundaryId: "m2#0",
+            compartments: [
+                { sequence: 0, content: "a".repeat(300 * 1024) },
+                { sequence: 1, content: "b".repeat(300 * 1024) },
+            ],
+            memories: [],
+            memoryMutations: [],
+            userProfile: profile,
+            workspace: null,
+            lastTodoState: "[]",
+            watermarks: {
+                compartment_sequence: 1,
+                memory_id: 0,
+                m0_mutation_id: 0,
+                memory_mutation_id: 0,
+                last_todo_state_hash: "hash",
+            },
+        });
+
+        expect(batches.length).toBeGreaterThan(1);
+        expect(batches.flatMap((batch) => batch.params.user_profile)).toEqual(profile);
+        expect(
+            batches.flatMap((batch) => {
+                const wire = __shadowSenderTest.toFlatWireBody(batch) as Record<string, unknown>;
+                return (wire.user_profile as string[]) ?? [];
+            }),
+        ).toEqual(profile);
+        expect(batches.at(-1)?.params.seed_complete).toBe(true);
+    });
+
     it("pages force seeds by exact flat wire bytes and keeps scalar state on the final batch", () => {
         const watermarks = {
             compartment_sequence: 2,
@@ -917,6 +1197,7 @@ describe("shadow sender", () => {
             compartments,
             memories: [],
             memoryMutations: [],
+            userProfile: [],
             workspace: null,
             lastTodoState: "[]",
             watermarks,
@@ -968,6 +1249,7 @@ describe("shadow sender", () => {
                 compartments: [{ content: "x".repeat(513 * 1024) }],
                 memories: [],
                 memoryMutations: [],
+                userProfile: [],
                 workspace: null,
                 lastTodoState: "[]",
                 watermarks,
@@ -981,6 +1263,7 @@ describe("shadow sender", () => {
             compartments: [{ content: "x".repeat(300 * 1024) }],
             memories: [],
             memoryMutations: [],
+            userProfile: [],
             workspace: null,
             lastTodoState: "y".repeat(300 * 1024),
             watermarks,
@@ -1003,11 +1286,199 @@ describe("shadow sender", () => {
                 compartments: [],
                 memories: [],
                 memoryMutations: [],
+                userProfile: [],
                 workspace: null,
                 lastTodoState: "x".repeat(513 * 1024),
                 watermarks,
             }),
         ).toThrow("512 KiB");
+    });
+
+    it("pages large transform requests and reassembles every array in order", () => {
+        const original: Record<string, unknown> = {
+            method: "shadow_transform",
+            session_id: "shadow:large",
+            shadow_generation: 3,
+            seed_pass: false,
+            input: ["a".repeat(260 * 1024), "b".repeat(260 * 1024)],
+            ts_output: ["out-a".repeat(60 * 1024), "out-b".repeat(60 * 1024)],
+            normalizations: [{ kind: "summary_message", message_id: "s" }],
+            pass_inputs: { now_ms: 1 },
+            ts_decision: { class: "defer" },
+            declared_trim: null,
+        };
+        const pages = __shadowSenderTest.buildPagedTransformPayloads(original);
+        expect(pages.length).toBeGreaterThan(1);
+        expect(
+            pages.every(
+                (page) =>
+                    Buffer.byteLength(JSON.stringify(page)) <=
+                    __shadowSenderTest.SHADOW_TRANSFORM_PAGE_MAX_BYTES,
+            ),
+        ).toBe(true);
+        const assembled = { ...pages.at(-1) } as Record<string, unknown>;
+        for (const field of ["transform_page_id", "transform_generation", "transform_page_index", "transform_page_total", "transform_page_complete", "transform_page_digest"]) {
+            delete assembled[field];
+        }
+        for (const field of ["input", "ts_output", "normalizations"]) {
+            assembled[field] = pages.flatMap((page) => (page[field] as unknown[]) ?? []);
+        }
+        expect(assembled).toEqual(original);
+    });
+
+    it("slices one oversized transform item and reassembles its original JSON", () => {
+        const item = { id: "oversized", text: "x".repeat(2 * 1024 * 1024) };
+        const body: Record<string, unknown> = {
+            method: "shadow_transform",
+            session_id: "shadow:oversized",
+            shadow_generation: 3,
+            seed_pass: false,
+            input: [item],
+            ts_output: [],
+            normalizations: [],
+            pass_inputs: { now_ms: 1 },
+            ts_decision: { class: "defer" },
+            declared_trim: null,
+        };
+        const pages = __shadowSenderTest.buildPagedTransformPayloads(body);
+        expect(pages.length).toBeGreaterThan(1);
+        expect(
+            pages.every(
+                (page) =>
+                    Buffer.byteLength(JSON.stringify(page)) <=
+                    __shadowSenderTest.SHADOW_TRANSFORM_PAGE_MAX_BYTES,
+            ),
+        ).toBe(true);
+        const chunks = pages.flatMap((page) =>
+            ((page.input as Array<Record<string, unknown>> | undefined) ?? []).filter(
+                (value) => value.__shadow_item_continuation !== undefined,
+            ),
+        );
+        expect(chunks.length).toBeGreaterThan(1);
+        const reassembled = JSON.parse(chunks.map((chunk) => chunk.chunk as string).join(""));
+        expect(reassembled).toEqual(item);
+    });
+
+    it("does not interleave pages from two transform passes for one session", async () => {
+        useTempDataHome("shadow-transform-pages-");
+        const sessionId = "s-transform-pages";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", text: "one" },
+            { id: "m2", role: "user", text: "two" },
+            { id: "m3", role: "user", text: "three" },
+        ]);
+        const db = openDatabase();
+        const { unregister } = installLinearRawProvider(sessionId, 3);
+        try {
+            const transport = new FakeTransport();
+            transport.blockFirstTransformPage();
+            const sender = createShadowSender({ transport });
+            const large = [
+                message(sessionId, "m1", "a".repeat(220 * 1024)),
+                message(sessionId, "m2", "b".repeat(220 * 1024)),
+                message(sessionId, "m3", "c".repeat(220 * 1024)),
+            ];
+            sender.enqueue(basePass({ db, sessionId, inputMessages: large, outputMessages: structuredClone(large) }));
+            await waitFor(
+                () =>
+                    transport.calls.some(
+                        (call) =>
+                            call.method === "shadow_transform" &&
+                            (call.body as { transform_page_index?: number }).transform_page_index === 0,
+                    ),
+            );
+            sender.enqueue(
+                basePass({
+                    db,
+                    sessionId,
+                    inputMessages: large,
+                    outputMessages: structuredClone(large),
+                    nowMs: 2,
+                }),
+            );
+            expect(sender.getQueueDepth(sessionId)).toBe(1);
+            transport.releaseTransform?.();
+            await waitFor(() => sender.getStats(sessionId).transforms_sent === 2);
+            const pageCalls = transport.calls.filter((call) => call.method === "shadow_transform");
+            const pageIds = pageCalls.map((call) => (call.body as { transform_page_id?: string }).transform_page_id);
+            const firstId = pageIds[0];
+            const firstEnd = pageIds.lastIndexOf(firstId);
+            expect(firstId).toBeDefined();
+            expect(pageIds.slice(0, firstEnd + 1).every((id) => id === firstId)).toBe(true);
+            expect(pageIds.slice(firstEnd + 1).every((id) => id !== firstId)).toBe(true);
+        } finally {
+            unregister();
+        }
+    });
+
+    it("derives the seed boundary from the serialized tail compartment snapshot", async () => {
+        useTempDataHome("shadow-seed-boundary-snapshot-");
+        const sessionId = "s-seed-boundary-snapshot";
+        const db = openDatabase();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 2,
+                startMessage: 2,
+                endMessage: 2,
+                startMessageId: "m2",
+                endMessageId: "m2",
+                title: "new tail",
+                content: "new",
+            },
+            {
+                sequence: 1,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                title: "older",
+                content: "old",
+            },
+        ]);
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "m1",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction-part",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 1,
+            targetEndMessageId: "m1",
+        });
+        const unregister = setRawMessageProvider(sessionId, {
+            readMessages() {
+                throw new Error("seed boundary derivation must use point reads");
+            },
+            readMessageOrdinalPage() {
+                return [
+                    { id: "m1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true },
+                    { id: "m2", timeCreated: 2, contributesOrdinal: true, hasValidInfo: true },
+                ];
+            },
+            getStoredMessageCount: () => 2,
+            readMessagePartsById(messageId) {
+                return {
+                    id: messageId,
+                    role: "user",
+                    parts: [{ type: "text", text: messageId }],
+                    createdAt: messageId === "m1" ? 1 : 2,
+                };
+            },
+        });
+        try {
+            const state = __shadowSenderTest.createSessionQueueState();
+            state.seedPassPending = true;
+            const sync = await __shadowSenderTest.buildStateSyncPayload({
+                state,
+                pass: basePass({ db, sessionId }),
+                force: true,
+            });
+            expect(sync).toEqual(
+                expect.objectContaining({
+                    params: expect.objectContaining({ seed_boundary_id: "m2#0" }),
+                }),
+            );
+        } finally {
+            unregister();
+        }
     });
 
     it("sends paged seed batches sequentially and closes failed attempts before retry", async () => {
@@ -1435,7 +1906,7 @@ describe("shadow sender", () => {
         expect(sender.getStats(sessionId).transforms_sent).toBe(1);
     });
 
-    it("retries reseeding after cooldown and resets the allowance after success", async () => {
+    it("parks deterministic reseeding after the same reset reason repeats", async () => {
         useTempDataHome("shadow-reseed-cooldown-");
         const sessionId = "s-reseed-cooldown";
         createOpenCodeDb(sessionId, [{ id: "m1", role: "user", text: "tail" }]);
@@ -1461,13 +1932,12 @@ describe("shadow sender", () => {
         now += 100;
         transport.seedBoundaryFailuresRemaining = 1;
         sender.enqueue({ ...pass, passInputs: { ...pass.passInputs, now_ms: 3 } });
-        await waitFor(() => sender.getStats(sessionId).transforms_sent === 1);
-        expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(5);
+        await waitFor(() => sender.getStats(sessionId).parked === 1);
+        expect(sender.getStats(sessionId).transforms_sent).toBe(0);
+        expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(3);
 
-        transport.quarantinedResponsesRemaining = 1;
         sender.enqueue({ ...pass, passInputs: { ...pass.passInputs, now_ms: 4 } });
-        await waitFor(() => sender.getStats(sessionId).transforms_sent === 3);
-        expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(6);
+        expect(transport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(3);
     });
 
     it("serializes state_sync and shadow_transform with the shadow wire field inventory", async () => {
@@ -1848,7 +2318,7 @@ describe("shadow sender", () => {
         transport.resetFailuresRemaining = 1;
         const sender = createShadowSender({ transport });
 
-        sender.resetSession(sessionId, "manual_recovery");
+        sender.resetSession(sessionId, "route_reopen");
         await waitFor(() => sender.getStats(sessionId).send_failures === 1);
         const msg = message(sessionId, "m1", "one");
         sender.enqueue(

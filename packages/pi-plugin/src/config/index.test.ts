@@ -144,6 +144,18 @@ describe("loadPiConfig", () => {
 		expect(result.loadedFromPaths).toEqual([projectPath]);
 	});
 
+	it("loads the shared transform_mode field without Pi-specific warnings", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(home, JSON.stringify({ transform_mode: "rust" }));
+
+		const result = loadPiConfig({ cwd });
+
+		expect(result.config.transform_mode).toBe("rust");
+		expect(result.warnings).toEqual([]);
+	});
+
 	it("loads user config only", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");

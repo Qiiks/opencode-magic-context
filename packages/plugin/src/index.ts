@@ -1,4 +1,4 @@
-import type { Plugin, PluginModule } from "@opencode-ai/plugin";
+import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin";
 
 import {
     buildHiddenAgentConfig,
@@ -30,11 +30,14 @@ import {
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
+import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
+import { SubcShadowTransport } from "./hooks/magic-context/shadow-sender";
+import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./plugin/embedding-bootstrap";
 import { createEventHandler } from "./plugin/event";
-import { createSessionHooks } from "./plugin/hooks/create-session-hooks";
+import { createSessionHooksAsync } from "./plugin/hooks/create-session-hooks";
 import { isDisposedInstanceDirectory } from "./plugin/instance-disposal";
 import { createMessagesTransformHandler } from "./plugin/messages-transform";
 import { registerRpcHandlers } from "./plugin/rpc-handlers";
@@ -49,6 +52,7 @@ import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 
 const server: Plugin = async (ctx) => {
+    beginBootQuietPeriod();
     // Move config from the legacy per-harness locations to the shared CortexKit
     // location BEFORE loading (hard cutover: the loader reads only CortexKit).
     // Idempotent + lock-guarded for Desktop multi-instance; fails open. Warnings
@@ -146,16 +150,22 @@ const server: Plugin = async (ctx) => {
     }
 
     const liveSessionState = createLiveSessionState();
+    const rustModeModuleClient: RustModeModuleClient | undefined =
+        pluginConfig.transform_mode === "rust"
+            ? new SubcShadowTransport(undefined, undefined, undefined, "")
+            : undefined;
 
-    const hooks = createSessionHooks({
+    const hooks = await createSessionHooksAsync({
         ctx,
         pluginConfig,
         liveSessionState,
+        rustModeModuleClient,
     });
 
     const tools = createToolRegistry({
         ctx,
         pluginConfig,
+        rustToolBackends: hooks.rustToolBackends,
     });
 
     // v22 deferred legacy-memory identity backfill. createSessionHooks() opens
@@ -166,8 +176,10 @@ const server: Plugin = async (ctx) => {
         try {
             const db = openDatabase();
             if (db && isDatabasePersisted(db)) {
-                runDeferredV22Backfill(db).catch((err) => {
-                    log(`[v22-backfill] background runner failed: ${err}`);
+                scheduleAfterBootQuiet(() => {
+                    runDeferredV22Backfill(db).catch((err) => {
+                        log(`[v22-backfill] background runner failed: ${err}`);
+                    });
                 });
             }
         } catch (err) {
@@ -179,7 +191,7 @@ const server: Plugin = async (ctx) => {
     // touch storage at all (openDatabase() would CREATE context.db, breaking
     // the disabled-path invariant that no state is written).
     if (pluginConfig.enabled && hooks.magicContext) {
-        setTimeout(() => {
+        scheduleAfterBootQuiet(() => {
             void (async () => {
                 const db = openDatabase();
                 if (!db || !isDatabasePersisted(db)) return;
@@ -279,6 +291,7 @@ const server: Plugin = async (ctx) => {
             config: pluginConfig,
             client: ctx.client,
             liveSessionState,
+            rustModeModuleClient,
         });
         rpcServer.start().catch((err) => {
             log(`[magic-context] RPC server failed to start: ${err}`);
@@ -455,7 +468,7 @@ const server: Plugin = async (ctx) => {
         }),
         "experimental.chat.messages.transform": createMessagesTransformHandler({
             magicContext: hooks.magicContext,
-        }),
+        }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
             await hooks.magicContext?.["experimental.chat.system.transform"]?.(input, output);
         },
