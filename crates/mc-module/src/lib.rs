@@ -9998,6 +9998,26 @@ mod tests {
         ck_with_role(mid, ordinal, "user", text)
     }
 
+    fn ck_reasoning(mid: &str, ordinal: u64, text: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(CkKind::Reasoning {
+                    text: text.to_string(),
+                    signature: Some(format!("signature-{mid}")),
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
     fn assistant_tool_call(mid: &str, ordinal: u64) -> CkIngressMessage {
         CkIngressMessage {
             mid: mid.to_string(),
@@ -10368,6 +10388,76 @@ mod tests {
                 .last()
                 .unwrap()["info"]["customInfo"],
             "preserve-me"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_shaped_opencode_reasoning_clear_attaches_on_the_same_pass() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut request = request(vec![
+            ck_reasoning("assistant-old", 1, "signed historical thinking"),
+            ck("user-new", 100, "new prompt"),
+        ]);
+        request["serializer_profile"] = json!("opencode-aisdk");
+        request["serve_native"] = json!(true);
+        // This is the current built-plugin wire shape: provider_id and clear_reasoning_age
+        // are absent, so the module must use native OpenCode metadata as its fallback.
+        request["native_messages"] = json!([
+            {
+                "info": {
+                    "id": "assistant-old",
+                    "role": "assistant",
+                    "providerID": "anthropic",
+                    "modelID": "claude-opus-4-8"
+                },
+                "parts": [{
+                    "type": "reasoning",
+                    "text": "signed historical thinking",
+                    "time": { "start": 1, "end": 2 },
+                    "metadata": { "anthropic": { "signature": "signature-assistant-old" } }
+                }]
+            },
+            {
+                "info": {
+                    "id": "user-new",
+                    "role": "user",
+                    "model": { "providerID": "anthropic", "modelID": "claude-opus-4-8" }
+                },
+                "parts": [{ "type": "text", "text": "new prompt" }]
+            }
+        ]);
+
+        let parsed: TransformRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(
+            SerializerProfile::parse(&parsed.serializer_profile),
+            Some(SerializerProfile::OpencodeAiSdk)
+        );
+        assert!(parsed.provider_id.is_none());
+        assert_eq!(parsed.clear_reasoning_age, 50);
+        assert!(transform::request_accepts_empty_content(&parsed));
+
+        let response = call_transform_request(&handler, request).await;
+        assert_eq!(response["status"], "ok");
+        assert_eq!(
+            store
+                .load("ses")
+                .unwrap()
+                .meta
+                .reasoning_cleared_through_ordinal,
+            50,
+            "the attach load must observe the watermark committed by this pass"
+        );
+        let old = response["native_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["info"]["id"] == json!("assistant-old"))
+            .expect("served assistant must retain its harness id");
+        assert_eq!(
+            old["parts"][0],
+            json!({ "type": "reasoning", "text": "" }),
+            "clear preserves the typed reasoning shell while dropping signed metadata"
         );
     }
 

@@ -4520,7 +4520,8 @@ fn reasoning_clear_cutoff(
 ///
 /// The CK transform deliberately leaves ingress reasoning available to identity and block
 /// fingerprint checks. Native serving is the provider boundary, so this pass replaces only
-/// eligible historical typed reasoning with empty text sentinels after the codec has finished.
+/// eligible historical typed reasoning with empty typed-reasoning shells after the codec has
+/// finished.
 /// That ordering is important: the codec's latest-assistant ingress shortcut cannot reintroduce
 /// a signed block after this function runs. The canonical OpenCode Anthropic adapter removes
 /// these sentinels before dispatch, so no rewritten text or stale signature reaches Anthropic.
@@ -4597,6 +4598,9 @@ pub(crate) fn clear_served_native_reasoning(
             {
                 continue;
             }
+            if is_empty_reasoning_sentinel(part) {
+                continue;
+            }
             *part = empty_reasoning_sentinel(part);
             cleared += 1;
         }
@@ -4606,16 +4610,33 @@ pub(crate) fn clear_served_native_reasoning(
 
 fn empty_reasoning_sentinel(part: &Value) -> Value {
     let mut sentinel = serde_json::Map::new();
-    sentinel.insert("type".to_string(), Value::String("text".to_string()));
-    sentinel.insert("text".to_string(), Value::String(String::new()));
-    if let Some(object) = part.as_object() {
-        for key in ["cache_control", "cacheControl"] {
-            if let Some(value) = object.get(key) {
-                sentinel.insert(key.to_string(), value.clone());
-            }
-        }
+    let Some(object) = part.as_object() else {
+        return Value::Object(sentinel);
+    };
+    let part_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("reasoning");
+    sentinel.insert("type".to_string(), Value::String(part_type.to_string()));
+    if object.contains_key("thinking") && !object.contains_key("text") {
+        sentinel.insert("thinking".to_string(), Value::String(String::new()));
+    } else {
+        sentinel.insert("text".to_string(), Value::String(String::new()));
     }
     Value::Object(sentinel)
+}
+
+fn is_empty_reasoning_sentinel(part: &Value) -> bool {
+    let Some(object) = part.as_object() else {
+        return false;
+    };
+    if object.len() != 2 || !object.contains_key("type") {
+        return false;
+    }
+    object
+        .get("text")
+        .or_else(|| object.get("thinking"))
+        .is_some_and(|value| value.as_str() == Some(""))
 }
 
 fn is_empty_text_block(block: &CkWireBlock) -> bool {
@@ -6835,8 +6856,14 @@ mod tests {
             2,
             "a completed historical latest assistant is still age-eligible"
         );
-        assert_eq!(native[0]["parts"][0], json!({ "type": "text", "text": "" }));
-        assert_eq!(native[1]["parts"][0], json!({ "type": "text", "text": "" }));
+        assert_eq!(
+            native[0]["parts"][0],
+            json!({ "type": "reasoning", "text": "" })
+        );
+        assert_eq!(
+            native[1]["parts"][0],
+            json!({ "type": "reasoning", "text": "" })
+        );
         let first_pass = native.clone();
         assert_eq!(
             clear_served_native_reasoning(
