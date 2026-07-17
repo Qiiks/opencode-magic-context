@@ -20,6 +20,10 @@ export interface CloneSessionStateFilter {
     resolveBoundaryOrdinal(messageId: string): number | undefined;
     includeTag(tag: CloneTagRow): boolean;
     includeMessageId(messageId: string): boolean;
+    /** Map a source message/content id into the destination session. */
+    mapMessageId?: (messageId: string) => string;
+    /** Opt into remapping globally keyed tag ids; leave undefined for Pi compatibility. */
+    mapTagId?: (sourceTagId: number, destinationTagId: number) => number;
     selectPendingPiMarker(
         rawState: string | null,
         copiedCompartments: readonly CloneCompartmentRow[],
@@ -54,6 +58,7 @@ type RawCompartmentRow = {
 };
 
 type RawTagRow = {
+    id: number;
     message_id: string;
     type: string;
     status: string;
@@ -112,14 +117,19 @@ function countRows(db: Database, table: "compartments" | "tags", sessionId: stri
     return typeof row?.count === "number" ? row.count : 0;
 }
 
-function filterIdBlob(raw: string | null, includeMessageId: (id: string) => boolean): string {
+function mapMessageId(filter: CloneSessionStateFilter, messageId: string | null): string | null {
+    if (messageId === null) return null;
+    return filter.mapMessageId?.(messageId) ?? messageId;
+}
+
+function filterIdBlob(raw: string | null, filter: CloneSessionStateFilter): string {
     if (!raw) return "";
     try {
         const value = JSON.parse(raw);
         if (!Array.isArray(value)) return "";
-        const filtered = value.filter(
-            (id): id is string => typeof id === "string" && includeMessageId(id),
-        );
+        const filtered = value
+            .filter((id): id is string => typeof id === "string" && filter.includeMessageId(id))
+            .map((id) => mapMessageId(filter, id));
         return filtered.length > 0 ? JSON.stringify(filtered) : "";
     } catch {
         return "";
@@ -181,8 +191,8 @@ export function copySessionStateForClone(
                 row.sequence,
                 startMessage,
                 endMessage,
-                row.start_message_id,
-                row.end_message_id,
+                mapMessageId(filter, row.start_message_id),
+                mapMessageId(filter, row.end_message_id),
                 row.title,
                 row.content,
                 row.p1,
@@ -199,14 +209,14 @@ export function copySessionStateForClone(
                 sequence: row.sequence,
                 startMessage,
                 endMessage,
-                startMessageId: row.start_message_id,
-                endMessageId: row.end_message_id,
+                startMessageId: mapMessageId(filter, row.start_message_id) ?? row.start_message_id,
+                endMessageId: mapMessageId(filter, row.end_message_id) ?? row.end_message_id,
             });
         }
 
         const sourceTags = db
             .prepare(
-                `SELECT message_id, type, status, byte_size, tag_number, harness,
+                `SELECT id, message_id, type, status, byte_size, tag_number, harness,
                         entry_fingerprint, token_count, input_token_count,
                         reasoning_token_count, reasoning_byte_size, drop_mode, tool_name,
                         input_byte_size, caveman_depth, tool_owner_message_id
@@ -222,6 +232,7 @@ export function copySessionStateForClone(
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         );
         const copiedTagNumbers: number[] = [];
+        const copiedTagIds = new Map<number, number>();
         for (const row of sourceTags) {
             if (
                 !filter.includeTag({
@@ -233,9 +244,9 @@ export function copySessionStateForClone(
             ) {
                 continue;
             }
-            insertTag.run(
+            const insertResult = insertTag.run(
                 destinationSessionId,
-                row.message_id,
+                mapMessageId(filter, row.message_id),
                 row.type,
                 row.status,
                 row.byte_size,
@@ -250,25 +261,76 @@ export function copySessionStateForClone(
                 row.tool_name,
                 row.input_byte_size,
                 row.caveman_depth,
-                row.tool_owner_message_id,
+                mapMessageId(filter, row.tool_owner_message_id),
             );
+            const insertedTagId = Number(insertResult.lastInsertRowid);
+            if (!Number.isSafeInteger(insertedTagId) || insertedTagId <= 0) {
+                throw new Error(`failed to obtain destination tag id for tag ${row.tag_number}`);
+            }
+            const sourceTagId = filter.mapTagId ? row.id : row.tag_number;
+            const destinationTagId = filter.mapTagId
+                ? filter.mapTagId(sourceTagId, insertedTagId)
+                : sourceTagId;
+            copiedTagIds.set(sourceTagId, destinationTagId);
             copiedTagNumbers.push(row.tag_number);
         }
 
         if (copiedTagNumbers.length > 0) {
-            const placeholders = copiedTagNumbers.map(() => "?").join(", ");
-            db.prepare(
-                `INSERT INTO source_contents (tag_id, session_id, content, created_at, harness)
-                 SELECT tag_id, ?, content, created_at, harness
-                   FROM source_contents
-                  WHERE session_id = ? AND tag_id IN (${placeholders})`,
-            ).run(destinationSessionId, sourceSessionId, ...copiedTagNumbers);
-            db.prepare(
-                `INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness)
-                 SELECT ?, tag_id, operation, queued_at, harness
-                   FROM pending_ops
-                  WHERE session_id = ? AND tag_id IN (${placeholders})`,
-            ).run(destinationSessionId, sourceSessionId, ...copiedTagNumbers);
+            const sourceTagIds = [...copiedTagIds.keys()];
+            const placeholders = sourceTagIds.map(() => "?").join(", ");
+            const sourceContents = db
+                .prepare(
+                    `SELECT tag_id, content, created_at, harness
+                       FROM source_contents
+                      WHERE session_id = ? AND tag_id IN (${placeholders})`,
+                )
+                .all(sourceSessionId, ...sourceTagIds) as Array<{
+                tag_id: number;
+                content: string | null;
+                created_at: number | null;
+                harness: string;
+            }>;
+            const insertSourceContent = db.prepare(
+                "INSERT INTO source_contents (tag_id, session_id, content, created_at, harness) VALUES (?, ?, ?, ?, ?)",
+            );
+            for (const row of sourceContents) {
+                const destinationTagId = copiedTagIds.get(row.tag_id);
+                if (destinationTagId === undefined) continue;
+                insertSourceContent.run(
+                    destinationTagId,
+                    destinationSessionId,
+                    row.content,
+                    row.created_at,
+                    row.harness,
+                );
+            }
+
+            const pendingOps = db
+                .prepare(
+                    `SELECT tag_id, operation, queued_at, harness
+                       FROM pending_ops
+                      WHERE session_id = ? AND tag_id IN (${placeholders})`,
+                )
+                .all(sourceSessionId, ...sourceTagIds) as Array<{
+                tag_id: number;
+                operation: string | null;
+                queued_at: number | null;
+                harness: string;
+            }>;
+            const insertPendingOp = db.prepare(
+                "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness) VALUES (?, ?, ?, ?, ?)",
+            );
+            for (const row of pendingOps) {
+                const destinationTagId = copiedTagIds.get(row.tag_id);
+                if (destinationTagId === undefined) continue;
+                insertPendingOp.run(
+                    destinationSessionId,
+                    destinationTagId,
+                    row.operation,
+                    row.queued_at,
+                    row.harness,
+                );
+            }
         }
 
         const meta = db
@@ -325,13 +387,13 @@ export function copySessionStateForClone(
                 Number.isFinite(meta.pi_stable_id_scheme)
                 ? meta.pi_stable_id_scheme
                 : null,
-            filterIdBlob(meta?.stripped_placeholder_ids ?? null, filter.includeMessageId),
-            filterIdBlob(meta?.stale_reduce_stripped_ids ?? null, filter.includeMessageId),
-            filterIdBlob(meta?.processed_image_stripped_ids ?? null, filter.includeMessageId),
+            filterIdBlob(meta?.stripped_placeholder_ids ?? null, filter),
+            filterIdBlob(meta?.stale_reduce_stripped_ids ?? null, filter),
+            filterIdBlob(meta?.processed_image_stripped_ids ?? null, filter),
             pendingMarker,
             migrateTodo ? (meta?.last_todo_state ?? "") : "",
             migrateTodo ? (meta?.todo_synthetic_call_id ?? "") : "",
-            migrateTodo ? todoAnchor : "",
+            migrateTodo ? (mapMessageId(filter, todoAnchor) ?? "") : "",
             migrateTodo ? (meta?.todo_synthetic_state_json ?? "") : "",
         );
 
