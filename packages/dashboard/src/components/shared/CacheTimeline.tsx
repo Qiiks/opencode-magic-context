@@ -156,9 +156,10 @@ export default function CacheTimeline(props: {
             <div class="ctx-drop-tip-title">⬇ Magic Context reclaimed context</div>
             <div class="ctx-drop-tip-row">{formatDateTime(tip().event.timestamp)}</div>
             <div class="ctx-drop-tip-row">
-              {tip().event.cause
-                ? `Cause: ${cacheCauseLabel(tip().event.cause)}`
-                : "Cause not recorded"}
+              {(() => {
+                const cause = tip().event.cause;
+                return cause ? `Cause: ${cacheCauseLabel(cause)}` : "Cause not recorded";
+              })()}
             </div>
             <div class="ctx-drop-tip-hint">click → jump to step</div>
           </div>
