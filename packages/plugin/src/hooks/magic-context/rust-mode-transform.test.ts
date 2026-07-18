@@ -14,7 +14,11 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
-import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
+import {
+    __rustModeTransformTest,
+    createRustModeTransform,
+    type RustModeModuleClient,
+} from "./rust-mode-transform";
 import type { TransformDeps } from "./transform";
 import { createTransform } from "./transform";
 import type { MessageLike } from "./transform-operations";
@@ -152,6 +156,20 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 }
 
 describe("Rust mode authority adapter", () => {
+    it("copies the resolved history budget onto the authority wire", () => {
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "budget-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: { history_budget_tokens: 42_000 },
+            usage: {},
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+        expect(body.history_budget_tokens).toBe(42_000);
+    });
+
     it("adopts a durable sequence from a fresh process and retries the sync", async () => {
         const sessionId = `rust-adopt-${Date.now()}`;
         sessions.push(sessionId);

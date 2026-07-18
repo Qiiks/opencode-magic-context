@@ -1517,6 +1517,7 @@ mod tests {
             mid_turn: false,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
+            history_budget_tokens: None,
             declared_trim: None,
         }
     }

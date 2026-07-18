@@ -92,8 +92,8 @@ use subc_protocol::{
 use transform::ReductionDecision;
 use transform::{transform_with_projection, DeclaredTrim, HistorianDiagnostics, TransformRequest};
 
-/// The per-route binding: the project, harness, session-slot value, and render budget
-/// frozen at bind. Transform routes carry the durable session in `session`; MCP facade
+/// The per-route binding: the project, harness, session-slot value, and fallback render
+/// budget frozen at bind. Transform routes carry the durable session in `session`; MCP facade
 /// routes carry an instance token there and must resolve it before touching the store.
 /// The project is NEVER taken from a per-pass request field — a crafted request could
 /// spoof it to read another project's memories — so it lives here, keyed by the route
@@ -105,10 +105,8 @@ pub struct SessionBinding {
     pub session: String,
     pub model_key: Option<String>,
     pub config: McModuleConfig,
-    /// The history budget (tokens) FROZEN at bind. Byte-affecting (a different budget → a
-    /// different m0 trim → different bytes), so it's read once and never per-pass. A
-    /// default for now (reading it from config is a later refinement); the freeze-once is
-    /// the load-bearing part — it can't change mid-session.
+    /// The fallback history budget (tokens) frozen at bind. A transform request may carry
+    /// a newer harness-resolved value because config can change while the route remains open.
     pub history_budget_tokens: f64,
 }
 
@@ -4113,6 +4111,19 @@ impl McHandler {
             "inactive"
         };
         let historian = historian_status_summary(&loaded.meta.historian);
+        // When the Rust module is active, it manages the frozen m0 in its own store
+        // instead of the harness SQLite cache. Report the exact session-history slice so
+        // status attribution does not estimate size by summing all raw-history p1 rows.
+        let compartment_tokens = loaded
+            .core
+            .frozen_units
+            .iter()
+            .find(|unit| unit.key == "m0")
+            .and_then(|unit| {
+                decay_render::extract_m0_block(&unit.frozen_payload, "session-history")
+            })
+            .map(|block| mc_tokenizer::estimate_tokens(&block))
+            .unwrap_or(0);
         let newest_pass_at = pass_trace
             .as_ref()
             .map(|trace| {
@@ -4152,6 +4163,7 @@ impl McHandler {
             "row_version": loaded.row_version,
             "boundary_present": !loaded.core.boundary_id.trim().is_empty(),
             "compartment_count": compartment_count,
+            "compartment_tokens": compartment_tokens,
             "pending_drop_count": pending_drop_count,
             "usage": {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
@@ -5174,7 +5186,13 @@ impl McHandler {
             let producer_ctx = transform::ProducerContext {
                 project_path: &project_path,
                 project_directory: &project_path,
-                history_budget_tokens: binding.history_budget_tokens,
+                // The authority adapter resolves this from the model context limit and
+                // sends it on each pass. Keep the bind-time value only for older callers
+                // that omit the field, and reject unusable values without disabling decay.
+                history_budget_tokens: parsed
+                    .history_budget_tokens
+                    .filter(|budget| budget.is_finite() && *budget >= 0.0)
+                    .unwrap_or(binding.history_budget_tokens),
                 memory_enabled: binding.config.memory_enabled,
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
@@ -6494,6 +6512,7 @@ impl McHandler {
             mid_turn: parsed.pass_inputs.mid_turn,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
+            history_budget_tokens: None,
             declared_trim: parsed.declared_trim.clone(),
         };
         let shadow_project = shadow_project_path(&binding.session);
@@ -7100,9 +7119,8 @@ impl ModuleHandler for McHandler {
                 session: req.identity.session.clone(),
                 model_key: None,
                 config,
-                // Frozen at bind. Currently a default constant (reading it from config is a
-                // later refinement); the load-bearing part is the freeze-once — a different
-                // budget would change the rendered m0 bytes, so it can't move mid-session.
+                // Older callers may omit the per-pass budget. Keep a safe fallback on the
+                // route, while authority requests carry the harness-resolved value.
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
             },
         );
@@ -11990,6 +12008,42 @@ mod tests {
             .and_then(|message| message["content"][0]["kind"]["text"].as_str())
             .unwrap_or_default()
             .to_string()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authority_transform_uses_request_history_budget_on_hard() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        store
+            .replace_compartments(
+                "ses",
+                &[
+                    stored_comp(1, 1, 40, "m40", &"OLD ".repeat(200)),
+                    stored_comp(2, 41, 80, "m80", &"NEW ".repeat(200)),
+                ],
+            )
+            .unwrap();
+        let mut request = request(big_messages());
+        request["history_budget_tokens"] = json!(300.0);
+
+        let response = call_transform_request(&handler, request).await;
+        assert_eq!(response["action"], "HARD");
+        let m0 = m0_text(&response);
+        assert!(m0.contains("NEW"), "newest compartment remains at P1: {m0}");
+        assert!(
+            !m0.contains("OLD"),
+            "request budget must reach the HARD decay renderer: {m0}"
+        );
+        let status = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        let history = decay_render::extract_m0_block(&m0, "session-history").unwrap();
+        assert_eq!(
+            status["compartment_tokens"],
+            json!(mc_tokenizer::estimate_tokens(&history))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

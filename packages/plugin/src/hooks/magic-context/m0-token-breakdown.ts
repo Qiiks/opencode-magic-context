@@ -41,9 +41,17 @@ export function computeM0BlockTokens(
         projectIdentity: string | undefined;
         injectionBudgetTokens: number | undefined;
         memoryBlockCount: number;
+        /** Exact history token count managed by the Rust module outside this local database. */
+        compartmentTokensOverride?: number;
     },
 ): M0BlockTokens {
-    const { m0Text, projectIdentity, injectionBudgetTokens, memoryBlockCount } = args;
+    const {
+        m0Text,
+        projectIdentity,
+        injectionBudgetTokens,
+        memoryBlockCount,
+        compartmentTokensOverride,
+    } = args;
 
     const docsBlock = extractM0Block(m0Text, "project-docs");
     const docsTokens = docsBlock ? estimateTokens(docsBlock) : 0;
@@ -61,8 +69,16 @@ export function computeM0BlockTokens(
 
     let compartmentTokens = 0;
     const historyBlock = extractM0Block(m0Text, "session-history");
-    if (historyBlock) {
-        // Real decayed render — count exactly what's on the wire.
+    if (
+        typeof compartmentTokensOverride === "number" &&
+        Number.isFinite(compartmentTokensOverride) &&
+        compartmentTokensOverride >= 0
+    ) {
+        // The active Rust module stores the canonical m0 data. Use its exact tokenizer
+        // count instead of estimating from mirrored raw-history p1 rows.
+        compartmentTokens = compartmentTokensOverride;
+    } else if (historyBlock) {
+        // Real decayed render, counted exactly from the cached wire block.
         compartmentTokens = estimateTokens(historyBlock);
     } else {
         // No materialized m[0] yet (brand-new / pre-first-materialization).

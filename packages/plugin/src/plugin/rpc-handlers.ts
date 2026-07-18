@@ -61,6 +61,7 @@ export interface RustSessionStatus {
     boundary_present?: boolean;
     coverage_ordinal?: number | null;
     compartment_count?: number;
+    compartment_tokens?: number;
     pending_drop_count?: number;
     wrapup_active?: boolean;
     wrapup_rounds?: number | null;
@@ -322,6 +323,7 @@ export function buildSidebarSnapshot(
             projectIdentity,
             injectionBudgetTokens,
             memoryBlockCount,
+            compartmentTokensOverride: moduleStatus?.compartment_tokens,
         });
         const compartmentTokens = m0Blocks.compartmentTokens;
         const factTokens = m0Blocks.factTokens;

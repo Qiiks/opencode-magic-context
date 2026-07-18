@@ -90,8 +90,8 @@ pub struct M0ComposeInputs<'a> {
     /// The expiry cutoff, FROZEN at the HARD (a memory expiring after this still renders;
     /// a later defer uses the same cutoff → identical bytes).
     pub now_ms: i64,
-    /// The history budget in tokens (frozen at route bind). The decay renderer fits the
-    /// compartments to it; under a loose budget the render is estimator-independent.
+    /// The history budget in tokens selected for this frozen render decision. The decay
+    /// renderer fits the compartments to it; under a loose budget the render is estimator-independent.
     pub history_budget_tokens: f64,
     /// System-role content that is no longer in the live tail because the current fold
     /// covers its ordinal. Passing it explicitly keeps m0 composition deterministic and

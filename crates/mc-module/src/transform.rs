@@ -122,15 +122,16 @@ struct LegacyCkItemWire {
 
 /// The project context the module composes m0/m1 FROM. Resolved once per request from the
 /// authenticated route binding (never a request body field) and threaded into the
-/// transform. Production ALWAYS supplies it; it carries the frozen render inputs (budget,
-/// expiry cutoff) so a HARD freezes them and later passes replay identical bytes.
+/// transform. Production ALWAYS supplies it; it carries the render inputs (budget,
+/// expiry cutoff) so the frozen render decision preserves them and later passes replay identical bytes.
 pub struct ProducerContext<'a> {
     /// The project identity the store reads key off (memories, mutation log, workspace).
     pub project_path: &'a str,
     /// The project directory on disk, for reading ARCHITECTURE.md / STRUCTURE.md.
     pub project_directory: &'a str,
-    /// The history budget in tokens, FROZEN at route bind (byte-affecting: a different
-    /// budget → a different m0 trim → different bytes, so it can't change mid-session).
+    /// The history budget in tokens for this pass. Authority callers resolve it from the
+    /// stable model limit and may refresh it after a config change; the route binding
+    /// supplies a fallback for older callers. A cache-busting render pass freezes the selected value in m0.
     pub history_budget_tokens: f64,
     /// Whether memory tools and m0 memory rendering are enabled for this binding.
     pub memory_enabled: bool,
@@ -257,6 +258,11 @@ pub struct TransformRequest {
     /// and would inflate every gap by that delay. Request evidence only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_observed_at_ms: Option<u64>,
+    /// History budget resolved by the harness from the stable context limit, threshold,
+    /// and history-budget percentage. Authority transforms carry it per pass because a
+    /// route can outlive a config reload; absent values use the bind-time fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_budget_tokens: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
 }
@@ -310,6 +316,8 @@ struct TransformRequestWire {
     #[serde(default)]
     request_observed_at_ms: Option<u64>,
     #[serde(default)]
+    history_budget_tokens: Option<f64>,
+    #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
 }
 
@@ -344,6 +352,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             mid_turn: wire.mid_turn,
             prev_response_completed_at_ms: wire.prev_response_completed_at_ms,
             request_observed_at_ms: wire.request_observed_at_ms,
+            history_budget_tokens: wire.history_budget_tokens,
             declared_trim: wire.declared_trim,
         })
     }
@@ -5266,6 +5275,7 @@ mod tests {
             mid_turn: false,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
+            history_budget_tokens: None,
             declared_trim: None,
         }
     }
@@ -6403,6 +6413,7 @@ mod tests {
             "full_array_fingerprint": "fp-full-array",
             "messages": [{ "mid": "m", "ordinal": 7, "ck": text_message("m", "hello") }],
             "usage": { "current_total_input_tokens": 1, "context_limit_tokens": 2 },
+            "history_budget_tokens": 42_000.0,
             "provider_error": "prompt is too long"
         });
         let parsed: TransformRequest = serde_json::from_value(value).unwrap();
@@ -6415,6 +6426,7 @@ mod tests {
         );
         assert_eq!(parsed.messages[0].mid, "m");
         assert_eq!(parsed.usage.unwrap().context_limit_tokens, 2);
+        assert_eq!(parsed.history_budget_tokens, Some(42_000.0));
         assert_eq!(parsed.provider_error.as_deref(), Some("prompt is too long"));
     }
 

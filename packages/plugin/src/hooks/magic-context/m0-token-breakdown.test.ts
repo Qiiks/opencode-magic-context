@@ -67,6 +67,22 @@ describe("computeM0BlockTokens", () => {
         expect(b.compartmentTokens).toBeGreaterThan(0);
     });
 
+    test("uses module history cost when Rust owns the materialized m[0]", () => {
+        const db = makeDb();
+        db.prepare(
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        ).run(SESSION_ID, 1, 1, 9, "m1", "m9", "Mirrored compartment", "p1 content", Date.now());
+        const b = computeM0BlockTokens(db, SESSION_ID, {
+            m0Text: "",
+            projectIdentity: undefined,
+            injectionBudgetTokens: undefined,
+            memoryBlockCount: 0,
+            compartmentTokensOverride: 17,
+        });
+        expect(b.compartmentTokens).toBe(17);
+        db.close();
+    });
+
     test("cold start (no materialized m[0]) falls back to Σp1 from compartments", () => {
         const db = makeDb();
         db.prepare(

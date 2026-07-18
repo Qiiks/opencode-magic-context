@@ -247,6 +247,7 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
                     boundary_present: true,
                     coverage_ordinal: 17,
                     compartment_count: 4,
+                    compartment_tokens: 23,
                     pending_drop_count: 2,
                 },
             );
@@ -255,6 +256,7 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
             expect(snapshot.usagePercentage).toBe(42);
             expect(snapshot.contextLimit).toBe(100_000);
             expect(snapshot.compartmentCount).toBe(4);
+            expect(snapshot.compartmentTokens).toBe(23);
             expect(snapshot.pendingOpsCount).toBe(2);
             expect(snapshot.boundaryPresent).toBe(true);
             expect(snapshot.coverageOrdinal).toBe(17);
