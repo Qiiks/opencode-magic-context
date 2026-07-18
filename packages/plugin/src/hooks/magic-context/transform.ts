@@ -57,7 +57,10 @@ import {
     checkCompartmentTrigger,
     FORCE_MATERIALIZE_PERCENTAGE,
 } from "./compartment-trigger";
-import { resolveCtxReduceAvailabilityFromMessages } from "./ctx-reduce-availability";
+import {
+    type CtxReduceAvailabilityVerdict,
+    resolveCtxReduceAvailabilityFromMessages,
+} from "./ctx-reduce-availability";
 import { computeTailTokenEstimate, shouldTriggerChannel2 } from "./ctx-reduce-nudge";
 import { DEFAULT_HISTORY_BUDGET_TOKENS } from "./decay-render";
 import { deriveTriggerBudget } from "./derive-budgets";
@@ -553,7 +556,9 @@ export function createTransform(deps: TransformDeps) {
         // the model can't call are pure overhead plus cargo-cult risk. The
         // verdict is frozen per session (first user message's tools map) so it
         // can never flap mid-session and bust the cache.
-        const ctxReduceCallable = resolveCtxReduceAvailabilityFromMessages(sessionId, messages);
+        const ctxReduceAvailability: CtxReduceAvailabilityVerdict =
+            resolveCtxReduceAvailabilityFromMessages(sessionId, messages);
+        const ctxReduceCallable = ctxReduceAvailability.callable;
 
         // Resolve the *session's* working directory, not the OpenCode launch
         // directory. When the user runs `opencode -s <id>` from outside the
@@ -1756,7 +1761,7 @@ export function createTransform(deps: TransformDeps) {
             reasoningByMessage,
             messageTagNumbers,
             tagger: deps.tagger,
-            ctxReduceCallable,
+            ctxReduceAvailability,
             batch,
             contextUsage,
             schedulerDecision,

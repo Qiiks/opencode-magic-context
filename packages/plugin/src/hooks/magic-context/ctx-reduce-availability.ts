@@ -41,9 +41,9 @@ function verdictFromToolsMap(tools: unknown): boolean | null {
 export function resolveCtxReduceAvailabilityFromMessages(
     sessionId: string,
     messages: ReadonlyArray<{ info?: { role?: string; tools?: unknown } }>,
-): boolean {
+): CtxReduceAvailabilityVerdict {
     const cached = availabilityBySession.get(sessionId);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) return { callable: cached, frozen: true };
 
     for (const message of messages) {
         if (message.info?.role !== "user") continue;
@@ -51,13 +51,13 @@ export function resolveCtxReduceAvailabilityFromMessages(
         // Either way the verdict is final — freeze it.
         const verdict = verdictFromToolsMap(message.info.tools) ?? true;
         availabilityBySession.set(sessionId, verdict);
-        return verdict;
+        return { callable: verdict, frozen: true };
     }
     // No user message in the array at all (not a real prompt — e.g. a stray
     // pass on an empty session). Fail open but do NOT freeze: caching true here
     // would lock a deny-list session into the reduce surface before its first
     // user message ever arrives to say otherwise.
-    return true;
+    return { callable: true, frozen: false };
 }
 
 /** Availability verdict plus whether it is final for the session's lifetime. */

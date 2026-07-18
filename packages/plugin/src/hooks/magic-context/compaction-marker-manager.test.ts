@@ -136,11 +136,11 @@ function markerServeWire(
 ): string {
     const messages = [
         {
-            info: { role: "user", sessionID: sessionId },
+            info: { role: "user", sessionID: sessionId, syntheticHead: true },
             parts: [{ type: "text", text: "m0", synthetic: true }],
         },
         {
-            info: { role: "user", sessionID: sessionId },
+            info: { role: "user", sessionID: sessionId, syntheticHead: true },
             parts: [{ type: "text", text: "m1", synthetic: true }],
         },
         {
@@ -159,7 +159,7 @@ function markerServeWire(
         db,
         sessionId,
         tagger: createTagger(),
-        ctxReduceCallable: true,
+        ctxReduceAvailability: { callable: true, frozen: true },
     });
     return serializeAnthropicWireWithAdjacentAssistantMerge(messages);
 }

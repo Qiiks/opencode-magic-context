@@ -18,6 +18,7 @@ import {
     queueM0Mutation,
     queuePendingOp,
     setPendingCompactionMarkerState,
+    updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
@@ -36,6 +37,7 @@ import {
     type ThinkingLikePart,
     tagMessages,
 } from "./tag-messages";
+import { isSyntheticTodoPart } from "./todo-view";
 import {
     createToolDropTarget,
     extractToolCallObservation,
@@ -49,6 +51,7 @@ import {
     clearPendingCompactionMarkerAfterSuccessfulDrain,
     evaluateEmergencyFailClosed,
     finalizeMessageRepresentation,
+    reconcileMarkerRepresentation,
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
 
@@ -182,7 +185,7 @@ function basePostTransformArgs(
         reasoningByMessage: new Map(),
         messageTagNumbers: new Map(),
         tagger: createTagger(),
-        ctxReduceCallable: true,
+        ctxReduceAvailability: { callable: true, frozen: true },
         batch: null,
         contextUsage: { percentage: 20, inputTokens: 1000 },
         schedulerDecision: "defer",
@@ -322,6 +325,190 @@ function serializeAnthropicWireWithAdjacentAssistantMerge(messages: MessageLike[
 }
 
 describe("deferred compaction marker representation", () => {
+    it("uses only marked m[0]/m[1] slots as the synthetic head", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-synthetic-tail";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        setPersistedCompactionMarkerState(db, sessionId, state);
+        const messages = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m0", synthetic: true }],
+            },
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m1", synthetic: true }],
+            },
+            {
+                info: { id: "channel2-nudge", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "compact now", synthetic: true }],
+            },
+            {
+                info: { id: "tail-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "new turn" }],
+            },
+        ] as unknown as MessageLike[];
+        const options = {
+            db,
+            sessionId,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: true, frozen: true },
+        };
+
+        reconcileMarkerRepresentation(messages, state, options);
+        expect(messages.map((message) => message.info.id)).toEqual([
+            undefined,
+            undefined,
+            "summary",
+            "channel2-nudge",
+            "tail-user",
+        ]);
+        const firstWire = serializeAnthropicWireWithAdjacentAssistantMerge(messages);
+
+        const replay = structuredClone(messages);
+        reconcileMarkerRepresentation(replay, state, options);
+        expect(serializeAnthropicWireWithAdjacentAssistantMerge(replay)).toBe(firstWire);
+        expect(replay).toEqual(messages);
+    });
+
+    it("keeps a provisional marker untagged and freezes the callable tag choice", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-provisional-availability";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        setPersistedCompactionMarkerState(db, sessionId, state);
+        const options = {
+            db,
+            sessionId,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: true, frozen: false },
+        };
+        const provisional = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "turn" }],
+            },
+        ] as unknown as MessageLike[];
+        reconcileMarkerRepresentation(provisional, state, options);
+        expect(provisional[0]?.parts[0]).toEqual({ type: "text", text: MARKER_SUMMARY_TEXT });
+
+        const frozen = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "turn" }],
+            },
+        ] as unknown as MessageLike[];
+        reconcileMarkerRepresentation(frozen, state, {
+            ...options,
+            ctxReduceAvailability: { callable: true, frozen: true },
+        });
+        const taggedText = (frozen[0]?.parts[0] as { text?: string }).text;
+        expect(taggedText).toMatch(/^§\d+§ /);
+        const stable = structuredClone(frozen);
+        reconcileMarkerRepresentation(stable, state, {
+            ...options,
+            ctxReduceAvailability: { callable: true, frozen: true },
+        });
+        expect(stable).toEqual(frozen);
+    });
+
+    it("keeps todo synthesis at the head when the only assistant is a summary", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-todo-head";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        setPersistedCompactionMarkerState(db, sessionId, state);
+        updateSessionMeta(db, sessionId, {
+            lastTodoState:
+                '[{"content":"finish marker work","status":"pending","priority":"high"}]',
+        });
+        const makeMessages = (): MessageLike[] =>
+            [
+                {
+                    info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                    parts: [{ type: "text", text: "m0", synthetic: true }],
+                },
+                {
+                    info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                    parts: [{ type: "text", text: "m1", synthetic: true }],
+                },
+                {
+                    info: {
+                        id: "summary",
+                        role: "assistant",
+                        sessionID: sessionId,
+                        summary: true,
+                        finish: "stop",
+                    },
+                    parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+                },
+                {
+                    info: { id: "new-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "continue" }],
+                },
+            ] as unknown as MessageLike[];
+        const firstMessages = makeMessages();
+        const firstTagger = createTagger();
+        const firstTagged = tagMessages(sessionId, firstMessages, firstTagger, db);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, firstMessages, {
+                schedulerDecision: "execute",
+                tagger: firstTagger,
+                targets: firstTagged.targets,
+                reasoningByMessage: firstTagged.reasoningByMessage,
+                messageTagNumbers: firstTagged.messageTagNumbers,
+                batch: firstTagged.batch,
+            }),
+        );
+        const firstTodoIndex = firstMessages.findIndex((message) =>
+            message.parts.some((part) => isSyntheticTodoPart(part)),
+        );
+        expect(firstTodoIndex).toBe(2);
+        const firstWire = serializeAnthropicWireWithAdjacentAssistantMerge(firstMessages);
+
+        const secondMessages = makeMessages();
+        const secondTagger = createTagger();
+        secondTagger.initFromDb(sessionId, db);
+        const secondTagged = tagMessages(sessionId, secondMessages, secondTagger, db);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, secondMessages, {
+                tagger: secondTagger,
+                targets: secondTagged.targets,
+                reasoningByMessage: secondTagged.reasoningByMessage,
+                messageTagNumbers: secondTagged.messageTagNumbers,
+                batch: secondTagged.batch,
+            }),
+        );
+        expect(
+            secondMessages.findIndex((message) =>
+                message.parts.some((part) => isSyntheticTodoPart(part)),
+            ),
+        ).toBe(2);
+        expect(serializeAnthropicWireWithAdjacentAssistantMerge(secondMessages)).toBe(firstWire);
+    });
+
     it("keeps the marker-consuming fold byte-identical with the rebuilt defer wire", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -532,11 +719,11 @@ describe("deferred compaction marker representation", () => {
             }) as MessageLike;
         const messages = [
             {
-                info: { role: "user", sessionID: sessionId },
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
                 parts: [{ type: "text", text: "m0", synthetic: true }],
             },
             {
-                info: { role: "user", sessionID: sessionId },
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
                 parts: [{ type: "text", text: "m1", synthetic: true }],
             },
             summary("stale-summary"),
@@ -708,7 +895,7 @@ describe("deferred compaction marker advance representation", () => {
         const tagger = createTagger();
         const drainMessages = [
             {
-                info: { role: "user", sessionID: sessionId },
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
                 parts: [
                     {
                         type: "text",
@@ -774,7 +961,7 @@ describe("deferred compaction marker advance representation", () => {
 
         const rebuiltMessages = [
             {
-                info: { role: "user", sessionID: sessionId },
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
                 parts: [
                     {
                         type: "text",
