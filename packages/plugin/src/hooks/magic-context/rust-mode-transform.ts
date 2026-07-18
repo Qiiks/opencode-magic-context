@@ -8,6 +8,7 @@ import {
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
+import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
 import {
     resolveExecuteThreshold,
     resolveModelKey,
@@ -297,6 +298,7 @@ function buildTransformBody(args: {
         mid_turn: args.midTurn,
         model_key: args.modelKey,
         provider_id: args.providerId,
+        tool_present: args.passInputs.tool_present === true,
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
         history_budget_tokens: args.passInputs.history_budget_tokens,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
@@ -475,6 +477,10 @@ export function createRustModeTransform(
             }
         }
         const rawMessages = messages.slice();
+        const reduceAvailability = resolveCtxReduceAvailability(sessionId);
+        // A provisional fail-open verdict must not activate provider-visible bytes. The
+        // first persisted user message freezes the verdict for all later transform passes.
+        const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
         try {
             const { directory } = await getSessionDirectory(deps, sessionId);
             const model =
@@ -520,6 +526,7 @@ export function createRustModeTransform(
                 cache_ttl: sessionMeta.cacheTtl,
                 mid_turn: midTurn,
                 is_subagent: sessionMeta.isSubagent,
+                tool_present: toolPresent,
             };
             const resolved = await resolveOrdinalsForModule({
                 sessionId,

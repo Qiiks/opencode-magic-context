@@ -168,16 +168,28 @@ pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     }
 }
 
-/// Normalize the request-local Claude Code surface signal once. Every behavior tied to
-/// the reduction tool consumes this value rather than maintaining an independent gate.
+/// Normalize the request-local Claude Code surface signal once. This remains limited to
+/// Claude Code mechanics such as the Thalamus acknowledgement contract and guidance variant.
 pub const fn cc_u1_active(profile: Option<SerializerProfile>, tool_present: bool) -> bool {
     matches!(profile, Some(SerializerProfile::ClaudeCodeAnthropic)) && tool_present
 }
 
+/// Return whether the provider-visible tagging and reduction overlay may be enabled.
+/// OpenCode uses the same overlay when its session exposes ctx_reduce.
+pub const fn tagging_surface_active(
+    profile: Option<SerializerProfile>,
+    tool_present: bool,
+) -> bool {
+    matches!(
+        profile,
+        Some(SerializerProfile::ClaudeCodeAnthropic | SerializerProfile::OpencodeAiSdk)
+    ) && tool_present
+}
+
 /// The tagger component of the effective render identity. A false request contributes
 /// no component, preserving the render identity used before the capability existed.
-pub const fn tagger_feature_epoch(cc_u1_active: bool) -> u32 {
-    if cc_u1_active {
+pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
+    if tagging_surface_active {
         TAGGER_FEATURE_EPOCH
     } else {
         0
@@ -4095,7 +4107,7 @@ impl McHandler {
         } else {
             "present"
         };
-        let surface = if loaded.meta.cc_u1_active {
+        let surface = if loaded.meta.tagging_surface_active || loaded.meta.cc_u1_active {
             "active"
         } else {
             "inactive"
@@ -12725,6 +12737,55 @@ mod tests {
         let retry = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn opencode_raw_drop_range_resolves_minted_tags_and_drains_on_next_bust() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let messages = (1..=25u64)
+            .map(|ordinal| {
+                let mid = format!("m{ordinal}");
+                let text = format!("output {ordinal}");
+                ck(&mid, ordinal, &text)
+            })
+            .collect::<Vec<_>>();
+        let mut transform_request = request(messages);
+        transform_request["serializer_profile"] = json!("opencode-aisdk");
+        transform_request["tool_present"] = json!(true);
+        transform_request["serve_native"] = json!(true);
+
+        let transition = call_transform_request(&handler, transform_request.clone()).await;
+        assert_eq!(transition["surface_state"], "transition");
+        let tagged = call_transform_request(&handler, transform_request.clone()).await;
+        assert_eq!(tagged["surface_state"], "active");
+        let tagged_bytes = serde_json::to_string(&tagged["ck_messages"]).unwrap();
+        assert!(tagged_bytes.contains("§1§ output 1"));
+        assert!(tagged_bytes.contains("§2§ output 2"));
+        assert!(tagged_bytes.contains("§3§ output 3"));
+        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 25);
+
+        let queued = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1-3",
+                "command_id": "opencode-drop-range",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(queued, json!({ "ok": true, "queued": 3 }));
+
+        transform_request["render_config"] = json!("cfg1");
+        let drained = call_transform_request(&handler, transform_request).await;
+        let drained_bytes = serde_json::to_string(&drained["ck_messages"]).unwrap();
+        assert!(drained_bytes.contains("[dropped §1§]"));
+        assert!(drained_bytes.contains("[dropped §2§]"));
+        assert!(drained_bytes.contains("[dropped §3§]"));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

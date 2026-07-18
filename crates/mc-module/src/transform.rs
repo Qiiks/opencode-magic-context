@@ -842,14 +842,19 @@ fn apply_once(
     let mutation_exempt_mid =
         latest_assistant_mutation_exempt_mid(&req.messages, serializer_profile, req.mid_turn);
     let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
+    let tagging_surface_requested =
+        crate::tagging_surface_active(serializer_profile, req.tool_present);
     let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
     let loaded = transform_snapshot.loaded;
     let overlay_frontier = transform_snapshot.overlay_frontier;
-    let surface_transition = serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic)
-        && loaded.meta.cc_u1_active != cc_u1_active;
+    // Legacy sessions stored the CC latch before the generic surface latch existed.
+    // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
+    let persisted_tagging_surface_active =
+        loaded.meta.tagging_surface_active || loaded.meta.cc_u1_active;
+    let surface_transition = persisted_tagging_surface_active != tagging_surface_requested;
     let surface_state = if surface_transition {
         SurfaceState::Transition
-    } else if cc_u1_active {
+    } else if tagging_surface_requested {
         SurfaceState::Active
     } else {
         SurfaceState::Inactive
@@ -874,7 +879,7 @@ fn apply_once(
         .filter(|epoch| *epoch != 0)
         .map(|epoch| format!("mpe{epoch}"))
         .unwrap_or_default();
-    let tagger_feature_epoch = match crate::tagger_feature_epoch(cc_u1_active) {
+    let tagger_feature_epoch = match crate::tagger_feature_epoch(tagging_surface_requested) {
         0 => String::new(),
         epoch => format!("tfe{epoch}"),
     };
@@ -890,7 +895,7 @@ fn apply_once(
             tagger_feature_epoch: tagger_feature_epoch.clone(),
         },
     );
-    let tagging_active = cc_u1_active && loaded.meta.cc_u1_active;
+    let tagging_active = tagging_surface_requested && persisted_tagging_surface_active;
     // Previously stored overlay rows may still replay when boundary-lineage validation
     // later forces pass-through. Decisions from this request stay in memory until the
     // final cache-state compare-and-swap accepts the pass.
@@ -1152,10 +1157,10 @@ fn apply_once(
         || reconcile_hard_due
         || emergency_arm_engaged;
     // Profile defaults remain conservative, while the request-local tool signal enables
-    // full-array tail reclaim for the Claude Code profile. A false request therefore
+    // full-array tail reclaim for an active tagging surface. A false request therefore
     // retains the exact pre-capability behavior without changing the global profile table.
-    let tail_reclaim_enabled =
-        serializer_profile.is_none_or(|profile| healing::tail_reclaim(profile) || cc_u1_active);
+    let tail_reclaim_enabled = serializer_profile
+        .is_none_or(|profile| healing::tail_reclaim(profile) || tagging_surface_requested);
     let producer_gate = tail_reclaim_enabled
         && producer_gate(
             scheduler_outcome.pass,
@@ -1170,7 +1175,7 @@ fn apply_once(
         PassClass::Defer
     };
     let tail_for_selection = tail_sel_items(&live, loaded.meta.coverage_ordinal);
-    let mut protected_block_ids = if cc_u1_active {
+    let mut protected_block_ids = if tagging_surface_requested {
         newest_active_tag_block_ids(
             &loaded.core,
             &loaded.meta,
@@ -1298,6 +1303,7 @@ fn apply_once(
     }
     apply_ingress_meta(&mut meta, req, &projection, provisional_tail_mid);
     meta.cc_u1_active = cc_u1_active;
+    meta.tagging_surface_active = tagging_surface_requested;
     if cc_u1_active {
         meta.last_serializer_profile = req.serializer_profile.clone();
     }
@@ -9137,6 +9143,97 @@ mod tests {
     }
 
     #[test]
+    fn opencode_tagging_surface_tags_tool_results_and_replays_byte_stably() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![
+            wire_tool_call("call-1", 1, "call_result-1"),
+            wire_tool_result(
+                "result-1",
+                2,
+                json!({ "kind": { "type": "text", "text": "tool output" } }),
+            ),
+        ];
+        let request = active_opencode_req("opencode-tags", "cfg0", messages);
+
+        let transition = run(&s, &request, &spine());
+        assert_eq!(transition.surface_state, SurfaceState::Transition);
+        assert!(!serde_json::to_string(transition.messages())
+            .unwrap()
+            .contains("§1§"));
+
+        let active = run(&s, &request, &spine());
+        assert_eq!(active.surface_state, SurfaceState::Active);
+        let active_bytes = serde_json::to_vec(active.messages()).unwrap();
+        assert!(serde_json::to_string(active.messages())
+            .unwrap()
+            .contains("§1§ tool output"));
+        assert_eq!(s.load_tags_for_session("opencode-tags").unwrap().len(), 1);
+
+        let replay = run(&s, &request, &spine());
+        assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), active_bytes);
+    }
+
+    #[test]
+    fn opencode_tool_absent_keeps_overlay_bytes_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = opencode_req(
+            "opencode-inactive",
+            "cfg0",
+            vec![item("m1", 1, "plain output")],
+        );
+
+        let first = run(&s, &request, &spine());
+        let replay = run(&s, &request, &spine());
+        assert_eq!(first.surface_state, SurfaceState::Inactive);
+        assert_eq!(
+            serde_json::to_vec(first.messages()).unwrap(),
+            serde_json::to_vec(replay.messages()).unwrap()
+        );
+        assert!(!serde_json::to_string(first.messages())
+            .unwrap()
+            .contains("§1§"));
+        assert!(s
+            .load_tags_for_session("opencode-inactive")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn opencode_surface_flip_folds_once_before_rendering_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request =
+            opencode_req("opencode-flip", "cfg0", vec![item("m1", 1, "stable bytes")]);
+
+        let before = run(&s, &request, &spine());
+        let before_config = s.load("opencode-flip").unwrap().meta.last_render_config;
+        assert_eq!(before.action, "HARD");
+        assert!(!before_config.contains("tfe:"));
+
+        request.tool_present = true;
+        let transition = run(&s, &request, &spine());
+        let transitioned_config = s.load("opencode-flip").unwrap().meta.last_render_config;
+        assert_eq!(transition.action, "HARD");
+        assert_ne!(transitioned_config, before_config);
+        assert!(transitioned_config.contains("tfe:4:tfe3"));
+        assert!(!serde_json::to_string(transition.messages())
+            .unwrap()
+            .contains("§1§"));
+
+        let active = run(&s, &request, &spine());
+        assert_ne!(active.action, "HARD");
+        assert_eq!(
+            s.load("opencode-flip").unwrap().meta.last_render_config,
+            transitioned_config
+        );
+        assert!(serde_json::to_string(active.messages())
+            .unwrap()
+            .contains("§1§ stable bytes"));
+    }
+
+    #[test]
     fn tagger_flip_hards_before_committed_identity_can_render_tags() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -11613,6 +11710,20 @@ mod tests {
         messages: Vec<CkIngressMessage>,
     ) -> TransformRequest {
         let mut request = cc_req(session, cfg, messages);
+        request.tool_present = true;
+        request
+    }
+
+    fn opencode_req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
+        profile_req(SerializerProfile::OpencodeAiSdk, session, cfg, messages)
+    }
+
+    fn active_opencode_req(
+        session: &str,
+        cfg: &str,
+        messages: Vec<CkIngressMessage>,
+    ) -> TransformRequest {
+        let mut request = opencode_req(session, cfg, messages);
         request.tool_present = true;
         request
     }
