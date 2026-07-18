@@ -1,7 +1,7 @@
 import type { EmbeddingConfig } from "../../../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-context";
-import { computeNormalizedHash } from "./normalize-hash";
 import { getSynapseLaneIdentity } from "./embedding-synapse";
+import { computeNormalizedHash } from "./normalize-hash";
 
 function normalizeEndpoint(endpoint?: string): string {
     return endpoint?.trim().replace(/\/+$/, "") ?? "";
