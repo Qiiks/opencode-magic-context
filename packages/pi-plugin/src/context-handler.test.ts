@@ -1,4 +1,3 @@
-import { setBootQuietPeriodForTests } from '@magic-context/core/plugin/boot-quiet';
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -42,6 +41,7 @@ import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/der
 import { resolveExecuteThreshold } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { withRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
+import { setBootQuietPeriodForTests } from "@magic-context/core/plugin/boot-quiet";
 import { clearModelsDevCache } from "@magic-context/core/shared/models-dev-cache";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
