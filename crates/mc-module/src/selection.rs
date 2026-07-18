@@ -1283,8 +1283,7 @@ mod tests {
         ctx.agent_drop_ids = vec![reasoning_block_id("c1")];
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(
-            out.iter()
-                .all(|d| d.target_id != reasoning_block_id("c1")),
+            out.iter().all(|d| d.target_id != reasoning_block_id("c1")),
             "{out:?}"
         );
     }
