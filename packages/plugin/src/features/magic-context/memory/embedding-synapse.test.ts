@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import {
-    SYNAPSE_MAX_INPUT_TOKENS,
-    SynapseEmbeddingProvider,
     _resetSynapseClientForTests,
     getSynapseLaneIdentity,
+    SYNAPSE_MAX_INPUT_TOKENS,
     type SynapseClientLike,
+    SynapseEmbeddingProvider,
 } from "./embedding-synapse";
 
 class MockSynapseClient implements SynapseClientLike {
@@ -12,7 +12,11 @@ class MockSynapseClient implements SynapseClientLike {
     private batchAttempts = 0;
     constructor(private readonly batchSize = 2) {}
 
-    async call<Response = unknown>(_module: string, method: string, params?: unknown): Promise<Response> {
+    async call<Response = unknown>(
+        _module: string,
+        method: string,
+        params?: unknown,
+    ): Promise<Response> {
         this.requests.push({ method, params });
         if (method === "models.list") {
             return {
@@ -117,11 +121,22 @@ describe("SynapseEmbeddingProvider", () => {
 
     it("rejects served fingerprint substitution without adapting", async () => {
         const client = new MockSynapseClient();
-        client.call = async <Response = unknown>(_module: string, method: string, params?: unknown) => {
+        client.call = async <Response = unknown>(
+            _module: string,
+            method: string,
+            params?: unknown,
+        ) => {
             client.requests.push({ method, params });
             if (method === "models.list") {
                 return {
-                    models: [{ model: "gte-modernbert-base-f16", fingerprint: "fp-live", table_epoch: 0, dims: 3 }],
+                    models: [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-live",
+                            table_epoch: 0,
+                            dims: 3,
+                        },
+                    ],
                 } as Response;
             }
             return { vector: [1, 2, 3], fingerprint: "fp-other", table_epoch: 0 } as Response;
