@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
 import { Database } from "../src/shared/sqlite";
 import { closeQuietly } from "../src/shared/sqlite-helpers";
+import { clearSession } from "../src/features/magic-context/storage-meta-session";
 import {
     copySessionStateForClone,
     type CloneCompartmentRow,
@@ -23,11 +24,25 @@ type ColumnInfo = {
 
 export interface CloneSessionOptions {
     sessionId: string;
+    deleteSessionId?: string;
     suffix?: string;
     dryRun?: boolean;
     force?: boolean;
     opencodeDbPath?: string;
     contextDbPath?: string;
+}
+
+export interface DeleteClonedSessionOptions {
+    sessionId: string;
+    force?: boolean;
+    opencodeDbPath?: string;
+    contextDbPath?: string;
+}
+
+export interface DeleteClonedSessionResult {
+    sessionId: string;
+    opencode: CloneTableCount[];
+    magicContext: CloneTableCount[];
 }
 
 export interface CloneTableCount {
@@ -41,10 +56,12 @@ export interface ClonePlan {
     title: string;
     directory: string;
     projectId: string;
+    retainedMessageIds: string[];
+    trimmedMessageIds: string[];
     opencode: CloneTableCount[];
     magicContext: CloneTableCount[];
     skippedMagicContext: CloneTableCount[];
-    messageIdPolicy: "remint-global-primary-key";
+    messageIdPolicy: "remint-native-time-ordered";
 }
 
 export interface CloneResult {
@@ -56,7 +73,20 @@ export interface CloneResult {
 
 const BUSY_TIMEOUT_MS = 5000;
 const CONTENT_ID_SUFFIX = /(:(?:p|file)\d+)$/;
-const OPENCODE_EXCLUDED_TABLES = new Set(["session_share"]);
+const OPENCODE_EXCLUDED_TABLES = new Set(["session_share", "session_input"]);
+const NATIVE_ID_PREFIX_HEX_LENGTH = 12;
+const NATIVE_ID_SUFFIX_LENGTH = 14;
+const NATIVE_ID_COUNTER_BITS = 12n;
+const NATIVE_ID_PREFIX_MASK = (1n << BigInt(NATIVE_ID_PREFIX_HEX_LENGTH * 4)) - 1n;
+const BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const CLONE_MARKER_KEY = "cortexkitClone";
+
+// Native OpenCode samples are msg_f75177794001ViIwT8V72U0yhv and
+// prt_f751778ae001HUqSOyQYgAuRGh. Their 12-hex prefix is the low 48 bits
+// of (epoch milliseconds shifted left 12 bits) plus a sequence value, followed
+// by a 14-character base62 suffix. For example, 1784375900052 ms produces
+// f75177794000 before sequence 1, so the observed prefix is f75177794001.
+const NATIVE_ID_PATTERN = /^(?:msg|prt)_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const MAGIC_CONTEXT_ADDITIONAL_TABLES = [
     "compression_depth",
     "session_projects",
@@ -243,6 +273,15 @@ function randomToken(): string {
         .slice(0, 28);
 }
 
+function randomBase62(length: number): string {
+    const bytes = randomBytes(length);
+    return Array.from(bytes, (byte) => BASE62_ALPHABET[byte % BASE62_ALPHABET.length]).join("");
+}
+
+function compareLexical(left: string, right: string): number {
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function mintSessionId(db: Database): string {
     for (;;) {
         const id = `ses_${randomToken()}`;
@@ -272,6 +311,45 @@ function mintRowId(db: Database, table: string, sourceId: string, used: Set<stri
             return id;
         }
     }
+}
+
+function nativePrefixForTime(timeCreated: unknown, previousPacked: bigint): { prefix: string; packed: bigint } {
+    const milliseconds =
+        typeof timeCreated === "number" && Number.isFinite(timeCreated)
+            ? BigInt(Math.max(0, Math.floor(timeCreated)))
+            : 0n;
+    let packed = ((milliseconds << NATIVE_ID_COUNTER_BITS) + 1n) & NATIVE_ID_PREFIX_MASK;
+    if (packed <= previousPacked) packed = previousPacked + 1n;
+    if (packed > NATIVE_ID_PREFIX_MASK) {
+        throw new Error("native OpenCode id prefix exhausted while reminting rows");
+    }
+    return {
+        prefix: packed.toString(16).padStart(NATIVE_ID_PREFIX_HEX_LENGTH, "0"),
+        packed,
+    };
+}
+
+function buildNativeIdMap(
+    db: Database,
+    table: "message" | "part",
+    rows: readonly SqlRow[],
+): IdMap {
+    const sourcePrefix = table === "message" ? "msg" : "prt";
+    const used = new Set<string>();
+    const result: IdMap = new Map();
+    let previousPacked = 0n;
+    for (const row of rows) {
+        const next = nativePrefixForTime(row.time_created, previousPacked);
+        previousPacked = next.packed;
+        let id = "";
+        do {
+            id = `${sourcePrefix}_${next.prefix}${randomBase62(NATIVE_ID_SUFFIX_LENGTH)}`;
+        } while (used.has(id) || db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} WHERE id = ?`).get(id));
+        used.add(id);
+        if (!NATIVE_ID_PATTERN.test(id)) throw new Error(`generated invalid native ${table} id: ${id}`);
+        result.set(String(row.id), id);
+    }
+    return result;
 }
 
 function mapContentId(id: string, messageIds: IdMap): string {
@@ -386,20 +464,6 @@ function rewriteJsonBlob(
     }
 }
 
-function getIds(db: Database, table: string, column: string, whereColumn: string, whereValue: string): string[] {
-    return (db
-        .prepare(
-            `SELECT ${quoteIdentifier(column)} AS value FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(whereColumn)} = ? ORDER BY ${quoteIdentifier(column)}`,
-        )
-        .all(whereValue) as Array<{ value?: unknown }>).flatMap((row) =>
-        typeof row.value === "string" ? [row.value] : [],
-    );
-}
-
-function getAggregateIds(db: Database, table: string, sourceSessionId: string): string[] {
-    return getIds(db, table, "id", "aggregate_id", sourceSessionId);
-}
-
 function buildIdMap(db: Database, table: string, ids: readonly string[]): IdMap {
     const used = new Set<string>(ids);
     const result: IdMap = new Map();
@@ -486,11 +550,181 @@ function makeOpenCodeRowRewriter(
     };
 }
 
+type MessageCandidate = {
+    id: string;
+    time_created: number;
+    data: string;
+};
+
+function parseJsonObject(raw: unknown): Record<string, unknown> | null {
+    if (typeof raw !== "string" || raw.length === 0) return null;
+    try {
+        const value = JSON.parse(raw);
+        return value !== null && typeof value === "object" && !Array.isArray(value)
+            ? (value as Record<string, unknown>)
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+function messageRowsForSession(db: Database, sessionId: string): MessageCandidate[] {
+    return db
+        .prepare(
+            "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC",
+        )
+        .all(sessionId) as MessageCandidate[];
+}
+
+function messageRole(row: MessageCandidate): string | null {
+    return parseJsonObject(row.data)?.role as string | null | undefined ?? null;
+}
+
+function hasUnresolvedLocalTool(db: Database, messageId: string): boolean {
+    const parts = db
+        .prepare("SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC")
+        .all(messageId) as Array<{ data?: unknown }> ;
+    return parts.some((row) => {
+        const part = parseJsonObject(row.data);
+        if (!part || part.type !== "tool" || part.providerExecuted === true) return false;
+        const status =
+            typeof part.status === "string"
+                ? part.status
+                : part.state !== null && typeof part.state === "object"
+                  ? (part.state as Record<string, unknown>).status
+                  : null;
+        return status !== "completed" && status !== "error";
+    });
+}
+
+function terminalMessageReason(db: Database, row: MessageCandidate): string | null {
+    if (messageRole(row) !== "assistant") return "final visible message is not an assistant";
+    const data = parseJsonObject(row.data);
+    if (data?.finish === "tool-calls") return 'assistant finish is "tool-calls"';
+    if (hasUnresolvedLocalTool(db, row.id)) return "assistant has an unresolved local tool";
+    return null;
+}
+
+function selectTerminalMessages(
+    db: Database,
+    sourceSessionId: string,
+): { retainedMessageIds: string[]; trimmedMessageIds: string[] } {
+    const rows = messageRowsForSession(db, sourceSessionId);
+    const trimmedMessageIds: string[] = [];
+    const trimmedMessageIdSet = new Set<string>();
+    const recordTrimmed = (id: string): void => {
+        if (trimmedMessageIdSet.has(id)) return;
+        trimmedMessageIdSet.add(id);
+        trimmedMessageIds.push(id);
+        console.log(`terminal guard: trimmed trailing message ${id}`);
+    };
+    let end = rows.length;
+    while (end > 0) {
+        let candidateIndex = -1;
+        for (let index = end - 1; index >= 0; index -= 1) {
+            if (messageRole(rows[index]) === "user" || messageRole(rows[index]) === "assistant") {
+                candidateIndex = index;
+                break;
+            }
+        }
+        if (candidateIndex < 0) break;
+        const reason = terminalMessageReason(db, rows[candidateIndex]);
+        if (reason === null) {
+            for (let index = candidateIndex + 1; index < rows.length; index += 1) {
+                recordTrimmed(rows[index].id);
+            }
+            const retainedMessageIds = rows.slice(0, candidateIndex + 1).map((row) => row.id);
+            if (trimmedMessageIds.length > 0) {
+                console.log(
+                    `terminal guard: retained ${retainedMessageIds.length} messages after trimming ${trimmedMessageIds.length}`,
+                );
+            }
+            return { retainedMessageIds, trimmedMessageIds };
+        }
+        console.log(`terminal guard: trimming ${rows[candidateIndex].id}: ${reason}`);
+        for (let index = candidateIndex; index < end; index += 1) {
+            recordTrimmed(rows[index].id);
+        }
+        end = candidateIndex;
+    }
+    throw new Error(`source session ${sourceSessionId} has no terminal assistant message suitable for cloning`);
+}
+
+function partRowsForMessages(db: Database, sessionId: string, messageIds: readonly string[]): SqlRow[] {
+    const result: SqlRow[] = [];
+    for (const group of chunk(messageIds, 400)) {
+        if (group.length === 0) continue;
+        const placeholders = group.map(() => "?").join(", ");
+        result.push(
+            ...(db
+                .prepare(
+                    `SELECT * FROM part WHERE session_id = ? AND message_id IN (${placeholders})`,
+                )
+                .all(sessionId, ...group) as SqlRow[]),
+        );
+    }
+    return result.sort((left, right) => {
+        const leftTime = typeof left.time_created === "number" ? left.time_created : 0;
+        const rightTime = typeof right.time_created === "number" ? right.time_created : 0;
+        return leftTime - rightTime || compareLexical(String(left.id), String(right.id));
+    });
+}
+
+function sourceUnmappedReferenceIds(
+    db: Database,
+    sourceSessionId: string,
+    retainedMessageIds: readonly string[],
+): Set<string> {
+    const retainedMessages = new Set(retainedMessageIds);
+    const unmapped = new Set(
+        messageRowsForSession(db, sourceSessionId)
+            .map((row) => row.id)
+            .filter((id) => !retainedMessages.has(id)),
+    );
+    for (const row of rowsForValue(db, "part", "session_id", sourceSessionId)) {
+        if (!retainedMessages.has(String(row.message_id)) && typeof row.id === "string") {
+            unmapped.add(row.id);
+        }
+    }
+    return unmapped;
+}
+
+function jsonContainsAnyReference(value: unknown, ids: ReadonlySet<string>): boolean {
+    if (typeof value === "string") {
+        for (const id of ids) {
+            if (value === id || value.startsWith(`${id}:`)) return true;
+        }
+        return false;
+    }
+    if (Array.isArray(value)) return value.some((item) => jsonContainsAnyReference(item, ids));
+    if (value !== null && typeof value === "object") {
+        return Object.values(value).some((item) => jsonContainsAnyReference(item, ids));
+    }
+    return false;
+}
+
+function eventRowsForClone(
+    db: Database,
+    sourceSessionId: string,
+    unmappedReferences: ReadonlySet<string>,
+): SqlRow[] {
+    if (!tableExists(db, "event")) return [];
+    return rowsForValue(db, "event", "aggregate_id", sourceSessionId).filter((row) => {
+        if (unmappedReferences.size === 0 || typeof row.data !== "string") return true;
+        try {
+            return !jsonContainsAnyReference(JSON.parse(row.data), unmappedReferences);
+        } catch {
+            return true;
+        }
+    });
+}
+
 function copyOpenCodeRows(
     db: Database,
     sourceSessionId: string,
     destinationSessionId: string,
     cloneTitle: string,
+    retainedMessageIds: readonly string[],
 ): {
     counts: CloneTableCount[];
     messageIds: IdMap;
@@ -498,17 +732,34 @@ function copyOpenCodeRows(
     messageOrdinals: Map<string, number>;
 } {
     const allSessionTables = sessionScopedTables(db);
-    const sourceMessageIds = (db
-        .prepare("SELECT id FROM message WHERE session_id = ? ORDER BY time_created, id")
-        .all(sourceSessionId) as Array<{ id?: unknown }>).flatMap((row) =>
-        typeof row.id === "string" ? [row.id] : [],
-    );
-    const messageIds = buildIdMap(db, "message", sourceMessageIds);
+    const sourceMessageRows = rowsByIds(db, "message", retainedMessageIds).sort((left, right) => {
+        const leftTime = typeof left.time_created === "number" ? left.time_created : 0;
+        const rightTime = typeof right.time_created === "number" ? right.time_created : 0;
+        return leftTime - rightTime || compareLexical(String(left.id), String(right.id));
+    });
+    const sourceMessageIds = sourceMessageRows.map((row) => String(row.id));
+    if (sourceMessageIds.length !== retainedMessageIds.length) {
+        throw new Error("terminal message selection referenced rows that disappeared before copy");
+    }
+    const messageIds = buildNativeIdMap(db, "message", sourceMessageRows);
     const messageOrdinals = new Map(sourceMessageIds.map((id, index) => [id, index + 1]));
-    const partIds = buildIdMap(db, "part", getIds(db, "part", "id", "session_id", sourceSessionId));
-    const eventIds = tableExists(db, "event")
-        ? buildIdMap(db, "event", getAggregateIds(db, "event", sourceSessionId))
-        : new Map();
+    const sourcePartRows = partRowsForMessages(db, sourceSessionId, sourceMessageIds);
+    const messageOrder = new Map(sourceMessageIds.map((id, index) => [id, index]));
+    sourcePartRows.sort((left, right) => {
+        const leftOrder = messageOrder.get(String(left.message_id)) ?? Number.MAX_SAFE_INTEGER;
+        const rightOrder = messageOrder.get(String(right.message_id)) ?? Number.MAX_SAFE_INTEGER;
+        const leftTime = typeof left.time_created === "number" ? left.time_created : 0;
+        const rightTime = typeof right.time_created === "number" ? right.time_created : 0;
+        return (leftOrder - rightOrder) || leftTime - rightTime || compareLexical(String(left.id), String(right.id));
+    });
+    const partIds = buildNativeIdMap(db, "part", sourcePartRows);
+    const unmappedReferences = sourceUnmappedReferenceIds(db, sourceSessionId, sourceMessageIds);
+    const eventRows = eventRowsForClone(db, sourceSessionId, unmappedReferences);
+    const eventIds = buildIdMap(
+        db,
+        "event",
+        eventRows.flatMap((row) => (typeof row.id === "string" ? [row.id] : [])),
+    );
     const otherIds: IdMap[] = [];
     const rowsByTable = new Map<string, SqlRow[]>();
     const idMapsByTable = new Map<string, IdMap>();
@@ -529,33 +780,37 @@ function copyOpenCodeRows(
     const sessionRows = rowsForValue(db, "session", "id", sourceSessionId);
     if (sessionRows.length !== 1) throw new Error(`source session ${sourceSessionId} disappeared before copy`);
     const sessionRow = sessionRows[0];
+    const now = Date.now();
     insertRow(db, "session", sessionRow, (column, value) => {
         if (column === "id") return destinationSessionId;
-        if (column === "parent_id" && value === sourceSessionId) return destinationSessionId;
+        if (column === "parent_id") return null;
         if (column === "title") return cloneTitle;
         if (column === "slug" && typeof value === "string") return `${value}-rust-drive-clone`;
-        if (column === "share_url") return null;
-        if (column === "time_archived" || column === "time_compacting") return null;
-        if (column === "time_updated") return Date.now();
+        if (column === "time_created" || column === "time_updated") return now;
         if (
-            ["metadata", "data", "revert", "permission"].includes(column) &&
-            typeof value === "string"
+            column === "share_url" ||
+            column === "revert" ||
+            column.startsWith("summary_") ||
+            column === "time_archived" ||
+            column === "time_compacting"
         ) {
-            return rewriteJsonBlob(
-                value,
-                `session.${column}`,
-                sourceSessionId,
-                destinationSessionId,
-                messageIds,
-                partIds,
-                eventIds,
-                otherIds,
-            );
+            return null;
         }
+        if (column === "cost" || column.startsWith("tokens_")) return 0;
+        if (column === "metadata") {
+            return JSON.stringify({
+                [CLONE_MARKER_KEY]: {
+                    version: 1,
+                    sourceSessionId,
+                    createdAt: now,
+                },
+            });
+        }
+        if (column === "agent" || column === "model" || column === "permission") return value;
         return value;
     });
 
-    const messageRows = rowsByIds(db, "message", [...messageIds.keys()]);
+    const messageRows = sourceMessageRows;
     for (const row of messageRows) {
         insertRow(
             db,
@@ -574,7 +829,7 @@ function copyOpenCodeRows(
         );
     }
 
-    const partRows = rowsByIds(db, "part", [...partIds.keys()]);
+    const partRows = sourcePartRows;
     for (const row of partRows) {
         insertRow(
             db,
@@ -643,7 +898,7 @@ function copyOpenCodeRows(
     }
 
     if (tableExists(db, "event")) {
-        const rows = rowsByIds(db, "event", [...eventIds.keys()]);
+        const rows = eventRows;
         for (const row of rows) {
             insertRow(
                 db,
@@ -694,8 +949,40 @@ function copyOpenCodeRows(
         )
         .get(destinationSessionId) as { count?: number };
     if ((orphanParts.count ?? 0) !== 0) throw new Error("destination has orphaned OpenCode parts");
+    assertRemintedMessageInvariants(db, destinationSessionId);
 
     return { counts, messageIds, partIds, messageOrdinals };
+}
+
+function assertRemintedMessageInvariants(db: Database, destinationSessionId: string): void {
+    const rows = messageRowsForSession(db, destinationSessionId);
+    for (const row of rows) {
+        if (!NATIVE_ID_PATTERN.test(row.id) || !row.id.startsWith("msg_")) {
+            throw new Error(`destination message id is not native-shaped: ${row.id}`);
+        }
+    }
+    const partRows = db
+        .prepare("SELECT id FROM part WHERE session_id = ? ORDER BY time_created ASC, id ASC")
+        .all(destinationSessionId) as Array<{ id?: unknown }> ;
+    for (const row of partRows) {
+        if (typeof row.id !== "string" || !NATIVE_ID_PATTERN.test(row.id) || !row.id.startsWith("prt_")) {
+            throw new Error(`destination part id is not native-shaped: ${String(row.id)}`);
+        }
+    }
+    const userIds = rows.filter((row) => messageRole(row) === "user").map((row) => row.id);
+    const assistantIds = rows.filter((row) => messageRole(row) === "assistant").map((row) => row.id);
+    const maxUserId = userIds.sort().at(-1);
+    const maxAssistantId = assistantIds.sort().at(-1);
+    if (!maxUserId || !maxAssistantId || maxUserId >= maxAssistantId) {
+        throw new Error(
+            `destination message order violates terminal guard: max user ${maxUserId ?? "<none>"}, max assistant ${maxAssistantId ?? "<none>"}`,
+        );
+    }
+    const visibleRows = rows.filter((row) => messageRole(row) === "user" || messageRole(row) === "assistant");
+    const finalVisible = visibleRows.at(-1);
+    if (!finalVisible) throw new Error("destination has no visible messages");
+    const reason = terminalMessageReason(db, finalVisible);
+    if (reason !== null) throw new Error(`destination terminal assistant assertion failed: ${reason}`);
 }
 
 function contextMessageMapper(
@@ -820,6 +1107,27 @@ function copyContextAdditionalTables(
     return counts;
 }
 
+function sourceUsesGlobalTagIds(db: Database, sourceSessionId: string): boolean {
+    if (!tableExists(db, "source_contents")) return true;
+    const byTagId = db
+        .prepare(
+            `SELECT COUNT(*) AS count
+               FROM source_contents sc
+               JOIN tags t ON t.session_id = sc.session_id AND t.id = sc.tag_id
+              WHERE sc.session_id = ?`,
+        )
+        .get(sourceSessionId) as { count?: number };
+    const byTagNumber = db
+        .prepare(
+            `SELECT COUNT(*) AS count
+               FROM source_contents sc
+               JOIN tags t ON t.session_id = sc.session_id AND t.tag_number = sc.tag_id
+              WHERE sc.session_id = ?`,
+        )
+        .get(sourceSessionId) as { count?: number };
+    return (byTagId.count ?? 0) >= (byTagNumber.count ?? 0);
+}
+
 function copyMagicContext(
     db: Database,
     sourceSessionId: string,
@@ -832,7 +1140,6 @@ function copyMagicContext(
         resolveBoundaryOrdinal: (messageId) => messageOrdinals.get(messageId),
         includeMessageId: (messageId) => messageIds.has(messageId),
         mapMessageId: contextMessageMapper(sourceSessionId, destinationSessionId, messageIds, partIds),
-        mapTagId: (_sourceTagId, destinationTagId) => destinationTagId,
         includeTag: (tag) => {
             if (tag.type === "tool") return tag.toolOwnerMessageId !== null && messageIds.has(tag.toolOwnerMessageId);
             const rawId = tag.messageId.replace(CONTENT_ID_SUFFIX, "");
@@ -871,6 +1178,9 @@ function copyMagicContext(
             }
         },
     };
+    if (sourceUsesGlobalTagIds(db, sourceSessionId)) {
+        filter.mapTagId = (_sourceTagId, destinationTagId) => destinationTagId;
+    }
 
     const result = copySessionStateForClone(db, sourceSessionId, destinationSessionId, filter);
     if (result.kind === "destination-not-empty") {
@@ -907,14 +1217,32 @@ function buildPlan(
         .prepare("SELECT title, directory, project_id FROM session WHERE id = ?")
         .get(sourceSessionId) as { title?: string; directory?: string; project_id?: string } | undefined;
     if (!sourceSession) throw new Error(`OpenCode session not found: ${sourceSessionId}`);
+    const terminalSelection = selectTerminalMessages(opencodeDb, sourceSessionId);
     const sessionTables = sessionScopedTables(opencodeDb);
-    const opencode = [{ table: "session", rows: 1 }, ...countTableRows(opencodeDb, sessionTables, sourceSessionId, "session_id")];
+    const opencode: CloneTableCount[] = [{ table: "session", rows: 1 }];
+    for (const entry of countTableRows(opencodeDb, sessionTables, sourceSessionId, "session_id")) {
+        if (entry.table === "message" || entry.table === "part") continue;
+        opencode.push(entry);
+    }
+    if (terminalSelection.retainedMessageIds.length > 0) {
+        opencode.push({ table: "message", rows: terminalSelection.retainedMessageIds.length });
+    }
+    const retainedPartCount = partRowsForMessages(
+        opencodeDb,
+        sourceSessionId,
+        terminalSelection.retainedMessageIds,
+    ).length;
+    if (retainedPartCount > 0) opencode.push({ table: "part", rows: retainedPartCount });
     if (tableExists(opencodeDb, "event_sequence")) {
         const count = countRows(opencodeDb, "event_sequence", "aggregate_id", sourceSessionId);
         if (count > 0) opencode.push({ table: "event_sequence", rows: count });
     }
     if (tableExists(opencodeDb, "event")) {
-        const count = countRows(opencodeDb, "event", "aggregate_id", sourceSessionId);
+        const count = eventRowsForClone(
+            opencodeDb,
+            sourceSessionId,
+            sourceUnmappedReferenceIds(opencodeDb, sourceSessionId, terminalSelection.retainedMessageIds),
+        ).length;
         if (count > 0) opencode.push({ table: "event", rows: count });
     }
 
@@ -939,10 +1267,12 @@ function buildPlan(
         title: `${sourceSession.title ?? ""} (rust-drive clone${suffix ? `: ${suffix}` : ""})`,
         directory: sourceSession.directory ?? "",
         projectId: sourceSession.project_id ?? "",
+        retainedMessageIds: terminalSelection.retainedMessageIds,
+        trimmedMessageIds: terminalSelection.trimmedMessageIds,
         opencode,
         magicContext: magicContext.filter((entry) => entry.rows > 0),
         skippedMagicContext,
-        messageIdPolicy: "remint-global-primary-key",
+        messageIdPolicy: "remint-native-time-ordered",
     };
 }
 
@@ -983,6 +1313,35 @@ function printPlan(plan: ClonePlan, dryRun: boolean): void {
 }
 
 function deleteContextDestination(db: Database, sessionId: string): void {
+    const clearSessionTables = [
+        "pending_ops",
+        "source_contents",
+        "tool_owner_backfill_state",
+        "tags",
+        "session_meta",
+        "session_projects",
+        "compartment_chunk_embeddings",
+        "compartments",
+        "compression_depth",
+        "session_facts",
+        "compartment_state_lease",
+        "notes",
+        "recomp_compartments",
+        "recomp_facts",
+        "user_memory_candidates",
+        "primer_candidates",
+        "m0_mutation_log",
+        "compartment_events",
+        "subagent_invocations",
+        "historian_runs",
+        "plugin_messages",
+        "transform_decisions",
+        "synapse_batch_ledger",
+        "embedding_measurement_corpus",
+    ];
+    if (clearSessionTables.every((table) => tableExists(db, table))) {
+        clearSession(db, sessionId);
+    }
     const tables = sessionScopedTables(db).reverse();
     runImmediate(db, () => {
         for (const table of tables) {
@@ -992,14 +1351,61 @@ function deleteContextDestination(db: Database, sessionId: string): void {
 }
 
 function deleteOpenCodeDestination(db: Database, sessionId: string): void {
+    const allSessionTables = tableNames(db).filter((table) => hasColumn(db, table, "session_id"));
     runImmediate(db, () => {
         if (tableExists(db, "event")) db.prepare("DELETE FROM event WHERE aggregate_id = ?").run(sessionId);
         if (tableExists(db, "event_sequence")) db.prepare("DELETE FROM event_sequence WHERE aggregate_id = ?").run(sessionId);
-        for (const table of sessionScopedTables(db).reverse()) {
+        for (const table of allSessionTables.reverse()) {
             db.prepare(`DELETE FROM ${quoteIdentifier(table)} WHERE session_id = ?`).run(sessionId);
         }
         db.prepare("DELETE FROM session WHERE id = ?").run(sessionId);
     });
+}
+
+function isCloneMarker(metadata: unknown): boolean {
+    const parsed = parseJsonObject(metadata);
+    const marker = parsed?.[CLONE_MARKER_KEY];
+    return marker !== null && typeof marker === "object" && !Array.isArray(marker) &&
+        (marker as Record<string, unknown>).version === 1;
+}
+
+export function deleteClonedSession(options: DeleteClonedSessionOptions): DeleteClonedSessionResult {
+    if (!options.sessionId) throw new Error("--delete requires a session id");
+    const opencodeDbPath = options.opencodeDbPath ?? join(getDataDir(), "opencode", "opencode.db");
+    const contextDbPath = options.contextDbPath ?? join(getMagicContextStorageDir(), "context.db");
+    let opencode: Database | null = null;
+    let context: Database | null = null;
+    try {
+        opencode = openDatabase(opencodeDbPath, false);
+        context = openDatabase(contextDbPath, false);
+        const session = opencode
+            .prepare("SELECT metadata FROM session WHERE id = ?")
+            .get(options.sessionId) as { metadata?: unknown } | undefined;
+        if (!session) throw new Error(`OpenCode session not found: ${options.sessionId}`);
+        if (!options.force && !isCloneMarker(session.metadata)) {
+            throw new Error(
+                `refusing to delete ${options.sessionId}: it is not marked as a clone created by this script; use --force to override`,
+            );
+        }
+        const opencodeCounts = countTableRows(
+            opencode,
+            sessionScopedTables(opencode),
+            options.sessionId,
+            "session_id",
+        );
+        const contextCounts = countTableRows(
+            context,
+            sessionScopedTables(context),
+            options.sessionId,
+            "session_id",
+        );
+        deleteContextDestination(context, options.sessionId);
+        deleteOpenCodeDestination(opencode, options.sessionId);
+        console.log(`deleted clone session: ${options.sessionId}`);
+        return { sessionId: options.sessionId, opencode: opencodeCounts, magicContext: contextCounts };
+    } finally {
+        closeDatabases(opencode, context);
+    }
 }
 
 export function cloneSession(options: CloneSessionOptions): CloneResult {
@@ -1042,6 +1448,7 @@ export function cloneSession(options: CloneSessionOptions): CloneResult {
                 options.sessionId,
                 destinationSessionId,
                 plan.title,
+                plan.retainedMessageIds,
             ),
         );
         const openCodeSnapshotAfter = sourceSnapshot(writeOpenCode, sessionScopedTables(writeOpenCode), options.sessionId);
@@ -1099,6 +1506,7 @@ export function cloneSession(options: CloneSessionOptions): CloneResult {
 
 function parseArgs(argv: readonly string[]): CloneSessionOptions {
     let sessionId = "";
+    let deleteSessionId: string | undefined;
     let suffix: string | undefined;
     let dryRun = false;
     let force = false;
@@ -1106,6 +1514,8 @@ function parseArgs(argv: readonly string[]): CloneSessionOptions {
         const arg = argv[index];
         if (arg === "--session") {
             sessionId = argv[++index] ?? "";
+        } else if (arg === "--delete") {
+            deleteSessionId = argv[++index] ?? "";
         } else if (arg === "--suffix") {
             suffix = argv[++index];
         } else if (arg === "--dry-run") {
@@ -1114,17 +1524,29 @@ function parseArgs(argv: readonly string[]): CloneSessionOptions {
             force = true;
         } else if (arg === "--help" || arg === "-h") {
             console.log("Usage: bun packages/plugin/scripts/clone-session.ts --session <ses_id> [--suffix <label>] [--dry-run] [--force]");
+            console.log("       bun packages/plugin/scripts/clone-session.ts --delete <ses_id> [--force]");
             process.exit(0);
         } else {
             throw new Error(`unknown argument: ${arg}`);
         }
     }
-    return { sessionId, suffix, dryRun, force };
+    if (deleteSessionId && sessionId) throw new Error("--delete cannot be combined with --session");
+    return { sessionId, deleteSessionId, suffix, dryRun, force };
 }
 
 if (import.meta.main) {
     try {
-        cloneSession(parseArgs(process.argv.slice(2)));
+        const options = parseArgs(process.argv.slice(2));
+        if (options.deleteSessionId) {
+            deleteClonedSession({
+                sessionId: options.deleteSessionId,
+                force: options.force,
+                opencodeDbPath: options.opencodeDbPath,
+                contextDbPath: options.contextDbPath,
+            });
+        } else {
+            cloneSession(options);
+        }
     } catch (error) {
         console.error(`clone-session failed: ${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;
