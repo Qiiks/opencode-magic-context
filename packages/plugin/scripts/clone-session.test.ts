@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../src/shared/sqlite";
 import { closeQuietly } from "../src/shared/sqlite-helpers";
-import { cloneSession } from "./clone-session";
+import { cloneSession, deleteClonedSession } from "./clone-session";
 
 const temporaryDirectories: string[] = [];
 
@@ -34,6 +34,20 @@ function makeFixture(): { opencodePath: string; contextPath: string; sourceSessi
             time_updated INTEGER NOT NULL,
             time_compacting INTEGER,
             time_archived INTEGER,
+            summary_additions INTEGER,
+            summary_deletions INTEGER,
+            summary_files INTEGER,
+            summary_diffs TEXT,
+            revert TEXT,
+            permission TEXT,
+            agent TEXT,
+            model TEXT,
+            cost REAL NOT NULL DEFAULT 0,
+            tokens_input INTEGER NOT NULL DEFAULT 0,
+            tokens_output INTEGER NOT NULL DEFAULT 0,
+            tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_write INTEGER NOT NULL DEFAULT 0,
             metadata TEXT
         );
         CREATE TABLE message (
@@ -50,6 +64,15 @@ function makeFixture(): { opencodePath: string; contextPath: string; sourceSessi
             time_created INTEGER NOT NULL,
             time_updated INTEGER NOT NULL,
             data TEXT NOT NULL
+        );
+        CREATE TABLE session_input (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+            prompt TEXT NOT NULL,
+            delivery TEXT NOT NULL,
+            admitted_seq INTEGER NOT NULL,
+            promoted_seq INTEGER,
+            time_created INTEGER NOT NULL
         );
         CREATE TABLE todo (
             session_id TEXT NOT NULL,
@@ -87,6 +110,9 @@ function makeFixture(): { opencodePath: string; contextPath: string; sourceSessi
             20,
             JSON.stringify({ sourceSessionId }),
         );
+    opencode.prepare(
+        "INSERT INTO session_input (id, session_id, prompt, delivery, admitted_seq, time_created) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run("input_source_1", sourceSessionId, "input", "admitted", 1, 15);
     const insertMessage = opencode.prepare(
         "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
     );
@@ -95,14 +121,24 @@ function makeFixture(): { opencodePath: string; contextPath: string; sourceSessi
         sourceSessionId,
         100,
         100,
-        JSON.stringify({ role: "user", id: "msg_source_1" }),
+        JSON.stringify({
+            role: "user",
+            id: "msg_source_1",
+            compaction: { tail_start_id: "msg_source_1", summary_refs: ["msg_source_1"] },
+        }),
     );
     insertMessage.run(
         "msg_source_2",
         sourceSessionId,
         200,
         200,
-        JSON.stringify({ role: "assistant", parentID: "msg_source_1" }),
+        JSON.stringify({
+            role: "assistant",
+            id: "msg_source_2",
+            parentID: "msg_source_1",
+            finish: "stop",
+            compaction: { tail_start_id: "msg_source_1", summary_refs: ["msg_source_1"] },
+        }),
     );
     opencode
         .prepare(
@@ -114,7 +150,13 @@ function makeFixture(): { opencodePath: string; contextPath: string; sourceSessi
             sourceSessionId,
             101,
             101,
-            JSON.stringify({ type: "text", text: "hello" }),
+            JSON.stringify({
+                id: "prt_source_1",
+                messageID: "msg_source_1",
+                sessionID: sourceSessionId,
+                type: "text",
+                text: "hello",
+            }),
         );
     opencode
         .prepare(
@@ -126,7 +168,14 @@ function makeFixture(): { opencodePath: string; contextPath: string; sourceSessi
             sourceSessionId,
             201,
             201,
-            JSON.stringify({ type: "tool", callID: "tool_source_1" }),
+            JSON.stringify({
+                id: "prt_source_2",
+                messageID: "msg_source_2",
+                sessionID: sourceSessionId,
+                type: "tool",
+                callID: "tool_source_1",
+                providerExecuted: true,
+            }),
         );
     opencode
         .prepare(
@@ -320,19 +369,59 @@ describe("clone-session", () => {
             .prepare("SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created")
             .all(destinationSessionId) as Array<{ id: string; data: string }>;
         expect(clonedMessages).toHaveLength(2);
+        expect(clonedMessages.every((message) => /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(message.id))).toBe(true);
+        expect(clonedMessages[0].id < clonedMessages[1].id).toBe(true);
         expect(clonedMessages[0].id).not.toBe("msg_source_1");
-        expect(JSON.parse(clonedMessages[1].data).parentID).toBe(clonedMessages[0].id);
+        const clonedUserData = JSON.parse(clonedMessages[0].data);
+        expect(clonedUserData.id).toBe(clonedMessages[0].id);
+        expect(clonedUserData.compaction.tail_start_id).toBe(clonedMessages[0].id);
+        const clonedAssistantData = JSON.parse(clonedMessages[1].data);
+        expect(clonedAssistantData.id).toBe(clonedMessages[1].id);
+        expect(clonedAssistantData.parentID).toBe(clonedMessages[0].id);
+        expect(clonedAssistantData.compaction.tail_start_id).toBe(clonedMessages[0].id);
+        expect(clonedAssistantData.compaction.summary_refs).toEqual([clonedMessages[0].id]);
         expect(JSON.parse(sourceMessage.data).id).toBe("msg_source_1");
         const clonedParts = opencode
-            .prepare("SELECT id FROM part WHERE session_id = ? ORDER BY time_created")
-            .all(destinationSessionId) as Array<{ id: string }>;
+            .prepare("SELECT id, data FROM part WHERE session_id = ? ORDER BY time_created")
+            .all(destinationSessionId) as Array<{ id: string; data: string }>;
         expect(clonedParts.map((part) => part.id)).not.toEqual(["prt_source_1", "prt_source_2"]);
+        expect(clonedParts.every((part) => /^prt_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(part.id))).toBe(true);
+        expect(clonedParts[0].id < clonedParts[1].id).toBe(true);
+        const clonedToolData = JSON.parse(clonedParts[1].data);
+        expect(clonedToolData.id).toBe(clonedParts[1].id);
+        expect(clonedToolData.messageID).toBe(clonedMessages[1].id);
+        expect(clonedToolData.sessionID).toBe(destinationSessionId);
+        const maxUserId = clonedMessages.filter((message) => JSON.parse(message.data).role === "user").map((message) => message.id).sort().at(-1);
+        const maxAssistantId = clonedMessages.filter((message) => JSON.parse(message.data).role === "assistant").map((message) => message.id).sort().at(-1);
+        expect(maxUserId! < maxAssistantId!).toBe(true);
         const clonedEvent = opencode
             .prepare("SELECT id, data FROM event WHERE aggregate_id = ?")
             .get(destinationSessionId) as { id: string; data: string };
         expect(clonedEvent.id).not.toBe("evt_source_1");
         expect(JSON.parse(clonedEvent.data).sessionID).toBe(destinationSessionId);
         expect(JSON.parse(clonedEvent.data).info.id).toBe(clonedMessages[0].id);
+        const clonedSession = opencode
+            .prepare("SELECT parent_id, time_created, time_updated, cost, tokens_input, share_url, summary_additions, revert, metadata FROM session WHERE id = ?")
+            .get(destinationSessionId) as {
+            parent_id: string | null;
+            time_created: number;
+            time_updated: number;
+            cost: number;
+            tokens_input: number;
+            share_url: string | null;
+            summary_additions: number | null;
+            revert: string | null;
+            metadata: string;
+        };
+        expect(clonedSession.parent_id).toBeNull();
+        expect(clonedSession.time_created).toBe(clonedSession.time_updated);
+        expect(clonedSession.cost).toBe(0);
+        expect(clonedSession.tokens_input).toBe(0);
+        expect(clonedSession.share_url).toBeNull();
+        expect(clonedSession.summary_additions).toBeNull();
+        expect(clonedSession.revert).toBeNull();
+        expect(JSON.parse(clonedSession.metadata).cortexkitClone.version).toBe(1);
+        expect((opencode.prepare("SELECT COUNT(*) AS count FROM session_input WHERE session_id = ?").get(destinationSessionId) as { count: number }).count).toBe(0);
         opencode.close();
 
         const context = new Database(fixture.contextPath, { readonly: true });
@@ -392,6 +481,71 @@ describe("clone-session", () => {
             (mutable.prepare("SELECT data FROM message WHERE id = ?").get("msg_source_1") as { data: string }).data,
         ).toContain("msg_source_1");
         mutable.close();
+    });
+
+    it("trims an unfinished trailing assistant before reminting", () => {
+        const fixture = makeFixture();
+        const opencode = new Database(fixture.opencodePath);
+        opencode
+            .prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)")
+            .run(
+                "msg_source_3",
+                fixture.sourceSessionId,
+                300,
+                300,
+                JSON.stringify({ role: "assistant", id: "msg_source_3", finish: "tool-calls" }),
+            );
+        opencode
+            .prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+            .run(
+                "prt_source_3",
+                "msg_source_3",
+                fixture.sourceSessionId,
+                301,
+                301,
+                JSON.stringify({ type: "tool", callID: "tool_source_3" }),
+            );
+        opencode.close();
+
+        const result = cloneSession({
+            sessionId: fixture.sourceSessionId,
+            opencodeDbPath: fixture.opencodePath,
+            contextDbPath: fixture.contextPath,
+        });
+        expect(result.plan.trimmedMessageIds).toEqual(["msg_source_3"]);
+        const cloned = new Database(fixture.opencodePath, { readonly: true });
+        expect((cloned.prepare("SELECT COUNT(*) AS count FROM message WHERE session_id = ?").get(result.plan.destinationSessionId) as { count: number }).count).toBe(2);
+        expect((cloned.prepare("SELECT COUNT(*) AS count FROM part WHERE session_id = ?").get(result.plan.destinationSessionId) as { count: number }).count).toBe(2);
+        cloned.close();
+    });
+
+    it("deletes only marked clones and clears their Magic Context state", () => {
+        const fixture = makeFixture();
+        expect(() =>
+            deleteClonedSession({
+                sessionId: fixture.sourceSessionId,
+                opencodeDbPath: fixture.opencodePath,
+                contextDbPath: fixture.contextPath,
+            }),
+        ).toThrow("not marked as a clone");
+        const clone = cloneSession({
+            sessionId: fixture.sourceSessionId,
+            opencodeDbPath: fixture.opencodePath,
+            contextDbPath: fixture.contextPath,
+        });
+        deleteClonedSession({
+            sessionId: clone.plan.destinationSessionId,
+            opencodeDbPath: fixture.opencodePath,
+            contextDbPath: fixture.contextPath,
+        });
+        const opencode = new Database(fixture.opencodePath, { readonly: true });
+        const context = new Database(fixture.contextPath, { readonly: true });
+        expect((opencode.prepare("SELECT COUNT(*) AS count FROM session WHERE id = ?").get(clone.plan.destinationSessionId) as { count: number }).count).toBe(0);
+        expect((opencode.prepare("SELECT COUNT(*) AS count FROM message WHERE session_id = ?").get(clone.plan.destinationSessionId) as { count: number }).count).toBe(0);
+        expect((context.prepare("SELECT COUNT(*) AS count FROM tags WHERE session_id = ?").get(clone.plan.destinationSessionId) as { count: number }).count).toBe(0);
+        expect((context.prepare("SELECT COUNT(*) AS count FROM compartments WHERE session_id = ?").get(clone.plan.destinationSessionId) as { count: number }).count).toBe(0);
+        opencode.close();
+        context.close();
     });
 
     it("plans without writing either database", () => {
