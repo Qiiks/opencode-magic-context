@@ -20,7 +20,10 @@ import {
     setPendingCompactionMarkerState,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
-import { getPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
+import {
+    getPersistedCompactionMarkerState,
+    setPersistedCompactionMarkerState,
+} from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
@@ -481,6 +484,182 @@ describe("deferred compaction marker representation", () => {
                 ],
             },
         ]);
+    });
+});
+
+describe("deferred compaction marker advance representation", () => {
+    it("keeps the advance drain byte-identical with the next pass after removing the old marker", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-advance-wire-stability";
+        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-marker-advance-wire-"));
+        tempDirs.push(dataHome);
+        process.env.XDG_DATA_HOME = dataHome;
+        mkdirSync(join(dataHome, "opencode"), { recursive: true });
+        const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        opencodeDb.exec(
+            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        const insertMessage = opencodeDb.prepare(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+        );
+        insertMessage.run(
+            "old-boundary",
+            sessionId,
+            1_000,
+            1_000,
+            JSON.stringify({ role: "user" }),
+        );
+        insertMessage.run(
+            "new-boundary",
+            sessionId,
+            2_000,
+            2_000,
+            JSON.stringify({ role: "user" }),
+        );
+        insertMessage.run(
+            "new-end",
+            sessionId,
+            3_000,
+            3_000,
+            JSON.stringify({ role: "assistant", finish: "stop" }),
+        );
+        insertMessage.run(
+            "old-summary",
+            sessionId,
+            1_001,
+            1_001,
+            JSON.stringify({ role: "assistant", summary: true, finish: "stop" }),
+        );
+        opencodeDb.prepare(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+        ).run(
+            "old-compaction",
+            "old-boundary",
+            sessionId,
+            1_000,
+            1_000,
+            JSON.stringify({ type: "compaction", auto: true }),
+        );
+        opencodeDb.prepare(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+        ).run(
+            "old-summary-part",
+            "old-summary",
+            sessionId,
+            1_001,
+            1_001,
+            JSON.stringify({ type: "text", text: MARKER_SUMMARY_TEXT }),
+        );
+        opencodeDb.close();
+
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 20,
+                startMessageId: "old-boundary",
+                endMessageId: "new-end",
+                title: "marker advance",
+                content: "test content",
+            },
+        ]);
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "old-boundary",
+            summaryMessageId: "old-summary",
+            compactionPartId: "old-compaction",
+            summaryPartId: "old-summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "old-end",
+        });
+        setPendingCompactionMarkerState(db, sessionId, {
+            ordinal: 20,
+            endMessageId: "new-end",
+            publishedAt: 2,
+        });
+
+        const tagger = createTagger();
+        const drainMessages = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "<session-history>\\n\\n</session-history>" }],
+            },
+            {
+                info: {
+                    id: "old-summary",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    summary: true,
+                    finish: "stop",
+                },
+                parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+            },
+            {
+                info: { id: "new-end", role: "assistant", sessionID: sessionId, finish: "stop" },
+                parts: [{ type: "text", text: "tail content" }],
+            },
+        ] as unknown as MessageLike[];
+        const taggedDrain = tagMessages(sessionId, drainMessages, tagger, db);
+        const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, drainMessages, {
+                fullFeatureMode: false,
+                tagger,
+                targets: taggedDrain.targets,
+                reasoningByMessage: taggedDrain.reasoningByMessage,
+                messageTagNumbers: taggedDrain.messageTagNumbers,
+                batch: taggedDrain.batch,
+                deferredHistoryWasPendingAtPassStart: true,
+                historyRebuiltThisPass: true,
+                canConsumeDeferredLate: true,
+                deferredHistoryRefreshSessions,
+                pendingCompartmentInjection: {
+                    block: "",
+                    compartmentEndMessage: 20,
+                    compartmentEndMessageId: "new-end",
+                    compartmentCount: 1,
+                    skippedVisibleMessages: 0,
+                    factCount: 0,
+                    memoryCount: 0,
+                    rebuiltFromDb: true,
+                },
+            }),
+        );
+
+        const marker = getPersistedCompactionMarkerState(db, sessionId);
+        expect(marker?.summaryMessageId).toBeString();
+        expect(drainMessages.some((message) => message.info.id === "old-summary")).toBe(false);
+
+        const rebuiltMessages = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "<session-history>\\n\\n</session-history>" }],
+            },
+            {
+                info: {
+                    id: marker?.summaryMessageId,
+                    role: "assistant",
+                    sessionID: sessionId,
+                    summary: true,
+                    finish: "stop",
+                },
+                parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+            },
+            {
+                info: { id: "new-end", role: "assistant", sessionID: sessionId, finish: "stop" },
+                parts: [{ type: "text", text: "tail content" }],
+            },
+        ] as unknown as MessageLike[];
+        tagger.initFromDb(sessionId, db);
+        tagMessages(sessionId, rebuiltMessages, tagger, db);
+
+        expect(serializeAnthropicWireWithAdjacentAssistantMerge(drainMessages)).toBe(
+            serializeAnthropicWireWithAdjacentAssistantMerge(rebuiltMessages),
+        );
     });
 });
 

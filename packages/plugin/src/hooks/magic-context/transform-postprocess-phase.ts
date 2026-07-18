@@ -160,6 +160,22 @@ export function injectDeferredCompactionSummaryRepresentation(args: {
     return true;
 }
 
+/**
+ * Remove the prior marker source from the drain array when a boundary advances.
+ * The database mutation happens before the next transform pass, so serving the
+ * old summary during this pass would make the provider wire differ from replay.
+ */
+function removeDeferredCompactionSummaryRepresentation(
+    messages: MessageLike[],
+    summaryMessageId: string | null,
+): boolean {
+    if (summaryMessageId === null) return false;
+    const index = messages.findIndex((message) => message.info.id === summaryMessageId);
+    if (index < 0) return false;
+    messages.splice(index, 1);
+    return true;
+}
+
 function pendingMarkerCoveredByConsumedBoundary(
     pending: PendingCompactionMarker,
     injection: PreparedCompartmentInjection | null,
@@ -1363,6 +1379,10 @@ export async function runPostTransformPhase(
                     args.sessionDirectory,
                 );
                 if (outcome.kind === "applied") {
+                    removeDeferredCompactionSummaryRepresentation(
+                        args.messages,
+                        outcome.removedSummaryMessageId,
+                    );
                     injectDeferredCompactionSummaryRepresentation({
                         db: args.db,
                         sessionId: args.sessionId,

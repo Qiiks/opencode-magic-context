@@ -55,6 +55,8 @@ export type MarkerUpdateOutcome =
           markerOrdinal: number;
           summaryMessageId: string;
           boundaryMessageId: string;
+          /** Summary source removed from the database during an advance, if any. */
+          removedSummaryMessageId: string | null;
       }
     | { kind: "already-current" }
     | {
@@ -255,6 +257,9 @@ export function applyDeferredCompactionMarker(
 
         // Remove old marker if present. `removeCompactionMarker` returns false
         // only when the DELETE transaction itself failed (e.g. SQLITE_BUSY).
+        // Keep the summary id so the transform can remove the old source from
+        // the in-memory drain representation before it serves the new marker.
+        const removedSummaryMessageId = existing?.summaryMessageId ?? null;
         // No-op success on already-missing rows is fine — that's why retry is
         // safe. False here means we couldn't even attempt the delete cleanly;
         // bail to retryable WITHOUT calling inject (avoids leaving two marker
@@ -309,6 +314,7 @@ export function applyDeferredCompactionMarker(
             markerOrdinal: pending.ordinal,
             summaryMessageId: result.summaryMessageId,
             boundaryMessageId: result.boundaryMessageId,
+            removedSummaryMessageId,
         };
     } catch (err) {
         // Thrown paths:
