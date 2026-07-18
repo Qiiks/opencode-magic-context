@@ -719,10 +719,26 @@ describe("deferred compaction marker representation", () => {
             },
         ] as unknown as MessageLike[];
         tagger.initFromDb(sessionId, db);
-        // This is the next pass's normal tag stage. OpenCode then groups the
-        // adjacent assistant messages while building the Anthropic wire.
-        tagMessages(sessionId, rebuiltMessages, tagger, db);
-        const deferWire = serializeAnthropicWireWithAdjacentAssistantMerge(rebuiltMessages);
+        // The next pass rebuilds its input from the database projection (raw
+        // summary row included), tags it, and runs the SAME postprocess order
+        // the production defer pass runs, so any mutator that fires after
+        // reconciliation is exercised on both sides of the comparison.
+        const deferInput = rebuiltMessages.slice(2);
+        const taggedDefer = tagMessages(sessionId, deferInput, tagger, db);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferInput, {
+                tagger,
+                targets: taggedDefer.targets,
+                reasoningByMessage: taggedDefer.reasoningByMessage,
+                messageTagNumbers: taggedDefer.messageTagNumbers,
+                batch: taggedDefer.batch,
+                m0M1: {
+                    projectDirectory: dataHome,
+                    injectDocs: false,
+                },
+            }),
+        );
+        const deferWire = serializeAnthropicWireWithAdjacentAssistantMerge(deferInput);
 
         expect(deferWire).toBe(foldWire);
         expect(JSON.parse(foldWire)).toMatchObject([
