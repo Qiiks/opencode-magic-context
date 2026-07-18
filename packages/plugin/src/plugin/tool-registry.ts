@@ -8,6 +8,8 @@ import {
     isDatabasePersisted,
     openDatabase,
 } from "../features/magic-context/storage";
+import { getErrorMessage } from '../shared/error-message';
+import { log } from '../shared/logger';
 import type { Database } from "../shared/sqlite";
 import { createCtxExpandTools } from "../tools/ctx-expand";
 import { CTX_MEMORY_ACTIONS, createCtxMemoryTools } from "../tools/ctx-memory";
@@ -58,7 +60,12 @@ export function createToolRegistry(args: {
         return {};
     }
 
-    void ensureProjectRegisteredFromOpenCodeDirectory(ctx.directory, db);
+    // Fire-and-forget: registration failure (including a database handle that
+    // closed during process teardown) must never surface as an unhandled
+    // rejection from plugin init. The next boot or embed path re-registers.
+    void ensureProjectRegisteredFromOpenCodeDirectory(ctx.directory, db).catch((error) => {
+        log(`[magic-context] embedding registration skipped: ${getErrorMessage(error)}`);
+    });
 
     // Tools resolve project per-call from `toolContext.directory` because
     // OpenCode's top-level `ctx.directory` reflects the launch dir, not the
