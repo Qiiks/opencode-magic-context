@@ -224,7 +224,8 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
         const fingerprint =
             typeof record.fingerprint === "string" && record.fingerprint.length > 0
                 ? record.fingerprint
-                : Array.isArray(record.fingerprints) && typeof record.fingerprints[0] === "string"
+                : Array.isArray(record.fingerprints) &&
+                    typeof record.fingerprints[0] === "string"
                   ? record.fingerprints[0]
                   : "";
         const entryEpoch = record.table_epoch ?? record.tableEpoch;
@@ -248,7 +249,9 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
                 model,
                 fingerprint,
                 table_epoch: tableEpoch,
-                ...(typeof dims === "number" && Number.isInteger(dims) && dims > 0 ? { dims } : {}),
+                ...(typeof dims === "number" && Number.isInteger(dims) && dims > 0
+                    ? { dims }
+                    : {}),
                 ...(typeof recommendedBatch === "number" && recommendedBatch > 0
                     ? { recommended_batch: Math.floor(recommendedBatch) }
                     : {}),
@@ -271,7 +274,9 @@ function extractVector(
     // The live envelope carries vectors: [{id, vector, content_sha256}] for
     // every embed op, including single-text queries; older sketches used a
     // top-level vector/embedding field, kept as a fallback.
-    const fromVectors = Array.isArray(body.vectors) ? asRecord(body.vectors[0])?.vector : undefined;
+    const fromVectors = Array.isArray(body.vectors)
+        ? asRecord(body.vectors[0])?.vector
+        : undefined;
     const raw = fromVectors ?? body.vector ?? body.embedding;
     if (
         !Array.isArray(raw) ||

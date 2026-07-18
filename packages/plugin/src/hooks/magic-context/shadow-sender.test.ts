@@ -715,10 +715,7 @@ describe("shadow sender", () => {
             expect(first).toEqual(expect.objectContaining({ ok: true }));
             if (!first.ok) throw new Error("provisional ordinal setup failed");
 
-            rows = [
-                ...rows,
-                { id: "m3", timeCreated: 3, contributesOrdinal: true, hasValidInfo: true },
-            ];
+            rows = [...rows, { id: "m3", timeCreated: 3, contributesOrdinal: true, hasValidInfo: true }];
             const healed = await __shadowSenderTest.resolveOrdinalsForShadow({
                 sessionId,
                 messages: provisional,
@@ -747,14 +744,7 @@ describe("shadow sender", () => {
                 { id: "m1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true },
                 { id: "m2", timeCreated: 2, contributesOrdinal: true, hasValidInfo: true },
             ];
-            sender.enqueue(
-                basePass({
-                    db,
-                    sessionId,
-                    inputMessages: provisional,
-                    outputMessages: provisional,
-                }),
-            );
+            sender.enqueue(basePass({ db, sessionId, inputMessages: provisional, outputMessages: provisional }));
             await waitFor(() => sender.getStats(sessionId).transforms_sent === 1);
             rows = [
                 ...rows,
@@ -771,9 +761,9 @@ describe("shadow sender", () => {
                 }),
             );
             await waitFor(() => sender.getStats(sessionId).transforms_sent === 2);
-            expect(
-                resetTransport.calls.filter((call) => call.method === "shadow_reset"),
-            ).toHaveLength(2);
+            expect(resetTransport.calls.filter((call) => call.method === "shadow_reset")).toHaveLength(
+                2,
+            );
             expect(sender.getStats(sessionId).ordinal_mismatch).toBe(1);
         } finally {
             unregister();
@@ -1327,14 +1317,7 @@ describe("shadow sender", () => {
             ),
         ).toBe(true);
         const assembled = { ...pages.at(-1) } as Record<string, unknown>;
-        for (const field of [
-            "transform_page_id",
-            "transform_generation",
-            "transform_page_index",
-            "transform_page_total",
-            "transform_page_complete",
-            "transform_page_digest",
-        ]) {
+        for (const field of ["transform_page_id", "transform_generation", "transform_page_index", "transform_page_total", "transform_page_complete", "transform_page_digest"]) {
             delete assembled[field];
         }
         for (const field of ["input", "ts_output", "normalizations"]) {
@@ -1395,20 +1378,14 @@ describe("shadow sender", () => {
                 message(sessionId, "m2", "b".repeat(220 * 1024)),
                 message(sessionId, "m3", "c".repeat(220 * 1024)),
             ];
-            sender.enqueue(
-                basePass({
-                    db,
-                    sessionId,
-                    inputMessages: large,
-                    outputMessages: structuredClone(large),
-                }),
-            );
-            await waitFor(() =>
-                transport.calls.some(
-                    (call) =>
-                        call.method === "shadow_transform" &&
-                        (call.body as { transform_page_index?: number }).transform_page_index === 0,
-                ),
+            sender.enqueue(basePass({ db, sessionId, inputMessages: large, outputMessages: structuredClone(large) }));
+            await waitFor(
+                () =>
+                    transport.calls.some(
+                        (call) =>
+                            call.method === "shadow_transform" &&
+                            (call.body as { transform_page_index?: number }).transform_page_index === 0,
+                    ),
             );
             sender.enqueue(
                 basePass({
@@ -1423,9 +1400,7 @@ describe("shadow sender", () => {
             transport.releaseTransform?.();
             await waitFor(() => sender.getStats(sessionId).transforms_sent === 2);
             const pageCalls = transport.calls.filter((call) => call.method === "shadow_transform");
-            const pageIds = pageCalls.map(
-                (call) => (call.body as { transform_page_id?: string }).transform_page_id,
-            );
+            const pageIds = pageCalls.map((call) => (call.body as { transform_page_id?: string }).transform_page_id);
             const firstId = pageIds[0];
             const firstEnd = pageIds.lastIndexOf(firstId);
             expect(firstId).toBeDefined();

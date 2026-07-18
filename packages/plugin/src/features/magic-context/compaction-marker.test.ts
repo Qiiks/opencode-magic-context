@@ -9,6 +9,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     closeCompactionMarkerDb,
     findBoundaryUserMessage,
+    generateMessageId,
     injectCompactionMarker,
 } from "./compaction-marker";
 
@@ -134,6 +135,52 @@ describe("findBoundaryUserMessage", () => {
 });
 
 describe("injectCompactionMarker", () => {
+    it("keeps deterministic marker ids in OpenCode's lexicographic row order", () => {
+        const dataHome = useTempDataHome("marker-inject-id-order-");
+        const db = createOpenCodeDb(dataHome);
+        const boundaryId = generateMessageId(1_000, 0n, "boundary");
+        const retainedId = generateMessageId(1_002, 0n, "retained");
+        insertMessage(db, boundaryId, "user", 1_000);
+        insertMessage(db, retainedId, "assistant", 1_002);
+        closeQuietly(db);
+
+        const result = injectCompactionMarker({
+            sessionId: "ses-1",
+            endOrdinal: 2,
+            endMessageId: retainedId,
+            summaryText: "summary placeholder",
+            directory: dataHome,
+        });
+
+        expect(result?.summaryMessageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+        expect(result?.compactionPartId).toMatch(/^prt_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+        expect(boundaryId < (result?.summaryMessageId ?? "")).toBe(true);
+        expect((result?.summaryMessageId ?? "") < retainedId).toBe(true);
+
+        const inspection = new Database(join(dataHome, "opencode", "opencode.db"));
+        const rows = inspection
+            .prepare(
+                "SELECT id, json_extract(data, '$.role') AS role, json_extract(data, '$.summary') AS summary, json_extract(data, '$.parentID') AS parentID FROM message WHERE session_id = 'ses-1' ORDER BY time_created ASC, id ASC",
+            )
+            .all() as Array<{
+            id: string;
+            role: string;
+            summary: number | null;
+            parentID: string | null;
+        }>;
+        expect(rows).toEqual([
+            { id: boundaryId, role: "user", summary: null, parentID: null },
+            {
+                id: result?.summaryMessageId,
+                role: "assistant",
+                summary: 1,
+                parentID: boundaryId,
+            },
+            { id: retainedId, role: "assistant", summary: null, parentID: null },
+        ]);
+        closeQuietly(inspection);
+    });
+
     it("preserves the deterministic boundary in the healthy no-deletion case", () => {
         const dataHome = useTempDataHome("marker-inject-healthy-");
         const db = createOpenCodeDb(dataHome);
@@ -150,8 +197,16 @@ describe("injectCompactionMarker", () => {
             directory: dataHome,
         });
 
-        // Generated marker row ids include random base62 suffixes; compare only
-        // the deterministic boundary field that the old ordinal path intended.
         expect(result?.boundaryMessageId).toBe("msg_001_user");
+        expect(result?.summaryMessageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+
+        const retry = injectCompactionMarker({
+            sessionId: "ses-1",
+            endOrdinal: 3,
+            endMessageId: "msg_003_target",
+            summaryText: "summary placeholder",
+            directory: dataHome,
+        });
+        expect(retry).toEqual(result);
     });
 });

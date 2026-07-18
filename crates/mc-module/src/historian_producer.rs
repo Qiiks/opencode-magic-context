@@ -738,6 +738,7 @@ impl HistorianProducer {
             },
             consumer_identity: consumer_identity_from_env(),
             consumer_capabilities: None,
+            admission_facts: None,
         };
         let corr = self.next_corr();
         let body = serde_json::to_vec(&request)?;

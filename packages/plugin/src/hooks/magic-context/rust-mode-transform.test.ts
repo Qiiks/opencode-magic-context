@@ -1,15 +1,24 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
+import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { setRawMessageProvider } from "./read-session-chunk";
-import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
+import { closeReadOnlySessionDb } from "./read-session-db";
+import {
+    __rustModeTransformTest,
+    createRustModeTransform,
+    type RustModeModuleClient,
+} from "./rust-mode-transform";
 import type { TransformDeps } from "./transform";
 import { createTransform } from "./transform";
 import type { MessageLike } from "./transform-operations";
@@ -17,9 +26,17 @@ import type { MessageLike } from "./transform-operations";
 const sessions: string[] = [];
 const databases: ContextDatabase[] = [];
 const unregisters: Array<() => void> = [];
+const availabilityDataHomes: string[] = [];
+const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
+    closeReadOnlySessionDb();
     for (const unregister of unregisters.splice(0)) unregister();
+    for (const dataHome of availabilityDataHomes.splice(0)) {
+        rmSync(dataHome, { recursive: true, force: true });
+    }
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const db of databases.splice(0)) closeQuietly(db);
 });
 
@@ -93,6 +110,38 @@ function makeMeta(
     return getOrCreateSessionMeta(db, sessionId);
 }
 
+function installAvailabilityDb(sessionId: string, firstUserTools?: Record<string, unknown>): void {
+    const dataHome = mkdtempSync(join(tmpdir(), "rust-mode-availability-"));
+    availabilityDataHomes.push(dataHome);
+    const dbPath = join(dataHome, "opencode", "opencode.db");
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const opencodeDb = new Database(dbPath);
+    opencodeDb.exec(`
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );
+    `);
+    if (firstUserTools !== undefined) {
+        opencodeDb
+            .prepare(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+            )
+            .run(
+                "availability-user",
+                sessionId,
+                1,
+                1,
+                JSON.stringify({ id: "availability-user", role: "user", tools: firstUserTools }),
+            );
+    }
+    closeQuietly(opencodeDb);
+    process.env.XDG_DATA_HOME = dataHome;
+}
+
 function authoritySeqMismatch(durableSeq: number): Error & {
     code: string;
 } {
@@ -107,6 +156,20 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 }
 
 describe("Rust mode authority adapter", () => {
+    it("copies the resolved history budget onto the authority wire", () => {
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "budget-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: { history_budget_tokens: 42_000 },
+            usage: {},
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+        expect(body.history_budget_tokens).toBe(42_000);
+    });
+
     it("adopts a durable sequence from a fresh process and retries the sync", async () => {
         const sessionId = `rust-adopt-${Date.now()}`;
         sessions.push(sessionId);
@@ -261,6 +324,7 @@ describe("Rust mode authority adapter", () => {
         const sessionId = `rust-seed-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
+        installAvailabilityDb(sessionId, {});
         installRawProvider(sessionId);
         const native = [{ role: "user", parts: [{ type: "text", text: "module output" }] }];
         const methods: string[] = [];
@@ -279,6 +343,7 @@ describe("Rust mode authority adapter", () => {
         await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
         expect(methods).toEqual(["state_sync", "transform"]);
         expect(transformRequest?.serve_native).toBe(true);
+        expect(transformRequest?.tool_present).toBe(true);
         expect(transformRequest?.native_messages).toBe(messages);
         expect(Array.isArray(transformRequest?.messages)).toBe(true);
         expect(output.messages).toEqual(native);
@@ -291,10 +356,147 @@ describe("Rust mode authority adapter", () => {
         expect(secondOutput.messages).toEqual(native);
     });
 
+    it("sends tool_present false while availability remains provisional", async () => {
+        const sessionId = `rust-availability-provisional-${Date.now()}`;
+        sessions.push(sessionId);
+        installAvailabilityDb(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const requestBodies: Array<Record<string, unknown>> = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") requestBodies.push(body as Record<string, unknown>);
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const messages: MessageLike[] = [
+            {
+                info: { id: "m1", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "assistant" }],
+            },
+        ];
+
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: messages as unknown[] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(requestBodies).toHaveLength(1);
+        expect(requestBodies[0]?.tool_present).toBe(false);
+    });
+
+    it("delivers a repeated module directive only once across the synthetic nudge turn", async () => {
+        const sessionId = `rust-channel2-refire-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const native = [{ role: "assistant", parts: [] }];
+        const promptAsync = mock(async () => ({}));
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          native_messages: native,
+                          host_directives: {
+                              channel2_nudge: { text: "drop spent tool output" },
+                          },
+                      }
+                    : { ok: true },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            hostClient: {
+                session: {
+                    messages: async () => ({ data: [] }),
+                    promptAsync,
+                },
+            },
+        });
+
+        const firstInput = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            firstInput,
+            { messages: firstInput },
+            makeMeta(db, sessionId),
+        );
+
+        const syntheticInput = [
+            ...makeMessages(sessionId),
+            {
+                info: { id: "channel2-nudge-1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "drop spent tool output", synthetic: true }],
+            },
+        ];
+        await transform.run(
+            sessionId,
+            syntheticInput,
+            { messages: syntheticInput },
+            makeMeta(db, sessionId),
+        );
+
+        expect(getChannel2NudgeState(db, sessionId)).toBe("delivered");
+        expect(transform.getState(sessionId).syntheticTurnCount).toBe(1);
+    });
+
+    it("breaks a synthetic-turn cascade after three turns", async () => {
+        const sessionId = `rust-loop-breaker-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const promptAsync = mock(async () => ({}));
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          native_messages: [{ role: "assistant", parts: [] }],
+                          host_directives: {
+                              channel2_nudge: { text: "drop spent tool output" },
+                          },
+                      }
+                    : { ok: true },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            hostClient: {
+                session: {
+                    messages: async () => ({ data: [] }),
+                    promptAsync,
+                },
+            },
+        });
+
+        for (let turn = 1; turn <= 4; turn += 1) {
+            setChannel2NudgeState(db, sessionId, "pending");
+            const input = [
+                ...makeMessages(sessionId),
+                {
+                    info: { id: `synthetic-${turn}`, role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "synthetic turn", synthetic: true }],
+                },
+            ];
+            await transform.run(sessionId, input, { messages: input }, makeMeta(db, sessionId));
+        }
+
+        expect(promptAsync).toHaveBeenCalledTimes(0);
+        expect(transform.getState(sessionId).syntheticTurnCount).toBe(4);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
+
+        setChannel2NudgeState(db, sessionId, "pending");
+        const realInput = makeMessages(sessionId);
+        await transform.run(sessionId, realInput, { messages: realInput }, makeMeta(db, sessionId));
+        expect(promptAsync).toHaveBeenCalledTimes(1);
+        expect(transform.getState(sessionId).syntheticTurnCount).toBe(0);
+    });
+
     it("re-pages every transform payload after need_full_sync", async () => {
         const sessionId = `rust-repage-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
+        installAvailabilityDb(sessionId, {});
         installRawProvider(sessionId);
         const messages = makeMessages(sessionId);
         messages[0]!.parts = [{ type: "text", text: "x".repeat(600_000) }];
@@ -332,6 +534,7 @@ describe("Rust mode authority adapter", () => {
                 ].every((field) => field in body),
             ),
         ).toBe(true);
+        expect(transformBodies.at(-1)?.tool_present).toBe(true);
         expect(output.messages).toEqual(native);
     });
 

@@ -18,9 +18,13 @@ import {
     queueM0Mutation,
     queuePendingOp,
     setPendingCompactionMarkerState,
+    updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
-import { getPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
+import {
+    getPersistedCompactionMarkerState,
+    setPersistedCompactionMarkerState,
+} from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
@@ -33,6 +37,7 @@ import {
     type ThinkingLikePart,
     tagMessages,
 } from "./tag-messages";
+import { isSyntheticTodoPart } from "./todo-view";
 import {
     createToolDropTarget,
     extractToolCallObservation,
@@ -46,6 +51,7 @@ import {
     clearPendingCompactionMarkerAfterSuccessfulDrain,
     evaluateEmergencyFailClosed,
     finalizeMessageRepresentation,
+    reconcileMarkerRepresentation,
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
 
@@ -179,7 +185,7 @@ function basePostTransformArgs(
         reasoningByMessage: new Map(),
         messageTagNumbers: new Map(),
         tagger: createTagger(),
-        ctxReduceCallable: true,
+        ctxReduceAvailability: { callable: true, frozen: true },
         batch: null,
         contextUsage: { percentage: 20, inputTokens: 1000 },
         schedulerDecision: "defer",
@@ -319,6 +325,236 @@ function serializeAnthropicWireWithAdjacentAssistantMerge(messages: MessageLike[
 }
 
 describe("deferred compaction marker representation", () => {
+    it("ignores a persisted message that carries a forged syntheticHead flag", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-forged-head";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        setPersistedCompactionMarkerState(db, sessionId, state);
+        const messages = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m0", synthetic: true }],
+            },
+            {
+                // A persisted row (it carries an id) claiming head membership
+                // through metadata alone. It must stay in the retained tail,
+                // AFTER the summary.
+                info: {
+                    id: "msg_persisted_forged",
+                    role: "user",
+                    sessionID: sessionId,
+                    syntheticHead: true,
+                },
+                parts: [{ type: "text", text: "real turn", synthetic: true }],
+            },
+        ] as unknown as MessageLike[];
+        const options = {
+            db,
+            sessionId,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: true, frozen: true },
+        };
+
+        reconcileMarkerRepresentation(messages, state, options);
+        expect(messages.map((message) => message.info.id)).toEqual([
+            undefined,
+            "summary",
+            "msg_persisted_forged",
+        ]);
+    });
+
+    it("uses only marked m[0]/m[1] slots as the synthetic head", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-synthetic-tail";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        setPersistedCompactionMarkerState(db, sessionId, state);
+        const messages = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m0", synthetic: true }],
+            },
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m1", synthetic: true }],
+            },
+            {
+                info: { id: "channel2-nudge", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "compact now", synthetic: true }],
+            },
+            {
+                info: { id: "tail-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "new turn" }],
+            },
+        ] as unknown as MessageLike[];
+        const options = {
+            db,
+            sessionId,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: true, frozen: true },
+        };
+
+        reconcileMarkerRepresentation(messages, state, options);
+        expect(messages.map((message) => message.info.id)).toEqual([
+            undefined,
+            undefined,
+            "summary",
+            "channel2-nudge",
+            "tail-user",
+        ]);
+        const firstWire = serializeAnthropicWireWithAdjacentAssistantMerge(messages);
+
+        const replay = structuredClone(messages);
+        reconcileMarkerRepresentation(replay, state, options);
+        expect(serializeAnthropicWireWithAdjacentAssistantMerge(replay)).toBe(firstWire);
+        expect(replay).toEqual(messages);
+    });
+
+    it("keeps a provisional marker untagged and freezes the callable tag choice", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-provisional-availability";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        setPersistedCompactionMarkerState(db, sessionId, state);
+        const options = {
+            db,
+            sessionId,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: true, frozen: false },
+        };
+        const provisional = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "turn" }],
+            },
+        ] as unknown as MessageLike[];
+        reconcileMarkerRepresentation(provisional, state, options);
+        expect(provisional[0]?.parts[0]).toEqual({ type: "text", text: MARKER_SUMMARY_TEXT });
+
+        const frozen = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "turn" }],
+            },
+        ] as unknown as MessageLike[];
+        reconcileMarkerRepresentation(frozen, state, {
+            ...options,
+            ctxReduceAvailability: { callable: true, frozen: true },
+        });
+        const taggedText = (frozen[0]?.parts[0] as { text?: string }).text;
+        expect(taggedText).toMatch(/^§\d+§ /);
+        const stable = structuredClone(frozen);
+        reconcileMarkerRepresentation(stable, state, {
+            ...options,
+            ctxReduceAvailability: { callable: true, frozen: true },
+        });
+        expect(stable).toEqual(frozen);
+    });
+
+    it("keeps todo synthesis at the head when the only assistant is a summary", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-todo-head";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        setPersistedCompactionMarkerState(db, sessionId, state);
+        updateSessionMeta(db, sessionId, {
+            lastTodoState:
+                '[{"content":"finish marker work","status":"pending","priority":"high"}]',
+        });
+        const makeMessages = (): MessageLike[] =>
+            [
+                {
+                    info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                    parts: [{ type: "text", text: "m0", synthetic: true }],
+                },
+                {
+                    info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                    parts: [{ type: "text", text: "m1", synthetic: true }],
+                },
+                {
+                    info: {
+                        id: "summary",
+                        role: "assistant",
+                        sessionID: sessionId,
+                        summary: true,
+                        finish: "stop",
+                    },
+                    parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+                },
+                {
+                    info: { id: "new-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "continue" }],
+                },
+            ] as unknown as MessageLike[];
+        const firstMessages = makeMessages();
+        const firstTagger = createTagger();
+        const firstTagged = tagMessages(sessionId, firstMessages, firstTagger, db);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, firstMessages, {
+                schedulerDecision: "execute",
+                tagger: firstTagger,
+                targets: firstTagged.targets,
+                reasoningByMessage: firstTagged.reasoningByMessage,
+                messageTagNumbers: firstTagged.messageTagNumbers,
+                batch: firstTagged.batch,
+            }),
+        );
+        const firstTodoIndex = firstMessages.findIndex((message) =>
+            message.parts.some((part) => isSyntheticTodoPart(part)),
+        );
+        expect(firstTodoIndex).toBe(2);
+        const firstWire = serializeAnthropicWireWithAdjacentAssistantMerge(firstMessages);
+
+        const secondMessages = makeMessages();
+        const secondTagger = createTagger();
+        secondTagger.initFromDb(sessionId, db);
+        const secondTagged = tagMessages(sessionId, secondMessages, secondTagger, db);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, secondMessages, {
+                tagger: secondTagger,
+                targets: secondTagged.targets,
+                reasoningByMessage: secondTagged.reasoningByMessage,
+                messageTagNumbers: secondTagged.messageTagNumbers,
+                batch: secondTagged.batch,
+            }),
+        );
+        expect(
+            secondMessages.findIndex((message) =>
+                message.parts.some((part) => isSyntheticTodoPart(part)),
+            ),
+        ).toBe(2);
+        expect(serializeAnthropicWireWithAdjacentAssistantMerge(secondMessages)).toBe(firstWire);
+    });
+
     it("keeps the marker-consuming fold byte-identical with the rebuilt defer wire", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -374,6 +610,14 @@ describe("deferred compaction marker representation", () => {
         const foldMessages = [
             {
                 info: {
+                    id: "msg-tail-user",
+                    role: "user",
+                    sessionID: sessionId,
+                },
+                parts: [{ type: "text", text: "retained user turn" }],
+            },
+            {
+                info: {
                     id: "msg-tail-assistant",
                     role: "assistant",
                     sessionID: sessionId,
@@ -389,11 +633,16 @@ describe("deferred compaction marker representation", () => {
                 ],
             },
         ] as unknown as MessageLike[];
+        const taggedFold = tagMessages(sessionId, foldMessages, tagger, db);
         const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
 
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, foldMessages, {
                 tagger,
+                targets: taggedFold.targets,
+                reasoningByMessage: taggedFold.reasoningByMessage,
+                messageTagNumbers: taggedFold.messageTagNumbers,
+                batch: taggedFold.batch,
                 deferredHistoryWasPendingAtPassStart: true,
                 historyRebuiltThisPass: true,
                 canConsumeDeferredLate: true,
@@ -408,6 +657,10 @@ describe("deferred compaction marker representation", () => {
                     memoryCount: 0,
                     rebuiltFromDb: true,
                 },
+                m0M1: {
+                    projectDirectory: dataHome,
+                    injectDocs: false,
+                },
             }),
         );
 
@@ -415,10 +668,12 @@ describe("deferred compaction marker representation", () => {
         expect(marker?.summaryMessageId).toBeString();
         expect(foldMessages.map((message) => message.info.id)).toEqual([
             undefined,
+            undefined,
             marker?.summaryMessageId,
+            "msg-tail-user",
             "msg-tail-assistant",
         ]);
-        expect(foldMessages[1]?.parts).toEqual([
+        expect(foldMessages[2]?.parts).toEqual([
             expect.objectContaining({
                 type: "text",
                 text: expect.stringContaining(MARKER_SUMMARY_TEXT),
@@ -427,16 +682,7 @@ describe("deferred compaction marker representation", () => {
 
         const foldWire = serializeAnthropicWireWithAdjacentAssistantMerge(foldMessages);
         const rebuiltMessages = [
-            {
-                info: { role: "user", sessionID: sessionId },
-                parts: [
-                    {
-                        type: "text",
-                        text: "<session-history>\n\n</session-history>",
-                        synthetic: true,
-                    },
-                ],
-            },
+            ...cloneMessages(foldMessages.slice(0, 2)),
             {
                 info: {
                     id: marker?.summaryMessageId,
@@ -446,6 +692,14 @@ describe("deferred compaction marker representation", () => {
                     finish: "stop",
                 },
                 parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+            },
+            {
+                info: {
+                    id: "msg-tail-user",
+                    role: "user",
+                    sessionID: sessionId,
+                },
+                parts: [{ type: "text", text: "retained user turn" }],
             },
             {
                 info: {
@@ -465,13 +719,105 @@ describe("deferred compaction marker representation", () => {
             },
         ] as unknown as MessageLike[];
         tagger.initFromDb(sessionId, db);
-        // This is the next pass's normal tag stage. OpenCode then groups the
-        // adjacent assistant messages while building the Anthropic wire.
-        tagMessages(sessionId, rebuiltMessages, tagger, db);
-        const deferWire = serializeAnthropicWireWithAdjacentAssistantMerge(rebuiltMessages);
+        // The next pass rebuilds its input from the database projection (raw
+        // summary row included), tags it, and runs the SAME postprocess order
+        // the production defer pass runs, so any mutator that fires after
+        // reconciliation is exercised on both sides of the comparison.
+        const deferInput = rebuiltMessages.slice(2);
+        const taggedDefer = tagMessages(sessionId, deferInput, tagger, db);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferInput, {
+                tagger,
+                targets: taggedDefer.targets,
+                reasoningByMessage: taggedDefer.reasoningByMessage,
+                messageTagNumbers: taggedDefer.messageTagNumbers,
+                batch: taggedDefer.batch,
+                m0M1: {
+                    projectDirectory: dataHome,
+                    injectDocs: false,
+                },
+            }),
+        );
+        const deferWire = serializeAnthropicWireWithAdjacentAssistantMerge(deferInput);
 
         expect(deferWire).toBe(foldWire);
         expect(JSON.parse(foldWire)).toMatchObject([
+            {},
+            {},
+            {
+                role: "assistant",
+                content: [{ type: "text", text: expect.stringContaining(MARKER_SUMMARY_TEXT) }],
+            },
+            { role: "user", content: [{ type: "text", text: expect.any(String) }] },
+            {
+                role: "assistant",
+                content: [{ type: "tool_use", id: "toolu-tail" }],
+            },
+        ]);
+    });
+
+    it("reconciles duplicate summaries at the synthetic-prefix boundary and is idempotent", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-reconcile-idempotent";
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "current-summary",
+            compactionPartId: "current-compaction",
+            summaryPartId: "current-summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        });
+        const summary = (id: string): MessageLike =>
+            ({
+                info: {
+                    id,
+                    role: "assistant",
+                    sessionID: sessionId,
+                    summary: true,
+                    finish: "stop",
+                },
+                parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+            }) as MessageLike;
+        const messages = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m0", synthetic: true }],
+            },
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m1", synthetic: true }],
+            },
+            summary("stale-summary"),
+            summary("current-summary"),
+            summary("current-summary"),
+            {
+                info: { id: "tail-assistant", role: "assistant", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "tool_use",
+                        id: "toolu-tail",
+                        name: "read",
+                        input: { path: "README.md" },
+                    },
+                ],
+            },
+        ] as MessageLike[];
+        const tagger = createTagger();
+        tagMessages(sessionId, messages, tagger, db);
+
+        await runPostTransformPhase(basePostTransformArgs(db, sessionId, messages, { tagger }));
+
+        expect(messages.map((message) => message.info.id)).toEqual([
+            undefined,
+            undefined,
+            "current-summary",
+            "tail-assistant",
+        ]);
+        expect(
+            JSON.parse(serializeAnthropicWireWithAdjacentAssistantMerge(messages)),
+        ).toMatchObject([
+            {},
             {},
             {
                 role: "assistant",
@@ -481,6 +827,274 @@ describe("deferred compaction marker representation", () => {
                 ],
             },
         ]);
+        expect(
+            getTagsBySession(db, sessionId).find((tag) => tag.messageId === "stale-summary:p0")
+                ?.status,
+        ).toBe("dropped");
+
+        const onceReconciled = structuredClone(messages);
+        await runPostTransformPhase(basePostTransformArgs(db, sessionId, messages, { tagger }));
+        expect(messages).toEqual(onceReconciled);
+    });
+
+    it("leaves a marker-free session byte-identical across repeated passes", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-without-marker";
+        const messages = [
+            {
+                info: { id: "real-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "unchanged" }],
+            },
+        ] as MessageLike[];
+        const original = structuredClone(messages);
+
+        await runPostTransformPhase(basePostTransformArgs(db, sessionId, messages));
+        await runPostTransformPhase(basePostTransformArgs(db, sessionId, messages));
+
+        expect(messages).toEqual(original);
+    });
+});
+
+describe("deferred compaction marker advance representation", () => {
+    it("keeps the advance drain byte-identical with the next pass after removing the old marker", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-advance-wire-stability";
+        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-marker-advance-wire-"));
+        tempDirs.push(dataHome);
+        process.env.XDG_DATA_HOME = dataHome;
+        mkdirSync(join(dataHome, "opencode"), { recursive: true });
+        const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        opencodeDb.exec(
+            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        const insertMessage = opencodeDb.prepare(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+        );
+        insertMessage.run(
+            "old-boundary",
+            sessionId,
+            1_000,
+            1_000,
+            JSON.stringify({ role: "user" }),
+        );
+        insertMessage.run(
+            "new-boundary",
+            sessionId,
+            2_000,
+            2_000,
+            JSON.stringify({ role: "user" }),
+        );
+        insertMessage.run(
+            "new-end",
+            sessionId,
+            3_000,
+            3_000,
+            JSON.stringify({ role: "assistant", finish: "stop" }),
+        );
+        insertMessage.run(
+            "old-summary",
+            sessionId,
+            1_001,
+            1_001,
+            JSON.stringify({ role: "assistant", summary: true, finish: "stop" }),
+        );
+        opencodeDb
+            .prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+                "old-compaction",
+                "old-boundary",
+                sessionId,
+                1_000,
+                1_000,
+                JSON.stringify({ type: "compaction", auto: true }),
+            );
+        opencodeDb
+            .prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+                "old-summary-part",
+                "old-summary",
+                sessionId,
+                1_001,
+                1_001,
+                JSON.stringify({ type: "text", text: MARKER_SUMMARY_TEXT }),
+            );
+        opencodeDb.close();
+
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 20,
+                startMessageId: "old-boundary",
+                endMessageId: "new-end",
+                title: "marker advance",
+                content: "test content",
+            },
+        ]);
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "old-boundary",
+            summaryMessageId: "old-summary",
+            compactionPartId: "old-compaction",
+            summaryPartId: "old-summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "old-end",
+        });
+        setPendingCompactionMarkerState(db, sessionId, {
+            ordinal: 20,
+            endMessageId: "new-end",
+            publishedAt: 2,
+        });
+
+        const tagger = createTagger();
+        const drainMessages = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<session-history>\\n\\n</session-history>",
+                        synthetic: true,
+                    },
+                ],
+            },
+            {
+                info: {
+                    id: "old-summary",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    summary: true,
+                    finish: "stop",
+                },
+                parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+            },
+            {
+                info: { id: "retained-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "retained user content" }],
+            },
+            {
+                info: { id: "new-end", role: "assistant", sessionID: sessionId, finish: "stop" },
+                parts: [{ type: "text", text: "tail content" }],
+            },
+        ] as unknown as MessageLike[];
+        const loserMessages = cloneMessages(drainMessages);
+        const taggedDrain = tagMessages(sessionId, drainMessages, tagger, db);
+        const loserTagger = createTagger();
+        loserTagger.initFromDb(sessionId, db);
+        const taggedLoser = tagMessages(sessionId, loserMessages, loserTagger, db);
+        const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, drainMessages, {
+                fullFeatureMode: false,
+                tagger,
+                targets: taggedDrain.targets,
+                reasoningByMessage: taggedDrain.reasoningByMessage,
+                messageTagNumbers: taggedDrain.messageTagNumbers,
+                batch: taggedDrain.batch,
+                deferredHistoryWasPendingAtPassStart: true,
+                historyRebuiltThisPass: true,
+                canConsumeDeferredLate: true,
+                deferredHistoryRefreshSessions,
+                pendingCompartmentInjection: {
+                    block: "",
+                    compartmentEndMessage: 20,
+                    compartmentEndMessageId: "new-end",
+                    compartmentCount: 1,
+                    skippedVisibleMessages: 0,
+                    factCount: 0,
+                    memoryCount: 0,
+                    rebuiltFromDb: true,
+                },
+            }),
+        );
+
+        const marker = getPersistedCompactionMarkerState(db, sessionId);
+        expect(marker?.summaryMessageId).toBeString();
+        expect(drainMessages.some((message) => message.info.id === "old-summary")).toBe(false);
+
+        const rebuiltMessages = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<session-history>\\n\\n</session-history>",
+                        synthetic: true,
+                    },
+                ],
+            },
+            {
+                info: {
+                    id: marker?.summaryMessageId,
+                    role: "assistant",
+                    sessionID: sessionId,
+                    summary: true,
+                    finish: "stop",
+                },
+                parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+            },
+            {
+                info: { id: "retained-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "retained user content" }],
+            },
+            {
+                info: { id: "new-end", role: "assistant", sessionID: sessionId, finish: "stop" },
+                parts: [{ type: "text", text: "tail content" }],
+            },
+        ] as unknown as MessageLike[];
+        tagger.initFromDb(sessionId, db);
+        tagMessages(sessionId, rebuiltMessages, tagger, db);
+        const expectedWire = serializeAnthropicWireWithAdjacentAssistantMerge(rebuiltMessages);
+
+        expect(serializeAnthropicWireWithAdjacentAssistantMerge(drainMessages)).toBe(expectedWire);
+        expect(
+            getTagsBySession(db, sessionId).find((tag) => tag.messageId === "old-summary:p0")
+                ?.status,
+        ).toBe("dropped");
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, loserMessages, {
+                fullFeatureMode: false,
+                tagger: loserTagger,
+                targets: taggedLoser.targets,
+                reasoningByMessage: taggedLoser.reasoningByMessage,
+                messageTagNumbers: taggedLoser.messageTagNumbers,
+                batch: taggedLoser.batch,
+                deferredHistoryWasPendingAtPassStart: true,
+                historyRebuiltThisPass: true,
+                canConsumeDeferredLate: true,
+                deferredHistoryRefreshSessions: new Set([sessionId]),
+                pendingCompartmentInjection: {
+                    block: "",
+                    compartmentEndMessage: 20,
+                    compartmentEndMessageId: "new-end",
+                    compartmentCount: 1,
+                    skippedVisibleMessages: 0,
+                    factCount: 0,
+                    memoryCount: 0,
+                    rebuiltFromDb: true,
+                },
+            }),
+        );
+        expect(serializeAnthropicWireWithAdjacentAssistantMerge(loserMessages)).toBe(expectedWire);
+
+        const onceReconciled = structuredClone(loserMessages);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, loserMessages, {
+                fullFeatureMode: false,
+                tagger: loserTagger,
+            }),
+        );
+        expect(loserMessages).toEqual(onceReconciled);
     });
 });
 

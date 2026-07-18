@@ -61,6 +61,33 @@ const ACTIVE_TODOS_JSON = JSON.stringify([
 const TERMINAL_TODOS_JSON = JSON.stringify([
     { content: "All done", status: "completed", priority: "high" },
 ]);
+const TODO_HEAD_ANCHOR_ID = "__magic_context_todo_head__";
+
+type SyntheticTodoPart = NonNullable<ReturnType<typeof buildSyntheticTodoPart>>;
+
+function injectSyntheticTodoAtHead(messages: MessageLike[], part: SyntheticTodoPart): string {
+    const existing = messages[0];
+    if (existing?.info.id === TODO_HEAD_ANCHOR_ID) {
+        injectToolPartIntoAssistantById(messages, TODO_HEAD_ANCHOR_ID, part);
+        return TODO_HEAD_ANCHOR_ID;
+    }
+    messages.unshift({
+        info: { id: TODO_HEAD_ANCHOR_ID, role: "assistant", sessionID: "ses-1" },
+        parts: [part],
+    });
+    return TODO_HEAD_ANCHOR_ID;
+}
+
+function injectPersistedTodoAnchor(
+    messages: MessageLike[],
+    messageId: string,
+    part: SyntheticTodoPart,
+): boolean {
+    if (injectToolPartIntoAssistantById(messages, messageId, part)) return true;
+    if (messageId !== TODO_HEAD_ANCHOR_ID) return false;
+    injectSyntheticTodoAtHead(messages, part);
+    return true;
+}
 
 function buildMessages(): MessageLike[] {
     return [
@@ -110,7 +137,7 @@ function runTodoSynthesis(args: {
         if (
             persistedAnchor &&
             persistedAnchor.callId === part.callID &&
-            injectToolPartIntoAssistantById(messages, persistedAnchor.messageId, part)
+            injectPersistedTodoAnchor(messages, persistedAnchor.messageId, part)
         ) {
             // Mirror production: backfill stateJson if it's empty (legacy upgrade row).
             if (persistedAnchor.stateJson.length === 0) {
@@ -124,24 +151,22 @@ function runTodoSynthesis(args: {
             }
             return;
         }
-        const anchoredMessageId = injectToolPartIntoLatestAssistant(messages, part);
-        if (anchoredMessageId) {
-            setPersistedTodoSyntheticAnchor(
-                db,
-                sessionId,
-                part.callID,
-                anchoredMessageId,
-                sessionMeta.lastTodoState,
-            );
-        } else if (persistedAnchor) {
-            clearPersistedTodoSyntheticAnchor(db, sessionId);
-        }
+        const anchoredMessageId =
+            injectToolPartIntoLatestAssistant(messages, part) ??
+            injectSyntheticTodoAtHead(messages, part);
+        setPersistedTodoSyntheticAnchor(
+            db,
+            sessionId,
+            part.callID,
+            anchoredMessageId,
+            sessionMeta.lastTodoState,
+        );
     } else if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
         // Defer pass — replay rebuilds from PERSISTED stateJson, NOT from
         // sessionMeta.lastTodoState. Council Finding #1 fix.
         const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
         if (part !== null && part.callID === persistedAnchor.callId) {
-            injectToolPartIntoAssistantById(messages, persistedAnchor.messageId, part);
+            injectPersistedTodoAnchor(messages, persistedAnchor.messageId, part);
         }
     }
 }
@@ -364,7 +389,7 @@ describe("todo state synthesis — cache-busting branches", () => {
         expect(anchor?.messageId).toBe("msg-asst-2");
     });
 
-    it("Branch 5b: cache-bust + render and no assistant message in window → clears stale anchor", () => {
+    it("Branch 5b: cache-bust + no assistant message uses the deterministic head anchor", () => {
         useTempDataHome("todo-b5b-");
         const db = openDatabase();
         const oldCallId = "mc_synthetic_todo_stalestale00000a";
@@ -387,8 +412,9 @@ describe("todo state synthesis — cache-busting branches", () => {
             fullFeatureMode: true,
         });
 
-        expect(countSyntheticParts(messages)).toBe(0);
-        expect(getPersistedTodoSyntheticAnchor(db, "ses-1")).toBeNull();
+        expect(countSyntheticParts(messages)).toBe(1);
+        expect(messages[0]?.info.id).toBe(TODO_HEAD_ANCHOR_ID);
+        expect(getPersistedTodoSyntheticAnchor(db, "ses-1")?.messageId).toBe(TODO_HEAD_ANCHOR_ID);
     });
 });
 

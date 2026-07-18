@@ -247,33 +247,16 @@ describe("project embedding registry", () => {
             features,
             "/repo",
         );
-        const off = registerProjectEmbedding(
-            db,
-            "golden-off",
-            { provider: "off" },
-            features,
-            "/repo",
-        );
-        expect({
-            providerIdentity: local.providerIdentity,
-            runtimeFingerprint: local.runtimeFingerprint,
-        }).toEqual({
+        const off = registerProjectEmbedding(db, "golden-off", { provider: "off" }, features, "/repo");
+        expect({ providerIdentity: local.providerIdentity, runtimeFingerprint: local.runtimeFingerprint }).toEqual({
             providerIdentity: "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357",
-            runtimeFingerprint:
-                "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357:f0bab7fe74e0f0a0",
+            runtimeFingerprint: "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357:f0bab7fe74e0f0a0",
         });
-        expect({
-            providerIdentity: openai.providerIdentity,
-            runtimeFingerprint: openai.runtimeFingerprint,
-        }).toEqual({
+        expect({ providerIdentity: openai.providerIdentity, runtimeFingerprint: openai.runtimeFingerprint }).toEqual({
             providerIdentity: "embedding-provider:efd9edf1dbe1d83cef0860fb93475cb4",
-            runtimeFingerprint:
-                "embedding-provider:efd9edf1dbe1d83cef0860fb93475cb4:9b840cd5c05319d9",
+            runtimeFingerprint: "embedding-provider:efd9edf1dbe1d83cef0860fb93475cb4:9b840cd5c05319d9",
         });
-        expect({
-            providerIdentity: off.providerIdentity,
-            runtimeFingerprint: off.runtimeFingerprint,
-        }).toEqual({
+        expect({ providerIdentity: off.providerIdentity, runtimeFingerprint: off.runtimeFingerprint }).toEqual({
             providerIdentity: "embedding-provider:off",
             runtimeFingerprint: "embedding-provider:off",
         });

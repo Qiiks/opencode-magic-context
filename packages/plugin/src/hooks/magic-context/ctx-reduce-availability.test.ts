@@ -16,7 +16,7 @@ describe("ctx_reduce availability (spawn tools map)", () => {
         const verdict = resolveCtxReduceAvailabilityFromMessages("ses-allow", [
             userMsg({ "*": false, read: true, grep: true }),
         ]);
-        expect(verdict).toBe(false);
+        expect(verdict).toEqual({ callable: false, frozen: true });
     });
 
     it("resolves true when ctx_reduce is explicitly allowed", () => {
@@ -24,13 +24,13 @@ describe("ctx_reduce availability (spawn tools map)", () => {
         const verdict = resolveCtxReduceAvailabilityFromMessages("ses-explicit", [
             userMsg({ "*": false, read: true, ctx_reduce: true }),
         ]);
-        expect(verdict).toBe(true);
+        expect(verdict).toEqual({ callable: true, frozen: true });
     });
 
     it("fails open for sessions without a tools map (normal sessions)", () => {
         clearCtxReduceAvailability("ses-plain");
         const verdict = resolveCtxReduceAvailabilityFromMessages("ses-plain", [userMsg()]);
-        expect(verdict).toBe(true);
+        expect(verdict).toEqual({ callable: true, frozen: true });
     });
 
     it("resolves false when ctx_reduce is explicitly denied", () => {
@@ -38,7 +38,7 @@ describe("ctx_reduce availability (spawn tools map)", () => {
         const verdict = resolveCtxReduceAvailabilityFromMessages("ses-deny", [
             userMsg({ ctx_reduce: false }),
         ]);
-        expect(verdict).toBe(false);
+        expect(verdict).toEqual({ callable: false, frozen: true });
     });
 
     it("freezes the verdict per session — later, different tool maps cannot flap it", () => {
@@ -46,13 +46,13 @@ describe("ctx_reduce availability (spawn tools map)", () => {
         const first = resolveCtxReduceAvailabilityFromMessages("ses-frozen", [
             userMsg({ "*": false, read: true }),
         ]);
-        expect(first).toBe(false);
+        expect(first).toEqual({ callable: false, frozen: true });
         // Same session, contradictory map on a later pass: cached verdict wins
         // (per-turn maps can differ; a flapping verdict would bust the cache).
         const second = resolveCtxReduceAvailabilityFromMessages("ses-frozen", [
             userMsg({ "*": false, ctx_reduce: true }),
         ]);
-        expect(second).toBe(false);
+        expect(second).toEqual({ callable: false, frozen: true });
     });
 
     it("ignores non-user messages and falls open when the first user message carries no signal", () => {
@@ -61,7 +61,7 @@ describe("ctx_reduce availability (spawn tools map)", () => {
             { info: { role: "assistant" } },
             userMsg({}),
         ]);
-        expect(verdict).toBe(true);
+        expect(verdict).toEqual({ callable: true, frozen: true });
     });
 
     it("does not freeze a fail-open verdict from an array with no user message", () => {
@@ -70,13 +70,13 @@ describe("ctx_reduce availability (spawn tools map)", () => {
         const provisional = resolveCtxReduceAvailabilityFromMessages("ses-no-user-yet", [
             { info: { role: "assistant" } },
         ]);
-        expect(provisional).toBe(true);
+        expect(provisional).toEqual({ callable: true, frozen: false });
         // ...but must NOT lock the session: the real first user message (a
         // deny-list spawn) still decides the frozen verdict.
         const final = resolveCtxReduceAvailabilityFromMessages("ses-no-user-yet", [
             { info: { role: "assistant" } },
             userMsg({ "*": false, read: true }),
         ]);
-        expect(final).toBe(false);
+        expect(final).toEqual({ callable: false, frozen: true });
     });
 });

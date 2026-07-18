@@ -1,3 +1,4 @@
+import { setBootQuietPeriodForTests } from '@magic-context/core/plugin/boot-quiet';
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

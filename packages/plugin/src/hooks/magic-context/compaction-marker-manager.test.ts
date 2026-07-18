@@ -32,14 +32,18 @@ import {
     type PersistedCompactionMarkerState,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { createTagger } from "../../features/magic-context/tagger";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     applyDeferredCompactionMarker,
     closeCompactionMarkerConnection,
+    MARKER_SUMMARY_TEXT,
     updateCompactionMarkerAfterPublication,
 } from "./compaction-marker-manager";
+import type { MessageLike } from "./tag-messages";
+import { reconcileMarkerRepresentation } from "./transform-postprocess-phase";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
@@ -110,6 +114,56 @@ function insertCompartment(
     ]);
 }
 
+function serializeAnthropicWireWithAdjacentAssistantMerge(messages: MessageLike[]): string {
+    const merged: MessageLike[] = [];
+    for (const message of messages) {
+        const previous = merged.at(-1);
+        if (previous?.info.role === "assistant" && message.info.role === "assistant") {
+            previous.parts.push(...message.parts);
+        } else {
+            merged.push(structuredClone(message));
+        }
+    }
+    return JSON.stringify(
+        merged.map((message) => ({ role: message.info.role, content: message.parts })),
+    );
+}
+
+function markerServeWire(
+    db: Database,
+    sessionId: string,
+    state: PersistedCompactionMarkerState,
+): string {
+    const messages = [
+        {
+            info: { role: "user", sessionID: sessionId, syntheticHead: true },
+            parts: [{ type: "text", text: "m0", synthetic: true }],
+        },
+        {
+            info: { role: "user", sessionID: sessionId, syntheticHead: true },
+            parts: [{ type: "text", text: "m1", synthetic: true }],
+        },
+        {
+            info: { id: "tail-assistant", role: "assistant", sessionID: sessionId },
+            parts: [
+                {
+                    type: "tool_use",
+                    id: "toolu-tail",
+                    name: "read",
+                    input: { path: "README.md" },
+                },
+            ],
+        },
+    ] as MessageLike[];
+    reconcileMarkerRepresentation(messages, state, {
+        db,
+        sessionId,
+        tagger: createTagger(),
+        ctxReduceAvailability: { callable: true, frozen: true },
+    });
+    return serializeAnthropicWireWithAdjacentAssistantMerge(messages);
+}
+
 function insertMarkerRows(
     db: Database,
     sessionId: string,
@@ -166,6 +220,110 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         const persisted = getPersistedCompactionMarkerState(db, "ses-1");
         expect(persisted).not.toBeNull();
         expect(persisted?.boundaryOrdinal).toBe(10);
+    });
+
+    it("retries a post-insert state failure without minting duplicate marker rows", () => {
+        const dataHome = useTempDataHome("apply-deferred-post-insert-retry-");
+        const opencodeDb = createOpenCodeDb(dataHome);
+        insertUserMessage(opencodeDb, "msg-boundary", "ses-retry", 1_000);
+        insertMessage(opencodeDb, "legacy-summary", "ses-retry", 1_001, "assistant");
+        opencodeDb.prepare("UPDATE message SET data = ? WHERE id = 'legacy-summary'").run(
+            JSON.stringify({
+                role: "assistant",
+                parentID: "msg-boundary",
+                summary: true,
+                finish: "stop",
+                mode: "compaction",
+                agent: "compaction",
+                modelID: "magic-context",
+                providerID: "magic-context",
+            }),
+        );
+        opencodeDb
+            .prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+                "legacy-summary-part",
+                "legacy-summary",
+                "ses-retry",
+                1_001,
+                1_001,
+                JSON.stringify({ type: "text", text: MARKER_SUMMARY_TEXT }),
+            );
+        opencodeDb
+            .prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+                "legacy-compaction-part",
+                "msg-boundary",
+                "ses-retry",
+                1_000,
+                1_000,
+                JSON.stringify({ type: "compaction", auto: true }),
+            );
+        closeQuietly(opencodeDb);
+
+        const db = openDatabase();
+        insertCompartment(db, "ses-retry", 10, "msg-boundary");
+        db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-retry");
+        db.exec(`CREATE TRIGGER fail_marker_state_persist
+            BEFORE UPDATE OF compaction_marker_state ON session_meta
+            WHEN NEW.compaction_marker_state <> ''
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated marker state persist failure');
+            END`);
+
+        const first = applyDeferredCompactionMarker(db, "ses-retry", makePending(), dataHome);
+        expect(first.kind).toBe("retryable-failure");
+
+        const inspectAfterCrash = new Database(join(dataHome, "opencode", "opencode.db"));
+        const firstSummaryIds = inspectAfterCrash
+            .prepare(
+                "SELECT id FROM message WHERE session_id = ? AND json_extract(data, '$.summary') = 1 ORDER BY id",
+            )
+            .all("ses-retry") as Array<{ id: string }>;
+        expect(firstSummaryIds).toHaveLength(1);
+        expect(firstSummaryIds[0]?.id).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+        closeQuietly(inspectAfterCrash);
+
+        db.exec("DROP TRIGGER fail_marker_state_persist");
+        const retry = applyDeferredCompactionMarker(db, "ses-retry", makePending(), dataHome);
+        expect(retry.kind).toBe("applied");
+
+        const inspectAfterRetry = new Database(join(dataHome, "opencode", "opencode.db"));
+        const summaryIds = inspectAfterRetry
+            .prepare(
+                "SELECT id FROM message WHERE session_id = ? AND json_extract(data, '$.summary') = 1 ORDER BY id",
+            )
+            .all("ses-retry") as Array<{ id: string }>;
+        const compactionParts = inspectAfterRetry
+            .prepare(
+                "SELECT id FROM part WHERE session_id = ? AND message_id = ? AND json_extract(data, '$.type') = 'compaction' ORDER BY id",
+            )
+            .all("ses-retry", "msg-boundary") as Array<{ id: string }>;
+        expect(summaryIds.map((row) => row.id)).toEqual(firstSummaryIds.map((row) => row.id));
+        expect(compactionParts).toHaveLength(1);
+        const retryState = getPersistedCompactionMarkerState(db, "ses-retry");
+        expect(retryState?.summaryMessageId).toBe(firstSummaryIds[0]?.id);
+
+        insertUserMessage(inspectAfterRetry, "clean-boundary", "ses-clean", 2_000);
+        closeQuietly(inspectAfterRetry);
+        insertCompartment(db, "ses-clean", 10, "clean-boundary");
+        db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-clean");
+        const clean = applyDeferredCompactionMarker(
+            db,
+            "ses-clean",
+            makePending({ endMessageId: "clean-boundary" }),
+            dataHome,
+        );
+        expect(clean.kind).toBe("applied");
+        const cleanState = getPersistedCompactionMarkerState(db, "ses-clean");
+        if (!retryState || !cleanState) throw new Error("expected both marker states");
+        expect(markerServeWire(db, "ses-retry", retryState)).toBe(
+            markerServeWire(db, "ses-clean", cleanState),
+        );
     });
 
     it("returns `already-current` when persisted boundary >= pending ordinal", () => {

@@ -11,6 +11,7 @@ export interface ResolveTransformModeArgs {
 }
 
 const warnedShadowProjects = new Set<string>();
+const warnedCavemanProjects = new Set<string>();
 
 const RUST_REQUIRES_USER_SUBC_WARNING =
     "rust mode requires user-level subc configuration; running ts.";
@@ -39,7 +40,11 @@ export function resolveTransformMode(args: ResolveTransformModeArgs): {
     }
 
     if (args.configured === "rust" && args.cavemanCompressionEnabled) {
-        warnings.push(CAVEMAN_RUST_WARNING);
+        const projectKey = args.projectKey ?? "<unspecified-project>";
+        if (!warnedCavemanProjects.has(projectKey)) {
+            warnedCavemanProjects.add(projectKey);
+            warnings.push(CAVEMAN_RUST_WARNING);
+        }
     }
 
     return { mode: args.configured, warnings };

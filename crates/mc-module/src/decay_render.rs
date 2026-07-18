@@ -367,6 +367,7 @@ pub fn extract_m0_block(m0_text: &str, tag: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use sha2::{Digest, Sha256};
 
     fn comp(
         start: i64,
@@ -654,6 +655,130 @@ mod tests {
                 .collect();
             let got = render_decayed_compartments(&comps, case.budget, no_guard);
             assert_eq!(got, case.body, "render mismatch in case {n}");
+        }
+    }
+
+    #[test]
+    fn redacted_store_shape_matches_ts_at_real_history_budgets() {
+        #[derive(Deserialize)]
+        struct ShapeFixture {
+            compartments: Vec<RawComp>,
+        }
+        #[derive(Deserialize)]
+        struct DifferentialCase {
+            budget: f64,
+            #[serde(rename = "tsCost")]
+            ts_cost: usize,
+            #[serde(rename = "tsTierCounts")]
+            ts_tier_counts: [usize; 5],
+            #[serde(rename = "bodySha256")]
+            body_sha256: String,
+        }
+        #[derive(Deserialize)]
+        struct DifferentialFixture {
+            cases: Vec<DifferentialCase>,
+        }
+
+        let shape: ShapeFixture =
+            serde_json::from_str(include_str!("../testdata/decay-store-shape.json"))
+                .expect("parse redacted store shape");
+        assert_eq!(
+            shape.compartments.len(),
+            388,
+            "fixture must preserve the store shape"
+        );
+        let compartments: Vec<DecayRenderCompartment> = shape
+            .compartments
+            .iter()
+            .map(|raw| DecayRenderCompartment {
+                start_message: raw.start,
+                end_message: raw.end,
+                title: raw.title.clone(),
+                content: raw.content.clone(),
+                start_date: raw.start_date.clone(),
+                end_date: raw.end_date.clone(),
+                p1: raw.p1.clone(),
+                p2: raw.p2.clone(),
+                p3: raw.p3.clone(),
+                p4: raw.p4.clone(),
+                importance: raw.importance,
+                legacy: raw.legacy,
+            })
+            .collect();
+        let differential: DifferentialFixture =
+            serde_json::from_str(include_str!("../testdata/decay-store-differential.json"))
+                .expect("parse TS differential table");
+        assert_eq!(differential.cases.len(), 4);
+
+        let mut previous_cost = None;
+        for case in &differential.cases {
+            let body = render_decayed_compartments(
+                &compartments,
+                case.budget,
+                mc_tokenizer::estimate_tokens,
+            );
+            let rust_cost = mc_tokenizer::estimate_tokens(&body);
+            assert_eq!(
+                rust_cost, case.ts_cost,
+                "token cost drift at budget {}",
+                case.budget
+            );
+            assert!(
+                rust_cost as f64 <= case.budget || body.is_empty(),
+                "render exceeded budget {} with {} tokens",
+                case.budget,
+                rust_cost
+            );
+            if let Some(previous) = previous_cost {
+                assert!(
+                    rust_cost > previous,
+                    "shrinking budget must not grow rendered cost: previous {previous}, current {rust_cost}"
+                );
+            }
+            previous_cost = Some(rust_cost);
+
+            let digest = Sha256::digest(body.as_bytes());
+            let rust_hash = digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(
+                rust_hash, case.body_sha256,
+                "byte drift at budget {}",
+                case.budget
+            );
+
+            let sections = if body.is_empty() {
+                Vec::new()
+            } else {
+                body.split("\n\n").collect::<Vec<_>>()
+            };
+            let mut tier_counts = [0usize; 5];
+            for compartment in &compartments {
+                let heading = format!(
+                    "## {}-{}",
+                    compartment.start_message, compartment.end_message
+                );
+                let section = sections
+                    .iter()
+                    .find(|section| section.starts_with(&heading))
+                    .copied();
+                let mut selected = 5usize;
+                for tier in 1..=5u8 {
+                    if render_compartment_at_tier(compartment, tier).as_str()
+                        == section.unwrap_or("")
+                    {
+                        selected = tier as usize;
+                        break;
+                    }
+                }
+                tier_counts[selected - 1] += 1;
+            }
+            assert_eq!(
+                tier_counts, case.ts_tier_counts,
+                "tier drift at budget {}",
+                case.budget
+            );
         }
     }
 

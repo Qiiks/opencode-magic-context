@@ -1,7 +1,10 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
-import { getOverflowState } from "../../features/magic-context/storage-meta-persisted";
+import {
+    getOverflowState,
+    loadPersistedUsage,
+} from "../../features/magic-context/storage-meta-persisted";
 import { log, sessionLog } from "../../shared/logger";
-import { getSdkContextLimit } from "../../shared/models-dev-cache";
+import { getSdkContextLimit, isSaneLimit } from "../../shared/models-dev-cache";
 
 export const DEFAULT_CONTEXT_LIMIT = 128_000;
 const MAX_EXECUTE_THRESHOLD = 80;
@@ -52,16 +55,22 @@ export function resolveContextLimit(
 
 /**
  * Like resolveContextLimit, but returns a limit ONLY when it is TRUSTED for the
- * current model — i.e. it came from a real models.dev hit (or user override) or
- * a detected-overflow limit. Returns `undefined` when neither is available,
- * rather than the generic 128K `DEFAULT_CONTEXT_LIMIT`.
+ * current model, rather than the generic 128K `DEFAULT_CONTEXT_LIMIT`.
+ *
+ * Resolution precedence is:
+ *   1. models.dev or a user provider override.
+ *   2. A detected-overflow limit when it is smaller than the models.dev limit,
+ *      or whenever models.dev has no entry.
+ *   3. A sane persisted usage-reported limit when models.dev and overflow
+ *      detection are both unavailable, but only when its observed model key
+ *      matches the current model key.
  *
  * The history-budget resolver needs this distinction: deriving the decay budget
  * from a bare 128K guess for an UNKNOWN model would shrink history below what
  * the live-usage back-derivation would yield for a large-context model. So the
- * budget resolver only trusts a real/detected limit and otherwise falls back to
- * live-usage. (resolveContextLimit itself must keep returning 128K for pressure
- * math, which needs a positive denominator.)
+ * budget resolver only trusts a real, detected, or model-matched usage-reported
+ * limit and otherwise falls back to live-usage. (resolveContextLimit itself must
+ * keep returning 128K for pressure math, which needs a positive denominator.)
  */
 export function resolveTrustedContextLimit(
     providerID: string | undefined,
@@ -84,14 +93,34 @@ export function resolveTrustedContextLimit(
         }
     }
 
-    // A detected (real) limit overrides the cache only when smaller — providers
-    // never under-report. When models.dev has no entry, a detected limit is the
-    // only trusted signal we have.
+    // A detected (real) limit overrides the cache only when smaller, because
+    // providers never under-report. When models.dev has no entry, a detected
+    // limit is the next trusted signal we have.
     if (typeof fromModelsDev === "number" && fromModelsDev > 0) {
         if (detected !== undefined && detected < fromModelsDev) return detected;
         return fromModelsDev;
     }
-    return detected;
+    if (detected !== undefined) {
+        return detected;
+    }
+
+    // Usage reports are trusted only for the model that produced them. A
+    // session-scoped limit from a previous model must not leak across a switch.
+    if (modelKey && ctx?.db && ctx.sessionID) {
+        try {
+            const persisted = loadPersistedUsage(ctx.db, ctx.sessionID);
+            if (
+                persisted?.lastObservedModelKey === modelKey &&
+                isSaneLimit(persisted.lastUsageContextLimit)
+            ) {
+                return persisted.lastUsageContextLimit;
+            }
+        } catch {
+            // best-effort; ignore
+        }
+    }
+
+    return undefined;
 }
 
 export function resolveCacheTtl(cacheTtl: CacheTtlConfig, modelKey: string | undefined): string {

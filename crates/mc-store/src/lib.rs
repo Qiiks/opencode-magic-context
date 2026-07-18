@@ -1381,10 +1381,15 @@ pub struct ModuleMeta {
     /// after OpenCode rebuilds the native message array from its database.
     #[serde(default)]
     pub reasoning_cleared_through_ordinal: u64,
-    /// The request-local reduction surface state committed with the rendered identity.
+    /// The request-local Claude Code mechanics state committed with the rendered identity.
     /// Missing legacy metadata is false, which preserves the dormant render path.
     #[serde(default)]
     pub cc_u1_active: bool,
+    /// The request-local tagging surface latch committed with the rendered identity.
+    /// Both the current request and this durable latch must be active before overlay bytes
+    /// render, so a transition pass can coordinate one cache-breaking HARD first.
+    #[serde(default)]
+    pub tagging_surface_active: bool,
     /// Reclaimable-token amount at the last Channel-1 append or suppression reset.
     #[serde(default)]
     pub channel1_last_nudge_undropped: i64,

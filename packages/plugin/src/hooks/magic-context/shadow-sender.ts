@@ -18,6 +18,7 @@ import {
     getAutoSearchHintDecisions,
     getPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { getActiveUserMemories } from "../../features/magic-context/user-memory/storage-user-memory";
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
@@ -219,6 +220,13 @@ interface ShadowWorkspacePayload {
     members: Array<{ project_path: string; share_categories: string[] }>;
 }
 
+interface ShadowWorkspaceContext {
+    workspace: ShadowWorkspacePayload | null;
+    expandedIdentities: string[];
+    ownIdentities: string[];
+    shareCategories: string[] | null;
+}
+
 interface ShadowStateSyncPayload {
     method: "state_sync";
     params: {
@@ -241,6 +249,12 @@ interface ShadowStateSyncPayload {
     watermarks: ShadowWatermarks;
     wireBatches?: ShadowStateSyncPayload[];
 }
+
+type ShadowSeedItem =
+    | { kind: "compartment"; value: unknown }
+    | { kind: "memory"; value: unknown }
+    | { kind: "memory_mutation"; value: unknown }
+    | { kind: "user_profile"; value: string };
 
 function flatWireBodyBytes(payload: ShadowStateSyncPayload): number {
     return moduleWireBodyBytes(payload);
@@ -315,11 +329,11 @@ function cloneJson<T>(value: T): T {
     return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function _yieldToEventLoop(): Promise<void> {
+function yieldToEventLoop(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function _stableHash(value: string): string {
+function stableHash(value: string): string {
     return createHmac("sha256", "magic-context-shadow-watermark").update(value).digest("hex");
 }
 
@@ -335,7 +349,7 @@ function canonicalJson(value: unknown): string {
     return encoded === undefined ? "null" : encoded;
 }
 
-function _shadowTransformPageDigest(pageArrays: Record<string, unknown>): string {
+function shadowTransformPageDigest(pageArrays: Record<string, unknown>): string {
     // Hash the JSON wire values, not in-memory undefined properties that JSON.stringify drops.
     const wireArrays = JSON.parse(JSON.stringify(pageArrays)) as Record<string, unknown>;
     return createHash("sha256").update(canonicalJson(wireArrays)).digest("hex");
@@ -764,7 +778,7 @@ function buildShadowTransformBody(args: { pass: PreparedShadowPass; state: Sessi
     };
 }
 
-const _SHADOW_TRANSFORM_ARRAY_FIELDS = [
+const SHADOW_TRANSFORM_ARRAY_FIELDS = [
     "input",
     "messages",
     "ts_output",

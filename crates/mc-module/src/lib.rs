@@ -92,8 +92,8 @@ use subc_protocol::{
 use transform::ReductionDecision;
 use transform::{transform_with_projection, DeclaredTrim, HistorianDiagnostics, TransformRequest};
 
-/// The per-route binding: the project, harness, session-slot value, and render budget
-/// frozen at bind. Transform routes carry the durable session in `session`; MCP facade
+/// The per-route binding: the project, harness, session-slot value, and fallback render
+/// budget frozen at bind. Transform routes carry the durable session in `session`; MCP facade
 /// routes carry an instance token there and must resolve it before touching the store.
 /// The project is NEVER taken from a per-pass request field — a crafted request could
 /// spoof it to read another project's memories — so it lives here, keyed by the route
@@ -105,10 +105,8 @@ pub struct SessionBinding {
     pub session: String,
     pub model_key: Option<String>,
     pub config: McModuleConfig,
-    /// The history budget (tokens) FROZEN at bind. Byte-affecting (a different budget → a
-    /// different m0 trim → different bytes), so it's read once and never per-pass. A
-    /// default for now (reading it from config is a later refinement); the freeze-once is
-    /// the load-bearing part — it can't change mid-session.
+    /// The fallback history budget (tokens) frozen at bind. A transform request may carry
+    /// a newer harness-resolved value because config can change while the route remains open.
     pub history_budget_tokens: f64,
 }
 
@@ -168,16 +166,28 @@ pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     }
 }
 
-/// Normalize the request-local Claude Code surface signal once. Every behavior tied to
-/// the reduction tool consumes this value rather than maintaining an independent gate.
+/// Normalize the request-local Claude Code surface signal once. This remains limited to
+/// Claude Code mechanics such as the Thalamus acknowledgement contract and guidance variant.
 pub const fn cc_u1_active(profile: Option<SerializerProfile>, tool_present: bool) -> bool {
     matches!(profile, Some(SerializerProfile::ClaudeCodeAnthropic)) && tool_present
 }
 
+/// Return whether the provider-visible tagging and reduction overlay may be enabled.
+/// OpenCode uses the same overlay when its session exposes ctx_reduce.
+pub const fn tagging_surface_active(
+    profile: Option<SerializerProfile>,
+    tool_present: bool,
+) -> bool {
+    matches!(
+        profile,
+        Some(SerializerProfile::ClaudeCodeAnthropic | SerializerProfile::OpencodeAiSdk)
+    ) && tool_present
+}
+
 /// The tagger component of the effective render identity. A false request contributes
 /// no component, preserving the render identity used before the capability existed.
-pub const fn tagger_feature_epoch(cc_u1_active: bool) -> u32 {
-    if cc_u1_active {
+pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
+    if tagging_surface_active {
         TAGGER_FEATURE_EPOCH
     } else {
         0
@@ -4095,12 +4105,25 @@ impl McHandler {
         } else {
             "present"
         };
-        let surface = if loaded.meta.cc_u1_active {
+        let surface = if loaded.meta.tagging_surface_active || loaded.meta.cc_u1_active {
             "active"
         } else {
             "inactive"
         };
         let historian = historian_status_summary(&loaded.meta.historian);
+        // When the Rust module is active, it manages the frozen m0 in its own store
+        // instead of the harness SQLite cache. Report the exact session-history slice so
+        // status attribution does not estimate size by summing all raw-history p1 rows.
+        let compartment_tokens = loaded
+            .core
+            .frozen_units
+            .iter()
+            .find(|unit| unit.key == "m0")
+            .and_then(|unit| {
+                decay_render::extract_m0_block(&unit.frozen_payload, "session-history")
+            })
+            .map(|block| mc_tokenizer::estimate_tokens(&block))
+            .unwrap_or(0);
         let newest_pass_at = pass_trace
             .as_ref()
             .map(|trace| {
@@ -4140,6 +4163,7 @@ impl McHandler {
             "row_version": loaded.row_version,
             "boundary_present": !loaded.core.boundary_id.trim().is_empty(),
             "compartment_count": compartment_count,
+            "compartment_tokens": compartment_tokens,
             "pending_drop_count": pending_drop_count,
             "usage": {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
@@ -5162,7 +5186,13 @@ impl McHandler {
             let producer_ctx = transform::ProducerContext {
                 project_path: &project_path,
                 project_directory: &project_path,
-                history_budget_tokens: binding.history_budget_tokens,
+                // The authority adapter resolves this from the model context limit and
+                // sends it on each pass. Keep the bind-time value only for older callers
+                // that omit the field, and reject unusable values without disabling decay.
+                history_budget_tokens: parsed
+                    .history_budget_tokens
+                    .filter(|budget| budget.is_finite() && *budget >= 0.0)
+                    .unwrap_or(binding.history_budget_tokens),
                 memory_enabled: binding.config.memory_enabled,
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
@@ -6482,6 +6512,7 @@ impl McHandler {
             mid_turn: parsed.pass_inputs.mid_turn,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
+            history_budget_tokens: None,
             declared_trim: parsed.declared_trim.clone(),
         };
         let shadow_project = shadow_project_path(&binding.session);
@@ -7088,9 +7119,8 @@ impl ModuleHandler for McHandler {
                 session: req.identity.session.clone(),
                 model_key: None,
                 config,
-                // Frozen at bind. Currently a default constant (reading it from config is a
-                // later refinement); the load-bearing part is the freeze-once — a different
-                // budget would change the rendered m0 bytes, so it can't move mid-session.
+                // Older callers may omit the per-pass budget. Keep a safe fallback on the
+                // route, while authority requests carry the harness-resolved value.
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
             },
         );
@@ -11981,6 +12011,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn authority_transform_uses_request_history_budget_on_hard() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        store
+            .replace_compartments(
+                "ses",
+                &[
+                    stored_comp(1, 1, 40, "m40", &"OLD ".repeat(200)),
+                    stored_comp(2, 41, 80, "m80", &"NEW ".repeat(200)),
+                ],
+            )
+            .unwrap();
+        let mut request = request(big_messages());
+        request["history_budget_tokens"] = json!(300.0);
+
+        let response = call_transform_request(&handler, request).await;
+        assert_eq!(response["action"], "HARD");
+        let m0 = m0_text(&response);
+        assert!(m0.contains("NEW"), "newest compartment remains at P1: {m0}");
+        assert!(
+            !m0.contains("OLD"),
+            "request budget must reach the HARD decay renderer: {m0}"
+        );
+        let status = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        let history = decay_render::extract_m0_block(&m0, "session-history").unwrap();
+        assert_eq!(
+            status["compartment_tokens"],
+            json!(mc_tokenizer::estimate_tokens(&history))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn handler_full_autonomous_cycle_fires_publishes_and_next_pass_folds() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
@@ -12725,6 +12791,55 @@ mod tests {
         let retry = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn opencode_raw_drop_range_resolves_minted_tags_and_drains_on_next_bust() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let messages = (1..=25u64)
+            .map(|ordinal| {
+                let mid = format!("m{ordinal}");
+                let text = format!("output {ordinal}");
+                ck(&mid, ordinal, &text)
+            })
+            .collect::<Vec<_>>();
+        let mut transform_request = request(messages);
+        transform_request["serializer_profile"] = json!("opencode-aisdk");
+        transform_request["tool_present"] = json!(true);
+        transform_request["serve_native"] = json!(true);
+
+        let transition = call_transform_request(&handler, transform_request.clone()).await;
+        assert_eq!(transition["surface_state"], "transition");
+        let tagged = call_transform_request(&handler, transform_request.clone()).await;
+        assert_eq!(tagged["surface_state"], "active");
+        let tagged_bytes = serde_json::to_string(&tagged["ck_messages"]).unwrap();
+        assert!(tagged_bytes.contains("§1§ output 1"));
+        assert!(tagged_bytes.contains("§2§ output 2"));
+        assert!(tagged_bytes.contains("§3§ output 3"));
+        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 25);
+
+        let queued = match handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1-3",
+                "command_id": "opencode-drop-range",
+            }),
+        ) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        assert_eq!(queued, json!({ "ok": true, "queued": 3 }));
+
+        transform_request["render_config"] = json!("cfg1");
+        let drained = call_transform_request(&handler, transform_request).await;
+        let drained_bytes = serde_json::to_string(&drained["ck_messages"]).unwrap();
+        assert!(drained_bytes.contains("[dropped §1§]"));
+        assert!(drained_bytes.contains("[dropped §2§]"));
+        assert!(drained_bytes.contains("[dropped §3§]"));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

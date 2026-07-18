@@ -64,6 +64,7 @@ export function resolveSchedulerDecision(
     contextUsage: ContextUsage,
     sessionId: string,
     modelKey?: string,
+    contextLimit?: number,
 ): "execute" | "defer" {
     try {
         const schedulerDecision = scheduler.shouldExecute(
@@ -72,6 +73,7 @@ export function resolveSchedulerDecision(
             undefined,
             sessionId,
             modelKey,
+            contextLimit,
         );
         sessionLog(
             sessionId,

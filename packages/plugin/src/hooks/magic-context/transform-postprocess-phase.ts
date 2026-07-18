@@ -23,6 +23,14 @@ import {
     setPersistedTodoSyntheticAnchor,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import {
+    getPersistedCompactionMarkerState,
+    type PersistedCompactionMarkerState,
+} from "../../features/magic-context/storage-meta-persisted";
+import {
+    getTagNumberByMessageId,
+    updateTagStatus,
+} from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { SessionMeta, TagEntry } from "../../features/magic-context/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
@@ -31,6 +39,7 @@ import { sessionLog } from "../../shared/logger";
 import { runAutoSearchHint } from "./auto-search-runner";
 import { applyDeferredCompactionMarker, MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { getActiveCompartmentRun } from "./compartment-runner";
+import type { CtxReduceAvailabilityVerdict } from "./ctx-reduce-availability";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
@@ -58,7 +67,7 @@ import {
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
-import { buildSyntheticTodoPart } from "./todo-view";
+import { buildSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
     buildSyntheticToolReclaimOps,
@@ -91,40 +100,118 @@ export type DeferredCompactionMarkerClearOutcome =
     | "cas-lost-newer-pending"
     | "cas-lost-already-cleared";
 
+function isSyntheticHeadMessage(message: MessageLike): boolean {
+    // The flag alone is input-controlled metadata: a persisted or foreign row
+    // could carry it and absorb a real message into the injected head, shifting
+    // the summary's canonical position. Require the exact shape only
+    // prependM0M1Messages produces: an ID-less user message whose every part is
+    // marked synthetic. Persisted OpenCode rows always carry an id, so they can
+    // never satisfy this regardless of their metadata.
+    if (message.info.syntheticHead !== true) return false;
+    if (message.info.id !== undefined) return false;
+    if (message.info.role !== "user") return false;
+    const parts = message.parts;
+    if (parts.length === 0) return false;
+    return parts.every((part) => (part as { synthetic?: boolean }).synthetic === true);
+}
+
+const TODO_HEAD_ANCHOR_ID = "__magic_context_todo_head__";
+
+function injectSyntheticTodoAtHead(
+    messages: MessageLike[],
+    sessionId: string,
+    part: SyntheticTodoPart,
+): string {
+    let headEnd = 0;
+    while (headEnd < messages.length && isSyntheticHeadMessage(messages[headEnd])) {
+        headEnd += 1;
+    }
+    const existing = messages[headEnd];
+    if (existing?.info.id === TODO_HEAD_ANCHOR_ID) {
+        injectToolPartIntoAssistantById(messages, TODO_HEAD_ANCHOR_ID, part);
+        return TODO_HEAD_ANCHOR_ID;
+    }
+    messages.splice(headEnd, 0, {
+        info: {
+            id: TODO_HEAD_ANCHOR_ID,
+            role: "assistant",
+            sessionID: sessionId,
+        },
+        parts: [part],
+    });
+    return TODO_HEAD_ANCHOR_ID;
+}
+
+function injectPersistedTodoAnchor(
+    messages: MessageLike[],
+    sessionId: string,
+    messageId: string,
+    part: SyntheticTodoPart,
+): boolean {
+    if (injectToolPartIntoAssistantById(messages, messageId, part)) return true;
+    if (messageId !== TODO_HEAD_ANCHOR_ID) return false;
+    injectSyntheticTodoAtHead(messages, sessionId, part);
+    return true;
+}
+
+function dropMarkerSummaryTag(
+    db: ContextDatabase,
+    sessionId: string,
+    summaryMessageId: string,
+): void {
+    const tagNumber = getTagNumberByMessageId(db, sessionId, `${summaryMessageId}:p0`);
+    if (tagNumber !== null) updateTagStatus(db, sessionId, tagNumber, "dropped");
+}
+
 /**
- * Add the deferred marker summary to the current transform array before the
- * marker row becomes visible in OpenCode's database-backed input.
+ * Replay the persisted marker representation on every pass.
  *
- * OpenCode runs this transform before provider serialization. On the next pass
- * it supplies a separate summary assistant before the retained tail, and the
- * Anthropic serializer groups adjacent assistant messages into one wire
- * message. Adding the same source assistant now keeps both passes' provider
- * content blocks identical. Other providers retain the source message
- * boundary, which is also the representation they receive on the next pass.
- *
- * The summary tag is allocated now, after the current pass has assigned all
- * visible tags. The allocation is persisted under the summary part's stable
- * content id, so the next pass reuses the same §N§ prefix when it tags the
- * database-backed summary row.
+ * OpenCode projects a completed summary immediately before the retained tail.
+ * The transform prepends synthetic history slots later, so the canonical array
+ * position is after the contiguous synthetic head and before every real tail
+ * message, regardless of role. Rebuilding from persisted state also removes
+ * stale loser-process arrays and duplicate summaries deterministically.
  */
-export function injectDeferredCompactionSummaryRepresentation(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    messages: MessageLike[];
-    tagger: Tagger;
-    summaryMessageId: string;
-    ctxReduceCallable: boolean;
-}): boolean {
-    if (args.messages.some((message) => message.info.id === args.summaryMessageId)) {
-        return false;
+export function reconcileMarkerRepresentation(
+    messages: MessageLike[],
+    persistedMarkerState: PersistedCompactionMarkerState | null,
+    options: {
+        db: ContextDatabase;
+        sessionId: string;
+        tagger: Tagger;
+        ctxReduceAvailability: CtxReduceAvailabilityVerdict;
+    },
+): boolean {
+    const retainedMessages: MessageLike[] = [];
+    const staleSummaryIds = new Set<string>();
+    for (const message of messages) {
+        if (message.info.summary !== true) {
+            retainedMessages.push(message);
+            continue;
+        }
+        const messageId = message.info.id;
+        if (typeof messageId === "string" && messageId !== persistedMarkerState?.summaryMessageId) {
+            staleSummaryIds.add(messageId);
+        }
+    }
+    if (staleSummaryIds.size > 0) {
+        options.db.transaction(() => {
+            for (const messageId of staleSummaryIds) {
+                dropMarkerSummaryTag(options.db, options.sessionId, messageId);
+            }
+        })();
     }
 
-    const summaryTagNumber = args.tagger.assignTag(
-        args.sessionId,
-        `${args.summaryMessageId}:p0`,
+    const removedSummary = retainedMessages.length !== messages.length;
+    if (removedSummary) messages.splice(0, messages.length, ...retainedMessages);
+    if (persistedMarkerState === null) return removedSummary;
+
+    const summaryTagNumber = options.tagger.assignTag(
+        options.sessionId,
+        `${persistedMarkerState.summaryMessageId}:p0`,
         "message",
         byteSize(MARKER_SUMMARY_TEXT),
-        args.db,
+        options.db,
         0,
         null,
         0,
@@ -135,28 +222,29 @@ export function injectDeferredCompactionSummaryRepresentation(args: {
             reasoningTokenCount: null,
         }),
     );
-    const summaryText = args.ctxReduceCallable
-        ? prependTag(summaryTagNumber, MARKER_SUMMARY_TEXT)
-        : MARKER_SUMMARY_TEXT;
+    const summaryText =
+        options.ctxReduceAvailability.frozen && options.ctxReduceAvailability.callable
+            ? prependTag(summaryTagNumber, MARKER_SUMMARY_TEXT)
+            : MARKER_SUMMARY_TEXT;
     const summaryMessage: MessageLike = {
         info: {
-            id: args.summaryMessageId,
+            id: persistedMarkerState.summaryMessageId,
             role: "assistant",
-            sessionID: args.sessionId,
+            sessionID: options.sessionId,
             summary: true,
             finish: "stop",
         },
         parts: [{ type: "text", text: summaryText }],
     };
 
-    const firstTailAssistant = args.messages.findIndex(
-        (message) => message.info.role === "assistant" && message.info.summary !== true,
-    );
-    args.messages.splice(
-        firstTailAssistant >= 0 ? firstTailAssistant : args.messages.length,
-        0,
-        summaryMessage,
-    );
+    let retainedTailStart = 0;
+    while (
+        retainedTailStart < messages.length &&
+        isSyntheticHeadMessage(messages[retainedTailStart])
+    ) {
+        retainedTailStart += 1;
+    }
+    messages.splice(retainedTailStart, 0, summaryMessage);
     return true;
 }
 
@@ -205,7 +293,7 @@ interface RunPostTransformPhaseArgs {
     reasoningByMessage: Map<MessageLike, { type: string; thinking?: string; text?: string }[]>;
     messageTagNumbers: Map<MessageLike, number>;
     tagger: Tagger;
-    ctxReduceCallable: boolean;
+    ctxReduceAvailability: CtxReduceAvailabilityVerdict;
     batch: { finalize: () => void } | null;
     contextUsage: { percentage: number; inputTokens: number };
     schedulerDecision: "execute" | "defer";
@@ -1157,6 +1245,94 @@ export async function runPostTransformPhase(
     // fire (fullFeatureMode), so we skip the scan in subagent sessions.
     logTransformTiming(args.sessionId, "pp.nudgeAndSticky", tNudgeBlock);
 
+    const explicitRebuildHappened =
+        args.historyRefreshExplicitBeforePrepare && args.rebuiltHistoryFromInitialPrepare;
+    const materializationSatisfied =
+        !deferredMaterializationWasPending ||
+        explicitMaterializedSuccessfully ||
+        deferredMaterializedSuccessfully;
+    const historyWasConsumedThisPass =
+        args.historyRebuiltThisPass &&
+        (args.canConsumeDeferredLate ||
+            args.phaseJustAwaitedPublication ||
+            explicitRebuildHappened) &&
+        materializationSatisfied;
+
+    // Drain the persisted marker before todo synthesis so the todo anchor sees
+    // the same summary representation that this pass will emit.
+    let suppressV12HistoryDrain = false;
+    if (historyWasConsumedThisPass && args.deferredHistoryWasPendingAtPassStart) {
+        const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
+        if (pending) {
+            if (
+                !pendingMarkerCoveredByConsumedBoundary(pending, args.pendingCompartmentInjection)
+            ) {
+                suppressV12HistoryDrain = true;
+                sessionLog(
+                    args.sessionId,
+                    `compaction-marker drain: pending ordinal ${pending.ordinal} is newer than consumed boundary ${args.pendingCompartmentInjection?.compartmentEndMessage ?? "<none>"}; preserving deferred history refresh signal`,
+                );
+            } else {
+                const outcome = applyDeferredCompactionMarker(
+                    args.db,
+                    args.sessionId,
+                    pending,
+                    args.sessionDirectory,
+                );
+                switch (outcome.kind) {
+                    case "applied":
+                    case "already-current":
+                    case "stale-skip":
+                        if (
+                            clearPendingCompactionMarkerAfterSuccessfulDrain({
+                                db: args.db,
+                                sessionId: args.sessionId,
+                                pending,
+                                deferredHistoryRefreshSessions: args.deferredHistoryRefreshSessions,
+                            }) === "cas-lost-newer-pending"
+                        ) {
+                            suppressV12HistoryDrain = true;
+                        }
+                        break;
+                    case "retryable-failure":
+                        args.passOutcome?.record("compaction-marker-drain-failure");
+                        sessionLog(
+                            args.sessionId,
+                            "compaction-marker drain: retryable failure; preserving deferred history refresh signal",
+                            outcome.error,
+                        );
+                        suppressV12HistoryDrain = true;
+                        break;
+                }
+            }
+        }
+    }
+
+    reconcileMarkerRepresentation(
+        args.messages,
+        getPersistedCompactionMarkerState(args.db, args.sessionId),
+        {
+            db: args.db,
+            sessionId: args.sessionId,
+            tagger: args.tagger,
+            ctxReduceAvailability: args.ctxReduceAvailability,
+        },
+    );
+
+    const deferredHistoryDrainEligible =
+        historyWasConsumedThisPass &&
+        args.deferredHistoryWasPendingAtPassStart &&
+        !suppressV12HistoryDrain;
+    if (deferredHistoryDrainEligible) {
+        args.deferredHistoryRefreshSessions.delete(args.sessionId);
+    }
+    if (
+        (explicitMaterializedSuccessfully || deferredMaterializedSuccessfully) &&
+        deferredMaterializationAtPassStart
+    ) {
+        args.deferredMaterializationSessions.delete(args.sessionId);
+    }
+
     const tNoteAndTodo = performance.now();
     const noteReadStillVisible = args.fullFeatureMode
         ? hasVisibleNoteReadCall(args.messages)
@@ -1187,10 +1363,12 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Todo state synthesis — inject a synthetic `todowrite` tool part into
-    // the latest assistant message so the agent reads current todos through
-    // their native todowrite-tracking mental model. The wire shape is
-    // identical to OpenCode's stored todowrite tool parts, so providers,
+    // Todo state synthesis: inject a synthetic `todowrite` tool part into the
+    // latest eligible assistant so the agent reads current todos through its
+    // native todowrite-tracking mental model. Summary assistants are excluded
+    // because marker reconciliation rebuilds them. When no eligible assistant
+    // exists, the pair uses a deterministic head anchor before the retained tail.
+    // The wire shape is identical to OpenCode's stored todowrite tool parts, so providers,
     // serializers, and downstream code see something indistinguishable from
     // a real call.
     //
@@ -1217,7 +1395,12 @@ export async function runPostTransformPhase(
             } else if (
                 persistedAnchor &&
                 persistedAnchor.callId === part.callID &&
-                injectToolPartIntoAssistantById(args.messages, persistedAnchor.messageId, part)
+                injectPersistedTodoAnchor(
+                    args.messages,
+                    args.sessionId,
+                    persistedAnchor.messageId,
+                    part,
+                )
             ) {
                 // Snapshot unchanged AND persisted anchor message still
                 // present — idempotent re-inject leaves DB and messages
@@ -1247,25 +1430,20 @@ export async function runPostTransformPhase(
                     );
                 }
             } else {
-                const anchoredMessageId = injectToolPartIntoLatestAssistant(args.messages, part);
-                if (anchoredMessageId) {
-                    setPersistedTodoSyntheticAnchor(
-                        args.db,
-                        args.sessionId,
-                        part.callID,
-                        anchoredMessageId,
-                        // Persist the SNAPSHOT we injected, not just the
-                        // callID. Defer-pass replay rebuilds from THIS state
-                        // so prefix bytes stay identical even if a real
-                        // `todowrite` mutates `last_todo_state` before the
-                        // next cache-busting pass.
-                        args.sessionMeta.lastTodoState,
-                    );
-                } else if (persistedAnchor) {
-                    // No assistant message in this pass — clear stale
-                    // anchor so a later cache-busting pass re-anchors fresh.
-                    clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
-                }
+                const anchoredMessageId =
+                    injectToolPartIntoLatestAssistant(args.messages, part) ??
+                    injectSyntheticTodoAtHead(args.messages, args.sessionId, part);
+                setPersistedTodoSyntheticAnchor(
+                    args.db,
+                    args.sessionId,
+                    part.callID,
+                    anchoredMessageId,
+                    // Persist the SNAPSHOT we injected, not just the callID.
+                    // Defer-pass replay rebuilds from THIS state so prefix bytes
+                    // stay identical even if a real todowrite mutates
+                    // last_todo_state before the next cache-busting pass.
+                    args.sessionMeta.lastTodoState,
+                );
             }
         } else if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
             // Defer pass — byte-identical replay. Rebuild the part from the
@@ -1284,7 +1462,12 @@ export async function runPostTransformPhase(
             // matching legacy behavior.
             const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
             if (part !== null && part.callID === persistedAnchor.callId) {
-                injectToolPartIntoAssistantById(args.messages, persistedAnchor.messageId, part);
+                injectPersistedTodoAnchor(
+                    args.messages,
+                    args.sessionId,
+                    persistedAnchor.messageId,
+                    part,
+                );
             }
         }
     }
@@ -1300,21 +1483,8 @@ export async function runPostTransformPhase(
     // running embedding on subagent input wastes cycles + saturates the
     // embedding endpoint when many subagents run in parallel (e.g. Athena
     // council).
-    const explicitRebuildHappened =
-        args.historyRefreshExplicitBeforePrepare && args.rebuiltHistoryFromInitialPrepare;
-    const materializationSatisfied =
-        !deferredMaterializationWasPending ||
-        explicitMaterializedSuccessfully ||
-        deferredMaterializedSuccessfully;
-    const historyWasConsumedThisPass =
-        args.historyRebuiltThisPass &&
-        (args.canConsumeDeferredLate ||
-            args.phaseJustAwaitedPublication ||
-            explicitRebuildHappened) &&
-        materializationSatisfied;
-
-    // Plan v6 §3 degraded-cache counter: track consecutive null-boundary
-    // rebuilds. Independent of the drain logic below.
+    // Degraded-cache counter: track consecutive null-boundary rebuilds.
+    // This bookkeeping is independent of marker reconciliation.
     if (args.compartmentInjectionRebuiltFromDb && args.pendingCompartmentInjection) {
         if (args.pendingCompartmentInjection.compartmentEndMessageId === null) {
             const nextCount = (degradedCacheCountBySession.get(args.sessionId) ?? 0) + 1;
@@ -1328,93 +1498,6 @@ export async function runPostTransformPhase(
         } else {
             degradedCacheCountBySession.delete(args.sessionId);
         }
-    }
-
-    // Plan v6 §3 deferred-marker drain. Runs when v12's
-    // `historyWasConsumedThisPass` is true AND we hold the deferred-history
-    // signal AND a pending marker blob exists. The blob is the in-tx record
-    // written by the incremental runner at publication time (plan v6 §4); the
-    // drain finally applies the marker movement to OpenCode's DB.
-    //
-    // The v12 drain of `deferredHistoryRefreshSessions` still fires below — we
-    // only conditionally suppress it when the marker apply returned
-    // `retryable-failure`, so the next consuming pass retries.
-    let suppressV12HistoryDrain = false;
-    if (historyWasConsumedThisPass && args.deferredHistoryWasPendingAtPassStart) {
-        const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
-        if (pending) {
-            if (
-                !pendingMarkerCoveredByConsumedBoundary(pending, args.pendingCompartmentInjection)
-            ) {
-                // One cache bust must cover BOTH the history rebuild and the marker
-                // advance. Never move OpenCode's marker past history that this pass
-                // actually rendered into m[0]/m[1]; the newer blob belongs to a later
-                // consuming pass whose prepare step includes that compartment boundary.
-                suppressV12HistoryDrain = true;
-                sessionLog(
-                    args.sessionId,
-                    `compaction-marker drain: pending ordinal ${pending.ordinal} is newer than consumed boundary ${args.pendingCompartmentInjection?.compartmentEndMessage ?? "<none>"}; preserving deferred history refresh signal`,
-                );
-            } else {
-                const outcome = applyDeferredCompactionMarker(
-                    args.db,
-                    args.sessionId,
-                    pending,
-                    args.sessionDirectory,
-                );
-                if (outcome.kind === "applied") {
-                    injectDeferredCompactionSummaryRepresentation({
-                        db: args.db,
-                        sessionId: args.sessionId,
-                        messages: args.messages,
-                        tagger: args.tagger,
-                        summaryMessageId: outcome.summaryMessageId,
-                        ctxReduceCallable: args.ctxReduceCallable,
-                    });
-                }
-                switch (outcome.kind) {
-                    case "applied":
-                    case "already-current":
-                    case "stale-skip":
-                        if (
-                            clearPendingCompactionMarkerAfterSuccessfulDrain({
-                                db: args.db,
-                                sessionId: args.sessionId,
-                                pending,
-                                deferredHistoryRefreshSessions: args.deferredHistoryRefreshSessions,
-                            }) === "cas-lost-newer-pending"
-                        ) {
-                            suppressV12HistoryDrain = true;
-                        }
-                        // v12 drain proceeds below unless CAS lost to a newer blob,
-                        // in which case the signal must survive for that blob's pass.
-                        break;
-                    case "retryable-failure":
-                        args.passOutcome?.record("compaction-marker-drain-failure");
-                        sessionLog(
-                            args.sessionId,
-                            "compaction-marker drain: retryable failure; preserving deferred history refresh signal",
-                            outcome.error,
-                        );
-                        suppressV12HistoryDrain = true;
-                        break;
-                }
-            }
-        }
-    }
-
-    const deferredHistoryDrainEligible =
-        historyWasConsumedThisPass &&
-        args.deferredHistoryWasPendingAtPassStart &&
-        !suppressV12HistoryDrain;
-    if (deferredHistoryDrainEligible) {
-        args.deferredHistoryRefreshSessions.delete(args.sessionId);
-    }
-    if (
-        (explicitMaterializedSuccessfully || deferredMaterializedSuccessfully) &&
-        deferredMaterializationAtPassStart
-    ) {
-        args.deferredMaterializationSessions.delete(args.sessionId);
     }
 
     if (

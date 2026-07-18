@@ -454,10 +454,15 @@ own authoritative runtime source, then bounds it to a sane `[20k, 3M]` range
 - **OpenCode** warms `apiCache` from the SDK `config.providers()` (OpenCode's
   fully-resolved config: models.dev + snapshot + opencode.json + auth-plugin
   caps), persisted for cold-start. `getSdkContextLimit()` returns the SDK value
-  or `undefined`. Pi never warms `apiCache`, so for Pi that getter is unused.
+  or `undefined`. When it is undefined, OpenCode's trusted resolver can use the
+  sane `session_meta.last_usage_context_limit` only when
+  `last_observed_model_key` matches the current model. Pi never warms `apiCache`,
+  so for Pi that getter is unused.
 - **Pi** resolves from its own runtime: `getContextUsage().contextWindow`,
   falling back to `ctx.model.contextWindow` (available at model-select, before
-  any message). The detected-overflow limit still overrides both. This is Pi's
+  any message). Because Pi supplies this runtime window even for models absent
+  from models.dev, it does not need the OpenCode persisted-usage fallback. The
+  detected-overflow limit still overrides both. This is Pi's
   equivalent of OpenCode's SDK — instant and auth-correct — so Pi does not call
   `getSdkContextLimit`/`resolveContextLimit`/`resolveTrustedContextLimit` at all.
 

@@ -3,9 +3,9 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { clearSession } from "./storage-meta-session";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
-import { clearSession } from "./storage-meta-session";
 
 function tableExists(db: Database, table: string): boolean {
     return Boolean(
@@ -51,17 +51,13 @@ describe("migration v53: Synapse embedding storage", () => {
             clearSession(db, "ses-v53");
 
             expect(
-                db
-                    .prepare(
-                        "SELECT COUNT(*) AS count FROM synapse_batch_ledger WHERE session_id = ?",
-                    )
-                    .get("ses-v53"),
+                db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger WHERE session_id = ?").get(
+                    "ses-v53",
+                ),
             ).toEqual({ count: 0 });
             expect(
                 db
-                    .prepare(
-                        "SELECT COUNT(*) AS count FROM embedding_measurement_corpus WHERE session_id = ?",
-                    )
+                    .prepare("SELECT COUNT(*) AS count FROM embedding_measurement_corpus WHERE session_id = ?")
                     .get("ses-v53"),
             ).toEqual({ count: 0 });
         } finally {

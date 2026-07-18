@@ -63,16 +63,28 @@ describe("resolveTransformMode", () => {
     });
 
     it("warns when TS-only caveman compression is enabled in rust mode", () => {
+        const projectKey = `transform-mode-caveman-${Date.now()}`;
         const result = resolveTransformMode({
             configured: "rust",
             userTierHasSubc: true,
             shadowTransformEnabled: false,
             cavemanCompressionEnabled: true,
+            projectKey,
         });
 
         expect(result.mode).toBe("rust");
         expect(result.warnings).toEqual([
             "caveman_text_compression is TS-only and inert in rust mode.",
         ]);
+
+        expect(
+            resolveTransformMode({
+                configured: "rust",
+                userTierHasSubc: true,
+                shadowTransformEnabled: false,
+                cavemanCompressionEnabled: true,
+                projectKey,
+            }),
+        ).toEqual({ mode: "rust", warnings: [] });
     });
 });

@@ -8,8 +8,8 @@ import {
     isDatabasePersisted,
     openDatabase,
 } from "../features/magic-context/storage";
-import { getErrorMessage } from "../shared/error-message";
-import { log } from "../shared/logger";
+import { getErrorMessage } from '../shared/error-message';
+import { log } from '../shared/logger';
 import type { Database } from "../shared/sqlite";
 import { createCtxExpandTools } from "../tools/ctx-expand";
 import { CTX_MEMORY_ACTIONS, createCtxMemoryTools } from "../tools/ctx-memory";

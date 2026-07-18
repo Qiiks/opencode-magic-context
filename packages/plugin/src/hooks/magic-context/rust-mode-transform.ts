@@ -8,6 +8,7 @@ import {
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
+import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
 import {
     resolveExecuteThreshold,
     resolveModelKey,
@@ -59,6 +60,9 @@ interface RustSessionState extends ModuleStateSyncState {
     ordinalMemoCanonicalCount: number;
     failureCount: number;
     parkCount: number;
+    syntheticTurnCount: number;
+    lastObservedUserMessageId: string | null;
+    syntheticLoopBreakerLogged: boolean;
 }
 
 export interface RustModeTransformOptions {
@@ -92,6 +96,42 @@ function replaceMessagesInPlace(output: { messages: unknown[] }, next: unknown[]
 function messageInfo(value: unknown): Record<string, unknown> {
     if (!isRecord(value)) return {};
     return isRecord(value.info) ? value.info : value;
+}
+
+function newestUserMessage(messages: MessageLike[]): MessageLike | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (messageInfo(messages[index]).role === "user") return messages[index];
+    }
+    return undefined;
+}
+
+function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
+    if (!message || messageInfo(message).role !== "user" || !Array.isArray(message.parts)) {
+        return false;
+    }
+    return (
+        message.parts.length > 0 &&
+        message.parts.every(
+            (part) => isRecord(part) && (part.synthetic === true || part.ignored === true),
+        )
+    );
+}
+
+function observeSyntheticTurn(state: RustSessionState, messages: MessageLike[]): boolean {
+    const newest = newestUserMessage(messages);
+    const info = messageInfo(newest);
+    const messageId = typeof info.id === "string" ? info.id : null;
+    const synthetic = isSyntheticUserMessage(newest);
+    const isNewMessage = messageId === null || messageId !== state.lastObservedUserMessageId;
+
+    if (!synthetic) {
+        state.syntheticTurnCount = 0;
+        state.syntheticLoopBreakerLogged = false;
+    } else if (isNewMessage) {
+        state.syntheticTurnCount += 1;
+    }
+    state.lastObservedUserMessageId = messageId;
+    return synthetic;
 }
 
 function assertNativeBoundary(output: unknown[], sessionId: string, boundaryId: string): void {
@@ -153,6 +193,9 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             lastAckedWatermarks: null,
             idOrdinalMemoGeneration: 0,
             idOrdinalMemo: new Map(),
+            syntheticTurnCount: 0,
+            lastObservedUserMessageId: null,
+            syntheticLoopBreakerLogged: false,
         };
         states.set(sessionId, state);
     }
@@ -255,6 +298,7 @@ function buildTransformBody(args: {
         mid_turn: args.midTurn,
         model_key: args.modelKey,
         provider_id: args.providerId,
+        tool_present: args.passInputs.tool_present === true,
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
         history_budget_tokens: args.passInputs.history_budget_tokens,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
@@ -397,6 +441,15 @@ export function createRustModeTransform(
     ): Promise<void> => {
         const state = ensureState(states, sessionId);
         state.passCount += 1;
+        const syntheticTurn = observeSyntheticTurn(state, messages);
+        const syntheticLoopBlocked = syntheticTurn && state.syntheticTurnCount >= 3;
+        if (syntheticLoopBlocked && !state.syntheticLoopBreakerLogged) {
+            state.syntheticLoopBreakerLogged = true;
+            sessionLog(
+                sessionId,
+                "RUST LOOP BREAKER: suppressing host directives after three consecutive synthetic turns until a real user message arrives",
+            );
+        }
         const inputCount = messages.length;
         let decision = "error";
         let servedFrom = "none";
@@ -424,6 +477,10 @@ export function createRustModeTransform(
             }
         }
         const rawMessages = messages.slice();
+        const reduceAvailability = resolveCtxReduceAvailability(sessionId);
+        // A provisional fail-open verdict must not activate provider-visible bytes. The
+        // first persisted user message freezes the verdict for all later transform passes.
+        const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
         try {
             const { directory } = await getSessionDirectory(deps, sessionId);
             const model =
@@ -469,6 +526,7 @@ export function createRustModeTransform(
                 cache_ttl: sessionMeta.cacheTtl,
                 mid_turn: midTurn,
                 is_subagent: sessionMeta.isSubagent,
+                tool_present: toolPresent,
             };
             const resolved = await resolveOrdinalsForModule({
                 sessionId,
@@ -598,7 +656,15 @@ export function createRustModeTransform(
             state.passesSincePark = 0;
 
             const directiveText = directiveTextOf(response);
-            if (directiveText) {
+            if (syntheticTurn) {
+                // A pending lease must not escape the breaker through the terminal
+                // event handler while synthetic turns are cascading.
+                try {
+                    casChannel2NudgeState(deps.db, sessionId, "pending", "");
+                } catch {
+                    // The delivery lease remains authoritative if another sender owns it.
+                }
+            } else if (directiveText) {
                 try {
                     casChannel2NudgeState(deps.db, sessionId, "", "pending");
                     await maybeDeliverChannel2(sessionId, {

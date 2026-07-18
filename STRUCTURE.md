@@ -49,17 +49,17 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 **`src/config/`:**
 - Purpose: Parse and validate plugin configuration.
 - Contains: Config loaders, re-exports, and Zod schemas.
-- Key files: `src/config/index.ts`, `src/config/schema/magic-context.ts`, `src/config/schema/agent-overrides.ts`, `src/config/project-security.ts`
+- Key files: `src/config/index.ts`, `src/config/schema/magic-context.ts`, `src/config/schema/agent-overrides.ts`, `src/config/project-security.ts`, `src/config/transform-mode.ts`
 
 **`src/plugin/`:**
 - Purpose: Adapt internal services to OpenCode plugin interfaces.
-- Contains: Hook wrappers, tool registry setup, RPC handlers, dream-timer lifecycle, conflict-warning delivery, per-session hook construction.
-- Key files: `src/plugin/messages-transform.ts`, `src/plugin/event.ts`, `src/plugin/tool-registry.ts`, `src/plugin/hooks/create-session-hooks.ts`, `src/plugin/rpc-handlers.ts`, `src/plugin/dream-timer.ts`, `src/plugin/conflict-warning-hook.ts`
+- Contains: Hook wrappers, tool registry setup, RPC handlers, dream-timer lifecycle, conflict-warning delivery, per-session hook construction, boot quiet period enforcement, and tool backend overrides for Rust mode.
+- Key files: `src/plugin/messages-transform.ts`, `src/plugin/event.ts`, `src/plugin/tool-registry.ts`, `src/plugin/hooks/create-session-hooks.ts`, `src/plugin/rpc-handlers.ts`, `src/plugin/dream-timer.ts`, `src/plugin/conflict-warning-hook.ts`, `src/plugin/boot-quiet.ts`, `src/plugin/rust-tool-backends.ts`
 
 **`src/hooks/`:**
 - Purpose: Hold hook implementations and hook-specific helpers.
-- Contains: The `magic-context` runtime and the auto-update checker.
-- Key files: `src/hooks/magic-context/hook.ts`, `src/hooks/magic-context/transform.ts`, `src/hooks/magic-context/transform-postprocess-phase.ts`, `src/hooks/magic-context/strip-content.ts`, `src/hooks/auto-update-checker/checker.ts`
+- Contains: The `magic-context` runtime, the auto-update checker, and the Rust-mode execution adapter.
+- Key files: `src/hooks/magic-context/hook.ts`, `src/hooks/magic-context/transform.ts`, `src/hooks/magic-context/transform-postprocess-phase.ts`, `src/hooks/magic-context/strip-content.ts`, `src/hooks/auto-update-checker/checker.ts`, `src/hooks/magic-context/rust-mode-transform.ts`, `src/hooks/magic-context/module-state-sync.ts`, `src/hooks/magic-context/module-wire.ts`
 
 **`src/tui/`:**
 - Purpose: Render Magic Context sidebar and `/ctx-status` / `/ctx-recomp` dialogs inside OpenCode's TUI.
@@ -121,6 +121,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/config/index.ts`: Load and merge config files with field-level fallback for invalid leaves; collect warnings rather than disable the plugin.
 - `src/config/schema/magic-context.ts`: Define defaults and schema rules.
 - `src/config/schema/agent-overrides.ts`: Define overridable built-in agents.
+- `src/config/transform-mode.ts`: Resolve transform mode (TS vs Rust) based on configuration and system capabilities.
 - `assets/magic-context.schema.json`: Generated JSON schema, kept in sync via `scripts/build-schema.ts` and `scripts/release.sh`.
 
 **Core Logic:**
@@ -133,6 +134,14 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/hooks/magic-context/supersession-reclaim.ts`: Select superseded spent control-plane tool outputs (oldest todowrite, ctx_reduce, zero-value meta calls) and older edit/write calls for the same file under the `smart_drops` configuration flag.
 - `src/hooks/magic-context/edit-marker.ts`: Implement `edit_marker` mode to compress superseded edits, keeping the `filePath` and a region-hint prefix while dropping the bulky output content.
 - `src/hooks/magic-context/shadow-sender.ts`: Mirror finalized transform passes, inputs, and decisions to the Rust module over the subc protocol using the `@cortexkit/subc-client` library (wire v2 protocol via `SubcClient` and `RouteHandle`) under the `shadow_transform` configuration flag. Pages large cold-start state_sync seeds into batches under 512KiB to stay under transport limits.
+- `src/hooks/magic-context/rust-mode-transform.ts`: Orchestrate the experimental Rust transform mode, coordinating state sync and LKG (Last Known Good) fallback/replay logic.
+- `src/hooks/magic-context/module-state-sync.ts`: Synchronize database state (memories, commits, tags, markers) between host (TS SQLite) and subc (Rust).
+- `src/hooks/magic-context/module-wire.ts`: Translate wire messages, ordinals, and normalizations between host and Rust formats.
+- `src/hooks/magic-context/lkg-slot.ts` and `src/hooks/magic-context/lkg-replay.ts`: Capture and replay the Last Known Good (LKG) transformed state on failure/parking.
+- `src/hooks/magic-context/pass-outcome.ts`: Track the outcome of transform passes.
+- `src/hooks/magic-context/emergency-fail-closed.ts`: Handle fail-closed cases under emergency context limit situations.
+- `src/plugin/boot-quiet.ts`: Quiet background maintenance logging on startup.
+- `src/plugin/rust-tool-backends.ts`: Define overrides for tool backends (`ctx_reduce`, `ctx_memory`) when running in Rust mode.
 - `src/hooks/magic-context/inject-compartments.ts`: m[0]/m[1] history layout — `renderM0`/`renderM1`/`materializeM0`/`mustMaterialize` (mirrored in Pi's `inject-compartments-pi.ts`).
 - `src/hooks/magic-context/decay-curve.ts`: Council-validated deterministic tier-decay math (half-life, log-cost tier boundaries, budget pressure).
 - `src/hooks/magic-context/decay-render.ts`: Shared OpenCode+Pi compartment renderer built on the decay curve (replaces the removed LLM compressor).
