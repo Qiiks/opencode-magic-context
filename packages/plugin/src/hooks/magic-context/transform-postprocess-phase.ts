@@ -23,6 +23,14 @@ import {
     setPersistedTodoSyntheticAnchor,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import {
+    getPersistedCompactionMarkerState,
+    type PersistedCompactionMarkerState,
+} from "../../features/magic-context/storage-meta-persisted";
+import {
+    getTagNumberByMessageId,
+    updateTagStatus,
+} from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { SessionMeta, TagEntry } from "../../features/magic-context/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
@@ -91,40 +99,74 @@ export type DeferredCompactionMarkerClearOutcome =
     | "cas-lost-newer-pending"
     | "cas-lost-already-cleared";
 
+function isSyntheticHeadMessage(message: MessageLike): boolean {
+    if ((message.info as { synthetic?: unknown }).synthetic === true) return true;
+    return message.parts.some(
+        (part) =>
+            part !== null &&
+            typeof part === "object" &&
+            (part as { synthetic?: unknown }).synthetic === true,
+    );
+}
+
+function dropMarkerSummaryTag(
+    db: ContextDatabase,
+    sessionId: string,
+    summaryMessageId: string,
+): void {
+    const tagNumber = getTagNumberByMessageId(db, sessionId, `${summaryMessageId}:p0`);
+    if (tagNumber !== null) updateTagStatus(db, sessionId, tagNumber, "dropped");
+}
+
 /**
- * Add the deferred marker summary to the current transform array before the
- * marker row becomes visible in OpenCode's database-backed input.
+ * Replay the persisted marker representation on every pass.
  *
- * OpenCode runs this transform before provider serialization. On the next pass
- * it supplies a separate summary assistant before the retained tail, and the
- * Anthropic serializer groups adjacent assistant messages into one wire
- * message. Adding the same source assistant now keeps both passes' provider
- * content blocks identical. Other providers retain the source message
- * boundary, which is also the representation they receive on the next pass.
- *
- * The summary tag is allocated now, after the current pass has assigned all
- * visible tags. The allocation is persisted under the summary part's stable
- * content id, so the next pass reuses the same §N§ prefix when it tags the
- * database-backed summary row.
+ * OpenCode projects a completed summary immediately before the retained tail.
+ * The transform prepends synthetic history slots later, so the canonical array
+ * position is after the contiguous synthetic head and before every real tail
+ * message, regardless of role. Rebuilding from persisted state also removes
+ * stale loser-process arrays and duplicate summaries deterministically.
  */
-export function injectDeferredCompactionSummaryRepresentation(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    messages: MessageLike[];
-    tagger: Tagger;
-    summaryMessageId: string;
-    ctxReduceCallable: boolean;
-}): boolean {
-    if (args.messages.some((message) => message.info.id === args.summaryMessageId)) {
-        return false;
+export function reconcileMarkerRepresentation(
+    messages: MessageLike[],
+    persistedMarkerState: PersistedCompactionMarkerState | null,
+    options: {
+        db: ContextDatabase;
+        sessionId: string;
+        tagger: Tagger;
+        ctxReduceCallable: boolean;
+    },
+): boolean {
+    const retainedMessages: MessageLike[] = [];
+    const staleSummaryIds = new Set<string>();
+    for (const message of messages) {
+        if (message.info.summary !== true) {
+            retainedMessages.push(message);
+            continue;
+        }
+        const messageId = message.info.id;
+        if (typeof messageId === "string" && messageId !== persistedMarkerState?.summaryMessageId) {
+            staleSummaryIds.add(messageId);
+        }
+    }
+    if (staleSummaryIds.size > 0) {
+        options.db.transaction(() => {
+            for (const messageId of staleSummaryIds) {
+                dropMarkerSummaryTag(options.db, options.sessionId, messageId);
+            }
+        })();
     }
 
-    const summaryTagNumber = args.tagger.assignTag(
-        args.sessionId,
-        `${args.summaryMessageId}:p0`,
+    const removedSummary = retainedMessages.length !== messages.length;
+    if (removedSummary) messages.splice(0, messages.length, ...retainedMessages);
+    if (persistedMarkerState === null) return removedSummary;
+
+    const summaryTagNumber = options.tagger.assignTag(
+        options.sessionId,
+        `${persistedMarkerState.summaryMessageId}:p0`,
         "message",
         byteSize(MARKER_SUMMARY_TEXT),
-        args.db,
+        options.db,
         0,
         null,
         0,
@@ -135,44 +177,28 @@ export function injectDeferredCompactionSummaryRepresentation(args: {
             reasoningTokenCount: null,
         }),
     );
-    const summaryText = args.ctxReduceCallable
+    const summaryText = options.ctxReduceCallable
         ? prependTag(summaryTagNumber, MARKER_SUMMARY_TEXT)
         : MARKER_SUMMARY_TEXT;
     const summaryMessage: MessageLike = {
         info: {
-            id: args.summaryMessageId,
+            id: persistedMarkerState.summaryMessageId,
             role: "assistant",
-            sessionID: args.sessionId,
+            sessionID: options.sessionId,
             summary: true,
             finish: "stop",
         },
         parts: [{ type: "text", text: summaryText }],
     };
 
-    const firstTailAssistant = args.messages.findIndex(
-        (message) => message.info.role === "assistant" && message.info.summary !== true,
-    );
-    args.messages.splice(
-        firstTailAssistant >= 0 ? firstTailAssistant : args.messages.length,
-        0,
-        summaryMessage,
-    );
-    return true;
-}
-
-/**
- * Remove the prior marker source from the drain array when a boundary advances.
- * The database mutation happens before the next transform pass, so serving the
- * old summary during this pass would make the provider wire differ from replay.
- */
-function removeDeferredCompactionSummaryRepresentation(
-    messages: MessageLike[],
-    summaryMessageId: string | null,
-): boolean {
-    if (summaryMessageId === null) return false;
-    const index = messages.findIndex((message) => message.info.id === summaryMessageId);
-    if (index < 0) return false;
-    messages.splice(index, 1);
+    let retainedTailStart = 0;
+    while (
+        retainedTailStart < messages.length &&
+        isSyntheticHeadMessage(messages[retainedTailStart])
+    ) {
+        retainedTailStart += 1;
+    }
+    messages.splice(retainedTailStart, 0, summaryMessage);
     return true;
 }
 
@@ -1378,20 +1404,6 @@ export async function runPostTransformPhase(
                     pending,
                     args.sessionDirectory,
                 );
-                if (outcome.kind === "applied") {
-                    removeDeferredCompactionSummaryRepresentation(
-                        args.messages,
-                        outcome.removedSummaryMessageId,
-                    );
-                    injectDeferredCompactionSummaryRepresentation({
-                        db: args.db,
-                        sessionId: args.sessionId,
-                        messages: args.messages,
-                        tagger: args.tagger,
-                        summaryMessageId: outcome.summaryMessageId,
-                        ctxReduceCallable: args.ctxReduceCallable,
-                    });
-                }
                 switch (outcome.kind) {
                     case "applied":
                     case "already-current":
@@ -1422,6 +1434,21 @@ export async function runPostTransformPhase(
             }
         }
     }
+
+    // Persistent message mutations must rebuild from stored state on every pass.
+    // Reconcile the marker after successful drains, concurrent no-op drains, retries,
+    // and ordinary defer passes. Running after tagging and cleanup but before final
+    // normalization gives every pass the same mutation ordering.
+    reconcileMarkerRepresentation(
+        args.messages,
+        getPersistedCompactionMarkerState(args.db, args.sessionId),
+        {
+            db: args.db,
+            sessionId: args.sessionId,
+            tagger: args.tagger,
+            ctxReduceCallable: args.ctxReduceCallable,
+        },
+    );
 
     const deferredHistoryDrainEligible =
         historyWasConsumedThisPass &&

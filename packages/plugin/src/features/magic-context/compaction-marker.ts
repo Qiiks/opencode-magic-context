@@ -27,6 +27,7 @@
  *       whose parentID matches that user message's id
  */
 
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { getDataDir } from "../../shared/data-path";
@@ -37,33 +38,44 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 // ── ID Generation ────────────────────────────────────────────────
 
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const ID_PREFIX_HEX_LENGTH = 12;
+const ID_SUFFIX_LENGTH = 14;
+const ID_PREFIX_MASK = (1n << BigInt(ID_PREFIX_HEX_LENGTH * 4)) - 1n;
 
-function randomBase62(length: number): string {
-    const chars: string[] = [];
-    for (let i = 0; i < length; i++) {
-        chars.push(BASE62_CHARS[Math.floor(Math.random() * BASE62_CHARS.length)]);
+function deterministicBase62(seed: string, length: number): string {
+    let value = BigInt(`0x${createHash("sha256").update(seed).digest("hex")}`);
+    const chars = Array<string>(length);
+    for (let index = length - 1; index >= 0; index -= 1) {
+        chars[index] = BASE62_CHARS[Number(value % 62n)];
+        value /= 62n;
     }
     return chars.join("");
 }
 
 /**
  * Generate an OpenCode-compatible ascending ID.
- * Format: `prefix_[hex-chars][14-random-base62]`
- * The hex encodes `BigInt(timestamp_ms) * 0x1000n + counter`.
- * Current timestamps produce 14 hex chars; padStart(14) ensures consistency.
+ * Format: `prefix_[12-hex-chars][14-deterministic-base62]`.
+ * The time prefix preserves OpenCode's lexicographic ordering, while the hash
+ * suffix makes retries for the same marker identity converge on the same rows.
  */
-function generateId(prefix: string, timestampMs: number, counter = 0n): string {
-    const encoded = BigInt(timestampMs) * 0x1000n + counter;
-    const hex = encoded.toString(16).padStart(14, "0");
-    return `${prefix}_${hex}${randomBase62(14)}`;
+function generateId(
+    prefix: string,
+    timestampMs: number,
+    counter: bigint,
+    identity: string,
+): string {
+    const encoded =
+        (BigInt(Math.max(0, Math.floor(timestampMs))) * 0x1000n + counter) & ID_PREFIX_MASK;
+    const hex = encoded.toString(16).padStart(ID_PREFIX_HEX_LENGTH, "0");
+    return `${prefix}_${hex}${deterministicBase62(`${prefix}\0${identity}`, ID_SUFFIX_LENGTH)}`;
 }
 
-export function generateMessageId(timestampMs: number, counter = 0n): string {
-    return generateId("msg", timestampMs, counter);
+export function generateMessageId(timestampMs: number, counter = 0n, identity = ""): string {
+    return generateId("msg", timestampMs, counter, identity);
 }
 
-export function generatePartId(timestampMs: number, counter = 0n): string {
-    return generateId("prt", timestampMs, counter);
+export function generatePartId(timestampMs: number, counter = 0n, identity = ""): string {
+    return generateId("prt", timestampMs, counter, identity);
 }
 
 // ── DB Access ────────────────────────────────────────────────────
@@ -343,6 +355,66 @@ export interface InjectCompactionMarkerArgs {
     resolvedBoundary?: BoundaryUserMessage;
 }
 
+function removeLegacyMarkerLineageRows(
+    db: Database,
+    args: {
+        sessionId: string;
+        boundaryMessageId: string;
+        summaryText: string;
+        summaryMessageId: string;
+        compactionPartId: string;
+    },
+): void {
+    const legacySummaries = db
+        .prepare(
+            `SELECT m.id
+             FROM message m
+             WHERE m.session_id = ?
+               AND m.id <> ?
+               AND COALESCE(json_extract(m.data, '$.summary'), 0) = 1
+               AND COALESCE(json_extract(m.data, '$.finish'), '') = 'stop'
+               AND COALESCE(json_extract(m.data, '$.parentID'), '') = ?
+               AND EXISTS (
+                   SELECT 1
+                   FROM part p
+                   WHERE p.session_id = m.session_id
+                     AND p.message_id = m.id
+                     AND COALESCE(json_extract(p.data, '$.type'), '') = 'text'
+                     AND COALESCE(json_extract(p.data, '$.text'), '') = ?
+               )`,
+        )
+        .all(
+            args.sessionId,
+            args.summaryMessageId,
+            args.boundaryMessageId,
+            args.summaryText,
+        ) as Array<{ id?: unknown }>;
+    const legacySummaryIds = legacySummaries.flatMap((row) =>
+        typeof row.id === "string" ? [row.id] : [],
+    );
+    if (legacySummaryIds.length === 0) return;
+
+    const deleteSummaryParts = db.prepare(
+        "DELETE FROM part WHERE session_id = ? AND message_id = ?",
+    );
+    const deleteSummary = db.prepare("DELETE FROM message WHERE session_id = ? AND id = ?");
+    for (const summaryMessageId of legacySummaryIds) {
+        deleteSummaryParts.run(args.sessionId, summaryMessageId);
+        deleteSummary.run(args.sessionId, summaryMessageId);
+    }
+
+    // A stale marker lineage can carry its own compaction part. Once the
+    // lineage is identified, retain only the deterministic boundary part.
+    db.prepare(
+        `DELETE FROM part
+         WHERE session_id = ?
+           AND message_id = ?
+           AND id <> ?
+           AND COALESCE(json_extract(data, '$.type'), '') = 'compaction'
+           AND COALESCE(json_extract(data, '$.auto'), 0) = 1`,
+    ).run(args.sessionId, args.boundaryMessageId, args.compactionPartId);
+}
+
 /**
  * Inject a compaction marker into OpenCode's DB.
  * Returns the marker state if successful, null if boundary couldn't be found.
@@ -367,13 +439,17 @@ export function injectCompactionMarker(
         );
         return null;
     }
-    // Use timestamps relative to the boundary so sort order is consistent
+    // Use timestamps relative to the boundary so OpenCode's time/id ordering
+    // places the marker immediately after the boundary.
     const boundaryTime = boundary.timeCreated;
-
-    // Generate IDs with timestamps that sort correctly — right after the boundary
-    const summaryMsgId = generateMessageId(boundaryTime + 1, 1n);
-    const compactionPartId = generatePartId(boundaryTime, 1n);
-    const summaryPartId = generatePartId(boundaryTime + 1, 2n);
+    const markerIdentity = `${args.sessionId}\0${args.endMessageId}`;
+    const summaryMsgId = generateMessageId(
+        boundaryTime + 1,
+        1n,
+        `${markerIdentity}\0summary-message`,
+    );
+    const compactionPartId = generatePartId(boundaryTime, 1n, `${markerIdentity}\0compaction-part`);
+    const summaryPartId = generatePartId(boundaryTime + 1, 2n, `${markerIdentity}\0summary-part`);
 
     const summaryMsgData = JSON.stringify({
         role: "assistant",
@@ -392,9 +468,27 @@ export function injectCompactionMarker(
 
     try {
         db.transaction(() => {
-            // 1. Add compaction part to the boundary user message
+            // A committed insert can outlive a failed context-state write. Remove
+            // any stale lineage in the transaction that writes the canonical rows.
+            removeLegacyMarkerLineageRows(db, {
+                sessionId: args.sessionId,
+                boundaryMessageId: boundary.id,
+                summaryText: args.summaryText,
+                summaryMessageId: summaryMsgId,
+                compactionPartId,
+            });
+
+            // Deterministic IDs make this transaction an upsert on retry. Rewriting
+            // the exact canonical row also repairs a partial or stale prior write.
             db.prepare(
-                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+                `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     message_id = excluded.message_id,
+                     session_id = excluded.session_id,
+                     time_created = excluded.time_created,
+                     time_updated = excluded.time_updated,
+                     data = excluded.data`,
             ).run(
                 compactionPartId,
                 boundary.id,
@@ -404,14 +498,25 @@ export function injectCompactionMarker(
                 '{"type":"compaction","auto":true}',
             );
 
-            // 2. Insert summary assistant message
             db.prepare(
-                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+                `INSERT INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     session_id = excluded.session_id,
+                     time_created = excluded.time_created,
+                     time_updated = excluded.time_updated,
+                     data = excluded.data`,
             ).run(summaryMsgId, args.sessionId, boundaryTime + 1, boundaryTime + 1, summaryMsgData);
 
-            // 3. Insert text part with the summary content
             db.prepare(
-                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+                `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     message_id = excluded.message_id,
+                     session_id = excluded.session_id,
+                     time_created = excluded.time_created,
+                     time_updated = excluded.time_updated,
+                     data = excluded.data`,
             ).run(
                 summaryPartId,
                 summaryMsgId,
