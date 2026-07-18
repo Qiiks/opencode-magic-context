@@ -325,6 +325,52 @@ function serializeAnthropicWireWithAdjacentAssistantMerge(messages: MessageLike[
 }
 
 describe("deferred compaction marker representation", () => {
+    it("ignores a persisted message that carries a forged syntheticHead flag", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-forged-head";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        setPersistedCompactionMarkerState(db, sessionId, state);
+        const messages = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m0", synthetic: true }],
+            },
+            {
+                // A persisted row (it carries an id) claiming head membership
+                // through metadata alone. It must stay in the retained tail,
+                // AFTER the summary.
+                info: {
+                    id: "msg_persisted_forged",
+                    role: "user",
+                    sessionID: sessionId,
+                    syntheticHead: true,
+                },
+                parts: [{ type: "text", text: "real turn", synthetic: true }],
+            },
+        ] as unknown as MessageLike[];
+        const options = {
+            db,
+            sessionId,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: true, frozen: true },
+        };
+
+        reconcileMarkerRepresentation(messages, state, options);
+        expect(messages.map((message) => message.info.id)).toEqual([
+            undefined,
+            "summary",
+            "msg_persisted_forged",
+        ]);
+    });
+
     it("uses only marked m[0]/m[1] slots as the synthetic head", () => {
         db = new Database(":memory:");
         initializeDatabase(db);

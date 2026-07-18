@@ -101,7 +101,18 @@ export type DeferredCompactionMarkerClearOutcome =
     | "cas-lost-already-cleared";
 
 function isSyntheticHeadMessage(message: MessageLike): boolean {
-    return message.info.syntheticHead === true;
+    // The flag alone is input-controlled metadata: a persisted or foreign row
+    // could carry it and absorb a real message into the injected head, shifting
+    // the summary's canonical position. Require the exact shape only
+    // prependM0M1Messages produces: an ID-less user message whose every part is
+    // marked synthetic. Persisted OpenCode rows always carry an id, so they can
+    // never satisfy this regardless of their metadata.
+    if (message.info.syntheticHead !== true) return false;
+    if (message.info.id !== undefined) return false;
+    if (message.info.role !== "user") return false;
+    const parts = message.parts;
+    if (parts.length === 0) return false;
+    return parts.every((part) => (part as { synthetic?: boolean }).synthetic === true);
 }
 
 const TODO_HEAD_ANCHOR_ID = "__magic_context_todo_head__";
