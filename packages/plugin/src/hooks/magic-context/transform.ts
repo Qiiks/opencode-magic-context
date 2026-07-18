@@ -977,6 +977,7 @@ export function createTransform(deps: TransformDeps) {
             contextUsageEarly,
             sessionId,
             deps.getModelKey?.(sessionId),
+            resolvedContextLimit,
         );
         const midTurn = isMidTurn(deps, resolvedSessionId);
         const bypassReason = detectMidTurnBypassReason({

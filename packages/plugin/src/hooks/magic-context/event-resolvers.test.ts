@@ -1,4 +1,10 @@
 import { describe, expect, it } from "bun:test";
+
+import { runMigrations } from "../../features/magic-context/migrations";
+import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { updateSessionMeta } from "../../features/magic-context/storage-meta";
+import { Database } from "../../shared/sqlite";
+import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     resolveCacheTtl,
     resolveContextLimit,
@@ -67,6 +73,68 @@ describe("event-resolvers", () => {
         it("returns undefined when provider/model missing", () => {
             expect(resolveTrustedContextLimit(undefined, "gpt-4o")).toBeUndefined();
             expect(resolveTrustedContextLimit("anthropic", undefined)).toBeUndefined();
+        });
+
+        it("uses a matching persisted usage limit for token thresholds on an unknown model", () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-usage-limit-threshold";
+            const modelKey = "custom-proxy/gemini-agent";
+            try {
+                updateSessionMeta(db, sessionId, {
+                    lastContextPercentage: 10,
+                    lastInputTokens: 100_000,
+                    lastUsageContextLimit: 1_048_576,
+                    lastObservedModelKey: modelKey,
+                });
+
+                const trustedLimit = resolveTrustedContextLimit("custom-proxy", "gemini-agent", {
+                    db,
+                    sessionID: sessionId,
+                });
+
+                expect(trustedLimit).toBe(1_048_576);
+                const detail = resolveExecuteThresholdDetail(65, modelKey, 65, {
+                    tokensConfig: { [modelKey]: 300_000 },
+                    contextLimit: trustedLimit,
+                });
+                expect(detail.mode).toBe("tokens");
+                expect(detail.absoluteTokens).toBe(300_000);
+                expect(detail.percentage).toBeCloseTo((300_000 / 1_048_576) * 100, 10);
+            } finally {
+                closeQuietly(db);
+            }
+        });
+
+        it("does not trust a persisted usage limit after the model key changes", () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-usage-limit-model-switch";
+            try {
+                updateSessionMeta(db, sessionId, {
+                    lastContextPercentage: 10,
+                    lastInputTokens: 100_000,
+                    lastUsageContextLimit: 1_048_576,
+                    lastObservedModelKey: "custom-proxy/previous-model",
+                });
+
+                const trustedLimit = resolveTrustedContextLimit("custom-proxy", "gemini-agent", {
+                    db,
+                    sessionID: sessionId,
+                });
+
+                expect(trustedLimit).toBeUndefined();
+                const detail = resolveExecuteThresholdDetail(65, "custom-proxy/gemini-agent", 65, {
+                    tokensConfig: { "custom-proxy/gemini-agent": 300_000 },
+                    contextLimit: trustedLimit,
+                });
+                expect(detail.mode).toBe("percentage");
+                expect(detail.percentage).toBe(65);
+            } finally {
+                closeQuietly(db);
+            }
         });
     });
 
