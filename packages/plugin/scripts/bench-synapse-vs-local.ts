@@ -8,8 +8,8 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { SynapseEmbeddingProvider } from "../src/features/magic-context/memory/embedding-synapse.ts";
-import { LocalEmbeddingProvider } from "../src/features/magic-context/memory/embedding-local.ts";
+import { SynapseEmbeddingProvider } from "../src/features/magic-context/memory/embedding-synapse";
+import { LocalEmbeddingProvider } from "../src/features/magic-context/memory/embedding-local";
 
 const nIdx = process.argv.indexOf("--n");
 const N = nIdx >= 0 ? Number(process.argv[nIdx + 1]) : 100;

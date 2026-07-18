@@ -21,7 +21,7 @@ import { existsSync } from "node:fs";
 import {
     SYNAPSE_DEFAULT_MODEL,
     SynapseEmbeddingProvider,
-} from "../src/features/magic-context/memory/embedding-synapse.ts";
+} from "../src/features/magic-context/memory/embedding-synapse";
 
 const args = process.argv.slice(2);
 const compare = args.includes("--compare");
@@ -93,7 +93,7 @@ console.log(
 if (compare) {
     // 4. Rank comparison against the primary lane vectors already in context.db.
     step("rank-compare against primary lane (read-only context.db)...");
-    const { openDatabase } = await import("../src/features/magic-context/storage.ts");
+    const { openDatabase } = await import("../src/features/magic-context/storage");
     const db = openDatabase();
     if (!db) throw new Error("context.db unavailable");
     const rows = db
@@ -151,7 +151,7 @@ if (compare) {
     // Build the primary-lane provider directly from the user config so query
     // embeds hit the same lane the stored vectors came from.
     const { OpenAICompatibleEmbeddingProvider } = await import(
-        "../src/features/magic-context/memory/embedding-openai.ts"
+        "../src/features/magic-context/memory/embedding-openai"
     );
     const { readFileSync } = await import("node:fs");
     const apiKey = readFileSync(join(homedir(), ".config", "openrouter.key"), "utf8").trim();
