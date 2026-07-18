@@ -5,7 +5,7 @@ CONTAINER=${DRIVE_RIG_CONTAINER:-mc-drive}
 SNAPSHOT=${DRIVE_RIG_SNAPSHOT:-"$HOME/.cache/mc-drive-rig/snapshot"}
 CONNECTION_FILE=${DRIVE_RIG_CONNECTION_FILE:-"$HOME/.local/share/cortexkit/run/subc-connection.json"}
 SESSION_ID=${DRIVE_RIG_SESSION_ID:-ses_OqknfoW2O3LTOcjLvOMQoREVPtz1}
-LOG_PATH=${DRIVE_RIG_LOG_PATH:-/snapshot/magic-context.log}
+LOG_PATH=${DRIVE_RIG_LOG_PATH:-$SNAPSHOT/magic-context.log}
 WAIT_SECONDS=${DRIVE_RIG_WAIT_SECONDS:-180}
 
 if ! command -v docker >/dev/null 2>&1; then

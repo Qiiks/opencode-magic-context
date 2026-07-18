@@ -54,15 +54,15 @@ docker run -d \
     --cpus=4 \
     --memory=8g \
     --add-host=host.docker.internal:host-gateway \
-    -v "$SNAPSHOT:/snapshot:rw" \
+    -v "$SNAPSHOT:$SNAPSHOT:rw" \
     -v "$CONNECTION_FILE:$CONNECTION_FILE:ro" \
-    -e HOME=/snapshot/home \
-    -e XDG_DATA_HOME=/snapshot/home/.local/share \
-    -e XDG_CONFIG_HOME=/snapshot/home/.config \
-    -e XDG_CACHE_HOME=/snapshot/home/.cache \
-    -e MAGIC_CONTEXT_LOG_PATH=/snapshot/magic-context.log \
+    -e HOME="$SNAPSHOT/home" \
+    -e XDG_DATA_HOME="$SNAPSHOT/home/.local/share" \
+    -e XDG_CONFIG_HOME="$SNAPSHOT/home/.config" \
+    -e XDG_CACHE_HOME="$SNAPSHOT/home/.cache" \
+    -e MAGIC_CONTEXT_LOG_PATH="$SNAPSHOT/magic-context.log" \
     -e SUBC_CONNECTION_FILE="$CONNECTION_FILE" \
-    -e DRIVE_REPO=/snapshot/repo \
+    -e DRIVE_REPO="$SNAPSHOT/repo" \
     "$IMAGE"
 
 printf 'container started: %s\n' "$CONTAINER"

@@ -46,7 +46,7 @@ mkdir -p \
     "$SNAPSHOT/home/.config/cortexkit" \
     "$SNAPSHOT/home/.config/opencode" \
     "$SNAPSHOT/home/.cache" \
-    "$SNAPSHOT/plugin-dist"
+    "$SNAPSHOT/plugin/dist"
 
 vacuum_into() {
     local source=$1
@@ -106,8 +106,8 @@ rewrite_opencode_plugin_path() {
     local contents
     local host_plugin_url="file://$REPO_ROOT/packages/plugin"
     contents=$(<"$config_path")
-    contents=${contents//"$host_plugin_url"/"file:///snapshot/plugin-dist/index.js"}
-    contents=${contents//"$REPO_ROOT/packages/plugin"/"/snapshot/plugin-dist/index.js"}
+    contents=${contents//"$host_plugin_url"/"file://$SNAPSHOT/plugin"}
+    contents=${contents//"$REPO_ROOT/packages/plugin"/"$SNAPSHOT/plugin"}
     printf '%s\n' "$contents" > "$config_path"
 }
 prune_dead_file_plugins() {
@@ -116,7 +116,7 @@ prune_dead_file_plugins() {
     awk '
         BEGIN { in_plugins = 0 }
         /^[[:space:]]*"plugin"[[:space:]]*:[[:space:]]*\[/ { in_plugins = 1 }
-        in_plugins && /file:\/\// && $0 !~ /file:\/\/\/snapshot\/plugin-dist\/index\.js/ { next }
+        in_plugins && /file:\/\// && $0 !~ /file:\/\/\/snapshot\/plugin/ { next }
         in_plugins && /^[[:space:]]*\]/ { in_plugins = 0 }
         { print }
     ' "$config_path" > "$config_tmp"
@@ -143,7 +143,31 @@ if [[ -d "$BENCHMARKS_SOURCE/.cortexkit" ]]; then
     cp -R "$BENCHMARKS_SOURCE/.cortexkit" "$SNAPSHOT/repo/.cortexkit"
 fi
 
-cp -R "$PLUGIN_DIST/." "$SNAPSHOT/plugin-dist/"
+# OpenCode loads directory plugins through their package.json entry. The dist
+# bundle inlines almost everything but externalizes @opencode-ai/plugin (the
+# host resolves it through the workspace node_modules), so the snapshot
+# package declares exactly that one dependency and installs it here on the
+# host. The subtree is pure JS, so a host-side install is portable to the
+# linux container. The full plugin package.json is deliberately NOT copied:
+# its dependency list includes macOS-native onnx binaries that cannot load
+# inside the container.
+cp -R "$PLUGIN_DIST/." "$SNAPSHOT/plugin/dist/"
+plugin_version=$(jq -r '.version' "$REPO_ROOT/packages/plugin/package.json")
+plugin_api_version=$(jq -r '.version' \
+    "$REPO_ROOT/packages/plugin/node_modules/@opencode-ai/plugin/package.json")
+jq -n --arg version "$plugin_version" --arg api "$plugin_api_version" '{
+    name: "@cortexkit/opencode-magic-context",
+    version: $version,
+    type: "module",
+    main: "dist/index.js",
+    dependencies: { "@opencode-ai/plugin": $api }
+}' > "$SNAPSHOT/plugin/package.json"
+printf 'installing plugin runtime dependency\n'
+(cd "$SNAPSHOT/plugin" && bun install --production >/dev/null 2>&1)
+if [[ ! -d "$SNAPSHOT/plugin/node_modules/@opencode-ai/plugin" ]]; then
+    printf 'plugin dependency install failed in %s\n' "$SNAPSHOT/plugin" >&2
+    exit 1
+fi
 
 printf 'snapshot ready: %s\n' "$SNAPSHOT"
 printf 'session preserved: %s\n' "$SESSION_ID"
