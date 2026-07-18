@@ -1,8 +1,9 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
+import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
@@ -289,6 +290,110 @@ describe("Rust mode authority adapter", () => {
         await transform.run(sessionId, secondInput, secondOutput, makeMeta(db, sessionId));
         expect(methods).toEqual(["transform"]);
         expect(secondOutput.messages).toEqual(native);
+    });
+
+    it("delivers a repeated module directive only once across the synthetic nudge turn", async () => {
+        const sessionId = `rust-channel2-refire-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const native = [{ role: "assistant", parts: [] }];
+        const promptAsync = mock(async () => ({}));
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          native_messages: native,
+                          host_directives: {
+                              channel2_nudge: { text: "drop spent tool output" },
+                          },
+                      }
+                    : { ok: true },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            hostClient: {
+                session: {
+                    messages: async () => ({ data: [] }),
+                    promptAsync,
+                },
+            },
+        });
+
+        const firstInput = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            firstInput,
+            { messages: firstInput },
+            makeMeta(db, sessionId),
+        );
+
+        const syntheticInput = [
+            ...makeMessages(sessionId),
+            {
+                info: { id: "channel2-nudge-1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "drop spent tool output", synthetic: true }],
+            },
+        ];
+        await transform.run(
+            sessionId,
+            syntheticInput,
+            { messages: syntheticInput },
+            makeMeta(db, sessionId),
+        );
+
+        expect(getChannel2NudgeState(db, sessionId)).toBe("delivered");
+        expect(transform.getState(sessionId).syntheticTurnCount).toBe(1);
+    });
+
+    it("breaks a synthetic-turn cascade after three turns", async () => {
+        const sessionId = `rust-loop-breaker-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const promptAsync = mock(async () => ({}));
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          native_messages: [{ role: "assistant", parts: [] }],
+                          host_directives: {
+                              channel2_nudge: { text: "drop spent tool output" },
+                          },
+                      }
+                    : { ok: true },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            hostClient: {
+                session: {
+                    messages: async () => ({ data: [] }),
+                    promptAsync,
+                },
+            },
+        });
+
+        for (let turn = 1; turn <= 4; turn += 1) {
+            setChannel2NudgeState(db, sessionId, "pending");
+            const input = [
+                ...makeMessages(sessionId),
+                {
+                    info: { id: `synthetic-${turn}`, role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "synthetic turn", synthetic: true }],
+                },
+            ];
+            await transform.run(sessionId, input, { messages: input }, makeMeta(db, sessionId));
+        }
+
+        expect(promptAsync).toHaveBeenCalledTimes(0);
+        expect(transform.getState(sessionId).syntheticTurnCount).toBe(4);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
+
+        setChannel2NudgeState(db, sessionId, "pending");
+        const realInput = makeMessages(sessionId);
+        await transform.run(sessionId, realInput, { messages: realInput }, makeMeta(db, sessionId));
+        expect(promptAsync).toHaveBeenCalledTimes(1);
+        expect(transform.getState(sessionId).syntheticTurnCount).toBe(0);
     });
 
     it("re-pages every transform payload after need_full_sync", async () => {
