@@ -106,15 +106,28 @@ rewrite_opencode_plugin_path() {
     local contents
     local host_plugin_url="file://$REPO_ROOT/packages/plugin"
     contents=$(<"$config_path")
-contents=${contents//"$host_plugin_url"/"file:///snapshot/plugin-dist/index.js"}
-contents=${contents//"$REPO_ROOT/packages/plugin"/"/snapshot/plugin-dist/index.js"}
+    contents=${contents//"$host_plugin_url"/"file:///snapshot/plugin-dist/index.js"}
+    contents=${contents//"$REPO_ROOT/packages/plugin"/"/snapshot/plugin-dist/index.js"}
     printf '%s\n' "$contents" > "$config_path"
+}
+prune_dead_file_plugins() {
+    local config_path=$1
+    local config_tmp="$config_path.tmp"
+    awk '
+        BEGIN { in_plugins = 0 }
+        /^[[:space:]]*"plugin"[[:space:]]*:[[:space:]]*\[/ { in_plugins = 1 }
+        in_plugins && /file:\/\// && $0 !~ /file:\/\/\/snapshot\/plugin-dist\/index\.js/ { next }
+        in_plugins && /^[[:space:]]*\]/ { in_plugins = 0 }
+        { print }
+    ' "$config_path" > "$config_tmp"
+    mv "$config_tmp" "$config_path"
 }
 for opencode_config in \
     "$SNAPSHOT/home/.config/opencode/opencode.json" \
     "$SNAPSHOT/home/.config/opencode/opencode.jsonc"; do
     if [[ -f "$opencode_config" ]]; then
         rewrite_opencode_plugin_path "$opencode_config"
+        prune_dead_file_plugins "$opencode_config"
     fi
 done
 
