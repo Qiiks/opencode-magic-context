@@ -19,7 +19,9 @@ use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0Con
 use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
 use crate::m0_compose::compose_m0_from_store;
-use crate::m1_compose::{compose_m1_from_store, m1_revision_signal, m1_revision_signal_parts};
+use crate::m1_compose::{
+    claim_and_render_notes, compose_m1_from_store, m1_revision_signal, m1_revision_signal_parts,
+};
 use crate::memory_render::M1_PLACEHOLDER;
 use crate::scheduler::{
     self, BoundaryBypass, ContextUsage, DeferredExecute, ExecuteThresholdConfig, LatchState,
@@ -31,8 +33,8 @@ use crate::selection::{
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
     Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, ModuleMeta,
-    ModuleUsage, PendingAgentDrop, PendingRewriteState, StoredCompartment, TagMintInput,
-    TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
+    ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState, StoredCompartment,
+    TagMintInput, TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
     UserHintDecisionInput, UserHintRow, SHADOW_SESSION_PREFIX,
 };
 use serde::{Deserialize, Serialize};
@@ -447,6 +449,10 @@ pub struct TransformResponse {
     /// persist delivery because the host owns the channel-2 lease and deduplication.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_directives: Option<HostDirectives>,
+    /// Delivery ledger rows whose note bytes were included in this bust. The host sends
+    /// the existing transform.ack/nack after applying and validating the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_deliveries: Option<Vec<NoteDelivery>>,
 }
 
 impl TransformResponse {
@@ -473,6 +479,7 @@ impl TransformResponse {
             ck_messages: None,
             native_messages: None,
             host_directives: None,
+            note_deliveries: None,
         }
     }
 
@@ -496,6 +503,7 @@ impl TransformResponse {
             ck_messages: Some(ck_messages),
             native_messages: None,
             host_directives: None,
+            note_deliveries: None,
         }
     }
 }
@@ -1345,6 +1353,7 @@ fn apply_once(
 
     let mut coverage_shrunk_on_bust = false;
     let mut commit_memory_revision = None;
+    let mut note_deliveries: Vec<NoteDelivery> = Vec::new();
 
     match plan {
         PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
@@ -1510,7 +1519,21 @@ fn apply_once(
             let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
             core.frozen_units.clear();
             core.pending_changes.clear();
-            let mut rendered = vec![synth_region("m0", comp.m0_bytes), render_m1_placeholder()];
+            let (note_body, hard_note_deliveries) = claim_and_render_notes(
+                store,
+                ctx.project_path,
+                &req.session_id,
+                &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
+                &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
+                ctx.now_ms,
+            )?;
+            note_deliveries = hard_note_deliveries;
+            let m1_unit = if note_body.is_empty() {
+                render_m1_placeholder()
+            } else {
+                render_m1_body(&note_body)
+            };
+            let mut rendered = vec![synth_region("m0", comp.m0_bytes), m1_unit];
             rendered.extend(survivors);
 
             // A HARD re-composes m0 fully from the store, so the boundary ALWAYS reflects
@@ -1561,6 +1584,7 @@ fn apply_once(
                 &meta,
                 meta.expiry_cutoff_ms,
             )?;
+            note_deliveries = m1.note_deliveries.clone();
             let mut rendered = vec![render_m1_body(&m1.body)];
             rendered.extend(new_reduction_units(
                 &core,
@@ -1789,6 +1813,7 @@ fn apply_once(
             ck_messages: Some(ck_messages),
             native_messages: None,
             host_directives,
+            note_deliveries: (!note_deliveries.is_empty()).then_some(note_deliveries),
         },
     })
 }

@@ -89,6 +89,7 @@ export function createToolRegistry(args: {
             db,
             dreamerEnabled: isDreamerRunnable(pluginConfig),
             resolveProjectPath,
+            rustToolBackends,
         }),
         ...createCtxSearchTools({
             db,

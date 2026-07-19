@@ -613,9 +613,9 @@ function contextNoteId(db: Database, feed: ChangefeedRow, moduleProject: string)
     }
     const result = db
         .prepare(
-            "INSERT INTO notes (type, status, content, project_path, created_at, updated_at) VALUES ('smart', 'active', '', ?, 0, 0)",
+            "INSERT INTO notes (type, status, content, project_path, session_id, created_at, updated_at) VALUES ('smart', 'active', '', ?, ?, 0, 0)",
         )
-        .run(moduleProject);
+        .run(moduleProject, rowNullableString(row, "session_id"));
     const contextId = Number(result.lastInsertRowid);
     rememberIdentity(db, feed.domain, moduleProject, feed.module_row_id, contextId);
     return contextId;
@@ -655,16 +655,42 @@ function applyNoteRow(db: Database, feed: ChangefeedRow): void {
         return;
     }
     const contextId = contextNoteId(db, feed, moduleProject);
+    // Delivery-only module states are collapsed to the TS vocabulary. The ledger remains
+    // authoritative for at-least-once delivery; context.db must not invent a new status.
+    const moduleStatus = rowString(row, "status", "active");
+    const contextStatus = moduleStatus === "surfaced" || moduleStatus === "surfacing" ? "ready" : moduleStatus;
     db.prepare(
         `UPDATE notes SET type = 'smart', status = ?, project_path = ?, session_id = ?, content = ?,
-         surface_condition = ?, anchor_block_id = ?, created_at = ?, updated_at = ? WHERE id = ?`,
+         surface_condition = ?, ready_at = ?, ready_reason = ?, manifest_json = ?, compiled_check = ?,
+         check_hash = ?, check_cron = ?, check_failure_count = ?, check_network_failure_count = ?,
+         check_quarantined_until = ?, check_next_due_at = ?, check_compiled_at = ?, check_false_since_at = ?,
+         check_last_liveness_at = ?, last_checked_at = ?, check_status = ?, check_version = ?,
+         policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`,
     ).run(
-        rowString(row, "status", "active") === "dismissed" ? "dismissed" : "active",
+        contextStatus,
         moduleProject,
         rowNullableString(row, "session_id"),
         rowString(row, "content"),
         rowNullableString(row, "surface_condition"),
+        typeof row.ready_at === "number" ? row.ready_at : null,
+        rowNullableString(row, "ready_reason"),
+        rowNullableString(row, "manifest_json"),
+        rowNullableString(row, "compiled_check"),
+        rowNullableString(row, "check_hash"),
+        rowNullableString(row, "check_cron"),
+        rowNumber(row, "check_failure_count"),
+        rowNumber(row, "check_network_failure_count"),
+        typeof row.check_quarantined_until === "number" ? row.check_quarantined_until : null,
+        typeof row.check_next_due_at === "number" ? row.check_next_due_at : null,
+        typeof row.check_compiled_at === "number" ? row.check_compiled_at : null,
+        typeof row.check_false_since_at === "number" ? row.check_false_since_at : null,
+        typeof row.check_last_liveness_at === "number" ? row.check_last_liveness_at : null,
+        typeof row.last_checked_at === "number" ? row.last_checked_at : null,
+        rowString(row, "check_status", "uncompiled"),
+        rowNumber(row, "check_version"),
+        rowNumber(row, "policy_version", 1),
         rowNullableString(row, "anchor_block_id"),
+        typeof row.anchor_ordinal === "number" ? row.anchor_ordinal : null,
         rowNumber(row, "created_at_ms"),
         rowNumber(row, "updated_at_ms"),
         contextId,

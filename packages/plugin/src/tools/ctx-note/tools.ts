@@ -10,6 +10,7 @@ import {
     setNoteLastReadAt,
     updateNote,
 } from "../../features/magic-context/storage";
+import type { RustNoteToolRequest, RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
 import type { CtxNoteArgs, CtxNoteReadFilter } from "./types";
@@ -24,6 +25,7 @@ export interface CtxNoteToolDeps {
      * explanatory error.
      */
     resolveProjectPath?: (directory: string) => string;
+    rustToolBackends?: RustToolBackends;
 }
 
 /** Capture the live-tail message ordinal so a note can be traced back to the
@@ -161,6 +163,40 @@ function buildReadSections(args: {
     return sections;
 }
 
+function moduleNoteText(response: unknown): string | null {
+    let value = response;
+    if (value !== null && typeof value === "object" && "result" in value) {
+        value = (value as { result?: unknown }).result;
+    }
+    if (typeof value === "string") return value;
+    if (value !== null && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        if (record.ok === false || record.error || typeof record.message === "string") {
+            const error = record.error;
+            const message =
+                typeof error === "string"
+                    ? error
+                    : error !== null && typeof error === "object" && "message" in error
+                      ? String((error as { message?: unknown }).message)
+                      : typeof record.message === "string"
+                        ? record.message
+                        : "module rejected ctx_note";
+            return `Error: ${message}`;
+        }
+        const content = record.content;
+        if (Array.isArray(content)) {
+            const text = content.find(
+                (item): item is { text: string } =>
+                    item !== null &&
+                    typeof item === "object" &&
+                    typeof (item as { text?: unknown }).text === "string",
+            )?.text;
+            if (text) return text;
+        }
+    }
+    return null;
+}
+
 function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
     return tool({
         description: CTX_NOTE_DESCRIPTION,
@@ -212,6 +248,28 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             // can differ from the session's working directory when the user
             // runs `opencode -s <id>` from outside the project.
             const projectIdentity = deps.resolveProjectPath?.(toolContext.directory);
+
+            const rustNote = deps.rustToolBackends?.note;
+            if (rustNote) {
+                const request: RustNoteToolRequest = {
+                    sessionId,
+                    projectRoot: toolContext.directory,
+                    action,
+                    content: args.content,
+                    surfaceCondition: args.surface_condition,
+                    filter: args.filter,
+                    limit: args.limit,
+                    offset: args.offset,
+                    noteId: args.note_id,
+                };
+                try {
+                    const text = moduleNoteText(await rustNote(request));
+                    if (text !== null) return text;
+                    return "Error: Rust module returned an invalid ctx_note response.";
+                } catch (error) {
+                    return `Error: Rust module ctx_note failed. ${error instanceof Error ? error.message : String(error)}`;
+                }
+            }
 
             if (action === "write") {
                 const content = args.content?.trim();

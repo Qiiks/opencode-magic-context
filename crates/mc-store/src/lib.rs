@@ -17,11 +17,12 @@ use cortexkit_cache_core::CoreState;
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
@@ -1083,6 +1084,210 @@ const MIGRATIONS: &[Migration] = &[
         END;
     "#,
     },
+    Migration {
+        version: 26,
+        // Project-owned notes carry the complete smart-note state machine. Columns carried
+        // over from the previous context-note schema are copied as-is, while status_version
+        // and delivery rows make every evaluator, surfacer, and mirror transition
+        // compare-and-swap safe.
+        statements: r#"
+        DROP TRIGGER IF EXISTS mc_notes_feed_insert;
+        DROP TRIGGER IF EXISTS mc_notes_feed_update;
+        DROP TRIGGER IF EXISTS mc_notes_feed_delete;
+        DROP TRIGGER IF EXISTS mc_notes_ownership_insert;
+        DROP TRIGGER IF EXISTS mc_notes_ownership_update;
+        DROP TRIGGER IF EXISTS mc_notes_ownership_delete;
+        ALTER TABLE mc_notes RENAME TO mc_notes_v23;
+        CREATE TABLE mc_notes (
+            id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+            type                       TEXT NOT NULL DEFAULT 'smart'
+                CHECK (type IN ('session', 'smart')),
+            project_path               TEXT NOT NULL,
+            session_id                 TEXT,
+            content                    TEXT NOT NULL,
+            status                     TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'pending', 'ready', 'surfacing', 'surfaced', 'dismissed')),
+            surface_condition          TEXT,
+            ready_at                   INTEGER,
+            ready_reason               TEXT,
+            manifest_json              TEXT,
+            compiled_check             TEXT,
+            check_hash                 TEXT,
+            check_cron                 TEXT,
+            check_failure_count       INTEGER NOT NULL DEFAULT 0,
+            check_network_failure_count INTEGER NOT NULL DEFAULT 0,
+            check_quarantined_until   INTEGER,
+            check_next_due_at         INTEGER,
+            check_compiled_at         INTEGER,
+            check_false_since_at      INTEGER,
+            check_last_liveness_at    INTEGER,
+            last_checked_at           INTEGER,
+            check_status               TEXT NOT NULL DEFAULT 'uncompiled',
+            check_version              INTEGER NOT NULL DEFAULT 0,
+            policy_version            INTEGER NOT NULL DEFAULT 1,
+            harness                    TEXT NOT NULL DEFAULT 'module',
+            anchor_block_id            TEXT,
+            anchor_ordinal             INTEGER,
+            dismissed_at              INTEGER,
+            dismissal_resolution       TEXT,
+            status_version             INTEGER NOT NULL DEFAULT 0,
+            created_at_ms             INTEGER NOT NULL DEFAULT 0,
+            updated_at_ms             INTEGER NOT NULL DEFAULT 0,
+            context_store_uuid        TEXT,
+            context_row_id            INTEGER,
+            UNIQUE(context_store_uuid, context_row_id)
+        );
+        INSERT INTO mc_notes (
+            id, type, project_path, session_id, content, status, surface_condition,
+            anchor_block_id, created_at_ms, updated_at_ms
+        )
+        SELECT id, 'smart', project_path, session_id, content,
+               CASE status WHEN 'active' THEN 'active' ELSE 'dismissed' END,
+               surface_condition, anchor_block_id, created_at_ms, updated_at_ms
+          FROM mc_notes_v23;
+        DROP TABLE mc_notes_v23;
+        CREATE INDEX idx_mc_notes_scope_status
+            ON mc_notes(project_path, session_id, status, updated_at_ms DESC, id DESC);
+        CREATE INDEX idx_mc_notes_due
+            ON mc_notes(project_path, status, check_next_due_at, id);
+
+        CREATE TABLE IF NOT EXISTS mc_note_deliveries (
+            delivery_id                 TEXT PRIMARY KEY,
+            note_id                     INTEGER NOT NULL,
+            session_id                  TEXT NOT NULL,
+            delivered_pass_fingerprint  TEXT NOT NULL,
+            transform_pass_id           TEXT NOT NULL DEFAULT '',
+            acked_at                    INTEGER,
+            created_at_ms               INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(note_id, session_id, delivered_pass_fingerprint)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_note_deliveries_retry
+            ON mc_note_deliveries(session_id, acked_at, created_at_ms, note_id);
+
+        -- The module store is protected by a single-writer lease; no external process may
+        -- write this database, so every writer is registered with this connection's UDF.
+        CREATE TRIGGER mc_notes_ownership_insert
+        BEFORE INSERT ON mc_notes
+        WHEN NEW.project_path = '' OR mc_note_caller_project() IS NOT NEW.project_path
+        BEGIN
+            SELECT RAISE(ABORT, 'note ownership insert is outside the caller project');
+        END;
+        CREATE TRIGGER mc_notes_ownership_update
+        BEFORE UPDATE ON mc_notes
+        WHEN (NEW.id IS NOT OLD.id OR NEW.type IS NOT OLD.type
+              OR NEW.session_id IS NOT OLD.session_id OR NEW.project_path IS NOT OLD.project_path
+              OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+              OR NEW.context_row_id IS NOT OLD.context_row_id)
+          AND NOT (mc_note_caller_project() IS OLD.project_path
+                   OR mc_note_caller_project() IS NEW.project_path)
+        BEGIN
+            SELECT RAISE(ABORT, 'note ownership update is outside the old or new project');
+        END;
+        CREATE TRIGGER mc_notes_ownership_delete
+        BEFORE DELETE ON mc_notes
+        WHEN mc_note_caller_project() IS NOT OLD.project_path
+        BEGIN
+            SELECT RAISE(ABORT, 'note ownership delete is outside the row project');
+        END;
+
+        CREATE TRIGGER mc_notes_feed_insert AFTER INSERT ON mc_notes BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'insert', NEW.id,
+                json_object(
+                    'id', NEW.id, 'type', NEW.type, 'project_path', NEW.project_path,
+                    'session_id', NEW.session_id, 'content', NEW.content, 'status', NEW.status,
+                    'surface_condition', NEW.surface_condition, 'ready_at', NEW.ready_at,
+                    'ready_reason', NEW.ready_reason, 'manifest_json', NEW.manifest_json,
+                    'compiled_check', NEW.compiled_check, 'check_hash', NEW.check_hash,
+                    'check_cron', NEW.check_cron, 'check_failure_count', NEW.check_failure_count,
+                    'check_network_failure_count', NEW.check_network_failure_count,
+                    'check_quarantined_until', NEW.check_quarantined_until,
+                    'check_next_due_at', NEW.check_next_due_at, 'check_compiled_at', NEW.check_compiled_at,
+                    'check_false_since_at', NEW.check_false_since_at,
+                    'check_last_liveness_at', NEW.check_last_liveness_at,
+                    'last_checked_at', NEW.last_checked_at, 'check_status', NEW.check_status,
+                    'check_version', NEW.check_version, 'policy_version', NEW.policy_version,
+                    'harness', NEW.harness, 'anchor_block_id', NEW.anchor_block_id,
+                    'anchor_ordinal', NEW.anchor_ordinal, 'dismissed_at', NEW.dismissed_at,
+                    'dismissal_resolution', NEW.dismissal_resolution,
+                    'status_version', NEW.status_version, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id), NULL);
+        END;
+        CREATE TRIGGER mc_notes_feed_update AFTER UPDATE ON mc_notes
+        WHEN NEW.id IS NOT OLD.id OR NEW.type IS NOT OLD.type
+          OR NEW.project_path IS NOT OLD.project_path OR NEW.session_id IS NOT OLD.session_id
+          OR NEW.content IS NOT OLD.content OR NEW.status IS NOT OLD.status
+          OR NEW.surface_condition IS NOT OLD.surface_condition OR NEW.ready_at IS NOT OLD.ready_at
+          OR NEW.ready_reason IS NOT OLD.ready_reason OR NEW.manifest_json IS NOT OLD.manifest_json
+          OR NEW.compiled_check IS NOT OLD.compiled_check OR NEW.check_hash IS NOT OLD.check_hash
+          OR NEW.check_cron IS NOT OLD.check_cron
+          OR NEW.check_failure_count IS NOT OLD.check_failure_count
+          OR NEW.check_network_failure_count IS NOT OLD.check_network_failure_count
+          OR NEW.check_quarantined_until IS NOT OLD.check_quarantined_until
+          OR NEW.check_next_due_at IS NOT OLD.check_next_due_at
+          OR NEW.check_compiled_at IS NOT OLD.check_compiled_at
+          OR NEW.check_false_since_at IS NOT OLD.check_false_since_at
+          OR NEW.check_last_liveness_at IS NOT OLD.check_last_liveness_at
+          OR NEW.last_checked_at IS NOT OLD.last_checked_at OR NEW.check_status IS NOT OLD.check_status
+          OR NEW.check_version IS NOT OLD.check_version OR NEW.policy_version IS NOT OLD.policy_version
+          OR NEW.harness IS NOT OLD.harness OR NEW.anchor_block_id IS NOT OLD.anchor_block_id
+          OR NEW.anchor_ordinal IS NOT OLD.anchor_ordinal OR NEW.dismissed_at IS NOT OLD.dismissed_at
+          OR NEW.dismissal_resolution IS NOT OLD.dismissal_resolution
+          OR NEW.status_version IS NOT OLD.status_version
+          OR NEW.created_at_ms IS NOT OLD.created_at_ms OR NEW.updated_at_ms IS NOT OLD.updated_at_ms
+          OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+          OR NEW.context_row_id IS NOT OLD.context_row_id
+        BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'update', NEW.id,
+                json_object(
+                    'id', NEW.id, 'type', NEW.type, 'project_path', NEW.project_path,
+                    'session_id', NEW.session_id, 'content', NEW.content, 'status', NEW.status,
+                    'surface_condition', NEW.surface_condition, 'ready_at', NEW.ready_at,
+                    'ready_reason', NEW.ready_reason, 'manifest_json', NEW.manifest_json,
+                    'compiled_check', NEW.compiled_check, 'check_hash', NEW.check_hash,
+                    'check_cron', NEW.check_cron, 'check_failure_count', NEW.check_failure_count,
+                    'check_network_failure_count', NEW.check_network_failure_count,
+                    'check_quarantined_until', NEW.check_quarantined_until,
+                    'check_next_due_at', NEW.check_next_due_at, 'check_compiled_at', NEW.check_compiled_at,
+                    'check_false_since_at', NEW.check_false_since_at,
+                    'check_last_liveness_at', NEW.check_last_liveness_at,
+                    'last_checked_at', NEW.last_checked_at, 'check_status', NEW.check_status,
+                    'check_version', NEW.check_version, 'policy_version', NEW.policy_version,
+                    'harness', NEW.harness, 'anchor_block_id', NEW.anchor_block_id,
+                    'anchor_ordinal', NEW.anchor_ordinal, 'dismissed_at', NEW.dismissed_at,
+                    'dismissal_resolution', NEW.dismissal_resolution,
+                    'status_version', NEW.status_version, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id), NULL);
+        END;
+        CREATE TRIGGER mc_notes_feed_delete AFTER DELETE ON mc_notes BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'tombstone', OLD.id,
+                json_object(
+                    'id', OLD.id, 'type', OLD.type, 'project_path', OLD.project_path,
+                    'session_id', OLD.session_id, 'content', OLD.content, 'status', OLD.status,
+                    'surface_condition', OLD.surface_condition, 'ready_at', OLD.ready_at,
+                    'ready_reason', OLD.ready_reason, 'manifest_json', OLD.manifest_json,
+                    'compiled_check', OLD.compiled_check, 'check_hash', OLD.check_hash,
+                    'check_cron', OLD.check_cron, 'check_failure_count', OLD.check_failure_count,
+                    'check_network_failure_count', OLD.check_network_failure_count,
+                    'check_quarantined_until', OLD.check_quarantined_until,
+                    'check_next_due_at', OLD.check_next_due_at, 'check_compiled_at', OLD.check_compiled_at,
+                    'check_false_since_at', OLD.check_false_since_at,
+                    'check_last_liveness_at', OLD.check_last_liveness_at,
+                    'last_checked_at', OLD.last_checked_at, 'check_status', OLD.check_status,
+                    'check_version', OLD.check_version, 'policy_version', OLD.policy_version,
+                    'harness', OLD.harness, 'anchor_block_id', OLD.anchor_block_id,
+                    'anchor_ordinal', OLD.anchor_ordinal, 'dismissed_at', OLD.dismissed_at,
+                    'dismissal_resolution', OLD.dismissal_resolution,
+                    'status_version', OLD.status_version, 'created_at_ms', OLD.created_at_ms,
+                    'updated_at_ms', OLD.updated_at_ms, 'context_store_uuid', OLD.context_store_uuid,
+                    'context_row_id', OLD.context_row_id), NULL);
+        END;
+    "#,
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1963,17 +2168,95 @@ pub struct NoteInput<'a> {
     pub now_ms: i64,
 }
 
+/// Full module-side note write input. `surface_condition` selects the pending smart-note
+/// state; an absent condition creates an ordinary active note for legacy callers, while the
+/// Rust-mode adapter keeps session-only notes on the TypeScript-owned path.
+#[derive(Debug, Clone, Copy)]
+pub struct NoteWriteInput<'a> {
+    pub project_path: &'a str,
+    pub session_id: Option<&'a str>,
+    pub content: &'a str,
+    pub surface_condition: Option<&'a str>,
+    pub anchor_block_id: Option<&'a str>,
+    pub anchor_ordinal: Option<i64>,
+    pub now_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredNote {
     pub id: i64,
+    pub type_name: String,
     pub project_path: String,
     pub session_id: String,
     pub content: String,
     pub status: String,
     pub surface_condition: Option<String>,
+    pub ready_at: Option<i64>,
+    pub ready_reason: Option<String>,
+    pub manifest_json: Option<String>,
+    pub compiled_check: Option<String>,
+    pub check_hash: Option<String>,
+    pub check_cron: Option<String>,
+    pub check_failure_count: i64,
+    pub check_network_failure_count: i64,
+    pub check_quarantined_until: Option<i64>,
+    pub check_next_due_at: Option<i64>,
+    pub check_compiled_at: Option<i64>,
+    pub check_false_since_at: Option<i64>,
+    pub check_last_liveness_at: Option<i64>,
+    pub last_checked_at: Option<i64>,
+    pub check_status: Option<String>,
+    pub check_version: Option<i64>,
+    pub policy_version: Option<i64>,
+    pub harness: String,
     pub anchor_block_id: Option<String>,
+    pub anchor_ordinal: Option<i64>,
+    pub dismissed_at: Option<i64>,
+    pub dismissal_resolution: Option<String>,
+    pub status_version: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub context_store_uuid: Option<String>,
+    pub context_row_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteDelivery {
+    pub delivery_id: String,
+    pub note_id: i64,
+    pub session_id: String,
+    pub delivered_pass_fingerprint: String,
+    pub transform_pass_id: String,
+    pub acked_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteCasOutcome {
+    Applied(StoredNote),
+    Conflict { current: Option<StoredNote> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteTransitionInput<'a> {
+    pub project_path: &'a str,
+    pub note_id: i64,
+    pub from_status: &'a str,
+    pub source_revision: i64,
+    pub to_status: &'a str,
+    pub result: Option<&'a str>,
+    pub now_ms: i64,
+}
+
+pub struct NoteEvaluationInput<'a> {
+    pub project_path: &'a str,
+    pub note_id: i64,
+    pub source_revision: i64,
+    pub verdict: bool,
+    pub compiled_check: Option<&'a str>,
+    pub manifest_json: Option<&'a str>,
+    pub check_hash: Option<&'a str>,
+    pub next_due_at: Option<i64>,
+    pub now_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2285,6 +2568,17 @@ pub enum McStoreError {
     MemoryDuplicateContent {
         id: i64,
     },
+    NoteCasConflict {
+        id: i64,
+        expected_status: String,
+        expected_version: i64,
+        found_status: String,
+        found_version: i64,
+    },
+    NoteOwnershipMismatch {
+        id: i64,
+        project: String,
+    },
 }
 
 impl std::fmt::Display for McStoreError {
@@ -2309,6 +2603,19 @@ impl std::fmt::Display for McStoreError {
             McStoreError::Serde(e) => write!(f, "serde: {e}"),
             McStoreError::MemoryDuplicateContent { id } => {
                 write!(f, "memory content already exists as ID {id}")
+            }
+            McStoreError::NoteCasConflict {
+                id,
+                expected_status,
+                expected_version,
+                found_status,
+                found_version,
+            } => write!(
+                f,
+                "note {id} CAS conflict: expected {expected_status}@{expected_version}, found {found_status}@{found_version}"
+            ),
+            McStoreError::NoteOwnershipMismatch { id, project } => {
+                write!(f, "note {id} is not owned by project {project}")
             }
         }
     }
@@ -2685,6 +2992,10 @@ type AbandonHistorianHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut
 /// module's lifetime.
 pub struct McStore {
     inner: SqliteStore,
+    /// The connection-local caller identity used by note ownership triggers. It is
+    /// installed only while a fenced note mutation is executing, so an unwrapped SQL
+    /// writer fails closed instead of inheriting a previous operation's project.
+    note_caller_project: Arc<Mutex<Option<String>>>,
     #[cfg(any(test, feature = "test-support"))]
     abandon_historian_hook: AbandonHistorianHook,
 }
@@ -2694,9 +3005,28 @@ impl McStore {
     /// the cache-state migration chain. Open exactly ONCE per module lifetime.
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
         let inner = open_sqlite(descriptor)?;
+        let note_caller_project = Arc::new(Mutex::new(None::<String>));
+        let udf_scope = Arc::clone(&note_caller_project);
+        // Register before migrations: migration 26 creates triggers that call this function,
+        // and the same connection must have it before the first note write is possible.
+        inner.with_conn(move |conn| {
+            conn.create_scalar_function(
+                "mc_note_caller_project",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                move |_context| {
+                    Ok(udf_scope
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                        .unwrap_or_default())
+                },
+            )
+        })?;
         inner.migrate(NS, MIGRATIONS)?;
         Ok(McStore {
             inner,
+            note_caller_project,
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
@@ -2711,6 +3041,28 @@ impl McStore {
             .abandon_historian_hook
             .lock()
             .expect("abandon historian hook mutex") = Some(hook);
+    }
+
+    fn with_note_conn_fenced<T>(
+        &self,
+        caller_project: &str,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> Result<T, McStoreError> {
+        let caller_project = caller_project.to_string();
+        let caller_scope = Arc::clone(&self.note_caller_project);
+        self.inner
+            .with_conn_fenced(|tx| {
+                let previous = caller_scope
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replace(caller_project);
+                let result = operation(tx);
+                *caller_scope
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous;
+                result
+            })
+            .map_err(Into::into)
     }
 
     /// Load a session's persisted state. Returns defaults (uninitialized, no row)
@@ -6442,31 +6794,172 @@ impl McStore {
             .next())
     }
 
-    pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, McStoreError> {
-        let content = input.content.trim();
+    fn note_by_id(&self, note_id: i64) -> Result<Option<StoredNote>, McStoreError> {
         self.inner
-            .with_conn_fenced(|tx| {
-                tx.execute(
-                    "INSERT INTO mc_notes
-                   (project_path, session_id, content, status, surface_condition, anchor_block_id,
-                    created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?6)",
-                    params![
-                        input.project_path,
-                        input.session_id,
-                        content,
-                        input
-                            .surface_condition
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty()),
-                        input.anchor_block_id,
-                        input.now_ms,
-                    ],
-                )?;
-                let id = tx.last_insert_rowid();
-                load_note_tx(tx, id)
+            .with_conn(|conn| {
+                conn.query_row(
+                    &format!("SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes WHERE id = ?1"),
+                    params![note_id],
+                    stored_note_from_row,
+                )
+                .optional()
             })
             .map_err(Into::into)
+    }
+
+    fn require_note_project(&self, project_path: &str, note_id: i64) -> Result<(), McStoreError> {
+        if let Some(note) = self.note_by_id(note_id)? {
+            if note.project_path != project_path {
+                return Err(McStoreError::NoteOwnershipMismatch {
+                    id: note_id,
+                    project: project_path.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Load one note through the same project/session visibility fence used by the facade.
+    /// Smart notes are project-visible across sessions; session notes require the provenance
+    /// session to match. The SQL predicate keeps this lookup independent of page size.
+    pub fn get_note_by_id(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        note_id: i64,
+    ) -> Result<Option<StoredNote>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    &format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+                         WHERE id = ?1 AND project_path = ?2
+                           AND (type = 'smart' OR session_id = ?3)"
+                    ),
+                    params![note_id, project_path, session_id],
+                    stored_note_from_row,
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Page the notes visible to one session: all project smart notes plus that session's
+    /// ordinary notes. Ownership and pagination both remain in SQL.
+    pub fn read_visible_notes(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        statuses: &[&str],
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<StoredNote>, McStoreError> {
+        let limit = i64::try_from(limit.clamp(1, 1000))
+            .map_err(|_| McStoreError::Serde("note limit exceeds i64".to_string()))?;
+        let offset = i64::try_from(offset)
+            .map_err(|_| McStoreError::Serde("note offset exceeds i64".to_string()))?;
+        let statuses = if statuses.is_empty() {
+            vec!["active"]
+        } else {
+            statuses.to_vec()
+        };
+        let placeholders = std::iter::repeat_n("?", statuses.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+             WHERE project_path = ? AND status IN ({placeholders})
+               AND (type = 'smart' OR session_id = ?)
+             ORDER BY updated_at_ms DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        self.inner
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                let mut values = Vec::with_capacity(statuses.len() + 3);
+                values.push(SqlValue::Text(project_path.to_string()));
+                for status in &statuses {
+                    values.push(SqlValue::Text((*status).to_string()));
+                }
+                values.push(SqlValue::Text(session_id.to_string()));
+                values.push(SqlValue::Integer(limit));
+                values.push(SqlValue::Integer(offset));
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(values), stored_note_from_row)?
+                    .collect::<Result<Vec<_>, _>>();
+                rows
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, McStoreError> {
+        let content = input.content.trim();
+        if content.is_empty() {
+            return Err(McStoreError::Serde(
+                "note content must not be empty".to_string(),
+            ));
+        }
+        // This compatibility entry point keeps legacy callers on the active-status path
+        // used by the previous context-note surface; the full project smart-note writer
+        // below deliberately uses pending instead while still recording condition text.
+        self.with_note_conn_fenced(input.project_path, |tx| {
+            tx.execute(
+                "INSERT INTO mc_notes
+                 (type, project_path, session_id, content, status, surface_condition,
+                  anchor_block_id, harness, created_at_ms, updated_at_ms)
+                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
+                params![
+                    input.project_path,
+                    input.session_id,
+                    content,
+                    input.surface_condition,
+                    input.anchor_block_id,
+                    input.now_ms,
+                ],
+            )?;
+            load_note_tx(tx, tx.last_insert_rowid())
+        })
+    }
+
+    pub fn insert_project_note(
+        &self,
+        input: NoteWriteInput<'_>,
+    ) -> Result<StoredNote, McStoreError> {
+        let content = input.content.trim();
+        if content.is_empty() {
+            return Err(McStoreError::Serde(
+                "note content must not be empty".to_string(),
+            ));
+        }
+        let status = if input
+            .surface_condition
+            .is_some_and(|condition| !condition.trim().is_empty())
+        {
+            "pending"
+        } else {
+            "active"
+        };
+        self.with_note_conn_fenced(input.project_path, |tx| {
+            tx.execute(
+                "INSERT INTO mc_notes
+                 (type, project_path, session_id, content, status, surface_condition,
+                  anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
+                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                params![
+                    input.project_path,
+                    input.session_id,
+                    content,
+                    status,
+                    input
+                        .surface_condition
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty()),
+                    input.anchor_block_id,
+                    input.anchor_ordinal,
+                    input.now_ms,
+                ],
+            )?;
+            load_note_tx(tx, tx.last_insert_rowid())
+        })
     }
 
     pub fn read_notes(
@@ -6476,27 +6969,60 @@ impl McStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<StoredNote>, McStoreError> {
-        let limit = limit.clamp(1, 100) as i64;
+        self.read_project_notes(project_path, Some(session_id), &["active"], limit, offset)
+    }
+
+    /// Read project-owned notes without using session_id as the ownership key. Session id
+    /// remains an optional provenance filter for the legacy session-note view only.
+    pub fn read_project_notes(
+        &self,
+        project_path: &str,
+        session_id: Option<&str>,
+        statuses: &[&str],
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<StoredNote>, McStoreError> {
+        let limit = i64::try_from(limit.clamp(1, 1000))
+            .map_err(|_| McStoreError::Serde("note limit exceeds i64".to_string()))?;
         let offset = i64::try_from(offset)
             .map_err(|_| McStoreError::Serde("note offset exceeds i64".to_string()))?;
-        let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, project_path, session_id, content, status, surface_condition,
-                        anchor_block_id, created_at_ms, updated_at_ms
-                   FROM mc_notes
-                  WHERE project_path = ?1 AND session_id = ?2 AND status = 'active'
-                  ORDER BY updated_at_ms DESC, id DESC
-                  LIMIT ?3 OFFSET ?4",
-            )?;
-            let mapped = stmt
-                .query_map(
-                    params![project_path, session_id, limit, offset],
-                    stored_note_from_row,
-                )?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(mapped)
-        })?;
-        Ok(rows)
+        let statuses = if statuses.is_empty() {
+            vec!["active"]
+        } else {
+            statuses.to_vec()
+        };
+        let placeholders = std::iter::repeat_n("?", statuses.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let session_clause = if session_id.is_some() {
+            " AND type = 'session' AND session_id = ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+             WHERE project_path = ? AND status IN ({placeholders}){session_clause}
+             ORDER BY updated_at_ms DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        self.inner
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 4);
+                values.push(SqlValue::Text(project_path.to_string()));
+                for status in &statuses {
+                    values.push(SqlValue::Text((*status).to_string()));
+                }
+                if let Some(session_id) = session_id {
+                    values.push(SqlValue::Text(session_id.to_string()));
+                }
+                values.push(SqlValue::Integer(limit));
+                values.push(SqlValue::Integer(offset));
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(values), stored_note_from_row)?
+                    .collect::<Result<Vec<_>, _>>();
+                rows
+            })
+            .map_err(Into::into)
     }
 
     pub fn update_note_content(
@@ -6507,21 +7033,98 @@ impl McStore {
         content: &str,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        let content = content.trim();
-        self.inner
-            .with_conn_fenced(|tx| {
-                let changed = tx.execute(
-                    "UPDATE mc_notes
-                    SET content = ?4, updated_at_ms = ?5
-                  WHERE id = ?1 AND project_path = ?2 AND session_id = ?3 AND status = 'active'",
-                    params![note_id, project_path, session_id, content, now_ms],
-                )?;
-                if changed == 0 {
-                    return Ok(None);
-                }
-                load_note_tx(tx, note_id).map(Some)
-            })
-            .map_err(Into::into)
+        let current = self.get_note_by_id(project_path, session_id, note_id)?;
+        let current = current.filter(|note| {
+            matches!(
+                note.status.as_str(),
+                "active" | "pending" | "ready" | "surfacing" | "surfaced"
+            )
+        });
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        match self.update_note_cas(
+            project_path,
+            note_id,
+            &current.status,
+            current.status_version,
+            Some(content),
+            None,
+            now_ms,
+        )? {
+            NoteCasOutcome::Applied(note) => Ok(Some(note)),
+            NoteCasOutcome::Conflict { .. } => Ok(None),
+        }
+    }
+
+    /// Update note content and/or condition only when both the status and revision still
+    /// match the caller's snapshot. A changed condition clears compiled evaluation state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_note_cas(
+        &self,
+        project_path: &str,
+        note_id: i64,
+        expected_status: &str,
+        expected_version: i64,
+        content: Option<&str>,
+        surface_condition: Option<Option<&str>>,
+        now_ms: i64,
+    ) -> Result<NoteCasOutcome, McStoreError> {
+        self.require_note_project(project_path, note_id)?;
+        let result = self.with_note_conn_fenced(project_path, |tx| {
+            let current = load_note_tx(tx, note_id).optional()?;
+            let Some(current) = current else {
+                return Ok(NoteCasOutcome::Conflict { current: None });
+            };
+            if current.project_path != project_path {
+                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+            }
+            if current.status != expected_status || current.status_version != expected_version {
+                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+            }
+            let next_content = content.map(str::trim).unwrap_or(&current.content);
+            if next_content.is_empty() {
+                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+            }
+            let condition_changed = surface_condition.is_some();
+            let next_condition = surface_condition
+                .flatten()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let next_status = if condition_changed && next_condition.is_some() {
+                "pending"
+            } else {
+                current.status.as_str()
+            };
+            let changed = tx.execute(
+                "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
+                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
+                    last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
+                    ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
+                    ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
+                    compiled_check = CASE WHEN ?2 THEN NULL ELSE compiled_check END,
+                    manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
+                    check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
+                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
+                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                params![
+                    next_content,
+                    condition_changed,
+                    next_condition,
+                    next_status,
+                    now_ms,
+                    note_id,
+                    project_path,
+                    expected_status,
+                    expected_version,
+                ],
+            )?;
+            if changed == 0 {
+                return Ok(NoteCasOutcome::Conflict { current: load_note_tx(tx, note_id).optional()? });
+            }
+            Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+        })?;
+        Ok(result)
     }
 
     pub fn dismiss_note(
@@ -6532,34 +7135,396 @@ impl McStore {
         resolution: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        self.inner
-            .with_conn_fenced(|tx| {
-                let Some(mut note) = load_note_scoped_tx(tx, project_path, session_id, note_id)?
-                else {
-                    return Ok(None);
-                };
-                if note.status != "active" {
-                    return Ok(None);
+        let current = self.get_note_by_id(project_path, session_id, note_id)?;
+        let current = current.filter(|note| {
+            matches!(
+                note.status.as_str(),
+                "active" | "pending" | "ready" | "surfacing" | "surfaced"
+            )
+        });
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        match self.dismiss_note_cas(
+            project_path,
+            note_id,
+            &current.status,
+            current.status_version,
+            resolution,
+            now_ms,
+        )? {
+            NoteCasOutcome::Applied(note) => {
+                if let Some(resolution) = resolution.filter(|value| !value.trim().is_empty()) {
+                    let content = format!("{}\n\nResolution: {}", note.content, resolution.trim());
+                    return match self.update_note_cas(
+                        project_path,
+                        note.id,
+                        "dismissed",
+                        note.status_version,
+                        Some(&content),
+                        None,
+                        now_ms,
+                    )? {
+                        NoteCasOutcome::Applied(updated) => Ok(Some(updated)),
+                        NoteCasOutcome::Conflict { .. } => Ok(Some(note)),
+                    };
                 }
-                if let Some(resolution) = resolution.map(str::trim).filter(|s| !s.is_empty()) {
-                    note.content =
-                        format!("{}\n\nDismissal resolution: {resolution}", note.content);
+                Ok(Some(note))
+            }
+            NoteCasOutcome::Conflict {
+                current: Some(note),
+            } if note.status == "dismissed" => Ok(None),
+            NoteCasOutcome::Conflict { .. } => Ok(None),
+        }
+    }
+
+    /// Dismissal is a status CAS. It wins over a later surfacing claim, but never rewrites
+    /// bytes that a previous claim already placed in a frozen transform response.
+    pub fn dismiss_note_cas(
+        &self,
+        project_path: &str,
+        note_id: i64,
+        expected_status: &str,
+        expected_version: i64,
+        resolution: Option<&str>,
+        now_ms: i64,
+    ) -> Result<NoteCasOutcome, McStoreError> {
+        self.require_note_project(project_path, note_id)?;
+        let outcome = self.transition_note_internal(
+            project_path,
+            note_id,
+            expected_status,
+            expected_version,
+            "dismissed",
+            resolution,
+            now_ms,
+        )?;
+        if let NoteCasOutcome::Conflict {
+            current: Some(current),
+        } = &outcome
+        {
+            if current.status != "dismissed" {
+                // Dismissal is the terminal user decision. Re-read the winner and apply
+                // one fresh CAS so a concurrent surface/update cannot resurrect the note.
+                return self.transition_note_internal(
+                    project_path,
+                    note_id,
+                    &current.status,
+                    current.status_version,
+                    "dismissed",
+                    resolution,
+                    now_ms,
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Store a host-evaluated smart-note verdict under the evaluator's source revision.
+    /// The module never interprets condition text; it only performs this CAS write and
+    /// promotes a true verdict to `ready` for a later natural cache bust.
+    pub fn write_note_evaluation(
+        &self,
+        input: NoteEvaluationInput<'_>,
+    ) -> Result<NoteCasOutcome, McStoreError> {
+        self.require_note_project(input.project_path, input.note_id)?;
+        self.with_note_conn_fenced(input.project_path, |tx| {
+            let Some(current) = load_note_tx(tx, input.note_id).optional()? else {
+                return Ok(NoteCasOutcome::Conflict { current: None });
+            };
+            if current.project_path != input.project_path
+                || current.status != "pending"
+                || current.status_version != input.source_revision
+            {
+                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+            }
+            let status = if input.verdict { "ready" } else { "pending" };
+            tx.execute(
+                "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
+                    updated_at_ms = ?2, ready_at = CASE WHEN ?1 = 'ready' THEN ?2 ELSE ready_at END,
+                    ready_reason = CASE WHEN ?1 = 'ready' THEN 'condition_true' ELSE ready_reason END,
+                    compiled_check = ?3, manifest_json = ?4, check_hash = ?5,
+                    check_next_due_at = ?6, last_checked_at = ?2,
+                    check_status = CASE WHEN ?1 = 'ready' THEN 'true' ELSE 'false' END
+                  WHERE id = ?7 AND project_path = ?8 AND status = 'pending' AND status_version = ?9",
+                params![
+                    status,
+                    input.now_ms,
+                    input.compiled_check,
+                    input.manifest_json,
+                    input.check_hash,
+                    input.next_due_at,
+                    input.note_id,
+                    input.project_path,
+                    input.source_revision,
+                ],
+            )?;
+            Ok(NoteCasOutcome::Applied(load_note_tx(tx, input.note_id)?))
+        })
+    }
+
+    pub fn transition_note(
+        &self,
+        input: NoteTransitionInput<'_>,
+    ) -> Result<NoteCasOutcome, McStoreError> {
+        self.transition_note_internal(
+            input.project_path,
+            input.note_id,
+            input.from_status,
+            input.source_revision,
+            input.to_status,
+            input.result,
+            input.now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transition_note_internal(
+        &self,
+        project_path: &str,
+        note_id: i64,
+        expected_status: &str,
+        expected_version: i64,
+        to_status: &str,
+        result: Option<&str>,
+        now_ms: i64,
+    ) -> Result<NoteCasOutcome, McStoreError> {
+        self.require_note_project(project_path, note_id)?;
+        if !matches!(
+            to_status,
+            "active" | "pending" | "ready" | "surfacing" | "surfaced" | "dismissed"
+        ) {
+            return Err(McStoreError::Serde(format!(
+                "invalid note transition target {to_status}"
+            )));
+        }
+        self.with_note_conn_fenced(project_path, |tx| {
+            let Some(current) = load_note_tx(tx, note_id).optional()? else {
+                return Ok(NoteCasOutcome::Conflict { current: None });
+            };
+            if current.project_path != project_path
+                || current.status != expected_status
+                || current.status_version != expected_version
+            {
+                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+            }
+            tx.execute(
+                "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
+                    updated_at_ms = ?2,
+                    ready_at = CASE WHEN ?1 = 'ready' THEN COALESCE(ready_at, ?2) ELSE ready_at END,
+                    ready_reason = CASE WHEN ?1 = 'ready' THEN COALESCE(?3, ready_reason) ELSE ready_reason END,
+                    dismissed_at = CASE WHEN ?1 = 'dismissed' THEN ?2 ELSE dismissed_at END,
+                    dismissal_resolution = CASE WHEN ?1 = 'dismissed' THEN ?3 ELSE dismissal_resolution END
+                  WHERE id = ?4 AND project_path = ?5 AND status = ?6 AND status_version = ?7",
+                params![to_status, now_ms, result, note_id, project_path, expected_status, expected_version],
+            )?;
+            Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+        })
+    }
+
+    /// Claim one due pending smart note for an evaluator. The source revision is the
+    /// status_version observed by the evaluator; the lease itself is represented by the
+    /// module-internal `surfacing` state and is released by a CAS transition.
+    pub fn claim_due_note(
+        &self,
+        project_path: &str,
+        now_ms: i64,
+    ) -> Result<Option<StoredNote>, McStoreError> {
+        self.with_note_conn_fenced(project_path, |tx| {
+            let note = tx
+                .query_row(
+                    &format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+                         WHERE project_path = ?1 AND type = 'smart' AND status = 'pending'
+                           AND (check_next_due_at IS NULL OR check_next_due_at <= ?2)
+                           AND (check_quarantined_until IS NULL OR check_quarantined_until <= ?2)
+                         ORDER BY COALESCE(check_next_due_at, 0), id LIMIT 1"
+                    ),
+                    params![project_path, now_ms],
+                    stored_note_from_row,
+                )
+                .optional()?;
+            let Some(note) = note else { return Ok(None) };
+            let changed = tx.execute(
+                "UPDATE mc_notes SET status_version = status_version + 1, updated_at_ms = ?1
+                   WHERE id = ?2 AND project_path = ?3 AND status = 'pending' AND status_version = ?4",
+                params![now_ms, note.id, project_path, note.status_version],
+            )?;
+            if changed == 0 { return Ok(None); }
+            tx.query_row(
+                &format!("SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes WHERE id = ?1"),
+                params![note.id],
+                stored_note_from_row,
+            ).map(Some)
+        })
+    }
+
+    pub fn claim_note_delivery(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        delivered_pass_fingerprint: &str,
+        transform_pass_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<(StoredNote, NoteDelivery)>, McStoreError> {
+        self.with_note_conn_fenced(project_path, |tx| {
+            let notes = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+                     WHERE project_path = ?1 AND type = 'smart' AND
+                       (status = 'ready' OR status = 'surfacing' OR status = 'surfaced')
+                     ORDER BY updated_at_ms ASC, id ASC"
+                ))?;
+                let rows = stmt
+                    .query_map(params![project_path], stored_note_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut candidates = Vec::new();
+            for note in notes {
+                let unacked = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_note_deliveries
+                       WHERE note_id = ?1 AND session_id = ?2 AND acked_at IS NULL)",
+                    params![note.id, session_id],
+                    |r| r.get::<_, i64>(0),
+                )? != 0;
+                if note.status == "surfaced" && !unacked {
+                    continue;
                 }
+                let existing = tx
+                    .query_row(
+                        "SELECT delivery_id, transform_pass_id, acked_at
+                           FROM mc_note_deliveries
+                          WHERE note_id = ?1 AND session_id = ?2 AND delivered_pass_fingerprint = ?3",
+                        params![note.id, session_id, delivered_pass_fingerprint],
+                        |r| {
+                            Ok(NoteDelivery {
+                                delivery_id: r.get(0)?,
+                                note_id: note.id,
+                                session_id: session_id.to_string(),
+                                delivered_pass_fingerprint: delivered_pass_fingerprint.to_string(),
+                                transform_pass_id: r.get(1)?,
+                                acked_at: r.get(2)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+                if let Some(delivery) = existing {
+                    if delivery.acked_at.is_none() {
+                        candidates.push((note, delivery));
+                    }
+                    continue;
+                }
+                if note.status == "ready" {
+                    let changed = tx.execute(
+                        "UPDATE mc_notes SET status = 'surfacing', status_version = status_version + 1,
+                            updated_at_ms = ?1
+                          WHERE id = ?2 AND project_path = ?3 AND status = 'ready' AND status_version = ?4",
+                        params![now_ms, note.id, project_path, note.status_version],
+                    )?;
+                    if changed == 0 {
+                        continue;
+                    }
+                }
+                let delivery_id = format!("{transform_pass_id}:{}", note.id);
                 tx.execute(
-                    "UPDATE mc_notes
-                    SET content = ?2, status = 'dismissed', updated_at_ms = ?3
-                  WHERE id = ?1",
-                    params![note_id, note.content, now_ms],
+                    "INSERT INTO mc_note_deliveries
+                       (delivery_id, note_id, session_id, delivered_pass_fingerprint,
+                        transform_pass_id, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        delivery_id,
+                        note.id,
+                        session_id,
+                        delivered_pass_fingerprint,
+                        transform_pass_id,
+                        now_ms
+                    ],
                 )?;
-                load_note_tx(tx, note_id).map(Some)
-            })
-            .map_err(Into::into)
+                let stored = load_note_tx(tx, note.id)?;
+                candidates.push((
+                    stored,
+                    NoteDelivery {
+                        delivery_id,
+                        note_id: note.id,
+                        session_id: session_id.to_string(),
+                        delivered_pass_fingerprint: delivered_pass_fingerprint.to_string(),
+                        transform_pass_id: transform_pass_id.to_string(),
+                        acked_at: None,
+                    },
+                ));
+            }
+            Ok(candidates)
+        })
+    }
+
+    pub fn ack_note_delivery(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        transform_pass_id: &str,
+        now_ms: i64,
+    ) -> Result<usize, McStoreError> {
+        self.with_note_conn_fenced(project_path, |tx| {
+            let changed = tx.execute(
+                "UPDATE mc_note_deliveries SET acked_at = ?1
+                   WHERE session_id = ?2 AND transform_pass_id = ?3 AND acked_at IS NULL",
+                params![now_ms, session_id, transform_pass_id],
+            )?;
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT note_id FROM mc_note_deliveries
+                   WHERE session_id = ?1 AND transform_pass_id = ?2 AND acked_at = ?3",
+            )?;
+            let ids = stmt
+                .query_map(params![session_id, transform_pass_id, now_ms], |r| {
+                    r.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for id in ids {
+                tx.execute(
+                    "UPDATE mc_notes SET status = 'surfaced', status_version = status_version + 1,
+                        updated_at_ms = ?1
+                      WHERE id = ?2 AND project_path = ?3 AND status IN ('surfacing', 'surfaced')",
+                    params![now_ms, id, project_path],
+                )?;
+            }
+            Ok(changed)
+        })
+    }
+
+    pub fn nack_note_delivery(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        transform_pass_id: &str,
+        now_ms: i64,
+    ) -> Result<usize, McStoreError> {
+        self.with_note_conn_fenced(project_path, |tx| {
+            let ids = tx
+                .prepare(
+                    "SELECT DISTINCT note_id FROM mc_note_deliveries
+                       WHERE session_id = ?1 AND transform_pass_id = ?2 AND acked_at IS NULL",
+                )?
+                .query_map(params![session_id, transform_pass_id], |r| {
+                    r.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for id in &ids {
+                tx.execute(
+                    "UPDATE mc_notes SET status = 'ready', status_version = status_version + 1,
+                        updated_at_ms = ?1
+                      WHERE id = ?2 AND project_path = ?3 AND status IN ('surfacing', 'surfaced')",
+                    params![now_ms, id, project_path],
+                )?;
+            }
+            Ok(ids.len())
+        })
     }
 
     pub fn search_notes_like(
         &self,
         project_path: &str,
-        session_id: &str,
+        _session_id: &str,
         query: &str,
     ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
         if query.trim().is_empty() {
@@ -6570,14 +7535,14 @@ impl McStore {
             let mut stmt = conn.prepare(
                 "SELECT id, content, status, surface_condition, updated_at_ms
                    FROM mc_notes
-                  WHERE project_path = ?1 AND session_id = ?2
-                    AND (LOWER(content) LIKE ?3 ESCAPE '\\'
-                      OR LOWER(COALESCE(surface_condition, '')) LIKE ?3 ESCAPE '\\')
+                   WHERE project_path = ?1
+                     AND (LOWER(content) LIKE ?2 ESCAPE '\\'
+                       OR LOWER(COALESCE(surface_condition, '')) LIKE ?2 ESCAPE '\\')
                   ORDER BY updated_at_ms DESC, id DESC
                   LIMIT 100",
             )?;
             let mapped = stmt
-                .query_map(params![project_path, session_id, pattern], |r| {
+                .query_map(params![project_path, pattern], |r| {
                     Ok(StoredNoteSearchRow {
                         id: r.get(0)?,
                         content: r.get(1)?,
@@ -7333,36 +8298,76 @@ impl McStore {
         })?;
         let text = |name: &str| object.get(name).and_then(Value::as_str);
         let integer = |name: &str| object.get(name).and_then(Value::as_i64);
-        let id = self.inner.with_conn_fenced(|tx| {
+        let project = text("project_path").unwrap_or_default().to_string();
+        let id = self.with_note_conn_fenced(&project, |tx| {
             tx.execute(
-                "INSERT INTO mc_notes
-                    (project_path, session_id, content, status, surface_condition, anchor_block_id,
-                     created_at_ms, updated_at_ms, context_store_uuid, context_row_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
-                    project_path=excluded.project_path, session_id=excluded.session_id,
-                    content=excluded.content, status=excluded.status,
-                    surface_condition=excluded.surface_condition, anchor_block_id=excluded.anchor_block_id,
-                    created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms",
+                &format!(
+"INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
+                              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                              ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                              ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                     ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
+                        type=excluded.type, project_path=excluded.project_path,
+                        session_id=excluded.session_id, content=excluded.content,
+                        status=excluded.status, surface_condition=excluded.surface_condition,
+                        ready_at=excluded.ready_at, ready_reason=excluded.ready_reason,
+                        manifest_json=excluded.manifest_json, compiled_check=excluded.compiled_check,
+                        check_hash=excluded.check_hash, check_cron=excluded.check_cron,
+                        check_failure_count=excluded.check_failure_count,
+                        check_network_failure_count=excluded.check_network_failure_count,
+                        check_quarantined_until=excluded.check_quarantined_until,
+                        check_next_due_at=excluded.check_next_due_at, check_compiled_at=excluded.check_compiled_at,
+                        check_false_since_at=excluded.check_false_since_at,
+                        check_last_liveness_at=excluded.check_last_liveness_at,
+                        last_checked_at=excluded.last_checked_at, check_status=excluded.check_status,
+                        check_version=excluded.check_version, policy_version=excluded.policy_version,
+                        harness=excluded.harness, anchor_block_id=excluded.anchor_block_id,
+                        anchor_ordinal=excluded.anchor_ordinal, dismissed_at=excluded.dismissed_at,
+                        dismissal_resolution=excluded.dismissal_resolution,
+                        status_version=excluded.status_version, created_at_ms=excluded.created_at_ms,
+                        updated_at_ms=excluded.updated_at_ms"
+                ),
                 params![
-                    text("project_path").unwrap_or_default(),
-                    text("session_id").unwrap_or_default(),
-                    text("content").unwrap_or_default(),
+                          text("type").unwrap_or("smart"),
+                    project,
+                          text("session_id"),
+                    text("content").unwrap_or(""),
                     text("status").unwrap_or("active"),
                     text("surface_condition"),
+                    integer("ready_at"),
+                    text("ready_reason"),
+                    text("manifest_json"),
+                    text("compiled_check"),
+                    text("check_hash"),
+                    text("check_cron"),
+                    integer("check_failure_count").unwrap_or(0),
+                    integer("check_network_failure_count").unwrap_or(0),
+                    integer("check_quarantined_until"),
+                    integer("check_next_due_at"),
+                    integer("check_compiled_at"),
+                    integer("check_false_since_at"),
+                    integer("check_last_liveness_at"),
+                    integer("last_checked_at"),
+                          text("check_status").unwrap_or("uncompiled"),
+                          integer("check_version").unwrap_or(0),
+                          integer("policy_version").unwrap_or(1),
+                    text("harness").unwrap_or("module"),
                     text("anchor_block_id"),
-                    integer("created_at_ms").unwrap_or(0),
-                    integer("updated_at_ms").unwrap_or(0),
+                    integer("anchor_ordinal"),
+                    integer("dismissed_at"),
+                    text("dismissal_resolution"),
+                    integer("status_version").unwrap_or(0),
+                          integer("created_at_ms").or_else(|| integer("created_at")).unwrap_or(0),
+                          integer("updated_at_ms").or_else(|| integer("updated_at")).unwrap_or(0),
                     context_store_uuid,
                     source_row_id,
                 ],
             )?;
-            let id: i64 = tx.query_row(
+            tx.query_row(
                 "SELECT id FROM mc_notes WHERE context_store_uuid = ?1 AND context_row_id = ?2",
                 params![context_store_uuid, source_row_id],
                 |row| row.get(0),
-            )?;
-            Ok(id)
+            )
         })?;
         Ok(id)
     }
@@ -7910,45 +8915,54 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
     })
 }
 
+const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
+const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
+
 fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
     Ok(StoredNote {
         id: r.get(0)?,
-        project_path: r.get(1)?,
-        session_id: r.get(2)?,
-        content: r.get(3)?,
-        status: r.get(4)?,
-        surface_condition: r.get(5)?,
-        anchor_block_id: r.get(6)?,
-        created_at_ms: r.get(7)?,
-        updated_at_ms: r.get(8)?,
+        type_name: r.get(1)?,
+        project_path: r.get(2)?,
+        session_id: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        content: r.get(4)?,
+        status: r.get(5)?,
+        surface_condition: r.get(6)?,
+        ready_at: r.get(7)?,
+        ready_reason: r.get(8)?,
+        manifest_json: r.get(9)?,
+        compiled_check: r.get(10)?,
+        check_hash: r.get(11)?,
+        check_cron: r.get(12)?,
+        check_failure_count: r.get(13)?,
+        check_network_failure_count: r.get(14)?,
+        check_quarantined_until: r.get(15)?,
+        check_next_due_at: r.get(16)?,
+        check_compiled_at: r.get(17)?,
+        check_false_since_at: r.get(18)?,
+        check_last_liveness_at: r.get(19)?,
+        last_checked_at: r.get(20)?,
+        check_status: r.get(21)?,
+        check_version: r.get(22)?,
+        policy_version: r.get(23)?,
+        harness: r.get(24)?,
+        anchor_block_id: r.get(25)?,
+        anchor_ordinal: r.get(26)?,
+        dismissed_at: r.get(27)?,
+        dismissal_resolution: r.get(28)?,
+        status_version: r.get(29)?,
+        created_at_ms: r.get(30)?,
+        updated_at_ms: r.get(31)?,
+        context_store_uuid: r.get(32)?,
+        context_row_id: r.get(33)?,
     })
 }
 
 fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<StoredNote> {
     tx.query_row(
-        "SELECT id, project_path, session_id, content, status, surface_condition,
-                anchor_block_id, created_at_ms, updated_at_ms
-           FROM mc_notes WHERE id = ?1",
+        &format!("SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes WHERE id = ?1"),
         params![id],
         stored_note_from_row,
     )
-}
-
-fn load_note_scoped_tx(
-    tx: &rusqlite::Transaction<'_>,
-    project_path: &str,
-    session_id: &str,
-    id: i64,
-) -> rusqlite::Result<Option<StoredNote>> {
-    tx.query_row(
-        "SELECT id, project_path, session_id, content, status, surface_condition,
-                anchor_block_id, created_at_ms, updated_at_ms
-           FROM mc_notes
-          WHERE id = ?1 AND project_path = ?2 AND session_id = ?3",
-        params![id, project_path, session_id],
-        stored_note_from_row,
-    )
-    .optional()
 }
 
 fn promote_facts_tx(
@@ -10798,6 +11812,162 @@ mod tests {
             .search_notes_like("git:other", "ses", "pagination")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn project_notes_use_cas_and_at_least_once_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                session_id: Some("writer-session"),
+                content: "wait for the release",
+                surface_condition: Some("release exists"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 10,
+            })
+            .unwrap();
+        assert_eq!(note.status, "pending");
+        let note = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                "pending",
+                note.status_version,
+                Some("wait for the release tag"),
+                None,
+                11,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected cold-start update outcome: {other:?}"),
+        };
+        assert!(store
+            .read_project_notes("git:other", None, &["pending"], 25, 0)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            store.update_note_cas(
+                "git:other",
+                note.id,
+                "pending",
+                note.status_version,
+                Some("cross-project write"),
+                None,
+                11,
+            ),
+            Err(McStoreError::NoteOwnershipMismatch { .. })
+        ));
+
+        let claimed = store.claim_due_note("git:proj", 20).unwrap().unwrap();
+        let evaluated = store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: claimed.status_version,
+                verdict: true,
+                compiled_check: Some("release exists"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: None,
+                now_ms: 30,
+            })
+            .unwrap();
+        let ready = match evaluated {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected evaluation outcome: {other:?}"),
+        };
+        assert_eq!(ready.status, "ready");
+
+        let first = store
+            .claim_note_delivery("git:proj", "serve-session", "pass-1", "pass-1", 40)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(!store
+            .claim_note_delivery("git:proj", "serve-session", "pass-2", "pass-2", 50)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .ack_note_delivery("git:proj", "serve-session", "pass-2", 60)
+                .unwrap(),
+            1
+        );
+        // The first pass is still unacknowledged, so at-least-once delivery may
+        // legitimately return it again even though pass-2 was acknowledged.
+        assert!(!store
+            .claim_note_delivery("git:proj", "serve-session", "pass-3", "pass-3", 70)
+            .unwrap()
+            .is_empty());
+
+        let surfaced = store
+            .read_project_notes("git:proj", None, &["surfaced"], 25, 0)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == note.id)
+            .unwrap();
+        let dismissed = store
+            .dismiss_note_cas(
+                "git:proj",
+                note.id,
+                "surfaced",
+                surfaced.status_version,
+                Some("done"),
+                80,
+            )
+            .unwrap();
+        assert!(matches!(dismissed, NoteCasOutcome::Applied(note) if note.status == "dismissed"));
+        assert!(store
+            .claim_note_delivery("git:proj", "serve-session", "pass-4", "pass-4", 90)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn note_lookup_and_visibility_paging_are_not_bounded_by_first_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let mut first_id = 0;
+        for index in 0..105 {
+            let note = store
+                .insert_project_note(NoteWriteInput {
+                    project_path: "git:proj",
+                    session_id: Some("writer"),
+                    content: &format!("note {index}"),
+                    surface_condition: None,
+                    anchor_block_id: None,
+                    anchor_ordinal: None,
+                    now_ms: 1,
+                })
+                .unwrap();
+            if index == 0 {
+                first_id = note.id;
+            }
+        }
+        let found = store
+            .get_note_by_id("git:proj", "reader", first_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, first_id);
+        let updated = store
+            .update_note_content(
+                "git:proj",
+                "reader",
+                first_id,
+                "updated outside the first page",
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.content, "updated outside the first page");
+        let page = store
+            .read_visible_notes("git:proj", "reader", &["active"], 5, 100)
+            .unwrap();
+        assert_eq!(page.len(), 5);
+        assert!(page.iter().all(|note| note.project_path == "git:proj"));
     }
 
     #[test]

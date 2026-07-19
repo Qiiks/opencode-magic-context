@@ -132,7 +132,10 @@ export interface ShadowTransport {
             | "session.flush"
             | "session.recomp"
             | "session.wrapup"
-            | "todo_state.set";
+            | "todo_state.set"
+            | "ctx_note"
+            | "transform.ack"
+            | "transform.nack";
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown>;
@@ -1544,7 +1547,10 @@ export class SubcShadowTransport implements ShadowTransport {
             | "authority.drain_verify"
             | "authority.drain_flip"
             | "authority.drain_finish"
-            | "mirror.pull";
+            | "mirror.pull"
+            | "ctx_note"
+            | "transform.ack"
+            | "transform.nack";
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown> {
