@@ -93,11 +93,12 @@ use transform::ReductionDecision;
 use transform::{transform_with_projection, DeclaredTrim, HistorianDiagnostics, TransformRequest};
 
 /// The per-route binding: the project, harness, session-slot value, and fallback render
-/// budget frozen at bind. Transform routes carry the durable session in `session`; MCP facade
-/// routes carry an instance token there and must resolve it before touching the store.
-/// The project is NEVER taken from a per-pass request field — a crafted request could
-/// spoof it to read another project's memories — so it lives here, keyed by the route
-/// channel the daemon controls.
+/// budget frozen at bind. Transform routes carry the durable session in `session`. Facade
+/// routes have two identity modes: the OpenCode Rust route binds its durable session directly,
+/// while the Claude Code wrapper binds an instance token that must be resolved before touching
+/// the store. The project is NEVER taken from a per-pass request field — a crafted request could
+/// spoof it to read another project's memories — so it lives here, keyed by the route channel
+/// the daemon controls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
     pub project_root: PathBuf,
@@ -225,6 +226,9 @@ const SESSION_STATUS_COMPARTMENT_PAGE_LIMIT: usize = 50;
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
 const SESSION_UNRESOLVED_MESSAGE: &str =
     "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
+/// OpenCode's Rust-mode tool route binds the real harness session, unlike the Claude Code
+/// wrapper route whose binding is an instance-token namespace.
+const OPENCODE_HARNESS: &str = "opencode";
 const SHADOW_SESSION_PREFIX: &str = mc_store::SHADOW_SESSION_PREFIX;
 const SHADOW_COMPARE_PREFIX_LIMIT: usize = 4096;
 const SHADOW_SEED_MAX_ID_BYTES: usize = 128;
@@ -2513,9 +2517,9 @@ impl McHandler {
         )
     }
 
-    /// Return the channel binding without comparing a request session. MCP facade routes
-    /// bind the `session` slot to an instance token, not to the durable conversation key;
-    /// facade handlers must resolve that token through the thalamus gateway before touching the store.
+    /// Return the channel binding without comparing a request session. OpenCode Rust facade
+    /// routes bind a real session id, while Claude Code facade routes bind an instance token;
+    /// `resolve_facade_scope` applies the corresponding identity mode before touching the store.
     fn facade_binding(&self, channel: u16) -> Result<SessionBinding, BindingError> {
         self.bindings
             .lock()
@@ -7047,62 +7051,70 @@ impl McHandler {
         let binding = self
             .facade_binding(channel)
             .map_err(|_| session_unresolved_error())?;
-        let instance_token = binding.session.trim();
-        if instance_token.is_empty() {
+        let bound_session = binding.session.trim();
+        if bound_session.is_empty() {
             return Err(session_unresolved_error());
         }
-        match self
-            .session_resolver
-            .resolve_session(&binding.project_root, &binding.harness, instance_token)
-            .await
-        {
-            Ok(Some(resolved)) => {
-                let route_project_root = binding.project_root.to_string_lossy().to_string();
-                let requested_project = arguments
-                    .and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
-                let memory_project_path = match (requested_project, self.store.get()) {
-                    (Some(requested_project), Some(store)) => {
-                        match store
-                            .authority_project_for_route(&route_project_root, authority_domain)
-                        {
-                            Ok(Some(authority_project))
-                                if authority_project == requested_project =>
-                            {
-                                authority_project
-                            }
-                            Ok(Some(authority_project)) => {
-                                return Err(HandlerOutcome::Error {
-                                    code: "facade_project_vocabulary_mismatch".to_string(),
-                                    message: format!(
-                                        "{authority_domain} facade route {route_project_root} is authority-managed as {authority_project}, but the request supplied {requested_project}"
-                                    ),
-                                });
-                            }
-                            // Because the Thalamus leg does not provide an authority-route
-                            // binding, use its existing path-scoped project root when the
-                            // binding is absent.
-                            Ok(None) | Err(_) => route_project_root.clone(),
-                        }
+
+        // OpenCode's Rust-mode adapter opens the facade route with the actual session id. The
+        // Claude Code wrapper instead supplies an instance token, so only the structurally
+        // identified OpenCode route may bypass session.resolve.
+        let conversation_key =
+            if binding.harness == OPENCODE_HARNESS && !is_shadow_session(bound_session) {
+                bound_session.to_string()
+            } else {
+                match self
+                    .session_resolver
+                    .resolve_session(&binding.project_root, &binding.harness, bound_session)
+                    .await
+                {
+                    Ok(Some(resolved)) => resolved.session_id,
+                    Ok(None) => return Err(session_unresolved_error()),
+                    Err(SessionResolveError::Timeout) => {
+                        return Err(HandlerOutcome::Error {
+                            code: "session_resolve_timeout".to_string(),
+                            message: "session.resolve timed out after 2s".to_string(),
+                        })
                     }
-                    _ => route_project_root.clone(),
-                };
-                Ok(FacadeScope {
-                    memory_project_path,
-                    route_project_root,
-                    conversation_key: resolved.session_id,
-                    memory_enabled: binding.config.memory_enabled,
-                })
+                    Err(error) => {
+                        return Err(HandlerOutcome::Error {
+                            code: "session_resolve_failed".to_string(),
+                            message: error.to_string(),
+                        })
+                    }
+                }
+            };
+
+        let route_project_root = binding.project_root.to_string_lossy().to_string();
+        let requested_project =
+            arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
+        let memory_project_path = match (requested_project, self.store.get()) {
+            (Some(requested_project), Some(store)) => {
+                match store.authority_project_for_route(&route_project_root, authority_domain) {
+                    Ok(Some(authority_project)) if authority_project == requested_project => {
+                        authority_project
+                    }
+                    Ok(Some(authority_project)) => {
+                        return Err(HandlerOutcome::Error {
+                            code: "facade_project_vocabulary_mismatch".to_string(),
+                            message: format!(
+                                "{authority_domain} facade route {route_project_root} is authority-managed as {authority_project}, but the request supplied {requested_project}"
+                            ),
+                        });
+                    }
+                    // Because the Thalamus leg does not provide an authority-route binding, use
+                    // its existing path-scoped project root when the binding is absent.
+                    Ok(None) | Err(_) => route_project_root.clone(),
+                }
             }
-            Ok(None) => Err(session_unresolved_error()),
-            Err(SessionResolveError::Timeout) => Err(HandlerOutcome::Error {
-                code: "session_resolve_timeout".to_string(),
-                message: "session.resolve timed out after 2s".to_string(),
-            }),
-            Err(error) => Err(HandlerOutcome::Error {
-                code: "session_resolve_failed".to_string(),
-                message: error.to_string(),
-            }),
-        }
+            _ => route_project_root.clone(),
+        };
+        Ok(FacadeScope {
+            memory_project_path,
+            route_project_root,
+            conversation_key,
+            memory_enabled: binding.config.memory_enabled,
+        })
     }
 
     async fn handle_ctx_reduce_facade(&self, _channel: u16, request: &Value) -> HandlerOutcome {
@@ -10149,9 +10161,13 @@ mod tests {
     }
 
     fn binding(root: &str, session: &str) -> SessionBinding {
+        binding_with_harness(root, "mc-module-test", session)
+    }
+
+    fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
         SessionBinding {
             project_root: PathBuf::from(root),
-            harness: "mc-module-test".to_string(),
+            harness: harness.to_string(),
             session: session.to_string(),
             model_key: None,
             config: default_test_config(),
@@ -11886,6 +11902,90 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn opencode_facade_uses_bound_session_without_session_resolver() {
+        let resolver = FakeSessionResolver::with(&[]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver.clone(),
+        );
+        let project_root = project.to_str().unwrap();
+        handler.bind_route(
+            7,
+            binding_with_harness(project_root, OPENCODE_HARNESS, "opencode-session"),
+        );
+
+        let memory = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "OpenCode route identity is durable",
+                "memory_project": project_root,
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(memory));
+
+        let note = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "write",
+                "content": "OpenCode route identity is durable",
+                "memory_project": project_root,
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(note));
+        assert!(resolver.calls().is_empty());
+        assert_eq!(
+            store
+                .search_notes_like(project_root, "opencode-session", "route identity")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_facade_resolves_instance_token_before_store_access() {
+        let resolver = FakeSessionResolver::with(&[(
+            "claude-instance-token",
+            FakeResolve::Hit("claude-conversation".to_string()),
+        )]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver.clone(),
+        );
+        handler.bind_route(
+            7,
+            binding_with_harness("/repo", "claude-code", "claude-instance-token"),
+        );
+
+        let note = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "write",
+                "content": "Claude Code keeps resolver semantics",
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(note));
+        assert_eq!(resolver.calls(), vec!["claude-instance-token"]);
+        assert_eq!(
+            store
+                .search_notes_like("/repo", "claude-conversation", "resolver semantics")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn note_evaluator_verdict_transitions_a_module_note_to_ready_and_visible() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
@@ -12173,7 +12273,7 @@ mod tests {
         let (handler, _store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver.clone());
 
-        handler.bind_route(7, binding("/repo", ""));
+        handler.bind_route(7, binding_with_harness("/repo", "claude-code", ""));
         let no_token = call_facade(
             &handler,
             "ctx_search",
@@ -12189,7 +12289,10 @@ mod tests {
         }
         assert_eq!(resolver.calls(), Vec::<String>::new());
 
-        handler.bind_route(7, binding("/repo", "missing-map"));
+        handler.bind_route(
+            7,
+            binding_with_harness("/repo", "claude-code", "missing-map"),
+        );
         let none = call_facade(
             &handler,
             "ctx_search",
@@ -12198,7 +12301,7 @@ mod tests {
         .await;
         assert_eq!(error_code(none), "session_unresolved");
 
-        handler.bind_route(7, binding("/repo", "slow-map"));
+        handler.bind_route(7, binding_with_harness("/repo", "claude-code", "slow-map"));
         let timeout = call_facade(
             &handler,
             "ctx_search",
