@@ -113,6 +113,34 @@ describe("authority-managed context.db schema", () => {
         db.exec("ROLLBACK");
     });
 
+    it("keeps an outer privilege bracket active across sequential inner brackets", () => {
+        const db = freshDatabase();
+        const uuid = ensureContextStoreUuid(db);
+        installAuthorityManagedMarker(db, "/project", uuid);
+
+        withPrivilegedWriter(db, () => {
+            withPrivilegedWriter(db, () => {
+                db.prepare(
+                    "INSERT INTO authority_repair_pending(project_path, started_at) VALUES (?, 0)",
+                ).run("/inner-a");
+            });
+            withPrivilegedWriter(db, () => {
+                db.prepare(
+                    "INSERT INTO authority_repair_pending(project_path, started_at) VALUES (?, 0)",
+                ).run("/inner-b");
+            });
+            db.prepare(
+                "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, 0, 0, 0, 0)",
+            ).run("/project", "CONSTRAINTS", "outer write", "outer-hash");
+        });
+
+        expect(
+            db.prepare("SELECT content FROM memories WHERE project_path = ?").get("/project") as {
+                content: string;
+            },
+        ).toEqual({ content: "outer write" });
+    });
+
     it("rejects a raw connection that has not entered a privilege bracket", () => {
         const dir = mkdtempSync(join(tmpdir(), "mc-authority-"));
         tempDirs.push(dir);

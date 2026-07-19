@@ -239,7 +239,8 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
         } else {
             db.exec("COMMIT");
         }
-        privilegeDepth.delete(db);
+        if (previousDepth > 0) privilegeDepth.set(db, previousDepth);
+        else privilegeDepth.delete(db);
         return result;
     } catch (error) {
         try {
