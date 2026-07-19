@@ -8,9 +8,9 @@ import {
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
-import { Database } from "../../shared/sqlite";
+import { Database, registerPrivilegeFunction } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-
+import { ensureContextStoreUuid } from "./context-authority";
 import { runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -46,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 53;
+export const LATEST_SUPPORTED_VERSION = 54;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -415,6 +415,9 @@ export function initializeDatabase(db: Database): void {
     // or writes: it defaults to OFF, which silently breaks every ON DELETE
     // CASCADE / SET NULL declared in the schema below and in migrations.
     db.exec("PRAGMA foreign_keys=ON");
+    // Guard triggers call this connection-local function. Register it before any
+    // migration or application write so every writable opener fails closed when managed.
+    registerPrivilegeFunction(db);
     db.exec("PRAGMA journal_mode=WAL");
     applySqliteTuningPragmas(db);
     db.exec(`
@@ -1664,6 +1667,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         }
         initializeDatabase(db);
         runMigrations(db);
+        ensureContextStoreUuid(db);
         return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
     } catch (error) {
         const detail = getErrorMessage(error);
@@ -1713,6 +1717,7 @@ export async function openDatabaseAsync(
             }
             initializeDatabase(db);
             await runMigrationsWithRetry(db);
+            ensureContextStoreUuid(db);
             return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
         } catch (error) {
             if (db) closeQuietly(db);

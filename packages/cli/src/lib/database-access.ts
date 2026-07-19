@@ -4,8 +4,12 @@ import {
     getPersistedSchemaVersion,
     LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
+import {
+    ensureContextStoreUuid,
+    getContextStoreUuid,
+} from "@magic-context/core/features/magic-context/context-authority";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
-import { Database } from "@magic-context/core/shared/sqlite";
+import { Database, registerPrivilegeFunction } from "@magic-context/core/shared/sqlite";
 
 export class UnsupportedSchemaVersionError extends Error {
     readonly path: string;
@@ -32,7 +36,11 @@ export function openExistingDatabase(
     options: { readonly: boolean },
 ): DatabaseType | null {
     if (!existsSync(path)) return null;
-    if (options.readonly) return new Database(path, { readonly: true });
+    if (options.readonly) {
+        const db = new Database(path, { readonly: true });
+        registerPrivilegeFunction(db);
+        return db;
+    }
 
     // Open read-write WITHOUT SQLITE_OPEN_CREATE, so the race where the file
     // disappears between the existence check and the constructor errors instead
@@ -43,13 +51,17 @@ export function openExistingDatabase(
     if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
         // create/readwrite are bun:sqlite-only options, absent from the shared
         // better-sqlite3-shaped Options type the wrapper exports.
-        return new Database(path, { create: false, readwrite: true } as unknown as {
+        const db = new Database(path, { create: false, readwrite: true } as unknown as {
             readonly: boolean;
         });
+        registerPrivilegeFunction(db);
+        return db;
     }
     const uri = pathToFileURL(path);
     uri.searchParams.set("mode", "rw");
-    return new Database(uri.href);
+    const db = new Database(uri.href);
+    registerPrivilegeFunction(db);
+    return db;
 }
 
 /**
@@ -71,6 +83,17 @@ export function openExistingContextDatabase(
                 persistedVersion,
                 LATEST_SUPPORTED_VERSION,
             );
+        }
+        if (!options.readonly) {
+            // The CLI has no module route during database open. It can mint the
+            // local store identity, but REGRESSED detection remains a later
+            // module-reconciliation step when the module becomes reachable.
+            const hasIdentityTable = Boolean(
+                db
+                    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_store_meta'")
+                    .get(),
+            );
+            if (hasIdentityTable && !getContextStoreUuid(db)) ensureContextStoreUuid(db);
         }
         return db;
     } catch (error) {

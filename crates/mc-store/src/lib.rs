@@ -856,6 +856,176 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_recomp_commands(session_id, created_at, command_id);
     ",
     },
+    Migration {
+        version: 23,
+        // Authority and feed rows are storage-plane state. The source key lets a seed be
+        // retried after a crash without allocating a second module row for one context row.
+        // Feed triggers are deliberately the only append mechanism: direct SQL, facade ops,
+        // and future writers all receive the same complete snapshot automatically.
+        statements: r#"
+        ALTER TABLE mc_memories ADD COLUMN context_store_uuid TEXT;
+        ALTER TABLE mc_memories ADD COLUMN context_row_id INTEGER;
+        ALTER TABLE mc_notes ADD COLUMN context_store_uuid TEXT;
+        ALTER TABLE mc_notes ADD COLUMN context_row_id INTEGER;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mc_memories_context_source
+            ON mc_memories(context_store_uuid, context_row_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mc_notes_context_source
+            ON mc_notes(context_store_uuid, context_row_id);
+
+        CREATE TABLE IF NOT EXISTS mc_changefeed (
+            feed_seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain              TEXT NOT NULL CHECK (domain IN ('memories', 'notes')),
+            op                  TEXT NOT NULL CHECK (op IN ('insert', 'update', 'tombstone')),
+            module_row_id       INTEGER NOT NULL,
+            full_row_snapshot   JSON NOT NULL,
+            content_hash        TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_changefeed_domain_seq
+            ON mc_changefeed(domain, feed_seq);
+
+        CREATE TABLE IF NOT EXISTS mc_authority (
+            context_store_uuid TEXT NOT NULL,
+            project            TEXT NOT NULL,
+            domain             TEXT NOT NULL CHECK (domain IN ('memories', 'notes')),
+            state               TEXT NOT NULL CHECK (state IN ('TS', 'PREPARING', 'MODULE', 'DRAINING')),
+            generation         INTEGER NOT NULL DEFAULT 0,
+            captured_upper_bound INTEGER,
+            drain_generation   INTEGER,
+            drain_cursor       INTEGER NOT NULL DEFAULT 0,
+            step_seed          INTEGER NOT NULL DEFAULT 0,
+            step_memories      INTEGER NOT NULL DEFAULT 0,
+            step_notes         INTEGER NOT NULL DEFAULT 0,
+            step_compartments  INTEGER NOT NULL DEFAULT 0,
+            step_reconcile     INTEGER NOT NULL DEFAULT 0,
+            step_verify        INTEGER NOT NULL DEFAULT 0,
+            step_flip          INTEGER NOT NULL DEFAULT 0,
+            coordinator_lease TEXT,
+            lease_expires_at  INTEGER,
+            checksum_expected TEXT,
+            checksum_actual   TEXT,
+            checksum_ok       INTEGER,
+            PRIMARY KEY (context_store_uuid, project, domain)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_authority_project
+            ON mc_authority(context_store_uuid, project, state);
+
+        DROP TRIGGER IF EXISTS mc_memories_feed_insert;
+        DROP TRIGGER IF EXISTS mc_memories_feed_update;
+        DROP TRIGGER IF EXISTS mc_memories_feed_delete;
+        CREATE TRIGGER mc_memories_feed_insert AFTER INSERT ON mc_memories BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('memories', 'insert', NEW.id,
+                json_object(
+                    'id', NEW.id, 'project_path', NEW.project_path, 'category', NEW.category,
+                    'content', NEW.content, 'normalized_hash', NEW.normalized_hash,
+                    'importance', NEW.importance, 'scope', NEW.scope, 'shareable', NEW.shareable,
+                    'source_session_id', NEW.source_session_id, 'source_type', NEW.source_type,
+                    'seen_count', NEW.seen_count, 'retrieval_count', NEW.retrieval_count,
+                    'first_seen_at', NEW.first_seen_at, 'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at, 'last_seen_at', NEW.last_seen_at,
+                    'last_retrieved_at', NEW.last_retrieved_at, 'status', NEW.status,
+                    'expires_at', NEW.expires_at, 'verification_status', NEW.verification_status,
+                    'verified_at', NEW.verified_at, 'classified_at', NEW.classified_at,
+                    'superseded_by_memory_id', NEW.superseded_by_memory_id, 'merged_from', NEW.merged_from,
+                    'metadata_json', NEW.metadata_json, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id), NEW.normalized_hash);
+        END;
+        CREATE TRIGGER mc_memories_feed_update AFTER UPDATE ON mc_memories
+        WHEN NEW.id IS NOT OLD.id OR NEW.project_path IS NOT OLD.project_path
+          OR NEW.category IS NOT OLD.category OR NEW.content IS NOT OLD.content
+          OR NEW.normalized_hash IS NOT OLD.normalized_hash OR NEW.importance IS NOT OLD.importance
+          OR NEW.scope IS NOT OLD.scope OR NEW.shareable IS NOT OLD.shareable
+          OR NEW.source_session_id IS NOT OLD.source_session_id OR NEW.source_type IS NOT OLD.source_type
+          OR NEW.seen_count IS NOT OLD.seen_count OR NEW.retrieval_count IS NOT OLD.retrieval_count
+          OR NEW.first_seen_at IS NOT OLD.first_seen_at OR NEW.created_at IS NOT OLD.created_at
+          OR NEW.updated_at IS NOT OLD.updated_at OR NEW.last_seen_at IS NOT OLD.last_seen_at
+          OR NEW.last_retrieved_at IS NOT OLD.last_retrieved_at OR NEW.status IS NOT OLD.status
+          OR NEW.expires_at IS NOT OLD.expires_at OR NEW.verification_status IS NOT OLD.verification_status
+          OR NEW.verified_at IS NOT OLD.verified_at OR NEW.classified_at IS NOT OLD.classified_at
+          OR NEW.superseded_by_memory_id IS NOT OLD.superseded_by_memory_id
+          OR NEW.merged_from IS NOT OLD.merged_from OR NEW.metadata_json IS NOT OLD.metadata_json
+          OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+          OR NEW.context_row_id IS NOT OLD.context_row_id
+        BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('memories', 'update', NEW.id,
+                json_object(
+                    'id', NEW.id, 'project_path', NEW.project_path, 'category', NEW.category,
+                    'content', NEW.content, 'normalized_hash', NEW.normalized_hash,
+                    'importance', NEW.importance, 'scope', NEW.scope, 'shareable', NEW.shareable,
+                    'source_session_id', NEW.source_session_id, 'source_type', NEW.source_type,
+                    'seen_count', NEW.seen_count, 'retrieval_count', NEW.retrieval_count,
+                    'first_seen_at', NEW.first_seen_at, 'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at, 'last_seen_at', NEW.last_seen_at,
+                    'last_retrieved_at', NEW.last_retrieved_at, 'status', NEW.status,
+                    'expires_at', NEW.expires_at, 'verification_status', NEW.verification_status,
+                    'verified_at', NEW.verified_at, 'classified_at', NEW.classified_at,
+                    'superseded_by_memory_id', NEW.superseded_by_memory_id, 'merged_from', NEW.merged_from,
+                    'metadata_json', NEW.metadata_json, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id), NEW.normalized_hash);
+        END;
+        CREATE TRIGGER mc_memories_feed_delete AFTER DELETE ON mc_memories BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('memories', 'tombstone', OLD.id,
+                json_object(
+                    'id', OLD.id, 'project_path', OLD.project_path, 'category', OLD.category,
+                    'content', OLD.content, 'normalized_hash', OLD.normalized_hash,
+                    'importance', OLD.importance, 'scope', OLD.scope, 'shareable', OLD.shareable,
+                    'source_session_id', OLD.source_session_id, 'source_type', OLD.source_type,
+                    'seen_count', OLD.seen_count, 'retrieval_count', OLD.retrieval_count,
+                    'first_seen_at', OLD.first_seen_at, 'created_at', OLD.created_at,
+                    'updated_at', OLD.updated_at, 'last_seen_at', OLD.last_seen_at,
+                    'last_retrieved_at', OLD.last_retrieved_at, 'status', OLD.status,
+                    'expires_at', OLD.expires_at, 'verification_status', OLD.verification_status,
+                    'verified_at', OLD.verified_at, 'classified_at', OLD.classified_at,
+                    'superseded_by_memory_id', OLD.superseded_by_memory_id, 'merged_from', OLD.merged_from,
+                    'metadata_json', OLD.metadata_json, 'context_store_uuid', OLD.context_store_uuid,
+                    'context_row_id', OLD.context_row_id), OLD.normalized_hash);
+        END;
+
+        DROP TRIGGER IF EXISTS mc_notes_feed_insert;
+        DROP TRIGGER IF EXISTS mc_notes_feed_update;
+        DROP TRIGGER IF EXISTS mc_notes_feed_delete;
+        CREATE TRIGGER mc_notes_feed_insert AFTER INSERT ON mc_notes BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'insert', NEW.id,
+                json_object(
+                    'id', NEW.id, 'project_path', NEW.project_path, 'session_id', NEW.session_id,
+                    'content', NEW.content, 'status', NEW.status, 'surface_condition', NEW.surface_condition,
+                    'anchor_block_id', NEW.anchor_block_id, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id), NULL);
+        END;
+        CREATE TRIGGER mc_notes_feed_update AFTER UPDATE ON mc_notes
+        WHEN NEW.id IS NOT OLD.id OR NEW.project_path IS NOT OLD.project_path
+          OR NEW.session_id IS NOT OLD.session_id OR NEW.content IS NOT OLD.content
+          OR NEW.status IS NOT OLD.status OR NEW.surface_condition IS NOT OLD.surface_condition
+          OR NEW.anchor_block_id IS NOT OLD.anchor_block_id OR NEW.created_at_ms IS NOT OLD.created_at_ms
+          OR NEW.updated_at_ms IS NOT OLD.updated_at_ms
+          OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+          OR NEW.context_row_id IS NOT OLD.context_row_id
+        BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'update', NEW.id,
+                json_object(
+                    'id', NEW.id, 'project_path', NEW.project_path, 'session_id', NEW.session_id,
+                    'content', NEW.content, 'status', NEW.status, 'surface_condition', NEW.surface_condition,
+                    'anchor_block_id', NEW.anchor_block_id, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id), NULL);
+        END;
+        CREATE TRIGGER mc_notes_feed_delete AFTER DELETE ON mc_notes BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'tombstone', OLD.id,
+                json_object(
+                    'id', OLD.id, 'project_path', OLD.project_path, 'session_id', OLD.session_id,
+                    'content', OLD.content, 'status', OLD.status, 'surface_condition', OLD.surface_condition,
+                    'anchor_block_id', OLD.anchor_block_id, 'created_at_ms', OLD.created_at_ms,
+                    'updated_at_ms', OLD.updated_at_ms, 'context_store_uuid', OLD.context_store_uuid,
+                    'context_row_id', OLD.context_row_id), NULL);
+        END;
+    "#,
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -1755,6 +1925,61 @@ pub struct StoredNoteSearchRow {
     pub updated_at_ms: i64,
 }
 
+/// Durable authority state for one context store, project, and owned domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityRow {
+    pub context_store_uuid: String,
+    pub project: String,
+    pub domain: String,
+    pub state: String,
+    pub generation: u64,
+    pub captured_upper_bound: Option<i64>,
+    pub drain_generation: Option<u64>,
+    pub drain_cursor: i64,
+    pub step_seed: bool,
+    pub step_memories: bool,
+    pub step_notes: bool,
+    pub step_compartments: bool,
+    pub step_reconcile: bool,
+    pub step_verify: bool,
+    pub step_flip: bool,
+    pub coordinator_lease: Option<String>,
+    pub lease_expires_at: Option<i64>,
+    pub checksum_expected: Option<String>,
+    pub checksum_actual: Option<String>,
+    pub checksum_ok: Option<bool>,
+}
+
+/// One append-only row returned by `mirror.pull`. The snapshot is the complete row
+/// as serialized by the feed trigger, including nullable columns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangefeedRow {
+    pub feed_seq: i64,
+    pub domain: String,
+    pub op: String,
+    pub module_row_id: i64,
+    pub full_row_snapshot: Value,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangefeedPage {
+    pub domain: String,
+    pub cursor: i64,
+    pub next_cursor: i64,
+    pub has_more: bool,
+    pub rows: Vec<ChangefeedRow>,
+}
+
+/// A context row used by the crash-idempotent authority seed. The JSON payload is
+/// intentionally opaque here; the module persists the fields it owns and verifies
+/// the host-provided content hash separately.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthoritySeedRow {
+    pub source_row_id: i64,
+    pub snapshot: Value,
+}
+
 /// A loaded per-session row: the core state, the meta blob, and the CAS token.
 #[derive(Debug, Clone)]
 pub struct LoadedState {
@@ -1986,6 +2211,16 @@ pub enum McStoreError {
         expected: Option<u64>,
         found: u64,
     },
+    /// An authority transition was requested from the wrong durable state.
+    AuthorityStateMismatch {
+        expected: String,
+        found: String,
+    },
+    /// A caller used a stale authority generation after another transition committed.
+    AuthorityGenerationMismatch {
+        expected: u64,
+        found: u64,
+    },
     Serde(String),
     MemoryDuplicateContent {
         id: i64,
@@ -1998,6 +2233,18 @@ impl std::fmt::Display for McStoreError {
             McStoreError::Store(e) => write!(f, "store: {e}"),
             McStoreError::CasConflict { expected, found } => {
                 write!(f, "cas conflict: expected {expected:?}, found {found}")
+            }
+            McStoreError::AuthorityStateMismatch { expected, found } => {
+                write!(
+                    f,
+                    "authority state mismatch: expected {expected}, found {found}"
+                )
+            }
+            McStoreError::AuthorityGenerationMismatch { expected, found } => {
+                write!(
+                    f,
+                    "authority generation mismatch: expected {expected}, found {found}"
+                )
             }
             McStoreError::Serde(e) => write!(f, "serde: {e}"),
             McStoreError::MemoryDuplicateContent { id } => {
@@ -2151,6 +2398,75 @@ struct ValidatedSeedBoundary {
     coverage_start_ordinal: u64,
     coverage_end_ordinal: u64,
     max_sequence: i64,
+}
+
+const AUTHORITY_SELECT_SQL: &str = "SELECT context_store_uuid, project, domain, state, generation,
+    captured_upper_bound, drain_generation, drain_cursor, step_seed, step_memories,
+    step_notes, step_compartments, step_reconcile, step_verify, step_flip,
+    coordinator_lease, lease_expires_at, checksum_expected, checksum_actual, checksum_ok
+    FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3";
+
+#[derive(Debug)]
+enum AuthorityTransitionError {
+    State { expected: String, found: String },
+    Generation { expected: u64, found: u64 },
+}
+
+impl std::fmt::Display for AuthorityTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::State { expected, found } => {
+                write!(f, "expected state {expected}, found {found}")
+            }
+            Self::Generation { expected, found } => {
+                write!(f, "expected generation {expected}, found {found}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AuthorityTransitionError {}
+
+fn map_authority_sql_error(error: StoreError) -> McStoreError {
+    // cortexkit-store intentionally erases driver-specific errors at its connection
+    // boundary. Keep the durable operation error rather than pretending it was a
+    // successful transition when a generation or state check failed.
+    McStoreError::Store(error)
+}
+
+fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
+    if matches!(domain, "memories" | "notes") {
+        Ok(())
+    } else {
+        Err(McStoreError::Serde(format!(
+            "unknown authority domain {domain}"
+        )))
+    }
+}
+
+fn authority_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorityRow> {
+    Ok(AuthorityRow {
+        context_store_uuid: row.get(0)?,
+        project: row.get(1)?,
+        domain: row.get(2)?,
+        state: row.get(3)?,
+        generation: row.get::<_, i64>(4)? as u64,
+        captured_upper_bound: row.get(5)?,
+        drain_generation: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+        drain_cursor: row.get(7)?,
+        step_seed: row.get::<_, i64>(8)? != 0,
+        step_memories: row.get::<_, i64>(9)? != 0,
+        step_notes: row.get::<_, i64>(10)? != 0,
+        step_compartments: row.get::<_, i64>(11)? != 0,
+        step_reconcile: row.get::<_, i64>(12)? != 0,
+        step_verify: row.get::<_, i64>(13)? != 0,
+        step_flip: row.get::<_, i64>(14)? != 0,
+        coordinator_lease: row.get(15)?,
+        lease_expires_at: row.get(16)?,
+        checksum_expected: row.get(17)?,
+        checksum_actual: row.get(18)?,
+        checksum_ok: row.get::<_, Option<i64>>(19)?.map(|value| value != 0),
+    })
 }
 
 fn split_flat_block_id(id: &str) -> Option<(&str, u64)> {
@@ -6390,6 +6706,533 @@ impl McStore {
     }
 }
 
+impl McStore {
+    /// Read the durable authority row. A missing row is normal for a store that has
+    /// never opted a project into module ownership.
+    pub fn authority_status(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        domain: &str,
+    ) -> Result<Option<AuthorityRow>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Enter PREPARING and bump the generation. Repeating the request is idempotent
+    /// only when the row is already preparing at the same generation.
+    pub fn authority_begin_prepare(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        domain: &str,
+    ) -> Result<AuthorityRow, McStoreError> {
+        validate_authority_domain(domain)?;
+        self.inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                     VALUES (?1, ?2, ?3, 'TS') ON CONFLICT(context_store_uuid, project, domain) DO NOTHING",
+                    params![context_store_uuid, project, domain],
+                )?;
+                let current = tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )?;
+                if current.state == "TS" {
+                    tx.execute(
+                        "UPDATE mc_authority SET state = 'PREPARING', generation = generation + 1
+                         WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
+                        params![context_store_uuid, project, domain],
+                    )?;
+                } else if current.state != "PREPARING" {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::State {
+                            expected: "TS".to_string(),
+                            found: current.state,
+                        },
+                    )));
+                }
+                tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )
+            })
+            .map_err(map_authority_sql_error)
+    }
+
+    /// Record seed verification and complete TS -> MODULE. The host keeps its
+    /// context.db barrier until this transition has committed on the module side.
+    /// The arguments are kept explicit because each value is part of the durable
+    /// transition record and must be validated together.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authority_finish_prepare(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        domain: &str,
+        expected_generation: u64,
+        checksum_expected: &str,
+        checksum_actual: &str,
+        verified: bool,
+    ) -> Result<AuthorityRow, McStoreError> {
+        validate_authority_domain(domain)?;
+        self.inner
+            .with_conn_fenced(|tx| {
+                let current = tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )?;
+                if current.generation != expected_generation {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::Generation {
+                            expected: expected_generation,
+                            found: current.generation,
+                        },
+                    )));
+                }
+                if current.state != "PREPARING" {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::State {
+                            expected: "PREPARING".to_string(),
+                            found: current.state,
+                        },
+                    )));
+                }
+                let next_state = if verified { "MODULE" } else { "TS" };
+                tx.execute(
+                    "UPDATE mc_authority
+                        SET state = ?1, generation = generation + 1,
+                            checksum_expected = ?2, checksum_actual = ?3, checksum_ok = ?4
+                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7",
+                    params![
+                        next_state,
+                        checksum_expected,
+                        checksum_actual,
+                        if verified { 1 } else { 0 },
+                        context_store_uuid,
+                        project,
+                        domain
+                    ],
+                )?;
+                tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )
+            })
+            .map_err(map_authority_sql_error)
+    }
+
+    /// Abort a failed preparation without erasing the diagnostic checksum.
+    pub fn authority_abort_prepare(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        domain: &str,
+        expected_generation: u64,
+    ) -> Result<AuthorityRow, McStoreError> {
+        self.authority_finish_prepare(
+            context_store_uuid,
+            project,
+            domain,
+            expected_generation,
+            "",
+            "",
+            false,
+        )
+    }
+
+    /// Enter DRAINING and capture the feed upper bound in the same fenced write.
+    pub fn authority_begin_drain(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        domain: &str,
+        lease: &str,
+        lease_expires_at: i64,
+    ) -> Result<AuthorityRow, McStoreError> {
+        validate_authority_domain(domain)?;
+        self.inner
+            .with_conn_fenced(|tx| {
+                let current = tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )?;
+                if current.state != "MODULE" {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::State {
+                            expected: "MODULE".to_string(),
+                            found: current.state,
+                        },
+                    )));
+                }
+                let upper_bound: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
+                    params![domain],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE mc_authority
+                        SET state = 'DRAINING', generation = generation + 1,
+                            captured_upper_bound = ?1, drain_generation = generation + 1,
+                            drain_cursor = 0, coordinator_lease = ?2, lease_expires_at = ?3,
+                            step_seed = 0, step_memories = 0, step_notes = 0,
+                            step_compartments = 0, step_reconcile = 0, step_verify = 0, step_flip = 0
+                      WHERE context_store_uuid = ?4 AND project = ?5 AND domain = ?6",
+                    params![upper_bound, lease, lease_expires_at, context_store_uuid, project, domain],
+                )?;
+                tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )
+            })
+            .map_err(map_authority_sql_error)
+    }
+
+    /// Advance one idempotent DRAINING journal bit or its feed cursor.
+    pub fn authority_drain_step(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        domain: &str,
+        expected_generation: u64,
+        step: &str,
+        cursor: Option<i64>,
+    ) -> Result<AuthorityRow, McStoreError> {
+        validate_authority_domain(domain)?;
+        let column = match step {
+            "seed" => "step_seed",
+            "memories" => "step_memories",
+            "notes" => "step_notes",
+            "compartments" => "step_compartments",
+            "reconcile" => "step_reconcile",
+            "verify" => "step_verify",
+            "flip" => "step_flip",
+            _ => return Err(McStoreError::Serde(format!("unknown drain step {step}"))),
+        };
+        self.inner
+            .with_conn_fenced(|tx| {
+                let current = tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )?;
+                if current.generation != expected_generation {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::Generation {
+                            expected: expected_generation,
+                            found: current.generation,
+                        },
+                    )));
+                }
+                if current.state != "DRAINING" {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::State {
+                            expected: "DRAINING".to_string(),
+                            found: current.state,
+                        },
+                    )));
+                }
+                tx.execute(
+                    &format!("UPDATE mc_authority SET {column} = 1, drain_cursor = COALESCE(?1, drain_cursor) WHERE context_store_uuid = ?2 AND project = ?3 AND domain = ?4"),
+                    params![cursor, context_store_uuid, project, domain],
+                )?;
+                tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )
+            })
+            .map_err(map_authority_sql_error)
+    }
+
+    /// Complete DRAINING after the host has verified every journal step.
+    /// The checksum and generation fields are intentionally supplied together so
+    /// a stale coordinator cannot publish a partial handoff.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authority_finish_drain(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        domain: &str,
+        expected_generation: u64,
+        checksum_expected: &str,
+        checksum_actual: &str,
+        verified: bool,
+    ) -> Result<AuthorityRow, McStoreError> {
+        validate_authority_domain(domain)?;
+        self.inner
+            .with_conn_fenced(|tx| {
+                let current = tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )?;
+                if current.generation != expected_generation {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::Generation {
+                            expected: expected_generation,
+                            found: current.generation,
+                        },
+                    )));
+                }
+                if current.state != "DRAINING" {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::State {
+                            expected: "DRAINING".to_string(),
+                            found: current.state,
+                        },
+                    )));
+                }
+                let all_steps = current.step_seed
+                    && current.step_memories
+                    && current.step_notes
+                    && current.step_compartments
+                    && current.step_reconcile
+                    && current.step_verify;
+                if !all_steps || !verified {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::State {
+                            expected: "all drain steps and verification".to_string(),
+                            found: "incomplete or failed".to_string(),
+                        },
+                    )));
+                }
+                tx.execute(
+                    "UPDATE mc_authority SET state = 'TS', generation = generation + 1,
+                            checksum_expected = ?1, checksum_actual = ?2, checksum_ok = ?3,
+                            coordinator_lease = NULL, lease_expires_at = NULL, step_flip = 1
+                      WHERE context_store_uuid = ?4 AND project = ?5 AND domain = ?6",
+                    params![
+                        checksum_expected,
+                        checksum_actual,
+                        if verified { 1 } else { 0 },
+                        context_store_uuid,
+                        project,
+                        domain
+                    ],
+                )?;
+                tx.query_row(
+                    AUTHORITY_SELECT_SQL,
+                    params![context_store_uuid, project, domain],
+                    authority_row_from_sql,
+                )
+            })
+            .map_err(map_authority_sql_error)
+    }
+
+    /// Upsert a seeded context row by its durable source key. The source key is
+    /// intentionally independent of the module's integer id allocation.
+    pub fn seed_authority_row(
+        &self,
+        context_store_uuid: &str,
+        domain: &str,
+        source_row_id: i64,
+        snapshot: &Value,
+    ) -> Result<i64, McStoreError> {
+        validate_authority_domain(domain)?;
+        match domain {
+            "memories" => self.seed_memory_snapshot(context_store_uuid, source_row_id, snapshot),
+            "notes" => self.seed_note_snapshot(context_store_uuid, source_row_id, snapshot),
+            _ => unreachable!(),
+        }
+    }
+
+    fn seed_memory_snapshot(
+        &self,
+        context_store_uuid: &str,
+        source_row_id: i64,
+        snapshot: &Value,
+    ) -> Result<i64, McStoreError> {
+        let object = snapshot.as_object().ok_or_else(|| {
+            McStoreError::Serde("memory seed snapshot must be an object".to_string())
+        })?;
+        let text = |name: &str| object.get(name).and_then(Value::as_str);
+        let integer = |name: &str| object.get(name).and_then(Value::as_i64);
+        let id = self.inner.with_conn_fenced(|tx| {
+            let superseded_by_memory_id = match integer("superseded_by_memory_id") {
+                Some(source_id) => tx
+                    .query_row(
+                        "SELECT id FROM mc_memories WHERE context_store_uuid = ?1 AND context_row_id = ?2",
+                        params![context_store_uuid, source_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .or(Some(source_id)),
+                None => None,
+            };
+            tx.execute(
+                "INSERT INTO mc_memories
+                    (project_path, category, content, normalized_hash, importance, scope, shareable,
+                     source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
+                     created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
+                     verification_status, verified_at, classified_at, superseded_by_memory_id,
+                     merged_from, metadata_json, context_store_uuid, context_row_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+                 ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
+                    project_path=excluded.project_path, category=excluded.category,
+                    content=excluded.content, normalized_hash=excluded.normalized_hash,
+                    importance=excluded.importance, scope=excluded.scope, shareable=excluded.shareable,
+                    source_session_id=excluded.source_session_id, source_type=excluded.source_type,
+                    seen_count=excluded.seen_count, retrieval_count=excluded.retrieval_count,
+                    first_seen_at=excluded.first_seen_at, created_at=excluded.created_at,
+                    updated_at=excluded.updated_at, last_seen_at=excluded.last_seen_at,
+                    last_retrieved_at=excluded.last_retrieved_at, status=excluded.status,
+                    expires_at=excluded.expires_at, verification_status=excluded.verification_status,
+                    verified_at=excluded.verified_at, classified_at=excluded.classified_at,
+                    superseded_by_memory_id=excluded.superseded_by_memory_id,
+                    merged_from=excluded.merged_from, metadata_json=excluded.metadata_json",
+                params![
+                    text("project_path").unwrap_or_default(),
+                    text("category").unwrap_or_default(),
+                    text("content").unwrap_or_default(),
+                    text("normalized_hash").unwrap_or_default(),
+                    integer("importance"),
+                    text("scope").unwrap_or("project"),
+                    integer("shareable").unwrap_or(0),
+                    text("source_session_id"),
+                    text("source_type").unwrap_or("historian"),
+                    integer("seen_count").unwrap_or(1),
+                    integer("retrieval_count").unwrap_or(0),
+                    integer("first_seen_at").unwrap_or(0),
+                    integer("created_at").unwrap_or(0),
+                    integer("updated_at").unwrap_or(0),
+                    integer("last_seen_at").unwrap_or(0),
+                    integer("last_retrieved_at"),
+                    text("status").unwrap_or("active"),
+                    integer("expires_at"),
+                    text("verification_status").unwrap_or("unverified"),
+                    integer("verified_at"),
+                    integer("classified_at"),
+                    superseded_by_memory_id,
+                     text("merged_from"),
+                    text("metadata_json"),
+                    context_store_uuid,
+                    source_row_id,
+                ],
+            )?;
+            let id: i64 = tx.query_row(
+                "SELECT id FROM mc_memories WHERE context_store_uuid = ?1 AND context_row_id = ?2",
+                params![context_store_uuid, source_row_id],
+                |row| row.get(0),
+            )?;
+            Ok(id)
+        })?;
+        Ok(id)
+    }
+
+    fn seed_note_snapshot(
+        &self,
+        context_store_uuid: &str,
+        source_row_id: i64,
+        snapshot: &Value,
+    ) -> Result<i64, McStoreError> {
+        let object = snapshot.as_object().ok_or_else(|| {
+            McStoreError::Serde("note seed snapshot must be an object".to_string())
+        })?;
+        let text = |name: &str| object.get(name).and_then(Value::as_str);
+        let integer = |name: &str| object.get(name).and_then(Value::as_i64);
+        let id = self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO mc_notes
+                    (project_path, session_id, content, status, surface_condition, anchor_block_id,
+                     created_at_ms, updated_at_ms, context_store_uuid, context_row_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
+                    project_path=excluded.project_path, session_id=excluded.session_id,
+                    content=excluded.content, status=excluded.status,
+                    surface_condition=excluded.surface_condition, anchor_block_id=excluded.anchor_block_id,
+                    created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms",
+                params![
+                    text("project_path").unwrap_or_default(),
+                    text("session_id").unwrap_or_default(),
+                    text("content").unwrap_or_default(),
+                    text("status").unwrap_or("active"),
+                    text("surface_condition"),
+                    text("anchor_block_id"),
+                    integer("created_at_ms").unwrap_or(0),
+                    integer("updated_at_ms").unwrap_or(0),
+                    context_store_uuid,
+                    source_row_id,
+                ],
+            )?;
+            let id: i64 = tx.query_row(
+                "SELECT id FROM mc_notes WHERE context_store_uuid = ?1 AND context_row_id = ?2",
+                params![context_store_uuid, source_row_id],
+                |row| row.get(0),
+            )?;
+            Ok(id)
+        })?;
+        Ok(id)
+    }
+
+    /// Pull a bounded, ordered feed page. The cursor is a global feed sequence;
+    /// filtering by domain preserves monotonic retry semantics even when domains interleave.
+    pub fn pull_changefeed(
+        &self,
+        domain: &str,
+        cursor: i64,
+        limit: usize,
+    ) -> Result<ChangefeedPage, McStoreError> {
+        validate_authority_domain(domain)?;
+        let limit = i64::try_from(limit.clamp(1, 1000))
+            .map_err(|_| McStoreError::Serde("feed limit exceeds i64".to_string()))?;
+        self.inner
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT feed_seq, domain, op, module_row_id, full_row_snapshot, content_hash
+                       FROM mc_changefeed WHERE domain = ?1 AND feed_seq > ?2
+                       ORDER BY feed_seq ASC LIMIT ?3",
+                )?;
+                let rows = stmt
+                    .query_map(params![domain, cursor, limit], |row| {
+                        let snapshot: String = row.get(4)?;
+                        Ok(ChangefeedRow {
+                            feed_seq: row.get(0)?,
+                            domain: row.get(1)?,
+                            op: row.get(2)?,
+                            module_row_id: row.get(3)?,
+                            full_row_snapshot: serde_json::from_str(&snapshot).map_err(
+                                |error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        4,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                },
+                            )?,
+                            content_hash: row.get(5)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let next_cursor = rows.last().map(|row| row.feed_seq).unwrap_or(cursor);
+                Ok(ChangefeedPage {
+                    domain: domain.to_string(),
+                    cursor,
+                    next_cursor,
+                    has_more: rows.len() == limit as usize,
+                    rows,
+                })
+            })
+            .map_err(Into::into)
+    }
+}
+
 fn upsert_compartment_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
@@ -10261,6 +11104,136 @@ mod shadow_tests {
         assert!(!loaded.meta.shadow_quarantined);
         assert_eq!(loaded.meta.shadow_quarantined_pass_count, 0);
         assert_eq!(store.load_shadow_divergences(session).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn authority_feed_triggers_cover_idempotency_and_null_transitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let memory_id = store
+            .insert_memory(InsertMemoryInput {
+                project_path: "feed-project",
+                category: "CONSTRAINTS",
+                content: "first",
+                source_session_id: None,
+                source_type: Some("tool"),
+                importance: Some(50),
+                expires_at: None,
+                metadata_json: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        let trigger_sql: String = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT group_concat(sql, char(10)) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'mc_%_feed_%'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert!(!trigger_sql.contains("!="));
+        assert!(trigger_sql.contains(" IS NOT "));
+
+        let initial = store.pull_changefeed("memories", 0, 100).unwrap();
+        assert_eq!(initial.rows.len(), 1);
+        assert_eq!(initial.rows[0].op, "insert");
+        assert_eq!(
+            initial.rows[0].content_hash.as_deref(),
+            initial.rows[0].full_row_snapshot["normalized_hash"].as_str()
+        );
+
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE mc_memories SET content = content WHERE id = ?1",
+                    params![memory_id],
+                )?;
+                tx.execute(
+                    "UPDATE mc_memories SET last_retrieved_at = 1 WHERE id = ?1",
+                    params![memory_id],
+                )?;
+                tx.execute(
+                    "UPDATE mc_memories SET last_retrieved_at = NULL WHERE id = ?1",
+                    params![memory_id],
+                )?;
+                tx.execute("DELETE FROM mc_memories WHERE id = ?1", params![memory_id])?;
+                Ok(())
+            })
+            .unwrap();
+        let page = store
+            .pull_changefeed("memories", initial.next_cursor, 100)
+            .unwrap();
+        assert_eq!(
+            page.rows.len(),
+            3,
+            "no-op updates must not append feed rows"
+        );
+        assert_eq!(page.rows[0].op, "update");
+        assert_eq!(page.rows[1].op, "update");
+        assert_eq!(page.rows[2].op, "tombstone");
+
+        let note = serde_json::json!({
+            "id": 12,
+            "project_path": "feed-project",
+            "session_id": "session",
+            "content": "note",
+            "status": "active",
+            "created_at_ms": 1,
+            "updated_at_ms": 1
+        });
+        let first_id = store
+            .seed_authority_row("store-uuid", "notes", 12, &note)
+            .unwrap();
+        let second_id = store
+            .seed_authority_row("store-uuid", "notes", 12, &note)
+            .unwrap();
+        assert_eq!(first_id, second_id, "seed retries use the source key");
+        let notes = store.pull_changefeed("notes", 0, 100).unwrap();
+        assert_eq!(notes.rows.len(), 1, "idempotent same-row seed is a no-op");
+        assert_eq!(notes.rows[0].op, "insert");
+    }
+
+    #[test]
+    fn authority_state_machine_persists_generations_and_drain_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let preparing = store
+            .authority_begin_prepare("store-uuid", "project", "memories")
+            .unwrap();
+        assert_eq!(preparing.state, "PREPARING");
+        assert_eq!(preparing.generation, 1);
+        let module = store
+            .authority_finish_prepare(
+                "store-uuid",
+                "project",
+                "memories",
+                preparing.generation,
+                "hash",
+                "hash",
+                true,
+            )
+            .unwrap();
+        assert_eq!(module.state, "MODULE");
+        assert_eq!(module.generation, 2);
+        let draining = store
+            .authority_begin_drain("store-uuid", "project", "memories", "lease", 100)
+            .unwrap();
+        assert_eq!(draining.state, "DRAINING");
+        assert_eq!(draining.captured_upper_bound, Some(0));
+        let stepped = store
+            .authority_drain_step(
+                "store-uuid",
+                "project",
+                "memories",
+                draining.generation,
+                "seed",
+                Some(0),
+            )
+            .unwrap();
+        assert!(stepped.step_seed);
     }
 
     #[test]

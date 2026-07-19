@@ -4889,6 +4889,233 @@ impl McHandler {
         }
     }
 
+    fn handle_authority_status_value(&self, request: &Value) -> HandlerOutcome {
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
+            return invalid_params_error(
+                "authority.status requires context_store_uuid, project, and domain",
+            );
+        };
+        match store.authority_status(context_store_uuid, project, domain) {
+            Ok(Some(row)) => respond(json!({ "ok": true, "authority": row })),
+            Ok(None) => respond(json!({ "ok": true, "authority": null })),
+            Err(error) => HandlerOutcome::Error {
+                code: "authority_status_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_authority_prepare_value(&self, request: &Value) -> HandlerOutcome {
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
+            return invalid_params_error(
+                "authority.prepare requires context_store_uuid, project, and domain",
+            );
+        };
+        let phase = request
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("begin");
+        let result = match phase {
+            "begin" => store.authority_begin_prepare(context_store_uuid, project, domain),
+            "complete" => {
+                let Some(expected_generation) = request.get("generation").and_then(Value::as_u64)
+                else {
+                    return invalid_params_error("authority.prepare complete requires generation");
+                };
+                let expected = request
+                    .get("checksum_expected")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let actual = request
+                    .get("checksum_actual")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let verified = request
+                    .get("verified")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                store.authority_finish_prepare(
+                    context_store_uuid,
+                    project,
+                    domain,
+                    expected_generation,
+                    expected,
+                    actual,
+                    verified,
+                )
+            }
+            "abort" => {
+                let Some(expected_generation) = request.get("generation").and_then(Value::as_u64)
+                else {
+                    return invalid_params_error("authority.prepare abort requires generation");
+                };
+                store.authority_abort_prepare(
+                    context_store_uuid,
+                    project,
+                    domain,
+                    expected_generation,
+                )
+            }
+            _ => {
+                return invalid_params_error(
+                    "authority.prepare phase must be begin, complete, or abort",
+                )
+            }
+        };
+        match result {
+            Ok(row) => respond(json!({ "ok": true, "authority": row })),
+            Err(error) => HandlerOutcome::Error {
+                code: "authority_prepare_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_authority_seed_value(&self, request: &Value) -> HandlerOutcome {
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
+            return invalid_params_error(
+                "authority.seed requires context_store_uuid, project, and domain",
+            );
+        };
+        let Some(rows) = request.get("rows").and_then(Value::as_array) else {
+            return invalid_params_error("authority.seed requires a rows array");
+        };
+        let mut seeded = 0usize;
+        let mut module_row_ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let source_row_id = row
+                .get("source_row_id")
+                .and_then(Value::as_i64)
+                .or_else(|| {
+                    row.get("snapshot")
+                        .and_then(|value| value.get("id"))
+                        .and_then(Value::as_i64)
+                });
+            let Some(source_row_id) = source_row_id else {
+                return invalid_params_error("authority.seed rows require source_row_id");
+            };
+            let snapshot = row.get("snapshot").unwrap_or(row);
+            if snapshot.get("project_path").and_then(Value::as_str) != Some(project) {
+                return HandlerOutcome::Error {
+                    code: "authority_seed_project_mismatch".to_string(),
+                    message: "seed snapshot project_path did not match the authority project"
+                        .to_string(),
+                };
+            }
+            let module_row_id =
+                match store.seed_authority_row(context_store_uuid, domain, source_row_id, snapshot)
+                {
+                    Ok(id) => id,
+                    Err(error) => {
+                        return HandlerOutcome::Error {
+                            code: "authority_seed_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                };
+            module_row_ids.push(module_row_id);
+            seeded += 1;
+        }
+        respond(json!({ "ok": true, "seeded": seeded, "module_row_ids": module_row_ids }))
+    }
+
+    fn handle_authority_drain_value(&self, request: &Value, method: &str) -> HandlerOutcome {
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
+            return invalid_params_error(
+                "authority drain requires context_store_uuid, project, and domain",
+            );
+        };
+        let action = request
+            .get("action")
+            .and_then(Value::as_str)
+            .or_else(|| method.strip_prefix("authority.drain."))
+            .unwrap_or("step");
+        let result = match action {
+            "begin" => {
+                let lease = request.get("lease").and_then(Value::as_str).unwrap_or("");
+                let expires = request
+                    .get("lease_expires_at")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                store.authority_begin_drain(context_store_uuid, project, domain, lease, expires)
+            }
+            "finish" | "flip" => {
+                let Some(generation) = request.get("generation").and_then(Value::as_u64) else {
+                    return invalid_params_error("authority drain finish requires generation");
+                };
+                store.authority_finish_drain(
+                    context_store_uuid,
+                    project,
+                    domain,
+                    generation,
+                    request
+                        .get("checksum_expected")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    request
+                        .get("checksum_actual")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    request
+                        .get("verified")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+            }
+            step => {
+                let Some(generation) = request.get("generation").and_then(Value::as_u64) else {
+                    return invalid_params_error("authority drain step requires generation");
+                };
+                let step = step.strip_prefix("drain_").unwrap_or(step);
+                store.authority_drain_step(
+                    context_store_uuid,
+                    project,
+                    domain,
+                    generation,
+                    step,
+                    request.get("cursor").and_then(Value::as_i64),
+                )
+            }
+        };
+        match result {
+            Ok(row) => respond(json!({ "ok": true, "authority": row })),
+            Err(error) => HandlerOutcome::Error {
+                code: "authority_drain_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_mirror_pull_value(&self, request: &Value) -> HandlerOutcome {
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some(domain) = request.get("domain").and_then(Value::as_str) else {
+            return invalid_params_error("mirror.pull requires domain");
+        };
+        let cursor = request.get("cursor").and_then(Value::as_i64).unwrap_or(0);
+        let limit = request.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+        match store.pull_changefeed(domain, cursor, limit) {
+            Ok(page) => respond(json!({ "ok": true, "page": page })),
+            Err(error) => HandlerOutcome::Error {
+                code: "mirror_pull_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     fn handle_guidance_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
@@ -7157,6 +7384,21 @@ impl McHandler {
                 // Proves the store opened end-to-end and, when a session_id is supplied,
                 // returns the session's stored trace state directly from the module.
                 "health" | "status" | "diagnostics" => self.handle_status_value(&request),
+                "authority.status" => self.handle_authority_status_value(&request),
+                "authority.prepare" => self.handle_authority_prepare_value(&request),
+                "authority.seed" => self.handle_authority_seed_value(&request),
+                "authority.drain.begin"
+                | "authority.drain.step"
+                | "authority.drain.finish"
+                | "authority.drain_seed"
+                | "authority.drain_memories"
+                | "authority.drain_notes"
+                | "authority.drain_compartments"
+                | "authority.drain_reconcile"
+                | "authority.drain_verify"
+                | "authority.drain_flip"
+                | "authority.drain_finish" => self.handle_authority_drain_value(&request, method),
+                "mirror.pull" => self.handle_mirror_pull_value(&request),
                 "guidance.get" => self.handle_guidance_value(channel, &request),
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
@@ -7645,6 +7887,16 @@ fn session_unresolved_error() -> HandlerOutcome {
         code: "session_unresolved".to_string(),
         message: SESSION_UNRESOLVED_MESSAGE.to_string(),
     }
+}
+
+fn authority_request_key(request: &Value) -> Option<(&str, &str, &str)> {
+    let uuid = request.get("context_store_uuid").and_then(Value::as_str)?;
+    let project = request.get("project").and_then(Value::as_str)?;
+    let domain = request.get("domain").and_then(Value::as_str)?;
+    if uuid.is_empty() || project.is_empty() || domain.is_empty() {
+        return None;
+    }
+    Some((uuid, project, domain))
 }
 
 fn invalid_params_error(message: impl Into<String>) -> HandlerOutcome {

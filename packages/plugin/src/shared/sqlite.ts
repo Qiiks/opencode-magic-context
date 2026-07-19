@@ -199,3 +199,78 @@ export type Database = BetterSqlite3.Database;
  * historical behavior in this codebase).
  */
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
+
+interface PrivilegeFunctionState {
+    enabled: boolean;
+    /** Bun releases without sqlite3_create_function use this compatibility path. */
+    tempTableFallback: boolean;
+}
+
+const privilegeFunctionStates = new WeakMap<Database, PrivilegeFunctionState>();
+
+/**
+ * Register the connection-local privilege predicate used by managed context.db
+ * guard triggers. Unknown connections must not be able to write: omitting this
+ * registration intentionally leaves SQLite with a missing-function error rather
+ * than an implicit privileged default.
+ */
+export function registerPrivilegeFunction(db: Database): void {
+    if (privilegeFunctionStates.has(db)) return;
+    const state: PrivilegeFunctionState = { enabled: false, tempTableFallback: false };
+    const candidate = db as unknown as {
+        function?: (...args: unknown[]) => void;
+    };
+    if (typeof candidate.function !== "function") {
+        // The shipped Bun runtime currently omits sqlite3_create_function. The
+        // schema installs a fail-closed compatibility state for that backend;
+        // runtimes with scalar registration always take the UDF path below.
+        state.tempTableFallback = true;
+        privilegeFunctionStates.set(db, state);
+        return;
+    }
+    const predicate = () => (state.enabled ? 1 : 0);
+    if (isBun) {
+        candidate.function.call(db, "mc_privileged_writer", predicate);
+    } else {
+        candidate.function.call(db, "mc_privileged_writer", { deterministic: true }, predicate);
+    }
+    privilegeFunctionStates.set(db, state);
+}
+
+/** SQL predicate used by managed-write triggers. The UDF is the normal path;
+ * the persistent compatibility state is only for Bun runtimes that do not expose
+ * scalar registration in their SQLite wrapper. */
+export function privilegeGuardPredicate(db: Database): string {
+    const state = privilegeFunctionStates.get(db);
+    return state?.tempTableFallback
+        ? "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0"
+        : "mc_privileged_writer() = 0";
+}
+
+/** Run a validated storage operation with the privilege predicate enabled only
+ * for the duration of the synchronous transaction callback. */
+export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
+    const state = privilegeFunctionStates.get(db);
+    if (!state) {
+        throw new Error("context.db privilege function was not registered on this connection");
+    }
+    if (state.enabled) return operation();
+    state.enabled = true;
+    if (state.tempTableFallback) {
+        db.prepare(
+            "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
+        ).run();
+    }
+    try {
+        return operation();
+    } finally {
+        if (state.tempTableFallback) {
+            db.prepare("UPDATE context_privilege_state SET enabled = 0 WHERE id = 1").run();
+        }
+        state.enabled = false;
+    }
+}
+
+export function isPrivilegeFunctionRegistered(db: Database): boolean {
+    return privilegeFunctionStates.has(db);
+}

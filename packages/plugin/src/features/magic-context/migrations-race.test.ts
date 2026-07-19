@@ -59,8 +59,8 @@ describe("migration race tolerance", () => {
                 $`bun -e ${script}`.json() as Promise<{ version: number; table: boolean }>,
             ]);
 
-            expect(first).toEqual({ version: 53, table: true });
-            expect(second).toEqual({ version: 53, table: true });
+            expect(first).toEqual({ version: 54, table: true });
+            expect(second).toEqual({ version: 54, table: true });
 
             const verify = new Database(path);
             expect(
@@ -288,7 +288,7 @@ describe("migration race tolerance", () => {
                         version: number;
                     }
                 ).version,
-            ).toBe(53);
+            ).toBe(54);
             closeQuietly(db);
             await holder.exited;
         } finally {
