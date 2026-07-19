@@ -267,8 +267,14 @@ describe("migration race tolerance", () => {
             );
             closeQuietly(setup);
 
+            // Resolve from the package root like the sibling script above: the suite
+            // runs from the repo root in the combined gate and from packages/plugin in
+            // a package-local run, and a bare cwd path only works for the latter.
+            const holderRoot = process.cwd().endsWith("/packages/plugin")
+                ? process.cwd()
+                : join(process.cwd(), "packages", "plugin");
             const holderScript = `
-                const { Database } = await import(${JSON.stringify(`file://${process.cwd()}/src/shared/sqlite.ts`)});
+                const { Database } = await import(${JSON.stringify(`file://${holderRoot}/src/shared/sqlite.ts`)});
                 const db = new Database(${JSON.stringify(path)});
                 db.exec("PRAGMA busy_timeout=1; BEGIN IMMEDIATE;");
                 console.log("locked");
