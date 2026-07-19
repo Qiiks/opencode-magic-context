@@ -10651,6 +10651,7 @@ mod tests {
                 Some("command-a"),
                 &["first#0".to_string(), "held#0".to_string()],
                 1,
+                false,
             )
             .unwrap();
         let pending = initial_store
@@ -10728,6 +10729,7 @@ mod tests {
                 Some("command-a"),
                 &["a-first#0".to_string(), "a-held#0".to_string()],
                 1,
+                false,
             )
             .unwrap();
         let pending_a = store.load_pending_agent_drops("ride-output").unwrap();
@@ -10753,6 +10755,7 @@ mod tests {
                 Some("command-b"),
                 &["b-first#0".to_string()],
                 2,
+                false,
             )
             .unwrap();
 
@@ -10840,6 +10843,7 @@ mod tests {
                 Some("range-command"),
                 &["m4#0".to_string(), "m5#0".to_string(), "m24#1".to_string()],
                 99,
+                false,
             )
             .unwrap();
 
@@ -10878,6 +10882,7 @@ mod tests {
                 Some("range-command"),
                 &["m5#0".to_string(), "m24#1".to_string()],
                 100,
+                false,
             )
             .unwrap();
         assert_eq!(replay.queued, 0);

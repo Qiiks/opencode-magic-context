@@ -3807,11 +3807,18 @@ impl McHandler {
             Some(&command_id),
             &drop_ids,
             now_ms(),
+            drop_ids.is_empty(),
         ) {
             Ok(outcome) if outcome.duplicate => {
                 respond(json!({ "ok": true, "queued": 0, "duplicate": true }))
             }
-            Ok(outcome) => respond(json!({ "ok": true, "queued": outcome.queued })),
+            Ok(outcome) => {
+                let mut resp = json!({ "ok": true, "queued": outcome.queued });
+                if let Some(disposition) = &outcome.disposition {
+                    resp["disposition"] = json!(disposition);
+                }
+                respond(resp)
+            }
             Err(error) => HandlerOutcome::Error {
                 code: "store_write_failed".to_string(),
                 message: error.to_string(),
@@ -13043,6 +13050,49 @@ mod tests {
         let retry = queue_drop_command_with_id(&handler, "tool-use-1");
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
+    }
+
+    #[test]
+    fn ctx_reduce_no_targets_append_records_terminal_disposition() {
+        // When a drop range references tag numbers that don't exist in the session,
+        // the ledger row is still recorded (for idempotency) but with disposition='no_targets'
+        // and queued=0. A retry of the same command_id still dedupes.
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        // No tags minted, so drop "1" resolves zero targets.
+        let outcome = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1",
+                "command_id": "no-target-cmd",
+            }),
+        );
+        let body: Value = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(body, json!({ "ok": true, "queued": 0, "disposition": "no_targets" }));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        // Retry of the same command_id must still dedupe (idempotency).
+        let retry = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1",
+                "command_id": "no-target-cmd",
+            }),
+        );
+        let retry_body: Value = match retry {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(retry_body, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
