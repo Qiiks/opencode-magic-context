@@ -2205,6 +2205,78 @@ const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 56,
+        description: "record authority capture bounds and pending mirror references",
+        up(db: Database): void {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS authority_capture_bounds (
+                    project_path TEXT NOT NULL,
+                    domain TEXT NOT NULL CHECK(domain IN ('memories', 'notes')),
+                    max_rowid INTEGER NOT NULL,
+                    data_version INTEGER NOT NULL,
+                    captured_at INTEGER NOT NULL,
+                    PRIMARY KEY(project_path, domain)
+                );
+                CREATE TABLE IF NOT EXISTS mirror_pending_references (
+                    domain TEXT NOT NULL CHECK(domain = 'memories'),
+                    module_project TEXT NOT NULL,
+                    module_row_id INTEGER NOT NULL,
+                    target_module_row_id INTEGER NOT NULL,
+                    PRIMARY KEY(domain, module_project, module_row_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_mirror_pending_reference_target
+                    ON mirror_pending_references(domain, module_project, target_module_row_id);
+                CREATE TABLE IF NOT EXISTS mirror_note_revisions (
+                    module_project TEXT NOT NULL,
+                    module_row_id INTEGER NOT NULL,
+                    context_row_id INTEGER NOT NULL,
+                    status_version INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(module_project, module_row_id),
+                    UNIQUE(context_row_id)
+                );
+            `);
+            const native = db as unknown as {
+                function?: unknown;
+                createFunction?: unknown;
+            };
+            const privilegeCheck =
+                typeof native.function === "function" || typeof native.createFunction === "function"
+                    ? "mc_privileged_writer() = 0"
+                    : "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
+            const managed = (row: "OLD" | "NEW") => `(
+                EXISTS (SELECT 1 FROM authority_managed WHERE project_path = ${row}.project_path)
+                OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = ${row}.project_path)
+                OR EXISTS (
+                    SELECT 1 FROM session_projects sp
+                    JOIN authority_managed am ON am.project_path = sp.project_path
+                    WHERE sp.session_id = ${row}.session_id
+                )
+                OR EXISTS (
+                    SELECT 1 FROM session_projects sp
+                    JOIN authority_repair_pending arp ON arp.project_path = sp.project_path
+                    WHERE sp.session_id = ${row}.session_id
+                )
+            )`;
+            db.exec(`
+                DROP TRIGGER IF EXISTS notes_authority_guard_insert;
+                DROP TRIGGER IF EXISTS notes_authority_guard_update;
+                DROP TRIGGER IF EXISTS notes_authority_guard_delete;
+                CREATE TRIGGER notes_authority_guard_insert
+                BEFORE INSERT ON notes
+                WHEN ${managed("NEW")} AND ${privilegeCheck}
+                BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
+                CREATE TRIGGER notes_authority_guard_update
+                BEFORE UPDATE ON notes
+                WHEN (${managed("OLD")} OR ${managed("NEW")}) AND ${privilegeCheck}
+                BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
+                CREATE TRIGGER notes_authority_guard_delete
+                BEFORE DELETE ON notes
+                WHEN ${managed("OLD")} AND ${privilegeCheck}
+                BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
+            `);
+        },
+    },
 ];
 
 /**

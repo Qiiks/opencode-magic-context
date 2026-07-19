@@ -11,6 +11,12 @@ import {
 } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
+import {
+    applyMirrorPage,
+    ensureContextStoreUuid,
+    getMirrorCursor,
+    registerModuleNoteEvaluationBridge,
+} from "../../features/magic-context/context-authority";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
 import {
@@ -655,6 +661,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const rustToolBackends: RustToolBackends | undefined =
         deps.config.transform_mode === "rust" && rustModeModuleClient
             ? {
+                  authorityState: async ({ projectPath, domain }) => {
+                      if (!rustModeModuleClient.authorityStatus) return null;
+                      const result = await rustModeModuleClient.authorityStatus({
+                          context_store_uuid: ensureContextStoreUuid(db),
+                          project: projectPath,
+                          domain,
+                      });
+                      return result.authority?.state ?? null;
+                  },
                   reduce: ({ sessionId, projectRoot, drop, commandId }) =>
                       rustModeModuleClient.call({
                           sessionId,
@@ -696,11 +711,75 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               },
                           },
                       }),
+                  memory: ({ sessionId, projectRoot, action, content, category, ids, reason }) =>
+                      rustModeModuleClient.call({
+                          sessionId,
+                          projectRoot,
+                          method: "ctx_memory",
+                          body: {
+                              name: "ctx_memory",
+                              arguments: { action, content, category, ids, reason },
+                          },
+                      }),
+                  noteEvaluationAvailable: () =>
+                      Boolean(
+                          rustModeModuleClient.authorityStatus && rustModeModuleClient.mirrorPull,
+                      ),
                   memorySync: (sessionId: string) => {
-                       rustMemorySyncRequestedSessions.add(sessionId);
-                   },
+                      rustMemorySyncRequestedSessions.add(sessionId);
+                  },
               }
             : undefined;
+    if (rustModeModuleClient?.mirrorPull) {
+        const syncModuleNotes = async (): Promise<void> => {
+            for (;;) {
+                const cursor = getMirrorCursor(db, "notes");
+                const response = await rustModeModuleClient.mirrorPull?.({
+                    domain: "notes",
+                    cursor,
+                    limit: 1000,
+                });
+                if (!response) throw new Error("mirror.pull is unavailable for notes");
+                const next = applyMirrorPage({ db, page: response.page });
+                if (!response.page.has_more || next === cursor) break;
+            }
+        };
+        registerModuleNoteEvaluationBridge(projectPath, {
+            sync: syncModuleNotes,
+            async evaluate({ contextNoteId, sessionId, verdict }): Promise<void> {
+                const identity = db
+                    .prepare(
+                        `SELECT identity.module_row_id, revision.status_version
+                           FROM mirror_identity identity
+                           JOIN mirror_note_revisions revision
+                             ON revision.module_project = identity.module_project
+                            AND revision.module_row_id = identity.module_row_id
+                          WHERE identity.domain = 'notes' AND identity.module_project = ?
+                            AND identity.context_row_id = ?`,
+                    )
+                    .get(projectPath, contextNoteId) as
+                    | { module_row_id: number; status_version: number }
+                    | undefined;
+                if (!identity) {
+                    throw new Error(`module identity is missing for smart note ${contextNoteId}`);
+                }
+                await rustModeModuleClient.call({
+                    sessionId,
+                    projectRoot: deps.directory,
+                    method: "note.evaluate",
+                    body: {
+                        method: "note.evaluate",
+                        v: 1,
+                        session_id: sessionId,
+                        note_id: identity.module_row_id,
+                        source_revision: identity.status_version,
+                        verdict,
+                    },
+                });
+                await syncModuleNotes();
+            },
+        });
+    }
     const notifyRustModeParked = (sessionId: string, message: string): void => {
         const client = deps.client as {
             tui?: {

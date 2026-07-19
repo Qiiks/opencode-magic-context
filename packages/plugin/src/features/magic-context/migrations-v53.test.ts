@@ -1,11 +1,12 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
+
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { clearSession } from "./storage-meta-session";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
+import { clearSession } from "./storage-meta-session";
 
 function tableExists(db: Database, table: string): boolean {
     return Boolean(
@@ -38,7 +39,7 @@ describe("migration v53: Synapse embedding storage", () => {
                 DROP TABLE embedding_measurement_corpus;
                 DROP TABLE shadow_embedding_registrations;
                 DROP TABLE synapse_batch_ledger;
-                DELETE FROM schema_migrations WHERE version IN (53, 54, 55);
+                DELETE FROM schema_migrations WHERE version IN (53, 54, 55, 56);
             `);
             runMigrations(db);
             db.prepare(

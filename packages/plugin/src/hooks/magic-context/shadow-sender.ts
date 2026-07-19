@@ -134,6 +134,8 @@ export interface ShadowTransport {
             | "session.wrapup"
             | "todo_state.set"
             | "ctx_note"
+            | "ctx_memory"
+            | "note.evaluate"
             | "transform.ack"
             | "transform.nack";
         body: unknown;
@@ -1549,6 +1551,8 @@ export class SubcShadowTransport implements ShadowTransport {
             | "authority.drain_finish"
             | "mirror.pull"
             | "ctx_note"
+            | "ctx_memory"
+            | "note.evaluate"
             | "transform.ack"
             | "transform.nack";
         body: unknown;

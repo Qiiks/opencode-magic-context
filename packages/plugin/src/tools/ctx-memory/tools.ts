@@ -1,6 +1,7 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
+import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import {
     archiveMemory,
     CATEGORY_PRIORITY,
@@ -81,6 +82,35 @@ function getAllowedActions(deps: CtxMemoryToolDeps): [CtxMemoryAction, ...CtxMem
 function normalizeCategory(category?: string): string | undefined {
     const trimmed = category?.trim();
     return trimmed ? trimmed : undefined;
+}
+
+function moduleMemoryText(response: unknown): string | null {
+    let value = response;
+    if (value !== null && typeof value === "object" && "result" in value) {
+        value = (value as { result?: unknown }).result;
+    }
+    if (typeof value === "string") return value;
+    if (value !== null && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        if (record.ok === false || record.error || typeof record.message === "string") {
+            const detail = record.error ?? record.message ?? "module rejected ctx_memory";
+            const message =
+                detail !== null && typeof detail === "object" && "message" in detail
+                    ? String((detail as { message?: unknown }).message)
+                    : String(detail);
+            return `Error: ${message}`;
+        }
+        if (Array.isArray(record.content)) {
+            const text = record.content.find(
+                (item): item is { text: string } =>
+                    item !== null &&
+                    typeof item === "object" &&
+                    typeof (item as { text?: unknown }).text === "string",
+            )?.text;
+            if (text) return text;
+        }
+    }
+    return null;
 }
 
 function formatMemoryList(memories: Memory[]): string {
@@ -355,6 +385,49 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             // runs `opencode -s <id>` from outside the project.
             const projectPath = deps.resolveProjectPath(toolContext.directory);
             await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
+            if (args.action !== "list") {
+                const marker = getAuthorityManagedMarker(deps.db, projectPath);
+                let authorityState: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
+                try {
+                    authorityState =
+                        (await deps.rustToolBackends?.authorityState?.({
+                            projectPath,
+                            domain: "memories",
+                        })) ?? null;
+                } catch (error) {
+                    if (marker) {
+                        return `Error: Rust memory authority is unavailable. ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                }
+                if (authorityState === "MODULE") {
+                    const memoryBackend = deps.rustToolBackends?.memory;
+                    if (!memoryBackend) {
+                        return "Error: Rust memory authority is active, but this module transport does not support ctx_memory.";
+                    }
+                    try {
+                        const text = moduleMemoryText(
+                            await memoryBackend({
+                                sessionId: toolContext.sessionID,
+                                projectRoot: toolContext.directory,
+                                projectPath,
+                                action: args.action,
+                                content: args.content,
+                                category: args.category,
+                                ids: args.ids,
+                                reason: args.reason,
+                            }),
+                        );
+                        return (
+                            text ?? "Error: Rust module returned an invalid ctx_memory response."
+                        );
+                    } catch (error) {
+                        return `Error: Rust module ctx_memory failed. ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                }
+                if (marker || authorityState === "PREPARING" || authorityState === "DRAINING") {
+                    return "Error: Rust memory authority is not ready; TypeScript fallback is disabled.";
+                }
+            }
             const workspaceIdentitySet = resolveWorkspaceIdentitySet(deps.db, projectPath);
             const expandedWorkspace = expandWorkspaceIdentitySetWithAliases(
                 deps.db,
@@ -400,7 +473,13 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 }
                 const isOwn = targetIdentityForStoredPath(memory.projectPath) === projectPath;
                 if (isOwn) return true;
-                return toolShareCategories?.includes(memory.category) ?? false;
+                return (
+                    (memory.status === "active" || memory.status === "permanent") &&
+                    (memory.expiresAt === null || memory.expiresAt > Date.now()) &&
+                    memory.shareable === 1 &&
+                    ["project", "ecosystem", "universe"].includes(memory.scope) &&
+                    (toolShareCategories?.includes(memory.category) ?? false)
+                );
             };
             const memoryOwnedByTool = (memory: Memory): boolean =>
                 workspaceIdentitySet.identities.length > 1

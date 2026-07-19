@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { withPrivilegedWriter } from "../../shared/sqlite";
 
@@ -42,6 +43,26 @@ export interface AuthorityModuleClient {
         cursor: number;
         limit: number;
     }): Promise<{ page: ChangefeedPage }>;
+}
+
+export interface ModuleNoteEvaluationBridge {
+    sync(): Promise<void>;
+    evaluate(args: { contextNoteId: number; sessionId: string; verdict: boolean }): Promise<void>;
+}
+
+const moduleNoteEvaluationBridges = new Map<string, ModuleNoteEvaluationBridge>();
+
+export function registerModuleNoteEvaluationBridge(
+    projectPath: string,
+    bridge: ModuleNoteEvaluationBridge,
+): void {
+    moduleNoteEvaluationBridges.set(projectPath, bridge);
+}
+
+export function getModuleNoteEvaluationBridge(
+    projectPath: string,
+): ModuleNoteEvaluationBridge | undefined {
+    return moduleNoteEvaluationBridges.get(projectPath);
 }
 
 export interface ChangefeedRow {
@@ -189,7 +210,9 @@ export async function reconcileAuthorityMarker(args: {
             }),
         ),
     );
-    const authority = statuses.find((result) => result.authority !== null)?.authority ?? null;
+    const authority =
+        statuses.find((result) => result.authority !== null && result.authority.state !== "TS")
+            ?.authority ?? null;
     if (!authority) {
         clearRepairPending(args.db, args.projectPath);
         return { status: "legacy", authority: null };
@@ -206,33 +229,130 @@ export async function reconcileAuthorityMarker(args: {
     return { status: "repaired", authority };
 }
 
+export async function reconcileAuthorityProject(args: {
+    db: Database;
+    projectPath: string;
+    module: AuthorityModuleClient;
+}): Promise<void> {
+    await reconcileAuthorityMarker(args);
+    const contextStoreUuid = ensureContextStoreUuid(args.db);
+    for (const domain of AUTHORITY_DOMAINS) {
+        const status = await args.module.authorityStatus({
+            context_store_uuid: contextStoreUuid,
+            project: args.projectPath,
+            domain,
+        });
+        if (status.authority?.state !== "MODULE") continue;
+        const identity = args.db
+            .prepare(
+                "SELECT 1 FROM mirror_identity WHERE domain = ? AND module_project = ? LIMIT 1",
+            )
+            .get(domain, args.projectPath);
+        if (identity) continue;
+        if (!args.module.mirrorPull) {
+            throw new Error(`authority reconciliation requires mirror.pull for ${domain}`);
+        }
+        withPrivilegedWriter(args.db, () => {
+            args.db
+                .transaction(() => {
+                    args.db
+                        .prepare(
+                            "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ?",
+                        )
+                        .run(domain, args.projectPath);
+                    args.db
+                        .prepare(
+                            "DELETE FROM mirror_pending_references WHERE domain = ? AND module_project = ?",
+                        )
+                        .run(domain, args.projectPath);
+                    if (domain === "notes") {
+                        args.db
+                            .prepare("DELETE FROM mirror_note_revisions WHERE module_project = ?")
+                            .run(args.projectPath);
+                    }
+                    args.db
+                        .prepare(
+                            "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES (?, 0, ?) ON CONFLICT(domain) DO UPDATE SET cursor = 0, updated_at = excluded.updated_at",
+                        )
+                        .run(domain, Date.now());
+                })
+                .immediate();
+        });
+        for (;;) {
+            const cursor = getMirrorCursor(args.db, domain);
+            const response = await args.module.mirrorPull({ domain, cursor, limit: 1000 });
+            const next = applyMirrorPage({ db: args.db, page: response.page });
+            if (!response.page.has_more || next === cursor) break;
+        }
+    }
+}
+
 export interface PrepareAuthorityArgs {
     db: Database;
     projectPath: string;
     domains?: readonly AuthorityDomain[];
     module: AuthorityModuleClient;
     seedPages: (domain: AuthorityDomain) => Promise<readonly Record<string, unknown>[]>;
-    checksum: (domain: AuthorityDomain) => string;
-    /** Optional per-row verification hook used to fail closed before the flip. */
-    verifySeed?: (
-        domain: AuthorityDomain,
-        rows: readonly Record<string, unknown>[],
-    ) => boolean | Promise<boolean>;
+    /** Test seam for alternate canonical encoders. Production uses the shared row digest. */
+    checksum?: (domain: AuthorityDomain, rows: readonly Record<string, unknown>[]) => string;
 }
 
-/**
- * Run the TS-side PREPARING protocol. BEGIN IMMEDIATE intentionally remains open
- * while module round-trips run: SQLite readers do not conflict with this lock, while
- * every competing writer must commit or roll back before the seed bound is captured.
- */
-export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<AuthorityStatus[]> {
-    const contextStoreUuid = ensureContextStoreUuid(args.db);
-    const domains = args.domains ?? AUTHORITY_DOMAINS;
-    const results: AuthorityStatus[] = [];
-    if (!args.module.authoritySeed) {
-        throw new Error("memory authority preparation requires the authority.seed module route");
-    }
-    let removeMarkerAfterAbort = false;
+function canonicalizeSeedValue(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(canonicalizeSeedValue);
+    if (value === null || typeof value !== "object") return value;
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+        Object.keys(record)
+            .sort()
+            .map((key) => [key, canonicalizeSeedValue(record[key])]),
+    );
+}
+
+export function checksumAuthoritySeedRows(rows: readonly Record<string, unknown>[]): string {
+    const ordered = [...rows].sort((left, right) => {
+        const leftId = seedSourceRowId(left) ?? Number.MAX_SAFE_INTEGER;
+        const rightId = seedSourceRowId(right) ?? Number.MAX_SAFE_INTEGER;
+        return leftId - rightId;
+    });
+    return createHash("sha256")
+        .update(JSON.stringify(ordered.map(canonicalizeSeedValue)))
+        .digest("hex");
+}
+
+function dataVersion(db: Database): number {
+    const row = db.prepare("PRAGMA data_version").get() as { data_version?: number } | undefined;
+    return typeof row?.data_version === "number" ? row.data_version : 0;
+}
+
+function maxDomainRowId(db: Database, domain: AuthorityDomain, projectPath: string): number {
+    const row = (
+        domain === "memories"
+            ? db
+                  .prepare(
+                      "SELECT COALESCE(MAX(rowid), 0) AS max_rowid FROM memories WHERE project_path = ?",
+                  )
+                  .get(projectPath)
+            : db
+                  .prepare(
+                      `SELECT COALESCE(MAX(n.rowid), 0) AS max_rowid
+                         FROM notes n
+                        WHERE n.project_path = ?
+                           OR (n.project_path IS NULL AND EXISTS (
+                               SELECT 1 FROM session_projects sp
+                                WHERE sp.session_id = n.session_id AND sp.project_path = ?
+                           ))`,
+                  )
+                  .get(projectPath, projectPath)
+    ) as { max_rowid?: number } | undefined;
+    return typeof row?.max_rowid === "number" ? row.max_rowid : 0;
+}
+
+function installMarkerAndCaptureBounds(args: {
+    db: Database;
+    projectPath: string;
+    contextStoreUuid: string;
+    domains: readonly AuthorityDomain[];
+}): void {
     args.db.exec("BEGIN IMMEDIATE");
     try {
         withPrivilegedWriter(args.db, () => {
@@ -240,8 +360,85 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                 .prepare(
                     "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?) ON CONFLICT(project_path) DO UPDATE SET context_store_uuid = excluded.context_store_uuid, marked_at = excluded.marked_at",
                 )
-                .run(args.projectPath, contextStoreUuid, Date.now());
+                .run(args.projectPath, args.contextStoreUuid, Date.now());
+            const version = dataVersion(args.db);
+            const capture = args.db.prepare(
+                "INSERT INTO authority_capture_bounds(project_path, domain, max_rowid, data_version, captured_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_path, domain) DO UPDATE SET max_rowid = excluded.max_rowid, data_version = excluded.data_version, captured_at = excluded.captured_at",
+            );
+            for (const domain of args.domains) {
+                capture.run(
+                    args.projectPath,
+                    domain,
+                    maxDomainRowId(args.db, domain, args.projectPath),
+                    version,
+                    Date.now(),
+                );
+            }
         });
+        args.db.exec("COMMIT");
+    } catch (error) {
+        try {
+            args.db.exec("ROLLBACK");
+        } catch {
+            // Preserve the capture failure.
+        }
+        throw error;
+    }
+}
+
+function capturedBoundsUnchanged(
+    db: Database,
+    projectPath: string,
+    domains: readonly AuthorityDomain[],
+): boolean {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+        const version = dataVersion(db);
+        const read = db.prepare(
+            "SELECT max_rowid, data_version FROM authority_capture_bounds WHERE project_path = ? AND domain = ?",
+        );
+        const unchanged = domains.every((domain) => {
+            const captured = read.get(projectPath, domain) as
+                | { max_rowid: number; data_version: number }
+                | undefined;
+            return (
+                captured !== undefined &&
+                captured.max_rowid === maxDomainRowId(db, domain, projectPath) &&
+                captured.data_version === version
+            );
+        });
+        db.exec("COMMIT");
+        return unchanged;
+    } catch (error) {
+        try {
+            db.exec("ROLLBACK");
+        } catch {
+            // Preserve the verification failure.
+        }
+        throw error;
+    }
+}
+
+export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<AuthorityStatus[]> {
+    const contextStoreUuid = ensureContextStoreUuid(args.db);
+    const domains = args.domains ?? AUTHORITY_DOMAINS;
+    if (!args.module.authoritySeed) {
+        throw new Error("authority preparation requires the authority.seed module route");
+    }
+
+    installMarkerAndCaptureBounds({
+        db: args.db,
+        projectPath: args.projectPath,
+        contextStoreUuid,
+        domains,
+    });
+
+    const startedGenerations = new Map<AuthorityDomain, number>();
+    const prepared: Array<{
+        domain: AuthorityDomain;
+        generation: number;
+    }> = [];
+    try {
         for (const domain of domains) {
             const started = await args.module.authorityPrepare({
                 method: "authority.prepare",
@@ -250,6 +447,7 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                 project: args.projectPath,
                 domain,
             });
+            startedGenerations.set(domain, started.authority.generation);
             const rows = await args.seedPages(domain);
             for (const page of chunkRowsForFrame(rows)) {
                 const seedResponse = await args.module.authoritySeed({
@@ -272,20 +470,7 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                     }
                 }
             }
-            const digest = args.checksum(domain);
-            const verified = (await args.verifySeed?.(domain, rows)) ?? true;
-            if (!verified) {
-                removeMarkerAfterAbort = true;
-                await args.module.authorityPrepare({
-                    method: "authority.prepare",
-                    phase: "abort",
-                    context_store_uuid: contextStoreUuid,
-                    project: args.projectPath,
-                    domain,
-                    generation: started.authority.generation,
-                });
-                throw new Error(`memory authority seed verification failed for ${domain}`);
-            }
+            const digest = args.checksum?.(domain, rows) ?? checksumAuthoritySeedRows(rows);
             const completed = await args.module.authorityPrepare({
                 method: "authority.prepare",
                 phase: "complete",
@@ -294,51 +479,64 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                 domain,
                 generation: started.authority.generation,
                 checksum_expected: digest,
-                checksum_actual: digest,
-                verified,
             });
             const authority = completed.authority;
-            const moduleVerified =
-                authority.checksum_ok === undefined ||
-                authority.checksum_ok === null ||
-                authority.checksum_ok === true ||
-                authority.checksum_ok === 1;
-            const checksumsMatch =
-                authority.checksum_expected === undefined ||
-                authority.checksum_expected === null ||
-                authority.checksum_actual === undefined ||
-                authority.checksum_actual === null ||
-                authority.checksum_expected === authority.checksum_actual;
-            if (authority.state !== "MODULE" || !moduleVerified || !checksumsMatch) {
-                removeMarkerAfterAbort = true;
-                if (authority.state === "PREPARING") {
-                    try {
-                        await args.module.authorityPrepare({
-                            method: "authority.prepare",
-                            phase: "abort",
-                            context_store_uuid: contextStoreUuid,
-                            project: args.projectPath,
-                            domain,
-                            generation: started.authority.generation,
-                        });
-                    } catch {
-                        // Preserve the verification failure; the durable PREPARING row
-                        // remains visible for a later repair attempt if abort is unavailable.
-                    }
-                }
-                throw new Error(`memory authority seed verification failed for ${domain}`);
+            const checksumOk = authority.checksum_ok === true || authority.checksum_ok === 1;
+            if (
+                authority.state !== "PREPARING" ||
+                !checksumOk ||
+                authority.checksum_expected !== digest ||
+                authority.checksum_actual !== digest
+            ) {
+                log(
+                    `[magic-context] authority seed checksum mismatch for ${domain}; aborting module ownership`,
+                );
+                throw new Error(`authority seed verification failed for ${domain}`);
             }
-            results.push(authority);
+            prepared.push({ domain, generation: started.authority.generation });
         }
-        args.db.exec("COMMIT");
+
+        if (!capturedBoundsUnchanged(args.db, args.projectPath, domains)) {
+            log(
+                "[magic-context] authority capture bound drifted while writers were fenced; aborting module ownership",
+            );
+            throw new Error("authority capture bound changed while TypeScript writers were fenced");
+        }
+
+        const results: AuthorityStatus[] = [];
+        for (const item of prepared) {
+            const acknowledged = await args.module.authorityPrepare({
+                method: "authority.prepare",
+                phase: "ack",
+                context_store_uuid: contextStoreUuid,
+                project: args.projectPath,
+                domain: item.domain,
+                generation: item.generation,
+            });
+            if (acknowledged.authority.state !== "MODULE") {
+                throw new Error(`authority acknowledgement failed for ${item.domain}`);
+            }
+            results.push(acknowledged.authority);
+        }
         return results;
     } catch (error) {
-        try {
-            args.db.exec("ROLLBACK");
-        } catch {
-            // Preserve the original preparation error.
+        let moduleOwnsDomain = false;
+        for (const [domain, generation] of startedGenerations) {
+            try {
+                const aborted = await args.module.authorityPrepare({
+                    method: "authority.prepare",
+                    phase: "abort",
+                    context_store_uuid: contextStoreUuid,
+                    project: args.projectPath,
+                    domain,
+                    generation,
+                });
+                moduleOwnsDomain ||= aborted.authority.state === "MODULE";
+            } catch {
+                moduleOwnsDomain = true;
+            }
         }
-        if (removeMarkerAfterAbort) removeAuthorityManagedMarker(args.db, args.projectPath);
+        if (!moduleOwnsDomain) removeAuthorityManagedMarker(args.db, args.projectPath);
         throw error;
     }
 }
@@ -358,6 +556,7 @@ export async function drainAuthority(args: {
         throw new Error("memory authority drain requires the mirror.pull module route");
     }
     const contextStoreUuid = ensureContextStoreUuid(args.db);
+    const leaseStartedAt = Date.now();
     let status = (
         await args.module.authorityDrain({
             method: "authority.drain.begin",
@@ -366,7 +565,8 @@ export async function drainAuthority(args: {
             domain: args.domain,
             action: "begin",
             lease: `ts:${contextStoreUuid}`,
-            lease_expires_at: Date.now() + 60_000,
+            lease_started_at: leaseStartedAt,
+            lease_expires_at: leaseStartedAt + 60_000,
         })
     ).authority;
     const upperBound = status.captured_upper_bound ?? status.drain_cursor ?? 0;
@@ -418,9 +618,20 @@ export async function drainAuthority(args: {
     if (finished.state !== "TS") {
         throw new Error("memory authority drain did not reactivate TypeScript ownership");
     }
-    // Remove the authority-managed marker under an exclusive context.db write lock
-    // immediately after the module flip, so TS writers cannot resume before the fence is gone.
-    removeAuthorityManagedMarker(args.db, args.projectPath);
+    // A project marker fences both authority domains. Remove it only after neither
+    // domain remains module-owned; a one-domain drain must not reopen the other domain.
+    const remaining = await Promise.all(
+        AUTHORITY_DOMAINS.map((domain) =>
+            args.module.authorityStatus({
+                context_store_uuid: contextStoreUuid,
+                project: args.projectPath,
+                domain,
+            }),
+        ),
+    );
+    if (remaining.every((result) => !result.authority || result.authority.state === "TS")) {
+        removeAuthorityManagedMarker(args.db, args.projectPath);
+    }
     return finished;
 }
 
@@ -548,6 +759,9 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
         db.prepare(
             "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
         ).run(feed.domain, moduleProject, feed.module_row_id);
+        db.prepare(
+            "DELETE FROM mirror_pending_references WHERE domain = ? AND module_project = ? AND (module_row_id = ? OR target_module_row_id = ?)",
+        ).run(feed.domain, moduleProject, feed.module_row_id, feed.module_row_id);
         return;
     }
     const contextId = contextMemoryId(db, feed.domain, moduleProject, row, feed.module_row_id);
@@ -583,14 +797,36 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
         rowString(row, "verification_status", "unverified"),
         typeof row.verified_at === "number" ? row.verified_at : null,
         typeof row.classified_at === "number" ? row.classified_at : null,
-        typeof row.superseded_by_memory_id === "number"
-            ? (mirrorIdentity(db, "memories", moduleProject, row.superseded_by_memory_id)
-                  ?.context_row_id ?? null)
-            : null,
+        null,
         rowNullableString(row, "merged_from"),
         rowNullableString(row, "metadata_json"),
         contextId,
     );
+    if (typeof row.superseded_by_memory_id === "number") {
+        const translated = mirrorIdentity(
+            db,
+            "memories",
+            moduleProject,
+            row.superseded_by_memory_id,
+        );
+        if (translated) {
+            db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?").run(
+                translated.context_row_id,
+                contextId,
+            );
+            db.prepare(
+                "DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
+            ).run(moduleProject, feed.module_row_id);
+        } else {
+            db.prepare(
+                "INSERT INTO mirror_pending_references(domain, module_project, module_row_id, target_module_row_id) VALUES ('memories', ?, ?, ?) ON CONFLICT(domain, module_project, module_row_id) DO UPDATE SET target_module_row_id = excluded.target_module_row_id",
+            ).run(moduleProject, feed.module_row_id, row.superseded_by_memory_id);
+        }
+    } else {
+        db.prepare(
+            "DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
+        ).run(moduleProject, feed.module_row_id);
+    }
     if (previous?.normalized_hash !== feed.content_hash) {
         db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(contextId);
     }
@@ -621,23 +857,37 @@ function contextNoteId(db: Database, feed: ChangefeedRow, moduleProject: string)
     return contextId;
 }
 
-function translateMemoryReferences(db: Database, page: ChangefeedPage): void {
-    for (const feed of page.rows) {
-        if (feed.domain !== "memories" || feed.op === "tombstone") continue;
-        const row = feed.full_row_snapshot;
-        const moduleProject = rowString(row, "project_path");
-        const reference = row.superseded_by_memory_id;
-        const contextReference =
-            typeof reference === "number"
-                ? (mirrorIdentity(db, "memories", moduleProject, reference)?.context_row_id ?? null)
-                : null;
-        const mapped = mirrorIdentity(db, "memories", moduleProject, feed.module_row_id);
-        if (mapped) {
-            db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?").run(
-                contextReference,
-                mapped.context_row_id,
-            );
-        }
+function translateMemoryReferences(db: Database): void {
+    const pending = db
+        .prepare(
+            `SELECT pending.module_project, pending.module_row_id, pending.target_module_row_id,
+                    source.context_row_id AS source_context_id,
+                    target.context_row_id AS target_context_id
+               FROM mirror_pending_references pending
+               JOIN mirror_identity source
+                 ON source.domain = pending.domain
+                AND source.module_project = pending.module_project
+                AND source.module_row_id = pending.module_row_id
+               JOIN mirror_identity target
+                 ON target.domain = pending.domain
+                AND target.module_project = pending.module_project
+                AND target.module_row_id = pending.target_module_row_id
+              WHERE pending.domain = 'memories'`,
+        )
+        .all() as Array<{
+        module_project: string;
+        module_row_id: number;
+        target_module_row_id: number;
+        source_context_id: number;
+        target_context_id: number;
+    }>;
+    const update = db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?");
+    const clear = db.prepare(
+        "DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
+    );
+    for (const reference of pending) {
+        update.run(reference.target_context_id, reference.source_context_id);
+        clear.run(reference.module_project, reference.module_row_id);
     }
 }
 
@@ -652,21 +902,26 @@ function applyNoteRow(db: Database, feed: ChangefeedRow): void {
         db.prepare(
             "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
         ).run(feed.domain, moduleProject, feed.module_row_id);
+        db.prepare(
+            "DELETE FROM mirror_note_revisions WHERE module_project = ? AND module_row_id = ?",
+        ).run(moduleProject, feed.module_row_id);
         return;
     }
     const contextId = contextNoteId(db, feed, moduleProject);
     // Delivery-only module states are collapsed to the TS vocabulary. The ledger remains
     // authoritative for at-least-once delivery; context.db must not invent a new status.
     const moduleStatus = rowString(row, "status", "active");
-    const contextStatus = moduleStatus === "surfaced" || moduleStatus === "surfacing" ? "ready" : moduleStatus;
+    const contextStatus =
+        moduleStatus === "surfaced" || moduleStatus === "surfacing" ? "ready" : moduleStatus;
     db.prepare(
-        `UPDATE notes SET type = 'smart', status = ?, project_path = ?, session_id = ?, content = ?,
+        `UPDATE notes SET type = ?, status = ?, project_path = ?, session_id = ?, content = ?,
          surface_condition = ?, ready_at = ?, ready_reason = ?, manifest_json = ?, compiled_check = ?,
          check_hash = ?, check_cron = ?, check_failure_count = ?, check_network_failure_count = ?,
          check_quarantined_until = ?, check_next_due_at = ?, check_compiled_at = ?, check_false_since_at = ?,
          check_last_liveness_at = ?, last_checked_at = ?, check_status = ?, check_version = ?,
          policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`,
     ).run(
+        rowString(row, "type", "smart"),
         contextStatus,
         moduleProject,
         rowNullableString(row, "session_id"),
@@ -695,6 +950,9 @@ function applyNoteRow(db: Database, feed: ChangefeedRow): void {
         rowNumber(row, "updated_at_ms"),
         contextId,
     );
+    db.prepare(
+        "INSERT INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?) ON CONFLICT(module_project, module_row_id) DO UPDATE SET context_row_id = excluded.context_row_id, status_version = excluded.status_version",
+    ).run(moduleProject, feed.module_row_id, contextId, rowNumber(row, "status_version"));
 }
 
 export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): number {
@@ -715,7 +973,7 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
                 else applyNoteRow(db, feed);
                 nextCursor = feed.feed_seq;
             }
-            translateMemoryReferences(db, page);
+            translateMemoryReferences(db);
             if (page.next_cursor < nextCursor) {
                 throw new Error("mirror page moved its cursor backwards");
             }

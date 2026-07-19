@@ -79,10 +79,21 @@ describe("authority-managed context.db schema", () => {
             ).run("/project");
         });
 
-        // Session notes are deliberately outside the managed project-owned set.
         db.prepare(
-            "INSERT INTO notes (type, status, content, session_id, created_at, updated_at) VALUES ('session', 'active', 'session-owned', ?, 0, 0)",
-        ).run("session");
+            "INSERT INTO session_projects(session_id, harness, project_path, updated_at) VALUES (?, 'opencode', ?, 0)",
+        ).run("session", "/project");
+        expect(() =>
+            db
+                .prepare(
+                    "INSERT INTO notes (type, status, content, session_id, created_at, updated_at) VALUES ('session', 'active', 'blocked session note', ?, 0, 0)",
+                )
+                .run("session"),
+        ).toThrow();
+        withPrivilegedWriter(db, () => {
+            db.prepare(
+                "INSERT INTO notes (type, status, content, session_id, created_at, updated_at) VALUES ('session', 'active', 'allowed session note', ?, 0, 0)",
+            ).run("session");
+        });
 
         const triggerSql = (
             db

@@ -4939,22 +4939,35 @@ impl McHandler {
                     .get("checksum_expected")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let actual = request
-                    .get("checksum_actual")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let verified = request
-                    .get("verified")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                store.authority_finish_prepare(
+                let actual = match store.authority_seed_checksum(context_store_uuid, project, domain)
+                {
+                    Ok(checksum) => checksum,
+                    Err(error) => {
+                        return HandlerOutcome::Error {
+                            code: "authority_checksum_failed".to_string(),
+                            message: error.to_string(),
+                        }
+                    }
+                };
+                store.authority_verify_prepare(
                     context_store_uuid,
                     project,
                     domain,
                     expected_generation,
                     expected,
-                    actual,
-                    verified,
+                    &actual,
+                )
+            }
+            "ack" => {
+                let Some(expected_generation) = request.get("generation").and_then(Value::as_u64)
+                else {
+                    return invalid_params_error("authority.prepare ack requires generation");
+                };
+                store.authority_ack_prepare(
+                    context_store_uuid,
+                    project,
+                    domain,
+                    expected_generation,
                 )
             }
             "abort" => {
@@ -4971,7 +4984,7 @@ impl McHandler {
             }
             _ => {
                 return invalid_params_error(
-                    "authority.prepare phase must be begin, complete, or abort",
+                    "authority.prepare phase must be begin, complete, ack, or abort",
                 )
             }
         };
@@ -5056,7 +5069,18 @@ impl McHandler {
                     .get("lease_expires_at")
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
-                store.authority_begin_drain(context_store_uuid, project, domain, lease, expires)
+                let started_at = request
+                    .get("lease_started_at")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_else(now_ms);
+                store.authority_begin_drain(
+                    context_store_uuid,
+                    project,
+                    domain,
+                    lease,
+                    expires,
+                    started_at,
+                )
             }
             "finish" | "flip" => {
                 let Some(generation) = request.get("generation").and_then(Value::as_u64) else {
@@ -7081,6 +7105,30 @@ impl McHandler {
                     Err(error) => tool_error_result(format!("Error: {error}")),
                 }
             }
+            "get" => {
+                let ids = memory_ids(args, "get");
+                match memory_tool::get_memories(store, memory_project, &ids) {
+                    Ok(memories) => {
+                        let by_id = memories
+                            .into_iter()
+                            .map(|memory| (memory.id, memory))
+                            .collect::<std::collections::HashMap<_, _>>();
+                        let lines = ids
+                            .iter()
+                            .map(|id| match by_id.get(id) {
+                                Some(memory) => format!(
+                                    "Memory [ID: {}] in {} (status: {}): {}",
+                                    memory.id, memory.category, memory.status, memory.content
+                                ),
+                                None => format!("id {id}: not found or not visible from this project"),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        mcp_text_result(lines, false)
+                    }
+                    Err(error) => tool_error_result(format!("Error: {error}")),
+                }
+            }
             _ => tool_error_result("Error: Unknown ctx_memory action.".to_string()),
         }
     }
@@ -7425,31 +7473,64 @@ impl McHandler {
                             .to_string(),
                     ),
                 };
-                let notes = match filter {
-                    None => {
-                        let mut notes = match store.read_project_notes(
-                            project,
-                            Some(session),
-                            &["active"],
-                            limit,
-                            offset,
-                        ) {
-                            Ok(notes) => notes,
-                            Err(error) => return tool_error_result(format!("Error: {error}")),
-                        };
-                        match store.read_project_notes(project, None, &["ready"], 100, 0) {
-                            Ok(ready) => notes.extend(ready),
-                            Err(error) => return tool_error_result(format!("Error: {error}")),
-                        }
-                        notes
-                    }
-                    _ => match store.read_visible_notes(project, session, &statuses, limit, offset)
-                    {
-                        Ok(notes) => notes,
-                        Err(error) => return tool_error_result(format!("Error: {error}")),
-                    },
+                let session_statuses = if filter.is_none() {
+                    vec!["active"]
+                } else {
+                    statuses.clone()
                 };
-                mcp_text_result(render_notes(notes, offset, limit), false)
+                let smart_statuses = if filter.is_none() {
+                    vec!["ready"]
+                } else {
+                    statuses
+                };
+                let session_notes = match store.read_project_notes(
+                    project,
+                    Some(session),
+                    &session_statuses,
+                    limit,
+                    offset,
+                ) {
+                    Ok(notes) => notes,
+                    Err(error) => return tool_error_result(format!("Error: {error}")),
+                };
+                let smart_notes = match store.read_smart_notes(
+                    project,
+                    &smart_statuses,
+                    limit,
+                    offset,
+                ) {
+                    Ok(notes) => notes,
+                    Err(error) => return tool_error_result(format!("Error: {error}")),
+                };
+                let session_total = match store.count_notes_by_type(
+                    project,
+                    "session",
+                    Some(session),
+                    &session_statuses,
+                ) {
+                    Ok(total) => total,
+                    Err(error) => return tool_error_result(format!("Error: {error}")),
+                };
+                let smart_total = match store.count_notes_by_type(
+                    project,
+                    "smart",
+                    None,
+                    &smart_statuses,
+                ) {
+                    Ok(total) => total,
+                    Err(error) => return tool_error_result(format!("Error: {error}")),
+                };
+                mcp_text_result(
+                    render_notes(
+                        session_notes,
+                        smart_notes,
+                        session_total,
+                        smart_total,
+                        offset,
+                        filter.is_none(),
+                    ),
+                    false,
+                )
             }
             "update" => {
                 let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
@@ -8357,13 +8438,18 @@ fn render_range_expand(
     truncate_expand_output(lines.join("\n"))
 }
 
-fn render_notes(notes: Vec<StoredNote>, offset: usize, limit: usize) -> String {
-    if notes.is_empty() {
+fn render_notes(
+    session_notes: Vec<StoredNote>,
+    smart_notes: Vec<StoredNote>,
+    session_total: usize,
+    smart_total: usize,
+    offset: usize,
+    default_sections: bool,
+) -> String {
+    if session_notes.is_empty() && smart_notes.is_empty() {
         return "## Notes\n\nNo session notes or smart notes.".to_string();
     }
-    let mut session_lines = Vec::new();
-    let mut smart_lines = Vec::new();
-    for note in &notes {
+    let format_note = |note: &StoredNote| {
         let status_suffix = if note.status == "active" {
             String::new()
         } else {
@@ -8372,13 +8458,8 @@ fn render_notes(notes: Vec<StoredNote>, offset: usize, limit: usize) -> String {
         let anchor = note
             .anchor_ordinal
             .map(|ordinal| format!(" ↳ @msg {ordinal}"))
-            .or_else(|| {
-                note.anchor_block_id
-                    .as_ref()
-                    .map(|id| format!(" ↳ @block {id}"))
-            })
             .unwrap_or_default();
-        let line = if note.type_name == "smart" {
+        if note.type_name == "smart" {
             let condition = if note.status == "ready" {
                 note.ready_reason
                     .as_deref()
@@ -8407,30 +8488,54 @@ fn render_notes(notes: Vec<StoredNote>, offset: usize, limit: usize) -> String {
                 "- **#{}**{}: {}{}",
                 note.id, status_suffix, note.content, anchor
             )
-        };
-        if note.type_name == "smart" {
-            smart_lines.push(line);
-        } else {
-            session_lines.push(line);
         }
-    }
+    };
+    let footer = |total: usize, shown: usize| {
+        let remaining = total.saturating_sub(offset.saturating_add(shown));
+        (remaining > 0).then(|| {
+            format!(
+                "Showing {shown} of {total} (newest first) — {remaining} older: ctx_note(action=\"read\", offset={})",
+                offset.saturating_add(shown)
+            )
+        })
+    };
     let mut sections = Vec::new();
-    if !session_lines.is_empty() {
-        sections.push(format!("## Session Notes\n\n{}", session_lines.join("\n")));
-    }
-    if !smart_lines.is_empty() {
-        sections.push(format!("## Smart Notes\n\n{}", smart_lines.join("\n\n")));
-    }
-    if notes.len() == limit {
-        if let Some(next_offset) = offset.checked_add(notes.len()) {
-            sections.push(format!(
-                "Showing {} notes (newest first). For older notes: ctx_note(action=\"read\", offset={next_offset}).",
-                notes.len()
-            ));
+    if !session_notes.is_empty() {
+        let mut section = format!(
+            "## Session Notes\n\n{}",
+            session_notes.iter().map(&format_note).collect::<Vec<_>>().join("\n")
+        );
+        if let Some(footer) = footer(session_total, session_notes.len()) {
+            section.push_str("\n\n");
+            section.push_str(&footer);
         }
+        sections.push(section);
     }
-    sections.push("To dismiss a stale note: ctx_note(action=\"dismiss\", note_id=N)".to_string());
-    sections.join("\n\n")
+    if !smart_notes.is_empty() {
+        let mut section = format!(
+            "{}\n\n{}",
+            if default_sections {
+                "## 🔔 Ready Smart Notes"
+            } else {
+                "## Smart Notes"
+            },
+            smart_notes.iter().map(&format_note).collect::<Vec<_>>().join("\n\n")
+        );
+        if let Some(footer) = footer(smart_total, smart_notes.len()) {
+            section.push_str("\n\n");
+            section.push_str(&footer);
+        }
+        sections.push(section);
+    }
+    let body = sections.join("\n\n");
+    let anchor_hint = if body.contains("↳ @msg ") {
+        "\n\n↳ @msg N marks the conversation tail when a note was written. To see what led to it: ctx_expand(start=N-x, end=N) (pick x for how far back to look)."
+    } else {
+        ""
+    };
+    format!(
+        "{body}{anchor_hint}\n\nTo dismiss a stale note: ctx_note(action=\"dismiss\", note_id=N)"
+    )
 }
 
 // The facade never panics on agent input; an absent or malformed id stays a typed tool error.
@@ -9507,7 +9612,7 @@ fn ctx_memory_schema() -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["write", "update", "archive", "merge"],
+                "enum": ["write", "update", "archive", "merge", "get"],
                 "description": "Operation to perform."
             },
             "category": {
@@ -9528,7 +9633,7 @@ fn ctx_memory_schema() -> Value {
                 "type": "array",
                 "maxItems": 100,
                 "items": { "type": "integer", "minimum": 1 },
-                "description": "Memory ids. For update provide exactly one. For archive provide one or more. For merge, the first id is kept and updated, and the remaining ids are superseded."
+                "description": "Memory ids. For update provide exactly one. For archive provide one or more. For merge, the first id is kept and updated, and the remaining ids are superseded. For get provide one to twenty ids."
             },
             "target_id": {
                 "type": "integer",
@@ -9594,7 +9699,8 @@ fn ctx_note_schema() -> Value {
             "content": { "type": "string", "maxLength": 65536, "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
             "note_id": { "type": "integer", "minimum": 1, "description": "Note id for update or dismiss." },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Maximum active notes to return." },
-            "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes." },
+            "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes in each section." },
+            "filter": { "type": "string", "enum": ["all", "active", "pending", "ready", "dismissed"], "description": "Optional read filter. Defaults to active session notes plus ready smart notes." },
             "surface_condition": { "type": "string", "maxLength": 4096, "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." }
         }
     })
@@ -11512,6 +11618,123 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluator_verdict_transitions_a_module_note_to_ready_and_visible() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/repo", "token"));
+        let note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "/repo",
+                session_id: Some("session"),
+                content: "surface after evaluation",
+                surface_condition: Some("when ready"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 1,
+            })
+            .unwrap();
+
+        let evaluated = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "note.evaluate",
+                "session_id": "session",
+                "note_id": note.id,
+                "source_revision": note.status_version,
+                "verdict": true
+            }),
+        )
+        .await;
+        assert_eq!(evaluated["status"], "ready");
+        let output = tool_text(
+            call_facade(&handler, "ctx_note", json!({"action": "read"})).await,
+        );
+        assert!(output.contains("surface after evaluation"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_facade_reads_a_preexisting_seeded_ts_note_after_authority_flip() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/repo", "token"));
+        store
+            .seed_authority_row(
+                "context-db",
+                "notes",
+                42,
+                &json!({
+                    "type": "smart",
+                    "project_path": "/repo",
+                    "session_id": "session",
+                    "content": "seeded before Rust mode",
+                    "status": "ready",
+                    "surface_condition": "condition",
+                    "ready_reason": "condition met",
+                    "status_version": 2,
+                    "created_at": 1,
+                    "updated_at": 2
+                }),
+            )
+            .unwrap();
+
+        let output = tool_text(
+            call_facade(&handler, "ctx_note", json!({"action": "read"})).await,
+        );
+        assert!(output.contains("## 🔔 Ready Smart Notes"));
+        assert!(output.contains("seeded before Rust mode"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_facade_pages_ready_notes_beyond_one_hundred_with_shared_offset_semantics() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/repo", "token"));
+        for index in 0..105 {
+            let note = store
+                .insert_project_note(NoteWriteInput {
+                    project_path: "/repo",
+                    session_id: Some("session"),
+                    content: &format!("ready note {index}"),
+                    surface_condition: Some("condition"),
+                    anchor_block_id: None,
+                    anchor_ordinal: None,
+                    now_ms: index,
+                })
+                .unwrap();
+            store
+                .write_note_evaluation(NoteEvaluationInput {
+                    project_path: "/repo",
+                    note_id: note.id,
+                    source_revision: note.status_version,
+                    verdict: true,
+                    compiled_check: None,
+                    manifest_json: None,
+                    check_hash: None,
+                    next_due_at: None,
+                    now_ms: index,
+                })
+                .unwrap();
+        }
+        let page = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "read", "filter": "ready", "limit": 5, "offset": 100}),
+            )
+            .await,
+        );
+        assert!(page.contains("ready note 4"));
+        assert!(page.contains("ready note 0"));
+        assert!(!page.contains("ready note 104"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn emergency_absent_shape_pending_suppresses_historian_fire() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
@@ -11910,6 +12133,75 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn authority_complete_uses_the_module_seed_digest_before_ack() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let begin = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "authority.prepare",
+                "phase": "begin",
+                "context_store_uuid": "store-uuid",
+                "project": "/repo",
+                "domain": "memories"
+            }),
+        )
+        .await;
+        let generation = begin["authority"]["generation"].as_u64().unwrap();
+        let _ = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "authority.seed",
+                "context_store_uuid": "store-uuid",
+                "project": "/repo",
+                "domain": "memories",
+                "rows": [{
+                    "source_row_id": 1,
+                    "snapshot": {
+                        "id": 1,
+                        "project_path": "/repo",
+                        "category": "CONSTRAINTS",
+                        "content": "seeded",
+                        "normalized_hash": "hash"
+                    }
+                }]
+            }),
+        )
+        .await;
+        let actual = store
+            .authority_seed_checksum("store-uuid", "/repo", "memories")
+            .unwrap();
+        let verified = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "authority.prepare",
+                "phase": "complete",
+                "context_store_uuid": "store-uuid",
+                "project": "/repo",
+                "domain": "memories",
+                "generation": generation,
+                "checksum_expected": actual
+            }),
+        )
+        .await;
+        assert_eq!(verified["authority"]["state"], "PREPARING");
+        assert_eq!(verified["authority"]["checksum_ok"], true);
+        let acked = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "authority.prepare",
+                "phase": "ack",
+                "context_store_uuid": "store-uuid",
+                "project": "/repo",
+                "domain": "memories",
+                "generation": generation
+            }),
+        )
+        .await;
+        assert_eq!(acked["authority"]["state"], "MODULE");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn facade_never_panics_on_malformed_memory_arguments() {
         let producer = Arc::new(ProducerState::default());
         let resolver = FakeSessionResolver::with(&[(
@@ -11956,6 +12248,33 @@ mod tests {
         )
         .await;
         assert!(tool_is_error(oversized));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_facade_routes_all_authority_actions_into_store_and_changefeed() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/repo", "token"));
+
+        for arguments in [
+            json!({"action": "write", "category": "CONSTRAINTS", "content": "first"}),
+            json!({"action": "update", "ids": [1], "content": "first updated"}),
+            json!({"action": "write", "category": "CONSTRAINTS", "content": "second"}),
+            json!({"action": "merge", "ids": [1, 2], "content": "merged"}),
+            json!({"action": "get", "ids": [1]}),
+            json!({"action": "archive", "ids": [1]}),
+        ] {
+            let outcome = call_facade(&handler, "ctx_memory", arguments.clone()).await;
+            assert!(!tool_is_error(outcome), "action failed: {arguments}");
+        }
+        let memory = store.get_memory_full(1).unwrap().unwrap();
+        assert_eq!(memory.content, "merged");
+        assert_eq!(memory.status, "archived");
+        assert!(store.get_memory_full(2).unwrap().unwrap().superseded_by_memory_id.is_some());
+        let feed = store.pull_changefeed("memories", 0, 100).unwrap();
+        assert!(feed.rows.len() >= 6, "every mutation must append changefeed state");
     }
 
     #[tokio::test(flavor = "current_thread")]

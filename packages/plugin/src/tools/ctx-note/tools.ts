@@ -1,4 +1,5 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
+import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import { getLastIndexedOrdinal } from "../../features/magic-context/message-index";
 import {
     addNote,
@@ -105,13 +106,12 @@ function buildReadSections(args: {
             sections.push(`## Session Notes\n\n${lines}${footer ? `\n\n${footer}` : ""}`);
         }
 
-        // Ready smart notes are few by construction (condition-gated) and
-        // time-sensitive — always show all of them, unpaged.
         if (readySmartNotes.length > 0) {
+            const { page, footer } = paginateNewestFirst(readySmartNotes, args.limit, args.offset);
             sections.push(
-                `## 🔔 Ready Smart Notes\n\n${readySmartNotes
+                `## 🔔 Ready Smart Notes\n\n${page
                     .map((note) => formatNoteLine(note))
-                    .join("\n\n")}`,
+                    .join("\n\n")}${footer ? `\n\n${footer}` : ""}`,
             );
         }
 
@@ -249,11 +249,38 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             // runs `opencode -s <id>` from outside the project.
             const projectIdentity = deps.resolveProjectPath?.(toolContext.directory);
 
-            const rustNote = deps.rustToolBackends?.note;
-            if (rustNote) {
+            const marker = projectIdentity
+                ? getAuthorityManagedMarker(deps.db, projectIdentity)
+                : null;
+            let notesAuthority: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
+            if (projectIdentity && deps.rustToolBackends?.authorityState) {
+                try {
+                    notesAuthority = await deps.rustToolBackends.authorityState({
+                        projectPath: projectIdentity,
+                        domain: "notes",
+                    });
+                } catch (error) {
+                    if (marker) {
+                        return `Error: Rust notes authority is unavailable. ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                }
+            }
+            if (notesAuthority === "MODULE") {
+                const rustNote = deps.rustToolBackends?.note;
+                if (!rustNote || !projectIdentity) {
+                    return "Error: Rust notes authority is active, but this module transport does not support ctx_note.";
+                }
+                if (
+                    action === "write" &&
+                    args.surface_condition?.trim() &&
+                    deps.rustToolBackends?.noteEvaluationAvailable?.() !== true
+                ) {
+                    return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
+                }
                 const request: RustNoteToolRequest = {
                     sessionId,
                     projectRoot: toolContext.directory,
+                    projectPath: projectIdentity,
                     action,
                     content: args.content,
                     surfaceCondition: args.surface_condition,
@@ -269,6 +296,9 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 } catch (error) {
                     return `Error: Rust module ctx_note failed. ${error instanceof Error ? error.message : String(error)}`;
                 }
+            }
+            if (marker || notesAuthority === "PREPARING" || notesAuthority === "DRAINING") {
+                return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
             }
 
             if (action === "write") {

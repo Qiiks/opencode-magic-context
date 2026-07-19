@@ -802,6 +802,8 @@ export interface ModuleStateSyncClient {
             | "todo_state.set"
             | "agent_drops.append"
             | "ctx_note"
+            | "ctx_memory"
+            | "note.evaluate"
             | "transform.ack"
             | "transform.nack";
         body: unknown;

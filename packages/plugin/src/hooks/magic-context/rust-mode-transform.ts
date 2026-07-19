@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import {
     type AuthorityModuleClient,
     type AuthorityStatus,
+    checksumAuthoritySeedRows,
     drainAuthority,
     ensureContextStoreUuid,
     prepareAuthority,
     pullMemoryMirrorOnce,
+    reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
@@ -322,6 +324,37 @@ function checksumSeedRows(rows: readonly Record<string, unknown>[]): string {
         .digest("hex");
 }
 
+function authoritySeedRows(
+    db: TransformDeps["db"],
+    projectPath: string,
+    domain: "memories" | "notes",
+): Record<string, unknown>[] {
+    const snapshots =
+        domain === "memories"
+            ? db
+                  .prepare("SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC")
+                  .all(projectPath)
+            : db
+                  .prepare(
+                      `SELECT n.*
+                         FROM notes n
+                        WHERE n.project_path = ?
+                           OR (n.project_path IS NULL AND EXISTS (
+                               SELECT 1 FROM session_projects sp
+                                WHERE sp.session_id = n.session_id AND sp.project_path = ?
+                           ))
+                        ORDER BY n.id ASC`,
+                  )
+                  .all(projectPath, projectPath);
+    return snapshots.filter(isRecord).map((snapshot) => ({
+        source_row_id: snapshot.id,
+        snapshot:
+            domain === "notes" && snapshot.project_path == null
+                ? { ...snapshot, project_path: projectPath }
+                : snapshot,
+    }));
+}
+
 async function prepareRustMemoryAuthority(args: {
     db: TransformDeps["db"];
     module: RustModeModuleClient;
@@ -342,73 +375,87 @@ async function prepareRustMemoryAuthority(args: {
         );
     }
 
+    const authorityModule: AuthorityModuleClient = {
+        authorityStatus: module.authorityStatus.bind(module),
+        authorityPrepare: module.authorityPrepare.bind(module),
+        authoritySeed: module.authoritySeed.bind(module),
+        authorityDrain: module.authorityDrain?.bind(module),
+        mirrorPull: module.mirrorPull?.bind(module),
+    };
     const contextStoreUuid = ensureContextStoreUuid(db);
-    const current = await module.authorityStatus({
-        context_store_uuid: contextStoreUuid,
-        project: projectPath,
-        domain: "memories",
-    });
-    if (current.authority?.state === "DRAINING") {
-        const authorityModule: AuthorityModuleClient = {
-            authorityStatus: module.authorityStatus,
-            authorityPrepare: module.authorityPrepare,
-            authoritySeed: module.authoritySeed,
-            authorityDrain: module.authorityDrain,
-            mirrorPull:
-                module.mirrorPull ??
-                (async () => {
-                    throw new Error("mirror.pull unavailable during drain");
-                }),
-        };
+    const domains = ["memories", "notes"] as const;
+    const statuses = new Map<
+        (typeof domains)[number],
+        Awaited<ReturnType<NonNullable<RustModeModuleClient["authorityStatus"]>>>["authority"]
+    >();
+    for (const domain of domains) {
+        const current = await module.authorityStatus({
+            context_store_uuid: contextStoreUuid,
+            project: projectPath,
+            domain,
+        });
+        statuses.set(domain, current.authority);
+    }
+
+    let resumedDrain = false;
+    for (const domain of domains) {
+        const current = statuses.get(domain);
+        if (current?.state !== "DRAINING") continue;
+        resumedDrain = true;
         await drainAuthority({
             db,
             projectPath,
-            domain: "memories",
+            domain,
             module: authorityModule,
             checksum: () =>
                 checksumSeedRows(
                     db
-                        .prepare("SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC")
+                        .prepare(
+                            `SELECT * FROM ${domain === "memories" ? "memories" : "notes"} WHERE project_path = ? ORDER BY id ASC`,
+                        )
                         .all(projectPath)
                         .filter(isRecord),
                 ),
         });
+        statuses.set(domain, null);
+    }
+    if (resumedDrain) {
         state.memoryAuthorityReady = true;
         return;
-    }
-    if (current.authority?.state === "MODULE") {
-        state.memoryAuthorityReady = true;
-        return;
-    }
-    if (
-        current.authority &&
-        current.authority.state !== "TS" &&
-        current.authority.state !== "PREPARING"
-    ) {
-        throw new Error(`memory authority cannot prepare from ${current.authority.state}`);
     }
 
-    const seedRows = db
-        .prepare("SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC")
-        .all(projectPath)
-        .filter(isRecord);
-    const authorityModule: AuthorityModuleClient = {
-        authorityStatus: module.authorityStatus,
-        authorityPrepare: module.authorityPrepare,
-        authoritySeed: module.authoritySeed,
-    };
-    await prepareAuthority({
-        db,
-        projectPath,
-        domains: ["memories"],
-        module: authorityModule,
-        seedPages: async () =>
-            seedRows.map((snapshot) => ({
-                source_row_id: snapshot.id,
-                snapshot,
-            })),
-        checksum: () => checksumSeedRows(seedRows),
-    });
+    for (const domain of domains) {
+        const current = statuses.get(domain);
+        if (current?.state !== "PREPARING") continue;
+        await module.authorityPrepare({
+            method: "authority.prepare",
+            phase: "abort",
+            context_store_uuid: contextStoreUuid,
+            project: projectPath,
+            domain,
+            generation: current.generation,
+        });
+        statuses.set(domain, null);
+    }
+    const preparing = domains.filter((domain) => statuses.get(domain)?.state !== "MODULE");
+    for (const domain of preparing) {
+        const stateName = statuses.get(domain)?.state;
+        if (stateName && stateName !== "TS") {
+            throw new Error(`${domain} authority cannot prepare from ${stateName}`);
+        }
+    }
+    if (preparing.length > 0) {
+        await prepareAuthority({
+            db,
+            projectPath,
+            domains: preparing,
+            module: authorityModule,
+            seedPages: async (domain) => authoritySeedRows(db, projectPath, domain),
+            checksum: (_domain, rows) => checksumAuthoritySeedRows(rows),
+        });
+    }
+
+    await reconcileAuthorityProject({ db, projectPath, module: authorityModule });
     state.memoryAuthorityReady = true;
 }
 
@@ -815,7 +862,9 @@ export function createRustModeTransform(
                     typeof response.served_from === "string" ? response.served_from : "unknown";
             }
             const deliveryPassIds = noteDeliveryPassIds(response);
-            const sendNoteDeliveryDisposition = async (method: "transform.ack" | "transform.nack") => {
+            const sendNoteDeliveryDisposition = async (
+                method: "transform.ack" | "transform.nack",
+            ) => {
                 for (const transformPassId of deliveryPassIds) {
                     await callModule({
                         sessionId,

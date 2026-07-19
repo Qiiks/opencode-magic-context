@@ -5,6 +5,11 @@ import { createCtxNoteTools } from "./tools";
 function createTestDb(): Database {
     const db = new Database(":memory:");
     db.exec(`
+    CREATE TABLE authority_managed (
+      project_path TEXT PRIMARY KEY,
+      context_store_uuid TEXT NOT NULL,
+      marked_at INTEGER NOT NULL
+    );
     CREATE TABLE notes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       type TEXT NOT NULL DEFAULT 'session',
@@ -59,6 +64,73 @@ describe("createCtxNoteTools", () => {
         expect(readResult).toContain("## Session Notes");
         expect(readResult).toContain("#1");
         expect(readResult).toContain("Remember the user prefers build on integrate.");
+    });
+
+    it("routes notes only when the notes domain reports module authority", async () => {
+        const routed: string[] = [];
+        tools = createCtxNoteTools({
+            db,
+            resolveProjectPath: () => "git:project-a",
+            rustToolBackends: {
+                authorityState: async ({ domain }) => (domain === "notes" ? "MODULE" : "TS"),
+                note: async (request) => {
+                    routed.push(request.action);
+                    return { content: [{ type: "text", text: "module note result" }] };
+                },
+                noteEvaluationAvailable: () => true,
+            },
+        });
+        const result = await tools.ctx_note.execute(
+            { action: "write", content: "module owned note" },
+            toolContext(),
+        );
+        expect(result).toBe("module note result");
+        expect(routed).toEqual(["write"]);
+        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
+    });
+
+    it("keeps TS note handling when the notes domain reports TS authority", async () => {
+        let routed = false;
+        tools = createCtxNoteTools({
+            db,
+            resolveProjectPath: () => "git:project-a",
+            rustToolBackends: {
+                authorityState: async () => "TS",
+                note: async () => {
+                    routed = true;
+                    return "unexpected";
+                },
+            },
+        });
+        const result = await tools.ctx_note.execute(
+            { action: "write", content: "TS owned note" },
+            toolContext(),
+        );
+        expect(result).toContain("Saved session note");
+        expect(routed).toBe(false);
+    });
+
+    it("rejects module smart-note writes when evaluation is unavailable", async () => {
+        tools = createCtxNoteTools({
+            db,
+            dreamerEnabled: true,
+            resolveProjectPath: () => "git:project-a",
+            rustToolBackends: {
+                authorityState: async () => "MODULE",
+                note: async () => "must not be called",
+                noteEvaluationAvailable: () => false,
+            },
+        });
+        const result = await tools.ctx_note.execute(
+            {
+                action: "write",
+                content: "wait for release",
+                surface_condition: "when release exists",
+            },
+            toolContext(),
+        );
+        expect(result).toContain("evaluation is unavailable");
+        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
     });
 
     it("defaults to read (not write) when content is an empty string and no action is given", async () => {
@@ -304,5 +376,24 @@ describe("createCtxNoteTools", () => {
         expect(small).toContain("note number 28");
         expect(small).not.toContain("note number 27\n");
         expect(small).toContain("Showing 3 of 30");
+    });
+
+    it("pages ready smart notes with the same default offset contract", async () => {
+        const insert = db.prepare(
+            "INSERT INTO notes(type, status, content, project_path, surface_condition, created_at, updated_at, ready_at) VALUES ('smart', 'ready', ?, 'git:project-a', 'condition', ?, ?, ?)",
+        );
+        for (let i = 1; i <= 105; i += 1) {
+            insert.run(`ready note ${i}`, i, i, i);
+        }
+
+        const page = await tools.ctx_note.execute(
+            { action: "read", limit: 5, offset: 100 },
+            toolContext(),
+        );
+        expect(page).toContain("## 🔔 Ready Smart Notes");
+        expect(page).toContain("ready note 5");
+        expect(page).toContain("ready note 1");
+        expect(page).not.toContain("ready note 6\n");
+        expect(page).not.toContain("older: ctx_note");
     });
 });
