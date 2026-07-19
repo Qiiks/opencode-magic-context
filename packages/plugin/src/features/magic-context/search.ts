@@ -203,6 +203,41 @@ function normalizeLimit(limit?: number): number {
     return Math.max(1, Math.floor(limit));
 }
 
+// ID-shaped short-circuit: when the whole trimmed query is one memory id (with
+// or without a leading `#`) or a comma/space-separated list of up to
+// `ID_SHAPED_QUERY_MAX_TOKENS` such tokens, we treat it as a direct id lookup.
+// Anything else — `"fix bug 1234"`, a quoted sentence containing a number — is
+// left alone so the normal lexical+semantic lanes still run. Reused by
+// ctx_search and any future consumer that needs to decide whether a query
+// should bypass the normal search pipeline.
+export const ID_SHAPED_QUERY_MAX_TOKENS = 5;
+// Matches one ID token: an optional leading `#` followed by one or more digits.
+// The `+` requires at least one digit, so a bare `#` does not match.
+const ID_SHAPED_TOKEN = /^#?\d+$/;
+
+export function parseIdShapedQuery(query: string): number[] | null {
+    const trimmed = query.trim();
+    if (trimmed.length === 0) {
+        return null;
+    }
+    const tokens = trimmed.split(/[\s,]+/).filter((token) => token.length > 0);
+    if (tokens.length === 0 || tokens.length > ID_SHAPED_QUERY_MAX_TOKENS) {
+        return null;
+    }
+    const ids: number[] = [];
+    for (const token of tokens) {
+        if (!ID_SHAPED_TOKEN.test(token)) {
+            return null;
+        }
+        const parsed = Number.parseInt(token.replace(/^#/, ""), 10);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            return null;
+        }
+        ids.push(parsed);
+    }
+    return ids;
+}
+
 function normalizeCosineScore(score: number): number {
     if (!Number.isFinite(score)) {
         return 0;
@@ -1386,6 +1421,81 @@ function resolveSources(sources: SearchSource[] | undefined): Set<SearchSource> 
         }
     }
     return set;
+}
+
+/** Turn memories already filtered through the visibility predicate into
+ *  MemorySearchResult rows. Used by the ctx_search ID short-circuit so the
+ *  direct-by-id path can return the same shape the normal search lanes emit
+ *  (and reuse formatResult without a second code path). */
+function memoriesToIdLookupResults(args: {
+    memories: readonly Memory[];
+    limit: number;
+    sourceNameByMemoryId?: ReadonlyMap<number, string>;
+}): MemorySearchResult[] {
+    // Preserve the caller's order so a `parseIdShapedQuery` result like
+    // `["#12", "34"]` renders hits in the same order the user typed them.
+    const ordered = args.memories.slice(0, args.limit);
+    return ordered.map((memory, rank) => ({
+        source: "memory",
+        content: previewText(memory.content),
+        score: 1 - rank * 0.01,
+        memoryId: memory.id,
+        category: memory.category,
+        matchType: "fts" as const,
+        sourceName: args.sourceNameByMemoryId?.get(memory.id),
+    }));
+}
+
+/** Resolve a parsed id list through the session's visibility scope. Returns
+ *  MemorySearchResult rows in the caller's id order, or `null` when nothing
+ *  resolved (signals the caller to fall through to the normal search lanes). */
+export function resolveMemoriesByIdsForSearch(args: {
+    db: Database;
+    projectPath: string;
+    ids: readonly number[];
+    limit: number;
+    /** Optional filter mirroring the m[0] hard-filter — already-rendered
+     *  memories are skipped so the agent doesn't see the same content twice. */
+    visibleMemoryIds?: Set<number> | null;
+}): MemorySearchResult[] | null {
+    if (args.ids.length === 0) {
+        return null;
+    }
+    const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
+    const fetched = workspace.isWorkspaced
+        ? getMemoriesByProjects(
+              args.db,
+              workspace.expandedIdentities,
+              ["active", "permanent", "archived"],
+              Date.now(),
+              workspace.ownIdentities,
+              workspace.shareCategories,
+          )
+        : getMemoriesByProject(args.db, args.projectPath, ["active", "permanent", "archived"]);
+    if (fetched.length === 0) {
+        return null;
+    }
+    const memoriesById = new Map(fetched.map((memory) => [memory.id, memory]));
+    const ordered: Memory[] = [];
+    for (const id of args.ids) {
+        const memory = memoriesById.get(id);
+        if (!memory) continue;
+        if (args.visibleMemoryIds?.has(id)) continue;
+        ordered.push(memory);
+        if (ordered.length >= args.limit) break;
+    }
+    if (ordered.length === 0) {
+        return null;
+    }
+    return memoriesToIdLookupResults({
+        memories: ordered,
+        limit: args.limit,
+        sourceNameByMemoryId: sourceNamesForSearchMemories({
+            memories: ordered,
+            projectPath: args.projectPath,
+            workspace,
+        }),
+    });
 }
 
 export async function unifiedSearch(

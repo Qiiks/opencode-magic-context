@@ -22,6 +22,8 @@ import {
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
+	parseIdShapedQuery,
+	resolveMemoriesByIdsForSearch,
 	type UnifiedSearchResult,
 	unifiedSearch,
 } from "@magic-context/core/features/magic-context/search";
@@ -238,6 +240,33 @@ export function createCtxSearchTool(
 
 			// Hard-filter memories already rendered in <session-history>.
 			const visibleMemoryIds = getVisibleMemoryIds(deps.db, sessionId);
+
+			// ID-shaped short-circuit (parity with OpenCode ctx_search): when the
+			// whole query is one or more memory ids, bypass the lexical+semantic
+			// lanes and look the ids up directly. If nothing resolves we fall
+			// through to the normal lanes so a numeric query with no matching
+			// memory still searches text.
+			const idShape = parseIdShapedQuery(query);
+			if (idShape && memoryEnabled) {
+				const idResults = resolveMemoriesByIdsForSearch({
+					db: deps.db,
+					projectPath: projectIdentity,
+					ids: idShape,
+					limit: Math.max(normalizeLimit(params.limit), idShape.length),
+					visibleMemoryIds,
+				});
+				if (idResults !== null) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: formatSearchResults(query, idResults, sessionId),
+							},
+						],
+						details: undefined,
+					};
+				}
+			}
 
 			const results = await unifiedSearch(
 				deps.db,

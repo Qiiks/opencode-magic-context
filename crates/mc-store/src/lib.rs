@@ -5097,6 +5097,62 @@ impl McStore {
         Ok(row)
     }
 
+    /// Load multiple memory rows by id through the same workspace-visibility predicate the
+    /// m0 render path uses. Missing ids are silently absent from the result; rows that the
+    /// caller's project identity cannot see (own project always visible; foreign member
+    /// memory only when its category is in the workspace's share list) are filtered out
+    /// here. Returns a hashmap keyed by memory id, which lets the tool layer preserve the
+    /// caller's id order and emit a per-id not-visible report without exposing a foreign
+    /// existence oracle.
+    pub fn get_visible_memories_by_ids(
+        &self,
+        project_path: &str,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, StoredMemoryFull>, McStoreError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let membership = self.resolve_workspace_membership(project_path)?;
+        let (visibility, visibility_binds): (String, Vec<rusqlite::types::Value>) =
+            match &membership {
+                Some(m) => workspace_union_memory_visibility_filter(m),
+                None => (
+                    "project_path = ?".to_string(),
+                    vec![rusqlite::types::Value::from(project_path.to_string())],
+                ),
+            };
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let id_binds: Vec<rusqlite::types::Value> =
+            ids.iter().map(|id| rusqlite::types::Value::from(*id)).collect();
+        // The SQL placeholders appear in `id IN (?,…)` first, then the visibility
+        // expression, so positional binds follow the same order.
+        let mut binds = id_binds;
+        binds.extend(visibility_binds);
+        let sql = format!(
+            "SELECT id, project_path, category, content, normalized_hash, importance, scope,
+                    shareable, source_session_id, source_type, seen_count, retrieval_count,
+                    first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
+                    status, expires_at, verification_status, verified_at, classified_at,
+                    superseded_by_memory_id, merged_from, metadata_json
+               FROM mc_memories
+              WHERE id IN ({placeholders})
+                AND ({visibility})"
+        );
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let mapped = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                    let memory = stored_memory_full_from_row(r)?;
+                    Ok((memory.id, memory))
+                })?
+                .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+            Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
     /// Insert a memory row unless an existing row already matches the project, category,
     /// and normalized content hash. Duplicate hits update only bookkeeping fields such as
     /// `seen_count` and timestamps, and skip the mutation log because the rendered content

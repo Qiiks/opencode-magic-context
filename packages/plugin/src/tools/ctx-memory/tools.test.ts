@@ -1608,4 +1608,108 @@ describe("createCtxMemoryTools", () => {
             expect(getUnclassifiedMemoryIds(db, [memory.id])).toEqual([memory.id]); // re-scorable
         });
     });
+
+    describe("#given get action", () => {
+        it("returns an own-project memory by id", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "Always run bun before shipping.",
+            });
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [memory.id] },
+                toolContext(),
+            );
+            expect(result).toContain(`Found 1 active memory`);
+            expect(result).toContain(String(memory.id));
+            expect(result).toContain("Always run bun before shipping.");
+        });
+
+        it("labels archived rows with their status instead of hiding them", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "KNOWN_ISSUES",
+                content: "Retired issue entry the user just referenced.",
+            });
+            db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(memory.id);
+
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [memory.id] },
+                toolContext(),
+            );
+            expect(result).toContain(String(memory.id));
+            expect(result).toContain("archived");
+            expect(result).toContain("Retired issue entry the user just referenced.");
+        });
+
+        it("surfaces a foreign shared-category memory (workspace visibility)", async () => {
+            db.exec(`
+                INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+                VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
+                INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
+                       (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
+            `);
+            const foreign = insertMemory(db, {
+                projectPath: "/repo/foreign",
+                category: "CONSTRAINTS",
+                content: "Foreign shared constraint.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [foreign.id] },
+                toolContext(),
+            );
+            expect(result).toContain(String(foreign.id));
+            expect(result).toContain("Foreign shared constraint.");
+        });
+
+        it("reports a foreign non-shared-category memory as not visible (no existence oracle)", async () => {
+            db.exec(`
+                INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+                VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
+                INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
+                       (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
+            `);
+            const foreign = insertMemory(db, {
+                projectPath: "/repo/foreign",
+                category: "ARCHITECTURE",
+                content: "Foreign architecture hidden by the share policy.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [foreign.id] },
+                toolContext(),
+            );
+            // The id must be reported as not visible, NOT as a normal hit.
+            expect(result).toContain(
+                `id ${foreign.id}: not found or not visible from this project`,
+            );
+            expect(result).not.toContain("Foreign architecture hidden by the share policy.");
+        });
+
+        it("rejects >20 ids with a clear error and emits nothing", async () => {
+            const ids = Array.from({ length: 21 }, (_, i) => i + 1);
+            const result = await tools.ctx_memory.execute({ action: "get", ids }, toolContext());
+            expect(result).toContain("at most 20");
+        });
+
+        it("returns a per-id report mixing hits and misses in call order", async () => {
+            const own = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "Own constraint present.",
+            });
+            const missing = 999_999;
+
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [own.id, missing] },
+                toolContext(),
+            );
+            expect(result).toContain(String(own.id));
+            expect(result).toContain("Own constraint present.");
+            expect(result).toContain(`id ${missing}: not found or not visible from this project`);
+        });
+    });
 });

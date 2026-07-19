@@ -8,6 +8,7 @@ Actions:
 - update: rewrite one memory whose fact changed (ids: [one], content).
 - archive: retire wrong or obsolete memories (ids: [one or more], optional reason).
 - merge: collapse duplicates into one memory (ids: [two or more], content).
+- get: fetch memories by id (ids: [1-20]); readable in every status. \`list\` remains dreamer-only.
 
 Example: ctx_memory(action="write", category="CONSTRAINTS", content="Pi stores sessions as JSONL under ~/.pi/agent/sessions/, not SQLite")`;
 export const DEFAULT_SEARCH_LIMIT = 10;

@@ -1,7 +1,7 @@
 export const CTX_SEARCH_TOOL_NAME = "ctx_search";
 export const CTX_SEARCH_DESCRIPTION = `Your long-term recall for this project — search everything that ever happened here, not just what's currently visible.
 
-Reach for it when something feels familiar but isn't in view: "did we solve this before?", "what did we decide about X?", "when did this break?", "where does Y live?". Results only contain things you CANNOT currently see — memories already shown in <project-memory> and the live conversation tail are filtered out.
+Reach for it when something feels familiar but isn't in view: "did we solve this before?", "what did we decide about X?", "when did this break?", "where does Y live?". Results only contain things you CANNOT currently see — memories already shown in <project-memory> and the live conversation tail are filtered out. A query that is just one or more memory ids (e.g. \`#7234\` or \`12, 34\`) bypasses text search and resolves those ids directly.
 
 Sources (omit for a broad search across all):
 - memory: curated cross-session project knowledge — rules, constraints, conventions.
