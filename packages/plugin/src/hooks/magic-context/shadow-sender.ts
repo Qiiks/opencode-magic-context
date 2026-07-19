@@ -1615,7 +1615,14 @@ export class SubcShadowTransport implements ShadowTransport {
             | "mirror.pull",
         body: Record<string, unknown>,
     ): Promise<Record<string, unknown>> {
-        const response = (await this.call({ sessionId, projectRoot, method, body })) as unknown;
+        // The transport serializes the body verbatim; the module dispatches on the
+        // body's own method field, so it must always be present and canonical here.
+        const response = (await this.call({
+            sessionId,
+            projectRoot,
+            method,
+            body: { ...body, method, v: 1 },
+        })) as unknown;
         if (isRecord(response) && isRecord(response.result)) return response.result;
         if (isRecord(response)) return response;
         throw new Error(`module returned an invalid ${method} response`);
