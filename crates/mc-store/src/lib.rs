@@ -6785,6 +6785,25 @@ impl McStore {
     /// Insert an active memory with an explicit `expires_at` (ms) for `project_path` —
     /// used to test the frozen expiry cutoff (a memory live under one cutoff, expired
     /// under a later one).
+    /// Mark a seeded memory shareable with a workspace-eligible scope. Foreign
+    /// visibility is fail-closed (rows default to unshareable until classification),
+    /// so cross-project read tests must opt rows in explicitly.
+    pub fn set_memory_sharing_for_test(
+        &self,
+        id: i64,
+        scope: &str,
+        shareable: bool,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "UPDATE mc_memories SET scope = ?2, shareable = ?3 WHERE id = ?1",
+                params![id, scope, shareable as i64],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     pub fn seed_expiring_memory(
         &self,
         id: i64,

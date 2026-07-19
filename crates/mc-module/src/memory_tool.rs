@@ -871,6 +871,11 @@ mod tests {
         let foreign = "git:foreign";
         workspace(&store, own, foreign);
         let foreign_shared = insert(&store, foreign, "CONSTRAINTS", "shared", 1);
+        // Foreign visibility is fail-closed: a workspace neighbor's memory is readable
+        // only once classification marks it shareable with a workspace-eligible scope.
+        store
+            .set_memory_sharing_for_test(foreign_shared, "project", true)
+            .unwrap();
 
         let fetched = get_memories(&store, own, &[foreign_shared]).unwrap();
         assert_eq!(fetched.len(), 1);
