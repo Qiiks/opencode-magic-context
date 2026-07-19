@@ -857,6 +857,19 @@ const MIGRATIONS: &[Migration] = &[
     ",
     },
     Migration {
+        version: 24,
+        // Zero-target ctx_reduce commands must still record a ledger row for idempotency
+        // (a retry of the same command_id must dedupe), but they never produce pending_agent_drops
+        // rows. Without a terminal disposition those rows sit forever with first_applied_at_ms=NULL,
+        // making telemetry lie about pending counts. The 'no_targets' disposition marks them as
+        // resolved at insert time so they are excluded from "pending" interpretations.
+        statements: "
+        ALTER TABLE mc_reduce_command_ledger
+            ADD COLUMN disposition TEXT
+            CHECK (disposition IS NULL OR disposition IN ('no_targets'));
+        ",
+    },
+    Migration {
         version: 23,
         // Authority and feed rows are storage-plane state. The source key lets a seed be
         // retried after a crash without allocating a second module row for one context row.
@@ -1626,10 +1639,13 @@ pub struct PendingAgentDrop {
     pub command_first_applied_at_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendOutcome {
     pub queued: u64,
     pub duplicate: bool,
+    /// Terminal disposition for the ledger row, set when the command resolved zero targets.
+    /// NULL means the command produced pending drops (normal path).
+    pub disposition: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3029,18 +3045,24 @@ impl McStore {
             None,
             target_ids,
             queued_at_ms,
+            false,
         )?;
         Ok(outcome.queued as usize)
     }
 
     /// Append ctx_reduce drops and, when supplied, durably record the command that requested
     /// them. A repeated command is acknowledged without touching pending queue rows.
+    ///
+    /// When `zero_targets` is true the ledger row is still recorded (idempotency correctness
+    /// requires it — a retry of the same command_id must still dedupe), but the disposition
+    /// is set to "no_targets" so the row is not counted as pending.
     pub fn append_pending_agent_drops_with_command(
         &self,
         session_id: &str,
         command_id: Option<&str>,
         target_ids: &[String],
         queued_at_ms: i64,
+        zero_targets: bool,
     ) -> Result<AppendOutcome, McStoreError> {
         let outcome = self.inner.with_conn_fenced(|tx| {
             if let Some(command_id) = command_id {
@@ -3054,6 +3076,7 @@ impl McStore {
                     return Ok(AppendOutcome {
                         queued: 0,
                         duplicate: true,
+                        disposition: None,
                     });
                 }
             }
@@ -3075,9 +3098,29 @@ impl McStore {
             // Command ids are lineage-durable. Pruning would make an old outcome-unknown
             // retry destructive again, so rows leave only with real lineage teardown.
 
+            // When the caller resolved zero targets, mark the ledger row as terminal so it
+            // is not counted among pending commands. The row still exists for idempotency.
+            if zero_targets {
+                if let Some(command_id) = command_id {
+                    tx.execute(
+                        "UPDATE mc_reduce_command_ledger
+                         SET disposition = 'no_targets'
+                         WHERE session_id = ?1
+                           AND command_id = ?2
+                           AND disposition IS NULL",
+                        params![session_id, command_id],
+                    )?;
+                }
+            }
+
             Ok(AppendOutcome {
                 queued,
                 duplicate: false,
+                disposition: if zero_targets {
+                    Some("no_targets".to_string())
+                } else {
+                    None
+                },
             })
         })?;
         Ok(outcome)
@@ -8464,25 +8507,27 @@ mod tests {
         let target_ids = vec!["a#0".to_string()];
 
         let first = store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1, false)
             .unwrap();
         assert_eq!(
             first,
             AppendOutcome {
                 queued: 1,
                 duplicate: false,
+                disposition: None,
             }
         );
         let pending = store.load_pending_agent_drops("ses").unwrap();
 
         let retry = store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2)
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2, false)
             .unwrap();
         assert_eq!(
             retry,
             AppendOutcome {
                 queued: 0,
                 duplicate: true,
+                disposition: None,
             }
         );
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
@@ -8496,7 +8541,7 @@ mod tests {
         let store = McStore::open(&descriptor).unwrap();
         let targets = vec!["a#0".to_string(), "b#0".to_string()];
         store
-            .append_pending_agent_drops_with_command("ses", Some("batch-1"), &targets, 1)
+            .append_pending_agent_drops_with_command("ses", Some("batch-1"), &targets, 1, false)
             .unwrap();
         let pending = store.load_pending_agent_drops("ses").unwrap();
         let loaded = store.load("ses").unwrap();
@@ -8532,7 +8577,7 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let target_ids = vec!["a#0".to_string()];
         store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1, false)
             .unwrap();
         let pending = store.load_pending_agent_drops("ses").unwrap();
         store
@@ -8548,16 +8593,16 @@ mod tests {
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
         let retry = store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2)
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2, false)
             .unwrap();
         assert_eq!(
             retry,
             AppendOutcome {
                 queued: 0,
                 duplicate: true,
+                disposition: None,
             }
         );
-        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[test]
@@ -8566,7 +8611,7 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let target_ids = vec!["a#0".to_string()];
         store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1, false)
             .unwrap();
         let pending = store.load_pending_agent_drops("ses").unwrap();
         store
@@ -8581,16 +8626,16 @@ mod tests {
             .unwrap();
 
         let next = store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-2"), &target_ids, 2)
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-2"), &target_ids, 2, false)
             .unwrap();
         assert_eq!(
             next,
             AppendOutcome {
                 queued: 1,
                 duplicate: false,
+                disposition: None,
             }
         );
-        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
     }
 
     #[test]
@@ -8613,7 +8658,7 @@ mod tests {
         let target_ids = vec!["a#0".to_string()];
 
         assert!(store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1)
+            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1, false)
             .is_err());
         assert!(command_ledger_ids(&store, "ses").is_empty());
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
@@ -8627,11 +8672,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2)
+                .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2, false)
                 .unwrap(),
             AppendOutcome {
                 queued: 1,
                 duplicate: false,
+                disposition: None,
             }
         );
     }
@@ -8650,6 +8696,7 @@ mod tests {
                     Some(&command_id),
                     &target_ids,
                     queued_at_ms,
+                    false,
                 )
                 .unwrap();
             assert!(!outcome.duplicate);
@@ -8661,7 +8708,7 @@ mod tests {
         assert_eq!(command_ids.last().map(String::as_str), Some("command-512"));
 
         let oldest_retry = store
-            .append_pending_agent_drops_with_command("ses", Some("command-000"), &target_ids, 513)
+            .append_pending_agent_drops_with_command("ses", Some("command-000"), &target_ids, 513, false)
             .unwrap();
         assert!(oldest_retry.duplicate);
     }
@@ -8673,7 +8720,7 @@ mod tests {
         let session_id = "shadow:cleanup";
         let target_ids = vec!["a#0".to_string()];
         store
-            .append_pending_agent_drops_with_command(session_id, Some("tool-use-1"), &target_ids, 1)
+            .append_pending_agent_drops_with_command(session_id, Some("tool-use-1"), &target_ids, 1, false)
             .unwrap();
         store.reset_shadow_session(session_id, session_id).unwrap();
 
@@ -8684,13 +8731,70 @@ mod tests {
                     Some("tool-use-1"),
                     &target_ids,
                     2,
+                    false,
                 )
                 .unwrap(),
             AppendOutcome {
                 queued: 1,
                 duplicate: false,
+                disposition: None,
             }
         );
+    }
+
+    #[test]
+    fn zero_target_append_records_ledger_row_with_no_targets_disposition() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+        // Zero targets: the ledger row is recorded with disposition='no_targets'
+        // so a retry of the same command_id still dedupes.
+        let outcome = store
+            .append_pending_agent_drops_with_command("ses", Some("cmd-zero"), &[], 1, true)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            AppendOutcome {
+                queued: 0,
+                duplicate: false,
+                disposition: Some("no_targets".to_string()),
+            }
+        );
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        // Retry of the same command_id must still dedupe (idempotency).
+        let retry = store
+            .append_pending_agent_drops_with_command("ses", Some("cmd-zero"), &[], 2, true)
+            .unwrap();
+        assert_eq!(
+            retry,
+            AppendOutcome {
+                queued: 0,
+                duplicate: true,
+                disposition: None,
+            }
+        );
+
+        // A normal command with actual targets still queues pending drops and does not
+        // set any disposition — the no_targets path only applies when canonicalization
+        // resolved zero block_ids.
+        let normal = store
+            .append_pending_agent_drops_with_command("ses", Some("cmd-normal"), &["a#0".to_string()], 3, false)
+            .unwrap();
+        assert_eq!(
+            normal,
+            AppendOutcome {
+                queued: 1,
+                duplicate: false,
+                disposition: None,
+            }
+        );
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+
+        // The no_targets row exists in the ledger (for idempotency) but has disposition set.
+        let ledger_ids = command_ledger_ids(&store, "ses");
+        assert!(ledger_ids.contains(&"cmd-zero".to_string()));
+        assert!(ledger_ids.contains(&"cmd-normal".to_string()));
     }
 
     #[test]
@@ -9450,7 +9554,7 @@ mod tests {
             .append_pending_agent_drops("pending", &["m1#0".to_string()], 1)
             .unwrap();
         store
-            .append_pending_agent_drops_with_command("ledger", Some("command"), &[], 1)
+            .append_pending_agent_drops_with_command("ledger", Some("command"), &[], 1, true)
             .unwrap();
         store.append_user_hint("hints", "m1#0", "", 1).unwrap();
         store
