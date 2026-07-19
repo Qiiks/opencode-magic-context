@@ -2209,6 +2209,10 @@ const MIGRATIONS: Migration[] = [
         version: 56,
         description: "record authority capture bounds and pending mirror references",
         up(db: Database): void {
+            // Guard-trigger recreation below targets the notes table, which mid-chain
+            // upgrade fixtures may not have created yet; v1's CREATE runs later in
+            // their replay and the fresh-DB path builds these triggers in storage-db.
+            const notesPresent = tableExists(db, "notes");
             db.exec(`
                 CREATE TABLE IF NOT EXISTS authority_capture_bounds (
                     project_path TEXT NOT NULL,
@@ -2258,6 +2262,7 @@ const MIGRATIONS: Migration[] = [
                     WHERE sp.session_id = ${row}.session_id
                 )
             )`;
+            if (!notesPresent) return;
             db.exec(`
                 DROP TRIGGER IF EXISTS notes_authority_guard_insert;
                 DROP TRIGGER IF EXISTS notes_authority_guard_update;
