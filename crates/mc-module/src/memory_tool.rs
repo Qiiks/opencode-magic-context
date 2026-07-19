@@ -12,6 +12,8 @@ use mc_store::{
     StoredNoteSearchRow,
 };
 
+pub use mc_store::FOREIGN_VISIBLE_SQL;
+
 #[derive(Debug)]
 pub enum MemoryToolError {
     Store(McStoreError),

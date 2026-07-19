@@ -201,24 +201,42 @@ export type Database = BetterSqlite3.Database;
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
+const registeredPrivilegeFunctions = new WeakSet<Database>();
+const privilegeUdfAvailable = new WeakSet<Database>();
+
+/** Register the connection-local privilege predicate used by managed-write guards. */
+export function registerPrivilegedWriter(db: Database): void {
+    if (registeredPrivilegeFunctions.has(db)) return;
+    const native = db as unknown as {
+        function?: (name: string, implementation: () => number) => void;
+        createFunction?: (name: string, implementation: () => number) => void;
+    };
+    const implementation = (): number => ((privilegeDepth.get(db) ?? 0) > 0 ? 1 : 0);
+    if (typeof native.function === "function") {
+        native.function("mc_privileged_writer", implementation);
+    } else if (typeof native.createFunction === "function") {
+        native.createFunction("mc_privileged_writer", implementation);
+    } else {
+        // Older Bun releases do not expose scalar UDF registration. Migration 55
+        // retains the pre-UDF state-table trigger on those runtimes.
+        registeredPrivilegeFunctions.add(db);
+        return;
+    }
+    privilegeUdfAvailable.add(db);
+    registeredPrivilegeFunctions.add(db);
+}
 
 function isInTransaction(db: Database): boolean {
     const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
     return candidate.inTransaction === true || candidate.isTransaction === true;
 }
 
-const PRIVILEGE_STATE_ENABLED_SQL =
-    "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1";
-const PRIVILEGE_STATE_DISABLED_SQL = "UPDATE context_privilege_state SET enabled = 0 WHERE id = 1";
-
 /**
- * Run a storage operation while the shared privilege state is enabled inside the
- * same SQLite write transaction. The flag is cleared before commit; a crash or
- * thrown operation rolls the transaction back, so no committed row can expose
- * enabled=1 to another connection. SQLite's single-writer lock prevents another
- * connection from writing while this bracket is active.
+ * Run a storage operation while the connection-local privilege predicate is enabled.
+ * The depth lives outside SQLite, so a second connection can never observe or inherit it.
  */
 export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
+    registerPrivilegedWriter(db);
     const previousDepth = privilegeDepth.get(db) ?? 0;
     const nested = isInTransaction(db);
     const savepoint = "mc_privilege_scope";
@@ -229,11 +247,15 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
     }
     privilegeDepth.set(db, previousDepth + 1);
     try {
-        db.prepare(PRIVILEGE_STATE_ENABLED_SQL).run();
+        if (!privilegeUdfAvailable.has(db)) {
+            db.prepare(
+                "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
+            ).run();
+        }
         const result = operation();
-        db.prepare(
-            previousDepth > 0 ? PRIVILEGE_STATE_ENABLED_SQL : PRIVILEGE_STATE_DISABLED_SQL,
-        ).run();
+        if (!privilegeUdfAvailable.has(db) && previousDepth === 0) {
+            db.prepare("UPDATE context_privilege_state SET enabled = 0 WHERE id = 1").run();
+        }
         if (nested) {
             db.exec(`RELEASE ${savepoint}`);
         } else {

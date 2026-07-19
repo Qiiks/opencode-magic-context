@@ -96,6 +96,15 @@ export function searchMemoriesFTSUnion(
         ownIdentities,
         shareCategories,
         tableName: "memories",
+        includeClassificationFields: (() => {
+            const columns = db.prepare("PRAGMA table_info(memories)").all() as Array<{
+                name?: string;
+            }>;
+            return (
+                columns.some((row) => row.name === "shareable") &&
+                columns.some((row) => row.name === "scope")
+            );
+        })(),
     });
     if (identities.length === 1 && !sharingFilter.active) {
         return searchMemoriesFTS(db, identities[0], query, limit);

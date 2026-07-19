@@ -1,4 +1,8 @@
-import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
+import {
+    type Database,
+    type Statement as PreparedStatement,
+    registerPrivilegedWriter,
+} from "../../../shared/sqlite";
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
 import { invalidateMemory, invalidateProject } from "./embedding-cache";
 import { computeNormalizedHash } from "./normalize-hash";
@@ -11,6 +15,7 @@ import type {
     MemoryStatus,
     VerificationStatus,
 } from "./types";
+import { FOREIGN_VISIBLE_SQL } from "./visibility";
 
 export const COLUMN_MAP: Record<keyof Memory, string> = {
     id: "id",
@@ -576,7 +581,41 @@ function loadInsertedMemory(db: Database, rowid: number | bigint | undefined): M
     return inserted;
 }
 
+export class ModuleMemoryAuthorityError extends Error {
+    readonly code = "MEMORY_MODULE_AUTHORITY";
+
+    constructor(readonly projectPath: string) {
+        super(
+            `memory writes for module-managed project ${projectPath} must use the Rust ctx_memory module facade`,
+        );
+        this.name = "ModuleMemoryAuthorityError";
+    }
+}
+
+function assertTsMemoryWriteAllowed(db: Database, projectPath: string): void {
+    registerPrivilegedWriter(db);
+    try {
+        const managed = db
+            .prepare(
+                "SELECT 1 FROM authority_managed WHERE project_path = ? UNION SELECT 1 FROM authority_repair_pending WHERE project_path = ? LIMIT 1",
+            )
+            .get(projectPath, projectPath);
+        if (managed) throw new ModuleMemoryAuthorityError(projectPath);
+    } catch (error) {
+        // Older isolated test/legacy databases have no authority tables; their
+        // absent marker means ordinary TypeScript ownership by definition.
+        if (!(error instanceof Error) || !error.message.includes("no such table")) throw error;
+    }
+}
+
+function assertTsMemoryIdWriteAllowed(db: Database, id: number): Memory | null {
+    const memory = getMemoryById(db, id);
+    if (memory) assertTsMemoryWriteAllowed(db, memory.projectPath);
+    return memory;
+}
+
 export function insertMemory(db: Database, input: MemoryInput): Memory {
+    assertTsMemoryWriteAllowed(db, input.projectPath);
     const now = Date.now();
     const normalizedHash = computeNormalizedHash(input.content);
     const insertValues = buildInsertMemoryValues(
@@ -685,6 +724,8 @@ export interface WorkspaceMemorySqlFilter {
     clause: string;
     params: string[];
     active: boolean;
+    /** Canonical policy text retained for parity/golden checks across render paths. */
+    predicate: string;
 }
 
 // The same own-vs-foreign predicate is appended to baseline, delta, watermark,
@@ -695,9 +736,10 @@ export function buildWorkspaceMemorySqlFilter(args: {
     ownIdentities?: readonly string[];
     shareCategories?: readonly string[] | null;
     tableName?: string;
+    includeClassificationFields?: boolean;
 }): WorkspaceMemorySqlFilter {
     if (args.shareCategories === null || args.shareCategories === undefined) {
-        return { clause: "", params: [], active: false };
+        return { clause: "", params: [], active: false, predicate: FOREIGN_VISIBLE_SQL };
     }
 
     const identities = uniqueValues(args.identities);
@@ -707,12 +749,16 @@ export function buildWorkspaceMemorySqlFilter(args: {
     );
     const foreignIdentities = identities.filter((identity) => !ownSet.has(identity));
     if (foreignIdentities.length === 0) {
-        return { clause: "", params: [], active: false };
+        return { clause: "", params: [], active: false, predicate: FOREIGN_VISIBLE_SQL };
     }
 
     const ownIdentities = identities.filter((identity) => ownSet.has(identity));
     const shareCategories = uniqueValues([...args.shareCategories]);
     const qualifier = args.tableName ? `${args.tableName}.` : "";
+    const classification =
+        args.includeClassificationFields === false
+            ? ""
+            : ` AND ${qualifier}shareable = 1 AND ${qualifier}scope IN ('project','ecosystem','universe')`;
     const predicates: string[] = [];
     const params: string[] = [];
 
@@ -722,15 +768,20 @@ export function buildWorkspaceMemorySqlFilter(args: {
     }
     if (foreignIdentities.length > 0 && shareCategories.length > 0) {
         predicates.push(
-            `(${qualifier}project_path IN (${sqlPlaceholders(foreignIdentities)}) AND ${qualifier}category IN (${sqlPlaceholders(shareCategories)}))`,
+            `(${qualifier}project_path IN (${sqlPlaceholders(foreignIdentities)}) AND ${qualifier}category IN (${sqlPlaceholders(shareCategories)})${classification})`,
         );
         params.push(...foreignIdentities, ...shareCategories);
     }
 
     if (predicates.length === 0) {
-        return { clause: " AND 0 = 1", params: [], active: true };
+        return { clause: " AND 0 = 1", params: [], active: true, predicate: FOREIGN_VISIBLE_SQL };
     }
-    return { clause: ` AND (${predicates.join(" OR ")})`, params, active: true };
+    return {
+        clause: ` AND (${predicates.join(" OR ")})`,
+        params,
+        active: true,
+        predicate: FOREIGN_VISIBLE_SQL,
+    };
 }
 
 export function getMemoriesByProjects(
@@ -747,6 +798,7 @@ export function getMemoriesByProjects(
         identities,
         ownIdentities,
         shareCategories,
+        includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
     });
     if (identities.length === 1 && !sharingFilter.active) {
         return getMemoriesByProject(db, identities[0], statuses, expiryCutoff);
@@ -779,6 +831,7 @@ export function getMaxMemoryIdForProjects(
         identities,
         ownIdentities,
         shareCategories,
+        includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
     });
     if (identities.length === 1 && !sharingFilter.active) {
         const row = db
@@ -810,6 +863,7 @@ export function readNewMemoriesForM1Union(
         identities,
         ownIdentities,
         shareCategories,
+        includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
     });
     const rows = db
         .prepare(
@@ -859,16 +913,19 @@ export function getMemoriesByIds(db: Database, ids: readonly number[]): Memory[]
 }
 
 export function updateMemorySeenCount(db: Database, id: number): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     getUpdateMemorySeenCountStatement(db).run(now, now, id);
 }
 
 export function updateMemoryRetrievalCount(db: Database, id: number): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     getUpdateMemoryRetrievalCountStatement(db).run(now, now, id);
 }
 
 export function updateMemoryStatus(db: Database, id: number, status: MemoryStatus): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     getUpdateMemoryStatusStatement(db).run(status, Date.now(), id);
 }
 
@@ -896,6 +953,7 @@ export function updateMemoryVerification(
     id: number,
     verificationStatus: VerificationStatus,
 ): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     getUpdateMemoryVerificationStatement(db).run(
         verificationStatus,
@@ -915,7 +973,7 @@ export function updateMemoryContent(
     // Intentional: read outside transaction — Bun is single-threaded so no concurrent
     // modification can happen. The projectPath is only used for cache invalidation after
     // the write, which self-heals on next search if stale.
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
 
     db.transaction(() => {
         getUpdateMemoryContentStatement(db).run(content, normalizedHash, Date.now(), id);
@@ -973,7 +1031,7 @@ export function setMemoryClassification(
         throw new Error("setMemoryClassification requires at least one supplied field");
     }
 
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
     if (!memory) return false;
 
     const assignments: string[] = [];
@@ -1022,6 +1080,7 @@ export function setMemoryClassification(
 }
 
 export function supersededMemory(db: Database, id: number, supersededById: number): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     getSupersededMemoryStatement(db).run(supersededById, Date.now(), id);
 }
 
@@ -1033,6 +1092,7 @@ export function mergeMemoryStats(
     mergedFrom: string,
     status: MemoryStatus,
 ): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     getMergeMemoryStatsStatement(db).run(
         seenCount,
         retrievalCount,
@@ -1050,7 +1110,7 @@ export function archiveMemory(db: Database, id: number, reason?: string): void {
         return;
     }
 
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
     if (!memory) {
         return;
     }
@@ -1063,7 +1123,7 @@ export function archiveMemory(db: Database, id: number, reason?: string): void {
 }
 
 export function deleteMemory(db: Database, id: number): void {
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
 
     db.transaction(() => {
         getDeleteMemoryEmbeddingStatement(db).run(id);

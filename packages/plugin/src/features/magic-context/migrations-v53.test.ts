@@ -38,7 +38,7 @@ describe("migration v53: Synapse embedding storage", () => {
                 DROP TABLE embedding_measurement_corpus;
                 DROP TABLE shadow_embedding_registrations;
                 DROP TABLE synapse_batch_ledger;
-                DELETE FROM schema_migrations WHERE version IN (53, 54);
+                DELETE FROM schema_migrations WHERE version IN (53, 54, 55);
             `);
             runMigrations(db);
             db.prepare(
@@ -51,13 +51,17 @@ describe("migration v53: Synapse embedding storage", () => {
             clearSession(db, "ses-v53");
 
             expect(
-                db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger WHERE session_id = ?").get(
-                    "ses-v53",
-                ),
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM synapse_batch_ledger WHERE session_id = ?",
+                    )
+                    .get("ses-v53"),
             ).toEqual({ count: 0 });
             expect(
                 db
-                    .prepare("SELECT COUNT(*) AS count FROM embedding_measurement_corpus WHERE session_id = ?")
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM embedding_measurement_corpus WHERE session_id = ?",
+                    )
                     .get("ses-v53"),
             ).toEqual({ count: 0 });
         } finally {

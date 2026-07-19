@@ -21,6 +21,9 @@ export interface AuthorityStatus {
     step_reconcile?: boolean;
     step_verify?: boolean;
     step_flip?: boolean;
+    checksum_expected?: string | null;
+    checksum_actual?: string | null;
+    checksum_ok?: number | boolean | null;
 }
 
 export interface AuthorityModuleClient {
@@ -34,7 +37,7 @@ export interface AuthorityModuleClient {
     authoritySeed?(
         args: Record<string, unknown>,
     ): Promise<{ seeded: number; module_row_ids?: number[] }>;
-    mirrorPull(args: {
+    mirrorPull?(args: {
         domain: AuthorityDomain;
         cursor: number;
         limit: number;
@@ -210,6 +213,11 @@ export interface PrepareAuthorityArgs {
     module: AuthorityModuleClient;
     seedPages: (domain: AuthorityDomain) => Promise<readonly Record<string, unknown>[]>;
     checksum: (domain: AuthorityDomain) => string;
+    /** Optional per-row verification hook used to fail closed before the flip. */
+    verifySeed?: (
+        domain: AuthorityDomain,
+        rows: readonly Record<string, unknown>[],
+    ) => boolean | Promise<boolean>;
 }
 
 /**
@@ -221,6 +229,10 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
     const contextStoreUuid = ensureContextStoreUuid(args.db);
     const domains = args.domains ?? AUTHORITY_DOMAINS;
     const results: AuthorityStatus[] = [];
+    if (!args.module.authoritySeed) {
+        throw new Error("memory authority preparation requires the authority.seed module route");
+    }
+    let removeMarkerAfterAbort = false;
     args.db.exec("BEGIN IMMEDIATE");
     try {
         withPrivilegedWriter(args.db, () => {
@@ -239,32 +251,41 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                 domain,
             });
             const rows = await args.seedPages(domain);
-            if (args.module.authoritySeed) {
-                for (const page of chunkRows(rows, 100)) {
-                    const seedResponse = await args.module.authoritySeed({
-                        method: "authority.seed",
-                        context_store_uuid: contextStoreUuid,
-                        project: args.projectPath,
-                        domain,
-                        rows: page,
-                    });
-                    for (const [index, moduleRowId] of (
-                        seedResponse.module_row_ids ?? []
-                    ).entries()) {
-                        const sourceRowId = seedSourceRowId(page[index]);
-                        if (sourceRowId !== null) {
-                            rememberIdentity(
-                                args.db,
-                                domain,
-                                args.projectPath,
-                                moduleRowId,
-                                sourceRowId,
-                            );
-                        }
+            for (const page of chunkRowsForFrame(rows)) {
+                const seedResponse = await args.module.authoritySeed({
+                    method: "authority.seed",
+                    context_store_uuid: contextStoreUuid,
+                    project: args.projectPath,
+                    domain,
+                    rows: page,
+                });
+                for (const [index, moduleRowId] of (seedResponse.module_row_ids ?? []).entries()) {
+                    const sourceRowId = seedSourceRowId(page[index]);
+                    if (sourceRowId !== null) {
+                        rememberIdentity(
+                            args.db,
+                            domain,
+                            args.projectPath,
+                            moduleRowId,
+                            sourceRowId,
+                        );
                     }
                 }
             }
             const digest = args.checksum(domain);
+            const verified = (await args.verifySeed?.(domain, rows)) ?? true;
+            if (!verified) {
+                removeMarkerAfterAbort = true;
+                await args.module.authorityPrepare({
+                    method: "authority.prepare",
+                    phase: "abort",
+                    context_store_uuid: contextStoreUuid,
+                    project: args.projectPath,
+                    domain,
+                    generation: started.authority.generation,
+                });
+                throw new Error(`memory authority seed verification failed for ${domain}`);
+            }
             const completed = await args.module.authorityPrepare({
                 method: "authority.prepare",
                 phase: "complete",
@@ -274,9 +295,40 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                 generation: started.authority.generation,
                 checksum_expected: digest,
                 checksum_actual: digest,
-                verified: true,
+                verified,
             });
-            results.push(completed.authority);
+            const authority = completed.authority;
+            const moduleVerified =
+                authority.checksum_ok === undefined ||
+                authority.checksum_ok === null ||
+                authority.checksum_ok === true ||
+                authority.checksum_ok === 1;
+            const checksumsMatch =
+                authority.checksum_expected === undefined ||
+                authority.checksum_expected === null ||
+                authority.checksum_actual === undefined ||
+                authority.checksum_actual === null ||
+                authority.checksum_expected === authority.checksum_actual;
+            if (authority.state !== "MODULE" || !moduleVerified || !checksumsMatch) {
+                removeMarkerAfterAbort = true;
+                if (authority.state === "PREPARING") {
+                    try {
+                        await args.module.authorityPrepare({
+                            method: "authority.prepare",
+                            phase: "abort",
+                            context_store_uuid: contextStoreUuid,
+                            project: args.projectPath,
+                            domain,
+                            generation: started.authority.generation,
+                        });
+                    } catch {
+                        // Preserve the verification failure; the durable PREPARING row
+                        // remains visible for a later repair attempt if abort is unavailable.
+                    }
+                }
+                throw new Error(`memory authority seed verification failed for ${domain}`);
+            }
+            results.push(authority);
         }
         args.db.exec("COMMIT");
         return results;
@@ -286,6 +338,7 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
         } catch {
             // Preserve the original preparation error.
         }
+        if (removeMarkerAfterAbort) removeAuthorityManagedMarker(args.db, args.projectPath);
         throw error;
     }
 }
@@ -295,11 +348,14 @@ export async function drainAuthority(args: {
     projectPath: string;
     domain: AuthorityDomain;
     module: AuthorityModuleClient;
-    checksum: string;
+    checksum: string | (() => string);
     limit?: number;
 }): Promise<AuthorityStatus> {
     if (!args.module.authorityDrain) {
         throw new Error("authority drain is unavailable on this module client");
+    }
+    if (!args.module.mirrorPull) {
+        throw new Error("memory authority drain requires the mirror.pull module route");
     }
     const contextStoreUuid = ensureContextStoreUuid(args.db);
     let status = (
@@ -345,7 +401,8 @@ export async function drainAuthority(args: {
             })
         ).authority;
     }
-    return (
+    const drainChecksum = typeof args.checksum === "function" ? args.checksum() : args.checksum;
+    const finished = (
         await args.module.authorityDrain({
             method: "authority.drain.finish",
             context_store_uuid: contextStoreUuid,
@@ -353,11 +410,18 @@ export async function drainAuthority(args: {
             domain: args.domain,
             action: "finish",
             generation: status.generation,
-            checksum_expected: args.checksum,
-            checksum_actual: args.checksum,
+            checksum_expected: drainChecksum,
+            checksum_actual: drainChecksum,
             verified: true,
         })
     ).authority;
+    if (finished.state !== "TS") {
+        throw new Error("memory authority drain did not reactivate TypeScript ownership");
+    }
+    // Remove the authority-managed marker under an exclusive context.db write lock
+    // immediately after the module flip, so TS writers cannot resume before the fence is gone.
+    removeAuthorityManagedMarker(args.db, args.projectPath);
+    return finished;
 }
 
 function seedSourceRowId(row: Record<string, unknown>): number | null {
@@ -372,11 +436,23 @@ function seedSourceRowId(row: Record<string, unknown>): number | null {
     return typeof id === "number" && Number.isInteger(id) ? id : null;
 }
 
-function chunkRows<T>(rows: readonly T[], size: number): T[][] {
+const MAX_AUTHORITY_SEED_FRAME_BYTES = 900 * 1024;
+
+function chunkRowsForFrame<T>(rows: readonly T[]): T[][] {
     const chunks: T[][] = [];
-    for (let index = 0; index < rows.length; index += size) {
-        chunks.push(rows.slice(index, index + size) as T[]);
+    let current: T[] = [];
+    let currentBytes = 2;
+    for (const row of rows) {
+        const rowBytes = new TextEncoder().encode(JSON.stringify(row)).byteLength + 1;
+        if (current.length > 0 && currentBytes + rowBytes > MAX_AUTHORITY_SEED_FRAME_BYTES) {
+            chunks.push(current);
+            current = [];
+            currentBytes = 2;
+        }
+        current.push(row);
+        currentBytes += rowBytes;
     }
+    if (current.length > 0) chunks.push(current);
     return chunks;
 }
 
@@ -632,6 +708,9 @@ export async function pullAndApplyMirrorPage(args: {
     domain: AuthorityDomain;
     limit?: number;
 }): Promise<number> {
+    if (!args.module.mirrorPull) {
+        throw new Error("memory mirror consumer requires the mirror.pull module route");
+    }
     const cursor = getMirrorCursor(args.db, args.domain);
     const response = await args.module.mirrorPull({
         domain: args.domain,
@@ -639,4 +718,27 @@ export async function pullAndApplyMirrorPage(args: {
         limit: Math.max(1, Math.min(args.limit ?? 100, 1000)),
     });
     return applyMirrorPage({ db: args.db, page: response.page });
+}
+
+const mirrorFlights = new WeakMap<object, Promise<number>>();
+
+/**
+ * The rust transform pass is the mirror cadence. Coalesce overlapping passes so a
+ * slower pull can never race a second cursor application on the same connection.
+ */
+export function pullMemoryMirrorOnce(args: {
+    db: Database;
+    module: AuthorityModuleClient;
+    limit?: number;
+}): Promise<number> {
+    const existing = mirrorFlights.get(args.module);
+    if (existing) return existing;
+    const flight = pullAndApplyMirrorPage({
+        db: args.db,
+        module: args.module,
+        domain: "memories",
+        limit: args.limit,
+    }).finally(() => mirrorFlights.delete(args.module));
+    mirrorFlights.set(args.module, flight);
+    return flight;
 }

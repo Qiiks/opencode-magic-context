@@ -25,6 +25,10 @@ use std::io::{Read, Write};
 
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
+/// Canonical foreign-memory visibility predicate used by module SQL consumers.
+/// The plugin mirrors this literal to keep cache visibility and workspace policy aligned.
+pub const FOREIGN_VISIBLE_SQL: &str = "status IN ('active','permanent') AND (expires_at IS NULL OR expires_at > :now_ms) AND shareable = 1 AND scope IN ('project','ecosystem','universe') AND category IN (SELECT value FROM json_each(:share_categories)) AND project_path IN (SELECT project_path FROM mc_workspace_members WHERE workspace_id = :workspace_id) AND project_path <> :reader_project";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1038,6 +1042,46 @@ const MIGRATIONS: &[Migration] = &[
             ADD COLUMN disposition TEXT
             CHECK (disposition IS NULL OR disposition IN ('no_targets'));
         ",
+    },
+    Migration {
+        version: 25,
+        // A foreign-memory revocation changes the workspace cache identity exactly once.
+        // The trigger evaluates the complete old/new visibility transition in SQLite so
+        // direct SQL and facade mutations cannot bypass the epoch.
+        statements: r#"
+        CREATE TABLE IF NOT EXISTS mc_memory_visibility_epoch (
+            project_path TEXT PRIMARY KEY,
+            epoch INTEGER NOT NULL DEFAULT 0
+        );
+        DROP TRIGGER IF EXISTS mc_memories_visibility_epoch;
+        CREATE TRIGGER mc_memories_visibility_epoch
+        AFTER UPDATE OF status, expires_at, scope, shareable, category ON mc_memories
+        WHEN EXISTS (
+            SELECT 1
+              FROM mc_workspace_members old_member
+              JOIN mc_workspaces old_workspace ON old_workspace.id = old_member.workspace_id
+             WHERE old_member.project_path = OLD.project_path
+               AND OLD.status IN ('active','permanent')
+               AND OLD.shareable = 1
+               AND OLD.scope IN ('project','ecosystem','universe')
+               AND OLD.category IN (SELECT value FROM json_each(old_workspace.share_categories))
+        )
+        AND NOT EXISTS (
+            SELECT 1
+              FROM mc_workspace_members new_member
+              JOIN mc_workspaces new_workspace ON new_workspace.id = new_member.workspace_id
+             WHERE new_member.project_path = NEW.project_path
+               AND NEW.status IN ('active','permanent')
+               AND NEW.shareable = 1
+               AND NEW.scope IN ('project','ecosystem','universe')
+               AND NEW.category IN (SELECT value FROM json_each(new_workspace.share_categories))
+        )
+        BEGIN
+            INSERT INTO mc_memory_visibility_epoch(project_path, epoch)
+            VALUES (OLD.project_path, 1)
+            ON CONFLICT(project_path) DO UPDATE SET epoch = epoch + 1;
+        END;
+    "#,
     },
 ];
 
@@ -5983,10 +6027,10 @@ impl McStore {
     /// so no value forges a boundary. A nondeterministic fingerprint over a STABLE
     /// workspace would false-HARD every pass (the over-bust the m0/m1 split exists to
     /// avoid). Empty string when the project is in no workspace (the single-project state —
-    /// a stable "no workspace" marker). NOTE: in this slice the fingerprint covers
-    /// membership + share-policy only; production also folds each member's project-memory
-    /// epoch, which has no `mc_*` source yet (it lands with the deferred
-    /// `project_memory_epoch` marker when the write paths relocate).
+    /// a stable "no workspace" marker). A nondeterministic fingerprint would make a
+    /// stable workspace appear to change on every check, breaking cache consistency. The
+    /// fingerprint includes each member's visibility epoch so revocation invalidates all
+    /// affected caches in the same deterministic change.
     pub fn workspace_fingerprint(&self, project_path: &str) -> Result<String, McStoreError> {
         let Some(m) = self.resolve_workspace_membership(project_path)? else {
             return Ok(String::new());
@@ -5998,6 +6042,22 @@ impl McStore {
         let mut out = String::from("ws[");
         for id in &m.union_identities {
             out.push_str(&format!("m:{}:{};", id.len(), id));
+        }
+        let epochs = self.inner.with_conn(|conn| {
+            m.union_identities
+                .iter()
+                .map(|id| {
+                    conn.query_row(
+                        "SELECT COALESCE((SELECT epoch FROM mc_memory_visibility_epoch WHERE project_path = ?1), 0)",
+                        params![id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .collect::<Result<Vec<i64>, _>>()
+        })?;
+        out.push_str("|epochs:");
+        for (id, epoch) in m.union_identities.iter().zip(epochs) {
+            out.push_str(&format!("{}:{}:{};", id.len(), id, epoch));
         }
         out.push_str("|share:");
         for cat in &shared {
@@ -6909,6 +6969,14 @@ impl McStore {
                         },
                     )));
                 }
+                if verified && checksum_expected != checksum_actual {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::State {
+                            expected: "matching checksums".to_string(),
+                            found: "verification failed".to_string(),
+                        },
+                    )));
+                }
                 let next_state = if verified { "MODULE" } else { "TS" };
                 tx.execute(
                     "UPDATE mc_authority
@@ -7103,7 +7171,7 @@ impl McStore {
                     && current.step_compartments
                     && current.step_reconcile
                     && current.step_verify;
-                if !all_steps || !verified {
+                if !all_steps || !verified || checksum_expected != checksum_actual {
                     return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                         AuthorityTransitionError::State {
                             expected: "all drain steps and verification".to_string(),
@@ -8076,6 +8144,13 @@ fn workspace_union_memory_visibility_filter_for_column(
 
     let mut binds: Vec<rusqlite::types::Value> =
         vec![rusqlite::types::Value::from(own_identity.clone())];
+    // Mirror the canonical visibility rule locally: when it requires shareable = 1,
+    // also restrict foreign rows to the allowed scopes and bind values positionally.
+    let foreign_policy = if FOREIGN_VISIBLE_SQL.contains("shareable = 1") {
+        " AND shareable = 1 AND scope IN ('project','ecosystem','universe')"
+    } else {
+        ""
+    };
     let mut sharing = format!("{path_column} = ?");
     if !foreign.is_empty() && !share_categories.is_empty() {
         let fph = std::iter::repeat_n("?", foreign.len())
@@ -8085,7 +8160,7 @@ fn workspace_union_memory_visibility_filter_for_column(
             .collect::<Vec<_>>()
             .join(", ");
         sharing.push_str(&format!(
-            " OR ({path_column} IN ({fph}) AND category IN ({cph}))"
+            " OR ({path_column} IN ({fph}) AND category IN ({cph}){foreign_policy})"
         ));
         for p in &foreign {
             binds.push(rusqlite::types::Value::from((*p).clone()));
@@ -9749,8 +9824,8 @@ mod tests {
                 tx.execute(
                     "INSERT INTO mc_memories
                        (id, project_path, category, content, normalized_hash, importance,
-                        status, expires_at, first_seen_at, created_at, updated_at, last_seen_at)
-                     VALUES (?1,?2,'ARCHITECTURE',?3,?4,?5,?6,?7,0,0,0,0)",
+                        scope, shareable, status, expires_at, first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (?1,?2,'ARCHITECTURE',?3,?4,?5,'project',1,?6,?7,0,0,0,0)",
                     params![
                         id,
                         project,
@@ -9874,6 +9949,50 @@ mod tests {
             .memory_mutations_for_render(&projects, 0, &[])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn foreign_shareable_revocation_bumps_visibility_epoch_and_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:epoch-own";
+        let foreign = "git:epoch-foreign";
+        insert_memory(&store, foreign, 1, "shared", Some(50), "active", None);
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_workspaces (id, name, share_categories) VALUES (1,'epoch-ws','[\"CONSTRAINTS\",\"ARCHITECTURE\"]')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_workspace_members (workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?1, ?1, ?1, 0), (1, ?2, ?2, ?2, 0)",
+                    params![own, foreign],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let before = store.workspace_fingerprint(own).unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute("UPDATE mc_memories SET shareable = 0 WHERE id = 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let after = store.workspace_fingerprint(own).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            store
+                .inner
+                .with_conn(|conn| conn.query_row(
+                    "SELECT epoch FROM mc_memory_visibility_epoch WHERE project_path = ?1",
+                    params![foreign],
+                    |row| row.get::<_, i64>(0),
+                ))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -10926,6 +11045,7 @@ mod shadow_tests {
         own.category = "ARCHITECTURE".to_string();
         let mut shared = memory(2, "foreign constraint");
         shared.project_path = foreign.to_string();
+        shared.shareable = 1;
         let mut private = memory(3, "foreign preference");
         private.project_path = foreign.to_string();
         private.category = "PREFERENCES".to_string();

@@ -219,6 +219,7 @@ describe("unifiedSearch", () => {
             category: "CONSTRAINTS",
             content: "foreign constraint needle",
         });
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignShared.id);
         const foreignHidden = insertMemory(db, {
             projectPath: "git:foreign",
             category: "NAMING",
@@ -301,6 +302,7 @@ describe("unifiedSearch", () => {
             category: "CONSTRAINTS",
             content: "foreign legacy-null constraint needle",
         });
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignConstraint.id);
         const foreignNaming = insertMemory(db, {
             projectPath: "git:foreign",
             category: "NAMING",

@@ -1,0 +1,25 @@
+# Audit-B fixes: TS render epoch, Rust fallback-on-rejection, Unicode line separators (v0.32.1)
+
+Repo ~/Work/Projects/CortexKit/magic-context, branch subc-migration. Three verified findings from the historian/renderer audit. Verify each at source. Fix 1 is CACHE-AFFECTING — it must produce exactly ONE HARD fold per affected session and byte-stable replay after; it gets an adversarial diff review post-merge, so keep it minimal and explicit.
+
+## Fix 1 (HIGH, cache): TS/Pi compartment-render epoch
+decay-render.ts's title sanitization (already merged, e6319b72) changed rendered m0 bytes, but OpenCode's mustMaterialize (inject-compartments.ts:982-1103) and Pi's mustMaterializePi have NO compartment-render-epoch trigger — confirmed at source: triggers are model/system/ttl/project/workspace/max_mutation_id/upgrade only. So a v0.32-cached m0 replays PRE-sanitization title bytes indefinitely until some unrelated HARD fires, and a SOFT refresh can render sanitized m1 alongside stale m0. Since OC/Pi run the TS plugin in production (Rust is shadow-only), the shipped title fix is INERT on cached sessions.
+FIX: add a compartment-render-epoch component to the m0 cache identity in BOTH harnesses. Value "cre2" to match the Rust epoch vocabulary. Mechanism (follow memory #8603 omitted-at-zero + the existing marker pattern, NO new DB column):
+- Add a module constant COMPARTMENT_RENDER_EPOCH = "cre2" (single source; future renderer byte changes bump this one constant).
+- In mustMaterialize / mustMaterializePi: compare the cached epoch component vs current; differ → HARD (reason: reuse an existing canonical reason or add "compartment_render_epoch" to CanonicalMaterializeReason in transform-decision-log.ts). Absent cached value (v0.32 cache) MUST read as differing → exactly one HARD.
+- In materializeM0 / applyMarkersToState (both harnesses): persist the current epoch with the bytes actually rendered, so post-fold passes see equal → no repeated fold.
+- Store in the EXISTING cached-m0 marker set (session_meta cached_m0_* family) — reuse the column plumbing, do not add a migration.
+Tests: (a) cached-m0 with absent/old epoch → exactly ONE HARD fold, reason set; (b) post-fold defer passes replay byte-identical, zero further folds (applyMarkers covers the component); (c) Pi mirrors identically; (d) a session already at cre2 → zero extra folds.
+
+## Fix 2 (HIGH): Rust validation rejection must try the fallback chain + fix cooldown basis
+crates/mc-module/src/historian.rs:879-1024 — producer ERRORS `continue` to the next configured model, but publish_result? at ~1169-1221 returns immediately on VALIDATION rejection, so a deterministic primary leaving a narrative gap never lets a valid fallback run (bites harder now that strict gap-heal rejects narrative gaps — audit B + Fork 1 interaction).
+FIX: on validation rejection, advance to the remaining configured models using the same loop the producer-error path uses; preserve the FINAL validation error into last_failure after the chain is exhausted. ALSO: the 60s absolute backoff is computed from fire-START — a run >60s records an already-expired cooldown → immediate refire of the same chunk. Compute cooldown from failure COMPLETION time. If a cheap durable seam exists, bump a last_failure rejection counter for parity with TS's 3-failure escalation (do NOT build new notification machinery).
+Tests (inject a clock/test seam): invalid-primary + valid-fallback → fallback runs + publishes; all-models-reject → last_failure carries the final validation error, cooldown measured from completion; simulated model runtime > cooldown → NO immediate refire.
+
+## Fix 3 (MED): Unicode line/paragraph separators in the title sanitizer
+TS decay-render.ts:56-60 uses \p{Cc}; Rust decay_render.rs:104-121 uses char::is_control() — BOTH miss U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR), so "safe\u2028## forged" renders visually multiline. The TS/Rust differential golden agreed BECAUSE both share the omission (shared-oracle blind spot).
+FIX: normalize Cc + Zl + Zp in both implementations (TS: add \u2028\u2029 to the control-char collapse or use \p{Cc}\p{Zl}\p{Zp}; Rust: extend the predicate to include U+2028/U+2029). Regenerate the differential golden WITH a U+2028/U+2029 title case so the golden can never silently share this omission again.
+NOTE: this rides the SAME cre2 epoch as Fix 1 — it's another title-render byte change, so do Fix 1 first and let Fix 3's byte change fold under the same epoch (do not bump to cre3; both land together pre-release as one epoch step from cre1→cre2).
+
+## Gates
+packages/plugin + packages/pi-plugin: bun test, typecheck, lint, check_comments. crates: cargo test -p mc-module + -p mc-core, clippy, fmt. Comments explain the invariant (render-format changes need an epoch to invalidate cached m0; validation rejection must exhaust the fallback chain; unicode line separators forge headings). Report per-fix status + test evidence. Fix 1 will get a post-merge adversarial diff review — flag any place you were unsure about the epoch plumbing.
