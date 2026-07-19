@@ -26,6 +26,9 @@ pub enum MemoryToolError {
     /// dedicated error lets the facade translate it into a clear user-facing message
     /// instead of papering over the difference with a generic "not found".
     TooManyIds { requested: usize, max: usize },
+    /// A `get` call with no ids is an input error distinct from merge validation, so the
+    /// message names the read action instead of talking about merge sources.
+    EmptyGet,
 }
 
 impl std::fmt::Display for MemoryToolError {
@@ -53,6 +56,9 @@ impl std::fmt::Display for MemoryToolError {
                 f,
                 "'ids' must contain at most {max} memory IDs when action is 'get' (got {requested})"
             ),
+            MemoryToolError::EmptyGet => {
+                write!(f, "'ids' must contain at least one memory ID when action is 'get'")
+            }
         }
     }
 }
@@ -135,7 +141,7 @@ pub fn get_memories(
     ids: &[i64],
 ) -> Result<Vec<StoredMemoryFull>, MemoryToolError> {
     if ids.is_empty() {
-        return Err(MemoryToolError::EmptyMerge);
+        return Err(MemoryToolError::EmptyGet);
     }
     if ids.len() > GET_MAX_IDS {
         return Err(MemoryToolError::TooManyIds {
@@ -887,7 +893,7 @@ mod tests {
         let own = "git:own";
         assert!(matches!(
             get_memories(&store, own, &[]),
-            Err(MemoryToolError::EmptyMerge)
+            Err(MemoryToolError::EmptyGet)
         ));
     }
 }
