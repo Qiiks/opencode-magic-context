@@ -80,6 +80,48 @@ pub fn open_readonly(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
     Ok(conn)
 }
 
+fn ensure_context_store_uuid(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_table: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_store_meta'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if has_table.is_none() {
+        return Ok(());
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT value FROM context_store_meta WHERE key = 'store_uuid'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Ok(());
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            error.to_string(),
+        )))
+    })?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let uuid = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    );
+    conn.execute(
+        "INSERT INTO context_store_meta(key, value) VALUES ('store_uuid', ?1) ON CONFLICT(key) DO NOTHING",
+        [&uuid],
+    )?;
+    Ok(())
+}
+
 /// Opens a read-write connection for write operations (memory edits, queue entries).
 pub fn open_readwrite(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
     // READ_WRITE WITHOUT CREATE: if the DB file vanished after startup,
@@ -96,6 +138,9 @@ pub fn open_readwrite(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // This opener has no module client, so a marker-less store cannot be classified as
+    // regressed here. The later module handshake performs the authoritative reconciliation.
+    ensure_context_store_uuid(&conn)?;
     Ok(conn)
 }
 

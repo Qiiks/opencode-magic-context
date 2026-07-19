@@ -15,6 +15,28 @@ export {
     incrementCompressionDepth,
 } from "./compression-depth-storage";
 export {
+    AUTHORITY_DOMAINS,
+    type AuthorityDomain,
+    type AuthorityManagedMarker,
+    type AuthorityModuleClient,
+    type AuthorityState,
+    type AuthorityStatus,
+    applyMirrorPage,
+    type ChangefeedPage,
+    type ChangefeedRow,
+    ensureContextStoreUuid,
+    getAuthorityManagedMarker,
+    getContextStoreUuid,
+    getMirrorCursor,
+    installAuthorityManagedMarker,
+    listAuthorityManagedMarkers,
+    type PrepareAuthorityArgs,
+    prepareAuthority,
+    pullAndApplyMirrorPage,
+    reconcileAuthorityMarker,
+    removeAuthorityManagedMarker,
+} from "./context-authority";
+export {
     clearIndexedMessages,
     deleteIndexedMessage,
 } from "./message-index";
@@ -55,6 +77,16 @@ export {
     schemaVersionIsSupported,
     setSqlitePragmaConfig,
 } from "./storage-db";
+export {
+    beginSynapseBatchLedger,
+    type EmbeddingMeasurementInput,
+    type EmbeddingMeasurementRow,
+    finishSynapseBatchLedger,
+    listEmbeddingMeasurements,
+    normalizedQueryHash,
+    recordEmbeddingMeasurement,
+    type SynapseBatchLedgerInput,
+} from "./storage-embedding-measurements";
 export {
     deleteIdentityRekeyMap,
     getIdentityRekeyMap,
@@ -191,16 +223,6 @@ export {
     type WrapupInProgressState,
 } from "./storage-meta";
 export { bumpSessionFactsVersion } from "./storage-meta-shared";
-export {
-    listEmbeddingMeasurements,
-    normalizedQueryHash,
-    recordEmbeddingMeasurement,
-    type EmbeddingMeasurementInput,
-    type EmbeddingMeasurementRow,
-    beginSynapseBatchLedger,
-    finishSynapseBatchLedger,
-    type SynapseBatchLedgerInput,
-} from "./storage-embedding-measurements";
 export {
     addNote,
     deleteNote,

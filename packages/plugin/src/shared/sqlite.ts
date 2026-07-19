@@ -199,3 +199,61 @@ export type Database = BetterSqlite3.Database;
  * historical behavior in this codebase).
  */
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
+
+const privilegeDepth = new WeakMap<Database, number>();
+
+function isInTransaction(db: Database): boolean {
+    const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
+    return candidate.inTransaction === true || candidate.isTransaction === true;
+}
+
+const PRIVILEGE_STATE_ENABLED_SQL =
+    "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1";
+const PRIVILEGE_STATE_DISABLED_SQL = "UPDATE context_privilege_state SET enabled = 0 WHERE id = 1";
+
+/**
+ * Run a storage operation while the shared privilege state is enabled inside the
+ * same SQLite write transaction. The flag is cleared before commit; a crash or
+ * thrown operation rolls the transaction back, so no committed row can expose
+ * enabled=1 to another connection. SQLite's single-writer lock prevents another
+ * connection from writing while this bracket is active.
+ */
+export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
+    const previousDepth = privilegeDepth.get(db) ?? 0;
+    const nested = isInTransaction(db);
+    const savepoint = "mc_privilege_scope";
+    if (nested) {
+        db.exec(`SAVEPOINT ${savepoint}`);
+    } else {
+        db.exec("BEGIN IMMEDIATE");
+    }
+    privilegeDepth.set(db, previousDepth + 1);
+    try {
+        db.prepare(PRIVILEGE_STATE_ENABLED_SQL).run();
+        const result = operation();
+        db.prepare(
+            previousDepth > 0 ? PRIVILEGE_STATE_ENABLED_SQL : PRIVILEGE_STATE_DISABLED_SQL,
+        ).run();
+        if (nested) {
+            db.exec(`RELEASE ${savepoint}`);
+        } else {
+            db.exec("COMMIT");
+        }
+        if (previousDepth > 0) privilegeDepth.set(db, previousDepth);
+        else privilegeDepth.delete(db);
+        return result;
+    } catch (error) {
+        try {
+            if (nested) {
+                db.exec(`ROLLBACK TO ${savepoint}`);
+                db.exec(`RELEASE ${savepoint}`);
+            } else {
+                db.exec("ROLLBACK");
+            }
+        } finally {
+            if (previousDepth > 0) privilegeDepth.set(db, previousDepth);
+            else privilegeDepth.delete(db);
+        }
+        throw error;
+    }
+}
