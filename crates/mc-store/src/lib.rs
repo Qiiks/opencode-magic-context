@@ -1331,23 +1331,94 @@ const MIGRATIONS: &[Migration] = &[
               JOIN mc_workspaces old_workspace ON old_workspace.id = old_member.workspace_id
              WHERE old_member.project_path = OLD.project_path
                AND OLD.status IN ('active','permanent')
-               AND (OLD.expires_at IS NULL OR OLD.expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000)
                AND OLD.shareable = 1
                AND OLD.scope IN ('project','ecosystem','universe')
                AND OLD.category IN (SELECT value FROM json_each(old_workspace.share_categories))
         )
-        AND NOT EXISTS (
+        OR EXISTS (
             SELECT 1
               FROM mc_workspace_members new_member
               JOIN mc_workspaces new_workspace ON new_workspace.id = new_member.workspace_id
              WHERE new_member.project_path = NEW.project_path
                AND NEW.status IN ('active','permanent')
-               AND (NEW.expires_at IS NULL OR NEW.expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000)
                AND NEW.shareable = 1
                AND NEW.scope IN ('project','ecosystem','universe')
                AND NEW.category IN (SELECT value FROM json_each(new_workspace.share_categories))
         )
         BEGIN
+            -- Ignore expiry in the trigger clock: SQLite's second-resolution now can
+            -- disagree with the caller's now_ms and miss same-second revocations.
+            -- A rare extra baseline recompute is acceptable; a missed revocation is not.
+            INSERT INTO mc_memory_visibility_epoch(project_path, epoch)
+            VALUES (OLD.project_path, 1)
+            ON CONFLICT(project_path) DO UPDATE SET epoch = epoch + 1;
+        END;
+        "#,
+    },
+    Migration {
+        version: 28,
+        // Scope pending seed references per project/domain, mint drain coordinator
+        // tokens, and keep the visibility trigger free of SQLite clock comparisons.
+        statements: r#"
+        CREATE TABLE mc_authority_pending_memory_references_v28 (
+            context_store_uuid TEXT NOT NULL,
+            project TEXT NOT NULL,
+            domain TEXT NOT NULL CHECK(domain IN ('memories','notes')),
+            source_context_row_id INTEGER NOT NULL,
+            target_context_row_id INTEGER NOT NULL,
+            PRIMARY KEY(context_store_uuid, project, domain, source_context_row_id)
+        );
+        INSERT INTO mc_authority_pending_memory_references_v28(
+            context_store_uuid, project, domain, source_context_row_id, target_context_row_id
+        )
+        SELECT p.context_store_uuid,
+               COALESCE(
+                   (SELECT m.project_path FROM mc_memories m
+                     WHERE m.context_store_uuid = p.context_store_uuid
+                       AND m.context_row_id = p.source_context_row_id),
+                   ''
+               ),
+               'memories',
+               p.source_context_row_id,
+               p.target_context_row_id
+          FROM mc_authority_pending_memory_references p;
+        DROP TABLE mc_authority_pending_memory_references;
+        ALTER TABLE mc_authority_pending_memory_references_v28
+            RENAME TO mc_authority_pending_memory_references;
+        CREATE INDEX IF NOT EXISTS idx_mc_authority_pending_memory_reference_target
+            ON mc_authority_pending_memory_references(
+                context_store_uuid, project, domain, target_context_row_id
+            );
+
+        ALTER TABLE mc_authority ADD COLUMN coordinator_token TEXT;
+
+        DROP TRIGGER IF EXISTS mc_memories_visibility_epoch;
+        CREATE TRIGGER mc_memories_visibility_epoch
+        AFTER UPDATE OF status, expires_at, scope, shareable, category ON mc_memories
+        WHEN EXISTS (
+            SELECT 1
+              FROM mc_workspace_members old_member
+              JOIN mc_workspaces old_workspace ON old_workspace.id = old_member.workspace_id
+             WHERE old_member.project_path = OLD.project_path
+               AND OLD.status IN ('active','permanent')
+               AND OLD.shareable = 1
+               AND OLD.scope IN ('project','ecosystem','universe')
+               AND OLD.category IN (SELECT value FROM json_each(old_workspace.share_categories))
+        )
+        OR EXISTS (
+            SELECT 1
+              FROM mc_workspace_members new_member
+              JOIN mc_workspaces new_workspace ON new_workspace.id = new_member.workspace_id
+             WHERE new_member.project_path = NEW.project_path
+               AND NEW.status IN ('active','permanent')
+               AND NEW.shareable = 1
+               AND NEW.scope IN ('project','ecosystem','universe')
+               AND NEW.category IN (SELECT value FROM json_each(new_workspace.share_categories))
+        )
+        BEGIN
+            -- Ignore expiry in the trigger clock: SQLite's second-resolution now can
+            -- disagree with the caller's now_ms and miss same-second revocations.
+            -- A rare extra baseline recompute is acceptable; a missed revocation is not.
             INSERT INTO mc_memory_visibility_epoch(project_path, epoch)
             VALUES (OLD.project_path, 1)
             ON CONFLICT(project_path) DO UPDATE SET epoch = epoch + 1;
@@ -2354,6 +2425,9 @@ pub struct AuthorityRow {
     pub step_flip: bool,
     pub coordinator_lease: Option<String>,
     pub lease_expires_at: Option<i64>,
+    /// Attempt-unique token minted at drain begin/takeover. Step and finish require it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_token: Option<String>,
     pub checksum_expected: Option<String>,
     pub checksum_actual: Option<String>,
     pub checksum_ok: Option<bool>,
@@ -2836,13 +2910,17 @@ struct ValidatedSeedBoundary {
 const AUTHORITY_SELECT_SQL: &str = "SELECT context_store_uuid, project, domain, state, generation,
     captured_upper_bound, drain_generation, drain_cursor, step_seed, step_memories,
     step_notes, step_compartments, step_reconcile, step_verify, step_flip,
-    coordinator_lease, lease_expires_at, checksum_expected, checksum_actual, checksum_ok
+    coordinator_lease, lease_expires_at, coordinator_token,
+    checksum_expected, checksum_actual, checksum_ok
     FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3";
 
 #[derive(Debug)]
 enum AuthorityTransitionError {
     State { expected: String, found: String },
     Generation { expected: u64, found: u64 },
+    CoordinatorToken,
+    CoordinatorLeaseExpired,
+    UnresolvedPendingReferences { count: i64 },
 }
 
 impl std::fmt::Display for AuthorityTransitionError {
@@ -2854,8 +2932,34 @@ impl std::fmt::Display for AuthorityTransitionError {
             Self::Generation { expected, found } => {
                 write!(f, "expected generation {expected}, found {found}")
             }
+            Self::CoordinatorToken => {
+                write!(f, "drain coordinator token mismatch or missing")
+            }
+            Self::CoordinatorLeaseExpired => {
+                write!(f, "drain coordinator lease expired")
+            }
+            Self::UnresolvedPendingReferences { count } => {
+                write!(
+                    f,
+                    "authority prepare complete rejected: {count} unresolved pending memory references"
+                )
+            }
         }
     }
+}
+
+fn mint_coordinator_token(lease: &str, lease_expires_at: i64, generation: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("drain-token:{lease}:{lease_expires_at}:{generation}:{nanos}").as_bytes()
+        )
+    )
 }
 
 impl std::error::Error for AuthorityTransitionError {}
@@ -2896,10 +3000,29 @@ fn authority_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Authority
         step_flip: row.get::<_, i64>(14)? != 0,
         coordinator_lease: row.get(15)?,
         lease_expires_at: row.get(16)?,
-        checksum_expected: row.get(17)?,
-        checksum_actual: row.get(18)?,
-        checksum_ok: row.get::<_, Option<i64>>(19)?.map(|value| value != 0),
+        coordinator_token: row.get(17)?,
+        checksum_expected: row.get(18)?,
+        checksum_actual: row.get(19)?,
+        checksum_ok: row.get::<_, Option<i64>>(20)?.map(|value| value != 0),
     })
+}
+
+fn authority_require_live_coordinator(
+    current: &AuthorityRow,
+    expected_token: &str,
+    now_ms: i64,
+) -> Result<(), rusqlite::Error> {
+    if current.coordinator_token.as_deref() != Some(expected_token) || expected_token.is_empty() {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            AuthorityTransitionError::CoordinatorToken,
+        )));
+    }
+    if current.lease_expires_at.unwrap_or(0) <= now_ms {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            AuthorityTransitionError::CoordinatorLeaseExpired,
+        )));
+    }
+    Ok(())
 }
 
 fn split_flat_block_id(id: &str) -> Option<(&str, u64)> {
@@ -6449,7 +6572,11 @@ impl McStore {
     /// stable workspace appear to change on every check, breaking cache consistency. The
     /// fingerprint includes each member's visibility epoch so revocation invalidates all
     /// affected caches in the same deterministic change.
-    pub fn workspace_fingerprint(&self, project_path: &str) -> Result<String, McStoreError> {
+    pub fn workspace_fingerprint(
+        &self,
+        project_path: &str,
+        now_ms: i64,
+    ) -> Result<String, McStoreError> {
         let Some(m) = self.resolve_workspace_membership(project_path)? else {
             return Ok(String::new());
         };
@@ -6481,8 +6608,69 @@ impl McStore {
         for cat in &shared {
             out.push_str(&format!("{}:{};", cat.len(), cat));
         }
+        // Earliest still-unexpired foreign expires_at is part of the fingerprint so that
+        // when time alone drops a foreign row from visibility, the fingerprint changes and
+        // forces exactly one full baseline recompute; after that pass the min advances or
+        // clears and the fingerprint stays stable again.
+        let earliest_foreign_expiry = self.earliest_unexpired_foreign_expires_at(&m, now_ms)?;
+        out.push_str(&format!(
+            "|exp:{}",
+            earliest_foreign_expiry
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
         out.push(']');
         Ok(out)
+    }
+
+    fn earliest_unexpired_foreign_expires_at(
+        &self,
+        membership: &WorkspaceMembership,
+        now_ms: i64,
+    ) -> Result<Option<i64>, McStoreError> {
+        let foreign: Vec<&str> = membership
+            .union_identities
+            .iter()
+            .map(String::as_str)
+            .filter(|path| *path != membership.own_identity.as_str())
+            .collect();
+        if foreign.is_empty() || membership.share_categories.is_empty() {
+            return Ok(None);
+        }
+        let path_placeholders = std::iter::repeat_n("?", foreign.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cat_placeholders = std::iter::repeat_n("?", membership.share_categories.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT MIN(expires_at) FROM mc_memories
+              WHERE project_path IN ({path_placeholders})
+                AND status IN ('active','permanent')
+                AND shareable = 1
+                AND scope IN ('project','ecosystem','universe')
+                AND category IN ({cat_placeholders})
+                AND expires_at IS NOT NULL
+                AND expires_at > ?"
+        );
+        let mut binds: Vec<rusqlite::types::Value> = foreign
+            .iter()
+            .map(|path| rusqlite::types::Value::from((*path).to_string()))
+            .collect();
+        binds.extend(
+            membership
+                .share_categories
+                .iter()
+                .map(|cat| rusqlite::types::Value::from(cat.clone())),
+        );
+        binds.push(rusqlite::types::Value::from(now_ms));
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+            })
+            .map_err(Into::into)
     }
 
     /// Load render-eligible memories across a workspace UNION: every member's `active` +
@@ -8075,8 +8263,9 @@ impl McStore {
                             params![context_store_uuid, project],
                         )?;
                         tx.execute(
-                            "DELETE FROM mc_authority_pending_memory_references WHERE context_store_uuid = ?1",
-                            params![context_store_uuid],
+                            "DELETE FROM mc_authority_pending_memory_references
+                              WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
+                            params![context_store_uuid, project, domain],
                         )?;
                     } else {
                         tx.execute(
@@ -8135,6 +8324,19 @@ impl McStore {
                             found: format!("{} generation {}", current.state, current.generation),
                         },
                     )));
+                }
+                if domain == "memories" {
+                    let pending: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM mc_authority_pending_memory_references
+                          WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
+                        params![context_store_uuid, project, domain],
+                        |row| row.get(0),
+                    )?;
+                    if pending > 0 {
+                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                            AuthorityTransitionError::UnresolvedPendingReferences { count: pending },
+                        )));
+                    }
                 }
                 tx.execute(
                     "UPDATE mc_authority SET checksum_expected = ?1, checksum_actual = ?2, checksum_ok = ?3
@@ -8319,10 +8521,21 @@ impl McStore {
                             },
                         )));
                     }
+                    // Takeover or same-lease resume mints a fresh token so the prior
+                    // coordinator cannot keep journaling with a stale attempt identity.
+                    let token = mint_coordinator_token(lease, lease_expires_at, current.generation);
                     tx.execute(
-                        "UPDATE mc_authority SET coordinator_lease = ?1, lease_expires_at = ?2
-                           WHERE context_store_uuid = ?3 AND project = ?4 AND domain = ?5",
-                        params![lease, lease_expires_at, context_store_uuid, project, domain],
+                        "UPDATE mc_authority
+                            SET coordinator_lease = ?1, lease_expires_at = ?2, coordinator_token = ?3
+                          WHERE context_store_uuid = ?4 AND project = ?5 AND domain = ?6",
+                        params![
+                            lease,
+                            lease_expires_at,
+                            token,
+                            context_store_uuid,
+                            project,
+                            domain
+                        ],
                     )?;
                     return tx.query_row(
                         AUTHORITY_SELECT_SQL,
@@ -8343,15 +8556,26 @@ impl McStore {
                     params![domain],
                     |row| row.get(0),
                 )?;
+                let next_generation = current.generation + 1;
+                let token = mint_coordinator_token(lease, lease_expires_at, next_generation);
                 tx.execute(
                     "UPDATE mc_authority
                         SET state = 'DRAINING', generation = generation + 1,
                             captured_upper_bound = ?1, drain_generation = generation + 1,
                             drain_cursor = 0, coordinator_lease = ?2, lease_expires_at = ?3,
+                            coordinator_token = ?4,
                             step_seed = 0, step_memories = 0, step_notes = 0,
                             step_compartments = 0, step_reconcile = 0, step_verify = 0, step_flip = 0
-                      WHERE context_store_uuid = ?4 AND project = ?5 AND domain = ?6",
-                    params![upper_bound, lease, lease_expires_at, context_store_uuid, project, domain],
+                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7",
+                    params![
+                        upper_bound,
+                        lease,
+                        lease_expires_at,
+                        token,
+                        context_store_uuid,
+                        project,
+                        domain
+                    ],
                 )?;
                 tx.query_row(
                     AUTHORITY_SELECT_SQL,
@@ -8363,6 +8587,7 @@ impl McStore {
     }
 
     /// Advance one idempotent DRAINING journal bit or its feed cursor.
+    #[allow(clippy::too_many_arguments)]
     pub fn authority_drain_step(
         &self,
         context_store_uuid: &str,
@@ -8371,6 +8596,8 @@ impl McStore {
         expected_generation: u64,
         step: &str,
         cursor: Option<i64>,
+        coordinator_token: &str,
+        now_ms: i64,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
         let column = match step {
@@ -8406,6 +8633,7 @@ impl McStore {
                         },
                     )));
                 }
+                authority_require_live_coordinator(&current, coordinator_token, now_ms)?;
                 tx.execute(
                     &format!("UPDATE mc_authority SET {column} = 1, drain_cursor = COALESCE(?1, drain_cursor) WHERE context_store_uuid = ?2 AND project = ?3 AND domain = ?4"),
                     params![cursor, context_store_uuid, project, domain],
@@ -8420,8 +8648,8 @@ impl McStore {
     }
 
     /// Complete DRAINING after the host has verified every journal step.
-    /// The checksum and generation fields are intentionally supplied together so
-    /// a stale coordinator cannot publish a partial handoff.
+    /// The checksum, generation, and coordinator token are intentionally supplied
+    /// together so a stale coordinator cannot publish a partial handoff.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_finish_drain(
         &self,
@@ -8432,6 +8660,8 @@ impl McStore {
         checksum_expected: &str,
         checksum_actual: &str,
         verified: bool,
+        coordinator_token: &str,
+        now_ms: i64,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
         self.inner
@@ -8457,6 +8687,7 @@ impl McStore {
                         },
                     )));
                 }
+                authority_require_live_coordinator(&current, coordinator_token, now_ms)?;
                 let all_steps = current.step_seed
                     && current.step_memories
                     && current.step_notes
@@ -8474,7 +8705,8 @@ impl McStore {
                 tx.execute(
                     "UPDATE mc_authority SET state = 'TS', generation = generation + 1,
                             checksum_expected = ?1, checksum_actual = ?2, checksum_ok = ?3,
-                            coordinator_lease = NULL, lease_expires_at = NULL, step_flip = 1
+                            coordinator_lease = NULL, lease_expires_at = NULL,
+                            coordinator_token = NULL, step_flip = 1
                       WHERE context_store_uuid = ?4 AND project = ?5 AND domain = ?6",
                     params![
                         checksum_expected,
@@ -8627,23 +8859,31 @@ impl McStore {
             match (target_source_row_id, superseded_by_memory_id) {
                 (Some(target), None) => {
                     tx.execute(
-                        "INSERT INTO mc_authority_pending_memory_references(context_store_uuid, source_context_row_id, target_context_row_id) VALUES (?1, ?2, ?3) ON CONFLICT(context_store_uuid, source_context_row_id) DO UPDATE SET target_context_row_id = excluded.target_context_row_id",
-                        params![context_store_uuid, source_row_id, target],
+                        "INSERT INTO mc_authority_pending_memory_references(
+                            context_store_uuid, project, domain, source_context_row_id, target_context_row_id
+                         ) VALUES (?1, ?2, 'memories', ?3, ?4)
+                         ON CONFLICT(context_store_uuid, project, domain, source_context_row_id)
+                         DO UPDATE SET target_context_row_id = excluded.target_context_row_id",
+                        params![context_store_uuid, project, source_row_id, target],
                     )?;
                 }
                 _ => {
                     tx.execute(
-                        "DELETE FROM mc_authority_pending_memory_references WHERE context_store_uuid = ?1 AND source_context_row_id = ?2",
-                        params![context_store_uuid, source_row_id],
+                        "DELETE FROM mc_authority_pending_memory_references
+                          WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'
+                            AND source_context_row_id = ?3",
+                        params![context_store_uuid, project, source_row_id],
                     )?;
                 }
             }
             let pending = {
                 let mut statement = tx.prepare(
-                    "SELECT source_context_row_id, target_context_row_id FROM mc_authority_pending_memory_references WHERE context_store_uuid = ?1",
+                    "SELECT source_context_row_id, target_context_row_id
+                       FROM mc_authority_pending_memory_references
+                      WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
                 )?;
                 let rows = statement
-                    .query_map(params![context_store_uuid], |row| {
+                    .query_map(params![context_store_uuid, project], |row| {
                         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -8652,19 +8892,23 @@ impl McStore {
             for (source, target) in pending {
                 let translated = tx
                     .query_row(
-                        "SELECT id FROM mc_memories WHERE context_store_uuid = ?1 AND context_row_id = ?2",
-                        params![context_store_uuid, target],
+                        "SELECT id FROM mc_memories
+                          WHERE context_store_uuid = ?1 AND project_path = ?2 AND context_row_id = ?3",
+                        params![context_store_uuid, project, target],
                         |row| row.get::<_, i64>(0),
                     )
                     .optional()?;
                 let Some(translated) = translated else { continue };
                 tx.execute(
-                    "UPDATE mc_memories SET superseded_by_memory_id = ?1 WHERE context_store_uuid = ?2 AND context_row_id = ?3",
-                    params![translated, context_store_uuid, source],
+                    "UPDATE mc_memories SET superseded_by_memory_id = ?1
+                      WHERE context_store_uuid = ?2 AND project_path = ?3 AND context_row_id = ?4",
+                    params![translated, context_store_uuid, project, source],
                 )?;
                 tx.execute(
-                    "DELETE FROM mc_authority_pending_memory_references WHERE context_store_uuid = ?1 AND source_context_row_id = ?2",
-                    params![context_store_uuid, source],
+                    "DELETE FROM mc_authority_pending_memory_references
+                      WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'
+                        AND source_context_row_id = ?3",
+                    params![context_store_uuid, project, source],
                 )?;
             }
             tx.execute(
@@ -11434,7 +11678,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let before = store.workspace_fingerprint(own).unwrap();
+        let before = store.workspace_fingerprint(own, 0).unwrap();
         store
             .inner
             .with_conn_fenced(|tx| {
@@ -11442,7 +11686,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let after = store.workspace_fingerprint(own).unwrap();
+        let after = store.workspace_fingerprint(own, 0).unwrap();
         assert_ne!(before, after);
         assert_eq!(
             store
@@ -11485,6 +11729,7 @@ mod tests {
                 )?;
                 tx.execute("UPDATE mc_memories SET expires_at = 0 WHERE id = 1", [])?;
                 tx.execute("UPDATE mc_memories SET shareable = 0 WHERE id = 1", [])?;
+                // Idempotent no-op after the row is already non-visible ignoring expiry.
                 tx.execute("UPDATE mc_memories SET shareable = 0 WHERE id = 1", [])?;
                 Ok(())
             })
@@ -11499,7 +11744,8 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(epoch, 1);
+        // expires_at and shareable each bump once; the final no-op does not.
+        assert_eq!(epoch, 2);
     }
 
     #[test]
@@ -11547,7 +11793,7 @@ mod tests {
         let foreign = "git:foreign";
 
         // a project in NO workspace → stable empty marker
-        assert_eq!(store.workspace_fingerprint(own).unwrap(), "");
+        assert_eq!(store.workspace_fingerprint(own, 0).unwrap(), "");
 
         store
             .inner
@@ -11568,8 +11814,8 @@ mod tests {
 
         // same membership → byte-identical across repeated reads (stability for an
         // unchanged workspace, so it never forces a needless re-render)
-        let fp1 = store.workspace_fingerprint(own).unwrap();
-        let fp2 = store.workspace_fingerprint(own).unwrap();
+        let fp1 = store.workspace_fingerprint(own, 0).unwrap();
+        let fp2 = store.workspace_fingerprint(own, 0).unwrap();
         assert_eq!(fp1, fp2, "stable workspace → stable fingerprint");
         assert!(!fp1.is_empty());
         // both members appear; the foreign member changes the marker (membership-sensitive)
@@ -11586,7 +11832,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let fp3 = store.workspace_fingerprint(own).unwrap();
+        let fp3 = store.workspace_fingerprint(own, 0).unwrap();
         assert_ne!(fp1, fp3, "a real membership change must change the marker");
     }
 
@@ -13355,6 +13601,7 @@ mod shadow_tests {
             .unwrap();
         assert_eq!(draining.state, "DRAINING");
         assert_eq!(draining.captured_upper_bound, Some(0));
+        let token = draining.coordinator_token.clone().expect("token minted");
         let stepped = store
             .authority_drain_step(
                 "store-uuid",
@@ -13363,6 +13610,8 @@ mod shadow_tests {
                 draining.generation,
                 "seed",
                 Some(0),
+                &token,
+                0,
             )
             .unwrap();
         assert!(stepped.step_seed);
@@ -13397,6 +13646,7 @@ mod shadow_tests {
                     0,
                 )
                 .unwrap();
+            let token = draining.coordinator_token.clone().expect("token minted");
             let steps = ["seed", "memories", "notes", "compartments", "reconcile", "verify"];
             for step in steps.iter().take(completed_steps) {
                 store
@@ -13407,6 +13657,8 @@ mod shadow_tests {
                         draining.generation,
                         step,
                         Some(0),
+                        &token,
+                        0,
                     )
                     .unwrap();
             }
@@ -13423,6 +13675,8 @@ mod shadow_tests {
                 .unwrap();
             assert_eq!(resumed.generation, draining.generation);
             assert_eq!(resumed.captured_upper_bound, draining.captured_upper_bound);
+            let resume_token = resumed.coordinator_token.clone().expect("resume token");
+            assert_ne!(resume_token, token, "resume mints a fresh coordinator token");
             for step in steps.iter().skip(completed_steps) {
                 store
                     .authority_drain_step(
@@ -13432,6 +13686,8 @@ mod shadow_tests {
                         resumed.generation,
                         step,
                         Some(0),
+                        &resume_token,
+                        101,
                     )
                     .unwrap();
             }
@@ -13444,6 +13700,8 @@ mod shadow_tests {
                     "hash",
                     "hash",
                     true,
+                    &resume_token,
+                    101,
                 )
                 .unwrap();
             assert_eq!(finished.state, "TS");
@@ -13478,6 +13736,227 @@ mod shadow_tests {
             .authority_begin_drain("store-uuid", "project", "memories", "second", 400, 201)
             .unwrap();
         assert_eq!(resumed.coordinator_lease.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn authority_drain_stale_coordinator_token_rejected_after_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let preparing = store
+            .authority_begin_prepare("store-uuid", "project", "memories")
+            .unwrap();
+        store
+            .authority_finish_prepare(
+                "store-uuid",
+                "project",
+                "memories",
+                preparing.generation,
+                "hash",
+                "hash",
+                true,
+            )
+            .unwrap();
+        let first = store
+            .authority_begin_drain("store-uuid", "project", "memories", "first", 100, 0)
+            .unwrap();
+        let stale_token = first.coordinator_token.clone().expect("first token");
+        let second = store
+            .authority_begin_drain("store-uuid", "project", "memories", "second", 400, 101)
+            .unwrap();
+        let live_token = second.coordinator_token.clone().expect("second token");
+        assert_ne!(stale_token, live_token);
+        assert!(store
+            .authority_drain_step(
+                "store-uuid",
+                "project",
+                "memories",
+                second.generation,
+                "seed",
+                Some(0),
+                &stale_token,
+                150,
+            )
+            .is_err());
+        assert!(store
+            .authority_finish_drain(
+                "store-uuid",
+                "project",
+                "memories",
+                second.generation,
+                "hash",
+                "hash",
+                true,
+                &stale_token,
+                150,
+            )
+            .is_err());
+        store
+            .authority_drain_step(
+                "store-uuid",
+                "project",
+                "memories",
+                second.generation,
+                "seed",
+                Some(0),
+                &live_token,
+                150,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn authority_pending_references_are_project_scoped_and_block_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let snapshot = |project: &str, source_id: i64, superseded_by: Option<i64>| {
+            serde_json::json!({
+                "id": source_id,
+                "project_path": project,
+                "category": "CONSTRAINTS",
+                "content": format!("{project}-{source_id}"),
+                "normalized_hash": format!("h{source_id}"),
+                "status": "active",
+                "superseded_by_memory_id": superseded_by,
+            })
+        };
+        store
+            .authority_begin_prepare("store-uuid", "project-a", "memories")
+            .unwrap();
+        store
+            .seed_authority_row(
+                "store-uuid",
+                "memories",
+                1,
+                &snapshot("project-a", 1, Some(99)),
+            )
+            .unwrap();
+        store
+            .authority_begin_prepare("store-uuid", "project-b", "memories")
+            .unwrap();
+        let pending_b: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_authority_pending_memory_references
+                      WHERE context_store_uuid = 'store-uuid' AND project = 'project-a'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(pending_b, 1, "project B begin must not wipe project A pending refs");
+        store
+            .seed_authority_row(
+                "store-uuid",
+                "memories",
+                2,
+                &snapshot("project-b", 2, Some(88)),
+            )
+            .unwrap();
+        let preparing_b = store
+            .authority_status("store-uuid", "project-b", "memories")
+            .unwrap()
+            .unwrap();
+        let err = store
+            .authority_verify_prepare(
+                "store-uuid",
+                "project-b",
+                "memories",
+                preparing_b.generation,
+                "x",
+                "x",
+            )
+            .expect_err("unresolved pending refs must reject complete");
+        assert!(
+            err.to_string().contains("unresolved pending memory references")
+                || format!("{err:?}").contains("UnresolvedPending")
+                || format!("{err}").contains("pending"),
+            "typed pending-ref rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn natural_foreign_expiry_changes_workspace_fingerprint_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let own = "git:exp-own";
+        let foreign = "git:exp-foreign";
+        let deadline = 1_000_i64;
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_workspaces (id, name, share_categories) VALUES (1,'exp-ws','[\"ARCHITECTURE\"]')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_workspace_members (workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?1, ?1, ?1, 0), (1, ?2, ?2, ?2, 0)",
+                    params![own, foreign],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_memories
+                       (id, project_path, category, content, normalized_hash, importance,
+                        scope, shareable, status, expires_at, first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (1, ?1, 'ARCHITECTURE', 'shared until expiry', 'h1', 50,
+                             'project', 1, 'active', ?2, 0, 0, 0, 0)",
+                    params![foreign, deadline],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let before = store.workspace_fingerprint(own, deadline - 1).unwrap();
+        let at_deadline = store.workspace_fingerprint(own, deadline).unwrap();
+        let after = store.workspace_fingerprint(own, deadline + 1).unwrap();
+        assert_ne!(before, at_deadline, "crossing expiry must HARD once");
+        assert_eq!(
+            at_deadline, after,
+            "fingerprint must not oscillate after the expiry HARD"
+        );
+    }
+
+    #[test]
+    fn same_second_visibility_revocation_bumps_epoch_without_sqlite_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let own = "git:same-sec-own";
+        let foreign = "git:same-sec-foreign";
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_workspaces (id, name, share_categories) VALUES (1,'ss-ws','[\"ARCHITECTURE\"]')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_workspace_members (workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?1, ?1, ?1, 0), (1, ?2, ?2, ?2, 0)",
+                    params![own, foreign],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_memories
+                       (id, project_path, category, content, normalized_hash, importance,
+                        scope, shareable, status, expires_at, first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (1, ?1, 'ARCHITECTURE', 'shared', 'h1', 50,
+                             'project', 1, 'active',
+                             CAST(strftime('%s', 'now') AS INTEGER) * 1000, 0, 0, 0, 0)",
+                    params![foreign],
+                )?;
+                // Revoke while expires_at equals SQLite's second clock — the old trigger
+                // could treat OLD as already invisible and skip the epoch bump.
+                tx.execute("UPDATE mc_memories SET shareable = 0 WHERE id = 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let epoch = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT epoch FROM mc_memory_visibility_epoch WHERE project_path = ?1",
+                    params![foreign],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert!(epoch >= 1, "same-second revocation must bump visibility epoch");
     }
 
     #[test]

@@ -273,7 +273,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 if (
                     action === "write" &&
                     args.surface_condition?.trim() &&
-                    deps.rustToolBackends?.noteEvaluationAvailable?.() !== true
+                    deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) !== true
                 ) {
                     return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
                 }

@@ -4,6 +4,10 @@ import { afterEach, describe, expect, it, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+    type AuthorityStatus,
+    getAuthorityManagedMarker,
+} from "../../features/magic-context/context-authority";
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
@@ -588,5 +592,138 @@ describe("Rust mode authority adapter", () => {
         }
         expect(transform.getState(sessionId).parked).toBe(false);
         expect(transformCalls).toBe(1);
+    });
+});
+
+describe("prepareRustMemoryAuthority mixed restore", () => {
+    it("reconciles remaining MODULE domains after a DRAINING resume before tools open", async () => {
+        const db = makeDb();
+        const projectPath = "/mixed-restore";
+        const statuses = new Map<string, AuthorityStatus | null>([
+            [
+                "memories",
+                {
+                    context_store_uuid: "store",
+                    project: projectPath,
+                    domain: "memories",
+                    state: "DRAINING",
+                    generation: 3,
+                    coordinator_token: "tok-a",
+                    captured_upper_bound: 0,
+                },
+            ],
+            [
+                "notes",
+                {
+                    context_store_uuid: "store",
+                    project: projectPath,
+                    domain: "notes",
+                    state: "MODULE",
+                    generation: 2,
+                },
+            ],
+        ]);
+        const module: RustModeModuleClient = {
+            call: async () => ({ ok: true }),
+            authorityStatus: async (args) => ({
+                authority: statuses.get(args.domain) ?? null,
+            }),
+            authorityPrepare: async () => {
+                throw new Error("prepare should not run on mixed DRAINING resume");
+            },
+            authoritySeed: async () => ({ seeded: 0 }),
+            authorityDrain: async (args) => {
+                if (args.action === "begin") {
+                    return {
+                        authority: {
+                            context_store_uuid: "store",
+                            project: projectPath,
+                            domain: "memories",
+                            state: "DRAINING",
+                            generation: 3,
+                            coordinator_token: "tok-a",
+                            captured_upper_bound: 0,
+                        },
+                    };
+                }
+                if (args.action === "finish") {
+                    statuses.set("memories", {
+                        context_store_uuid: "store",
+                        project: projectPath,
+                        domain: "memories",
+                        state: "TS",
+                        generation: 4,
+                    });
+                    return {
+                        authority: {
+                            context_store_uuid: "store",
+                            project: projectPath,
+                            domain: "memories",
+                            state: "TS",
+                            generation: 4,
+                            coordinator_token: "tok-a",
+                        },
+                    };
+                }
+                return {
+                    authority: {
+                        context_store_uuid: "store",
+                        project: projectPath,
+                        domain: "memories",
+                        state: "DRAINING",
+                        generation: 3,
+                        coordinator_token: "tok-a",
+                    },
+                };
+            },
+            mirrorPull: async (args) => ({
+                page: {
+                    domain: args.domain,
+                    cursor: args.cursor,
+                    next_cursor: args.cursor,
+                    has_more: false,
+                    rows: [],
+                },
+            }),
+        };
+        const state = {
+            initialized: false,
+            consecutiveFailures: 0,
+            passCount: 0,
+            parked: false,
+            passesSincePark: 0,
+            warningSent: false,
+            ordinalMemoAnchor: null,
+            ordinalMemoStoredCount: null,
+            ordinalMemoCanonicalCount: 0,
+            seedPassPending: true,
+            failureCount: 0,
+            parkCount: 0,
+            shadowGeneration: 0,
+            lastAckedSeq: 0,
+            lastAckedWatermarks: null,
+            idOrdinalMemoGeneration: 0,
+            idOrdinalMemo: new Map(),
+            syntheticTurnCount: 0,
+            lastObservedUserMessageId: null,
+            syntheticLoopBreakerLogged: false,
+            memoryAuthorityProject: null as string | null,
+            memoryAuthorityReady: false,
+        };
+        await __rustModeTransformTest.prepareRustMemoryAuthority({
+            db,
+            module,
+            projectPath,
+            state,
+        });
+        expect(state.memoryAuthorityReady).toBe(true);
+        expect(getAuthorityManagedMarker(db, projectPath)).not.toBeNull();
+        expect(() =>
+            db
+                .prepare(
+                    "INSERT INTO notes(type, status, content, project_path, session_id, created_at, updated_at) VALUES ('plain', 'active', 'blocked', ?, 's', 0, 0)",
+                )
+                .run(projectPath),
+        ).toThrow("managed by the Rust module");
     });
 });

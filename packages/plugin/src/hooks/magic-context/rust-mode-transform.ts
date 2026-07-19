@@ -419,40 +419,41 @@ async function prepareRustMemoryAuthority(args: {
         });
         statuses.set(domain, null);
     }
-    if (resumedDrain) {
-        state.memoryAuthorityReady = true;
-        return;
-    }
 
-    for (const domain of domains) {
-        const current = statuses.get(domain);
-        if (current?.state !== "PREPARING") continue;
-        await module.authorityPrepare({
-            method: "authority.prepare",
-            phase: "abort",
-            context_store_uuid: contextStoreUuid,
-            project: projectPath,
-            domain,
-            generation: current.generation,
-        });
-        statuses.set(domain, null);
-    }
-    const preparing = domains.filter((domain) => statuses.get(domain)?.state !== "MODULE");
-    for (const domain of preparing) {
-        const stateName = statuses.get(domain)?.state;
-        if (stateName && stateName !== "TS") {
-            throw new Error(`${domain} authority cannot prepare from ${stateName}`);
+    // Do not return before finishing authority restore: if some domains are still
+    // DRAINING and others MODULE, reinstall the on-disk authority_managed marker and
+    // re-apply write fences on remaining MODULE domains before any tools run.
+    if (!resumedDrain) {
+        for (const domain of domains) {
+            const current = statuses.get(domain);
+            if (current?.state !== "PREPARING") continue;
+            await module.authorityPrepare({
+                method: "authority.prepare",
+                phase: "abort",
+                context_store_uuid: contextStoreUuid,
+                project: projectPath,
+                domain,
+                generation: current.generation,
+            });
+            statuses.set(domain, null);
         }
-    }
-    if (preparing.length > 0) {
-        await prepareAuthority({
-            db,
-            projectPath,
-            domains: preparing,
-            module: authorityModule,
-            seedPages: async (domain) => authoritySeedRows(db, projectPath, domain),
-            checksum: (_domain, rows) => checksumAuthoritySeedRows(rows),
-        });
+        const preparing = domains.filter((domain) => statuses.get(domain)?.state !== "MODULE");
+        for (const domain of preparing) {
+            const stateName = statuses.get(domain)?.state;
+            if (stateName && stateName !== "TS") {
+                throw new Error(`${domain} authority cannot prepare from ${stateName}`);
+            }
+        }
+        if (preparing.length > 0) {
+            await prepareAuthority({
+                db,
+                projectPath,
+                domains: preparing,
+                module: authorityModule,
+                seedPages: async (domain) => authoritySeedRows(db, projectPath, domain),
+                checksum: (_domain, rows) => checksumAuthoritySeedRows(rows),
+            });
+        }
     }
 
     await reconcileAuthorityProject({ db, projectPath, module: authorityModule });
@@ -1013,4 +1014,5 @@ export const __rustModeTransformTest = {
     buildTransformBody,
     createRustModeTransform,
     directiveTextOf,
+    prepareRustMemoryAuthority,
 };

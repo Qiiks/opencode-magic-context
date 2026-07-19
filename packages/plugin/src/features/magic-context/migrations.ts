@@ -2282,6 +2282,30 @@ const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 57,
+        description: "domain mutation epoch for authority capture bounds",
+        up(db: Database): void {
+            // Privileged same-connection writes do not advance PRAGMA data_version, so
+            // capture verification tracks an explicit per-domain mutation epoch instead.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS domain_mutation_epoch (
+                    project_path TEXT NOT NULL,
+                    domain TEXT NOT NULL CHECK(domain IN ('memories', 'notes')),
+                    epoch INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(project_path, domain)
+                );
+            `);
+            if (tableExists(db, "authority_capture_bounds")) {
+                ensureColumn(
+                    db,
+                    "authority_capture_bounds",
+                    "mutation_epoch",
+                    "INTEGER NOT NULL DEFAULT 0",
+                );
+            }
+        },
+    },
 ];
 
 /**

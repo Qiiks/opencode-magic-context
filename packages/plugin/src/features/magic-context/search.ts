@@ -12,6 +12,7 @@ import {
     getMemoriesByProjects,
     getProjectEmbeddings,
     type Memory,
+    ModuleMemoryAuthorityError,
     peekProjectEmbeddings,
     searchMemoriesFTS,
     searchMemoriesFTSUnion,
@@ -1703,6 +1704,8 @@ export async function unifiedSearch(
     // Only count retrievals for explicit agent-driven searches. Plugin-internal
     // automatic surfacing (auto-search hints) should not inflate retrieval_count
     // because the agent may never actually consume the hint.
+    // retrieval_count is telemetry, not correctness: under MODULE authority the
+    // TS write path is fenced, so skip the bump rather than failing the search.
     const countRetrievals = options.countRetrievals ?? true;
     if (countRetrievals) {
         const memoryIds = results
@@ -1712,7 +1715,13 @@ export async function unifiedSearch(
         if (memoryIds.length > 0) {
             db.transaction(() => {
                 for (const memoryId of memoryIds) {
-                    updateMemoryRetrievalCount(db, memoryId);
+                    try {
+                        updateMemoryRetrievalCount(db, memoryId);
+                    } catch (error) {
+                        // Telemetry only — module-managed rows must not fail the search.
+                        if (error instanceof ModuleMemoryAuthorityError) continue;
+                        throw error;
+                    }
                 }
             })();
         }

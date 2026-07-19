@@ -40,7 +40,7 @@ export interface RustToolBackends {
     note?: (args: RustNoteToolRequest) => Promise<unknown>;
     /** Route ctx_memory only after memories authority reports MODULE. */
     memory?: (args: RustMemoryToolRequest) => Promise<unknown>;
-    /** Smart-note writes fail closed when the host evaluator cannot send note.evaluate. */
-    noteEvaluationAvailable?: () => boolean;
+    /** Smart-note writes fail closed when the host evaluator cannot send note.evaluate for this project. */
+    noteEvaluationAvailable?: (projectPath: string) => boolean;
     memorySync?: (sessionId: string) => void;
 }

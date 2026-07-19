@@ -903,7 +903,7 @@ fn apply_once(
     let effective_render_config = fold_m0_content_epoch(
         &req.render_config,
         &M0ContentEpoch {
-            workspace_fingerprint: store.workspace_fingerprint(ctx.project_path)?,
+            workspace_fingerprint: store.workspace_fingerprint(ctx.project_path, ctx.now_ms)?,
             upgrade_state: String::new(),
             memory_content_epoch: String::new(),
             memory_render_epoch,
@@ -11632,7 +11632,7 @@ mod tests {
         let good_cfg = fold_m0_content_epoch(
             "cfg0",
             &M0ContentEpoch {
-                workspace_fingerprint: s.workspace_fingerprint("git:proj").unwrap(),
+                workspace_fingerprint: s.workspace_fingerprint("git:proj", 0).unwrap(),
                 upgrade_state: String::new(),
                 memory_content_epoch: String::new(),
                 memory_render_epoch: format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
@@ -11781,7 +11781,7 @@ mod tests {
         fold_m0_content_epoch(
             cfg,
             &M0ContentEpoch {
-                workspace_fingerprint: store.workspace_fingerprint("git:proj").unwrap(),
+                workspace_fingerprint: store.workspace_fingerprint("git:proj", 0).unwrap(),
                 upgrade_state: String::new(),
                 memory_content_epoch: String::new(),
                 memory_render_epoch,

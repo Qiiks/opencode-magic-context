@@ -3,14 +3,19 @@ import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import type { AuthorityModuleClient, AuthorityStatus, ChangefeedPage } from "./context-authority";
 import {
     applyMirrorPage,
+    bumpDomainMutationEpoch,
     drainAuthority,
     ensureContextStoreUuid,
     getAuthorityManagedMarker,
+    getModuleNoteEvaluationBridge,
     installAuthorityManagedMarker,
     prepareAuthority,
     reconcileAuthorityProject,
+    registerModuleNoteEvaluationBridge,
 } from "./context-authority";
+import { getMemoriesByProjects } from "./memory/storage-memory";
 import { runMigrations } from "./migrations";
+import { resolveMemoriesByIdsForSearch, unifiedSearch } from "./search";
 import { initializeDatabase } from "./storage-db";
 
 function db(): Database {
@@ -254,7 +259,12 @@ describe("memory authority protocol", () => {
             }),
             authorityDrain: async (args) => {
                 memoryState = args.action === "finish" ? "TS" : "DRAINING";
-                return { authority: authority(memoryState, ++generation) };
+                return {
+                    authority: {
+                        ...authority(memoryState, ++generation),
+                        coordinator_token: "tok-live",
+                    },
+                };
             },
         };
         const result = await drainAuthority({
@@ -414,5 +424,211 @@ describe("memory authority protocol", () => {
             .prepare("SELECT id, superseded_by_memory_id FROM memories ORDER BY id")
             .all() as Array<{ id: number; superseded_by_memory_id: number | null }>;
         expect(rows[0]?.superseded_by_memory_id).toBe(rows[1]?.id);
+    });
+
+    test("privileged same-connection UPDATE between capture and verify aborts prepare", async () => {
+        const database = db();
+        database
+            .prepare(
+                "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'seed', 'h1', 0, 0, 0, 0)",
+            )
+            .run("/repo");
+        const module = protocol({ bytes: [] });
+        const ordinaryPrepare = module.authorityPrepare;
+        module.authorityPrepare = async (args) => {
+            if (args.phase === "complete") {
+                withPrivilegedWriter(database, () => {
+                    database
+                        .prepare("UPDATE memories SET content = 'drifted' WHERE project_path = ?")
+                        .run("/repo");
+                    bumpDomainMutationEpoch(database, "/repo", "memories");
+                });
+            }
+            return ordinaryPrepare(args);
+        };
+        await expect(
+            prepareAuthority({
+                db: database,
+                projectPath: "/repo",
+                domains: ["memories"],
+                module,
+                seedPages: async () => {
+                    const rows = database
+                        .prepare("SELECT * FROM memories WHERE project_path = ? ORDER BY id")
+                        .all("/repo") as Array<Record<string, unknown>>;
+                    return rows.map((snapshot) => ({ source_row_id: snapshot.id, snapshot }));
+                },
+            }),
+        ).rejects.toThrow("authority capture bound changed");
+        expect(getAuthorityManagedMarker(database, "/repo")).toBeNull();
+    });
+
+    test("unmapped tombstone clears pending references without resurrecting the source", () => {
+        const database = db();
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: true,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 10,
+                        full_row_snapshot: {
+                            id: 10,
+                            project_path: "/repo",
+                            category: "CONSTRAINTS",
+                            content: "source",
+                            normalized_hash: "h10",
+                            scope: "project",
+                            shareable: 0,
+                            seen_count: 1,
+                            retrieval_count: 0,
+                            first_seen_at: 0,
+                            created_at: 0,
+                            updated_at: 0,
+                            last_seen_at: 0,
+                            status: "active",
+                            verification_status: "unverified",
+                            superseded_by_memory_id: 99,
+                        },
+                        content_hash: "h10",
+                    },
+                ],
+            },
+        });
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get() as {
+                c: number;
+            },
+        ).toEqual({ c: 1 });
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 1,
+                next_cursor: 2,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 2,
+                        domain: "memories",
+                        op: "tombstone",
+                        module_row_id: 99,
+                        full_row_snapshot: {
+                            id: 99,
+                            project_path: "/repo",
+                            category: "CONSTRAINTS",
+                            content: "",
+                            normalized_hash: "",
+                        },
+                        content_hash: null,
+                    },
+                ],
+            },
+        });
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get() as {
+                c: number;
+            },
+        ).toEqual({ c: 0 });
+        expect(
+            database.prepare("SELECT superseded_by_memory_id FROM memories WHERE id = 1").get(),
+        ).toEqual({ superseded_by_memory_id: null });
+    });
+
+    test("foreign archived expired and unshareable rows stay hidden on the id search path", () => {
+        const database = db();
+        const now = Date.now();
+        database
+            .prepare(
+                "INSERT INTO workspaces(id, name, created_at, updated_at, share_categories) VALUES (1, 'ws', 0, 0, ?)",
+            )
+            .run(JSON.stringify(["CONSTRAINTS"]));
+        database
+            .prepare(
+                "INSERT INTO workspace_members(workspace_id, project_path, display_name, display_path, added_at) VALUES (1, '/own', 'own', '/own', 0), (1, '/foreign', 'foreign', '/foreign', 0)",
+            )
+            .run();
+        database
+            .prepare(
+                `INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at, status, shareable, scope, expires_at)
+                 VALUES
+                 ('/own', 'CONSTRAINTS', 'own archived', 'h1', 0, 0, 0, 0, 'archived', 0, 'project', NULL),
+                 ('/foreign', 'CONSTRAINTS', 'foreign archived', 'h2', 0, 0, 0, 0, 'archived', 1, 'project', NULL),
+                 ('/foreign', 'CONSTRAINTS', 'foreign expired', 'h3', 0, 0, 0, 0, 'active', 1, 'project', ?),
+                 ('/foreign', 'CONSTRAINTS', 'foreign private', 'h4', 0, 0, 0, 0, 'active', 0, 'project', NULL),
+                 ('/foreign', 'CONSTRAINTS', 'foreign visible', 'h5', 0, 0, 0, 0, 'active', 1, 'project', NULL)`,
+            )
+            .run(now - 1);
+        const rows = getMemoriesByProjects(
+            database,
+            ["/own", "/foreign"],
+            ["active", "permanent", "archived"],
+            now,
+            ["/own"],
+            ["CONSTRAINTS"],
+        );
+        const contents = rows.map((row) => row.content).sort();
+        expect(contents).toEqual(["foreign visible", "own archived"]);
+        const idPath = resolveMemoriesByIdsForSearch({
+            db: database,
+            projectPath: "/own",
+            ids: [1, 2, 3, 4, 5],
+            limit: 10,
+        });
+        expect(idPath?.map((hit) => hit.content).sort()).toEqual([
+            "foreign visible",
+            "own archived",
+        ]);
+    });
+
+    test("note evaluation bridges are scoped per project", async () => {
+        const calls: string[] = [];
+        registerModuleNoteEvaluationBridge("/project-a", {
+            sync: async () => {
+                calls.push("sync-a");
+            },
+            evaluate: async () => {
+                calls.push("eval-a");
+            },
+        });
+        expect(getModuleNoteEvaluationBridge("/project-a")).toBeDefined();
+        expect(getModuleNoteEvaluationBridge("/project-b")).toBeUndefined();
+        await getModuleNoteEvaluationBridge("/project-a")?.evaluate({
+            contextNoteId: 1,
+            sessionId: "s",
+            verdict: true,
+        });
+        expect(calls).toEqual(["eval-a"]);
+    });
+
+    test("module-managed memory search skips retrieval_count writes", async () => {
+        const database = db();
+        installAuthorityManagedMarker(database, "/repo");
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at, status) VALUES (?, 'CONSTRAINTS', 'search me unique-token-xyz', 'h', 0, 0, 0, 0, 'active')",
+                )
+                .run("/repo");
+        });
+        const before = database
+            .prepare("SELECT retrieval_count AS c FROM memories WHERE id = 1")
+            .get() as { c: number };
+        const results = await unifiedSearch(database, "session", "/repo", "unique-token-xyz", {
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            countRetrievals: true,
+        });
+        expect(results.some((result) => result.source === "memory")).toBe(true);
+        const after = database
+            .prepare("SELECT retrieval_count AS c FROM memories WHERE id = 1")
+            .get() as { c: number };
+        expect(after.c).toBe(before.c);
     });
 });

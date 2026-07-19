@@ -15,6 +15,7 @@ import {
     applyMirrorPage,
     ensureContextStoreUuid,
     getMirrorCursor,
+    getModuleNoteEvaluationBridge,
     registerModuleNoteEvaluationBridge,
 } from "../../features/magic-context/context-authority";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
@@ -721,10 +722,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               arguments: { action, content, category, ids, reason },
                           },
                       }),
-                  noteEvaluationAvailable: () =>
-                      Boolean(
-                          rustModeModuleClient.authorityStatus && rustModeModuleClient.mirrorPull,
-                      ),
+                  noteEvaluationAvailable: (evaluationProjectPath: string) =>
+                      getModuleNoteEvaluationBridge(evaluationProjectPath) !== undefined,
                   memorySync: (sessionId: string) => {
                       rustMemorySyncRequestedSessions.add(sessionId);
                   },

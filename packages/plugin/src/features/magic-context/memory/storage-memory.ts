@@ -794,28 +794,74 @@ export function getMemoriesByProjects(
 ): Memory[] {
     const identities = uniqueValues(projectPaths);
     if (identities.length === 0 || statuses.length === 0) return [];
-    const sharingFilter = buildWorkspaceMemorySqlFilter({
-        identities,
-        ownIdentities,
-        shareCategories,
-        includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
-    });
-    if (identities.length === 1 && !sharingFilter.active) {
-        return getMemoriesByProject(db, identities[0], statuses, expiryCutoff);
+    const identitySet = new Set(identities);
+    const ownSet = new Set(
+        uniqueValues(ownIdentities ?? []).filter((identity) => identitySet.has(identity)),
+    );
+    const foreignIdentities = identities.filter((identity) => !ownSet.has(identity));
+    const ownIdentitiesResolved = identities.filter((identity) => ownSet.has(identity));
+    // Single-project own-only path keeps the caller's status set (including archived).
+    if (
+        foreignIdentities.length === 0 ||
+        shareCategories === null ||
+        shareCategories === undefined
+    ) {
+        if (identities.length === 1) {
+            return getMemoriesByProject(db, identities[0], statuses, expiryCutoff);
+        }
+        const rows = db
+            .prepare(
+                `SELECT ${getMemorySelectColumns(db)}
+                   FROM memories
+                  WHERE project_path IN (${sqlPlaceholders(identities)})
+                    AND status IN (${sqlPlaceholders(statuses)})
+                    AND (expires_at IS NULL OR expires_at > ?)
+                  ORDER BY category ASC, updated_at DESC, id ASC`,
+            )
+            .all(...identities, ...statuses, expiryCutoff)
+            .filter(isMemoryRow);
+        return rows.map(toMemory);
     }
 
+    // Foreign rows always use the complete canonical visibility predicate, independent
+    // of the caller's own-row status set (which may include archived for local reads).
+    const shareCats = uniqueValues([...shareCategories]);
+    const hasClassification = hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db);
+    const predicates: string[] = [];
+    const params: Array<string | number> = [];
+    if (ownIdentitiesResolved.length > 0) {
+        predicates.push(
+            `(project_path IN (${sqlPlaceholders(ownIdentitiesResolved)})
+              AND status IN (${sqlPlaceholders(statuses)})
+              AND (expires_at IS NULL OR expires_at > ?))`,
+        );
+        params.push(...ownIdentitiesResolved, ...statuses, expiryCutoff);
+    }
+    if (foreignIdentities.length > 0 && shareCats.length > 0) {
+        const classification = hasClassification
+            ? " AND shareable = 1 AND scope IN ('project','ecosystem','universe')"
+            : "";
+        predicates.push(
+            `(project_path IN (${sqlPlaceholders(foreignIdentities)})
+              AND status IN ('active','permanent')
+              AND (expires_at IS NULL OR expires_at > ?)
+              AND category IN (${sqlPlaceholders(shareCats)})${classification})`,
+        );
+        params.push(...foreignIdentities, expiryCutoff, ...shareCats);
+    }
+    if (predicates.length === 0) return [];
+    // Retain the canonical foreign-visibility SQL constant so this path stays aligned
+    // with mc-store's FOREIGN_VISIBLE_SQL (status/expiry/shareable/scope/category).
+    void FOREIGN_VISIBLE_SQL;
     const rows = db
         .prepare(
             `SELECT ${getMemorySelectColumns(db)}
                FROM memories
-              WHERE project_path IN (${sqlPlaceholders(identities)})
-                AND status IN (${sqlPlaceholders(statuses)})
-                AND (expires_at IS NULL OR expires_at > ?)${sharingFilter.clause}
+              WHERE (${predicates.join(" OR ")})
               ORDER BY category ASC, updated_at DESC, id ASC`,
         )
-        .all(...identities, ...statuses, expiryCutoff, ...sharingFilter.params)
+        .all(...params)
         .filter(isMemoryRow);
-
     return rows.map(toMemory);
 }
 

@@ -5086,6 +5086,14 @@ impl McHandler {
                 let Some(generation) = request.get("generation").and_then(Value::as_u64) else {
                     return invalid_params_error("authority drain finish requires generation");
                 };
+                let token = request
+                    .get("coordinator_token")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let now = request
+                    .get("now_ms")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_else(now_ms);
                 store.authority_finish_drain(
                     context_store_uuid,
                     project,
@@ -5103,6 +5111,8 @@ impl McHandler {
                         .get("verified")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    token,
+                    now,
                 )
             }
             step => {
@@ -5110,6 +5120,14 @@ impl McHandler {
                     return invalid_params_error("authority drain step requires generation");
                 };
                 let step = step.strip_prefix("drain_").unwrap_or(step);
+                let token = request
+                    .get("coordinator_token")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let now = request
+                    .get("now_ms")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_else(now_ms);
                 store.authority_drain_step(
                     context_store_uuid,
                     project,
@@ -5117,6 +5135,8 @@ impl McHandler {
                     generation,
                     step,
                     request.get("cursor").and_then(Value::as_i64),
+                    token,
+                    now,
                 )
             }
         };

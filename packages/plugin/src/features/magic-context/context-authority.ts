@@ -22,6 +22,10 @@ export interface AuthorityStatus {
     step_reconcile?: boolean;
     step_verify?: boolean;
     step_flip?: boolean;
+    coordinator_lease?: string | null;
+    lease_expires_at?: number | null;
+    /** Attempt-unique drain coordinator token minted at begin/takeover. */
+    coordinator_token?: string | null;
     checksum_expected?: string | null;
     checksum_actual?: string | null;
     checksum_ok?: number | boolean | null;
@@ -319,11 +323,6 @@ export function checksumAuthoritySeedRows(rows: readonly Record<string, unknown>
         .digest("hex");
 }
 
-function dataVersion(db: Database): number {
-    const row = db.prepare("PRAGMA data_version").get() as { data_version?: number } | undefined;
-    return typeof row?.data_version === "number" ? row.data_version : 0;
-}
-
 function maxDomainRowId(db: Database, domain: AuthorityDomain, projectPath: string): number {
     const row = (
         domain === "memories"
@@ -347,6 +346,34 @@ function maxDomainRowId(db: Database, domain: AuthorityDomain, projectPath: stri
     return typeof row?.max_rowid === "number" ? row.max_rowid : 0;
 }
 
+/** Read the transactionally maintained domain mutation epoch (0 when never bumped). */
+export function readDomainMutationEpoch(
+    db: Database,
+    projectPath: string,
+    domain: AuthorityDomain,
+): number {
+    const row = db
+        .prepare("SELECT epoch FROM domain_mutation_epoch WHERE project_path = ? AND domain = ?")
+        .get(projectPath, domain) as { epoch?: number } | undefined;
+    return typeof row?.epoch === "number" ? row.epoch : 0;
+}
+
+/**
+ * Bump the domain mutation epoch inside the current privileged write transaction.
+ * Same-connection privileged UPDATEs do not advance PRAGMA data_version; this epoch
+ * is the capture bound that detects those writes.
+ */
+export function bumpDomainMutationEpoch(
+    db: Database,
+    projectPath: string,
+    domain: AuthorityDomain,
+): void {
+    db.prepare(
+        `INSERT INTO domain_mutation_epoch(project_path, domain, epoch) VALUES (?, ?, 1)
+         ON CONFLICT(project_path, domain) DO UPDATE SET epoch = epoch + 1`,
+    ).run(projectPath, domain);
+}
+
 function installMarkerAndCaptureBounds(args: {
     db: Database;
     projectPath: string;
@@ -361,16 +388,15 @@ function installMarkerAndCaptureBounds(args: {
                     "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?) ON CONFLICT(project_path) DO UPDATE SET context_store_uuid = excluded.context_store_uuid, marked_at = excluded.marked_at",
                 )
                 .run(args.projectPath, args.contextStoreUuid, Date.now());
-            const version = dataVersion(args.db);
             const capture = args.db.prepare(
-                "INSERT INTO authority_capture_bounds(project_path, domain, max_rowid, data_version, captured_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_path, domain) DO UPDATE SET max_rowid = excluded.max_rowid, data_version = excluded.data_version, captured_at = excluded.captured_at",
+                "INSERT INTO authority_capture_bounds(project_path, domain, max_rowid, data_version, mutation_epoch, captured_at) VALUES (?, ?, ?, 0, ?, ?) ON CONFLICT(project_path, domain) DO UPDATE SET max_rowid = excluded.max_rowid, data_version = excluded.data_version, mutation_epoch = excluded.mutation_epoch, captured_at = excluded.captured_at",
             );
             for (const domain of args.domains) {
                 capture.run(
                     args.projectPath,
                     domain,
                     maxDomainRowId(args.db, domain, args.projectPath),
-                    version,
+                    readDomainMutationEpoch(args.db, args.projectPath, domain),
                     Date.now(),
                 );
             }
@@ -393,18 +419,17 @@ function capturedBoundsUnchanged(
 ): boolean {
     db.exec("BEGIN IMMEDIATE");
     try {
-        const version = dataVersion(db);
         const read = db.prepare(
-            "SELECT max_rowid, data_version FROM authority_capture_bounds WHERE project_path = ? AND domain = ?",
+            "SELECT max_rowid, mutation_epoch FROM authority_capture_bounds WHERE project_path = ? AND domain = ?",
         );
         const unchanged = domains.every((domain) => {
             const captured = read.get(projectPath, domain) as
-                | { max_rowid: number; data_version: number }
+                | { max_rowid: number; mutation_epoch: number }
                 | undefined;
             return (
                 captured !== undefined &&
                 captured.max_rowid === maxDomainRowId(db, domain, projectPath) &&
-                captured.data_version === version
+                captured.mutation_epoch === readDomainMutationEpoch(db, projectPath, domain)
             );
         });
         db.exec("COMMIT");
@@ -569,6 +594,10 @@ export async function drainAuthority(args: {
             lease_expires_at: leaseStartedAt + 60_000,
         })
     ).authority;
+    const coordinatorToken = status.coordinator_token;
+    if (typeof coordinatorToken !== "string" || coordinatorToken.length === 0) {
+        throw new Error("authority drain begin omitted coordinator_token");
+    }
     const upperBound = status.captured_upper_bound ?? status.drain_cursor ?? 0;
     while (getMirrorCursor(args.db, args.domain) < upperBound) {
         const cursor = getMirrorCursor(args.db, args.domain);
@@ -598,6 +627,8 @@ export async function drainAuthority(args: {
                 action: step,
                 generation: status.generation,
                 cursor: getMirrorCursor(args.db, args.domain),
+                coordinator_token: coordinatorToken,
+                now_ms: Date.now(),
             })
         ).authority;
     }
@@ -613,6 +644,8 @@ export async function drainAuthority(args: {
             checksum_expected: drainChecksum,
             checksum_actual: drainChecksum,
             verified: true,
+            coordinator_token: coordinatorToken,
+            now_ms: Date.now(),
         })
     ).authority;
     if (finished.state !== "TS") {
@@ -752,6 +785,11 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
     const moduleProject = rowString(row, "project_path");
     if (!moduleProject) throw new Error("memory feed snapshot has no project_path");
     if (feed.op === "tombstone") {
+        // Drop pending refs even when the tombstoned module row was never mapped
+        // locally; otherwise a forward reference to a never-seen target leaks forever.
+        db.prepare(
+            "DELETE FROM mirror_pending_references WHERE domain = ? AND module_project = ? AND (module_row_id = ? OR target_module_row_id = ?)",
+        ).run(feed.domain, moduleProject, feed.module_row_id, feed.module_row_id);
         const mapped = mirrorIdentity(db, feed.domain, moduleProject, feed.module_row_id);
         if (!mapped) return;
         db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(mapped.context_row_id);
@@ -759,9 +797,6 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
         db.prepare(
             "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
         ).run(feed.domain, moduleProject, feed.module_row_id);
-        db.prepare(
-            "DELETE FROM mirror_pending_references WHERE domain = ? AND module_project = ? AND (module_row_id = ? OR target_module_row_id = ?)",
-        ).run(feed.domain, moduleProject, feed.module_row_id, feed.module_row_id);
         return;
     }
     const contextId = contextMemoryId(db, feed.domain, moduleProject, row, feed.module_row_id);
@@ -967,13 +1002,19 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
     let nextCursor = durableCursor;
     withPrivilegedWriter(db, () => {
         db.transaction(() => {
+            const touchedProjects = new Set<string>();
             for (const feed of page.rows) {
                 if (feed.domain !== page.domain || feed.feed_seq <= nextCursor) continue;
+                const projectPath = rowString(feed.full_row_snapshot, "project_path");
+                if (projectPath) touchedProjects.add(projectPath);
                 if (feed.domain === "memories") applyMemoryRow(db, feed);
                 else applyNoteRow(db, feed);
                 nextCursor = feed.feed_seq;
             }
             translateMemoryReferences(db);
+            for (const projectPath of touchedProjects) {
+                bumpDomainMutationEpoch(db, projectPath, page.domain);
+            }
             if (page.next_cursor < nextCursor) {
                 throw new Error("mirror page moved its cursor backwards");
             }
