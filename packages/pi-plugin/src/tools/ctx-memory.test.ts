@@ -866,4 +866,196 @@ describe("createCtxMemoryTool", () => {
 			closeQuietly(db);
 		}
 	});
+
+	describe("get action", () => {
+		it("returns an own-project memory by id", async () => {
+			const db = createTestDb();
+			try {
+				const ctx = fakeContext("ses-get") as never;
+				const projectIdentity = resolveProjectIdentity(
+					(ctx as { cwd: string }).cwd,
+				);
+				const memory = insertMemory(db, {
+					projectPath: projectIdentity,
+					category: "CONSTRAINTS",
+					content: "Use the shared formatter.",
+				});
+				const primary = createCtxMemoryTool({
+					db,
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					allowDreamerActions: false,
+				});
+
+				const result = await primary.execute(
+					"call-get",
+					{ action: "get", ids: [memory.id] },
+					new AbortController().signal,
+					undefined,
+					ctx,
+				);
+
+				expect(result.isError).toBeUndefined();
+				const text = result.content[0]?.text ?? "";
+				expect(text).toContain(`Found 1 active memory`);
+				expect(text).toContain(String(memory.id));
+				expect(text).toContain("Use the shared formatter.");
+			} finally {
+				closeQuietly(db);
+			}
+		});
+
+		it("labels archived rows with their status instead of hiding them", async () => {
+			const db = createTestDb();
+			try {
+				const ctx = fakeContext("ses-get-archived") as never;
+				const projectIdentity = resolveProjectIdentity(
+					(ctx as { cwd: string }).cwd,
+				);
+				const memory = insertMemory(db, {
+					projectPath: projectIdentity,
+					category: "KNOWN_ISSUES",
+					content: "Retired issue the user just referenced.",
+				});
+				db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(
+					memory.id,
+				);
+				const primary = createCtxMemoryTool({
+					db,
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					allowDreamerActions: false,
+				});
+
+				const result = await primary.execute(
+					"call-get-archived",
+					{ action: "get", ids: [memory.id] },
+					new AbortController().signal,
+					undefined,
+					ctx,
+				);
+
+				const text = result.content[0]?.text ?? "";
+				expect(text).toContain(String(memory.id));
+				expect(text).toContain("archived");
+				expect(text).toContain("Retired issue the user just referenced.");
+			} finally {
+				closeQuietly(db);
+			}
+		});
+
+		it("reports a foreign non-shared-category memory as not visible (no existence oracle)", async () => {
+			const db = createTestDb();
+			try {
+				const ctx = fakeContext("ses-get-foreign") as never;
+				const ownIdentity = resolveProjectIdentity(
+					(ctx as { cwd: string }).cwd,
+				);
+				// Construct a workspace that shares only CONSTRAINTS so the
+				// foreign ARCHITECTURE memory is not visible from the own side.
+				db.exec(`
+					INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+					VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
+					INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+					VALUES (1, '${ownIdentity}', 'Own', '${ownIdentity}', 1),
+					       (1, 'git:foreign', 'Foreign', '/foreign', 1);
+				`);
+				const foreign = insertMemory(db, {
+					projectPath: "git:foreign",
+					category: "ARCHITECTURE",
+					content: "Foreign architecture hidden by the share policy.",
+				});
+				const primary = createCtxMemoryTool({
+					db,
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					allowDreamerActions: false,
+				});
+
+				const result = await primary.execute(
+					"call-get-foreign",
+					{ action: "get", ids: [foreign.id] },
+					new AbortController().signal,
+					undefined,
+					ctx,
+				);
+
+				const text = result.content[0]?.text ?? "";
+				expect(text).toContain(
+					`id ${foreign.id}: not found or not visible from this project`,
+				);
+				expect(text).not.toContain(
+					"Foreign architecture hidden by the share policy.",
+				);
+			} finally {
+				closeQuietly(db);
+			}
+		});
+
+		it("rejects >20 ids with a clear error", async () => {
+			const db = createTestDb();
+			try {
+				const ctx = fakeContext("ses-get-many") as never;
+				const primary = createCtxMemoryTool({
+					db,
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					allowDreamerActions: false,
+				});
+				const ids = Array.from({ length: 21 }, (_, i) => i + 1);
+
+				const result = await primary.execute(
+					"call-get-many",
+					{ action: "get", ids },
+					new AbortController().signal,
+					undefined,
+					ctx,
+				);
+
+				expect(result.isError).toBe(true);
+				expect(result.content[0]?.text).toContain("at most 20");
+			} finally {
+				closeQuietly(db);
+			}
+		});
+
+		it("returns a per-id report mixing hits and misses in call order", async () => {
+			const db = createTestDb();
+			try {
+				const ctx = fakeContext("ses-get-mixed") as never;
+				const projectIdentity = resolveProjectIdentity(
+					(ctx as { cwd: string }).cwd,
+				);
+				const own = insertMemory(db, {
+					projectPath: projectIdentity,
+					category: "CONSTRAINTS",
+					content: "Own constraint present.",
+				});
+				const missing = 999_999;
+				const primary = createCtxMemoryTool({
+					db,
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					allowDreamerActions: false,
+				});
+
+				const result = await primary.execute(
+					"call-get-mixed",
+					{ action: "get", ids: [own.id, missing] },
+					new AbortController().signal,
+					undefined,
+					ctx,
+				);
+
+				const text = result.content[0]?.text ?? "";
+				expect(text).toContain(String(own.id));
+				expect(text).toContain("Own constraint present.");
+				expect(text).toContain(
+					`id ${missing}: not found or not visible from this project`,
+				);
+			} finally {
+				closeQuietly(db);
+			}
+		});
+	});
 });

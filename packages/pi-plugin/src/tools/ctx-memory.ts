@@ -35,6 +35,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	archiveMemory,
+	getMemoriesByIds,
 	getMemoriesByProject,
 	getMemoryByHash,
 	getMemoryById,
@@ -81,21 +82,33 @@ const DEFAULT_LIST_LIMIT = 10;
 
 // Mirrors OpenCode CTX_MEMORY_DREAMER_ACTIONS. `delete` was removed — it was an
 // exact alias of `archive` (both soft-archive); `archive` is the single
-// soft-remove action. Primary agents get write/archive/update/merge on the
+// soft-remove action. Primary agents get write/archive/update/merge/get on the
 // memories they already see (with ids) in the injected project-memory block;
-// `list` (bulk enumeration) stays dreamer-only. Memory verification (file
-// mapping) and classification are no longer tool actions — the verify and
-// classify dreamer tasks apply them host-side from a manifest.
-const ALL_ACTIONS = ["write", "archive", "update", "merge", "list"] as const;
+// `list` (bulk enumeration) stays dreamer-only. `get` is the id-shaped read
+// that the user-facing <project-memory> ids imply but no other primary action
+// covered — the agent is given a memory id (dashboard, guidance) and there is
+// no other way to look it up. Memory verification (file mapping) and
+// classification are no longer tool actions — the verify and classify dreamer
+// tasks apply them host-side from a manifest.
+const ALL_ACTIONS = [
+	"write",
+	"archive",
+	"update",
+	"merge",
+	"get",
+	"list",
+] as const;
 type CtxMemoryAction = (typeof ALL_ACTIONS)[number];
 
 const DREAMER_ONLY_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(["list"]);
+
+const GET_MAX_IDS = 20;
 
 const ParamsSchema = Type.Object({
 	action: Type.Union(
 		ALL_ACTIONS.map((a) => Type.Literal(a)),
 		{
-			description: "What to do: write, update, archive, merge, or list",
+			description: "What to do: write, update, archive, merge, get, or list",
 		},
 	),
 	content: Type.Optional(
@@ -116,7 +129,7 @@ const ParamsSchema = Type.Object({
 	ids: Type.Optional(
 		Type.Array(Type.Number(), {
 			description:
-				"Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more",
+				"Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
 		}),
 	),
 	limit: Type.Optional(
@@ -226,6 +239,30 @@ function inactiveMemoryError(
 	action: "updating" | "merging" | "archiving",
 ): string {
 	return `Error: Memory with ID ${id} is archived or superseded; restore it before ${action}.`;
+}
+
+// Per-id not-found / not-visible wording. Sharing one message between the two
+// states avoids an existence oracle for foreign memories — a caller that knows
+// a memory is hidden by workspace share policy should not be able to
+// distinguish "this id is foreign and not shared" from "this id does not
+// exist" by reading the error text.
+const getNotVisibleMessage = (id: number): string =>
+	`id ${id}: not found or not visible from this project`;
+
+function formatGetOutput(args: {
+	requestedIds: number[];
+	memoriesById: Map<number, Memory>;
+}): string {
+	const parts: string[] = [];
+	for (const id of args.requestedIds) {
+		const memory = args.memoriesById.get(id);
+		if (!memory) {
+			parts.push(getNotVisibleMessage(id));
+		} else {
+			parts.push(formatMemoryList([memory]));
+		}
+	}
+	return parts.join("\n\n");
 }
 
 function updateMemoryContentInCurrentTransaction(
@@ -448,6 +485,35 @@ export function createCtxMemoryTool(
 					? filtered.filter((m) => m.category === category)
 					: filtered;
 				return ok(formatMemoryList(filtered2.slice(0, limit)));
+			}
+
+			if (params.action === "get") {
+				const getIds = params.ids;
+				if (!getIds || getIds.length === 0 || !getIds.every(Number.isInteger)) {
+					return err(
+						"Error: 'ids' must contain at least one integer memory ID when action is 'get'.",
+					);
+				}
+				if (getIds.length > GET_MAX_IDS) {
+					return err(
+						`Error: 'ids' must contain at most ${GET_MAX_IDS} memory IDs when action is 'get' (got ${getIds.length}).`,
+					);
+				}
+				// De-dupe while preserving first-seen order so the output lists
+				// each requested id exactly once and never reflects a row twice.
+				const uniqueIds = [...new Set(getIds)];
+				const fetched = getMemoriesByIds(deps.db, uniqueIds);
+				const memoriesById = new Map<number, Memory>(
+					fetched
+						.filter((memory) => memoryVisibleToTool(memory))
+						.map((memory) => [memory.id, memory]),
+				);
+				return ok(
+					formatGetOutput({
+						requestedIds: uniqueIds,
+						memoriesById,
+					}),
+				);
 			}
 
 			if (params.action === "update") {

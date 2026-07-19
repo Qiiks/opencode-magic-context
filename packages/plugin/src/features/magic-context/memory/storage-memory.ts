@@ -85,6 +85,7 @@ const VERIFICATION_STATUS_LOOKUP = {
 const insertMemoryStatements = new WeakMap<Database, PreparedStatement>();
 const getMemoryByHashStatements = new WeakMap<Database, PreparedStatement>();
 const getMemoryByIdStatements = new WeakMap<Database, PreparedStatement>();
+const getMemoriesByIdsStatements = new Map<string, WeakMap<Database, PreparedStatement>>();
 const activeMemoriesNoExpiryStatements = new WeakMap<Database, PreparedStatement>();
 const updateMemorySeenCountStatements = new WeakMap<Database, PreparedStatement>();
 const updateMemoryRetrievalCountStatements = new WeakMap<Database, PreparedStatement>();
@@ -343,6 +344,24 @@ function getMemoryByIdStatement(db: Database): PreparedStatement {
     if (!stmt) {
         stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id = ?`);
         getMemoryByIdStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getMemoriesByIdsStatement(db: Database, idCount: number): PreparedStatement {
+    const key = `n${idCount}`;
+    let map = getMemoriesByIdsStatements.get(key);
+    if (!map) {
+        map = new WeakMap<Database, PreparedStatement>();
+        getMemoriesByIdsStatements.set(key, map);
+    }
+    let stmt = map.get(db);
+    if (!stmt) {
+        const placeholders = new Array(idCount).fill("?").join(", ");
+        stmt = db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id IN (${placeholders})`,
+        );
+        map.set(db, stmt);
     }
     return stmt;
 }
@@ -818,6 +837,25 @@ export function getMemoryById(db: Database, id: number): Memory | null {
         return null;
     }
     return toMemory(result);
+}
+
+/** Load multiple memories by id in one positional-bind statement.
+ *
+ *  Returns whatever rows exist; missing ids are simply absent from the result.
+ *  Visibility (own project vs foreign workspace + share category) is the
+ *  caller's job — this helper does not enforce it. The tool layer applies the
+ *  same union-read predicate used by every other read path (`memoryVisibleToTool`)
+ *  and reports not-found / not-visible ids with one opaque per-id message, so
+ *  foreign memory existence is never leaked. */
+export function getMemoriesByIds(db: Database, ids: readonly number[]): Memory[] {
+    const uniqueIds = Array.from(new Set(ids.filter((id) => Number.isInteger(id))));
+    if (uniqueIds.length === 0) {
+        return [];
+    }
+    const rows = getMemoriesByIdsStatement(db, uniqueIds.length)
+        .all(...uniqueIds)
+        .filter(isMemoryRow);
+    return rows.map(toMemory);
 }
 
 export function updateMemorySeenCount(db: Database, id: number): void {

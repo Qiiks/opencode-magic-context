@@ -4,7 +4,12 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
-import { type UnifiedSearchResult, unifiedSearch } from "../../features/magic-context/search";
+import {
+    parseIdShapedQuery,
+    resolveMemoriesByIdsForSearch,
+    type UnifiedSearchResult,
+    unifiedSearch,
+} from "../../features/magic-context/search";
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
 import {
     CTX_SEARCH_DESCRIPTION,
@@ -207,6 +212,31 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                 : deps.embeddingEnabled;
             const gitCommitsEnabled =
                 embeddingSnapshot?.gitCommitEnabled ?? deps.gitCommitsEnabled ?? false;
+
+            // ID-shaped short-circuit: when the whole query is one or more
+            // memory ids, bypass the lexical+semantic lanes and look the ids
+            // up directly. The agent is given memory ids everywhere
+            // (<project-memory> shows `#id:` lines, dashboard, guidance) and
+            // ctx_search was the only tool that could surface content for
+            // an id but it did so through text matching. Whole-query id list
+            // only — `parseIdShapedQuery` returns null for "fix bug 1234" so
+            // numeric phrases still search text. If no ids resolve (foreign
+            // hidden, missing, hard-deleted) the call falls through to the
+            // normal lanes so a query like "7234" with no such memory still
+            // returns the corpus text matches.
+            const idShape = parseIdShapedQuery(query);
+            if (idShape && memoryEnabled) {
+                const idResults = resolveMemoriesByIdsForSearch({
+                    db: deps.db,
+                    projectPath,
+                    ids: idShape,
+                    limit: Math.max(normalizeLimit(args.limit), idShape.length),
+                    visibleMemoryIds,
+                });
+                if (idResults !== null) {
+                    return formatSearchResults(query, idResults, toolContext.sessionID);
+                }
+            }
 
             const results = await unifiedSearch(
                 deps.db,

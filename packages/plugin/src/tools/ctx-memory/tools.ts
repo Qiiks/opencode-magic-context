@@ -4,6 +4,7 @@ import { SIDEKICK_AGENT } from "../../agents/sidekick";
 import {
     archiveMemory,
     CATEGORY_PRIORITY,
+    getMemoriesByIds,
     getMemoriesByProject,
     getMemoryByHash,
     getMemoryById,
@@ -147,6 +148,32 @@ function filterByCategory(memories: Memory[], category?: string): Memory[] {
     return memories.filter((memory) => memory.category === category);
 }
 
+// Per-id not-found / not-visible wording. Sharing one message between the two
+// states avoids an existence oracle for foreign memories — a caller that knows
+// a memory is hidden by workspace share policy should not be able to
+// distinguish "this id is foreign and not shared" from "this id does not
+// exist" by reading the error text.
+const GET_NOT_VISIBLE_MESSAGE = (id: number): string =>
+    `id ${id}: not found or not visible from this project`;
+
+const GET_MAX_IDS = 20;
+
+function formatGetOutput(args: {
+    requestedIds: number[];
+    memoriesById: Map<number, Memory>;
+}): string {
+    const parts: string[] = [];
+    for (const id of args.requestedIds) {
+        const memory = args.memoriesById.get(id);
+        if (!memory) {
+            parts.push(GET_NOT_VISIBLE_MESSAGE(id));
+        } else {
+            parts.push(formatMemoryList([memory]));
+        }
+    }
+    return parts.join("\n\n");
+}
+
 function queueMemoryEmbedding(args: {
     deps: CtxMemoryToolDeps;
     sessionId: string;
@@ -287,7 +314,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             // schema visible to the runtime and enforce primary-session safety below.
             action: tool.schema
                 .enum([...CTX_MEMORY_DREAMER_ACTIONS])
-                .describe("What to do: write, update, archive, merge, or list"),
+                .describe("What to do: write, update, archive, merge, get, or list"),
             content: tool.schema
                 .string()
                 .optional()
@@ -304,7 +331,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 .array(tool.schema.number())
                 .optional()
                 .describe(
-                    "Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more",
+                    "Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
                 ),
             limit: tool.schema.number().optional().describe("Max results for list (default: 10)"),
             reason: tool.schema
@@ -449,6 +476,29 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 ).slice(0, limit);
 
                 return formatMemoryList(memories);
+            }
+
+            if (args.action === "get") {
+                const getIds = args.ids;
+                if (!getIds || getIds.length === 0 || !getIds.every(Number.isInteger)) {
+                    return "Error: 'ids' must contain at least one integer memory ID when action is 'get'.";
+                }
+                if (getIds.length > GET_MAX_IDS) {
+                    return `Error: 'ids' must contain at most ${GET_MAX_IDS} memory IDs when action is 'get' (got ${getIds.length}).`;
+                }
+                // De-dupe while preserving first-seen order so the output lists
+                // each requested id exactly once and never reflects a row twice.
+                const uniqueIds = [...new Set(getIds)];
+                const fetched = getMemoriesByIds(deps.db, uniqueIds);
+                const memoriesById = new Map<number, Memory>(
+                    fetched
+                        .filter((memory) => memoryVisibleToTool(memory))
+                        .map((memory) => [memory.id, memory]),
+                );
+                return formatGetOutput({
+                    requestedIds: uniqueIds,
+                    memoriesById,
+                });
             }
 
             if (args.action === "update") {
