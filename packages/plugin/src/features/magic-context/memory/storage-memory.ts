@@ -1,4 +1,8 @@
-import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
+import {
+    registerPrivilegedWriter,
+    type Database,
+    type Statement as PreparedStatement,
+} from "../../../shared/sqlite";
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
 import { invalidateMemory, invalidateProject } from "./embedding-cache";
 import { computeNormalizedHash } from "./normalize-hash";
@@ -569,12 +573,19 @@ export class ModuleMemoryAuthorityError extends Error {
 }
 
 function assertTsMemoryWriteAllowed(db: Database, projectPath: string): void {
-    const managed = db
-        .prepare(
-            "SELECT 1 FROM authority_managed WHERE project_path = ? UNION SELECT 1 FROM authority_repair_pending WHERE project_path = ? LIMIT 1",
-        )
-        .get(projectPath, projectPath);
-    if (managed) throw new ModuleMemoryAuthorityError(projectPath);
+    registerPrivilegedWriter(db);
+    try {
+        const managed = db
+            .prepare(
+                "SELECT 1 FROM authority_managed WHERE project_path = ? UNION SELECT 1 FROM authority_repair_pending WHERE project_path = ? LIMIT 1",
+            )
+            .get(projectPath, projectPath);
+        if (managed) throw new ModuleMemoryAuthorityError(projectPath);
+    } catch (error) {
+        // Older isolated test/legacy databases have no authority tables; their
+        // absent marker means ordinary TypeScript ownership by definition.
+        if (!(error instanceof Error) || !error.message.includes("no such table")) throw error;
+    }
 }
 
 function assertTsMemoryIdWriteAllowed(db: Database, id: number): Memory | null {

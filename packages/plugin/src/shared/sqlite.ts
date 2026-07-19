@@ -202,6 +202,7 @@ export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
 const registeredPrivilegeFunctions = new WeakSet<Database>();
+const privilegeUdfAvailable = new WeakSet<Database>();
 
 /** Register the connection-local privilege predicate used by managed-write guards. */
 export function registerPrivilegedWriter(db: Database): void {
@@ -216,8 +217,12 @@ export function registerPrivilegedWriter(db: Database): void {
     } else if (typeof native.createFunction === "function") {
         native.createFunction("mc_privileged_writer", implementation);
     } else {
-        throw new Error("SQLite backend cannot register mc_privileged_writer");
+        // Older Bun releases do not expose scalar UDF registration. Migration 55
+        // retains the pre-UDF state-table trigger on those runtimes.
+        registeredPrivilegeFunctions.add(db);
+        return;
     }
+    privilegeUdfAvailable.add(db);
     registeredPrivilegeFunctions.add(db);
 }
 
@@ -242,7 +247,15 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
     }
     privilegeDepth.set(db, previousDepth + 1);
     try {
+        if (!privilegeUdfAvailable.has(db)) {
+            db.prepare(
+                "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
+            ).run();
+        }
         const result = operation();
+        if (!privilegeUdfAvailable.has(db) && previousDepth === 0) {
+            db.prepare("UPDATE context_privilege_state SET enabled = 0 WHERE id = 1").run();
+        }
         if (nested) {
             db.exec(`RELEASE ${savepoint}`);
         } else {

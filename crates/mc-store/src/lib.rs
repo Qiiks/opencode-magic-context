@@ -25,6 +25,10 @@ use std::io::{Read, Write};
 
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
+/// Canonical foreign-memory visibility predicate used by module SQL consumers.
+/// The plugin mirrors this literal to keep cache visibility and workspace policy aligned.
+pub const FOREIGN_VISIBLE_SQL: &str = "status IN ('active','permanent') AND (expires_at IS NULL OR expires_at > :now_ms) AND shareable = 1 AND scope IN ('project','ecosystem','universe') AND category IN (SELECT value FROM json_each(:share_categories)) AND project_path IN (SELECT project_path FROM mc_workspace_members WHERE workspace_id = :workspace_id) AND project_path <> :reader_project";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1023,6 +1027,46 @@ const MIGRATIONS: &[Migration] = &[
                     'anchor_block_id', OLD.anchor_block_id, 'created_at_ms', OLD.created_at_ms,
                     'updated_at_ms', OLD.updated_at_ms, 'context_store_uuid', OLD.context_store_uuid,
                     'context_row_id', OLD.context_row_id), NULL);
+        END;
+    "#,
+    },
+    Migration {
+        version: 24,
+        // A foreign-memory revocation changes the workspace cache identity exactly once.
+        // The trigger evaluates the complete old/new visibility transition in SQLite so
+        // direct SQL and facade mutations cannot bypass the epoch.
+        statements: r#"
+        CREATE TABLE IF NOT EXISTS mc_memory_visibility_epoch (
+            project_path TEXT PRIMARY KEY,
+            epoch INTEGER NOT NULL DEFAULT 0
+        );
+        DROP TRIGGER IF EXISTS mc_memories_visibility_epoch;
+        CREATE TRIGGER mc_memories_visibility_epoch
+        AFTER UPDATE OF status, expires_at, scope, shareable, category ON mc_memories
+        WHEN EXISTS (
+            SELECT 1
+              FROM mc_workspace_members old_member
+              JOIN mc_workspaces old_workspace ON old_workspace.id = old_member.workspace_id
+             WHERE old_member.project_path = OLD.project_path
+               AND OLD.status IN ('active','permanent')
+               AND OLD.shareable = 1
+               AND OLD.scope IN ('project','ecosystem','universe')
+               AND OLD.category IN (SELECT value FROM json_each(old_workspace.share_categories))
+        )
+        AND NOT EXISTS (
+            SELECT 1
+              FROM mc_workspace_members new_member
+              JOIN mc_workspaces new_workspace ON new_workspace.id = new_member.workspace_id
+             WHERE new_member.project_path = NEW.project_path
+               AND NEW.status IN ('active','permanent')
+               AND NEW.shareable = 1
+               AND NEW.scope IN ('project','ecosystem','universe')
+               AND NEW.category IN (SELECT value FROM json_each(new_workspace.share_categories))
+        )
+        BEGIN
+            INSERT INTO mc_memory_visibility_epoch(project_path, epoch)
+            VALUES (OLD.project_path, 1)
+            ON CONFLICT(project_path) DO UPDATE SET epoch = epoch + 1;
         END;
     "#,
     },
@@ -5884,10 +5928,10 @@ impl McStore {
     /// so no value forges a boundary. A nondeterministic fingerprint over a STABLE
     /// workspace would false-HARD every pass (the over-bust the m0/m1 split exists to
     /// avoid). Empty string when the project is in no workspace (the single-project state —
-    /// a stable "no workspace" marker). NOTE: in this slice the fingerprint covers
-    /// membership + share-policy only; production also folds each member's project-memory
-    /// epoch, which has no `mc_*` source yet (it lands with the deferred
-    /// `project_memory_epoch` marker when the write paths relocate).
+    /// a stable "no workspace" marker). A nondeterministic fingerprint would make a
+    /// stable workspace appear to change on every check, breaking cache consistency. The
+    /// fingerprint includes each member's visibility epoch so revocation invalidates all
+    /// affected caches in the same deterministic change.
     pub fn workspace_fingerprint(&self, project_path: &str) -> Result<String, McStoreError> {
         let Some(m) = self.resolve_workspace_membership(project_path)? else {
             return Ok(String::new());
@@ -5899,6 +5943,22 @@ impl McStore {
         let mut out = String::from("ws[");
         for id in &m.union_identities {
             out.push_str(&format!("m:{}:{};", id.len(), id));
+        }
+        let epochs = self.inner.with_conn(|conn| {
+            m.union_identities
+                .iter()
+                .map(|id| {
+                    conn.query_row(
+                        "SELECT COALESCE((SELECT epoch FROM mc_memory_visibility_epoch WHERE project_path = ?1), 0)",
+                        params![id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .collect::<Result<Vec<i64>, _>>()
+        })?;
+        out.push_str("|epochs:");
+        for (id, epoch) in m.union_identities.iter().zip(epochs) {
+            out.push_str(&format!("{}:{}:{};", id.len(), id, epoch));
         }
         out.push_str("|share:");
         for cat in &shared {
