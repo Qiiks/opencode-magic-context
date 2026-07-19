@@ -6870,6 +6870,14 @@ impl McStore {
                         },
                     )));
                 }
+                if verified && checksum_expected != checksum_actual {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        AuthorityTransitionError::State {
+                            expected: "matching checksums".to_string(),
+                            found: "verification failed".to_string(),
+                        },
+                    )));
+                }
                 let next_state = if verified { "MODULE" } else { "TS" };
                 tx.execute(
                     "UPDATE mc_authority
@@ -7064,7 +7072,7 @@ impl McStore {
                     && current.step_compartments
                     && current.step_reconcile
                     && current.step_verify;
-                if !all_steps || !verified {
+                if !all_steps || !verified || checksum_expected != checksum_actual {
                     return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                         AuthorityTransitionError::State {
                             expected: "all drain steps and verification".to_string(),
@@ -8037,6 +8045,13 @@ fn workspace_union_memory_visibility_filter_for_column(
 
     let mut binds: Vec<rusqlite::types::Value> =
         vec![rusqlite::types::Value::from(own_identity.clone())];
+    // Mirror the canonical visibility rule locally: when it requires shareable = 1,
+    // also restrict foreign rows to the allowed scopes and bind values positionally.
+    let foreign_policy = if FOREIGN_VISIBLE_SQL.contains("shareable = 1") {
+        " AND shareable = 1 AND scope IN ('project','ecosystem','universe')"
+    } else {
+        ""
+    };
     let mut sharing = format!("{path_column} = ?");
     if !foreign.is_empty() && !share_categories.is_empty() {
         let fph = std::iter::repeat_n("?", foreign.len())
@@ -8046,7 +8061,7 @@ fn workspace_union_memory_visibility_filter_for_column(
             .collect::<Vec<_>>()
             .join(", ");
         sharing.push_str(&format!(
-            " OR ({path_column} IN ({fph}) AND category IN ({cph}))"
+            " OR ({path_column} IN ({fph}) AND category IN ({cph}){foreign_policy})"
         ));
         for p in &foreign {
             binds.push(rusqlite::types::Value::from((*p).clone()));
@@ -9649,8 +9664,8 @@ mod tests {
                 tx.execute(
                     "INSERT INTO mc_memories
                        (id, project_path, category, content, normalized_hash, importance,
-                        status, expires_at, first_seen_at, created_at, updated_at, last_seen_at)
-                     VALUES (?1,?2,'ARCHITECTURE',?3,?4,?5,?6,?7,0,0,0,0)",
+                        scope, shareable, status, expires_at, first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (?1,?2,'ARCHITECTURE',?3,?4,?5,'project',1,?6,?7,0,0,0,0)",
                     params![
                         id,
                         project,
@@ -9774,6 +9789,50 @@ mod tests {
             .memory_mutations_for_render(&projects, 0, &[])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn foreign_shareable_revocation_bumps_visibility_epoch_and_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:epoch-own";
+        let foreign = "git:epoch-foreign";
+        insert_memory(&store, foreign, 1, "shared", Some(50), "active", None);
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_workspaces (id, name, share_categories) VALUES (1,'epoch-ws','[\"CONSTRAINTS\",\"ARCHITECTURE\"]')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_workspace_members (workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?1, ?1, ?1, 0), (1, ?2, ?2, ?2, 0)",
+                    params![own, foreign],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let before = store.workspace_fingerprint(own).unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute("UPDATE mc_memories SET shareable = 0 WHERE id = 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let after = store.workspace_fingerprint(own).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            store
+                .inner
+                .with_conn(|conn| conn.query_row(
+                    "SELECT epoch FROM mc_memory_visibility_epoch WHERE project_path = ?1",
+                    params![foreign],
+                    |row| row.get::<_, i64>(0),
+                ))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -10826,6 +10885,7 @@ mod shadow_tests {
         own.category = "ARCHITECTURE".to_string();
         let mut shared = memory(2, "foreign constraint");
         shared.project_path = foreign.to_string();
+        shared.shareable = 1;
         let mut private = memory(3, "foreign preference");
         private.project_path = foreign.to_string();
         private.category = "PREFERENCES".to_string();

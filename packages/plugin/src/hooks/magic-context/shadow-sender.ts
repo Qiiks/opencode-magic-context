@@ -13,16 +13,15 @@ import {
     SubcClient,
 } from "@cortexkit/subc-client";
 import { getCompartmentsByEndMessageId } from "../../features/magic-context/compartment-storage";
+import type {
+    AuthorityStatus,
+    ChangefeedPage,
+} from "../../features/magic-context/context-authority";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getAutoSearchHintDecisions,
     getPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
-import { getActiveUserMemories } from "../../features/magic-context/user-memory/storage-user-memory";
-import {
-    type AuthorityStatus,
-    type ChangefeedPage,
-} from "../../features/magic-context/context-authority";
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
@@ -1535,6 +1534,16 @@ export class SubcShadowTransport implements ShadowTransport {
             | "authority.status"
             | "authority.prepare"
             | "authority.seed"
+            | "authority.drain.begin"
+            | "authority.drain.finish"
+            | "authority.drain_seed"
+            | "authority.drain_memories"
+            | "authority.drain_notes"
+            | "authority.drain_compartments"
+            | "authority.drain_reconcile"
+            | "authority.drain_verify"
+            | "authority.drain_flip"
+            | "authority.drain_finish"
             | "mirror.pull";
         body: unknown;
         signal?: AbortSignal;
@@ -1573,7 +1582,20 @@ export class SubcShadowTransport implements ShadowTransport {
     private async authorityRequest(
         sessionId: string,
         projectRoot: string,
-        method: "authority.status" | "authority.prepare" | "authority.seed" | "mirror.pull",
+        method:
+            | "authority.status"
+            | "authority.prepare"
+            | "authority.seed"
+            | "authority.drain.begin"
+            | "authority.drain.finish"
+            | "authority.drain_seed"
+            | "authority.drain_memories"
+            | "authority.drain_notes"
+            | "authority.drain_compartments"
+            | "authority.drain_reconcile"
+            | "authority.drain_verify"
+            | "authority.drain_finish"
+            | "mirror.pull",
         body: Record<string, unknown>,
     ): Promise<Record<string, unknown>> {
         const response = (await this.call({ sessionId, projectRoot, method, body })) as unknown;
@@ -1609,7 +1631,9 @@ export class SubcShadowTransport implements ShadowTransport {
         return { authority: response.authority as unknown as AuthorityStatus };
     }
 
-    async authoritySeed(args: Record<string, unknown>): Promise<{ seeded: number; module_row_ids?: number[] }> {
+    async authoritySeed(
+        args: Record<string, unknown>,
+    ): Promise<{ seeded: number; module_row_ids?: number[] }> {
         this.authorityProjectRoot = String(args.project ?? "");
         const response = await this.authorityRequest(
             String(args.project ?? "authority"),
@@ -1623,6 +1647,21 @@ export class SubcShadowTransport implements ShadowTransport {
                 ? response.module_row_ids.filter((id): id is number => typeof id === "number")
                 : undefined,
         };
+    }
+
+    async authorityDrain(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }> {
+        this.authorityProjectRoot = String(args.project ?? this.authorityProjectRoot);
+        const method = String(args.method ?? "authority.drain.step") as Parameters<
+            SubcShadowTransport["authorityRequest"]
+        >[2];
+        const response = await this.authorityRequest(
+            String(args.project ?? "authority"),
+            this.authorityProjectRoot,
+            method,
+            args,
+        );
+        if (!isRecord(response.authority)) throw new Error("authority.drain omitted authority");
+        return { authority: response.authority as unknown as AuthorityStatus };
     }
 
     async mirrorPull(args: {

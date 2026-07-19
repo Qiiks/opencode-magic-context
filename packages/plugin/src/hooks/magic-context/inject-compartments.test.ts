@@ -330,11 +330,12 @@ describe("prepareCompartmentInjection — workspace memory sharing", () => {
             category: "NAMING",
             content: "own workspace naming remains visible",
         });
-        insertMemory(db, {
+        const foreignShared = insertMemory(db, {
             projectPath: "/tmp/foreign-project",
             category: "CONSTRAINTS",
             content: "foreign workspace constraint is shared",
         });
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignShared.id);
         insertMemory(db, {
             projectPath: "/tmp/foreign-project",
             category: "NAMING",

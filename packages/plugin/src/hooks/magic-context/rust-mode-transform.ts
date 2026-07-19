@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import {
+    type AuthorityModuleClient,
+    type AuthorityStatus,
+    drainAuthority,
     ensureContextStoreUuid,
     prepareAuthority,
     pullMemoryMirrorOnce,
-    type AuthorityModuleClient,
-    type AuthorityStatus,
 } from "../../features/magic-context/context-authority";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
@@ -44,6 +45,17 @@ import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
 import type { MessageLike } from "./transform-operations";
 
+export class MemoryAuthorityUnavailableError extends Error {
+    readonly code = "MEMORY_AUTHORITY_UNAVAILABLE";
+
+    constructor(detail: string) {
+        super(
+            `rust memory authority unavailable; route ctx_memory through the Rust module: ${detail}`,
+        );
+        this.name = "MemoryAuthorityUnavailableError";
+    }
+}
+
 const RUST_FAILURE_PARK_THRESHOLD = 3;
 const RUST_PROBE_INTERVAL = 5;
 const RUST_SEND_TIMEOUT_MS = 15_000;
@@ -55,7 +67,10 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
-    authoritySeed?(args: Record<string, unknown>): Promise<{ seeded: number; module_row_ids?: number[] }>;
+    authoritySeed?(
+        args: Record<string, unknown>,
+    ): Promise<{ seeded: number; module_row_ids?: number[] }>;
+    authorityDrain?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
     mirrorPull?(args: {
         domain: "memories" | "notes";
         cursor: number;
@@ -94,6 +109,8 @@ export interface RustModeTransformOptions {
     notifyParked?: (sessionId: string, message: string) => void;
     moduleTimeoutMs?: number;
     memorySyncRequestedSessions?: Set<string>;
+    /** Test-only escape hatch for transform-wire tests without an authority transport. */
+    allowAuthorityProtocolBypassForTests?: boolean;
 }
 
 function cloneForModule<T>(value: T): T {
@@ -297,15 +314,19 @@ async function prepareRustMemoryAuthority(args: {
     module: RustModeModuleClient;
     projectPath: string;
     state: RustSessionState;
+    allowProtocolBypassForTests?: boolean;
 }): Promise<void> {
     const { db, module, projectPath, state } = args;
     if (state.memoryAuthorityProject === projectPath && state.memoryAuthorityReady) return;
     state.memoryAuthorityProject = projectPath;
     if (!module.authorityStatus || !module.authorityPrepare || !module.authoritySeed) {
-        // Older development transports do not expose the authority protocol. They remain
-        // usable for transform-only tests; production transport implements all three calls.
-        state.memoryAuthorityReady = true;
-        return;
+        if (args.allowProtocolBypassForTests === true) {
+            state.memoryAuthorityReady = true;
+            return;
+        }
+        throw new MemoryAuthorityUnavailableError(
+            "the module does not expose authority.status, authority.prepare, and authority.seed",
+        );
     }
 
     const contextStoreUuid = ensureContextStoreUuid(db);
@@ -314,11 +335,43 @@ async function prepareRustMemoryAuthority(args: {
         project: projectPath,
         domain: "memories",
     });
-    if (current.authority && ["MODULE", "DRAINING"].includes(current.authority.state)) {
+    if (current.authority?.state === "DRAINING") {
+        const authorityModule: AuthorityModuleClient = {
+            authorityStatus: module.authorityStatus,
+            authorityPrepare: module.authorityPrepare,
+            authoritySeed: module.authoritySeed,
+            authorityDrain: module.authorityDrain,
+            mirrorPull:
+                module.mirrorPull ??
+                (async () => {
+                    throw new Error("mirror.pull unavailable during drain");
+                }),
+        };
+        await drainAuthority({
+            db,
+            projectPath,
+            domain: "memories",
+            module: authorityModule,
+            checksum: () =>
+                checksumSeedRows(
+                    db
+                        .prepare("SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC")
+                        .all(projectPath)
+                        .filter(isRecord),
+                ),
+        });
         state.memoryAuthorityReady = true;
         return;
     }
-    if (current.authority && current.authority.state !== "TS" && current.authority.state !== "PREPARING") {
+    if (current.authority?.state === "MODULE") {
+        state.memoryAuthorityReady = true;
+        return;
+    }
+    if (
+        current.authority &&
+        current.authority.state !== "TS" &&
+        current.authority.state !== "PREPARING"
+    ) {
         throw new Error(`memory authority cannot prepare from ${current.authority.state}`);
     }
 
@@ -330,9 +383,6 @@ async function prepareRustMemoryAuthority(args: {
         authorityStatus: module.authorityStatus,
         authorityPrepare: module.authorityPrepare,
         authoritySeed: module.authoritySeed,
-        mirrorPull: async () => {
-            throw new Error("mirror.pull is not part of authority preparation");
-        },
     };
     await prepareAuthority({
         db,
@@ -665,6 +715,7 @@ export function createRustModeTransform(
                 module: options.moduleClient,
                 projectPath: memoryProjectPath ?? projectRoot,
                 state,
+                allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
             });
             const authoritySeqAdoption = { used: false };
             if (options.memorySyncRequestedSessions?.delete(sessionId)) {

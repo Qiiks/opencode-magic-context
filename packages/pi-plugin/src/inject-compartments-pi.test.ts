@@ -79,11 +79,14 @@ describe("workspace memory sharing", () => {
 				category: "NAMING",
 				content: "own naming remains visible",
 			});
-			insertMemory(db, {
+			const shared = insertMemory(db, {
 				projectPath: "git:foreign",
 				category: "CONSTRAINTS",
 				content: "foreign constraint is shared",
 			});
+			db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(
+				shared.id,
+			);
 			insertMemory(db, {
 				projectPath: "git:foreign",
 				category: "NAMING",

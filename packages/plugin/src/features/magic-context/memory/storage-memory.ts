@@ -1,7 +1,7 @@
 import {
-    registerPrivilegedWriter,
     type Database,
     type Statement as PreparedStatement,
+    registerPrivilegedWriter,
 } from "../../../shared/sqlite";
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
 import { invalidateMemory, invalidateProject } from "./embedding-cache";
@@ -15,6 +15,7 @@ import type {
     MemoryStatus,
     VerificationStatus,
 } from "./types";
+import { FOREIGN_VISIBLE_SQL } from "./visibility";
 
 export const COLUMN_MAP: Record<keyof Memory, string> = {
     id: "id",
@@ -704,6 +705,8 @@ export interface WorkspaceMemorySqlFilter {
     clause: string;
     params: string[];
     active: boolean;
+    /** Canonical policy text retained for parity/golden checks across render paths. */
+    predicate: string;
 }
 
 // The same own-vs-foreign predicate is appended to baseline, delta, watermark,
@@ -714,9 +717,10 @@ export function buildWorkspaceMemorySqlFilter(args: {
     ownIdentities?: readonly string[];
     shareCategories?: readonly string[] | null;
     tableName?: string;
+    includeClassificationFields?: boolean;
 }): WorkspaceMemorySqlFilter {
     if (args.shareCategories === null || args.shareCategories === undefined) {
-        return { clause: "", params: [], active: false };
+        return { clause: "", params: [], active: false, predicate: FOREIGN_VISIBLE_SQL };
     }
 
     const identities = uniqueValues(args.identities);
@@ -726,12 +730,16 @@ export function buildWorkspaceMemorySqlFilter(args: {
     );
     const foreignIdentities = identities.filter((identity) => !ownSet.has(identity));
     if (foreignIdentities.length === 0) {
-        return { clause: "", params: [], active: false };
+        return { clause: "", params: [], active: false, predicate: FOREIGN_VISIBLE_SQL };
     }
 
     const ownIdentities = identities.filter((identity) => ownSet.has(identity));
     const shareCategories = uniqueValues([...args.shareCategories]);
     const qualifier = args.tableName ? `${args.tableName}.` : "";
+    const classification =
+        args.includeClassificationFields === false
+            ? ""
+            : ` AND ${qualifier}shareable = 1 AND ${qualifier}scope IN ('project','ecosystem','universe')`;
     const predicates: string[] = [];
     const params: string[] = [];
 
@@ -741,15 +749,20 @@ export function buildWorkspaceMemorySqlFilter(args: {
     }
     if (foreignIdentities.length > 0 && shareCategories.length > 0) {
         predicates.push(
-            `(${qualifier}project_path IN (${sqlPlaceholders(foreignIdentities)}) AND ${qualifier}category IN (${sqlPlaceholders(shareCategories)}))`,
+            `(${qualifier}project_path IN (${sqlPlaceholders(foreignIdentities)}) AND ${qualifier}category IN (${sqlPlaceholders(shareCategories)})${classification})`,
         );
         params.push(...foreignIdentities, ...shareCategories);
     }
 
     if (predicates.length === 0) {
-        return { clause: " AND 0 = 1", params: [], active: true };
+        return { clause: " AND 0 = 1", params: [], active: true, predicate: FOREIGN_VISIBLE_SQL };
     }
-    return { clause: ` AND (${predicates.join(" OR ")})`, params, active: true };
+    return {
+        clause: ` AND (${predicates.join(" OR ")})`,
+        params,
+        active: true,
+        predicate: FOREIGN_VISIBLE_SQL,
+    };
 }
 
 export function getMemoriesByProjects(
@@ -766,6 +779,7 @@ export function getMemoriesByProjects(
         identities,
         ownIdentities,
         shareCategories,
+        includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
     });
     if (identities.length === 1 && !sharingFilter.active) {
         return getMemoriesByProject(db, identities[0], statuses, expiryCutoff);
@@ -798,6 +812,7 @@ export function getMaxMemoryIdForProjects(
         identities,
         ownIdentities,
         shareCategories,
+        includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
     });
     if (identities.length === 1 && !sharingFilter.active) {
         const row = db
@@ -829,6 +844,7 @@ export function readNewMemoriesForM1Union(
         identities,
         ownIdentities,
         shareCategories,
+        includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
     });
     const rows = db
         .prepare(

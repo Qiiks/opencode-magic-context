@@ -16,12 +16,21 @@ import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import {
     __rustModeTransformTest,
-    createRustModeTransform,
+    createRustModeTransform as createRustModeTransformImpl,
     type RustModeModuleClient,
 } from "./rust-mode-transform";
 import type { TransformDeps } from "./transform";
 import { createTransform } from "./transform";
 import type { MessageLike } from "./transform-operations";
+
+const createRustModeTransform = (
+    deps: TransformDeps,
+    options: Parameters<typeof createRustModeTransformImpl>[1],
+) =>
+    createRustModeTransformImpl(deps, {
+        ...options,
+        allowAuthorityProtocolBypassForTests: true,
+    });
 
 const sessions: string[] = [];
 const databases: ContextDatabase[] = [];
@@ -100,6 +109,7 @@ function makeDeps(db: ContextDatabase, moduleClient: RustModeModuleClient): Tran
         sessionDirectoryBySession: new Map(),
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
+        rustModeAllowAuthorityProtocolBypassForTests: true,
     };
 }
 

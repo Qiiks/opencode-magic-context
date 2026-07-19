@@ -437,6 +437,8 @@ export interface TransformDeps {
     transformMode?: "ts" | "rust";
     /** Module transport injected by the hook; tests use a deterministic mock. */
     rustModeModuleClient?: RustModeModuleClient;
+    /** Test-only opt-out for transform-wire fixtures without the authority protocol. */
+    rustModeAllowAuthorityProtocolBypassForTests?: boolean;
     rustModeProjectRoot?: string;
     onRustModeParked?: (sessionId: string, message: string) => void;
     rustMemorySyncRequestedSessions?: Set<string>;
@@ -452,6 +454,8 @@ export function createTransform(deps: TransformDeps) {
                   projectRoot: deps.rustModeProjectRoot ?? deps.directory,
                   notifyParked: deps.onRustModeParked,
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
+                  allowAuthorityProtocolBypassForTests:
+                      deps.rustModeAllowAuthorityProtocolBypassForTests,
               })
             : undefined;
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
