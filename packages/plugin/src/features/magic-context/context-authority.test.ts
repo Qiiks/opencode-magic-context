@@ -240,6 +240,120 @@ describe("memory authority protocol", () => {
         ).toEqual({ count: 0 });
     });
 
+    test("mirror-back adopts an unambiguous legacy facade row by content", () => {
+        const database = db();
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0)",
+                )
+                .run(9395, "/repo", "CONFIG_VALUES", "drive model", "same-hash");
+        });
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 8214,
+                        full_row_snapshot: {
+                            id: 8214,
+                            project_path: "git:identity",
+                            category: "CONFIG_VALUES",
+                            content: "drive model",
+                            normalized_hash: "same-hash",
+                            status: "active",
+                        },
+                        content_hash: "same-hash",
+                    },
+                ],
+            },
+        });
+        expect(
+            database
+                .prepare("SELECT COUNT(*) AS count FROM memories WHERE category = 'CONFIG_VALUES'")
+                .get(),
+        ).toEqual({ count: 1 });
+        expect(database.prepare("SELECT id, project_path FROM memories").get()).toEqual({
+            id: 9395,
+            project_path: "git:identity",
+        });
+        expect(
+            database
+                .prepare(
+                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = 'git:identity' AND module_row_id = 8214",
+                )
+                .get(),
+        ).toEqual({ context_row_id: 9395 });
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 1,
+                next_cursor: 2,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 2,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 9395,
+                        full_row_snapshot: {
+                            id: 9395,
+                            project_path: "/repo",
+                            category: "CONFIG_VALUES",
+                            content: "drive model",
+                            normalized_hash: "same-hash",
+                            status: "active",
+                        },
+                        content_hash: "same-hash",
+                    },
+                ],
+            },
+        });
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 2,
+                next_cursor: 3,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 3,
+                        domain: "memories",
+                        op: "tombstone",
+                        module_row_id: 9395,
+                        full_row_snapshot: {
+                            id: 9395,
+                            project_path: "/repo",
+                            category: "CONFIG_VALUES",
+                            content: "drive model",
+                            normalized_hash: "same-hash",
+                            status: "active",
+                        },
+                        content_hash: "same-hash",
+                    },
+                ],
+            },
+        });
+        expect(database.prepare("SELECT id FROM memories").get()).toEqual({ id: 9395 });
+        expect(
+            database
+                .prepare(
+                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = 'git:identity' AND module_row_id = 8214",
+                )
+                .get(),
+        ).toEqual({ context_row_id: 9395 });
+    });
+
     test("drain finish removes the marker only after module ownership returns to TS", async () => {
         const database = db();
         installAuthorityManagedMarker(database, "/repo");

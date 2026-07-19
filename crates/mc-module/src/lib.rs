@@ -6204,6 +6204,14 @@ impl McHandler {
         } else {
             binding.project_root.to_string_lossy().to_string()
         };
+        let authority_project = if lane.is_shadow() {
+            None
+        } else {
+            store
+                .authority_project_for_route(&root_path, "memories")
+                .ok()
+                .flatten()
+        };
         let (workspace, member_paths) = match if lane.is_shadow() {
             prepare_shadow_workspace(&binding.session, parsed.workspace)
         } else {
@@ -6229,6 +6237,7 @@ impl McHandler {
                         &root_path,
                         &member_paths,
                         has_workspace,
+                        authority_project.as_deref(),
                     )?
                 };
                 Ok(memory.into_row(project_path))
@@ -6255,6 +6264,7 @@ impl McHandler {
                         &root_path,
                         &member_paths,
                         has_workspace,
+                        authority_project.as_deref(),
                     )?
                 };
                 Ok(mutation.into_row(project_path))
@@ -6995,6 +7005,39 @@ impl McHandler {
         }
     }
 
+    fn bind_facade_route_for_write(
+        &self,
+        channel: u16,
+        arguments: &Map<String, Value>,
+        authority_domain: &str,
+    ) -> Result<(), HandlerOutcome> {
+        let Some(requested_project) = non_empty_string_arg(arguments, "memory_project") else {
+            return Ok(());
+        };
+        let binding = self
+            .facade_binding(channel)
+            .map_err(|_| session_unresolved_error())?;
+        let route_project_root = binding.project_root.to_string_lossy().to_string();
+        let Some(store) = self.store.get() else {
+            return Err(store_unavailable_error());
+        };
+        let authority = store
+            .module_authority_for_project(requested_project, authority_domain)
+            .map_err(|error| HandlerOutcome::Error {
+                code: "authority_route_lookup_failed".to_string(),
+                message: error.to_string(),
+            })?;
+        if let Some((context_store_uuid, project)) = authority {
+            store
+                .bind_authority_route(&context_store_uuid, &project, &route_project_root)
+                .map_err(|error| HandlerOutcome::Error {
+                    code: "authority_route_bind_failed".to_string(),
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
     async fn resolve_facade_scope(
         &self,
         channel: u16,
@@ -7084,6 +7127,11 @@ impl McHandler {
             .and_then(|_| validate_string_cap(args, "reason", MAX_SHORT_FIELD_BYTES))
         {
             return tool_error_result(format!("Error: {error}."));
+        }
+        if matches!(action, "write" | "update" | "archive" | "merge") {
+            if let Err(outcome) = self.bind_facade_route_for_write(channel, args, "memories") {
+                return outcome;
+            }
         }
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "memories")
@@ -7518,6 +7566,14 @@ impl McHandler {
         {
             return tool_error_result(format!("Error: {error}."));
         }
+        let action = string_arg(args, "action")
+            .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
+            .unwrap_or("read");
+        if matches!(action, "write" | "update" | "dismiss") {
+            if let Err(outcome) = self.bind_facade_route_for_write(channel, args, "notes") {
+                return outcome;
+            }
+        }
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "notes")
             .await
@@ -7531,9 +7587,6 @@ impl McHandler {
         };
         let project = facade_scope.memory_project_path.as_str();
         let session = facade_scope.conversation_key.as_str();
-        let action = string_arg(args, "action")
-            .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
-            .unwrap_or("read");
         let filter = string_arg(args, "filter");
         let now = now_ms();
         if matches!(action, "write" | "update" | "dismiss") {
@@ -8876,12 +8929,19 @@ fn authority_source_path(
     root_path: &str,
     member_paths: &HashMap<String, String>,
     has_workspace: bool,
+    authority_project: Option<&str>,
 ) -> Result<String, String> {
     let Some(source_path) = source_path else {
         return Ok(root_path.to_string());
     };
     if !has_workspace {
-        return Ok(root_path.to_string());
+        // A bound authority route stores the stable project identity. Unbound test and
+        // legacy routes retain their route-root vocabulary until the route is known.
+        return Ok(if authority_project.is_some() {
+            source_path.to_string()
+        } else {
+            root_path.to_string()
+        });
     }
     member_paths
         .get(source_path)

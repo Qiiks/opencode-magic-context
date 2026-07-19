@@ -745,8 +745,12 @@ function rememberIdentity(
     moduleRowId: number,
     contextRowId: number,
 ): void {
+    const existing = mirrorIdentity(db, domain, moduleProject, moduleRowId);
+    if (existing) return;
+    // A context row has one canonical module identity. A duplicate feed row may
+    // still update that row, but it must not claim a second identity for it.
     db.prepare(
-        "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES (?, ?, ?, ?) ON CONFLICT(domain, module_project, module_row_id) DO UPDATE SET context_row_id = excluded.context_row_id",
+        "INSERT OR IGNORE INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES (?, ?, ?, ?)",
     ).run(domain, moduleProject, moduleRowId, contextRowId);
 }
 
@@ -768,6 +772,22 @@ function contextMemoryId(
         if (existing?.id !== undefined) {
             rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id);
             return existing.id;
+        }
+    }
+    // A legacy facade row may have no source identity even though the context
+    // database already owns the same fact. Adopt an unambiguous content match
+    // instead of creating a second context row during mirror-back.
+    const normalizedHash = rowString(row, "normalized_hash");
+    const category = rowString(row, "category", "CONSTRAINTS");
+    if (normalizedHash) {
+        const candidates = db
+            .prepare(
+                "SELECT id FROM memories WHERE category = ? AND normalized_hash = ? ORDER BY id",
+            )
+            .all(category, normalizedHash) as Array<{ id?: number }>;
+        if (candidates.length === 1 && candidates[0]?.id !== undefined) {
+            rememberIdentity(db, domain, moduleProject, moduleRowId, candidates[0].id);
+            return candidates[0].id;
         }
     }
     const result = db
@@ -792,11 +812,19 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
         ).run(feed.domain, moduleProject, feed.module_row_id, feed.module_row_id);
         const mapped = mirrorIdentity(db, feed.domain, moduleProject, feed.module_row_id);
         if (!mapped) return;
-        db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(mapped.context_row_id);
-        db.prepare("DELETE FROM memories WHERE id = ?").run(mapped.context_row_id);
         db.prepare(
             "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
         ).run(feed.domain, moduleProject, feed.module_row_id);
+        const shared = db
+            .prepare(
+                "SELECT 1 FROM mirror_identity WHERE domain = ? AND context_row_id = ? LIMIT 1",
+            )
+            .get(feed.domain, mapped.context_row_id);
+        // A cleanup tombstone for one legacy twin must not delete the context row
+        // still owned by another module identity for the same source memory.
+        if (shared) return;
+        db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(mapped.context_row_id);
+        db.prepare("DELETE FROM memories WHERE id = ?").run(mapped.context_row_id);
         return;
     }
     const contextId = contextMemoryId(db, feed.domain, moduleProject, row, feed.module_row_id);

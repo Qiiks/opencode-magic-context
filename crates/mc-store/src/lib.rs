@@ -1547,7 +1547,174 @@ const MIGRATIONS: &[Migration] = &[
         END;
         "#,
     },
+    Migration {
+        version: 30,
+        // Bindings may have been stored before the route became authority-owned or before
+        // facade rows were written. Normalize every stored binding during upgrade by removing
+        // duplicate memory rows and rekeying the remaining route, mutation, and note rows,
+        // so cleanup does not depend on trigger timing or a later status request.
+        statements: r#"
+        DELETE FROM mc_memories
+         WHERE EXISTS (
+                SELECT 1
+                  FROM mc_authority_route_bindings binding
+                  JOIN mc_authority authority
+                    ON authority.context_store_uuid = binding.context_store_uuid
+                   AND authority.project = binding.project
+                   AND authority.domain = 'memories'
+                   AND authority.state = 'MODULE'
+                 WHERE binding.route_project_root = mc_memories.project_path
+               )
+           AND EXISTS (
+                SELECT 1
+                  FROM mc_authority_route_bindings binding
+                  JOIN mc_authority authority
+                    ON authority.context_store_uuid = binding.context_store_uuid
+                   AND authority.project = binding.project
+                   AND authority.domain = 'memories'
+                   AND authority.state = 'MODULE'
+                  JOIN mc_memories canonical
+                    ON canonical.project_path = binding.project
+                   AND canonical.category = mc_memories.category
+                   AND canonical.normalized_hash = mc_memories.normalized_hash
+                 WHERE binding.route_project_root = mc_memories.project_path
+               );
+        UPDATE mc_memories
+           SET project_path = (
+               SELECT binding.project
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'memories'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_memories.project_path
+           )
+         WHERE EXISTS (
+               SELECT 1
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'memories'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_memories.project_path
+           );
+        UPDATE mc_memory_mutation_log
+           SET project_path = (
+               SELECT binding.project
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'memories'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_memory_mutation_log.project_path
+           )
+         WHERE EXISTS (
+               SELECT 1
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'memories'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_memory_mutation_log.project_path
+           );
+        UPDATE mc_notes
+           SET project_path = (
+               SELECT binding.project
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'notes'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_notes.project_path
+           )
+         WHERE EXISTS (
+               SELECT 1
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'notes'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_notes.project_path
+           );
+        "#,
+    },
 ];
+
+/// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
+/// Deletes only content twins, then rekeys remaining route rows and their mutation/note
+/// companions. The authority predicate is repeated on every statement so a binding is
+/// harmless until its domain is actually MODULE-owned.
+fn normalize_authority_route_tx(
+    tx: &rusqlite::Transaction<'_>,
+    context_store_uuid: &str,
+    project: &str,
+    route_project_root: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM mc_memories
+          WHERE project_path = ?3
+            AND EXISTS (
+                SELECT 1 FROM mc_authority
+                 WHERE context_store_uuid = ?1
+                   AND project = ?2
+                   AND domain = 'memories'
+                   AND state = 'MODULE'
+            )
+            AND EXISTS (
+                SELECT 1 FROM mc_memories canonical
+                 WHERE canonical.project_path = ?2
+                   AND canonical.category = mc_memories.category
+                   AND canonical.normalized_hash = mc_memories.normalized_hash
+            )",
+        params![context_store_uuid, project, route_project_root],
+    )?;
+    tx.execute(
+        "UPDATE mc_memories
+            SET project_path = ?2
+          WHERE project_path = ?3
+            AND EXISTS (
+                SELECT 1 FROM mc_authority
+                 WHERE context_store_uuid = ?1
+                   AND project = ?2
+                   AND domain = 'memories'
+                   AND state = 'MODULE'
+            )",
+        params![context_store_uuid, project, route_project_root],
+    )?;
+    tx.execute(
+        "UPDATE mc_memory_mutation_log
+            SET project_path = ?2
+          WHERE project_path = ?3
+            AND EXISTS (
+                SELECT 1 FROM mc_authority
+                 WHERE context_store_uuid = ?1
+                   AND project = ?2
+                   AND domain = 'memories'
+                   AND state = 'MODULE'
+            )",
+        params![context_store_uuid, project, route_project_root],
+    )?;
+    tx.execute(
+        "UPDATE mc_notes
+            SET project_path = ?2
+          WHERE project_path = ?3
+            AND EXISTS (
+                SELECT 1 FROM mc_authority
+                 WHERE context_store_uuid = ?1
+                   AND project = ?2
+                   AND domain = 'notes'
+                   AND state = 'MODULE'
+            )",
+        params![context_store_uuid, project, route_project_root],
+    )?;
+    Ok(())
+}
 
 /// A project's workspace membership: the union of member identities it reads, which of
 /// them are its OWN (full visibility) vs FOREIGN (visible only in `share_categories`),
@@ -3384,8 +3551,38 @@ impl McStore {
                     project = excluded.project",
                 params![route_project_root, context_store_uuid, project],
             )?;
+            // The trigger remains the direct-SQL safety net, but cleanup also belongs to
+            // this operation: a bind can happen before twins exist and never be retried
+            // by the cached authority-status path. Running it after every upsert makes
+            // the vocabulary law independent of write ordering.
+            normalize_authority_route_tx(tx, context_store_uuid, project, route_project_root)?;
             Ok(())
         })
+    }
+
+    /// Resolve a requested facade identity to the MODULE authority that owns it. The
+    /// context UUID is returned with the identity so a write can establish the route
+    /// binding even when the transform's authority-status result was cached.
+    pub fn module_authority_for_project(
+        &self,
+        project: &str,
+        domain: &str,
+    ) -> Result<Option<(String, String)>, McStoreError> {
+        validate_authority_domain(domain)?;
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT context_store_uuid, project
+                       FROM mc_authority
+                      WHERE project = ?1 AND domain = ?2 AND state = 'MODULE'
+                      ORDER BY context_store_uuid
+                      LIMIT 1",
+                    params![project, domain],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+            })
+            .map_err(Into::into)
     }
 
     /// Return the MODULE-authority identity currently bound to this daemon route.
@@ -5128,8 +5325,16 @@ impl McStore {
                 replace_shadow_user_profile_tx(tx, request.shadow_project_path, request.user_profile)?;
             } else {
                 replace_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
-                replace_authority_memories_tx(tx, request.memories)?;
-                replace_authority_memory_mutations_tx(tx, request.memory_mutations)?;
+                replace_authority_memories_tx(
+                    tx,
+                    request.shadow_project_path,
+                    request.memories,
+                )?;
+                replace_authority_memory_mutations_tx(
+                    tx,
+                    request.shadow_project_path,
+                    request.memory_mutations,
+                )?;
                 replace_authority_user_profile_tx(tx, request.user_profile)?;
             }
 
@@ -9463,11 +9668,97 @@ fn replace_shadow_memories_tx(
     Ok(())
 }
 
+fn authority_route_context_store_uuid_tx(
+    tx: &rusqlite::Transaction<'_>,
+    route_project_root: &str,
+) -> rusqlite::Result<Option<String>> {
+    tx.query_row(
+        "SELECT context_store_uuid
+           FROM mc_authority_route_bindings
+          WHERE route_project_root = ?1",
+        params![route_project_root],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+fn authority_memory_id_for_source_tx(
+    tx: &rusqlite::Transaction<'_>,
+    context_store_uuid: Option<&str>,
+    context_row_id: i64,
+) -> rusqlite::Result<Option<i64>> {
+    let Some(context_store_uuid) = context_store_uuid else {
+        return Ok(None);
+    };
+    tx.query_row(
+        "SELECT id FROM mc_memories
+          WHERE context_store_uuid = ?1 AND context_row_id = ?2",
+        params![context_store_uuid, context_row_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 fn replace_authority_memories_tx(
     tx: &rusqlite::Transaction<'_>,
+    route_project_root: &str,
     memories: &[ShadowMemoryRow],
 ) -> rusqlite::Result<()> {
+    let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
     for memory in memories {
+        // The source row id is the context identity, not necessarily the module row id
+        // allocated during the authority seed. Adopt that seeded row before the ordinary
+        // id/content upserts so a mirror-back update cannot create a second module row.
+        let superseded_by_memory_id = memory
+            .superseded_by_memory_id
+            .map(|source_id| {
+                authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), source_id)
+                    .map(|translated| translated.unwrap_or(source_id))
+            })
+            .transpose()?;
+        if let Some(existing_id) =
+            authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), memory.id)?
+        {
+            tx.execute(
+                "UPDATE mc_memories
+                    SET project_path = ?2, category = ?3, content = ?4, normalized_hash = ?5,
+                        importance = ?6, scope = ?7, shareable = ?8, source_session_id = ?9,
+                        source_type = ?10, seen_count = ?11, retrieval_count = ?12,
+                        first_seen_at = ?13, created_at = ?14, updated_at = ?15, last_seen_at = ?16,
+                        last_retrieved_at = ?17, status = ?18, expires_at = ?19,
+                        verification_status = ?20, verified_at = ?21, classified_at = ?22,
+                        superseded_by_memory_id = ?23, merged_from = ?24, metadata_json = ?25
+                  WHERE id = ?1",
+                params![
+                    existing_id,
+                    &memory.project_path,
+                    &memory.category,
+                    &memory.content,
+                    &memory.normalized_hash,
+                    memory.importance.map(i64::from),
+                    &memory.scope,
+                    memory.shareable as i64,
+                    memory.source_session_id.as_deref(),
+                    memory.source_type.as_deref(),
+                    memory.seen_count,
+                    memory.retrieval_count,
+                    memory.first_seen_at,
+                    memory.created_at,
+                    memory.updated_at,
+                    memory.last_seen_at,
+                    memory.last_retrieved_at,
+                    &memory.status,
+                    memory.expires_at,
+                    &memory.verification_status,
+                    memory.verified_at,
+                    memory.classified_at,
+                    superseded_by_memory_id,
+                    memory.merged_from.as_deref(),
+                    memory.metadata_json.as_deref(),
+                ],
+            )?;
+            continue;
+        }
         tx.execute(
             "INSERT INTO mc_memories
                (id, project_path, category, content, normalized_hash, importance,
@@ -9500,7 +9791,29 @@ fn replace_authority_memories_tx(
                 classified_at = excluded.classified_at,
                 superseded_by_memory_id = excluded.superseded_by_memory_id,
                 merged_from = excluded.merged_from,
-                metadata_json = excluded.metadata_json",
+                metadata_json = excluded.metadata_json
+              ON CONFLICT(project_path, category, normalized_hash) DO UPDATE SET
+                 content = excluded.content,
+                 importance = excluded.importance,
+                 scope = excluded.scope,
+                 shareable = excluded.shareable,
+                 source_session_id = excluded.source_session_id,
+                 source_type = excluded.source_type,
+                 seen_count = excluded.seen_count,
+                 retrieval_count = excluded.retrieval_count,
+                 first_seen_at = excluded.first_seen_at,
+                 created_at = excluded.created_at,
+                 updated_at = excluded.updated_at,
+                 last_seen_at = excluded.last_seen_at,
+                 last_retrieved_at = excluded.last_retrieved_at,
+                 status = excluded.status,
+                 expires_at = excluded.expires_at,
+                 verification_status = excluded.verification_status,
+                 verified_at = excluded.verified_at,
+                 classified_at = excluded.classified_at,
+                 superseded_by_memory_id = excluded.superseded_by_memory_id,
+                 merged_from = excluded.merged_from,
+                 metadata_json = excluded.metadata_json",
             params![
                 memory.id,
                 &memory.project_path,
@@ -9524,8 +9837,8 @@ fn replace_authority_memories_tx(
                 &memory.verification_status,
                 memory.verified_at,
                 memory.classified_at,
-                memory.superseded_by_memory_id,
-                memory.merged_from.as_deref(),
+                 superseded_by_memory_id,
+                 memory.merged_from.as_deref(),
                 memory.metadata_json.as_deref(),
             ],
         )?;
@@ -9590,10 +9903,25 @@ fn replace_shadow_memory_mutations_tx(
 
 fn replace_authority_memory_mutations_tx(
     tx: &rusqlite::Transaction<'_>,
+    route_project_root: &str,
     mutations: &[ShadowMemoryMutationRow],
 ) -> rusqlite::Result<()> {
+    let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
     for row in mutations {
         let mutation = &row.mutation;
+        let target_memory_id = authority_memory_id_for_source_tx(
+            tx,
+            context_store_uuid.as_deref(),
+            mutation.target_memory_id,
+        )?
+        .unwrap_or(mutation.target_memory_id);
+        let superseded_by_id = mutation
+            .superseded_by_id
+            .map(|source_id| {
+                authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), source_id)
+                    .map(|translated| translated.unwrap_or(source_id))
+            })
+            .transpose()?;
         tx.execute(
             "INSERT INTO mc_memory_mutation_log
                (id, project_path, mutation_type, target_memory_id, superseded_by_id,
@@ -9611,8 +9939,8 @@ fn replace_authority_memory_mutations_tx(
                 mutation.id,
                 &row.project_path,
                 &mutation.mutation_type,
-                mutation.target_memory_id,
-                mutation.superseded_by_id,
+                target_memory_id,
+                superseded_by_id,
                 mutation.category.as_deref(),
                 mutation.new_content.as_deref(),
                 mutation.queued_at,
@@ -13824,6 +14152,221 @@ mod shadow_tests {
                 .iter()
                 .any(|row| row.module_row_id == duplicate && row.op == "tombstone"),
             "historical changefeed rows remain while the duplicate receives a tombstone"
+        );
+    }
+
+    #[test]
+    fn authority_route_binding_upgrade_normalizes_preexisting_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.create_scalar_function(
+            "mc_note_caller_project",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(String::new()),
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cortexkit_schema_version (
+                 namespace TEXT NOT NULL,
+                 version INTEGER NOT NULL,
+                 applied_at_unix INTEGER NOT NULL,
+                 PRIMARY KEY (namespace, version)
+             );",
+        )
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 29)
+        {
+            conn.execute_batch(migration.statements).unwrap();
+            conn.execute(
+                "INSERT INTO cortexkit_schema_version(namespace, version, applied_at_unix)
+                 VALUES (?1, ?2, 0)",
+                params![NS, migration.version],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
+             VALUES ('/worktrees/repo', 'context', 'git:identity')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mc_memories
+                 (id, project_path, category, content, normalized_hash, importance, status,
+                  first_seen_at, created_at, updated_at, last_seen_at)
+             VALUES (1, 'git:identity', 'CONSTRAINTS', 'same', 'same-hash', 50, 'active', 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mc_memories
+                 (id, project_path, category, content, normalized_hash, importance, status,
+                  first_seen_at, created_at, updated_at, last_seen_at)
+             VALUES (2, '/worktrees/repo', 'CONSTRAINTS', 'same', 'same-hash', 50, 'active', 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+             VALUES ('context', 'git:identity', 'memories', 'MODULE')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = store(dir.path());
+        assert!(store.get_memory_full(2).unwrap().is_none());
+        assert_eq!(
+            store.get_memory_full(1).unwrap().unwrap().project_path,
+            "git:identity"
+        );
+        assert!(store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.module_row_id == 2 && row.op == "tombstone"));
+    }
+
+    #[test]
+    fn authority_route_binding_rekeys_twins_that_arrive_after_the_first_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let route_project_root = "/worktrees/repo";
+        let identity = "git:identity";
+        store
+            .bind_authority_route("context", identity, route_project_root)
+            .unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_memories
+                         (id, project_path, category, content, normalized_hash, importance, status,
+                          first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (1, ?1, 'CONSTRAINTS', 'same fact', 'same-hash', 50, 'active', 0, 0, 0, 0)",
+                    params![identity],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_memories
+                         (id, project_path, category, content, normalized_hash, importance, status,
+                          first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (2, ?1, 'CONSTRAINTS', 'same fact', 'same-hash', 50, 'active', 0, 0, 0, 0)",
+                    params![route_project_root],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                     VALUES ('context', ?1, 'memories', 'MODULE')",
+                    params![identity],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Repeating the bind repairs duplicates created when the binding was stored before
+        // either corresponding memory row existed; bind-time cleanup can then remove the
+        // duplicate row and preserve the canonical identity regardless of write order.
+        store
+            .bind_authority_route("context", identity, route_project_root)
+            .unwrap();
+
+        assert!(store.get_memory_full(2).unwrap().is_none());
+        assert_eq!(
+            store.get_memory_full(1).unwrap().unwrap().project_path,
+            identity
+        );
+        let feed = store.pull_changefeed("memories", 0, 100).unwrap();
+        assert!(feed
+            .rows
+            .iter()
+            .any(|row| row.module_row_id == 2 && row.op == "tombstone"));
+    }
+
+    #[test]
+    fn authority_state_sync_adopts_seed_identity_instead_of_inserting_a_twin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let route_project_root = "/worktrees/repo";
+        let identity = "git:identity";
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                     VALUES ('context', ?1, 'memories', 'MODULE')",
+                    params![identity],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
+                     VALUES (?1, 'context', ?2)",
+                    params![route_project_root, identity],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_memories
+                         (id, project_path, category, content, normalized_hash, importance, status,
+                          first_seen_at, created_at, updated_at, last_seen_at,
+                          context_store_uuid, context_row_id)
+                     VALUES (8214, ?1, 'CONFIG_VALUES', 'drive model', 'same-hash', 50, 'active',
+                             0, 0, 0, 0, 'context', 9395)",
+                    params![identity],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut incoming = memory(9395, "drive model");
+        incoming.project_path = identity.to_string();
+        incoming.category = "CONFIG_VALUES".to_string();
+        incoming.normalized_hash = "same-hash".to_string();
+
+        store
+            .apply_authority_state_sync(ShadowStateSyncRequest {
+                session_id: "authority-session",
+                shadow_project_path: route_project_root,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                compartments: &[],
+                memories: &[incoming],
+                memory_mutations: &[],
+                user_profile: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+
+        let rows = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT id, project_path, context_store_uuid, context_row_id
+                       FROM mc_memories
+                      WHERE category = 'CONFIG_VALUES' AND normalized_hash = 'same-hash'
+                      ORDER BY id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                8214,
+                identity.to_string(),
+                Some("context".to_string()),
+                Some(9395)
+            )]
         );
     }
 
