@@ -19,6 +19,10 @@ import {
     getPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getActiveUserMemories } from "../../features/magic-context/user-memory/storage-user-memory";
+import {
+    type AuthorityStatus,
+    type ChangefeedPage,
+} from "../../features/magic-context/context-authority";
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
@@ -1498,6 +1502,7 @@ export class SubcShadowTransport implements ShadowTransport {
     private routes = new Map<string, RouteHandle>();
     private activeSession: string | null = null;
     private nextProbeMs = 0;
+    private authorityProjectRoot = "";
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
     private connectionGeneration = 0;
 
@@ -1526,7 +1531,11 @@ export class SubcShadowTransport implements ShadowTransport {
             | "session.recomp"
             | "session.wrapup"
             | "todo_state.set"
-            | "agent_drops.append";
+            | "agent_drops.append"
+            | "authority.status"
+            | "authority.prepare"
+            | "authority.seed"
+            | "mirror.pull";
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown> {
@@ -1559,6 +1568,76 @@ export class SubcShadowTransport implements ShadowTransport {
             args.signal?.removeEventListener("abort", onAbort);
             this.activeSession = null;
         }
+    }
+
+    private async authorityRequest(
+        sessionId: string,
+        projectRoot: string,
+        method: "authority.status" | "authority.prepare" | "authority.seed" | "mirror.pull",
+        body: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> {
+        const response = (await this.call({ sessionId, projectRoot, method, body })) as unknown;
+        if (isRecord(response) && isRecord(response.result)) return response.result;
+        if (isRecord(response)) return response;
+        throw new Error(`module returned an invalid ${method} response`);
+    }
+
+    async authorityStatus(args: {
+        context_store_uuid: string;
+        project: string;
+        domain: "memories" | "notes";
+    }): Promise<{ authority: AuthorityStatus | null }> {
+        this.authorityProjectRoot = args.project;
+        const response = await this.authorityRequest(
+            args.project,
+            args.project,
+            "authority.status",
+            args,
+        );
+        return { authority: (response.authority as AuthorityStatus | null) ?? null };
+    }
+
+    async authorityPrepare(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }> {
+        this.authorityProjectRoot = String(args.project ?? "");
+        const response = await this.authorityRequest(
+            String(args.project ?? "authority"),
+            this.authorityProjectRoot,
+            "authority.prepare",
+            args,
+        );
+        if (!isRecord(response.authority)) throw new Error("authority.prepare omitted authority");
+        return { authority: response.authority as unknown as AuthorityStatus };
+    }
+
+    async authoritySeed(args: Record<string, unknown>): Promise<{ seeded: number; module_row_ids?: number[] }> {
+        this.authorityProjectRoot = String(args.project ?? "");
+        const response = await this.authorityRequest(
+            String(args.project ?? "authority"),
+            this.authorityProjectRoot,
+            "authority.seed",
+            args,
+        );
+        return {
+            seeded: typeof response.seeded === "number" ? response.seeded : 0,
+            module_row_ids: Array.isArray(response.module_row_ids)
+                ? response.module_row_ids.filter((id): id is number => typeof id === "number")
+                : undefined,
+        };
+    }
+
+    async mirrorPull(args: {
+        domain: "memories" | "notes";
+        cursor: number;
+        limit: number;
+    }): Promise<{ page: ChangefeedPage }> {
+        const response = await this.authorityRequest(
+            `mirror:${args.domain}`,
+            this.authorityProjectRoot,
+            "mirror.pull",
+            args,
+        );
+        if (!isRecord(response.page)) throw new Error("mirror.pull omitted page");
+        return { page: response.page as unknown as ChangefeedPage };
     }
 
     closeSession(sessionId: string): void {

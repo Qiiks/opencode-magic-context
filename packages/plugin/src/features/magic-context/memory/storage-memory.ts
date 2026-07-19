@@ -557,7 +557,34 @@ function loadInsertedMemory(db: Database, rowid: number | bigint | undefined): M
     return inserted;
 }
 
+export class ModuleMemoryAuthorityError extends Error {
+    readonly code = "MEMORY_MODULE_AUTHORITY";
+
+    constructor(readonly projectPath: string) {
+        super(
+            `memory writes for module-managed project ${projectPath} must use the Rust ctx_memory module facade`,
+        );
+        this.name = "ModuleMemoryAuthorityError";
+    }
+}
+
+function assertTsMemoryWriteAllowed(db: Database, projectPath: string): void {
+    const managed = db
+        .prepare(
+            "SELECT 1 FROM authority_managed WHERE project_path = ? UNION SELECT 1 FROM authority_repair_pending WHERE project_path = ? LIMIT 1",
+        )
+        .get(projectPath, projectPath);
+    if (managed) throw new ModuleMemoryAuthorityError(projectPath);
+}
+
+function assertTsMemoryIdWriteAllowed(db: Database, id: number): Memory | null {
+    const memory = getMemoryById(db, id);
+    if (memory) assertTsMemoryWriteAllowed(db, memory.projectPath);
+    return memory;
+}
+
 export function insertMemory(db: Database, input: MemoryInput): Memory {
+    assertTsMemoryWriteAllowed(db, input.projectPath);
     const now = Date.now();
     const normalizedHash = computeNormalizedHash(input.content);
     const insertValues = buildInsertMemoryValues(
@@ -821,16 +848,19 @@ export function getMemoryById(db: Database, id: number): Memory | null {
 }
 
 export function updateMemorySeenCount(db: Database, id: number): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     getUpdateMemorySeenCountStatement(db).run(now, now, id);
 }
 
 export function updateMemoryRetrievalCount(db: Database, id: number): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     getUpdateMemoryRetrievalCountStatement(db).run(now, now, id);
 }
 
 export function updateMemoryStatus(db: Database, id: number, status: MemoryStatus): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     getUpdateMemoryStatusStatement(db).run(status, Date.now(), id);
 }
 
@@ -858,6 +888,7 @@ export function updateMemoryVerification(
     id: number,
     verificationStatus: VerificationStatus,
 ): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     getUpdateMemoryVerificationStatement(db).run(
         verificationStatus,
@@ -877,7 +908,7 @@ export function updateMemoryContent(
     // Intentional: read outside transaction — Bun is single-threaded so no concurrent
     // modification can happen. The projectPath is only used for cache invalidation after
     // the write, which self-heals on next search if stale.
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
 
     db.transaction(() => {
         getUpdateMemoryContentStatement(db).run(content, normalizedHash, Date.now(), id);
@@ -935,7 +966,7 @@ export function setMemoryClassification(
         throw new Error("setMemoryClassification requires at least one supplied field");
     }
 
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
     if (!memory) return false;
 
     const assignments: string[] = [];
@@ -984,6 +1015,7 @@ export function setMemoryClassification(
 }
 
 export function supersededMemory(db: Database, id: number, supersededById: number): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     getSupersededMemoryStatement(db).run(supersededById, Date.now(), id);
 }
 
@@ -995,6 +1027,7 @@ export function mergeMemoryStats(
     mergedFrom: string,
     status: MemoryStatus,
 ): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     getMergeMemoryStatsStatement(db).run(
         seenCount,
         retrievalCount,
@@ -1012,7 +1045,7 @@ export function archiveMemory(db: Database, id: number, reason?: string): void {
         return;
     }
 
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
     if (!memory) {
         return;
     }
@@ -1025,7 +1058,7 @@ export function archiveMemory(db: Database, id: number, reason?: string): void {
 }
 
 export function deleteMemory(db: Database, id: number): void {
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
 
     db.transaction(() => {
         getDeleteMemoryEmbeddingStatement(db).run(id);

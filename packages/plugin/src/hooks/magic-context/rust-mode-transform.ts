@@ -1,3 +1,11 @@
+import { createHash } from "node:crypto";
+import {
+    ensureContextStoreUuid,
+    prepareAuthority,
+    pullMemoryMirrorOnce,
+    type AuthorityModuleClient,
+    type AuthorityStatus,
+} from "../../features/magic-context/context-authority";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
@@ -41,6 +49,18 @@ const RUST_PROBE_INTERVAL = 5;
 const RUST_SEND_TIMEOUT_MS = 15_000;
 
 export interface RustModeModuleClient extends ModuleStateSyncClient {
+    authorityStatus?(args: {
+        context_store_uuid: string;
+        project: string;
+        domain: "memories" | "notes";
+    }): Promise<{ authority: AuthorityStatus | null }>;
+    authorityPrepare?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
+    authoritySeed?(args: Record<string, unknown>): Promise<{ seeded: number; module_row_ids?: number[] }>;
+    mirrorPull?(args: {
+        domain: "memories" | "notes";
+        cursor: number;
+        limit: number;
+    }): Promise<{ page: import("../../features/magic-context/context-authority").ChangefeedPage }>;
     closeSession?(sessionId: string): void;
     getCompartmentsAfter?(
         sessionId: string,
@@ -63,6 +83,8 @@ interface RustSessionState extends ModuleStateSyncState {
     syntheticTurnCount: number;
     lastObservedUserMessageId: string | null;
     syntheticLoopBreakerLogged: boolean;
+    memoryAuthorityProject: string | null;
+    memoryAuthorityReady: boolean;
 }
 
 export interface RustModeTransformOptions {
@@ -196,6 +218,8 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             syntheticTurnCount: 0,
             lastObservedUserMessageId: null,
             syntheticLoopBreakerLogged: false,
+            memoryAuthorityProject: null,
+            memoryAuthorityReady: false,
         };
         states.set(sessionId, state);
     }
@@ -250,6 +274,79 @@ function directiveTextOf(response: Record<string, unknown>): string | undefined 
 
 function isNeedFullSync(response: Record<string, unknown>): boolean {
     return response.status === "need_full_sync" || response.action === "NEED_FULL_SYNC";
+}
+
+function canonicalizeForChecksum(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(canonicalizeForChecksum);
+    if (!isRecord(value)) return value;
+    return Object.fromEntries(
+        Object.keys(value)
+            .sort()
+            .map((key) => [key, canonicalizeForChecksum(value[key])]),
+    );
+}
+
+function checksumSeedRows(rows: readonly Record<string, unknown>[]): string {
+    return createHash("sha256")
+        .update(JSON.stringify(rows.map(canonicalizeForChecksum)))
+        .digest("hex");
+}
+
+async function prepareRustMemoryAuthority(args: {
+    db: TransformDeps["db"];
+    module: RustModeModuleClient;
+    projectPath: string;
+    state: RustSessionState;
+}): Promise<void> {
+    const { db, module, projectPath, state } = args;
+    if (state.memoryAuthorityProject === projectPath && state.memoryAuthorityReady) return;
+    state.memoryAuthorityProject = projectPath;
+    if (!module.authorityStatus || !module.authorityPrepare || !module.authoritySeed) {
+        // Older development transports do not expose the authority protocol. They remain
+        // usable for transform-only tests; production transport implements all three calls.
+        state.memoryAuthorityReady = true;
+        return;
+    }
+
+    const contextStoreUuid = ensureContextStoreUuid(db);
+    const current = await module.authorityStatus({
+        context_store_uuid: contextStoreUuid,
+        project: projectPath,
+        domain: "memories",
+    });
+    if (current.authority && ["MODULE", "DRAINING"].includes(current.authority.state)) {
+        state.memoryAuthorityReady = true;
+        return;
+    }
+    if (current.authority && current.authority.state !== "TS" && current.authority.state !== "PREPARING") {
+        throw new Error(`memory authority cannot prepare from ${current.authority.state}`);
+    }
+
+    const seedRows = db
+        .prepare("SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC")
+        .all(projectPath)
+        .filter(isRecord);
+    const authorityModule: AuthorityModuleClient = {
+        authorityStatus: module.authorityStatus,
+        authorityPrepare: module.authorityPrepare,
+        authoritySeed: module.authoritySeed,
+        mirrorPull: async () => {
+            throw new Error("mirror.pull is not part of authority preparation");
+        },
+    };
+    await prepareAuthority({
+        db,
+        projectPath,
+        domains: ["memories"],
+        module: authorityModule,
+        seedPages: async () =>
+            seedRows.map((snapshot) => ({
+                source_row_id: snapshot.id,
+                snapshot,
+            })),
+        checksum: () => checksumSeedRows(seedRows),
+    });
+    state.memoryAuthorityReady = true;
 }
 
 /** Single response-field seam for the parallel module encode-back contract. */
@@ -559,6 +656,16 @@ export function createRustModeTransform(
                 nowMs: Date.now(),
             };
             const projectRoot = options.projectRoot ?? directory;
+            const memoryProjectPath =
+                deps.memoryConfig?.enabled && directory.length > 0
+                    ? resolveProjectIdentity(directory)
+                    : deps.projectPath;
+            await prepareRustMemoryAuthority({
+                db: deps.db,
+                module: options.moduleClient,
+                projectPath: memoryProjectPath ?? projectRoot,
+                state,
+            });
             const authoritySeqAdoption = { used: false };
             if (options.memorySyncRequestedSessions?.delete(sessionId)) {
                 // A memory tool call can complete after the prior authority pass has
@@ -678,6 +785,16 @@ export function createRustModeTransform(
                         "rust channel2 directive delivery failed (ignored):",
                         error,
                     );
+                }
+            }
+            if (options.moduleClient.mirrorPull) {
+                try {
+                    await pullMemoryMirrorOnce({
+                        db: deps.db,
+                        module: options.moduleClient as AuthorityModuleClient,
+                    });
+                } catch (error) {
+                    sessionLog(sessionId, "rust memory mirror-back failed (ignored):", error);
                 }
             }
             if (options.moduleClient.getCompartmentsAfter) {

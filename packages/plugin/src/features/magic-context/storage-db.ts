@@ -8,7 +8,7 @@ import {
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
-import { Database } from "../../shared/sqlite";
+import { Database, registerPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { ensureContextStoreUuid } from "./context-authority";
 import { runMigrations, runMigrationsWithRetry } from "./migrations";
@@ -46,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 54;
+export const LATEST_SUPPORTED_VERSION = 55;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1640,6 +1640,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) {
             return null;
         }
+        registerPrivilegedWriter(existing);
         if (!persistenceByDatabase.has(existing)) {
             persistenceByDatabase.set(existing, true);
         }
@@ -1658,6 +1659,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         ensureSecureStorageDir(dbDir);
 
         const db = new Database(dbPath);
+        registerPrivilegedWriter(db);
         if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
             closeQuietly(db);
             return null;
@@ -1708,6 +1710,7 @@ export async function openDatabaseAsync(
             ensureSecureStorageDir(dbDir);
 
             db = new Database(dbPath);
+            registerPrivilegedWriter(db);
             if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
                 closeQuietly(db);
                 return null;

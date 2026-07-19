@@ -2129,6 +2129,74 @@ const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 55,
+        description: "make managed-write privilege connection-local",
+        up(db: Database): void {
+            // Guard triggers must never consult a persistent flag: a crashed or second
+            // connection must not inherit permission to write module-owned rows.
+            const memoriesPresent = tableExists(db, "memories");
+            const notesPresent = tableExists(db, "notes");
+            if (memoriesPresent) {
+                db.exec(`
+                    DROP TRIGGER IF EXISTS memories_authority_guard_insert;
+                    DROP TRIGGER IF EXISTS memories_authority_guard_update;
+                    DROP TRIGGER IF EXISTS memories_authority_guard_delete;
+                    CREATE TRIGGER memories_authority_guard_insert
+                    BEFORE INSERT ON memories
+                    WHEN (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
+                       OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path))
+                      AND mc_privileged_writer() = 0
+                    BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
+                    CREATE TRIGGER memories_authority_guard_update
+                    BEFORE UPDATE ON memories
+                    WHEN (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = OLD.project_path)
+                       OR EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
+                       OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = OLD.project_path)
+                       OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path))
+                      AND mc_privileged_writer() = 0
+                    BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
+                    CREATE TRIGGER memories_authority_guard_delete
+                    BEFORE DELETE ON memories
+                    WHEN (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = OLD.project_path)
+                       OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = OLD.project_path))
+                      AND mc_privileged_writer() = 0
+                    BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
+                `);
+            }
+            if (notesPresent) {
+                db.exec(`
+                    DROP TRIGGER IF EXISTS notes_authority_guard_insert;
+                    DROP TRIGGER IF EXISTS notes_authority_guard_update;
+                    DROP TRIGGER IF EXISTS notes_authority_guard_delete;
+                    CREATE TRIGGER notes_authority_guard_insert
+                    BEFORE INSERT ON notes
+                    WHEN NEW.type = 'smart' AND NEW.project_path IS NOT NULL
+                      AND (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
+                        OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path))
+                      AND mc_privileged_writer() = 0
+                    BEGIN SELECT RAISE(ABORT, 'context.db smart-note writes are managed by the Rust module'); END;
+                    CREATE TRIGGER notes_authority_guard_update
+                    BEFORE UPDATE ON notes
+                    WHEN ((OLD.type = 'smart' AND OLD.project_path IS NOT NULL
+                            AND (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = OLD.project_path)
+                              OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = OLD.project_path)))
+                       OR (NEW.type = 'smart' AND NEW.project_path IS NOT NULL
+                            AND (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
+                              OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path))))
+                      AND mc_privileged_writer() = 0
+                    BEGIN SELECT RAISE(ABORT, 'context.db smart-note writes are managed by the Rust module'); END;
+                    CREATE TRIGGER notes_authority_guard_delete
+                    BEFORE DELETE ON notes
+                    WHEN OLD.type = 'smart' AND OLD.project_path IS NOT NULL
+                      AND (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = OLD.project_path)
+                        OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = OLD.project_path))
+                      AND mc_privileged_writer() = 0
+                    BEGIN SELECT RAISE(ABORT, 'context.db smart-note writes are managed by the Rust module'); END;
+                `);
+            }
+        },
+    },
 ];
 
 /**
