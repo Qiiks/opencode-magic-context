@@ -13,6 +13,7 @@ import {
 } from "../../features/magic-context/storage";
 import type { RustNoteToolRequest, RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
 import type { CtxNoteArgs, CtxNoteReadFilter } from "./types";
 
@@ -235,8 +236,11 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 .number()
                 .optional()
                 .describe("Note ID (required for 'dismiss' and 'update' actions)."),
+            reduced: tool.schema.boolean().optional(),
+            summary: tool.schema.string().optional(),
         },
         async execute(args: CtxNoteArgs, toolContext) {
+            args = unwrapImitatedReducedArgs(args, ["action", "content"]);
             const sessionId = toolContext.sessionID;
             // Infer write only on NON-EMPTY content. GPT-family models fill every
             // optional param (content:"" for a read), so a bare `typeof === "string"`

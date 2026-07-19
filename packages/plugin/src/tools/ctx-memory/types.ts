@@ -1,6 +1,7 @@
 import type { MemorySourceType } from "../../features/magic-context/memory";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
+import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 
 // Actions a PRIMARY (non-dreamer) agent may run. Primary agents see active
 // memories — with their ids — in the injected <project-memory> block, so they
@@ -21,8 +22,8 @@ export const CTX_MEMORY_DREAMER_ACTIONS = [...CTX_MEMORY_ACTIONS, "list"] as con
 
 export type CtxMemoryAction = (typeof CTX_MEMORY_DREAMER_ACTIONS)[number];
 
-export interface CtxMemoryArgs {
-    action: CtxMemoryAction;
+export interface CtxMemoryArgs extends ImitatedReducedArgs {
+    action?: CtxMemoryAction;
     content?: string;
     category?: string;
     /**

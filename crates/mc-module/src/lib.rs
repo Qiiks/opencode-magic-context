@@ -6998,7 +6998,7 @@ impl McHandler {
     async fn resolve_facade_scope(
         &self,
         channel: u16,
-        request: &Value,
+        arguments: Option<&Map<String, Value>>,
         authority_domain: &str,
     ) -> Result<FacadeScope, HandlerOutcome> {
         let binding = self
@@ -7015,7 +7015,7 @@ impl McHandler {
         {
             Ok(Some(resolved)) => {
                 let route_project_root = binding.project_root.to_string_lossy().to_string();
-                let requested_project = facade_arguments(request)
+                let requested_project = arguments
                     .and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
                 let memory_project_path = match (requested_project, self.store.get()) {
                     (Some(requested_project), Some(store)) => {
@@ -7062,16 +7062,20 @@ impl McHandler {
         }
     }
 
-    async fn handle_ctx_reduce_facade(&self, _channel: u16, _request: &Value) -> HandlerOutcome {
+    async fn handle_ctx_reduce_facade(&self, _channel: u16, request: &Value) -> HandlerOutcome {
+        // Parse the optional reduced-call envelope a model may repeat from context, even though
+        // this endpoint only acknowledges the request; the response observer performs delivery.
+        let _ = facade_arguments(request, &["drop"]);
         // The MCP-facing route is acknowledgement-only. Destructive delivery is owned by
         // the response observer, so this path must return before identity or storage work.
         mcp_text_result(CTX_REDUCE_ACKNOWLEDGEMENT.to_string(), false)
     }
 
     async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(args) = facade_arguments(request) else {
+        let Some(args) = facade_arguments(request, &["action"]) else {
             return invalid_params_error("ctx_memory arguments must be an object");
         };
+        let args = &args;
         let Some(action) = string_arg(args, "action") else {
             return invalid_params_error("ctx_memory requires an action");
         };
@@ -7082,7 +7086,7 @@ impl McHandler {
             return tool_error_result(format!("Error: {error}."));
         }
         let facade_scope = match self
-            .resolve_facade_scope(channel, request, "memories")
+            .resolve_facade_scope(channel, Some(args), "memories")
             .await
         {
             Ok(scope) => scope,
@@ -7253,9 +7257,10 @@ impl McHandler {
     }
 
     async fn handle_ctx_search_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(args) = facade_arguments(request) else {
+        let Some(args) = facade_arguments(request, &["query"]) else {
             return invalid_params_error("ctx_search arguments must be an object");
         };
+        let args = &args;
         let Some(query) = non_empty_string_arg(args, "query") else {
             return tool_error_result("Error: 'query' is required for ctx_search.");
         };
@@ -7264,7 +7269,7 @@ impl McHandler {
         }
         let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
         let facade_scope = match self
-            .resolve_facade_scope(channel, request, "memories")
+            .resolve_facade_scope(channel, Some(args), "memories")
             .await
         {
             Ok(scope) => scope,
@@ -7312,11 +7317,12 @@ impl McHandler {
     }
 
     async fn handle_ctx_expand_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(args) = facade_arguments(request) else {
+        let Some(args) = facade_arguments(request, &["message", "start"]) else {
             return invalid_params_error("ctx_expand arguments must be an object");
         };
+        let args = &args;
         let facade_scope = match self
-            .resolve_facade_scope(channel, request, "memories")
+            .resolve_facade_scope(channel, Some(args), "memories")
             .await
         {
             Ok(scope) => scope,
@@ -7385,7 +7391,7 @@ impl McHandler {
                 message: "note.evaluate requires session_id".to_string(),
             };
         };
-        let scope = match self.resolve_facade_scope(channel, request, "notes").await {
+        let scope = match self.resolve_facade_scope(channel, None, "notes").await {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -7464,7 +7470,7 @@ impl McHandler {
                     .to_string(),
             };
         };
-        let scope = match self.resolve_facade_scope(channel, request, "notes").await {
+        let scope = match self.resolve_facade_scope(channel, None, "notes").await {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -7503,15 +7509,19 @@ impl McHandler {
     }
 
     async fn handle_ctx_note_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(args) = facade_arguments(request) else {
+        let Some(args) = facade_arguments(request, &["action", "content"]) else {
             return invalid_params_error("ctx_note arguments must be an object");
         };
+        let args = &args;
         if let Err(error) = validate_string_cap(args, "content", MAX_NOTE_CONTENT_BYTES)
             .and_then(|_| validate_string_cap(args, "surface_condition", MAX_SHORT_FIELD_BYTES))
         {
             return tool_error_result(format!("Error: {error}."));
         }
-        let facade_scope = match self.resolve_facade_scope(channel, request, "notes").await {
+        let facade_scope = match self
+            .resolve_facade_scope(channel, Some(args), "notes")
+            .await
+        {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -8469,8 +8479,25 @@ fn validate_memory_id_arguments(args: &Map<String, Value>) -> Result<(), String>
     Ok(())
 }
 
-fn facade_arguments(request: &Value) -> Option<&Map<String, Value>> {
-    request.get("arguments")?.as_object()
+/// Recover the intended argument object when a model repeats the reduced-call
+/// envelope it saw in context. Only unwrap when no real primary field is present,
+/// so explicit tool arguments always take precedence.
+fn facade_arguments(request: &Value, primary_fields: &[&str]) -> Option<Map<String, Value>> {
+    let arguments = request.get("arguments")?.as_object()?;
+    if primary_fields
+        .iter()
+        .any(|field| arguments.contains_key(*field))
+        || arguments.get("reduced") != Some(&Value::Bool(true))
+    {
+        return Some(arguments.clone());
+    }
+    let Some(summary) = arguments.get("summary").and_then(Value::as_str) else {
+        return Some(arguments.clone());
+    };
+    match serde_json::from_str::<Value>(summary) {
+        Ok(Value::Object(unwrapped)) => Some(unwrapped),
+        _ => Some(arguments.clone()),
+    }
 }
 
 fn string_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -9790,9 +9817,10 @@ fn ctx_memory_schema() -> Value {
             "memory_project": {
                 "type": "string",
                 "description": "Resolved MC project identity supplied by the host transport."
-            }
-        },
-        "required": ["action"]
+            },
+            "reduced": { "type": "boolean" },
+            "summary": { "type": "string" }
+        }
     })
 }
 
@@ -9812,9 +9840,10 @@ fn ctx_search_schema() -> Value {
                 "maximum": 25,
                 "default": 8,
                 "description": "Maximum number of matches to return."
-            }
-        },
-        "required": ["query"]
+            },
+            "reduced": { "type": "boolean" },
+            "summary": { "type": "string" }
+        }
     })
 }
 
@@ -9825,7 +9854,9 @@ fn ctx_expand_schema() -> Value {
         "properties": {
             "start": { "type": "integer", "minimum": 1, "description": "First message ordinal to expand." },
             "end": { "type": "integer", "minimum": 1, "description": "Last message ordinal to expand, inclusive." },
-            "message": { "type": "integer", "minimum": 1, "description": "Recover the single persisted chunk transcript covering this message ordinal." }
+            "message": { "type": "integer", "minimum": 1, "description": "Recover the single persisted chunk transcript covering this message ordinal." },
+            "reduced": { "type": "boolean" },
+            "summary": { "type": "string" }
         }
     })
 }
@@ -9842,7 +9873,9 @@ fn ctx_note_schema() -> Value {
             "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes in each section." },
             "filter": { "type": "string", "enum": ["all", "active", "pending", "ready", "dismissed"], "description": "Optional read filter. Defaults to active session notes plus ready smart notes." },
             "surface_condition": { "type": "string", "maxLength": 4096, "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." },
-            "memory_project": { "type": "string", "description": "Resolved MC project identity supplied by the host transport." }
+            "memory_project": { "type": "string", "description": "Resolved MC project identity supplied by the host transport." },
+            "reduced": { "type": "boolean" },
+            "summary": { "type": "string" }
         }
     })
 }
@@ -9874,9 +9907,10 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
                     schema: json!({
                         "type": "object",
                         "properties": {
-                            "drop": { "type": "string" }
+                            "drop": { "type": "string" },
+                            "reduced": { "type": "boolean" },
+                            "summary": { "type": "string" }
                         },
-                        "required": ["drop"],
                         "additionalProperties": false
                     }),
                 },
@@ -12280,7 +12314,7 @@ mod tests {
     }
 
     #[test]
-    fn ctx_reduce_manifest_schema_is_closed_and_requires_drop() {
+    fn ctx_reduce_manifest_schema_is_closed_and_accepts_reduced_envelopes() {
         let manifest = manifest("magic-context");
         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("tool provider manifest entry");
@@ -12293,8 +12327,11 @@ mod tests {
             tool.schema,
             json!({
                 "type": "object",
-                "properties": { "drop": { "type": "string" } },
-                "required": ["drop"],
+                "properties": {
+                    "drop": { "type": "string" },
+                    "reduced": { "type": "boolean" },
+                    "summary": { "type": "string" }
+                },
                 "additionalProperties": false
             })
         );
@@ -12423,6 +12460,78 @@ mod tests {
         )
         .await;
         assert!(tool_is_error(oversized));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_unwraps_imitated_reduced_arguments_without_overriding_real_values() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/repo", "token"));
+        let id = insert_memory(&store, "/repo", "CONSTRAINTS", "Run focused tests.", 1);
+
+        let plain = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "action": "get", "ids": [id] }),
+            )
+            .await,
+        );
+        let imitated = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "reduced": true,
+                    "summary": json!({ "action": "get", "ids": [id] }).to_string(),
+                }),
+            )
+            .await,
+        );
+        let real_arguments = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": "get",
+                    "ids": [id],
+                    "reduced": true,
+                    "summary": json!({ "action": "archive", "ids": [id] }).to_string(),
+                }),
+            )
+            .await,
+        );
+        let malformed = error_frame(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({ "reduced": true, "summary": "not JSON" }),
+            )
+            .await,
+        );
+        let plain_missing = error_frame(call_facade(&handler, "ctx_memory", json!({})).await);
+        let reduce_plain =
+            tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1" })).await);
+        let reduce_imitated = tool_text(
+            call_facade(
+                &handler,
+                "ctx_reduce",
+                json!({
+                    "reduced": true,
+                    "summary": json!({ "drop": "1" }).to_string(),
+                }),
+            )
+            .await,
+        );
+
+        assert_eq!(imitated, plain);
+        assert_eq!(real_arguments, plain);
+        assert_eq!(store.get_memory_full(id).unwrap().unwrap().status, "active");
+        assert_eq!(malformed, plain_missing);
+        assert_eq!(reduce_imitated, reduce_plain);
     }
 
     #[tokio::test(flavor = "current_thread")]

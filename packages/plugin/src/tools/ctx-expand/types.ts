@@ -1,4 +1,6 @@
-export interface CtxExpandArgs {
+import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
+
+export interface CtxExpandArgs extends ImitatedReducedArgs {
     start?: number;
     end?: number;
     /** Verbose range view: each message + tool call shown separately, with ordinals. */

@@ -53,6 +53,46 @@ describe("createCtxMemoryTool", () => {
 		}
 	});
 
+	it("unwraps an imitated reduced get call", async () => {
+		const db = createTestDb();
+		try {
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const ctx = fakeContext("ses-memory") as never;
+			const memory = insertMemory(db, {
+				projectPath: resolveProjectIdentity((ctx as { cwd: string }).cwd),
+				category: "CONSTRAINTS",
+				content: "Run the focused test suite.",
+			});
+
+			const plain = await tool.execute(
+				"call-plain",
+				{ action: "get", ids: [memory.id] },
+				new AbortController().signal,
+				undefined,
+				ctx,
+			);
+			const imitated = await tool.execute(
+				"call-imitated",
+				{
+					reduced: true,
+					summary: JSON.stringify({ action: "get", ids: [memory.id] }),
+				},
+				new AbortController().signal,
+				undefined,
+				ctx,
+			);
+
+			expect(imitated).toEqual(plain);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("formats list output with a header and verification column", async () => {
 		const db = createTestDb();
 		try {

@@ -11,6 +11,7 @@ import {
     unifiedSearch,
 } from "../../features/magic-context/search";
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import {
     CTX_SEARCH_DESCRIPTION,
     CTX_SEARCH_TOOL_NAME,
@@ -163,6 +164,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
         args: {
             query: tool.schema
                 .string()
+                .optional()
                 .describe(
                     "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
                 ),
@@ -176,8 +178,11 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                 .describe(
                     'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources; pass [] to search no sources.',
                 ),
+            reduced: tool.schema.boolean().optional(),
+            summary: tool.schema.string().optional(),
         },
         async execute(args: CtxSearchArgs, toolContext) {
+            args = unwrapImitatedReducedArgs(args, ["query"]);
             const query = args.query?.trim();
             if (!query) {
                 return "Error: 'query' is required.";

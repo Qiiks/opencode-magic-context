@@ -76,6 +76,7 @@ import {
 import { log } from "@magic-context/core/shared/logger";
 import { CTX_MEMORY_DESCRIPTION } from "@magic-context/core/tools/ctx-memory/constants";
 import { runImmediateTransaction } from "@magic-context/core/tools/ctx-memory/verification-recording";
+import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
 const DEFAULT_LIST_LIMIT = 10;
@@ -105,11 +106,13 @@ const DREAMER_ONLY_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(["list"]);
 const GET_MAX_IDS = 20;
 
 const ParamsSchema = Type.Object({
-	action: Type.Union(
-		ALL_ACTIONS.map((a) => Type.Literal(a)),
-		{
-			description: "What to do: write, update, archive, merge, get, or list",
-		},
+	action: Type.Optional(
+		Type.Union(
+			ALL_ACTIONS.map((a) => Type.Literal(a)),
+			{
+				description: "What to do: write, update, archive, merge, get, or list",
+			},
+		),
 	),
 	content: Type.Optional(
 		Type.String({
@@ -142,6 +145,8 @@ const ParamsSchema = Type.Object({
 			description: "Why the memory is being archived (optional, recommended)",
 		}),
 	),
+	reduced: Type.Optional(Type.Boolean()),
+	summary: Type.Optional(Type.String()),
 });
 
 type CtxMemoryParams = Static<typeof ParamsSchema>;
@@ -356,6 +361,10 @@ export function createCtxMemoryTool(
 			_onUpdate,
 			ctx,
 		) {
+			params = unwrapImitatedReducedArgs(params, ["action"]);
+			if (params.action === undefined) {
+				return err("Error: Action 'undefined' is not allowed in this context.");
+			}
 			// Gate dreamer-only actions on the allowlist flag. Mirrors
 			// OpenCode's `if (toolContext.agent !== DREAMER_AGENT && !allowedActions.includes(args.action))`.
 			if (!dreamerAllowed && DREAMER_ONLY_ACTIONS.has(params.action)) {

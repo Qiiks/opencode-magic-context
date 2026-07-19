@@ -32,6 +32,7 @@ import {
 	renderMessageByOrdinal,
 	renderVerboseRange,
 } from "@magic-context/core/tools/ctx-expand/render";
+import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 import { readPiSessionMessages } from "../read-session-pi";
 
@@ -60,6 +61,8 @@ const ParamsSchema = Type.Object({
 				"Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
 		}),
 	),
+	reduced: Type.Optional(Type.Boolean()),
+	summary: Type.Optional(Type.String()),
 });
 
 type CtxExpandParams = Static<typeof ParamsSchema>;
@@ -95,6 +98,7 @@ export function createCtxExpandTool(
 			_onUpdate,
 			ctx,
 		) {
+			params = unwrapImitatedReducedArgs(params, ["message", "start"]);
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (!sessionId) {
 				return err("Error: no active Pi session.");

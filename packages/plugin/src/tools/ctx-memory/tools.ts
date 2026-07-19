@@ -42,6 +42,7 @@ import {
     storedPathBelongsToWorkspace,
 } from "../../features/magic-context/workspaces";
 import { sessionLog } from "../../shared/logger";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, DEFAULT_SEARCH_LIMIT } from "./constants";
 import {
     CTX_MEMORY_ACTIONS,
@@ -344,6 +345,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             // schema visible to the runtime and enforce primary-session safety below.
             action: tool.schema
                 .enum([...CTX_MEMORY_DREAMER_ACTIONS])
+                .optional()
                 .describe("What to do: write, update, archive, merge, get, or list"),
             content: tool.schema
                 .string()
@@ -368,14 +370,20 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 .string()
                 .optional()
                 .describe("Why the memory is being archived (optional, recommended)"),
+            reduced: tool.schema.boolean().optional(),
+            summary: tool.schema.string().optional(),
         },
         async execute(args: CtxMemoryArgs, toolContext) {
+            args = unwrapImitatedReducedArgs(args, ["action"]);
             // Sidekick consumes untrusted `/ctx-aug` prompt text and is retrieval-only;
             // fail closed even if a future permission list accidentally exposes this tool.
             if (toolContext.agent === SIDEKICK_AGENT) {
                 return "Error: ctx_memory is not available to the sidekick agent.";
             }
-            if (toolContext.agent !== DREAMER_AGENT && !allowedActions.includes(args.action)) {
+            if (
+                args.action === undefined ||
+                (toolContext.agent !== DREAMER_AGENT && !allowedActions.includes(args.action))
+            ) {
                 return `Error: Action '${args.action}' is not allowed in this context.`;
             }
 

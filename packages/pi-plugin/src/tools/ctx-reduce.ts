@@ -25,6 +25,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { getErrorMessage } from "@magic-context/core/shared/error-message";
 import { CTX_REDUCE_DESCRIPTION } from "@magic-context/core/tools/ctx-reduce/constants";
+import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
 const ParamsSchema = Type.Object({
@@ -33,6 +34,8 @@ const ParamsSchema = Type.Object({
 			description: "Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'",
 		}),
 	),
+	reduced: Type.Optional(Type.Boolean()),
+	summary: Type.Optional(Type.String()),
 });
 
 type CtxReduceParams = Static<typeof ParamsSchema>;
@@ -81,6 +84,7 @@ export function createCtxReduceTool(
 			_onUpdate,
 			ctx,
 		) {
+			params = unwrapImitatedReducedArgs(params, ["drop"]);
 			const sessionId = ctx.sessionManager.getSessionId();
 			const protectedTags = Math.max(
 				0,

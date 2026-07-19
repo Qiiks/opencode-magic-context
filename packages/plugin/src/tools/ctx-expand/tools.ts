@@ -2,6 +2,7 @@ import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { readSessionChunk } from "../../hooks/magic-context/read-session-chunk";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "./constants";
 import { renderMessageByOrdinal, renderVerboseRange } from "./render";
 import type { CtxExpandArgs } from "./types";
@@ -38,8 +39,11 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 .describe(
                     "Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
                 ),
+            reduced: tool.schema.boolean().optional(),
+            summary: tool.schema.string().optional(),
         },
         async execute(args: CtxExpandArgs, toolContext) {
+            args = unwrapImitatedReducedArgs(args, ["message", "start"]);
             const sessionId = toolContext.sessionID;
 
             // By-ordinal mode: full recovery of a single message from stored history.

@@ -30,6 +30,7 @@ import {
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/constants";
+import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
 const DEFAULT_LIMIT = 10;
@@ -37,10 +38,12 @@ const NOTE_EXPAND_HINT =
 	"Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
 
 const ParamsSchema = Type.Object({
-	query: Type.String({
-		description:
-			"Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
-	}),
+	query: Type.Optional(
+		Type.String({
+			description:
+				"Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+		}),
+	),
 	limit: Type.Optional(
 		Type.Number({
 			description: "Maximum results to return (default: 10)",
@@ -61,6 +64,8 @@ const ParamsSchema = Type.Object({
 			},
 		),
 	),
+	reduced: Type.Optional(Type.Boolean()),
+	summary: Type.Optional(Type.String()),
 });
 
 type CtxSearchParams = Static<typeof ParamsSchema>;
@@ -202,6 +207,7 @@ export function createCtxSearchTool(
 			_onUpdate,
 			ctx,
 		) {
+			params = unwrapImitatedReducedArgs(params, ["query"]);
 			const query = params.query?.trim();
 			if (!query) {
 				return {

@@ -11,6 +11,7 @@ import {
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import { getErrorMessage } from "../../shared/error-message";
 import type { Database } from "../../shared/sqlite";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_REDUCE_DESCRIPTION } from "./constants";
 import type { CtxReduceArgs } from "./types";
 
@@ -62,8 +63,11 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                 .string()
                 .optional()
                 .describe("Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'"),
+            reduced: tool.schema.boolean().optional(),
+            summary: tool.schema.string().optional(),
         },
         async execute(args: CtxReduceArgs, toolContext) {
+            args = unwrapImitatedReducedArgs(args, ["drop"]);
             const sessionId = toolContext.sessionID;
 
             if (!args.drop) {

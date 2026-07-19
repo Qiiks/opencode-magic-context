@@ -1689,6 +1689,43 @@ describe("createCtxMemoryTools", () => {
             expect(result).toContain("Always run bun before shipping.");
         });
 
+        it("unwraps imitated reduced get calls without overriding real arguments", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "Run the focused test suite.",
+            });
+            const plain = await tools.ctx_memory.execute(
+                { action: "get", ids: [memory.id] },
+                toolContext(),
+            );
+            const imitated = await tools.ctx_memory.execute(
+                {
+                    reduced: true,
+                    summary: JSON.stringify({ action: "get", ids: [memory.id] }),
+                },
+                toolContext(),
+            );
+            const malformed = await tools.ctx_memory.execute(
+                { reduced: true, summary: "not JSON" },
+                toolContext(),
+            );
+            const realArguments = await tools.ctx_memory.execute(
+                {
+                    action: "get",
+                    ids: [memory.id],
+                    reduced: true,
+                    summary: JSON.stringify({ action: "archive", ids: [memory.id] }),
+                },
+                toolContext(),
+            );
+
+            expect(imitated).toBe(plain);
+            expect(malformed).toBe("Error: Action 'undefined' is not allowed in this context.");
+            expect(realArguments).toBe(plain);
+            expect(getMemoryById(db, memory.id)?.status).toBe("active");
+        });
+
         it("labels archived rows with their status instead of hiding them", async () => {
             const memory = insertMemory(db, {
                 projectPath: "/repo/project",

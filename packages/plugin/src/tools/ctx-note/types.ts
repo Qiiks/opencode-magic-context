@@ -1,6 +1,8 @@
+import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
+
 export type CtxNoteReadFilter = "all" | "active" | "pending" | "ready" | "dismissed";
 
-export interface CtxNoteArgs {
+export interface CtxNoteArgs extends ImitatedReducedArgs {
     action?: "write" | "read" | "dismiss" | "update";
     content?: string;
     surface_condition?: string;

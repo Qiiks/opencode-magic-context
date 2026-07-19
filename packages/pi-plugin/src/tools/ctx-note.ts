@@ -32,6 +32,7 @@ import {
 	updateNote,
 } from "@magic-context/core/features/magic-context/storage";
 import { CTX_NOTE_DESCRIPTION } from "@magic-context/core/tools/ctx-note/constants";
+import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
 const FILTER_VALUES = [
@@ -92,6 +93,8 @@ const ParamsSchema = Type.Object({
 				"Skip this many newest notes for read — page older ones (default: 0)",
 		}),
 	),
+	reduced: Type.Optional(Type.Boolean()),
+	summary: Type.Optional(Type.String()),
 });
 
 type CtxNoteParams = Static<typeof ParamsSchema>;
@@ -191,6 +194,7 @@ export function createCtxNoteTool(
 		description: CTX_NOTE_DESCRIPTION,
 		parameters: ParamsSchema,
 		async execute(_toolCallId, params: CtxNoteParams, _signal, _onUpdate, ctx) {
+			params = unwrapImitatedReducedArgs(params, ["action", "content"]);
 			const sessionId = ctx.sessionManager.getSessionId();
 			const dreamerEnabled =
 				deps.resolveDreamerEnabled?.(ctx) ?? deps.dreamerEnabled;
