@@ -5,6 +5,8 @@ export interface RustNoteToolRequest {
     sessionId: string;
     projectRoot: string;
     projectPath: string;
+    /** MC identity; projectRoot stays transport-only. */
+    memoryProject: string;
     action: "write" | "read" | "update" | "dismiss";
     content?: string;
     surfaceCondition?: string;
@@ -18,6 +20,8 @@ export interface RustMemoryToolRequest {
     sessionId: string;
     projectRoot: string;
     projectPath: string;
+    /** MC identity; projectRoot stays transport-only. */
+    memoryProject: string;
     action: "write" | "update" | "archive" | "merge" | "get";
     content?: string;
     category?: string;
@@ -34,6 +38,7 @@ export interface RustToolBackends {
     }) => Promise<unknown>;
     authorityState?: (args: {
         projectPath: string;
+        projectRoot: string;
         domain: RustAuthorityDomain;
     }) => Promise<RustAuthorityState | null>;
     /** Route ctx_note only after notes authority reports MODULE. */

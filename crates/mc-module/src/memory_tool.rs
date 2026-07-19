@@ -19,15 +19,30 @@ pub enum MemoryToolError {
     Store(McStoreError),
     EmptyContent,
     EmptyMerge,
-    DuplicateSourceId { id: i64 },
-    NotFound { id: i64 },
-    Inactive { id: i64, status: String },
-    Superseded { id: i64, superseded_by: i64 },
-    CrossCategoryMerge { categories: Vec<String> },
+    DuplicateSourceId {
+        id: i64,
+    },
+    NotFound {
+        id: i64,
+    },
+    Inactive {
+        id: i64,
+        status: String,
+    },
+    Superseded {
+        id: i64,
+        superseded_by: i64,
+    },
+    CrossCategoryMerge {
+        categories: Vec<String>,
+    },
     /// Cap on the `get` op's per-call id list (matches the plugin/pi twins). Returning a
     /// dedicated error lets the facade translate it into a clear user-facing message
     /// instead of papering over the difference with a generic "not found".
-    TooManyIds { requested: usize, max: usize },
+    TooManyIds {
+        requested: usize,
+        max: usize,
+    },
     /// A `get` call with no ids is an input error distinct from merge validation, so the
     /// message names the read action instead of talking about merge sources.
     EmptyGet,
@@ -59,7 +74,10 @@ impl std::fmt::Display for MemoryToolError {
                 "'ids' must contain at most {max} memory IDs when action is 'get' (got {requested})"
             ),
             MemoryToolError::EmptyGet => {
-                write!(f, "'ids' must contain at least one memory ID when action is 'get'")
+                write!(
+                    f,
+                    "'ids' must contain at least one memory ID when action is 'get'"
+                )
             }
         }
     }
@@ -527,6 +545,7 @@ mod tests {
     ) -> InsertMemoryInput<'a> {
         InsertMemoryInput {
             project_path: project,
+            route_project_root: None,
             category,
             content,
             source_session_id: None,

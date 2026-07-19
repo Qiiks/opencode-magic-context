@@ -66,6 +66,8 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
     authorityStatus?(args: {
         context_store_uuid: string;
         project: string;
+        /** Bound route root for this authority query. */
+        projectRoot?: string;
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;

@@ -354,7 +354,7 @@ describe("createCtxMemoryTools", () => {
         });
 
         it("routes all module-owned memory actions without writing the TS table", async () => {
-            const routed: Array<{ action: string; ids?: number[] }> = [];
+            const routed: Array<{ action: string; ids?: number[]; memoryProject: string }> = [];
             const moduleTools = createCtxMemoryTools({
                 db,
                 resolveProjectPath: () => "/repo/project",
@@ -363,7 +363,11 @@ describe("createCtxMemoryTools", () => {
                 rustToolBackends: {
                     authorityState: async () => "MODULE",
                     memory: async (request) => {
-                        routed.push({ action: request.action, ids: request.ids });
+                        routed.push({
+                            action: request.action,
+                            ids: request.ids,
+                            memoryProject: request.memoryProject,
+                        });
                         return { content: [{ type: "text", text: `module ${request.action}` }] };
                     },
                 },
@@ -386,6 +390,7 @@ describe("createCtxMemoryTools", () => {
                 "merge",
                 "get",
             ]);
+            expect(routed.every((request) => request.memoryProject === "/repo/project")).toBe(true);
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
         });
 

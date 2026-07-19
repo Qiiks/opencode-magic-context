@@ -663,11 +663,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const rustToolBackends: RustToolBackends | undefined =
         deps.config.transform_mode === "rust" && rustModeModuleClient
             ? {
-                  authorityState: async ({ projectPath, domain }) => {
+                  authorityState: async ({ projectPath, projectRoot, domain }) => {
                       if (!rustModeModuleClient.authorityStatus) return null;
                       const result = await rustModeModuleClient.authorityStatus({
                           context_store_uuid: ensureContextStoreUuid(db),
                           project: projectPath,
+                          projectRoot,
                           domain,
                       });
                       return result.authority?.state ?? null;
@@ -688,6 +689,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   note: ({
                       sessionId,
                       projectRoot,
+                      memoryProject,
                       action,
                       content,
                       surfaceCondition,
@@ -705,6 +707,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               arguments: {
                                   action,
                                   content,
+                                  memory_project: memoryProject,
                                   surface_condition: surfaceCondition,
                                   filter,
                                   limit,
@@ -713,14 +716,30 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               },
                           },
                       }),
-                  memory: ({ sessionId, projectRoot, action, content, category, ids, reason }) =>
+                  memory: ({
+                      sessionId,
+                      projectRoot,
+                      memoryProject,
+                      action,
+                      content,
+                      category,
+                      ids,
+                      reason,
+                  }) =>
                       rustModeModuleClient.call({
                           sessionId,
                           projectRoot,
                           method: "ctx_memory",
                           body: {
                               name: "ctx_memory",
-                              arguments: { action, content, category, ids, reason },
+                              arguments: {
+                                  action,
+                                  content,
+                                  category,
+                                  ids,
+                                  reason,
+                                  memory_project: memoryProject,
+                              },
                           },
                       }),
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>

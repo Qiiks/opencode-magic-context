@@ -1430,6 +1430,123 @@ const MIGRATIONS: &[Migration] = &[
         END;
         "#,
     },
+    Migration {
+        version: 29,
+        // The module store uses project identity as its domain key. A route root is
+        // transport vocabulary, so retain the mapping only to normalize legacy facade
+        // rows when a MODULE authority route is observed.
+        statements: r#"
+        CREATE TABLE IF NOT EXISTS mc_authority_route_bindings (
+            route_project_root TEXT PRIMARY KEY,
+            context_store_uuid TEXT NOT NULL,
+            project            TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_authority_route_bindings_authority
+            ON mc_authority_route_bindings(context_store_uuid, project);
+
+        CREATE TRIGGER mc_authority_route_binding_rekey_insert
+        AFTER INSERT ON mc_authority_route_bindings
+        WHEN NEW.route_project_root LIKE '/%'
+        BEGIN
+            DELETE FROM mc_memories
+             WHERE project_path = NEW.route_project_root
+               AND EXISTS (
+                    SELECT 1 FROM mc_authority authority
+                     WHERE authority.context_store_uuid = NEW.context_store_uuid
+                       AND authority.project = NEW.project
+                       AND authority.domain = 'memories'
+                       AND authority.state = 'MODULE'
+               )
+               AND EXISTS (
+                    SELECT 1 FROM mc_memories canonical
+                     WHERE canonical.project_path = NEW.project
+                       AND canonical.category = mc_memories.category
+                       AND canonical.normalized_hash = mc_memories.normalized_hash
+               );
+            UPDATE mc_memories
+               SET project_path = NEW.project
+             WHERE project_path = NEW.route_project_root
+               AND EXISTS (
+                    SELECT 1 FROM mc_authority authority
+                     WHERE authority.context_store_uuid = NEW.context_store_uuid
+                       AND authority.project = NEW.project
+                       AND authority.domain = 'memories'
+                       AND authority.state = 'MODULE'
+               );
+            UPDATE mc_memory_mutation_log
+               SET project_path = NEW.project
+             WHERE project_path = NEW.route_project_root
+               AND EXISTS (
+                    SELECT 1 FROM mc_authority authority
+                     WHERE authority.context_store_uuid = NEW.context_store_uuid
+                       AND authority.project = NEW.project
+                       AND authority.domain = 'memories'
+                       AND authority.state = 'MODULE'
+               );
+            UPDATE mc_notes
+               SET project_path = NEW.project
+             WHERE project_path = NEW.route_project_root
+               AND EXISTS (
+                    SELECT 1 FROM mc_authority authority
+                     WHERE authority.context_store_uuid = NEW.context_store_uuid
+                       AND authority.project = NEW.project
+                       AND authority.domain = 'notes'
+                       AND authority.state = 'MODULE'
+               );
+        END;
+
+        CREATE TRIGGER mc_authority_route_binding_rekey_update
+        AFTER UPDATE OF context_store_uuid, project ON mc_authority_route_bindings
+        WHEN NEW.route_project_root LIKE '/%'
+        BEGIN
+            DELETE FROM mc_memories
+             WHERE project_path = NEW.route_project_root
+               AND EXISTS (
+                    SELECT 1 FROM mc_authority authority
+                     WHERE authority.context_store_uuid = NEW.context_store_uuid
+                       AND authority.project = NEW.project
+                       AND authority.domain = 'memories'
+                       AND authority.state = 'MODULE'
+               )
+               AND EXISTS (
+                    SELECT 1 FROM mc_memories canonical
+                     WHERE canonical.project_path = NEW.project
+                       AND canonical.category = mc_memories.category
+                       AND canonical.normalized_hash = mc_memories.normalized_hash
+               );
+            UPDATE mc_memories
+               SET project_path = NEW.project
+             WHERE project_path = NEW.route_project_root
+               AND EXISTS (
+                    SELECT 1 FROM mc_authority authority
+                     WHERE authority.context_store_uuid = NEW.context_store_uuid
+                       AND authority.project = NEW.project
+                       AND authority.domain = 'memories'
+                       AND authority.state = 'MODULE'
+               );
+            UPDATE mc_memory_mutation_log
+               SET project_path = NEW.project
+             WHERE project_path = NEW.route_project_root
+               AND EXISTS (
+                    SELECT 1 FROM mc_authority authority
+                     WHERE authority.context_store_uuid = NEW.context_store_uuid
+                       AND authority.project = NEW.project
+                       AND authority.domain = 'memories'
+                       AND authority.state = 'MODULE'
+               );
+            UPDATE mc_notes
+               SET project_path = NEW.project
+             WHERE project_path = NEW.route_project_root
+               AND EXISTS (
+                    SELECT 1 FROM mc_authority authority
+                     WHERE authority.context_store_uuid = NEW.context_store_uuid
+                       AND authority.project = NEW.project
+                       AND authority.domain = 'notes'
+                       AND authority.state = 'MODULE'
+               );
+        END;
+        "#,
+    },
 ];
 
 /// A project's workspace membership: the union of member identities it reads, which of
@@ -2257,6 +2374,9 @@ pub struct StoredMemoryFull {
 #[derive(Debug, Clone, Copy)]
 pub struct InsertMemoryInput<'a> {
     pub project_path: &'a str,
+    /// Bound route root for facade writes. Domain rows use `project_path`; the route
+    /// path is only used to enforce the authority vocabulary boundary.
+    pub route_project_root: Option<&'a str>,
     pub category: &'a str,
     pub content: &'a str,
     pub source_session_id: Option<&'a str>,
@@ -2303,6 +2423,8 @@ pub struct StoredChunkTranscript {
 #[derive(Debug, Clone, Copy)]
 pub struct NoteInput<'a> {
     pub project_path: &'a str,
+    /// Bound route root for facade writes. The note remains keyed by `project_path`.
+    pub route_project_root: Option<&'a str>,
     pub session_id: &'a str,
     pub content: &'a str,
     pub surface_condition: Option<&'a str>,
@@ -2316,6 +2438,8 @@ pub struct NoteInput<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct NoteWriteInput<'a> {
     pub project_path: &'a str,
+    /// Bound route root for facade writes. The note remains keyed by `project_path`.
+    pub route_project_root: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub content: &'a str,
     pub surface_condition: Option<&'a str>,
@@ -2724,6 +2848,14 @@ pub enum McStoreError {
         id: i64,
         project: String,
     },
+    /// A facade route bound to an authority-managed identity attempted to write
+    /// using filesystem-path transport vocabulary instead of the domain identity.
+    FacadeProjectVocabularyMismatch {
+        route_project_root: String,
+        authority_project: String,
+        write_project: String,
+        domain: String,
+    },
 }
 
 impl std::fmt::Display for McStoreError {
@@ -2762,6 +2894,15 @@ impl std::fmt::Display for McStoreError {
             McStoreError::NoteOwnershipMismatch { id, project } => {
                 write!(f, "note {id} is not owned by project {project}")
             }
+            McStoreError::FacadeProjectVocabularyMismatch {
+                route_project_root,
+                authority_project,
+                write_project,
+                domain,
+            } => write!(
+                f,
+                "{domain} facade route {route_project_root} is authority-managed as {authority_project}, but the write used {write_project}"
+            ),
         }
     }
 }
@@ -3224,6 +3365,72 @@ impl McStore {
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Associate a daemon-bound route root with an authority identity. The route path
+    /// is transport vocabulary; the identity remains the key used by domain rows.
+    pub fn bind_authority_route(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        route_project_root: &str,
+    ) -> Result<(), McStoreError> {
+        self.with_note_conn_fenced(route_project_root, |tx| {
+            tx.execute(
+                "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(route_project_root) DO UPDATE SET
+                    context_store_uuid = excluded.context_store_uuid,
+                    project = excluded.project",
+                params![route_project_root, context_store_uuid, project],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Return the MODULE-authority identity currently bound to this daemon route.
+    pub fn authority_project_for_route(
+        &self,
+        route_project_root: &str,
+        domain: &str,
+    ) -> Result<Option<String>, McStoreError> {
+        validate_authority_domain(domain)?;
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT authority.project
+                       FROM mc_authority_route_bindings binding
+                       JOIN mc_authority authority
+                         ON authority.context_store_uuid = binding.context_store_uuid
+                        AND authority.project = binding.project
+                      WHERE binding.route_project_root = ?1
+                        AND authority.domain = ?2
+                        AND authority.state = 'MODULE'",
+                    params![route_project_root, domain],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Reject a facade write that crosses the route's active authority identity.
+    pub fn enforce_facade_project_vocabulary(
+        &self,
+        route_project_root: &str,
+        write_project: &str,
+        domain: &str,
+    ) -> Result<(), McStoreError> {
+        let authority_project = self.authority_project_for_route(route_project_root, domain)?;
+        if let Some(authority_project) = authority_project.filter(|value| value != write_project) {
+            return Err(McStoreError::FacadeProjectVocabularyMismatch {
+                route_project_root: route_project_root.to_string(),
+                authority_project,
+                write_project: write_project.to_string(),
+                domain: domain.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Install a test callback while cleanup of a matching pending historian run holds
@@ -5714,8 +5921,10 @@ impl McStore {
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let id_binds: Vec<rusqlite::types::Value> =
-            ids.iter().map(|id| rusqlite::types::Value::from(*id)).collect();
+        let id_binds: Vec<rusqlite::types::Value> = ids
+            .iter()
+            .map(|id| rusqlite::types::Value::from(*id))
+            .collect();
         // The SQL placeholders appear in `id IN (?,…)` first, then the visibility
         // expression, so positional binds follow the same order.
         let mut binds = id_binds;
@@ -5748,6 +5957,13 @@ impl McStore {
     /// `seen_count` and timestamps, and skip the mutation log because the rendered content
     /// did not change.
     pub fn insert_memory(&self, input: InsertMemoryInput<'_>) -> Result<i64, McStoreError> {
+        if let Some(route_project_root) = input.route_project_root {
+            self.enforce_facade_project_vocabulary(
+                route_project_root,
+                input.project_path,
+                "memories",
+            )?;
+        }
         let memory_id = self.inner.with_conn_fenced(|tx| {
             let normalized_hash = compute_normalized_memory_hash(input.content);
             let existing: Option<i64> = tx
@@ -7151,6 +7367,13 @@ impl McStore {
     }
 
     pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, McStoreError> {
+        if let Some(route_project_root) = input.route_project_root {
+            self.enforce_facade_project_vocabulary(
+                route_project_root,
+                input.project_path,
+                "notes",
+            )?;
+        }
         let content = input.content.trim();
         if content.is_empty() {
             return Err(McStoreError::Serde(
@@ -7183,6 +7406,13 @@ impl McStore {
         &self,
         input: NoteWriteInput<'_>,
     ) -> Result<StoredNote, McStoreError> {
+        if let Some(route_project_root) = input.route_project_root {
+            self.enforce_facade_project_vocabulary(
+                route_project_root,
+                input.project_path,
+                "notes",
+            )?;
+        }
         let content = input.content.trim();
         if content.is_empty() {
             return Err(McStoreError::Serde(
@@ -7828,9 +8058,10 @@ impl McStore {
                        WHERE project_path = ?1 AND session_id = ?2 AND transform_pass_id = ?3
                          AND disposition IS NULL",
                 )?
-                .query_map(params![project_path, session_id, transform_pass_id], |row| {
-                    row.get::<_, i64>(0)
-                })?
+                .query_map(
+                    params![project_path, session_id, transform_pass_id],
+                    |row| row.get::<_, i64>(0),
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             let changed = tx.execute(
                 "UPDATE mc_note_deliveries SET acked_at = ?1, disposition = 'acked'
@@ -10022,6 +10253,7 @@ mod tests {
     ) -> InsertMemoryInput<'a> {
         InsertMemoryInput {
             project_path,
+            route_project_root: None,
             category,
             content,
             source_session_id: None,
@@ -10349,7 +10581,13 @@ mod tests {
         let target_ids = vec!["a#0".to_string()];
 
         let first = store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1, false)
+            .append_pending_agent_drops_with_command(
+                "ses",
+                Some("tool-use-1"),
+                &target_ids,
+                1,
+                false,
+            )
             .unwrap();
         assert_eq!(
             first,
@@ -10362,7 +10600,13 @@ mod tests {
         let pending = store.load_pending_agent_drops("ses").unwrap();
 
         let retry = store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2, false)
+            .append_pending_agent_drops_with_command(
+                "ses",
+                Some("tool-use-1"),
+                &target_ids,
+                2,
+                false,
+            )
             .unwrap();
         assert_eq!(
             retry,
@@ -10419,7 +10663,13 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let target_ids = vec!["a#0".to_string()];
         store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1, false)
+            .append_pending_agent_drops_with_command(
+                "ses",
+                Some("tool-use-1"),
+                &target_ids,
+                1,
+                false,
+            )
             .unwrap();
         let pending = store.load_pending_agent_drops("ses").unwrap();
         store
@@ -10435,7 +10685,13 @@ mod tests {
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
         let retry = store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2, false)
+            .append_pending_agent_drops_with_command(
+                "ses",
+                Some("tool-use-1"),
+                &target_ids,
+                2,
+                false,
+            )
             .unwrap();
         assert_eq!(
             retry,
@@ -10453,7 +10709,13 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let target_ids = vec!["a#0".to_string()];
         store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1, false)
+            .append_pending_agent_drops_with_command(
+                "ses",
+                Some("tool-use-1"),
+                &target_ids,
+                1,
+                false,
+            )
             .unwrap();
         let pending = store.load_pending_agent_drops("ses").unwrap();
         store
@@ -10468,7 +10730,13 @@ mod tests {
             .unwrap();
 
         let next = store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-2"), &target_ids, 2, false)
+            .append_pending_agent_drops_with_command(
+                "ses",
+                Some("tool-use-2"),
+                &target_ids,
+                2,
+                false,
+            )
             .unwrap();
         assert_eq!(
             next,
@@ -10500,7 +10768,13 @@ mod tests {
         let target_ids = vec!["a#0".to_string()];
 
         assert!(store
-            .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 1, false)
+            .append_pending_agent_drops_with_command(
+                "ses",
+                Some("tool-use-1"),
+                &target_ids,
+                1,
+                false
+            )
             .is_err());
         assert!(command_ledger_ids(&store, "ses").is_empty());
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
@@ -10514,7 +10788,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .append_pending_agent_drops_with_command("ses", Some("tool-use-1"), &target_ids, 2, false)
+                .append_pending_agent_drops_with_command(
+                    "ses",
+                    Some("tool-use-1"),
+                    &target_ids,
+                    2,
+                    false
+                )
                 .unwrap(),
             AppendOutcome {
                 queued: 1,
@@ -10550,7 +10830,13 @@ mod tests {
         assert_eq!(command_ids.last().map(String::as_str), Some("command-512"));
 
         let oldest_retry = store
-            .append_pending_agent_drops_with_command("ses", Some("command-000"), &target_ids, 513, false)
+            .append_pending_agent_drops_with_command(
+                "ses",
+                Some("command-000"),
+                &target_ids,
+                513,
+                false,
+            )
             .unwrap();
         assert!(oldest_retry.duplicate);
     }
@@ -10562,7 +10848,13 @@ mod tests {
         let session_id = "shadow:cleanup";
         let target_ids = vec!["a#0".to_string()];
         store
-            .append_pending_agent_drops_with_command(session_id, Some("tool-use-1"), &target_ids, 1, false)
+            .append_pending_agent_drops_with_command(
+                session_id,
+                Some("tool-use-1"),
+                &target_ids,
+                1,
+                false,
+            )
             .unwrap();
         store.reset_shadow_session(session_id, session_id).unwrap();
 
@@ -10621,7 +10913,13 @@ mod tests {
         // set any disposition — the no_targets path only applies when canonicalization
         // resolved zero block_ids.
         let normal = store
-            .append_pending_agent_drops_with_command("ses", Some("cmd-normal"), &["a#0".to_string()], 3, false)
+            .append_pending_agent_drops_with_command(
+                "ses",
+                Some("cmd-normal"),
+                &["a#0".to_string()],
+                3,
+                false,
+            )
             .unwrap();
         assert_eq!(
             normal,
@@ -11787,7 +12085,10 @@ mod tests {
         assert!(!visible.contains_key(&1), "foreign shareable=0 row leaked");
         assert!(!visible.contains_key(&2), "foreign archived row leaked");
         assert!(!visible.contains_key(&3), "foreign expired row leaked");
-        assert_eq!(visible.get(&4).map(|row| row.status.as_str()), Some("archived"));
+        assert_eq!(
+            visible.get(&4).map(|row| row.status.as_str()),
+            Some("archived")
+        );
     }
 
     #[test]
@@ -12521,6 +12822,7 @@ mod tests {
         let first = store
             .insert_note(NoteInput {
                 project_path: "git:proj",
+                route_project_root: None,
                 session_id: "ses",
                 content: "Revisit frobnicator later",
                 surface_condition: Some("when release tag advances"),
@@ -12531,6 +12833,7 @@ mod tests {
         let second = store
             .insert_note(NoteInput {
                 project_path: "git:proj",
+                route_project_root: None,
                 session_id: "ses",
                 content: "Check pagination",
                 surface_condition: None,
@@ -12583,6 +12886,7 @@ mod tests {
         let note = store
             .insert_project_note(NoteWriteInput {
                 project_path: "git:proj",
+                route_project_root: None,
                 session_id: Some("writer-session"),
                 content: "wait for the release",
                 surface_condition: Some("release exists"),
@@ -12695,6 +12999,7 @@ mod tests {
         let note = store
             .insert_project_note(NoteWriteInput {
                 project_path: "git:proj",
+                route_project_root: None,
                 session_id: Some("writer"),
                 content: "evaluate me",
                 surface_condition: Some("condition"),
@@ -12753,6 +13058,7 @@ mod tests {
             let note = store
                 .insert_project_note(NoteWriteInput {
                     project_path: project,
+                    route_project_root: None,
                     session_id: Some("writer"),
                     content: "scoped note",
                     surface_condition: Some("condition"),
@@ -12809,6 +13115,7 @@ mod tests {
             let note = store
                 .insert_project_note(NoteWriteInput {
                     project_path: "git:proj",
+                    route_project_root: None,
                     session_id: Some("writer"),
                     content: &format!("note {index}"),
                     surface_condition: None,
@@ -13450,12 +13757,124 @@ mod shadow_tests {
     }
 
     #[test]
+    fn authority_route_binding_migration_merges_duplicates_and_rekeys_singletons() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let route_project_root = "/worktrees/repo";
+        let identity = "git:identity";
+        let insert = |project_path: &str, content: &str, now_ms| {
+            store
+                .insert_memory(InsertMemoryInput {
+                    project_path,
+                    route_project_root: None,
+                    category: "CONSTRAINTS",
+                    content,
+                    source_session_id: None,
+                    source_type: Some("agent"),
+                    importance: Some(50),
+                    expires_at: None,
+                    metadata_json: None,
+                    now_ms,
+                })
+                .unwrap()
+        };
+        let canonical = insert(identity, "same fact", 1);
+        let duplicate = insert(route_project_root, "same fact", 2);
+        let singleton = insert(route_project_root, "path-only fact", 3);
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                     VALUES ('context', ?1, 'memories', 'MODULE')",
+                    params![identity],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        store
+            .bind_authority_route("context", identity, route_project_root)
+            .unwrap();
+
+        assert!(store.get_memory_full(duplicate).unwrap().is_none());
+        assert_eq!(
+            store
+                .get_memory_full(singleton)
+                .unwrap()
+                .unwrap()
+                .project_path,
+            identity
+        );
+        assert_eq!(
+            store
+                .get_memory_full(canonical)
+                .unwrap()
+                .unwrap()
+                .project_path,
+            identity
+        );
+        assert!(store
+            .load_active_memories(route_project_root, 10)
+            .unwrap()
+            .is_empty());
+        let feed = store.pull_changefeed("memories", 0, 100).unwrap();
+        assert!(
+            feed.rows
+                .iter()
+                .any(|row| row.module_row_id == duplicate && row.op == "tombstone"),
+            "historical changefeed rows remain while the duplicate receives a tombstone"
+        );
+    }
+
+    #[test]
+    fn authority_route_binding_rejects_path_vocabulary_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let route_project_root = "/worktrees/repo";
+        let identity = "git:identity";
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                     VALUES ('context', ?1, 'memories', 'MODULE')",
+                    params![identity],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .bind_authority_route("context", identity, route_project_root)
+            .unwrap();
+
+        let error = store
+            .insert_memory(InsertMemoryInput {
+                project_path: route_project_root,
+                route_project_root: Some(route_project_root),
+                category: "CONSTRAINTS",
+                content: "must not split",
+                source_session_id: None,
+                source_type: Some("agent"),
+                importance: Some(50),
+                expires_at: None,
+                metadata_json: None,
+                now_ms: 1,
+            })
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(identity));
+        assert!(message.contains(route_project_root));
+    }
+
+    #[test]
     fn authority_feed_triggers_cover_idempotency_and_null_transitions() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let memory_id = store
             .insert_memory(InsertMemoryInput {
                 project_path: "feed-project",
+                route_project_root: None,
                 category: "CONSTRAINTS",
                 content: "first",
                 source_session_id: None,
@@ -13642,17 +14061,17 @@ mod shadow_tests {
                 )
                 .unwrap();
             let draining = store
-                .authority_begin_drain(
-                    "store-uuid",
-                    "project",
-                    "memories",
-                    "coordinator",
-                    100,
-                    0,
-                )
+                .authority_begin_drain("store-uuid", "project", "memories", "coordinator", 100, 0)
                 .unwrap();
             let token = draining.coordinator_token.clone().expect("token minted");
-            let steps = ["seed", "memories", "notes", "compartments", "reconcile", "verify"];
+            let steps = [
+                "seed",
+                "memories",
+                "notes",
+                "compartments",
+                "reconcile",
+                "verify",
+            ];
             for step in steps.iter().take(completed_steps) {
                 store
                     .authority_drain_step(
@@ -13669,19 +14088,15 @@ mod shadow_tests {
             }
 
             let resumed = store
-                .authority_begin_drain(
-                    "store-uuid",
-                    "project",
-                    "memories",
-                    "coordinator",
-                    200,
-                    101,
-                )
+                .authority_begin_drain("store-uuid", "project", "memories", "coordinator", 200, 101)
                 .unwrap();
             assert_eq!(resumed.generation, draining.generation);
             assert_eq!(resumed.captured_upper_bound, draining.captured_upper_bound);
             let resume_token = resumed.coordinator_token.clone().expect("resume token");
-            assert_ne!(resume_token, token, "resume mints a fresh coordinator token");
+            assert_ne!(
+                resume_token, token,
+                "resume mints a fresh coordinator token"
+            );
             for step in steps.iter().skip(completed_steps) {
                 store
                     .authority_drain_step(
@@ -13849,7 +14264,10 @@ mod shadow_tests {
                 )
             })
             .unwrap();
-        assert_eq!(pending_b, 1, "project B begin must not wipe project A pending refs");
+        assert_eq!(
+            pending_b, 1,
+            "project B begin must not wipe project A pending refs"
+        );
         store
             .seed_authority_row(
                 "store-uuid",
@@ -13873,7 +14291,8 @@ mod shadow_tests {
             )
             .expect_err("unresolved pending refs must reject complete");
         assert!(
-            err.to_string().contains("unresolved pending memory references")
+            err.to_string()
+                .contains("unresolved pending memory references")
                 || format!("{err:?}").contains("UnresolvedPending")
                 || format!("{err}").contains("pending"),
             "typed pending-ref rejection, got {err}"
@@ -13961,7 +14380,10 @@ mod shadow_tests {
                 )
             })
             .unwrap();
-        assert!(epoch >= 1, "same-second revocation must bump visibility epoch");
+        assert!(
+            epoch >= 1,
+            "same-second revocation must bump visibility epoch"
+        );
     }
 
     #[test]

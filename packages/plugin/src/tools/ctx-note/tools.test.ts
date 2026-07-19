@@ -67,14 +67,17 @@ describe("createCtxNoteTools", () => {
     });
 
     it("routes notes only when the notes domain reports module authority", async () => {
-        const routed: string[] = [];
+        const routed: Array<{ action: string; memoryProject: string }> = [];
         tools = createCtxNoteTools({
             db,
             resolveProjectPath: () => "git:project-a",
             rustToolBackends: {
                 authorityState: async ({ domain }) => (domain === "notes" ? "MODULE" : "TS"),
                 note: async (request) => {
-                    routed.push(request.action);
+                    routed.push({
+                        action: request.action,
+                        memoryProject: request.memoryProject,
+                    });
                     return { content: [{ type: "text", text: "module note result" }] };
                 },
                 noteEvaluationAvailable: () => true,
@@ -85,7 +88,7 @@ describe("createCtxNoteTools", () => {
             toolContext(),
         );
         expect(result).toBe("module note result");
-        expect(routed).toEqual(["write"]);
+        expect(routed).toEqual([{ action: "write", memoryProject: "git:project-a" }]);
         expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
     });
 

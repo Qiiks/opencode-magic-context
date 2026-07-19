@@ -338,6 +338,7 @@ mod tests {
         store
             .insert_memory(InsertMemoryInput {
                 project_path: "git:proj",
+                route_project_root: None,
                 category: "CONSTRAINTS",
                 content: "must stay hidden",
                 source_session_id: None,

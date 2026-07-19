@@ -257,6 +257,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 try {
                     notesAuthority = await deps.rustToolBackends.authorityState({
                         projectPath: projectIdentity,
+                        projectRoot: toolContext.directory,
                         domain: "notes",
                     });
                 } catch (error) {
@@ -281,6 +282,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     sessionId,
                     projectRoot: toolContext.directory,
                     projectPath: projectIdentity,
+                    memoryProject: projectIdentity,
                     action,
                     content: args.content,
                     surfaceCondition: args.surface_condition,

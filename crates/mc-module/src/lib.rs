@@ -1360,7 +1360,10 @@ struct ShadowReportInput {
 }
 
 struct FacadeScope {
+    /// MC project identity for module-store reads and writes.
     memory_project_path: String,
+    /// Daemon-bound filesystem path retained only for route-vocabulary enforcement.
+    route_project_root: String,
     conversation_key: String,
     memory_enabled: bool,
 }
@@ -2520,6 +2523,26 @@ impl McHandler {
             .get(&channel)
             .cloned()
             .ok_or(BindingError::Unbound)
+    }
+
+    /// Persist the route's transport-to-identity mapping when a route becomes bound to an
+    /// authority-managed project. Unbound administrative calls have no route vocabulary to
+    /// record and remain valid.
+    fn bind_authority_route(
+        &self,
+        store: &McStore,
+        channel: u16,
+        context_store_uuid: &str,
+        project: &str,
+    ) -> Result<(), McStoreError> {
+        let Ok(binding) = self.facade_binding(channel) else {
+            return Ok(());
+        };
+        store.bind_authority_route(
+            context_store_uuid,
+            project,
+            binding.project_root.to_string_lossy().as_ref(),
+        )
     }
 
     /// Check whether the shadow lane is enabled. The cached configuration value is checked
@@ -4896,7 +4919,7 @@ impl McHandler {
         }
     }
 
-    fn handle_authority_status_value(&self, request: &Value) -> HandlerOutcome {
+    fn handle_authority_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
         };
@@ -4906,7 +4929,19 @@ impl McHandler {
             );
         };
         match store.authority_status(context_store_uuid, project, domain) {
-            Ok(Some(row)) => respond(json!({ "ok": true, "authority": row })),
+            Ok(Some(row)) => {
+                if row.state == "MODULE" {
+                    if let Err(error) =
+                        self.bind_authority_route(store, channel, context_store_uuid, project)
+                    {
+                        return HandlerOutcome::Error {
+                            code: "authority_route_binding_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                }
+                respond(json!({ "ok": true, "authority": row }))
+            }
             Ok(None) => respond(json!({ "ok": true, "authority": null })),
             Err(error) => HandlerOutcome::Error {
                 code: "authority_status_failed".to_string(),
@@ -4915,7 +4950,7 @@ impl McHandler {
         }
     }
 
-    fn handle_authority_prepare_value(&self, request: &Value) -> HandlerOutcome {
+    fn handle_authority_prepare_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
         };
@@ -4939,16 +4974,16 @@ impl McHandler {
                     .get("checksum_expected")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let actual = match store.authority_seed_checksum(context_store_uuid, project, domain)
-                {
-                    Ok(checksum) => checksum,
-                    Err(error) => {
-                        return HandlerOutcome::Error {
-                            code: "authority_checksum_failed".to_string(),
-                            message: error.to_string(),
+                let actual =
+                    match store.authority_seed_checksum(context_store_uuid, project, domain) {
+                        Ok(checksum) => checksum,
+                        Err(error) => {
+                            return HandlerOutcome::Error {
+                                code: "authority_checksum_failed".to_string(),
+                                message: error.to_string(),
+                            }
                         }
-                    }
-                };
+                    };
                 store.authority_verify_prepare(
                     context_store_uuid,
                     project,
@@ -4989,7 +5024,19 @@ impl McHandler {
             }
         };
         match result {
-            Ok(row) => respond(json!({ "ok": true, "authority": row })),
+            Ok(row) => {
+                if row.state == "MODULE" {
+                    if let Err(error) =
+                        self.bind_authority_route(store, channel, context_store_uuid, project)
+                    {
+                        return HandlerOutcome::Error {
+                            code: "authority_route_binding_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                }
+                respond(json!({ "ok": true, "authority": row }))
+            }
             Err(error) => HandlerOutcome::Error {
                 code: "authority_prepare_failed".to_string(),
                 message: error.to_string(),
@@ -6948,7 +6995,12 @@ impl McHandler {
         }
     }
 
-    async fn resolve_facade_scope(&self, channel: u16) -> Result<FacadeScope, HandlerOutcome> {
+    async fn resolve_facade_scope(
+        &self,
+        channel: u16,
+        request: &Value,
+        authority_domain: &str,
+    ) -> Result<FacadeScope, HandlerOutcome> {
         let binding = self
             .facade_binding(channel)
             .map_err(|_| session_unresolved_error())?;
@@ -6961,11 +7013,43 @@ impl McHandler {
             .resolve_session(&binding.project_root, &binding.harness, instance_token)
             .await
         {
-            Ok(Some(resolved)) => Ok(FacadeScope {
-                memory_project_path: binding.project_root.to_string_lossy().to_string(),
-                conversation_key: resolved.session_id,
-                memory_enabled: binding.config.memory_enabled,
-            }),
+            Ok(Some(resolved)) => {
+                let route_project_root = binding.project_root.to_string_lossy().to_string();
+                let requested_project = facade_arguments(request)
+                    .and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
+                let memory_project_path = match (requested_project, self.store.get()) {
+                    (Some(requested_project), Some(store)) => {
+                        match store
+                            .authority_project_for_route(&route_project_root, authority_domain)
+                        {
+                            Ok(Some(authority_project))
+                                if authority_project == requested_project =>
+                            {
+                                authority_project
+                            }
+                            Ok(Some(authority_project)) => {
+                                return Err(HandlerOutcome::Error {
+                                    code: "facade_project_vocabulary_mismatch".to_string(),
+                                    message: format!(
+                                        "{authority_domain} facade route {route_project_root} is authority-managed as {authority_project}, but the request supplied {requested_project}"
+                                    ),
+                                });
+                            }
+                            // Because the Thalamus leg does not provide an authority-route
+                            // binding, use its existing path-scoped project root when the
+                            // binding is absent.
+                            Ok(None) | Err(_) => route_project_root.clone(),
+                        }
+                    }
+                    _ => route_project_root.clone(),
+                };
+                Ok(FacadeScope {
+                    memory_project_path,
+                    route_project_root,
+                    conversation_key: resolved.session_id,
+                    memory_enabled: binding.config.memory_enabled,
+                })
+            }
             Ok(None) => Err(session_unresolved_error()),
             Err(SessionResolveError::Timeout) => Err(HandlerOutcome::Error {
                 code: "session_resolve_timeout".to_string(),
@@ -6997,7 +7081,10 @@ impl McHandler {
         {
             return tool_error_result(format!("Error: {error}."));
         }
-        let facade_scope = match self.resolve_facade_scope(channel).await {
+        let facade_scope = match self
+            .resolve_facade_scope(channel, request, "memories")
+            .await
+        {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -7010,6 +7097,15 @@ impl McHandler {
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
+        if matches!(action, "write" | "update" | "archive" | "merge") {
+            if let Err(error) = store.enforce_facade_project_vocabulary(
+                facade_scope.route_project_root.as_str(),
+                memory_project,
+                "memories",
+            ) {
+                return tool_error_result(format!("Error: {error}"));
+            }
+        }
         match action {
             "write" => {
                 let Some(category) = non_empty_string_arg(args, "category") else {
@@ -7030,6 +7126,7 @@ impl McHandler {
                 };
                 match store.insert_memory(InsertMemoryInput {
                     project_path: memory_project,
+                    route_project_root: Some(facade_scope.route_project_root.as_str()),
                     category,
                     content,
                     source_session_id: Some(conversation_key),
@@ -7140,7 +7237,9 @@ impl McHandler {
                                     "Memory [ID: {}] in {} (status: {}): {}",
                                     memory.id, memory.category, memory.status, memory.content
                                 ),
-                                None => format!("id {id}: not found or not visible from this project"),
+                                None => {
+                                    format!("id {id}: not found or not visible from this project")
+                                }
                             })
                             .collect::<Vec<_>>()
                             .join("\n\n");
@@ -7164,7 +7263,10 @@ impl McHandler {
             return tool_error_result(format!("Error: {error}."));
         }
         let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
-        let facade_scope = match self.resolve_facade_scope(channel).await {
+        let facade_scope = match self
+            .resolve_facade_scope(channel, request, "memories")
+            .await
+        {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -7213,7 +7315,10 @@ impl McHandler {
         let Some(args) = facade_arguments(request) else {
             return invalid_params_error("ctx_expand arguments must be an object");
         };
-        let facade_scope = match self.resolve_facade_scope(channel).await {
+        let facade_scope = match self
+            .resolve_facade_scope(channel, request, "memories")
+            .await
+        {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -7280,7 +7385,7 @@ impl McHandler {
                 message: "note.evaluate requires session_id".to_string(),
             };
         };
-        let scope = match self.resolve_facade_scope(channel).await {
+        let scope = match self.resolve_facade_scope(channel, request, "notes").await {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -7359,7 +7464,7 @@ impl McHandler {
                     .to_string(),
             };
         };
-        let scope = match self.resolve_facade_scope(channel).await {
+        let scope = match self.resolve_facade_scope(channel, request, "notes").await {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -7406,7 +7511,7 @@ impl McHandler {
         {
             return tool_error_result(format!("Error: {error}."));
         }
-        let facade_scope = match self.resolve_facade_scope(channel).await {
+        let facade_scope = match self.resolve_facade_scope(channel, request, "notes").await {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -7421,6 +7526,15 @@ impl McHandler {
             .unwrap_or("read");
         let filter = string_arg(args, "filter");
         let now = now_ms();
+        if matches!(action, "write" | "update" | "dismiss") {
+            if let Err(error) = store.enforce_facade_project_vocabulary(
+                facade_scope.route_project_root.as_str(),
+                project,
+                "notes",
+            ) {
+                return tool_error_result(format!("Error: {error}"));
+            }
+        }
 
         match action {
             "write" => {
@@ -7439,6 +7553,7 @@ impl McHandler {
                 if let Some(condition) = condition {
                     match store.insert_project_note(NoteWriteInput {
                         project_path: project,
+                        route_project_root: Some(facade_scope.route_project_root.as_str()),
                         session_id: Some(session),
                         content,
                         surface_condition: Some(condition),
@@ -7458,6 +7573,7 @@ impl McHandler {
                 } else {
                     match store.insert_note(NoteInput {
                         project_path: project,
+                        route_project_root: Some(facade_scope.route_project_root.as_str()),
                         session_id: session,
                         content,
                         surface_condition: None,
@@ -7513,15 +7629,11 @@ impl McHandler {
                     Ok(notes) => notes,
                     Err(error) => return tool_error_result(format!("Error: {error}")),
                 };
-                let smart_notes = match store.read_smart_notes(
-                    project,
-                    &smart_statuses,
-                    limit,
-                    offset,
-                ) {
-                    Ok(notes) => notes,
-                    Err(error) => return tool_error_result(format!("Error: {error}")),
-                };
+                let smart_notes =
+                    match store.read_smart_notes(project, &smart_statuses, limit, offset) {
+                        Ok(notes) => notes,
+                        Err(error) => return tool_error_result(format!("Error: {error}")),
+                    };
                 let session_total = match store.count_notes_by_type(
                     project,
                     "session",
@@ -7531,15 +7643,11 @@ impl McHandler {
                     Ok(total) => total,
                     Err(error) => return tool_error_result(format!("Error: {error}")),
                 };
-                let smart_total = match store.count_notes_by_type(
-                    project,
-                    "smart",
-                    None,
-                    &smart_statuses,
-                ) {
-                    Ok(total) => total,
-                    Err(error) => return tool_error_result(format!("Error: {error}")),
-                };
+                let smart_total =
+                    match store.count_notes_by_type(project, "smart", None, &smart_statuses) {
+                        Ok(total) => total,
+                        Err(error) => return tool_error_result(format!("Error: {error}")),
+                    };
                 mcp_text_result(
                     render_notes(
                         session_notes,
@@ -7709,8 +7817,8 @@ impl McHandler {
                 // Proves the store opened end-to-end and, when a session_id is supplied,
                 // returns the session's stored trace state directly from the module.
                 "health" | "status" | "diagnostics" => self.handle_status_value(&request),
-                "authority.status" => self.handle_authority_status_value(&request),
-                "authority.prepare" => self.handle_authority_prepare_value(&request),
+                "authority.status" => self.handle_authority_status_value(channel, &request),
+                "authority.prepare" => self.handle_authority_prepare_value(channel, &request),
                 "authority.seed" => self.handle_authority_seed_value(&request),
                 "authority.drain.begin"
                 | "authority.drain.step"
@@ -8523,7 +8631,11 @@ fn render_notes(
     if !session_notes.is_empty() {
         let mut section = format!(
             "## Session Notes\n\n{}",
-            session_notes.iter().map(&format_note).collect::<Vec<_>>().join("\n")
+            session_notes
+                .iter()
+                .map(&format_note)
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         if let Some(footer) = footer(session_total, session_notes.len()) {
             section.push_str("\n\n");
@@ -8539,7 +8651,11 @@ fn render_notes(
             } else {
                 "## Smart Notes"
             },
-            smart_notes.iter().map(&format_note).collect::<Vec<_>>().join("\n\n")
+            smart_notes
+                .iter()
+                .map(&format_note)
+                .collect::<Vec<_>>()
+                .join("\n\n")
         );
         if let Some(footer) = footer(smart_total, smart_notes.len()) {
             section.push_str("\n\n");
@@ -9670,6 +9786,10 @@ fn ctx_memory_schema() -> Value {
                 "type": "string",
                 "maxLength": 4096,
                 "description": "Optional short reason for archive."
+            },
+            "memory_project": {
+                "type": "string",
+                "description": "Resolved MC project identity supplied by the host transport."
             }
         },
         "required": ["action"]
@@ -9721,7 +9841,8 @@ fn ctx_note_schema() -> Value {
             "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Maximum active notes to return." },
             "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes in each section." },
             "filter": { "type": "string", "enum": ["all", "active", "pending", "ready", "dismissed"], "description": "Optional read filter. Defaults to active session notes plus ready smart notes." },
-            "surface_condition": { "type": "string", "maxLength": 4096, "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." }
+            "surface_condition": { "type": "string", "maxLength": 4096, "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." },
+            "memory_project": { "type": "string", "description": "Resolved MC project identity supplied by the host transport." }
         }
     })
 }
@@ -10952,6 +11073,7 @@ mod tests {
         store
             .insert_memory(InsertMemoryInput {
                 project_path: project,
+                route_project_root: None,
                 category,
                 content,
                 source_session_id: Some(project),
@@ -10962,6 +11084,38 @@ mod tests {
                 now_ms: now,
             })
             .unwrap()
+    }
+
+    fn activate_module_authority(
+        store: &McStore,
+        context_store_uuid: &str,
+        identity: &str,
+        route_project_root: &str,
+        domain: &str,
+    ) {
+        let preparing = store
+            .authority_begin_prepare(context_store_uuid, identity, domain)
+            .unwrap();
+        let checksum = store
+            .authority_seed_checksum(context_store_uuid, identity, domain)
+            .unwrap();
+        store
+            .authority_verify_prepare(
+                context_store_uuid,
+                identity,
+                domain,
+                preparing.generation,
+                &checksum,
+                &checksum,
+            )
+            .unwrap();
+        let module = store
+            .authority_ack_prepare(context_store_uuid, identity, domain, preparing.generation)
+            .unwrap();
+        assert_eq!(module.state, "MODULE");
+        store
+            .bind_authority_route(context_store_uuid, identity, route_project_root)
+            .unwrap();
     }
 
     fn seed_workspace(store: &McStore, own: &str, foreign: &str) {
@@ -11640,13 +11794,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn note_evaluator_verdict_transitions_a_module_note_to_ready_and_visible() {
         let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         handler.bind_route(7, binding("/repo", "token"));
         let note = store
             .insert_project_note(NoteWriteInput {
                 project_path: "/repo",
+                route_project_root: None,
                 session_id: Some("session"),
                 content: "surface after evaluation",
                 surface_condition: Some("when ready"),
@@ -11668,16 +11824,15 @@ mod tests {
         )
         .await;
         assert_eq!(evaluated["status"], "ready");
-        let output = tool_text(
-            call_facade(&handler, "ctx_note", json!({"action": "read"})).await,
-        );
+        let output = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
         assert!(output.contains("surface after evaluation"));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn note_facade_reads_a_preexisting_seeded_ts_note_after_authority_flip() {
         let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         handler.bind_route(7, binding("/repo", "token"));
@@ -11701,9 +11856,7 @@ mod tests {
             )
             .unwrap();
 
-        let output = tool_text(
-            call_facade(&handler, "ctx_note", json!({"action": "read"})).await,
-        );
+        let output = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
         assert!(output.contains("## 🔔 Ready Smart Notes"));
         assert!(output.contains("seeded before Rust mode"));
     }
@@ -11711,7 +11864,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn note_facade_pages_ready_notes_beyond_one_hundred_with_shared_offset_semantics() {
         let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         handler.bind_route(7, binding("/repo", "token"));
@@ -11719,6 +11873,7 @@ mod tests {
             let note = store
                 .insert_project_note(NoteWriteInput {
                     project_path: "/repo",
+                    route_project_root: None,
                     session_id: Some("session"),
                     content: &format!("ready note {index}"),
                     surface_condition: Some("condition"),
@@ -12273,7 +12428,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn memory_facade_routes_all_authority_actions_into_store_and_changefeed() {
         let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         handler.bind_route(7, binding("/repo", "token"));
@@ -12292,9 +12448,118 @@ mod tests {
         let memory = store.get_memory_full(1).unwrap().unwrap();
         assert_eq!(memory.content, "merged");
         assert_eq!(memory.status, "archived");
-        assert!(store.get_memory_full(2).unwrap().unwrap().superseded_by_memory_id.is_some());
+        assert!(store
+            .get_memory_full(2)
+            .unwrap()
+            .unwrap()
+            .superseded_by_memory_id
+            .is_some());
         let feed = store.pull_changefeed("memories", 0, 100).unwrap();
-        assert!(feed.rows.len() >= 6, "every mutation must append changefeed state");
+        assert!(
+            feed.rows.len() >= 6,
+            "every mutation must append changefeed state"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_authority_facade_write_uses_identity_not_route_path() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_project_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_project_root, "token"));
+        activate_module_authority(
+            &store,
+            "context",
+            "git:identity",
+            route_project_root,
+            "memories",
+        );
+
+        let outcome = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "identity scoped",
+                "memory_project": "git:identity",
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(outcome));
+        assert_eq!(
+            store.get_memory_full(1).unwrap().unwrap().project_path,
+            "git:identity"
+        );
+        assert!(store
+            .load_active_memories(route_project_root, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_authority_rejects_mismatched_facade_project_vocabulary() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_project_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_project_root, "token"));
+        activate_module_authority(
+            &store,
+            "context",
+            "git:identity",
+            route_project_root,
+            "memories",
+        );
+
+        let (code, message) = error_frame(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": "write",
+                    "category": "CONSTRAINTS",
+                    "content": "must fail",
+                    "memory_project": route_project_root,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(code, "facade_project_vocabulary_mismatch");
+        assert!(message.contains("git:identity"));
+        assert!(message.contains(route_project_root));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_without_authority_keeps_path_scoped_writes() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_project_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_project_root, "token"));
+
+        let outcome = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "path scoped",
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(outcome));
+        assert_eq!(
+            store.get_memory_full(1).unwrap().unwrap().project_path,
+            route_project_root
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13678,7 +13943,10 @@ mod tests {
             HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("unexpected outcome: {other:?}"),
         };
-        assert_eq!(body, json!({ "ok": true, "queued": 0, "disposition": "no_targets" }));
+        assert_eq!(
+            body,
+            json!({ "ok": true, "queued": 0, "disposition": "no_targets" })
+        );
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
         // Retry of the same command_id must still dedupe (idempotency).
@@ -13695,7 +13963,10 @@ mod tests {
             HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("unexpected outcome: {other:?}"),
         };
-        assert_eq!(retry_body, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert_eq!(
+            retry_body,
+            json!({ "ok": true, "queued": 0, "duplicate": true })
+        );
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 

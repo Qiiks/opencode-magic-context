@@ -1676,12 +1676,13 @@ export class SubcShadowTransport implements ShadowTransport {
     async authorityStatus(args: {
         context_store_uuid: string;
         project: string;
+        projectRoot?: string;
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }> {
         this.authorityProjectRoot = args.project;
         const response = await this.authorityRequest(
             args.project,
-            this.bindRootForAuthority(),
+            args.projectRoot ?? this.bindRootForAuthority(),
             "authority.status",
             args,
         );

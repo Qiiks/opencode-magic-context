@@ -5333,6 +5333,7 @@ mod tests {
     ) -> InsertMemoryInput<'a> {
         InsertMemoryInput {
             project_path,
+            route_project_root: None,
             category,
             content,
             source_session_id: None,
