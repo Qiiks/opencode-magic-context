@@ -710,13 +710,19 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
             memoryAuthorityProject: null as string | null,
             memoryAuthorityReady: false,
         };
+        const preparedProjects: string[] = [];
         await __rustModeTransformTest.prepareRustMemoryAuthority({
             db,
             module,
             projectPath,
             state,
+            onProjectPrepared: (prepared) => preparedProjects.push(prepared),
         });
         expect(state.memoryAuthorityReady).toBe(true);
+        // Hosts hang per-project services (the smart-note evaluator bridge) off this
+        // callback, so it must fire with the RESOLVED project — a session that resolves
+        // a project other than the plugin's launch directory still gets its bridge.
+        expect(preparedProjects).toEqual([projectPath]);
         expect(getAuthorityManagedMarker(db, projectPath)).not.toBeNull();
         expect(() =>
             db
@@ -727,3 +733,4 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
         ).toThrow("managed by the Rust module");
     });
 });
+

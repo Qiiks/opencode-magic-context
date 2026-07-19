@@ -441,6 +441,7 @@ export interface TransformDeps {
     rustModeAllowAuthorityProtocolBypassForTests?: boolean;
     rustModeProjectRoot?: string;
     onRustModeParked?: (sessionId: string, message: string) => void;
+    onRustModeProjectPrepared?: (projectPath: string) => void;
     rustMemorySyncRequestedSessions?: Set<string>;
 }
 
@@ -453,6 +454,7 @@ export function createTransform(deps: TransformDeps) {
                   hostClient: deps.client,
                   projectRoot: deps.rustModeProjectRoot ?? deps.directory,
                   notifyParked: deps.onRustModeParked,
+                  onProjectPrepared: deps.onRustModeProjectPrepared,
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
                   allowAuthorityProtocolBypassForTests:
                       deps.rustModeAllowAuthorityProtocolBypassForTests,

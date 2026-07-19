@@ -111,6 +111,12 @@ export interface RustModeTransformOptions {
     notifyParked?: (sessionId: string, message: string) => void;
     moduleTimeoutMs?: number;
     memorySyncRequestedSessions?: Set<string>;
+    /**
+     * Invoked with each project that reaches rust-mode authority preparation, so the
+     * host can lazily register per-project services (the smart-note evaluator bridge)
+     * for projects other than the plugin's launch directory.
+     */
+    onProjectPrepared?: (projectPath: string) => void;
     /** Test-only escape hatch for transform-wire tests without an authority transport. */
     allowAuthorityProtocolBypassForTests?: boolean;
 }
@@ -361,6 +367,8 @@ async function prepareRustMemoryAuthority(args: {
     projectPath: string;
     state: RustSessionState;
     allowProtocolBypassForTests?: boolean;
+    /** Fires after authority is ready so hosts can register per-project services. */
+    onProjectPrepared?: (projectPath: string) => void;
 }): Promise<void> {
     const { db, module, projectPath, state } = args;
     if (state.memoryAuthorityProject === projectPath && state.memoryAuthorityReady) return;
@@ -458,6 +466,7 @@ async function prepareRustMemoryAuthority(args: {
 
     await reconcileAuthorityProject({ db, projectPath, module: authorityModule });
     state.memoryAuthorityReady = true;
+    args.onProjectPrepared?.(projectPath);
 }
 
 /** Single response-field seam for the parallel module encode-back contract. */
@@ -777,6 +786,7 @@ export function createRustModeTransform(
                 projectPath: memoryProjectPath ?? projectRoot,
                 state,
                 allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
+                onProjectPrepared: options.onProjectPrepared,
             });
             const authoritySeqAdoption = { used: false };
             if (options.memorySyncRequestedSessions?.delete(sessionId)) {

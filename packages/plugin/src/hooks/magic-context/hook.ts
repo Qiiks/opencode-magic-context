@@ -729,7 +729,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   },
               }
             : undefined;
-    if (rustModeModuleClient?.mirrorPull) {
+    // Bridges are per resolved project, and sessions can resolve projects other
+    // than the plugin's launch directory (a /cd switch, multi-project hosts).
+    // Registration is therefore an idempotent ensure invoked for every project
+    // that reaches rust-mode preparation, not a one-shot at construction.
+    const ensureModuleNoteEvaluationBridge = (bridgeProjectPath: string): void => {
+        if (!rustModeModuleClient?.mirrorPull) return;
+        if (getModuleNoteEvaluationBridge(bridgeProjectPath)) return;
         const syncModuleNotes = async (): Promise<void> => {
             for (;;) {
                 const cursor = getMirrorCursor(db, "notes");
@@ -743,7 +749,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 if (!response.page.has_more || next === cursor) break;
             }
         };
-        registerModuleNoteEvaluationBridge(projectPath, {
+        registerModuleNoteEvaluationBridge(bridgeProjectPath, {
             sync: syncModuleNotes,
             async evaluate({ contextNoteId, sessionId, verdict }): Promise<void> {
                 const identity = db
@@ -756,7 +762,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           WHERE identity.domain = 'notes' AND identity.module_project = ?
                             AND identity.context_row_id = ?`,
                     )
-                    .get(projectPath, contextNoteId) as
+                    .get(bridgeProjectPath, contextNoteId) as
                     | { module_row_id: number; status_version: number }
                     | undefined;
                 if (!identity) {
@@ -778,7 +784,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 await syncModuleNotes();
             },
         });
-    }
+    };
+    ensureModuleNoteEvaluationBridge(projectPath);
     const notifyRustModeParked = (sessionId: string, message: string): void => {
         const client = deps.client as {
             tui?: {
@@ -890,6 +897,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         rustModeModuleClient,
         rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
+        onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,
     });
     const eventHandler = createEventHandler({
         contextUsageMap,

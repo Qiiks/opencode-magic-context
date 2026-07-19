@@ -1382,6 +1382,11 @@ const MIGRATIONS: &[Migration] = &[
                p.source_context_row_id,
                p.target_context_row_id
           FROM mc_authority_pending_memory_references p;
+        -- A pending row whose source memory no longer exists has no project to scope
+        -- it under; every runtime query requires a concrete project, so keeping the
+        -- row would only strand it forever. Dropping it is safe: the reference is
+        -- re-derived from wire rows on the next seed of whichever project owns it.
+        DELETE FROM mc_authority_pending_memory_references_v28 WHERE project = '';
         DROP TABLE mc_authority_pending_memory_references;
         ALTER TABLE mc_authority_pending_memory_references_v28
             RENAME TO mc_authority_pending_memory_references;
