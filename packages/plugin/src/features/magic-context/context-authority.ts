@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../../shared/sqlite";
-import { registerPrivilegeFunction, withPrivilegedWriter } from "../../shared/sqlite";
+import { withPrivilegedWriter } from "../../shared/sqlite";
 
 export const AUTHORITY_DOMAINS = ["memories", "notes"] as const;
 export type AuthorityDomain = (typeof AUTHORITY_DOMAINS)[number];
@@ -72,7 +72,6 @@ export function getContextStoreUuid(db: Database): string | null {
 /** Mint the store identity once. Restoring a database restores this value too,
  * which is what lets the module recognize a regressed marker. */
 export function ensureContextStoreUuid(db: Database): string {
-    registerPrivilegeFunction(db);
     const existing = getContextStoreUuid(db);
     if (existing) return existing;
     const minted = randomUUID();
@@ -176,22 +175,17 @@ export async function reconcileAuthorityMarker(args: {
     // A missing marker is ambiguous until the module answers. Keep all writes closed
     // during that round-trip so a restored store cannot accept a write before repair.
     setRepairPending(args.db, args.projectPath);
-    let statuses: Array<{ authority: AuthorityStatus | null }>;
-    try {
-        statuses = await Promise.all(
-            AUTHORITY_DOMAINS.map((domain) =>
-                args.module.authorityStatus({
-                    context_store_uuid: contextStoreUuid,
-                    project: args.projectPath,
-                    domain,
-                }),
-            ),
-        );
-    } catch (error) {
-        // Keep the durable pending marker: this host is expected to reach the module,
-        // so an unknown result must remain fail-closed until a later retry answers.
-        throw error;
-    }
+    // Keep the durable pending marker if the module request fails: this host is expected
+    // to reach the module, so an unknown result remains fail-closed until a later retry.
+    const statuses: Array<{ authority: AuthorityStatus | null }> = await Promise.all(
+        AUTHORITY_DOMAINS.map((domain) =>
+            args.module.authorityStatus({
+                context_store_uuid: contextStoreUuid,
+                project: args.projectPath,
+                domain,
+            }),
+        ),
+    );
     const authority = statuses.find((result) => result.authority !== null)?.authority ?? null;
     if (!authority) {
         clearRepairPending(args.db, args.projectPath);
@@ -201,21 +195,10 @@ export async function reconcileAuthorityMarker(args: {
     // The module still owns this UUID, so a marker-less restore is regressed rather
     // than a new store. Hold the SQLite writer lock while reinstalling the fence.
     withPrivilegedWriter(args.db, () => {
-        args.db.exec("BEGIN IMMEDIATE");
-        try {
-            installAuthorityManagedMarker(args.db, args.projectPath, contextStoreUuid);
-            args.db
-                .prepare("DELETE FROM authority_repair_pending WHERE project_path = ?")
-                .run(args.projectPath);
-            args.db.exec("COMMIT");
-        } catch (error) {
-            try {
-                args.db.exec("ROLLBACK");
-            } catch {
-                // Preserve the original repair error.
-            }
-            throw error;
-        }
+        installAuthorityManagedMarker(args.db, args.projectPath, contextStoreUuid);
+        args.db
+            .prepare("DELETE FROM authority_repair_pending WHERE project_path = ?")
+            .run(args.projectPath);
     });
     return { status: "repaired", authority };
 }

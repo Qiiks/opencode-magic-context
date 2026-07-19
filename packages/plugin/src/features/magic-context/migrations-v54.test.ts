@@ -83,9 +83,37 @@ describe("authority-managed context.db schema", () => {
         db.prepare(
             "INSERT INTO notes (type, status, content, session_id, created_at, updated_at) VALUES ('session', 'active', 'session-owned', ?, 0, 0)",
         ).run("session");
+
+        const triggerSql = (
+            db
+                .prepare(
+                    "SELECT group_concat(sql, char(10)) AS sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%authority_guard%'",
+                )
+                .get() as { sql?: string }
+        ).sql;
+        expect(triggerSql).toContain(
+            "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0",
+        );
+        expect(triggerSql).not.toContain("mc_privileged_writer");
     });
 
-    it("rejects a raw connection that never registered the privilege UDF", () => {
+    it("composes privilege brackets with an existing BEGIN IMMEDIATE", () => {
+        const db = freshDatabase();
+        db.exec("BEGIN IMMEDIATE");
+        withPrivilegedWriter(db, () => {
+            db.prepare(
+                "INSERT INTO authority_repair_pending(project_path, started_at) VALUES (?, 0)",
+            ).run("/nested");
+        });
+        expect(
+            db.prepare("SELECT enabled FROM context_privilege_state WHERE id = 1").get() as {
+                enabled: number;
+            },
+        ).toEqual({ enabled: 0 });
+        db.exec("ROLLBACK");
+    });
+
+    it("rejects a raw connection that has not entered a privilege bracket", () => {
         const dir = mkdtempSync(join(tmpdir(), "mc-authority-"));
         tempDirs.push(dir);
         const path = join(dir, "context.db");
@@ -103,7 +131,37 @@ describe("authority-managed context.db schema", () => {
                     "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, 0, 0, 0, 0)",
                 )
                 .run("/project", "CONSTRAINTS", "raw", "raw"),
-        ).toThrow(/function|mc_privileged_writer|managed by the Rust module/i);
+        ).toThrow(/managed by the Rust module/i);
+    });
+
+    it("does not leak privilege to a second connection during a paused bracket", () => {
+        const dir = mkdtempSync(join(tmpdir(), "mc-authority-leak-"));
+        tempDirs.push(dir);
+        const path = join(dir, "context.db");
+        const connA = freshDatabase(path);
+        const uuid = ensureContextStoreUuid(connA);
+        installAuthorityManagedMarker(connA, "/project", uuid);
+        const connB = new Database(path);
+        databases.push(connB);
+        connB.exec("PRAGMA busy_timeout=50; PRAGMA journal_mode=WAL");
+
+        withPrivilegedWriter(connA, () => {
+            expect(() =>
+                connB
+                    .prepare(
+                        "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, 0, 0, 0, 0)",
+                    )
+                    .run("/project", "CONSTRAINTS", "racing", "hash"),
+            ).toThrow(/busy|locked|managed by the Rust module/i);
+        });
+
+        expect(() =>
+            connB
+                .prepare(
+                    "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, 0, 0, 0, 0)",
+                )
+                .run("/project", "CONSTRAINTS", "after", "hash"),
+        ).toThrow(/managed by the Rust module/i);
     });
 });
 

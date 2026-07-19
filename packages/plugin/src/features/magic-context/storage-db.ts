@@ -8,7 +8,7 @@ import {
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
-import { Database, registerPrivilegeFunction } from "../../shared/sqlite";
+import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { ensureContextStoreUuid } from "./context-authority";
 import { runMigrations, runMigrationsWithRetry } from "./migrations";
@@ -415,9 +415,6 @@ export function initializeDatabase(db: Database): void {
     // or writes: it defaults to OFF, which silently breaks every ON DELETE
     // CASCADE / SET NULL declared in the schema below and in migrations.
     db.exec("PRAGMA foreign_keys=ON");
-    // Guard triggers call this connection-local function. Register it before any
-    // migration or application write so every writable opener fails closed when managed.
-    registerPrivilegeFunction(db);
     db.exec("PRAGMA journal_mode=WAL");
     applySqliteTuningPragmas(db);
     db.exec(`

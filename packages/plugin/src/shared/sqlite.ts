@@ -200,77 +200,59 @@ export type Database = BetterSqlite3.Database;
  */
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
-interface PrivilegeFunctionState {
-    enabled: boolean;
-    /** Bun releases without sqlite3_create_function use this compatibility path. */
-    tempTableFallback: boolean;
+const privilegeDepth = new WeakMap<Database, number>();
+
+function isInTransaction(db: Database): boolean {
+    const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
+    return candidate.inTransaction === true || candidate.isTransaction === true;
 }
 
-const privilegeFunctionStates = new WeakMap<Database, PrivilegeFunctionState>();
+const PRIVILEGE_STATE_ENABLED_SQL =
+    "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1";
+const PRIVILEGE_STATE_DISABLED_SQL = "UPDATE context_privilege_state SET enabled = 0 WHERE id = 1";
 
 /**
- * Register the connection-local privilege predicate used by managed context.db
- * guard triggers. Unknown connections must not be able to write: omitting this
- * registration intentionally leaves SQLite with a missing-function error rather
- * than an implicit privileged default.
+ * Run a storage operation while the shared privilege state is enabled inside the
+ * same SQLite write transaction. The flag is cleared before commit; a crash or
+ * thrown operation rolls the transaction back, so no committed row can expose
+ * enabled=1 to another connection. SQLite's single-writer lock prevents another
+ * connection from writing while this bracket is active.
  */
-export function registerPrivilegeFunction(db: Database): void {
-    if (privilegeFunctionStates.has(db)) return;
-    const state: PrivilegeFunctionState = { enabled: false, tempTableFallback: false };
-    const candidate = db as unknown as {
-        function?: (...args: unknown[]) => void;
-    };
-    if (typeof candidate.function !== "function") {
-        // The shipped Bun runtime currently omits sqlite3_create_function. The
-        // schema installs a fail-closed compatibility state for that backend;
-        // runtimes with scalar registration always take the UDF path below.
-        state.tempTableFallback = true;
-        privilegeFunctionStates.set(db, state);
-        return;
-    }
-    const predicate = () => (state.enabled ? 1 : 0);
-    if (isBun) {
-        candidate.function.call(db, "mc_privileged_writer", predicate);
-    } else {
-        candidate.function.call(db, "mc_privileged_writer", { deterministic: true }, predicate);
-    }
-    privilegeFunctionStates.set(db, state);
-}
-
-/** SQL predicate used by managed-write triggers. The UDF is the normal path;
- * the persistent compatibility state is only for Bun runtimes that do not expose
- * scalar registration in their SQLite wrapper. */
-export function privilegeGuardPredicate(db: Database): string {
-    const state = privilegeFunctionStates.get(db);
-    return state?.tempTableFallback
-        ? "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0"
-        : "mc_privileged_writer() = 0";
-}
-
-/** Run a validated storage operation with the privilege predicate enabled only
- * for the duration of the synchronous transaction callback. */
 export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
-    const state = privilegeFunctionStates.get(db);
-    if (!state) {
-        throw new Error("context.db privilege function was not registered on this connection");
+    const previousDepth = privilegeDepth.get(db) ?? 0;
+    const nested = isInTransaction(db);
+    const savepoint = "mc_privilege_scope";
+    if (nested) {
+        db.exec(`SAVEPOINT ${savepoint}`);
+    } else {
+        db.exec("BEGIN IMMEDIATE");
     }
-    if (state.enabled) return operation();
-    state.enabled = true;
-    if (state.tempTableFallback) {
-        db.prepare(
-            "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
-        ).run();
-    }
+    privilegeDepth.set(db, previousDepth + 1);
     try {
-        return operation();
-    } finally {
-        if (state.tempTableFallback) {
-            db.prepare("UPDATE context_privilege_state SET enabled = 0 WHERE id = 1").run();
+        db.prepare(PRIVILEGE_STATE_ENABLED_SQL).run();
+        const result = operation();
+        db.prepare(
+            previousDepth > 0 ? PRIVILEGE_STATE_ENABLED_SQL : PRIVILEGE_STATE_DISABLED_SQL,
+        ).run();
+        if (nested) {
+            db.exec(`RELEASE ${savepoint}`);
+        } else {
+            db.exec("COMMIT");
         }
-        state.enabled = false;
+        privilegeDepth.delete(db);
+        return result;
+    } catch (error) {
+        try {
+            if (nested) {
+                db.exec(`ROLLBACK TO ${savepoint}`);
+                db.exec(`RELEASE ${savepoint}`);
+            } else {
+                db.exec("ROLLBACK");
+            }
+        } finally {
+            if (previousDepth > 0) privilegeDepth.set(db, previousDepth);
+            else privilegeDepth.delete(db);
+        }
+        throw error;
     }
-}
-
-export function isPrivilegeFunctionRegistered(db: Database): boolean {
-    return privilegeFunctionStates.has(db);
 }

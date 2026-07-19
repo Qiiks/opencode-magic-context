@@ -1,6 +1,5 @@
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { privilegeGuardPredicate } from "../../shared/sqlite";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
@@ -2014,7 +2013,6 @@ const MIGRATIONS: Migration[] = [
         version: 54,
         description: "add authority identity, managed-write guards, and mirror cursors",
         up(db: Database): void {
-            const guardPredicate = privilegeGuardPredicate(db);
             const memoriesPresent = tableExists(db, "memories");
             const notesPresent = tableExists(db, "notes");
             db.exec(`
@@ -2054,8 +2052,6 @@ const MIGRATIONS: Migration[] = [
             // covered by the managed-project or repair-pending marker.
             if (memoriesPresent) {
                 db.exec(`
-                -- Normal writable openers use mc_privileged_writer(); the fallback is only
-                -- needed for Bun builds that do not expose scalar registration.
                 DROP TRIGGER IF EXISTS memories_authority_guard_insert;
                 DROP TRIGGER IF EXISTS memories_authority_guard_update;
                 DROP TRIGGER IF EXISTS memories_authority_guard_delete;
@@ -2064,7 +2060,7 @@ const MIGRATIONS: Migration[] = [
                  WHEN (
                      EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
                      OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path)
-                 ) AND ${guardPredicate}
+                 ) AND COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0
                 BEGIN
                     SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module');
                 END;
@@ -2075,7 +2071,7 @@ const MIGRATIONS: Migration[] = [
                      OR EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
                      OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = OLD.project_path)
                      OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path)
-                 ) AND ${guardPredicate}
+                 ) AND COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0
                 BEGIN
                     SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module');
                 END;
@@ -2084,7 +2080,7 @@ const MIGRATIONS: Migration[] = [
                  WHEN (
                      EXISTS (SELECT 1 FROM authority_managed WHERE project_path = OLD.project_path)
                      OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = OLD.project_path)
-                 ) AND ${guardPredicate}
+                 ) AND COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0
                 BEGIN
                     SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module');
                 END;
@@ -2101,7 +2097,7 @@ const MIGRATIONS: Migration[] = [
                    AND (
                        EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
                        OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path)
-                   ) AND ${guardPredicate}
+                   ) AND COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0
                 BEGIN
                     SELECT RAISE(ABORT, 'context.db smart-note writes are managed by the Rust module');
                 END;
@@ -2115,7 +2111,7 @@ const MIGRATIONS: Migration[] = [
                      (NEW.type = 'smart' AND NEW.project_path IS NOT NULL
                       AND (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
                        OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path)))
-                ) AND ${guardPredicate}
+                ) AND COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0
                 BEGIN
                     SELECT RAISE(ABORT, 'context.db smart-note writes are managed by the Rust module');
                 END;
@@ -2125,7 +2121,7 @@ const MIGRATIONS: Migration[] = [
                    AND (
                        EXISTS (SELECT 1 FROM authority_managed WHERE project_path = OLD.project_path)
                        OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = OLD.project_path)
-                   ) AND ${guardPredicate}
+                   ) AND COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0
                 BEGIN
                     SELECT RAISE(ABORT, 'context.db smart-note writes are managed by the Rust module');
                 END;

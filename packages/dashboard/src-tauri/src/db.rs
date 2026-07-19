@@ -1,5 +1,4 @@
 use rusqlite::{
-    functions::FunctionFlags,
     params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
@@ -139,15 +138,6 @@ pub fn open_readwrite(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    // Managed-project guard triggers fail closed unless this connection explicitly
-    // registers the connection-local privilege predicate. Dashboard writes stay
-    // unprivileged in this unit and are rejected while the Rust module owns rows.
-    conn.create_scalar_function(
-        "mc_privileged_writer",
-        0,
-        FunctionFlags::SQLITE_DETERMINISTIC,
-        |_ctx| Ok(0i64),
-    )?;
     // This opener has no module client, so a marker-less store cannot be classified as
     // regressed here. The later module handshake performs the authoritative reconciliation.
     ensure_context_store_uuid(&conn)?;

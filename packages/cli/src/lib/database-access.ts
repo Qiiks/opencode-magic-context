@@ -9,7 +9,7 @@ import {
     getContextStoreUuid,
 } from "@magic-context/core/features/magic-context/context-authority";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
-import { Database, registerPrivilegeFunction } from "@magic-context/core/shared/sqlite";
+import { Database } from "@magic-context/core/shared/sqlite";
 
 export class UnsupportedSchemaVersionError extends Error {
     readonly path: string;
@@ -38,7 +38,6 @@ export function openExistingDatabase(
     if (!existsSync(path)) return null;
     if (options.readonly) {
         const db = new Database(path, { readonly: true });
-        registerPrivilegeFunction(db);
         return db;
     }
 
@@ -54,13 +53,11 @@ export function openExistingDatabase(
         const db = new Database(path, { create: false, readwrite: true } as unknown as {
             readonly: boolean;
         });
-        registerPrivilegeFunction(db);
         return db;
     }
     const uri = pathToFileURL(path);
     uri.searchParams.set("mode", "rw");
     const db = new Database(uri.href);
-    registerPrivilegeFunction(db);
     return db;
 }
 
