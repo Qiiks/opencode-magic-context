@@ -7436,18 +7436,11 @@ impl McHandler {
                         }
                         notes
                     }
-                    _ => {
-                        let all = match store.read_project_notes(project, None, &statuses, 1000, 0)
-                        {
-                            Ok(notes) => notes,
-                            Err(error) => return tool_error_result(format!("Error: {error}")),
-                        };
-                        all.into_iter()
-                            .filter(|note| note.type_name == "smart" || note.session_id == session)
-                            .skip(offset)
-                            .take(limit)
-                            .collect()
-                    }
+                    _ => match store.read_visible_notes(project, session, &statuses, limit, offset)
+                    {
+                        Ok(notes) => notes,
+                        Err(error) => return tool_error_result(format!("Error: {error}")),
+                    },
                 };
                 mcp_text_result(render_notes(notes, offset, limit), false)
             }
@@ -7467,16 +7460,12 @@ impl McHandler {
                             .to_string(),
                     );
                 }
-                let current = match store.read_project_notes(
-                    project,
-                    None,
-                    &["active", "pending", "ready", "surfacing", "surfaced"],
-                    100,
-                    0,
-                ) {
-                    Ok(notes) => notes.into_iter().find(|note| {
-                        note.id == note_id
-                            && (note.type_name == "smart" || note.session_id == session)
+                let current = match store.get_note_by_id(project, session, note_id) {
+                    Ok(note) => note.filter(|note| {
+                        matches!(
+                            note.status.as_str(),
+                            "active" | "pending" | "ready" | "surfacing" | "surfaced"
+                        )
                     }),
                     Err(error) => return tool_error_result(format!("Error: {error}")),
                 };

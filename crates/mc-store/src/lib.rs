@@ -1028,7 +1028,7 @@ const MIGRATIONS: &[Migration] = &[
     "#,
     },
     Migration {
-        version: 25,
+        version: 26,
         // Project-owned notes carry the complete smart-note state machine. Columns carried
         // over from the previous context-note schema are copied as-is, while status_version
         // and delivery rows make every evaluator, surfacer, and mirror transition
@@ -1107,6 +1107,8 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_mc_note_deliveries_retry
             ON mc_note_deliveries(session_id, acked_at, created_at_ms, note_id);
 
+        -- The module store is protected by a single-writer lease; no external process may
+        -- write this database, so every writer is registered with this connection's UDF.
         CREATE TRIGGER mc_notes_ownership_insert
         BEFORE INSERT ON mc_notes
         WHEN NEW.project_path = '' OR mc_note_caller_project() IS NOT NEW.project_path
@@ -2945,6 +2947,8 @@ impl McStore {
         let inner = open_sqlite(descriptor)?;
         let note_caller_project = Arc::new(Mutex::new(None::<String>));
         let udf_scope = Arc::clone(&note_caller_project);
+        // Register before migrations: migration 26 creates triggers that call this function,
+        // and the same connection must have it before the first note write is possible.
         inner.with_conn(move |conn| {
             conn.create_scalar_function(
                 "mc_note_caller_project",
@@ -6656,6 +6660,78 @@ impl McStore {
         Ok(())
     }
 
+    /// Load one note through the same project/session visibility fence used by the facade.
+    /// Smart notes are project-visible across sessions; session notes require the provenance
+    /// session to match. The SQL predicate keeps this lookup independent of page size.
+    pub fn get_note_by_id(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        note_id: i64,
+    ) -> Result<Option<StoredNote>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    &format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+                         WHERE id = ?1 AND project_path = ?2
+                           AND (type = 'smart' OR session_id = ?3)"
+                    ),
+                    params![note_id, project_path, session_id],
+                    stored_note_from_row,
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Page the notes visible to one session: all project smart notes plus that session's
+    /// ordinary notes. Ownership and pagination both remain in SQL.
+    pub fn read_visible_notes(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        statuses: &[&str],
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<StoredNote>, McStoreError> {
+        let limit = i64::try_from(limit.clamp(1, 1000))
+            .map_err(|_| McStoreError::Serde("note limit exceeds i64".to_string()))?;
+        let offset = i64::try_from(offset)
+            .map_err(|_| McStoreError::Serde("note offset exceeds i64".to_string()))?;
+        let statuses = if statuses.is_empty() {
+            vec!["active"]
+        } else {
+            statuses.to_vec()
+        };
+        let placeholders = std::iter::repeat_n("?", statuses.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+             WHERE project_path = ? AND status IN ({placeholders})
+               AND (type = 'smart' OR session_id = ?)
+             ORDER BY updated_at_ms DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        self.inner
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                let mut values = Vec::with_capacity(statuses.len() + 3);
+                values.push(SqlValue::Text(project_path.to_string()));
+                for status in &statuses {
+                    values.push(SqlValue::Text((*status).to_string()));
+                }
+                values.push(SqlValue::Text(session_id.to_string()));
+                values.push(SqlValue::Integer(limit));
+                values.push(SqlValue::Integer(offset));
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(values), stored_note_from_row)?
+                    .collect::<Result<Vec<_>, _>>();
+                rows
+            })
+            .map_err(Into::into)
+    }
+
     pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, McStoreError> {
         let content = input.content.trim();
         if content.is_empty() {
@@ -6760,7 +6836,7 @@ impl McStore {
             .collect::<Vec<_>>()
             .join(", ");
         let session_clause = if session_id.is_some() {
-            " AND session_id = ?"
+            " AND type = 'session' AND session_id = ?"
         } else {
             ""
         };
@@ -6798,18 +6874,13 @@ impl McStore {
         content: &str,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        let current = self
-            .read_project_notes(
-                project_path,
-                None,
-                &["active", "pending", "ready", "surfacing", "surfaced"],
-                100,
-                0,
-            )?
-            .into_iter()
-            .find(|note| {
-                note.id == note_id && (note.type_name == "smart" || note.session_id == session_id)
-            });
+        let current = self.get_note_by_id(project_path, session_id, note_id)?;
+        let current = current.filter(|note| {
+            matches!(
+                note.status.as_str(),
+                "active" | "pending" | "ready" | "surfacing" | "surfaced"
+            )
+        });
         let Some(current) = current else {
             return Ok(None);
         };
@@ -6905,18 +6976,13 @@ impl McStore {
         resolution: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        let current = self
-            .read_project_notes(
-                project_path,
-                None,
-                &["active", "pending", "ready", "surfacing", "surfaced"],
-                100,
-                0,
-            )?
-            .into_iter()
-            .find(|note| {
-                note.id == note_id && (note.type_name == "smart" || note.session_id == session_id)
-            });
+        let current = self.get_note_by_id(project_path, session_id, note_id)?;
+        let current = current.filter(|note| {
+            matches!(
+                note.status.as_str(),
+                "active" | "pending" | "ready" | "surfacing" | "surfaced"
+            )
+        });
         let Some(current) = current else {
             return Ok(None);
         };
@@ -11466,6 +11532,21 @@ mod tests {
             })
             .unwrap();
         assert_eq!(note.status, "pending");
+        let note = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                "pending",
+                note.status_version,
+                Some("wait for the release tag"),
+                None,
+                11,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected cold-start update outcome: {other:?}"),
+        };
         assert!(store
             .read_project_notes("git:other", None, &["pending"], 25, 0)
             .unwrap()
@@ -11545,6 +11626,50 @@ mod tests {
             .claim_note_delivery("git:proj", "serve-session", "pass-4", "pass-4", 90)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn note_lookup_and_visibility_paging_are_not_bounded_by_first_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let mut first_id = 0;
+        for index in 0..105 {
+            let note = store
+                .insert_project_note(NoteWriteInput {
+                    project_path: "git:proj",
+                    session_id: Some("writer"),
+                    content: &format!("note {index}"),
+                    surface_condition: None,
+                    anchor_block_id: None,
+                    anchor_ordinal: None,
+                    now_ms: 1,
+                })
+                .unwrap();
+            if index == 0 {
+                first_id = note.id;
+            }
+        }
+        let found = store
+            .get_note_by_id("git:proj", "reader", first_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, first_id);
+        let updated = store
+            .update_note_content(
+                "git:proj",
+                "reader",
+                first_id,
+                "updated outside the first page",
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.content, "updated outside the first page");
+        let page = store
+            .read_visible_notes("git:proj", "reader", &["active"], 5, 100)
+            .unwrap();
+        assert_eq!(page.len(), 5);
+        assert!(page.iter().all(|note| note.project_path == "git:proj"));
     }
 
     #[test]
