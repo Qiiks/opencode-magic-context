@@ -625,6 +625,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         (deps.config.transform_mode === "rust"
             ? (() => {
                   const transport = new SubcShadowTransport(undefined, undefined, undefined, "");
+                  transport.setAuthorityBindRoot(deps.directory);
                   const client: RustModeModuleClient = {
                       call: (args) => transport.call(args),
                       closeSession: (sessionId) => transport.closeSession(sessionId),

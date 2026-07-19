@@ -1507,6 +1507,13 @@ export class SubcShadowTransport implements ShadowTransport {
     private activeSession: string | null = null;
     private nextProbeMs = 0;
     private authorityProjectRoot = "";
+    /**
+     * Filesystem root used to bind authority/mirror routes. Authority request
+     * bodies carry the MC project IDENTITY (git:<sha> / dir:<hash>), which is not
+     * a path — the daemon validates BindIdentity.project_root against the real
+     * filesystem and rejects identity strings outright.
+     */
+    private authorityBindRoot = "";
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
     private connectionGeneration = 0;
 
@@ -1614,6 +1621,14 @@ export class SubcShadowTransport implements ShadowTransport {
         throw new Error(`module returned an invalid ${method} response`);
     }
 
+    setAuthorityBindRoot(root: string): void {
+        this.authorityBindRoot = root;
+    }
+
+    private bindRootForAuthority(): string {
+        return this.authorityBindRoot.length > 0 ? this.authorityBindRoot : process.cwd();
+    }
+
     async authorityStatus(args: {
         context_store_uuid: string;
         project: string;
@@ -1622,7 +1637,7 @@ export class SubcShadowTransport implements ShadowTransport {
         this.authorityProjectRoot = args.project;
         const response = await this.authorityRequest(
             args.project,
-            args.project,
+            this.bindRootForAuthority(),
             "authority.status",
             args,
         );
@@ -1633,7 +1648,7 @@ export class SubcShadowTransport implements ShadowTransport {
         this.authorityProjectRoot = String(args.project ?? "");
         const response = await this.authorityRequest(
             String(args.project ?? "authority"),
-            this.authorityProjectRoot,
+            this.bindRootForAuthority(),
             "authority.prepare",
             args,
         );
@@ -1647,7 +1662,7 @@ export class SubcShadowTransport implements ShadowTransport {
         this.authorityProjectRoot = String(args.project ?? "");
         const response = await this.authorityRequest(
             String(args.project ?? "authority"),
-            this.authorityProjectRoot,
+            this.bindRootForAuthority(),
             "authority.seed",
             args,
         );
@@ -1666,7 +1681,7 @@ export class SubcShadowTransport implements ShadowTransport {
         >[2];
         const response = await this.authorityRequest(
             String(args.project ?? "authority"),
-            this.authorityProjectRoot,
+            this.bindRootForAuthority(),
             method,
             args,
         );
@@ -1681,7 +1696,7 @@ export class SubcShadowTransport implements ShadowTransport {
     }): Promise<{ page: ChangefeedPage }> {
         const response = await this.authorityRequest(
             `mirror:${args.domain}`,
-            this.authorityProjectRoot,
+            this.bindRootForAuthority(),
             "mirror.pull",
             args,
         );
