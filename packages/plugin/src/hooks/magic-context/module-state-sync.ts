@@ -800,7 +800,10 @@ export interface ModuleStateSyncClient {
             | "session.recomp"
             | "session.wrapup"
             | "todo_state.set"
-            | "agent_drops.append";
+            | "agent_drops.append"
+            | "ctx_note"
+            | "transform.ack"
+            | "transform.nack";
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown>;

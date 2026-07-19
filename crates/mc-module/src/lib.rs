@@ -52,11 +52,11 @@ use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
     validate_state_import_compartments, HistorianPhase, InsertMemoryInput, McStore, McStoreError,
-    NoteInput, RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowMemoryMutationRow,
-    ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow,
-    ShadowWorkspaceRow, StateImportError, StateImportPreflight, StateImportValidationError,
-    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
-    TodoStateSetOutcome, WrapupCommandRecord,
+    NoteCasOutcome, NoteEvaluationInput, NoteInput, NoteWriteInput, RecordWrapupCommandOutcome,
+    ShadowDivergenceRecord, ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError,
+    ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError,
+    StateImportPreflight, StateImportValidationError, StoredChunkTranscript, StoredCompartment,
+    StoredMemoryMutation, StoredNote, TodoStateSetOutcome, WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -7188,6 +7188,140 @@ impl McHandler {
         )
     }
 
+    async fn handle_note_evaluation_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(note_id) = request
+            .get("note_id")
+            .and_then(Value::as_i64)
+            .filter(|id| *id > 0)
+        else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "note.evaluate requires a positive note_id".to_string(),
+            };
+        };
+        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "note.evaluate requires session_id".to_string(),
+            };
+        };
+        let scope = match self.resolve_facade_scope(channel).await {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        if scope.conversation_key != session_id {
+            return HandlerOutcome::Error {
+                code: "session_mismatch".to_string(),
+                message: "note.evaluate session_id does not match the channel binding".to_string(),
+            };
+        }
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some(source_revision) = request.get("source_revision").and_then(Value::as_i64) else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "note.evaluate requires source_revision".to_string(),
+            };
+        };
+        let input = NoteEvaluationInput {
+            project_path: scope.memory_project_path.as_str(),
+            note_id,
+            source_revision,
+            verdict: request
+                .get("verdict")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            compiled_check: request.get("compiled_check").and_then(Value::as_str),
+            manifest_json: request.get("manifest_json").and_then(Value::as_str),
+            check_hash: request.get("check_hash").and_then(Value::as_str),
+            next_due_at: request.get("next_due_at").and_then(Value::as_i64),
+            now_ms: now_ms(),
+        };
+        match store.write_note_evaluation(input) {
+            Ok(NoteCasOutcome::Applied(note)) => respond(json!({
+                "ok": true,
+                "note_id": note.id,
+                "status": note.status,
+                "status_version": note.status_version,
+            })),
+            Ok(NoteCasOutcome::Conflict { current }) => respond(json!({
+                "ok": false,
+                "conflict": true,
+                "note": current.map(|note| json!({
+                    "id": note.id,
+                    "status": note.status,
+                    "status_version": note.status_version,
+                })),
+            })),
+            Err(error) => HandlerOutcome::Error {
+                code: "note_store_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_note_delivery_value(
+        &self,
+        channel: u16,
+        request: &Value,
+        ack: bool,
+    ) -> HandlerOutcome {
+        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "transform delivery acknowledgement requires session_id".to_string(),
+            };
+        };
+        let pass_id = request
+            .get("transform_pass_id")
+            .and_then(Value::as_str)
+            .or_else(|| request.get("pass_id").and_then(Value::as_str));
+        let Some(pass_id) = pass_id.filter(|id| !id.trim().is_empty()) else {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: "transform delivery acknowledgement requires transform_pass_id"
+                    .to_string(),
+            };
+        };
+        let scope = match self.resolve_facade_scope(channel).await {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        if scope.conversation_key != session_id {
+            return HandlerOutcome::Error {
+                code: "session_mismatch".to_string(),
+                message: "delivery acknowledgement session_id does not match the channel binding"
+                    .to_string(),
+            };
+        }
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let result = if ack {
+            store.ack_note_delivery(
+                scope.memory_project_path.as_str(),
+                session_id,
+                pass_id,
+                now_ms(),
+            )
+        } else {
+            store.nack_note_delivery(
+                scope.memory_project_path.as_str(),
+                session_id,
+                pass_id,
+                now_ms(),
+            )
+        };
+        match result {
+            Ok(changed) => respond(json!({ "ok": true, "updated": changed })),
+            Err(error) => HandlerOutcome::Error {
+                code: "note_store_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     async fn handle_ctx_note_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let Some(args) = facade_arguments(request) else {
             return invalid_params_error("ctx_note arguments must be an object");
@@ -7196,11 +7330,6 @@ impl McHandler {
             .and_then(|_| validate_string_cap(args, "surface_condition", MAX_SHORT_FIELD_BYTES))
         {
             return tool_error_result(format!("Error: {error}."));
-        }
-        if args.get("surface_condition").is_some() {
-            return tool_error_result(
-                "Error: smart notes are not supported on this surface.".to_string(),
-            );
         }
         let facade_scope = match self.resolve_facade_scope(channel).await {
             Ok(scope) => scope,
@@ -7215,6 +7344,9 @@ impl McHandler {
         let action = string_arg(args, "action")
             .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
             .unwrap_or("read");
+        let filter = string_arg(args, "filter");
+        let now = now_ms();
+
         match action {
             "write" => {
                 let Some(content) = non_empty_string_arg(args, "content") else {
@@ -7226,36 +7358,98 @@ impl McHandler {
                     .load(session)
                     .ok()
                     .and_then(|loaded| loaded.meta.newest_live_block_id);
-                match store.insert_note(NoteInput {
-                    project_path: project,
-                    session_id: session,
-                    content,
-                    surface_condition: string_arg(args, "surface_condition"),
-                    anchor_block_id: anchor.as_deref(),
-                    now_ms: now_ms(),
-                }) {
-                    Ok(note) => {
-                        let mut message = format!("Saved session note #{}.", note.id);
-                        if note.surface_condition.is_some() {
-                            message.push_str(
-                                " Surface condition recorded; condition evaluation arrives later.",
-                            );
-                        }
-                        mcp_text_result(message, false)
+                let condition = string_arg(args, "surface_condition")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if let Some(condition) = condition {
+                    match store.insert_project_note(NoteWriteInput {
+                        project_path: project,
+                        session_id: Some(session),
+                        content,
+                        surface_condition: Some(condition),
+                        anchor_block_id: anchor.as_deref(),
+                        anchor_ordinal: None,
+                        now_ms: now,
+                    }) {
+                        Ok(note) => mcp_text_result(
+                            format!(
+                                "Created smart note #{}. Dreamer will evaluate the condition during nightly runs:\n- Content: {}\n- Condition: {}",
+                                note.id, note.content, condition
+                            ),
+                            false,
+                        ),
+                        Err(error) => tool_error_result(format!("Error: {error}")),
                     }
-                    Err(error) => tool_error_result(format!("Error: {error}")),
+                } else {
+                    match store.insert_note(NoteInput {
+                        project_path: project,
+                        session_id: session,
+                        content,
+                        surface_condition: None,
+                        anchor_block_id: anchor.as_deref(),
+                        now_ms: now,
+                    }) {
+                        Ok(note) => {
+                            mcp_text_result(format!("Saved session note #{}.", note.id), false)
+                        }
+                        Err(error) => tool_error_result(format!("Error: {error}")),
+                    }
                 }
             }
             "read" => {
                 let limit = usize_arg(args, "limit").unwrap_or(25).clamp(1, 100);
                 let offset = usize_arg(args, "offset").unwrap_or(0);
-                if i64::try_from(offset).is_err() {
-                    return tool_error_result("Error: 'offset' is too large.".to_string());
-                }
-                match store.read_notes(project, session, limit, offset) {
-                    Ok(notes) => mcp_text_result(render_notes(notes, offset, limit), false),
-                    Err(error) => tool_error_result(format!("Error: {error}")),
-                }
+                let statuses: Vec<&str> = match filter {
+                    None => vec!["active", "ready"],
+                    Some("active") => vec!["active"],
+                    Some("pending") => vec!["pending"],
+                    Some("ready") => vec!["ready"],
+                    Some("dismissed") => vec!["dismissed"],
+                    Some("all") => vec![
+                        "active",
+                        "pending",
+                        "ready",
+                        "surfacing",
+                        "surfaced",
+                        "dismissed",
+                    ],
+                    Some(_) => return tool_error_result(
+                        "Error: filter must be one of all, active, pending, ready, or dismissed."
+                            .to_string(),
+                    ),
+                };
+                let notes = match filter {
+                    None => {
+                        let mut notes = match store.read_project_notes(
+                            project,
+                            Some(session),
+                            &["active"],
+                            limit,
+                            offset,
+                        ) {
+                            Ok(notes) => notes,
+                            Err(error) => return tool_error_result(format!("Error: {error}")),
+                        };
+                        match store.read_project_notes(project, None, &["ready"], 100, 0) {
+                            Ok(ready) => notes.extend(ready),
+                            Err(error) => return tool_error_result(format!("Error: {error}")),
+                        }
+                        notes
+                    }
+                    _ => {
+                        let all = match store.read_project_notes(project, None, &statuses, 1000, 0)
+                        {
+                            Ok(notes) => notes,
+                            Err(error) => return tool_error_result(format!("Error: {error}")),
+                        };
+                        all.into_iter()
+                            .filter(|note| note.type_name == "smart" || note.session_id == session)
+                            .skip(offset)
+                            .take(limit)
+                            .collect()
+                    }
+                };
+                mcp_text_result(render_notes(notes, offset, limit), false)
             }
             "update" => {
                 let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
@@ -7263,15 +7457,49 @@ impl McHandler {
                         "Error: 'note_id' is required when action is 'update'.",
                     );
                 };
-                let Some(content) = non_empty_string_arg(args, "content") else {
+                let content = non_empty_string_arg(args, "content");
+                let condition = string_arg(args, "surface_condition")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if content.is_none() && condition.is_none() {
                     return tool_error_result(
-                        "Error: 'content' is required when action is 'update'.",
+                        "Error: Provide 'content' and/or 'surface_condition' to update."
+                            .to_string(),
                     );
+                }
+                let current = match store.read_project_notes(
+                    project,
+                    None,
+                    &["active", "pending", "ready", "surfacing", "surfaced"],
+                    100,
+                    0,
+                ) {
+                    Ok(notes) => notes.into_iter().find(|note| {
+                        note.id == note_id
+                            && (note.type_name == "smart" || note.session_id == session)
+                    }),
+                    Err(error) => return tool_error_result(format!("Error: {error}")),
                 };
-                match store.update_note_content(project, session, note_id, content, now_ms()) {
-                    Ok(Some(_)) => mcp_text_result(format!("Updated note #{note_id}."), false),
-                    Ok(None) => tool_error_result(format!(
-                        "Error: Note #{note_id} not found in your session/project or already dismissed."
+                let Some(current) = current else {
+                    return tool_error_result(format!(
+                        "Error: Note #{note_id} not found in your session/project or has no compatible fields to update."
+                    ));
+                };
+                match store.update_note_cas(
+                    project,
+                    note_id,
+                    &current.status,
+                    current.status_version,
+                    content,
+                    condition.map(Some),
+                    now,
+                ) {
+                    Ok(NoteCasOutcome::Applied(note)) => mcp_text_result(
+                        format!("Updated note #{}: {}", note.id, note.content),
+                        false,
+                    ),
+                    Ok(NoteCasOutcome::Conflict { .. }) => tool_error_result(format!(
+                        "Error: Note #{note_id} changed concurrently; retry with a fresh read."
                     )),
                     Err(error) => tool_error_result(format!("Error: {error}")),
                 }
@@ -7287,7 +7515,7 @@ impl McHandler {
                     session,
                     note_id,
                     string_arg(args, "content"),
-                    now_ms(),
+                    now,
                 ) {
                     Ok(Some(_)) => mcp_text_result(format!("Note #{note_id} dismissed."), false),
                     Ok(None) => tool_error_result(format!(
@@ -7446,6 +7674,15 @@ impl McHandler {
                 "shadow_reset" => self.handle_shadow_reset_value(channel, request),
                 "state_import" => self.handle_state_import_value(channel, request),
                 "agent_drops.append" => self.handle_agent_drops_value(channel, request),
+                "note.evaluate" => self.handle_note_evaluation_value(channel, &request).await,
+                "transform.ack" => {
+                    self.handle_note_delivery_value(channel, &request, true)
+                        .await
+                }
+                "transform.nack" => {
+                    self.handle_note_delivery_value(channel, &request, false)
+                        .await
+                }
                 "todo_state.set" => self.handle_todo_state_set_value(channel, &request),
                 "session.flush" => self.handle_session_flush_value(channel, &request),
                 "session.recomp" => self.handle_session_recomp_value(channel, &request),
@@ -8126,39 +8363,78 @@ fn render_range_expand(
 
 fn render_notes(notes: Vec<StoredNote>, offset: usize, limit: usize) -> String {
     if notes.is_empty() {
-        return "## Notes\n\nNo active session notes.".to_string();
+        return "## Notes\n\nNo session notes or smart notes.".to_string();
     }
-    let mut lines = vec!["## Session Notes".to_string(), String::new()];
+    let mut session_lines = Vec::new();
+    let mut smart_lines = Vec::new();
     for note in &notes {
-        let condition = note
-            .surface_condition
-            .as_ref()
-            .map(|condition| {
-                format!("\n  Condition (recorded, evaluation arrives later): {condition}")
+        let status_suffix = if note.status == "active" {
+            String::new()
+        } else {
+            format!(" ({})", note.status)
+        };
+        let anchor = note
+            .anchor_ordinal
+            .map(|ordinal| format!(" ↳ @msg {ordinal}"))
+            .or_else(|| {
+                note.anchor_block_id
+                    .as_ref()
+                    .map(|id| format!(" ↳ @block {id}"))
             })
             .unwrap_or_default();
-        let anchor = note
-            .anchor_block_id
-            .as_ref()
-            .map(|anchor| format!(" ↳ @block {anchor}"))
-            .unwrap_or_default();
-        lines.push(format!(
-            "- **#{}**: {}{}{}",
-            note.id, note.content, anchor, condition
-        ));
+        let line = if note.type_name == "smart" {
+            let condition = if note.status == "ready" {
+                note.ready_reason
+                    .as_deref()
+                    .or(note.surface_condition.as_deref())
+                    .unwrap_or("Condition satisfied")
+            } else {
+                note.surface_condition
+                    .as_deref()
+                    .unwrap_or("No condition recorded")
+            };
+            format!(
+                "- **#{}**{}: {}{}\n  {}: {}",
+                note.id,
+                status_suffix,
+                note.content,
+                anchor,
+                if note.status == "ready" {
+                    "Condition met"
+                } else {
+                    "Condition"
+                },
+                condition
+            )
+        } else {
+            format!(
+                "- **#{}**{}: {}{}",
+                note.id, status_suffix, note.content, anchor
+            )
+        };
+        if note.type_name == "smart" {
+            smart_lines.push(line);
+        } else {
+            session_lines.push(line);
+        }
+    }
+    let mut sections = Vec::new();
+    if !session_lines.is_empty() {
+        sections.push(format!("## Session Notes\n\n{}", session_lines.join("\n")));
+    }
+    if !smart_lines.is_empty() {
+        sections.push(format!("## Smart Notes\n\n{}", smart_lines.join("\n\n")));
     }
     if notes.len() == limit {
         if let Some(next_offset) = offset.checked_add(notes.len()) {
-            lines.push(String::new());
-            lines.push(format!(
+            sections.push(format!(
                 "Showing {} notes (newest first). For older notes: ctx_note(action=\"read\", offset={next_offset}).",
                 notes.len()
             ));
         }
     }
-    lines.push(String::new());
-    lines.push("To dismiss a stale note: ctx_note(action=\"dismiss\", note_id=N)".to_string());
-    lines.join("\n")
+    sections.push("To dismiss a stale note: ctx_note(action=\"dismiss\", note_id=N)".to_string());
+    sections.join("\n\n")
 }
 
 // The facade never panics on agent input; an absent or malformed id stays a typed tool error.
@@ -11197,7 +11473,7 @@ mod tests {
             )
             .await,
         );
-        assert!(write.contains("smart notes are not supported"));
+        assert!(write.contains("Created smart note"));
         let write = tool_text(
             call_facade(
                 &handler,

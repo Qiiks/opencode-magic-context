@@ -668,9 +668,37 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               command_id: commandId,
                           },
                       }),
+                  note: ({
+                      sessionId,
+                      projectRoot,
+                      action,
+                      content,
+                      surfaceCondition,
+                      filter,
+                      limit,
+                      offset,
+                      noteId,
+                  }) =>
+                      rustModeModuleClient.call({
+                          sessionId,
+                          projectRoot,
+                          method: "ctx_note",
+                          body: {
+                              name: "ctx_note",
+                              arguments: {
+                                  action,
+                                  content,
+                                  surface_condition: surfaceCondition,
+                                  filter,
+                                  limit,
+                                  offset,
+                                  note_id: noteId,
+                              },
+                          },
+                      }),
                   memorySync: (sessionId: string) => {
-                      rustMemorySyncRequestedSessions.add(sessionId);
-                  },
+                       rustMemorySyncRequestedSessions.add(sessionId);
+                   },
               }
             : undefined;
     const notifyRustModeParked = (sessionId: string, message: string): void => {

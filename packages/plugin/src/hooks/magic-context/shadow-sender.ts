@@ -129,7 +129,10 @@ export interface ShadowTransport {
             | "session.flush"
             | "session.recomp"
             | "session.wrapup"
-            | "todo_state.set";
+            | "todo_state.set"
+            | "ctx_note"
+            | "transform.ack"
+            | "transform.nack";
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown>;
@@ -1526,8 +1529,11 @@ export class SubcShadowTransport implements ShadowTransport {
             | "session.recomp"
             | "session.wrapup"
             | "todo_state.set"
-            | "agent_drops.append";
-        body: unknown;
+            | "agent_drops.append"
+            | "ctx_note"
+            | "transform.ack"
+            | "transform.nack";
+         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown> {
         // Each waiting closure would retain its complete shadow payload. Rejecting

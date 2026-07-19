@@ -152,6 +152,19 @@ function responseValue(response: unknown): Record<string, unknown> {
     throw new Error("module transform returned a non-object response");
 }
 
+function noteDeliveryPassIds(response: Record<string, unknown>): string[] {
+    if (!Array.isArray(response.note_deliveries)) return [];
+    return [
+        ...new Set(
+            response.note_deliveries.flatMap((delivery) => {
+                if (!isRecord(delivery)) return [];
+                const passId = delivery.transform_pass_id;
+                return typeof passId === "string" && passId.length > 0 ? [passId] : [];
+            }),
+        ),
+    ];
+}
+
 function modelFromMessages(
     messages: MessageLike[],
 ): { providerID: string; modelID: string } | undefined {
@@ -643,10 +656,45 @@ export function createRustModeTransform(
                 servedFrom =
                     typeof response.served_from === "string" ? response.served_from : "unknown";
             }
-            const appliedMessages = applyNativeMessagesVerbatim(output, response);
-            const boundaryId = response.boundary_id;
-            if (typeof boundaryId === "string" && boundaryId.length > 0) {
-                assertNativeBoundary(appliedMessages, sessionId, boundaryId);
+            const deliveryPassIds = noteDeliveryPassIds(response);
+            const sendNoteDeliveryDisposition = async (method: "transform.ack" | "transform.nack") => {
+                for (const transformPassId of deliveryPassIds) {
+                    await callModule({
+                        sessionId,
+                        projectRoot,
+                        method,
+                        body: {
+                            method,
+                            v: 1,
+                            session_id: sessionId,
+                            transform_pass_id: transformPassId,
+                        },
+                    });
+                }
+            };
+            let appliedMessages: unknown[];
+            try {
+                appliedMessages = applyNativeMessagesVerbatim(output, response);
+                const boundaryId = response.boundary_id;
+                if (typeof boundaryId === "string" && boundaryId.length > 0) {
+                    assertNativeBoundary(appliedMessages, sessionId, boundaryId);
+                }
+            } catch (error) {
+                try {
+                    await sendNoteDeliveryDisposition("transform.nack");
+                } catch (nackError) {
+                    sessionLog(sessionId, "rust note delivery nack failed (ignored):", nackError);
+                }
+                throw error;
+            }
+            if (deliveryPassIds.length > 0) {
+                try {
+                    await sendNoteDeliveryDisposition("transform.ack");
+                } catch (ackError) {
+                    // Leave the delivery unacknowledged when the acknowledgement transport
+                    // fails; the module will re-serve those bytes on a later natural bust.
+                    sessionLog(sessionId, "rust note delivery ack failed (will retry):", ackError);
+                }
             }
             captureRustResponse(sessionId, rawMessages, response);
             state.initialized = true;

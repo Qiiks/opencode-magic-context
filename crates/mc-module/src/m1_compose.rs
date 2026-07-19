@@ -20,7 +20,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use mc_store::{McStore, McStoreError, ModuleMeta};
+use mc_store::{McStore, McStoreError, ModuleMeta, NoteDelivery, StoredNote};
 
 use crate::compartment_coverage::{partition_by_folded_seq, resolve_coverage, CoverageGap};
 use crate::decay_render::DecayRenderCompartment;
@@ -145,6 +145,55 @@ pub fn m1_revision_signal_parts(
 pub struct M1Composition {
     pub body: String,
     pub new_coverage: Option<(String, u64)>,
+    pub note_deliveries: Vec<NoteDelivery>,
+}
+
+pub fn claim_and_render_notes(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    delivered_pass_fingerprint: &str,
+    transform_pass_id: &str,
+    now_ms: i64,
+) -> Result<(String, Vec<NoteDelivery>), McStoreError> {
+    let deliveries = store.claim_note_delivery(
+        project_path,
+        session_id,
+        delivered_pass_fingerprint,
+        transform_pass_id,
+        now_ms,
+    )?;
+    let notes = deliveries
+        .iter()
+        .map(|(note, _)| note.clone())
+        .collect::<Vec<_>>();
+    Ok((
+        render_note_delta(&notes),
+        deliveries
+            .into_iter()
+            .map(|(_, delivery)| delivery)
+            .collect(),
+    ))
+}
+
+fn render_note_delta(notes: &[StoredNote]) -> String {
+    if notes.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["<new-notes>".to_string()];
+    for note in notes {
+        let condition = note
+            .ready_reason
+            .as_deref()
+            .or(note.surface_condition.as_deref())
+            .unwrap_or("Condition satisfied");
+        lines.push(format!(
+            "- #{}: {}\n  Condition: {}",
+            note.id, note.content, condition
+        ));
+    }
+    lines.push("</new-notes>".to_string());
+    lines.join("\n")
 }
 
 /// EXPENSIVE bust-only: compose the m1 delta body from the store against the watermarks
@@ -219,15 +268,31 @@ pub fn compose_m1_from_store(
     // marker that has no mc_* source yet (the same no-source-inert bucket as
     // project_memory_epoch). It lands with the writer relocation.
 
+    // Notes intentionally do not participate in m1_revision_signal: a condition can
+    // become true during a defer, but it must ride the next natural bust rather than
+    // creating a cache bust of its own. Unacknowledged ledger rows are included again,
+    // which is the honest at-least-once contract.
+    let (notes_block, note_deliveries) = claim_and_render_notes(
+        store,
+        project_path,
+        session_id,
+        &format!("m1:{}:{}", meta.m1_revision, now_ms),
+        &format!("m1:{}:{}", meta.m1_revision, now_ms),
+        now_ms,
+    )?;
     let body = assemble_m1(
         &memory_updates_block,
         &new_compartments_block,
         &new_memories_block,
-        "", // new-user-profile (deferred, no source)
+        &notes_block, // project-owned notes share the existing m1 delta slot
         M1_PLACEHOLDER,
     );
 
-    Ok(M1Composition { body, new_coverage })
+    Ok(M1Composition {
+        body,
+        new_coverage,
+        note_deliveries,
+    })
 }
 
 /// Active memories with `id > after_id` for the calling project (or the workspace union
