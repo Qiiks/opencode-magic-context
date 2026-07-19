@@ -54,6 +54,12 @@ function getDefaultConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
+/**
+ * Correctness-lane calls (authority, tools, transform) queue behind the active
+ * request instead of dropping. The cap bounds retained closures if the daemon
+ * stalls; beyond it callers get the same typed busy error as the shadow lane.
+ */
+const SERIAL_LANE_MAX_WAITERS = 16;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const SHADOW_SEND_TIMEOUT_MS = 15_000;
@@ -1506,6 +1512,8 @@ export class SubcShadowTransport implements ShadowTransport {
     private routes = new Map<string, RouteHandle>();
     private activeSession: string | null = null;
     private nextProbeMs = 0;
+    private laneWaiters = 0;
+    private laneReleaseCallbacks: Array<() => void> = [];
     private authorityProjectRoot = "";
     /**
      * Filesystem root used to bind authority/mirror routes. Authority request
@@ -1565,14 +1573,41 @@ export class SubcShadowTransport implements ShadowTransport {
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown> {
-        // Each waiting closure would retain its complete shadow payload. Rejecting
-        // concurrent best-effort work keeps transport memory bounded.
-        if (this.activeSession !== null) {
+        // Shadow mirror traffic is best-effort: each waiting closure would retain its
+        // complete pass payload, so concurrent shadow work is dropped to keep transport
+        // memory bounded. Rust-mode authority/tool/transform calls are CORRECTNESS
+        // traffic that legitimately interleaves (a tool call lands mid-pass, the mirror
+        // consumer polls on its own cadence) — those serialize through a bounded FIFO
+        // instead of failing the pass.
+        const shadowLane =
+            args.method === "shadow_transform" ||
+            args.method === "state_sync" ||
+            args.method === "shadow_reset";
+        if (this.activeSession !== null && shadowLane) {
             const error = new Error("shadow transport busy; work dropped") as Error & {
                 code?: string;
             };
             error.code = "EBUSY";
             throw error;
+        }
+        if (!shadowLane && this.activeSession !== null) {
+            if (this.laneWaiters >= SERIAL_LANE_MAX_WAITERS) {
+                const error = new Error("module transport queue is full") as Error & {
+                    code?: string;
+                };
+                error.code = "EBUSY";
+                throw error;
+            }
+            this.laneWaiters += 1;
+            try {
+                while (this.activeSession !== null) {
+                    await new Promise<void>((resolve) => {
+                        this.laneReleaseCallbacks.push(resolve);
+                    });
+                }
+            } finally {
+                this.laneWaiters -= 1;
+            }
         }
         if (args.signal?.aborted) throw args.signal.reason;
 
@@ -1593,6 +1628,8 @@ export class SubcShadowTransport implements ShadowTransport {
         } finally {
             args.signal?.removeEventListener("abort", onAbort);
             this.activeSession = null;
+            const next = this.laneReleaseCallbacks.shift();
+            next?.();
         }
     }
 
