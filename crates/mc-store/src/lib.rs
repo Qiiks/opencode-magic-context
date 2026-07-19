@@ -857,19 +857,6 @@ const MIGRATIONS: &[Migration] = &[
     ",
     },
     Migration {
-        version: 24,
-        // Zero-target ctx_reduce commands must still record a ledger row for idempotency
-        // (a retry of the same command_id must dedupe), but they never produce pending_agent_drops
-        // rows. Without a terminal disposition those rows sit forever with first_applied_at_ms=NULL,
-        // making telemetry lie about pending counts. The 'no_targets' disposition marks them as
-        // resolved at insert time so they are excluded from "pending" interpretations.
-        statements: "
-        ALTER TABLE mc_reduce_command_ledger
-            ADD COLUMN disposition TEXT
-            CHECK (disposition IS NULL OR disposition IN ('no_targets'));
-        ",
-    },
-    Migration {
         version: 23,
         // Authority and feed rows are storage-plane state. The source key lets a seed be
         // retried after a crash without allocating a second module row for one context row.
@@ -1038,6 +1025,19 @@ const MIGRATIONS: &[Migration] = &[
                     'context_row_id', OLD.context_row_id), NULL);
         END;
     "#,
+    },
+    Migration {
+        version: 24,
+        // Zero-target ctx_reduce commands must still record a ledger row for idempotency
+        // (a retry of the same command_id must dedupe), but they never produce pending_agent_drops
+        // rows. Without a terminal disposition those rows sit forever with first_applied_at_ms=NULL,
+        // making telemetry lie about pending counts. The 'no_targets' disposition marks them as
+        // resolved at insert time so they are excluded from "pending" interpretations.
+        statements: "
+        ALTER TABLE mc_reduce_command_ledger
+            ADD COLUMN disposition TEXT
+            CHECK (disposition IS NULL OR disposition IN ('no_targets'));
+        ",
     },
 ];
 
