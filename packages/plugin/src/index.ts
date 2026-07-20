@@ -9,7 +9,6 @@ import { loadPluginConfig } from "./config";
 import { isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
-import type { ClassifyModuleCallArgs } from "./features/magic-context/dreamer/classify";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import { resolveProjectIdentityOrFallback } from "./features/magic-context/memory/project-identity";
@@ -36,6 +35,7 @@ import { SubcShadowTransport } from "./hooks/magic-context/shadow-sender";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
+import { createDreamTimerModuleClient } from "./plugin/dream-timer-module-client";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./plugin/embedding-bootstrap";
 import { createEventHandler } from "./plugin/event";
 import { createSessionHooksAsync } from "./plugin/hooks/create-session-hooks";
@@ -254,21 +254,7 @@ const server: Plugin = async (ctx) => {
     // so overnight dreaming works even when the user isn't chatting.
     if (pluginConfig.enabled) {
         const dreamerRunnable = isDreamerRunnable(pluginConfig);
-        const authorityStatus = rustModeModuleClient?.authorityStatus;
-        const classifyModuleClient = rustModeModuleClient
-            ? {
-                  authorityStatus: authorityStatus
-                      ? (statusArgs: Parameters<NonNullable<typeof authorityStatus>>[0]) =>
-                            authorityStatus.call(rustModeModuleClient, statusArgs)
-                      : undefined,
-                  call: (callArgs: ClassifyModuleCallArgs) =>
-                      (
-                          rustModeModuleClient.call as unknown as (
-                              args: ClassifyModuleCallArgs,
-                          ) => Promise<unknown>
-                      )(callArgs),
-              }
-            : undefined;
+        const classifyModuleClient = createDreamTimerModuleClient(rustModeModuleClient);
         const timerRegistration = {
             directory: ctx.directory,
             projectIdentity: resolveProjectIdentityOrFallback(ctx.directory),

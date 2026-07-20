@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import { createDreamTimerModuleClient } from "../../../plugin/dream-timer-module-client";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { ensureContextStoreUuid } from "../context-authority";
@@ -310,9 +311,20 @@ describe("createDreamTaskExecutor — classify-memories", () => {
                 delete: mock(async () => ({})),
             },
         };
-        const moduleClient = {
-            authorityStatus: mock(async () => ({ authority: { state: "MODULE", generation: 3 } })),
-            call: mock(async (args: { method: string; body: unknown }) => {
+        // This must be a class-backed fake: object-literal mocks cannot expose a detached-method
+        // regression because they do not need instance state through the timer adapter.
+        class StatefulTimerModuleClient {
+            private readonly instanceState = "timer-transport";
+
+            async authorityStatus() {
+                if (this.instanceState !== "timer-transport")
+                    throw new Error("lost transport this");
+                return { authority: { state: "MODULE", generation: 3 } };
+            }
+
+            async call(args: { method: string; body: unknown }) {
+                if (this.instanceState !== "timer-transport")
+                    throw new Error("lost transport this");
                 moduleCalls.push(args);
                 if (args.method === "dreamer.run_task") {
                     const body = args.body as { payload: { items: Array<{ memory_id: number }> } };
@@ -328,8 +340,9 @@ describe("createDreamTaskExecutor — classify-memories", () => {
                     };
                 }
                 return { accepted: [sensitive.id], rejected: [] };
-            }),
-        };
+            }
+        }
+        const moduleClient = createDreamTimerModuleClient(new StatefulTimerModuleClient() as never);
         const executor = createDreamTaskExecutor({
             client: client as never,
             sessionDirectory: project,
