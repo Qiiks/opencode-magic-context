@@ -52,13 +52,13 @@ use tokio::sync::Notify;
 use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
-    validate_state_import_compartments, HistorianPhase, InsertMemoryInput, MappingUpdate, McStore,
-    McStoreError, NoteCasOutcome, NoteEvaluationInput, NoteInput, NoteWriteInput,
-    RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowMemoryMutationRow, ShadowMemoryRow,
-    ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow,
-    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
-    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, VerificationUpdate,
-    WrapupCommandRecord,
+    canonical_root, validate_state_import_compartments, HistorianPhase, InsertMemoryInput,
+    MappingUpdate, McStore, McStoreError, NoteCasOutcome, NoteEvaluationInput, NoteInput,
+    NoteWriteInput, RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowMemoryMutationRow,
+    ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow,
+    ShadowWorkspaceRow, StateImportError, StateImportPreflight, StateImportValidationError,
+    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
+    TodoStateSetOutcome, VerificationUpdate, WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -2583,17 +2583,22 @@ impl McHandler {
     }
 
     fn module_knows_transform_session(&self, session_id: &str, project_root: &Path) -> bool {
+        let canonical_project_root = canonical_root(project_root);
         let root_observed = self
             .transform_session_roots
             .lock()
             .expect("transform session roots mutex")
             .get(session_id)
-            .is_some_and(|roots| roots.contains(project_root));
+            .is_some_and(|roots| {
+                roots
+                    .iter()
+                    .any(|root| canonical_root(root) == canonical_project_root)
+            });
         if !root_observed {
             let Some(store) = self.store.get() else {
                 return false;
             };
-            let durable_root_observed = project_root.to_str().is_some_and(|root| {
+            let durable_root_observed = canonical_project_root.to_str().is_some_and(|root| {
                 store
                     .knows_transform_session_root(session_id, root)
                     .unwrap_or(false)
@@ -2601,14 +2606,15 @@ impl McHandler {
             if !durable_root_observed || !store.has_cache_state(session_id).unwrap_or(false) {
                 return false;
             }
-            // Cache the durable proof after a process restart. The row pairs the exact root with
-            // the accepted transform commit, so it cannot authorize the same session on root B.
+            // Cache the durable proof after a process restart. The row pairs the canonical root
+            // with the accepted transform commit, so a genuinely different root cannot authorize
+            // the same session.
             self.transform_session_roots
                 .lock()
                 .expect("transform session roots mutex")
                 .entry(session_id.to_string())
                 .or_default()
-                .insert(project_root.to_path_buf());
+                .insert(canonical_project_root.clone());
             return true;
         }
         if self
@@ -2622,7 +2628,9 @@ impl McHandler {
             .lock()
             .expect("transform route channels mutex")
             .values()
-            .any(|(session, root)| session == session_id && root == project_root)
+            .any(|(session, root)| {
+                session == session_id && canonical_root(root) == canonical_project_root
+            })
     }
 
     /// Persist the route's transport-to-identity mapping when a route becomes bound to an
@@ -5656,19 +5664,17 @@ impl McHandler {
                     .to_string(),
             };
         }
+        let lineage_root = canonical_root(&binding.project_root);
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
-            .insert(
-                channel,
-                (binding.session.clone(), binding.project_root.clone()),
-            );
+            .insert(channel, (binding.session.clone(), lineage_root.clone()));
         self.transform_session_roots
             .lock()
             .expect("transform session roots mutex")
             .entry(binding.session.clone())
             .or_default()
-            .insert(binding.project_root.clone());
+            .insert(lineage_root);
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
                 code: "authority_transform_page_in_progress".to_string(),
@@ -12860,7 +12866,7 @@ mod tests {
         );
         handler.transform_route_channels.lock().unwrap().insert(
             7,
-            ("opencode-session".to_string(), PathBuf::from(project_root)),
+            ("opencode-session".to_string(), canonical_root(project_root)),
         );
         handler
             .transform_session_roots
@@ -12868,7 +12874,7 @@ mod tests {
             .unwrap()
             .entry("opencode-session".to_string())
             .or_default()
-            .insert(PathBuf::from(project_root));
+            .insert(canonical_root(project_root));
 
         let memory = call_facade(
             &handler,
@@ -12902,6 +12908,87 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn opencode_facade_lineage_matches_transform_across_symlink_spellings() {
+        use std::os::unix::fs::symlink;
+
+        let (handler, _store, dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            Arc::new(MissingSessionResolver),
+        );
+        let link = dir.path().join("project-link");
+        symlink(&project, &link).unwrap();
+        let target_text = project.to_str().unwrap();
+        let link_text = link.to_str().unwrap();
+
+        // The transform lane binds through the symlink spelling, while the facade lane binds to
+        // the canonical target. Both route bindings identify the same filesystem lineage.
+        handler.bind_route(7, binding_with_harness(link_text, OPENCODE_HARNESS, "ses"));
+        let transformed =
+            call_transform_request_on_channel(&handler, 7, request(vec![ck("m0", 0, "a")])).await;
+        assert_eq!(transformed["action"], "HARD");
+        handler.bind_route(
+            8,
+            binding_with_harness(target_text, OPENCODE_HARNESS, "ses"),
+        );
+
+        let outcome = call_facade_on_channel(
+            &handler,
+            8,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "symlink lineage resolves",
+                "memory_project": target_text,
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(outcome));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn opencode_facade_lineage_matches_transform_in_reverse_symlink_direction() {
+        use std::os::unix::fs::symlink;
+
+        let (handler, _store, dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            Arc::new(MissingSessionResolver),
+        );
+        let link = dir.path().join("project-link");
+        symlink(&project, &link).unwrap();
+        let target_text = project.to_str().unwrap();
+        let link_text = link.to_str().unwrap();
+
+        // Reverse the lane spellings: transform uses the target and facade uses the symlink.
+        handler.bind_route(
+            7,
+            binding_with_harness(target_text, OPENCODE_HARNESS, "ses"),
+        );
+        let transformed =
+            call_transform_request_on_channel(&handler, 7, request(vec![ck("m0", 0, "a")])).await;
+        assert_eq!(transformed["action"], "HARD");
+        handler.bind_route(8, binding_with_harness(link_text, OPENCODE_HARNESS, "ses"));
+
+        let outcome = call_facade_on_channel(
+            &handler,
+            8,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "reverse symlink lineage resolves",
+                "memory_project": link_text,
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(outcome));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12951,6 +13038,7 @@ mod tests {
         activate_module_authority(&store, "context", "git:identity", root_a, "memories");
 
         let root_b = project.join("other-root");
+        std::fs::create_dir_all(&root_b).unwrap();
         let root_b = root_b.to_str().unwrap();
         handler.bind_route(8, binding_with_harness(root_b, OPENCODE_HARNESS, "ses"));
         let outcome = call_facade_on_channel(

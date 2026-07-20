@@ -23,9 +23,22 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
+
+/// Canonicalize a filesystem route root before using it as lineage state.
+///
+/// Transform and facade lanes can observe the same directory through different spellings when
+/// a project is reached through a symlink. Comparing those spellings as strings would make a
+/// valid session look unresolved, so filesystem roots share this boundary normalization. A root
+/// may have been removed by the time a request arrives; retain the input spelling in that case
+/// instead of turning canonicalization into a request failure.
+pub fn canonical_root(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
 
 /// Canonical foreign-memory visibility predicate used by module SQL consumers.
 /// The plugin mirrors this literal to keep cache visibility and workspace policy aligned.
@@ -3909,17 +3922,25 @@ impl McStore {
         session_id: &str,
         project_root: &str,
     ) -> Result<bool, McStoreError> {
+        let candidate = canonical_root(project_root);
         self.inner
             .with_conn(|conn| {
-                Ok(conn
-                    .query_row(
-                        "SELECT 1 FROM mc_transform_session_roots
-                          WHERE session_id = ?1 AND project_root = ?2",
-                        params![session_id, project_root],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some())
+                // Older stores may contain symlink spellings. Load the tiny per-session set and
+                // canonicalize both sides in Rust rather than relying on SQL string equality;
+                // this keeps migration compatibility without changing the durable schema.
+                let mut statement = conn.prepare(
+                    "SELECT project_root
+                       FROM mc_transform_session_roots
+                      WHERE session_id = ?1",
+                )?;
+                let rows =
+                    statement.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    if canonical_root(row?) == candidate {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             })
             .map_err(Into::into)
     }
@@ -5875,6 +5896,9 @@ impl McStore {
         let meta_json =
             serde_json::to_string(meta).map_err(|e| McStoreError::Serde(e.to_string()))?;
         let next = expected.unwrap_or(0) + 1;
+        let canonical_project_root = project_root
+            .filter(|root| !root.is_empty())
+            .map(|root| canonical_root(root).to_string_lossy().into_owned());
 
         let outcome = self.inner.with_conn_fenced(|tx| {
             // Read the current row_version inside the fenced txn; NO_ROW when absent.
@@ -5938,11 +5962,11 @@ impl McStore {
                       meta        = excluded.meta",
                 params![session_id, next as i64, core_json, meta_json],
             )?;
-            if let Some(project_root) = project_root.filter(|root| !root.is_empty()) {
+            if let Some(project_root) = canonical_project_root.as_deref() {
                 // Durable root lineage is committed with the cache CAS, so a restart cannot
                 // authenticate a root that never produced the accepted session state.
                 tx.execute(
-                    "INSERT INTO mc_transform_session_roots(
+                     "INSERT INTO mc_transform_session_roots(
                          session_id, project_root, observed_at
                      ) VALUES (?1, ?2, ?3)
                      ON CONFLICT(session_id, project_root) DO UPDATE SET
@@ -11678,6 +11702,111 @@ mod tests {
             .knows_transform_session_root("deleted", "/root-a")
             .unwrap());
         assert!(!reopened.has_cache_state("deleted").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transform_session_roots_canonicalize_writes_and_match_legacy_symlink_rows() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        symlink(&target, &link).unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let canonical_target = canonical_root(&target);
+        let target_text = canonical_target.to_str().unwrap();
+        let link_text = link.to_str().unwrap();
+
+        let initial = store.load("canonical-write").unwrap();
+        store
+            .commit_transform(
+                "canonical-write",
+                TransformCommit {
+                    expected: initial.row_version,
+                    core: &initial.core,
+                    meta: &initial.meta,
+                    consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
+                    memory_revision: None,
+                    project_root: Some(link_text),
+                    overlays: TransformOverlayBatch::default(),
+                },
+            )
+            .unwrap();
+        let stored_root: String = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT project_root FROM mc_transform_session_roots
+                      WHERE session_id = 'canonical-write'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(stored_root, target_text);
+        assert!(store
+            .knows_transform_session_root("canonical-write", link_text)
+            .unwrap());
+        assert!(store
+            .knows_transform_session_root("canonical-write", target_text)
+            .unwrap());
+
+        // Simulate a pre-migration row that retained the symlink spelling.
+        store
+            .commit(
+                "legacy-row",
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+            )
+            .unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_transform_session_roots
+                         (session_id, project_root, observed_at)
+                     VALUES ('legacy-row', ?1, 1)",
+                    params![link_text],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store
+            .knows_transform_session_root("legacy-row", target_text)
+            .unwrap());
+        assert!(store
+            .knows_transform_session_root("legacy-row", link_text)
+            .unwrap());
+
+        let missing = dir.path().join("gone");
+        assert_eq!(canonical_root(&missing), missing);
+        let missing_text = missing.to_str().unwrap();
+        let missing_initial = store.load("missing-root").unwrap();
+        store
+            .commit_transform(
+                "missing-root",
+                TransformCommit {
+                    expected: missing_initial.row_version,
+                    core: &missing_initial.core,
+                    meta: &missing_initial.meta,
+                    consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
+                    memory_revision: None,
+                    project_root: Some(missing_text),
+                    overlays: TransformOverlayBatch::default(),
+                },
+            )
+            .unwrap();
+        assert!(store
+            .knows_transform_session_root("missing-root", missing_text)
+            .unwrap());
+        assert!(!store
+            .knows_transform_session_root("missing-root", "/another/gone")
+            .unwrap());
     }
 
     #[test]
