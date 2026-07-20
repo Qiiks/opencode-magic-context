@@ -30,6 +30,7 @@ import {
 } from "./classify-prompt";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
+import { getModuleMemoryIdentities } from "./module-apply";
 
 /**
  * classify-memories: a NON-agentic single-shot transform. Scores each project
@@ -150,40 +151,10 @@ function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
         }));
     }
 
-    const contextIds = active.map((memory) => memory.id);
-    const placeholders = contextIds.map(() => "?").join(", ");
-    const rows = args.db
-        .prepare(
-            `SELECT identity.context_row_id, identity.module_row_id, live.normalized_hash
-               FROM mirror_identity identity
-               LEFT JOIN mirror_live_memory_rows live
-                 ON live.module_project = identity.module_project
-                AND live.module_row_id = identity.module_row_id
-              WHERE identity.domain = 'memories'
-                AND identity.module_project = ?
-                AND identity.context_row_id IN (${placeholders})`,
-        )
-        .all(args.projectIdentity, ...contextIds) as Array<{
-        context_row_id?: number;
-        module_row_id?: number;
-        normalized_hash?: string | null;
-    }>;
-    const mappedByContextId = new Map(
-        rows
-            .filter(
-                (row) =>
-                    Number.isInteger(row.context_row_id) &&
-                    Number.isInteger(row.module_row_id) &&
-                    typeof row.normalized_hash === "string" &&
-                    row.normalized_hash.length > 0,
-            )
-            .map((row) => [
-                row.context_row_id as number,
-                {
-                    moduleId: row.module_row_id as number,
-                    normalizedHash: row.normalized_hash as string,
-                },
-            ]),
+    const mappedByContextId = getModuleMemoryIdentities(
+        args.db,
+        args.projectIdentity,
+        active.map((memory) => memory.id),
     );
     const candidates = active.flatMap((contextMemory) => {
         const mapped = mappedByContextId.get(contextMemory.id);
@@ -192,11 +163,7 @@ function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
             : [];
     });
     if (candidates.length !== active.length) {
-        const mappedContextIds = new Set(
-            rows
-                .filter((row) => Number.isInteger(row.context_row_id))
-                .map((row) => row.context_row_id as number),
-        );
+        const mappedContextIds = new Set(mappedByContextId.keys());
         const withoutIdentity = active.filter((memory) => !mappedContextIds.has(memory.id)).length;
         const withoutLiveHash = active.length - candidates.length - withoutIdentity;
         log(

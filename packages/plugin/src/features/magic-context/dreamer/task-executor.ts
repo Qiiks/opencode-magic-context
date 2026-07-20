@@ -44,6 +44,7 @@ import { refreshPrimers } from "./refresh-primers";
 import {
     applyRetrospectiveLearnings,
     parseRetrospectiveLearnings,
+    validateRetrospectiveLearningText,
 } from "./retrospective-learnings";
 import {
     type RetrospectiveRawMessage,
@@ -70,6 +71,7 @@ import {
 
 import type { DreamTaskRuntimeConfig, TaskExecOutcome, TaskExecutor } from "./task-scheduler";
 import { runVerify } from "./verify";
+import { DreamerModuleFailureError, resolveDreamerModuleRoute, type DreamerModuleRoute } from "./module-apply";
 
 export interface DreamTaskExecutorDeps {
     client: PluginContext["client"];
@@ -209,6 +211,14 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         const startedAt = Date.now();
         const deadline = startedAt + config.timeoutMinutes * 60 * 1000;
         const parent = await resolveParentSessionId();
+        let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
+        if (config.task === "map-memories" || config.task === "verify" || config.task === "verify-broad" || config.task === "retrospective") {
+            try {
+                moduleRoute = await resolveDreamerModuleRoute({ db, projectIdentity, projectRoot: deps.sessionDirectory, transformMode: deps.transformMode, moduleClient: deps.moduleClient, commandId: `${startedAt}:${holderId}:${config.task}` });
+            } catch (error) {
+                throw new DreamerModuleFailureError("authority.status", error);
+            }
+        }
 
         const recordRun = (
             status: "completed" | "failed",
@@ -303,6 +313,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
+                    moduleRoute,
                 });
                 recordRun("completed", null);
                 log(
@@ -326,6 +337,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
+                    moduleRoute,
                 });
                 recordRun("completed", null, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
@@ -476,6 +488,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     parent,
                     invocationStartedAt: startedAt,
+                    moduleRoute,
                 });
                 recordRun("completed", null, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
@@ -650,6 +663,7 @@ async function runRetrospectiveTask(
         deadline: number;
         parent: string | undefined;
         invocationStartedAt: number;
+        moduleRoute?: DreamerModuleRoute;
     },
 ): Promise<{ retrospectiveWatermarkMs: number | null }> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
@@ -828,6 +842,37 @@ async function runRetrospectiveTask(
         const sourceSessionId =
             flagged[0]?.sessionId ?? userMessages[0]?.sessionId ?? "retrospective";
         const learnings = parseRetrospectiveLearnings(deepenRun.validated);
+        let moduleMemoryWritten = 0;
+        let moduleRejected: Array<{ content: string; reason: string }> = [];
+        let hostLearnings = learnings;
+        if (helpers.moduleRoute) {
+            const moduleLearnings = learnings.filter((learning) => {
+                if (learning.route !== "memory") return false;
+                const reason = validateRetrospectiveLearningText(learning.content, userMessages.map((message) => message.text ?? ""));
+                if (reason || !learning.category) {
+                    if (reason) moduleRejected.push({ content: learning.content, reason });
+                    return false;
+                }
+                return true;
+            });
+            hostLearnings = learnings.filter((learning) => learning.route !== "memory");
+            for (const learning of moduleLearnings) {
+                try {
+                    const response = await helpers.moduleRoute.moduleClient.call({
+                        sessionId: helpers.moduleRoute.moduleSessionId,
+                        projectRoot: helpers.moduleRoute.moduleProjectRoot,
+                        method: "ctx_memory",
+                        body: { name: "ctx_memory", arguments: { action: "write", memory_project: projectIdentity, category: learning.category, content: learning.content, command_id: `${helpers.moduleRoute.moduleCommandId}:${moduleMemoryWritten}` } },
+                    });
+                    const body = ((response as { result?: unknown })?.result ?? response) as { ok?: unknown; error?: unknown };
+                    if (body?.ok === false || body?.error) throw new Error("module rejected retrospective memory");
+                    moduleMemoryWritten += 1;
+                } catch (error) {
+                    throw new DreamerModuleFailureError("ctx_memory retrospective write", error);
+                }
+            }
+            // Invalid memory learnings remain rejected, but never reach a TypeScript memory insert.
+        }
         // Apply learnings AND record the processed-window key in ONE transaction
         // so a crash between them can't leave the window un-recorded (which would
         // re-deepen + risk a duplicate observation next run, since
@@ -841,7 +886,7 @@ async function runRetrospectiveTask(
                     db,
                     projectIdentity,
                     sourceSessionId,
-                    learnings,
+                    learnings: hostLearnings,
                     userMemoryCollectionEnabled: deps.userMemoryCollectionEnabled === true,
                     // Source user lines for the near-transcription reject: a learning
                     // that echoes a long verbatim run of the user's words is a
@@ -850,6 +895,8 @@ async function runRetrospectiveTask(
                         .map((message) => message.text ?? "")
                         .filter((text) => text.length > 0),
                 });
+                result.memoryWritten += moduleMemoryWritten;
+                result.rejected.push(...moduleRejected);
                 recordRetrospectiveWindowProcessed(db, projectIdentity, windowKey);
                 return result;
             },

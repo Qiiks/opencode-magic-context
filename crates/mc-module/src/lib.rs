@@ -52,12 +52,13 @@ use tokio::sync::Notify;
 use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
-    validate_state_import_compartments, HistorianPhase, InsertMemoryInput, McStore, McStoreError,
-    NoteCasOutcome, NoteEvaluationInput, NoteInput, NoteWriteInput, RecordWrapupCommandOutcome,
-    ShadowDivergenceRecord, ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError,
-    ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError,
-    StateImportPreflight, StateImportValidationError, StoredChunkTranscript, StoredCompartment,
-    StoredMemoryMutation, StoredNote, TodoStateSetOutcome, WrapupCommandRecord,
+    validate_state_import_compartments, HistorianPhase, InsertMemoryInput, MappingUpdate, McStore,
+    McStoreError, NoteCasOutcome, NoteEvaluationInput, NoteInput, NoteWriteInput,
+    RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowMemoryMutationRow, ShadowMemoryRow,
+    ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow,
+    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
+    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, VerificationUpdate,
+    WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -7567,6 +7568,180 @@ impl McHandler {
         }
     }
 
+    async fn handle_memory_set_verification(
+        &self,
+        channel: u16,
+        request: &Value,
+    ) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request, &["rows"]) else {
+            return invalid_params_error("memory.set_verification requires arguments");
+        };
+        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
+            return invalid_params_error("memory.set_verification requires memory_project");
+        };
+        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
+            return outcome;
+        }
+        let binding = match self.facade_binding(channel) {
+            Ok(binding) => binding,
+            Err(_) => return session_unresolved_error(),
+        };
+        let route_root = binding.project_root.to_string_lossy().to_string();
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
+        else {
+            return invalid_params_error("memory.set_verification requires context_store_uuid");
+        };
+        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
+        else {
+            return invalid_params_error("memory.set_verification requires authority_generation");
+        };
+        let Some(rows) = args.get("rows").and_then(Value::as_array) else {
+            return invalid_params_error("memory.set_verification requires rows");
+        };
+        let mut updates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(row) = row.as_object() else {
+                return invalid_params_error("verification rows must be objects");
+            };
+            let Some(memory_id) = row.get("memory_id").and_then(Value::as_i64) else {
+                return invalid_params_error("verification row requires memory_id");
+            };
+            let Some(hash) = row.get("content_hash_at_prompt").and_then(Value::as_str) else {
+                return invalid_params_error("verification row requires content_hash_at_prompt");
+            };
+            let Some(status) = row.get("verification_status").and_then(Value::as_str) else {
+                return invalid_params_error("verification row requires verification_status");
+            };
+            updates.push(VerificationUpdate {
+                memory_id,
+                content_hash_at_prompt: hash.into(),
+                verification_status: status.into(),
+                updated_content: row
+                    .get("updated_content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                archive_reason: row
+                    .get("archive_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+        }
+        match store.with_facade_mutation(&route_root, "memories", || {
+            store.set_memory_verification(
+                context_store_uuid,
+                memory_project,
+                authority_generation,
+                &updates,
+                now_ms(),
+            )
+        }) {
+            Ok(result) => respond(
+                json!({ "accepted": result.accepted, "rejected": result.rejected.iter().map(|row| json!({"memory_id": row.memory_id, "reason": row.reason})).collect::<Vec<_>>() }),
+            ),
+            Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
+                HandlerOutcome::Error {
+                    code: "authority_generation_mismatch".into(),
+                    message: format!("authority generation is {found}, request used {expected}"),
+                }
+            }
+            Err(McStoreError::AuthorityStateMismatch { found, .. }) if found == "DRAINING" => {
+                authority_draining_error("memories")
+            }
+            Err(error) => HandlerOutcome::Error {
+                code: "verification_apply_failed".into(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_memory_set_mapping(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request, &["rows"]) else {
+            return invalid_params_error("memory.set_mapping requires arguments");
+        };
+        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
+            return invalid_params_error("memory.set_mapping requires memory_project");
+        };
+        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
+            return outcome;
+        }
+        let binding = match self.facade_binding(channel) {
+            Ok(binding) => binding,
+            Err(_) => return session_unresolved_error(),
+        };
+        let route_root = binding.project_root.to_string_lossy().to_string();
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
+        else {
+            return invalid_params_error("memory.set_mapping requires context_store_uuid");
+        };
+        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
+        else {
+            return invalid_params_error("memory.set_mapping requires authority_generation");
+        };
+        let Some(rows) = args.get("rows").and_then(Value::as_array) else {
+            return invalid_params_error("memory.set_mapping requires rows");
+        };
+        let mut updates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(row) = row.as_object() else {
+                return invalid_params_error("mapping rows must be objects");
+            };
+            let Some(memory_id) = row.get("memory_id").and_then(Value::as_i64) else {
+                return invalid_params_error("mapping row requires memory_id");
+            };
+            let Some(hash) = row.get("content_hash_at_prompt").and_then(Value::as_str) else {
+                return invalid_params_error("mapping row requires content_hash_at_prompt");
+            };
+            let mapped_files = match row.get("mapped_files") {
+                Some(Value::Null) | None => None,
+                Some(Value::Array(files)) => Some(
+                    files
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                ),
+                _ => return invalid_params_error("mapped_files must be an array or null"),
+            };
+            updates.push(MappingUpdate {
+                memory_id,
+                content_hash_at_prompt: hash.into(),
+                mapped_files,
+            });
+        }
+        match store.with_facade_mutation(&route_root, "memories", || {
+            store.set_memory_mapping(
+                context_store_uuid,
+                memory_project,
+                authority_generation,
+                &updates,
+                now_ms(),
+            )
+        }) {
+            Ok(result) => respond(
+                json!({ "accepted": result.accepted, "rejected": result.rejected.iter().map(|row| json!({"memory_id": row.memory_id, "reason": row.reason})).collect::<Vec<_>>() }),
+            ),
+            Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
+                HandlerOutcome::Error {
+                    code: "authority_generation_mismatch".into(),
+                    message: format!("authority generation is {found}, request used {expected}"),
+                }
+            }
+            Err(McStoreError::AuthorityStateMismatch { found, .. }) if found == "DRAINING" => {
+                authority_draining_error("memories")
+            }
+            Err(error) => HandlerOutcome::Error {
+                code: "mapping_apply_failed".into(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     async fn handle_facade_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         let Some(name) = request.get("name").and_then(Value::as_str) else {
             return unrecognized_request_error(&request);
@@ -7576,6 +7751,10 @@ impl McHandler {
                 self.handle_memory_set_classification(channel, &request)
                     .await
             }
+            "memory.set_verification" => {
+                self.handle_memory_set_verification(channel, &request).await
+            }
+            "memory.set_mapping" => self.handle_memory_set_mapping(channel, &request).await,
             "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,

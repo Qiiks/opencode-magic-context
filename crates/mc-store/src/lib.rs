@@ -1819,6 +1819,22 @@ const MIGRATIONS: &[Migration] = &[
         BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
         "#,
     },
+    Migration {
+        version: 34,
+        // Mappings are part of the persisted memory state, not merely a TypeScript verification cache.
+        // Store the complete file set so applying a revision can restore mappings correctly after
+        // data is mirrored or drained.
+        statements: r#"
+        CREATE TABLE IF NOT EXISTS mc_memory_mappings (
+            memory_id        INTEGER PRIMARY KEY,
+            project_path     TEXT NOT NULL,
+            mapped_files_json TEXT NOT NULL,
+            updated_at       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_memory_mappings_project
+            ON mc_memory_mappings(project_path, memory_id);
+        "#,
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -2952,6 +2968,46 @@ pub struct ClassificationRejected {
 pub struct ClassificationApplyResult {
     pub accepted: Vec<i64>,
     pub rejected: Vec<ClassificationRejected>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationUpdate {
+    pub memory_id: i64,
+    pub content_hash_at_prompt: String,
+    pub verification_status: String,
+    pub updated_content: Option<String>,
+    pub archive_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationRejected {
+    pub memory_id: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationApplyResult {
+    pub accepted: Vec<i64>,
+    pub rejected: Vec<VerificationRejected>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingUpdate {
+    pub memory_id: i64,
+    pub content_hash_at_prompt: String,
+    pub mapped_files: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingRejected {
+    pub memory_id: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingApplyResult {
+    pub accepted: Vec<i64>,
+    pub rejected: Vec<MappingRejected>,
 }
 
 /// A context row used by the crash-idempotent authority seed. The JSON payload is
@@ -5361,6 +5417,96 @@ impl McStore {
                 })
             }
         }
+    }
+
+    /// Apply verification updates only when their authority generation and content hash still match
+    /// the values used for classification. Verification-only changes do not invalidate caches, but
+    /// content rewrites and archives must be added to the mutation log so consumers see them in the
+    /// next incremental update.
+    pub fn set_memory_verification(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        authority_generation: u64,
+        rows: &[VerificationUpdate],
+        now_ms: i64,
+    ) -> Result<VerificationApplyResult, McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            let authority: (String, u64) = tx.query_row(
+                "SELECT state, generation FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
+                params![context_store_uuid, project], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            if authority.0 != "MODULE" {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    AuthorityTransitionError::State { expected: "MODULE".into(), found: authority.0 },
+                )));
+            }
+            if authority.1 != authority_generation {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    AuthorityTransitionError::Generation { expected: authority_generation, found: authority.1 },
+                )));
+            }
+            let mut accepted = Vec::new();
+            let mut rejected = Vec::new();
+            for update in rows {
+                let Some(memory) = load_memory_full_tx(tx, update.memory_id)? else {
+                    rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "not_found".into() });
+                    continue;
+                };
+                if memory.project_path != project { rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "not_owned".into() }); continue; }
+                if memory.normalized_hash != update.content_hash_at_prompt { rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "stale".into() }); continue; }
+                match update.verification_status.as_str() {
+                    "verified" => { tx.execute("UPDATE mc_memories SET verification_status = 'verified', verified_at = ?1 WHERE id = ?2", params![now_ms, update.memory_id])?; }
+                    "update" => {
+                        let Some(content) = update.updated_content.as_deref().map(str::trim).filter(|v| !v.is_empty()) else { rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "missing_updated_content".into() }); continue; };
+                        let hash = compute_normalized_memory_hash(content);
+                        tx.execute("UPDATE mc_memories SET content = ?1, normalized_hash = ?2, updated_at = ?3, shareable = 0, classified_at = NULL, verification_status = 'verified', verified_at = ?3 WHERE id = ?4", params![content, hash, now_ms, update.memory_id])?;
+                        tx.execute("DELETE FROM mc_memory_mappings WHERE memory_id = ?1", params![update.memory_id])?;
+                        append_memory_mutation_tx(tx, MemoryMutationAppend { project_path: project, mutation_type: "update", target_memory_id: update.memory_id, superseded_by_id: None, category: Some(&memory.category), new_content: Some(content), queued_at: now_ms })?;
+                    }
+                    "archive" => {
+                        let metadata = merge_archive_reason(memory.metadata_json.as_deref(), update.archive_reason.as_deref().unwrap_or("verified archive"));
+                        tx.execute("UPDATE mc_memories SET status = 'archived', metadata_json = ?1, updated_at = ?2 WHERE id = ?3", params![metadata, now_ms, update.memory_id])?;
+                        tx.execute("DELETE FROM mc_memory_mappings WHERE memory_id = ?1", params![update.memory_id])?;
+                        append_memory_mutation_tx(tx, MemoryMutationAppend { project_path: project, mutation_type: "archive", target_memory_id: update.memory_id, superseded_by_id: None, category: None, new_content: None, queued_at: now_ms })?;
+                    }
+                    _ => { rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "invalid_status".into() }); continue; }
+                }
+                accepted.push(update.memory_id);
+            }
+            Ok(VerificationApplyResult { accepted, rejected })
+        }).map_err(Into::into)
+    }
+
+    /// Store the complete file set reported by map-memories. Mapping is cache-neutral, but the
+    /// explicit feed row lets the context mirror converge without treating it as a memory rewrite.
+    pub fn set_memory_mapping(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        authority_generation: u64,
+        rows: &[MappingUpdate],
+        now_ms: i64,
+    ) -> Result<MappingApplyResult, McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            let authority: (String, u64) = tx.query_row(
+                "SELECT state, generation FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
+                params![context_store_uuid, project], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            if authority.0 != "MODULE" { return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(AuthorityTransitionError::State { expected: "MODULE".into(), found: authority.0 }))); }
+            if authority.1 != authority_generation { return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(AuthorityTransitionError::Generation { expected: authority_generation, found: authority.1 }))); }
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS mc_memory_mappings (memory_id INTEGER PRIMARY KEY, project_path TEXT NOT NULL, mapped_files_json TEXT NOT NULL, updated_at INTEGER NOT NULL);")?;
+            let mut accepted = Vec::new();
+            let mut rejected = Vec::new();
+            for update in rows {
+                let Some(memory) = load_memory_full_tx(tx, update.memory_id)? else { rejected.push(MappingRejected { memory_id: update.memory_id, reason: "not_found".into() }); continue; };
+                if memory.project_path != project { rejected.push(MappingRejected { memory_id: update.memory_id, reason: "not_owned".into() }); continue; }
+                if memory.normalized_hash != update.content_hash_at_prompt { rejected.push(MappingRejected { memory_id: update.memory_id, reason: "stale".into() }); continue; }
+                let files = serde_json::to_string(&update.mapped_files).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                tx.execute("INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(memory_id) DO UPDATE SET project_path=excluded.project_path, mapped_files_json=excluded.mapped_files_json, updated_at=excluded.updated_at", params![update.memory_id, project, files, now_ms])?;
+                tx.execute("INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash) VALUES ('memories', 'update', ?1, json_object('id', ?1, 'project_path', ?3, 'category', ?5, 'content', ?6, 'normalized_hash', ?4, 'status', ?7, 'mapping', json(?2)), ?4)", params![update.memory_id, files, project, update.content_hash_at_prompt, memory.category, memory.content, memory.status])?;
+                accepted.push(update.memory_id);
+            }
+            Ok(MappingApplyResult { accepted, rejected })
+        }).map_err(Into::into)
     }
 
     /// Record a terminal wrapup outcome only while the cache row still matches the
@@ -12550,7 +12696,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=33).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=34).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -15192,7 +15338,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=33).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=34).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
