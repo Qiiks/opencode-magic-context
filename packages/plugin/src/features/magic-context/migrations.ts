@@ -2352,6 +2352,19 @@ const MIGRATIONS: Migration[] = [
         version: 60,
         description: "persist the owning live memory resnapshot generation",
         up(db: Database): void {
+            // Databases that recorded v58 before its body gained this table never created
+            // it (a shipped-migration edit — version rows block re-runs). Recreate it here
+            // so both shapes converge; CREATE IF NOT EXISTS makes this a no-op on healthy DBs.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS mirror_resnapshot_state (
+                    domain TEXT PRIMARY KEY CHECK(domain = 'memories'),
+                    status TEXT NOT NULL CHECK(status IN ('pending_check', 'resnapshotting', 'complete')),
+                    updated_at INTEGER NOT NULL
+                );
+            `);
+            db.exec(
+                "INSERT OR IGNORE INTO mirror_resnapshot_state(domain, status, updated_at) VALUES ('memories', 'pending_check', 0)",
+            );
             ensureColumn(db, "mirror_resnapshot_state", "generation", "TEXT");
         },
     },

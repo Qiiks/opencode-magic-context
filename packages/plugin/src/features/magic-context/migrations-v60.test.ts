@@ -59,3 +59,25 @@ describe("migration v60: live memory resnapshot ownership", () => {
         }
     });
 });
+
+test("v60 heals a database whose v58 ran before the resnapshot table existed", () => {
+    // Shipped-migration edit shape: version 58 is recorded but the table was never
+    // created because the recorded run used the original v58 body.
+    const db = new Database(":memory:");
+    try {
+        initializeDatabase(db);
+        runMigrations(db);
+        db.exec("DROP TABLE mirror_resnapshot_state");
+        db.prepare("DELETE FROM schema_migrations WHERE version = 60").run();
+        runMigrations(db);
+        const row = db
+            .prepare(
+                "SELECT status, generation FROM mirror_resnapshot_state WHERE domain = 'memories'",
+            )
+            .get() as { status: string; generation: string | null };
+        expect(row.status).toBe("pending_check");
+        expect(row.generation).toBeNull();
+    } finally {
+        closeQuietly(db);
+    }
+});
