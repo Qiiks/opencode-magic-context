@@ -159,6 +159,7 @@ export type SubagentProgressEvent =
  *   reported as `ok: false, reason: "no_assistant"` so callers can try fallback
  *   models instead of accepting an unusable success.
  * - `reason`: failure category, one of:
+ *     - `"invalid_prompt"`: a known zero-tool child was given no system prompt
  *     - `"timeout"`: hit `timeoutMs` before the child finished
  *     - `"abort"`: caller's `signal` was triggered
  *     - `"model_failed"`: every configured model + fallback returned an error
@@ -194,6 +195,7 @@ export type SubagentRunResult =
     | {
           ok: false;
           reason:
+              | "invalid_prompt"
               | "timeout"
               | "abort"
               | "model_failed"
@@ -204,6 +206,8 @@ export type SubagentRunResult =
               | "parse_failed";
           error: string;
           durationMs: number;
+          /** True when the caller should retry the task rather than advance its schedule. */
+          transient?: boolean;
           meta?: Record<string, unknown>;
       };
 

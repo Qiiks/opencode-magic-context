@@ -618,6 +618,34 @@ describe("subagent-runner pure helpers", () => {
 });
 
 describe("PiSubagentRunner spawn lifecycle", () => {
+	it("refuses to spawn known zero-tool agents without a system prompt", async () => {
+		const spawnImpl = mock(() => {
+			throw new Error("spawn must not be reached");
+		});
+		// Replace the runner's test seam with a throwing spawn so this assertion
+		// proves the guard runs before any child process is created.
+		const guardedRunner = new PiSubagentRunner({
+			piBinary: "pi-test",
+			spawnImpl: spawnImpl as never,
+		});
+
+		for (const agent of ["dreamer-classifier", "dreamer-reviewer"]) {
+			const result = await guardedRunner.run({
+				...baseOptions,
+				agent,
+				systemPrompt: "  \n\t",
+			});
+			expect(result).toEqual({
+				ok: false,
+				reason: "invalid_prompt",
+				transient: true,
+				error: `zero-tool Pi subagent "${agent}" requires a non-empty system prompt`,
+				durationMs: expect.any(Number),
+			});
+		}
+		expect(spawnImpl).not.toHaveBeenCalled();
+	});
+
 	it("treats a terminal stop turn as success even when drain SIGTERM closes the child", async () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);

@@ -276,6 +276,12 @@ const STRICT_TOOL_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map(
 	STRICT_TOOL_ALLOWLIST_ENTRIES,
 );
 
+const ZERO_TOOL_PROMPT_REQUIRED_AGENTS: ReadonlySet<string> = new Set(
+	STRICT_TOOL_ALLOWLIST_ENTRIES.filter(([, tools]) => tools.length === 0).map(
+		([agent]) => agent,
+	),
+);
+
 const KNOWN_PI_SUBAGENT_AGENTS = [
 	"magic-context-historian",
 	"historian",
@@ -539,15 +545,18 @@ export class PiSubagentRunner implements SubagentRunner {
 			}
 			return result;
 		}
+
 		const failBeforeSpawn = (
 			reason: Extract<SubagentRunResult, { ok: false }>["reason"],
 			error: string,
+			transient = false,
 		): SubagentRunResult => {
 			const result: SubagentRunResult = {
 				ok: false,
 				reason,
 				error,
 				durationMs: Date.now() - startTime,
+				...(transient ? { transient: true } : {}),
 			};
 			try {
 				recordAccounting(result);
@@ -559,6 +568,20 @@ export class PiSubagentRunner implements SubagentRunner {
 			}
 			return result;
 		};
+
+		// A zero-tool child cannot receive its task instructions unless a system
+		// prompt is provided. Refuse before spawning so Pi cannot substitute a
+		// persisted user-mode prompt.
+		if (
+			ZERO_TOOL_PROMPT_REQUIRED_AGENTS.has(options.agent) &&
+			options.systemPrompt.trim().length === 0
+		) {
+			return failBeforeSpawn(
+				"invalid_prompt",
+				`zero-tool Pi subagent "${options.agent}" requires a non-empty system prompt`,
+				true,
+			);
+		}
 
 		// Large prompts (e.g. a ~50K-token historian chunk ≈ 200 KB) overflow
 		// Linux's per-argv-entry limit (MAX_ARG_STRLEN, 128 KiB) and make spawn()
@@ -1486,4 +1509,5 @@ export const __test = {
 	DREAMER_ACTION_AGENTS,
 	KNOWN_PI_SUBAGENT_AGENTS,
 	STRICT_TOOL_ALLOWLIST,
+	ZERO_TOOL_PROMPT_REQUIRED_AGENTS,
 };

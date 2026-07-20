@@ -382,6 +382,42 @@ describe("Pi dreamer wiring", () => {
 		expect(onAdjunctsRefreshNeeded).not.toHaveBeenCalled();
 	});
 
+	test("preserves transient status when a child rejects before producing output", async () => {
+		db = createDb();
+		let capturedClient: CapturedDreamClient | null = null;
+		__test.setStartDreamScheduleTimerFactory(async (registration) => {
+			capturedClient = registration.client as unknown as CapturedDreamClient;
+			return mock(() => {});
+		});
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async () => ({
+						ok: false,
+						reason: "invalid_prompt",
+						transient: true,
+						error: "zero-tool prompt missing",
+						durationMs: 0,
+					})),
+				}) as never,
+		);
+
+		registerPiDreamerProject(
+			dreamerOptions({
+				database: db,
+				projectIdentity: "git:pi-transient-child",
+			}),
+		);
+		const client = requireCapturedClient(capturedClient);
+		const created = (await client.session.create({})) as { id: string };
+		await expect(
+			client.session.prompt({
+				path: { id: created.id },
+				body: { system: "system", parts: [{ text: "run dreamer" }] },
+			}),
+		).rejects.toMatchObject({ transient: true });
+	});
+
 	test("unregister before timer promise resolves invokes timer cleanup when it eventually resolves", async () => {
 		db = createDb();
 		const timerCleanup = mock(() => {});
