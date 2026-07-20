@@ -555,6 +555,78 @@ describe("memory authority protocol", () => {
         }
     });
 
+    test("repairs a partially populated live mirror before replay", async () => {
+        const database = db();
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', 'git:partial', 1, 100)",
+                )
+                .run();
+            database
+                .prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', 'git:partial', 2, 101)",
+                )
+                .run();
+            database
+                .prepare(
+                    "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES ('git:partial', 1, 'ARCHITECTURE', 'hash-1')",
+                )
+                .run();
+        });
+        const calls: boolean[] = [];
+        const module: AuthorityModuleClient = {
+            authorityStatus: async () => ({ authority: null }),
+            authorityPrepare: async () => ({ authority: authority("PREPARING", 1) }),
+            mirrorPull: async (args) => {
+                calls.push(args.live_only === true);
+                if (args.live_only) {
+                    return {
+                        page: {
+                            domain: "memories",
+                            cursor: 0,
+                            next_cursor: 2,
+                            has_more: false,
+                            rows: [1, 2].map((moduleRowId) => ({
+                                feed_seq: 0,
+                                domain: "memories" as const,
+                                op: "insert" as const,
+                                module_row_id: moduleRowId,
+                                full_row_snapshot: {
+                                    project_path: "git:partial",
+                                    category: "ARCHITECTURE",
+                                    normalized_hash: `hash-${moduleRowId}`,
+                                },
+                                content_hash: `hash-${moduleRowId}`,
+                            })),
+                        },
+                    };
+                }
+                return {
+                    page: {
+                        domain: "memories",
+                        cursor: 0,
+                        next_cursor: 0,
+                        has_more: false,
+                        rows: [],
+                    },
+                };
+            },
+        };
+
+        await pullAndApplyMirrorPage({ db: database, module, domain: "memories" });
+
+        expect(calls).toEqual([true, false]);
+        expect(
+            database
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM mirror_live_memory_rows WHERE module_project = 'git:partial'",
+                )
+                .get(),
+        ).toEqual({ count: 2 });
+        database.close();
+    });
+
     test("DRAINING recovery resnapshots schema-57 memory identities before tombstones", async () => {
         const row = (id: number, projectPath: string) => ({
             id,
