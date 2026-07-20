@@ -2404,6 +2404,23 @@ const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 63,
+        description: "Add anchor_block_id to notes (module note mirror writes it)",
+        up(db: Database): void {
+            // The module-side mc_notes schema carries anchor_block_id (the flat block
+            // the note was taken against); the mirror consumer writes it through to
+            // context.db so anchors survive a later drain back to TS authority. The
+            // column was referenced by the mirror before any migration created it,
+            // which broke every mirror apply on upgraded databases.
+            const columns = db.prepare("PRAGMA table_info(notes)").all() as Array<{
+                name: string;
+            }>;
+            if (!columns.some((column) => column.name === "anchor_block_id")) {
+                db.exec("ALTER TABLE notes ADD COLUMN anchor_block_id TEXT");
+            }
+        },
+    },
 ];
 
 /**
