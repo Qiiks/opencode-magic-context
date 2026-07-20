@@ -308,9 +308,13 @@ function createPiDreamerClient(opts: PiDreamerOptions): DreamTimerClient {
 			try {
 				const result = await runPromise;
 				if (!result.ok) {
-					throw new Error(
+					const error = new Error(
 						`Pi dreamer subagent failed (${result.reason}): ${result.error}`,
 					);
+					if (result.transient) {
+						(error as Error & { transient?: boolean }).transient = true;
+					}
+					throw error;
 				}
 				dreamSession.messages = [
 					makeMessage("user", [{ type: "text", text: userMessage }]),

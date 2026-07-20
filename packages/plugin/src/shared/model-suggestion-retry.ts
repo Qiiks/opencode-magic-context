@@ -23,6 +23,15 @@ export type PromptArgs = {
     [key: string]: unknown;
 };
 
+/**
+ * Keep a prompt body independent from SDK/client mutation. Some prompt facades
+ * normalize or consume request bodies while handling a failed attempt; fallback
+ * attempts must start from the original system prompt and request body every time.
+ */
+function copyPromptArgs(args: PromptArgs, body: PromptBody): PromptArgs {
+    return { ...args, body: { ...body } };
+}
+
 export interface PromptAttemptInfo {
     /** Human-readable model label used in logs ("primary" or "provider/model"). */
     label: string;
@@ -280,8 +289,13 @@ async function attemptOnce(
     callContext: string,
     label: string,
 ): Promise<void> {
+    // Keep this snapshot separate from the object passed to the client. A
+    // failed prompt facade may rewrite its request body before rejecting; the
+    // model-suggestion retry still needs the original system prompt.
+    const originalBody = { ...args.body };
+    const attemptArgs = copyPromptArgs(args, originalBody);
     try {
-        await promptWithTimeout(client, args, timeoutMs, signal);
+        await promptWithTimeout(client, attemptArgs, timeoutMs, signal);
         return;
     } catch (error) {
         // If non-retryable (abort, overflow, timeout), bubble up immediately.
@@ -289,7 +303,7 @@ async function attemptOnce(
         if (isNonRetryable(error, signal)) throw error;
 
         const suggestion = parseModelSuggestion(error);
-        if (!suggestion || !args.body.model) {
+        if (!suggestion || !originalBody.model) {
             // No suggestion available — caller's fallback loop will decide
             // whether to try the next chain entry.
             throw error;
@@ -302,16 +316,13 @@ async function attemptOnce(
 
         await promptWithTimeout(
             client,
-            {
-                ...args,
-                body: {
-                    ...args.body,
-                    model: {
-                        providerID: suggestion.providerID,
-                        modelID: suggestion.suggestion,
-                    },
+            copyPromptArgs(args, {
+                ...originalBody,
+                model: {
+                    providerID: suggestion.providerID,
+                    modelID: suggestion.suggestion,
                 },
-            },
+            }),
             timeoutMs,
             signal,
         );
@@ -340,12 +351,17 @@ export async function promptSyncWithModelSuggestionRetry(
     const timeoutMs = options.timeoutMs ?? 300_000;
     const callContext = options.callContext ?? "subagent";
     const fallbacks = options.fallbackModels ?? [];
+    // Snapshot the body before the first client call. The Pi facade and the
+    // OpenCode SDK both receive this same shape, and either may mutate it while
+    // handling a failed request. Fallbacks must never inherit that mutation.
+    const baseBody = { ...args.body };
+    const baseArgs = copyPromptArgs(args, baseBody);
 
     // Attempt 0 = whatever the agent or explicit body.model resolves to.
     // Subsequent attempts override body.model with each fallback in order.
     const explicitPrimaryLabel =
-        args.body.model?.providerID && args.body.model.modelID
-            ? `${args.body.model.providerID}/${args.body.model.modelID}`
+        baseBody.model?.providerID && baseBody.model.modelID
+            ? `${baseBody.model.providerID}/${baseBody.model.modelID}`
             : "primary";
 
     let lastError: unknown = null;
@@ -353,7 +369,7 @@ export async function promptSyncWithModelSuggestionRetry(
     try {
         await attemptOnce(
             client,
-            args,
+            baseArgs,
             timeoutMs,
             options.signal,
             callContext,
@@ -385,10 +401,10 @@ export async function promptSyncWithModelSuggestionRetry(
         }
 
         const label = `${parsed.providerID}/${parsed.modelID}`;
-        const attemptArgs: PromptArgs = {
-            ...args,
-            body: { ...args.body, model: parsed },
-        };
+        const attemptArgs = copyPromptArgs(baseArgs, {
+            ...baseBody,
+            model: parsed,
+        });
 
         try {
             await attemptOnce(client, attemptArgs, timeoutMs, options.signal, callContext, label);
@@ -453,10 +469,15 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
     const timeoutMs = options.timeoutMs ?? 300_000;
     const callContext = options.callContext ?? "subagent";
     const fallbacks = options.fallbackModels ?? [];
+    // Snapshot the body before the first client call. The Pi facade and the
+    // OpenCode SDK both receive this same shape, and either may mutate it while
+    // handling a failed request. Fallbacks must never inherit that mutation.
+    const baseBody = { ...args.body };
+    const baseArgs = copyPromptArgs(args, baseBody);
 
     const explicitPrimaryLabel =
-        args.body.model?.providerID && args.body.model.modelID
-            ? `${args.body.model.providerID}/${args.body.model.modelID}`
+        baseBody.model?.providerID && baseBody.model.modelID
+            ? `${baseBody.model.providerID}/${baseBody.model.modelID}`
             : "primary";
     const totalAttempts = fallbacks.length + 1;
 
@@ -466,7 +487,7 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
     try {
         return await attemptAndValidate(
             client,
-            args,
+            baseArgs,
             timeoutMs,
             options.signal,
             callContext,
@@ -475,7 +496,7 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
                 attemptIndex: 0,
                 isFallback: false,
                 totalAttempts,
-                model: args.body.model,
+                model: baseBody.model,
             },
             options,
         );
@@ -501,10 +522,10 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
         }
 
         const label = `${parsed.providerID}/${parsed.modelID}`;
-        const attemptArgs: PromptArgs = {
-            ...args,
-            body: { ...args.body, model: parsed },
-        };
+        const attemptArgs = copyPromptArgs(baseArgs, {
+            ...baseBody,
+            model: parsed,
+        });
         const attempt: PromptAttemptInfo = {
             label,
             attemptIndex: i + 1,

@@ -6,7 +6,11 @@ import {
 } from "./model-suggestion-retry";
 
 type PromptCall = {
-    body: { model?: { providerID: string; modelID: string } };
+    body: {
+        model?: { providerID: string; modelID: string };
+        system?: string;
+        [key: string]: unknown;
+    };
     signal?: AbortSignal;
 };
 
@@ -336,6 +340,42 @@ describe("promptSyncWithValidatedOutputRetry", () => {
         expect(result.validated).toBe("primary-output");
         expect(prompt).toHaveBeenCalledTimes(1);
         expect(messages).toHaveBeenCalledTimes(1);
+    });
+
+    test("preserves body.system when a failed Pi-shaped attempt mutates its body", async () => {
+        const prompt = mock(async (args: PromptCall) => {
+            if (prompt.mock.calls.length === 1) {
+                // Reproduce a facade/SDK that consumes the request body before
+                // rejecting the primary model. The fallback must not inherit
+                // that mutation and spawn without its task prompt.
+                delete args.body.system;
+                throw new Error("primary failed");
+            }
+            return {};
+        });
+        const client = createClient(prompt);
+        const systemPrompt = "CLASSIFY_SYSTEM_PROMPT";
+
+        await promptSyncWithValidatedOutputRetry(
+            client,
+            {
+                path: { id: "ses-classify" },
+                body: {
+                    agent: "dreamer-classifier",
+                    system: systemPrompt,
+                    parts: [{ type: "text", text: "classify" }],
+                },
+            },
+            {
+                fallbackModels: ["anthropic/claude-sonnet-4-6"],
+                fetchOutput: async () => "fallback-output",
+                validateOutput: (output: string) => output,
+            },
+        );
+
+        expect(prompt).toHaveBeenCalledTimes(2);
+        expect((prompt.mock.calls[0]?.[0] as PromptCall).body.system).toBeUndefined();
+        expect((prompt.mock.calls[1]?.[0] as PromptCall).body.system).toBe(systemPrompt);
     });
 
     test("empty first model tries the next fallback", async () => {
