@@ -739,7 +739,7 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
             DROP TABLE mirror_live_staging;
             DROP TABLE mirror_resnapshot_state;
             DROP TABLE mirror_live_memory_rows;
-            DELETE FROM schema_migrations WHERE version IN (58, 59, 60);
+            DELETE FROM schema_migrations WHERE version IN (58, 59, 60, 61);
         `);
         withPrivilegedWriter(db, () => {
             db.prepare(
@@ -757,7 +757,7 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
             "UPDATE mirror_resnapshot_state SET status = 'resnapshotting' WHERE domain = 'memories'",
         ).run();
         db.prepare(
-            "INSERT INTO mirror_live_staging VALUES ('abandoned', '/stale', 1, 'CONSTRAINTS', 'stale')",
+            "INSERT INTO mirror_live_staging VALUES ('abandoned', '/stale', 1, 'CONSTRAINTS', 'stale', NULL)",
         ).run();
 
         const calls: Array<{ liveOnly?: boolean; cursor: number }> = [];

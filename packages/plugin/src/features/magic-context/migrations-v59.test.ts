@@ -35,11 +35,11 @@ describe("migration v59: live memory resnapshot staging", () => {
             initializeDatabase(db);
             runMigrations(db);
             db.prepare(
-                "INSERT INTO mirror_live_memory_rows VALUES ('project', 1, 'CONSTRAINTS', 'hash')",
+                "INSERT INTO mirror_live_memory_rows VALUES ('project', 1, 'CONSTRAINTS', 'hash', NULL)",
             ).run();
             db.exec(`
                 DROP TABLE mirror_live_staging;
-                DELETE FROM schema_migrations WHERE version IN (59, 60);
+                DELETE FROM schema_migrations WHERE version IN (59, 60, 61);
             `);
 
             runMigrations(db);

@@ -39,11 +39,11 @@ describe("migration v60: live memory resnapshot ownership", () => {
                 "UPDATE mirror_resnapshot_state SET status = 'resnapshotting' WHERE domain = 'memories'",
             ).run();
             db.prepare(
-                "INSERT INTO mirror_live_staging VALUES ('abandoned', 'project', 1, 'CONSTRAINTS', 'hash')",
+                "INSERT INTO mirror_live_staging VALUES ('abandoned', 'project', 1, 'CONSTRAINTS', 'hash', NULL)",
             ).run();
             db.exec(`
                 ALTER TABLE mirror_resnapshot_state DROP COLUMN generation;
-                DELETE FROM schema_migrations WHERE version = 60;
+                DELETE FROM schema_migrations WHERE version IN (60, 61);
             `);
 
             runMigrations(db);
@@ -68,7 +68,7 @@ test("v60 heals a database whose v58 ran before the resnapshot table existed", (
         initializeDatabase(db);
         runMigrations(db);
         db.exec("DROP TABLE mirror_resnapshot_state");
-        db.prepare("DELETE FROM schema_migrations WHERE version = 60").run();
+        db.prepare("DELETE FROM schema_migrations WHERE version IN (60, 61)").run();
         runMigrations(db);
         const row = db
             .prepare(

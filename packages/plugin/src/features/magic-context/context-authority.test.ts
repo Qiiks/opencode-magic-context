@@ -18,7 +18,7 @@ import {
     reconcileAuthorityProject,
     registerModuleNoteEvaluationBridge,
 } from "./context-authority";
-import { getMemoriesByProjects, insertMemory } from "./memory/storage-memory";
+import { getMemoriesByProjects, insertMemory, isMemoryRow } from "./memory/storage-memory";
 import { getMemoryVerifications } from "./memory/storage-memory-verifications";
 import { runMigrations } from "./migrations";
 import { resolveMemoriesByIdsForSearch, unifiedSearch } from "./search";
@@ -91,28 +91,190 @@ describe("memory authority protocol", () => {
             cursor: 0,
             next_cursor: 1,
             has_more: false,
-            rows: [{
-                feed_seq: 1,
-                domain: "memories",
-                op: "update",
-                module_row_id: 41,
-                content_hash: "module-hash",
-                full_row_snapshot: {
-                    id: 41,
-                    project_path: "/repo",
-                    category: "CONSTRAINTS",
-                    content: "mapped memory",
-                    normalized_hash: "module-hash",
-                    status: "active",
-                    mapping: ["src/lib.rs", "src/lib.rs"],
-                    context_store_uuid: "store",
-                    context_row_id: contextMemory.id,
+            rows: [
+                {
+                    feed_seq: 1,
+                    domain: "memories",
+                    op: "update",
+                    module_row_id: 41,
+                    content_hash: "module-hash",
+                    full_row_snapshot: {
+                        id: 41,
+                        project_path: "/repo",
+                        category: "CONSTRAINTS",
+                        content: "mapped memory",
+                        normalized_hash: "module-hash",
+                        status: "active",
+                        mapping: ["src/lib.rs", "src/lib.rs"],
+                        context_store_uuid: "store",
+                        context_row_id: contextMemory.id,
+                    },
                 },
-            }],
+            ],
         };
         applyMirrorPage({ db: database, page });
-        expect(getMemoryVerifications(database, [contextMemory.id]).get(contextMemory.id)?.files).toEqual(["src/lib.rs"]);
+        expect(
+            getMemoryVerifications(database, [contextMemory.id]).get(contextMemory.id)?.files,
+        ).toEqual(["src/lib.rs"]);
     });
+    test("preserves source metadata across the historical 9397 mapping sequence", () => {
+        const database = db();
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(
+                        id, project_path, category, content, normalized_hash, importance, scope, shareable,
+                        source_type, seen_count, retrieval_count, first_seen_at, created_at, updated_at,
+                        last_seen_at, status, verification_status
+                     ) VALUES (9397, '/repo', 'CONSTRAINTS', 'rig memory', 'rig-hash', 66, 'project', 0,
+                               'agent', 1, 0, 1, 1, 1, 1, 'active', 'unverified')`,
+                )
+                .run();
+        });
+        const fullSnapshot = {
+            id: 9397,
+            project_path: "/repo",
+            category: "CONSTRAINTS",
+            content: "rig memory",
+            normalized_hash: "rig-hash",
+            importance: 66,
+            scope: "project",
+            shareable: 0,
+            source_session_id: null,
+            source_type: "agent",
+            seen_count: 1,
+            retrieval_count: 0,
+            first_seen_at: 1,
+            created_at: 1,
+            updated_at: 1,
+            last_seen_at: 1,
+            last_retrieved_at: null,
+            status: "active",
+            expires_at: null,
+            verification_status: "unverified",
+            verified_at: null,
+            classified_at: null,
+            superseded_by_memory_id: null,
+            merged_from: null,
+            metadata_json: null,
+            context_store_uuid: "store",
+            context_row_id: 9397,
+        };
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1321,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1321,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 9397,
+                        full_row_snapshot: fullSnapshot,
+                        content_hash: "rig-hash",
+                    },
+                ],
+            },
+        });
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 1321,
+                next_cursor: 1322,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1322,
+                        domain: "memories",
+                        op: "update",
+                        module_row_id: 9397,
+                        full_row_snapshot: {
+                            id: 9397,
+                            project_path: "/repo",
+                            category: "CONSTRAINTS",
+                            content: "rig memory",
+                            normalized_hash: "rig-hash",
+                            status: "active",
+                            mapping: ["src/lib.rs"],
+                        },
+                        content_hash: "rig-hash",
+                    },
+                ],
+            },
+        });
+        const memories = getMemoriesByProjects(database, ["/repo"]);
+        expect(memories).toHaveLength(1);
+        expect(memories[0]?.sourceType).toBe("agent");
+        expect(memories[0]?.importance).toBe(66);
+        expect(isMemoryRow(memories[0])).toBe(true);
+    });
+
+    test("heals pre-clobbered source metadata from the retained live snapshot", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        installAuthorityManagedMarker(database, "/repo", storeUuid);
+        const snapshot = {
+            id: 9397,
+            project_path: "/repo",
+            category: "CONSTRAINTS",
+            content: "rig memory",
+            normalized_hash: "rig-hash",
+            importance: 66,
+            scope: "project",
+            shareable: 0,
+            source_session_id: null,
+            source_type: "agent",
+            seen_count: 1,
+            retrieval_count: 0,
+            first_seen_at: 1,
+            created_at: 1,
+            updated_at: 1,
+            last_seen_at: 1,
+            last_retrieved_at: null,
+            status: "active",
+            expires_at: null,
+            verification_status: "unverified",
+            verified_at: null,
+            classified_at: null,
+            superseded_by_memory_id: null,
+            merged_from: null,
+            metadata_json: null,
+            context_store_uuid: storeUuid,
+            context_row_id: 9397,
+        };
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(
+                        id, project_path, category, content, normalized_hash, importance, source_type,
+                        first_seen_at, created_at, updated_at, last_seen_at
+                     ) VALUES (9397, '/repo', 'CONSTRAINTS', 'rig memory', 'rig-hash', NULL, NULL, 1, 1, 1, 1)`,
+                )
+                .run();
+            database
+                .prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', '/repo', 9397, 9397)",
+                )
+                .run();
+            database
+                .prepare(
+                    "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash, full_row_snapshot) VALUES ('/repo', 9397, 'CONSTRAINTS', 'rig-hash', ?)",
+                )
+                .run(JSON.stringify(snapshot));
+        });
+        applyMirrorPage({
+            db: database,
+            page: { domain: "memories", cursor: 0, next_cursor: 0, has_more: false, rows: [] },
+        });
+        expect(
+            database.prepare("SELECT source_type, importance FROM memories WHERE id = 9397").get(),
+        ).toEqual({ source_type: "agent", importance: 66 });
+    });
+
     test("bounds authority seed frames below the management frame cap", async () => {
         const database = db();
         const seedCalls = { bytes: [] as number[] };
@@ -513,7 +675,7 @@ describe("memory authority protocol", () => {
                 DROP TABLE mirror_live_staging;
                 DROP TABLE mirror_resnapshot_state;
                 DROP TABLE mirror_live_memory_rows;
-                DELETE FROM schema_migrations WHERE version IN (58, 59, 60);
+                DELETE FROM schema_migrations WHERE version IN (58, 59, 60, 61);
             `);
             withPrivilegedWriter(database, () => {
                 database
@@ -679,7 +841,7 @@ describe("memory authority protocol", () => {
                 DROP TABLE mirror_live_staging;
                 DROP TABLE mirror_resnapshot_state;
                 DROP TABLE mirror_live_memory_rows;
-                DELETE FROM schema_migrations WHERE version IN (58, 59, 60);
+                DELETE FROM schema_migrations WHERE version IN (58, 59, 60, 61);
             `);
             withPrivilegedWriter(database, () => {
                 database
@@ -707,7 +869,7 @@ describe("memory authority protocol", () => {
                     .run();
                 database
                     .prepare(
-                        "INSERT INTO mirror_live_staging VALUES ('abandoned', '/stale', 1, 'CONSTRAINTS', 'stale')",
+                        "INSERT INTO mirror_live_staging VALUES ('abandoned', '/stale', 1, 'CONSTRAINTS', 'stale', NULL)",
                     )
                     .run();
             }
@@ -811,12 +973,12 @@ describe("memory authority protocol", () => {
             .run();
         database
             .prepare(
-                "INSERT INTO mirror_live_memory_rows VALUES ('old', 9, 'CONSTRAINTS', 'old-hash')",
+                "INSERT INTO mirror_live_memory_rows VALUES ('old', 9, 'CONSTRAINTS', 'old-hash', NULL)",
             )
             .run();
         database
             .prepare(
-                "INSERT INTO mirror_live_staging VALUES ('abandoned', 'stale', 8, 'CONSTRAINTS', 'stale-hash')",
+                "INSERT INTO mirror_live_staging VALUES ('abandoned', 'stale', 8, 'CONSTRAINTS', 'stale-hash', NULL)",
             )
             .run();
         let calls = 0;

@@ -2368,6 +2368,20 @@ const MIGRATIONS: Migration[] = [
             ensureColumn(db, "mirror_resnapshot_state", "generation", "TEXT");
         },
     },
+    {
+        version: 61,
+        description: "retain complete memory snapshots for mirror healing",
+        up(db: Database): void {
+            // Existing live identities only retained category/hash, so force one bounded live
+            // resnapshot after this migration. Its complete snapshots heal rows clobbered by
+            // historical mapping feed records before normal incremental replay resumes.
+            ensureColumn(db, "mirror_live_memory_rows", "full_row_snapshot", "TEXT");
+            ensureColumn(db, "mirror_live_staging", "full_row_snapshot", "TEXT");
+            db.prepare(
+                "UPDATE mirror_resnapshot_state SET status = 'pending_check', generation = NULL, updated_at = ? WHERE domain = 'memories' AND status = 'complete'",
+            ).run(Date.now());
+        },
+    },
 ];
 
 /**

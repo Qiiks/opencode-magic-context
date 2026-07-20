@@ -2738,7 +2738,41 @@ pub struct StoredMemoryFull {
     pub superseded_by_memory_id: Option<i64>,
     pub merged_from: Option<String>,
     pub metadata_json: Option<String>,
+    pub context_store_uuid: Option<String>,
+    pub context_row_id: Option<i64>,
 }
+
+/// Every column that a memories changefeed snapshot must contain. Keep this list aligned with
+/// `mc_memories`; the invariant test below queries the schema and checks every emitted snapshot.
+pub const MEMORY_FEED_COLUMNS: &[&str] = &[
+    "id",
+    "project_path",
+    "category",
+    "content",
+    "normalized_hash",
+    "importance",
+    "scope",
+    "shareable",
+    "source_session_id",
+    "source_type",
+    "seen_count",
+    "retrieval_count",
+    "first_seen_at",
+    "created_at",
+    "updated_at",
+    "last_seen_at",
+    "last_retrieved_at",
+    "status",
+    "expires_at",
+    "verification_status",
+    "verified_at",
+    "classified_at",
+    "superseded_by_memory_id",
+    "merged_from",
+    "metadata_json",
+    "context_store_uuid",
+    "context_row_id",
+];
 
 /// Inputs for an additive ctx_memory write. Duplicate detection follows the plugin's
 /// normalized-content hash (`lowercase → collapse whitespace → MD5`): a matching
@@ -5561,7 +5595,17 @@ impl McStore {
                 if memory.normalized_hash != update.content_hash_at_prompt { rejected.push(MappingRejected { memory_id: update.memory_id, reason: "stale".into() }); continue; }
                 let files = serde_json::to_string(&update.mapped_files).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                 tx.execute("INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(memory_id) DO UPDATE SET project_path=excluded.project_path, mapped_files_json=excluded.mapped_files_json, updated_at=excluded.updated_at", params![update.memory_id, project, files, now_ms])?;
-                tx.execute("INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash) VALUES ('memories', 'update', ?1, json_object('id', ?1, 'project_path', ?3, 'category', ?5, 'content', ?6, 'normalized_hash', ?4, 'status', ?7, 'mapping', json(?2)), ?4)", params![update.memory_id, files, project, update.content_hash_at_prompt, memory.category, memory.content, memory.status])?;
+                // Mapping is a feed-visible side effect, so it must carry the same complete
+                // row shape as the DML trigger. The mapping key is an overlay, not a replacement.
+                let snapshot = memory_feed_snapshot(&memory, update.mapped_files.as_deref());
+                tx.execute(
+                    "INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash) VALUES ('memories', 'update', ?1, ?2, ?3)",
+                    params![
+                        update.memory_id,
+                        serde_json::to_string(&snapshot).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                        update.content_hash_at_prompt,
+                    ],
+                )?;
                 accepted.push(update.memory_id);
             }
             Ok(MappingApplyResult { accepted, rejected })
@@ -7048,7 +7092,8 @@ impl McStore {
                     shareable, source_session_id, source_type, seen_count, retrieval_count,
                     first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
                     status, expires_at, verification_status, verified_at, classified_at,
-                    superseded_by_memory_id, merged_from, metadata_json
+                    superseded_by_memory_id, merged_from, metadata_json,
+                    context_store_uuid, context_row_id
                FROM mc_memories
               WHERE id IN ({placeholders})
                 AND ({visibility})"
@@ -11244,7 +11289,8 @@ const MEMORY_FULL_SELECT_BY_ID: &str =
             shareable, source_session_id, source_type, seen_count, retrieval_count,
             first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
             status, expires_at, verification_status, verified_at, classified_at,
-            superseded_by_memory_id, merged_from, metadata_json
+            superseded_by_memory_id, merged_from, metadata_json,
+            context_store_uuid, context_row_id
        FROM mc_memories WHERE id = ?1";
 
 fn stored_memory_full_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemoryFull> {
@@ -11278,6 +11324,8 @@ fn stored_memory_full_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Stored
         superseded_by_memory_id: r.get(22)?,
         merged_from: r.get(23)?,
         metadata_json: r.get(24)?,
+        context_store_uuid: r.get(25)?,
+        context_row_id: r.get(26)?,
     })
 }
 
@@ -11291,6 +11339,39 @@ fn load_memory_full_tx(
         stored_memory_full_from_row,
     )
     .optional()
+}
+
+fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Option<&[String]>) -> Value {
+    serde_json::json!({
+        "id": memory.id,
+        "project_path": memory.project_path,
+        "category": memory.category,
+        "content": memory.content,
+        "normalized_hash": memory.normalized_hash,
+        "importance": memory.importance,
+        "scope": memory.scope,
+        "shareable": memory.shareable,
+        "source_session_id": memory.source_session_id,
+        "source_type": memory.source_type,
+        "seen_count": memory.seen_count,
+        "retrieval_count": memory.retrieval_count,
+        "first_seen_at": memory.first_seen_at,
+        "created_at": memory.created_at,
+        "updated_at": memory.updated_at,
+        "last_seen_at": memory.last_seen_at,
+        "last_retrieved_at": memory.last_retrieved_at,
+        "status": memory.status,
+        "expires_at": memory.expires_at,
+        "verification_status": memory.verification_status,
+        "verified_at": memory.verified_at,
+        "classified_at": memory.classified_at,
+        "superseded_by_memory_id": memory.superseded_by_memory_id,
+        "merged_from": memory.merged_from,
+        "metadata_json": memory.metadata_json,
+        "context_store_uuid": memory.context_store_uuid,
+        "context_row_id": memory.context_row_id,
+        "mapping": mapping,
+    })
 }
 
 struct MemoryMutationAppend<'a> {
@@ -11540,6 +11621,46 @@ fn wrapup_replaced_failure_summary(summary: &str, failed_created_at: i64) -> Str
 
 fn capped_trace_error(error: &str) -> String {
     error.chars().take(2000).collect()
+}
+
+#[cfg(test)]
+fn assert_memory_feed_snapshots_complete(store: &McStore) {
+    let (columns, snapshots) = store
+        .inner
+        .with_conn(|conn| {
+            let mut columns_statement = conn.prepare("PRAGMA table_info(mc_memories)")?;
+            let columns = columns_statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut snapshots_statement = conn.prepare(
+                "SELECT full_row_snapshot FROM mc_changefeed WHERE domain = 'memories' ORDER BY feed_seq",
+            )?;
+            let snapshots = snapshots_statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((columns, snapshots))
+        })
+        .unwrap();
+    assert_eq!(
+        columns,
+        MEMORY_FEED_COLUMNS
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<Vec<_>>(),
+        "the shared feed-column list must track the mc_memories schema"
+    );
+    // This invariant intentionally checks every operation's emitted row rather than listing
+    // operation-specific keys, so a new mc_memories column cannot silently disappear from a feed.
+    for serialized in snapshots {
+        let snapshot: Value = serde_json::from_str(&serialized).unwrap();
+        let object = snapshot.as_object().unwrap();
+        for column in MEMORY_FEED_COLUMNS {
+            assert!(
+                object.contains_key(*column),
+                "memory feed snapshot omitted column {column}: {serialized}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -16709,6 +16830,22 @@ mod shadow_tests {
             .seed_memory(3, "git:other", "CONSTRAINTS", "three", 1)
             .unwrap();
         let hash = |id| store.get_memory_full(id).unwrap().unwrap().normalized_hash;
+        let classified = store
+            .set_memory_classification(
+                "context",
+                "git:applies",
+                authority.generation,
+                &[ClassificationUpdate {
+                    memory_id: 1,
+                    content_hash_at_prompt: hash(1),
+                    importance: Some(88),
+                    scope: Some("project".into()),
+                    shareable: Some(false),
+                }],
+                0,
+            )
+            .unwrap();
+        assert_eq!(classified.accepted, vec![1]);
         let result = store
             .set_memory_verification(
                 "context",
@@ -16808,5 +16945,6 @@ mod shadow_tests {
             .rows
             .iter()
             .any(|row| row.full_row_snapshot.get("mapping").is_some()));
+        assert_memory_feed_snapshots_complete(&store);
     }
 }

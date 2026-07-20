@@ -788,6 +788,46 @@ function rowNullableString(row: Record<string, unknown>, key: string): string | 
     return typeof value === "string" ? value : null;
 }
 
+const MEMORY_SNAPSHOT_COLUMNS = [
+    "id",
+    "project_path",
+    "category",
+    "content",
+    "normalized_hash",
+    "importance",
+    "scope",
+    "shareable",
+    "source_session_id",
+    "source_type",
+    "seen_count",
+    "retrieval_count",
+    "first_seen_at",
+    "created_at",
+    "updated_at",
+    "last_seen_at",
+    "last_retrieved_at",
+    "status",
+    "expires_at",
+    "verification_status",
+    "verified_at",
+    "classified_at",
+    "superseded_by_memory_id",
+    "merged_from",
+    "metadata_json",
+    "context_store_uuid",
+    "context_row_id",
+] as const;
+
+function hasSnapshotField(row: Record<string, unknown>, key: string): boolean {
+    // Own-property checks distinguish a missing snapshot field from an explicit null clear.
+    // biome-ignore lint/suspicious/noPrototypeBuiltins: snapshot objects may have an untrusted prototype
+    return Object.prototype.hasOwnProperty.call(row, key);
+}
+
+function isCompleteMemorySnapshot(row: Record<string, unknown>): boolean {
+    return MEMORY_SNAPSHOT_COLUMNS.every((column) => hasSnapshotField(row, column));
+}
+
 type MirrorResnapshotStatus = "pending_check" | "resnapshotting" | "complete";
 
 interface MirrorResnapshotState {
@@ -874,8 +914,8 @@ function stageLiveMemorySnapshotPage(
 
     const insert = db.prepare(
         `INSERT INTO mirror_live_staging(
-            generation, module_project, module_row_id, category, normalized_hash
-         ) VALUES (?, ?, ?, ?, ?)`,
+            generation, module_project, module_row_id, category, normalized_hash, full_row_snapshot
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
     );
     for (const feed of rows) {
         const row = feed.full_row_snapshot;
@@ -890,6 +930,7 @@ function stageLiveMemorySnapshotPage(
             feed.module_row_id,
             rowString(row, "category", "CONSTRAINTS"),
             normalizedHash,
+            JSON.stringify(row),
         );
     }
     return true;
@@ -910,9 +951,9 @@ function installStagedLiveMemorySnapshot(db: Database, generation: string): bool
     db.prepare("DELETE FROM mirror_live_memory_rows").run();
     db.prepare(
         `INSERT INTO mirror_live_memory_rows(
-            module_project, module_row_id, category, normalized_hash
+            module_project, module_row_id, category, normalized_hash, full_row_snapshot
          )
-         SELECT module_project, module_row_id, category, normalized_hash
+         SELECT module_project, module_row_id, category, normalized_hash, full_row_snapshot
            FROM mirror_live_staging
           WHERE generation = ?`,
     ).run(generation);
@@ -1071,22 +1112,85 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
         db.prepare("DELETE FROM memories WHERE id = ?").run(mapped.context_row_id);
         return;
     }
+
+    const storedLive = db
+        .prepare(
+            "SELECT full_row_snapshot FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?",
+        )
+        .get(moduleProject, feed.module_row_id) as
+        | { full_row_snapshot?: string | null }
+        | undefined;
+    const snapshotJson =
+        !isCompleteMemorySnapshot(row) && storedLive?.full_row_snapshot
+            ? storedLive.full_row_snapshot
+            : JSON.stringify(row);
     db.prepare(
-        `INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO mirror_live_memory_rows(
+             module_project, module_row_id, category, normalized_hash, full_row_snapshot
+         ) VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(module_project, module_row_id) DO UPDATE SET
              category = excluded.category,
-             normalized_hash = excluded.normalized_hash`,
+             normalized_hash = excluded.normalized_hash,
+             full_row_snapshot = excluded.full_row_snapshot`,
     ).run(
         moduleProject,
         feed.module_row_id,
         rowString(row, "category", "CONSTRAINTS"),
         rowString(row, "normalized_hash"),
+        snapshotJson,
     );
     const contextId = contextMemoryId(db, feed.domain, moduleProject, row, feed.module_row_id);
-    const previous = db
-        .prepare("SELECT normalized_hash FROM memories WHERE id = ?")
-        .get(contextId) as { normalized_hash?: string } | undefined;
+    const existing = db
+        .prepare(
+            `SELECT project_path, category, content, normalized_hash, importance, scope, shareable,
+                    source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
+                    created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
+                    verification_status, verified_at, classified_at, superseded_by_memory_id,
+                    merged_from, metadata_json
+               FROM memories WHERE id = ?`,
+        )
+        .get(contextId) as
+        | {
+              project_path?: string;
+              category?: string;
+              content?: string;
+              normalized_hash?: string;
+              importance?: number | null;
+              scope?: string;
+              shareable?: number;
+              source_session_id?: string | null;
+              source_type?: string | null;
+              seen_count?: number;
+              retrieval_count?: number;
+              first_seen_at?: number;
+              created_at?: number;
+              updated_at?: number;
+              last_seen_at?: number;
+              last_retrieved_at?: number | null;
+              status?: string;
+              expires_at?: number | null;
+              verification_status?: string;
+              verified_at?: number | null;
+              classified_at?: number | null;
+              superseded_by_memory_id?: number | null;
+              merged_from?: string | null;
+              metadata_json?: string | null;
+          }
+        | undefined;
+    const has = (key: string): boolean => hasSnapshotField(row, key);
+    const nullableNumber = (key: string, previous: number | null | undefined): number | null =>
+        has(key)
+            ? typeof row[key] === "number" && Number.isFinite(row[key])
+                ? row[key]
+                : null
+            : (previous ?? null);
+    const nullableString = (key: string, previous: string | null | undefined): string | null =>
+        has(key) ? rowNullableString(row, key) : (previous ?? null);
+    const hasSuperseded = has("superseded_by_memory_id");
+    const previousHash = existing?.normalized_hash;
+
+    // A feed update is allowed to be a sparse legacy snapshot. An absent property means
+    // "unchanged"; only a property explicitly present as null is a genuine clear.
     db.prepare(
         `UPDATE memories SET project_path = ?, category = ?, content = ?, normalized_hash = ?,
          importance = ?, scope = ?, shareable = ?, source_session_id = ?, source_type = ?,
@@ -1095,33 +1199,47 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
          verification_status = ?, verified_at = ?, classified_at = ?, superseded_by_memory_id = ?,
          merged_from = ?, metadata_json = ? WHERE id = ?`,
     ).run(
-        moduleProject,
-        rowString(row, "category", "CONSTRAINTS"),
-        rowString(row, "content"),
-        rowString(row, "normalized_hash"),
-        row.importance ?? null,
-        rowString(row, "scope", "project"),
-        rowNumber(row, "shareable"),
-        rowNullableString(row, "source_session_id"),
-        rowNullableString(row, "source_type"),
-        rowNumber(row, "seen_count", 1),
-        rowNumber(row, "retrieval_count"),
-        rowNumber(row, "first_seen_at"),
-        rowNumber(row, "created_at"),
-        rowNumber(row, "updated_at"),
-        rowNumber(row, "last_seen_at"),
-        typeof row.last_retrieved_at === "number" ? row.last_retrieved_at : null,
-        rowString(row, "status", "active"),
-        typeof row.expires_at === "number" ? row.expires_at : null,
-        rowString(row, "verification_status", "unverified"),
-        typeof row.verified_at === "number" ? row.verified_at : null,
-        typeof row.classified_at === "number" ? row.classified_at : null,
-        null,
-        rowNullableString(row, "merged_from"),
-        rowNullableString(row, "metadata_json"),
+        has("project_path")
+            ? rowString(row, "project_path")
+            : (existing?.project_path ?? moduleProject),
+        has("category")
+            ? rowString(row, "category", "CONSTRAINTS")
+            : (existing?.category ?? "CONSTRAINTS"),
+        has("content") ? rowString(row, "content") : (existing?.content ?? ""),
+        has("normalized_hash")
+            ? rowString(row, "normalized_hash")
+            : (existing?.normalized_hash ?? ""),
+        has("importance")
+            ? typeof row.importance === "number" && Number.isFinite(row.importance)
+                ? row.importance
+                : null
+            : (existing?.importance ?? null),
+        has("scope") ? rowString(row, "scope", "project") : (existing?.scope ?? "project"),
+        has("shareable") ? rowNumber(row, "shareable") : (existing?.shareable ?? 0),
+        nullableString("source_session_id", existing?.source_session_id),
+        nullableString("source_type", existing?.source_type),
+        has("seen_count") ? rowNumber(row, "seen_count", 1) : (existing?.seen_count ?? 1),
+        has("retrieval_count")
+            ? rowNumber(row, "retrieval_count")
+            : (existing?.retrieval_count ?? 0),
+        has("first_seen_at") ? rowNumber(row, "first_seen_at") : (existing?.first_seen_at ?? 0),
+        has("created_at") ? rowNumber(row, "created_at") : (existing?.created_at ?? 0),
+        has("updated_at") ? rowNumber(row, "updated_at") : (existing?.updated_at ?? 0),
+        has("last_seen_at") ? rowNumber(row, "last_seen_at") : (existing?.last_seen_at ?? 0),
+        nullableNumber("last_retrieved_at", existing?.last_retrieved_at),
+        has("status") ? rowString(row, "status", "active") : (existing?.status ?? "active"),
+        nullableNumber("expires_at", existing?.expires_at),
+        has("verification_status")
+            ? rowString(row, "verification_status", "unverified")
+            : (existing?.verification_status ?? "unverified"),
+        nullableNumber("verified_at", existing?.verified_at),
+        nullableNumber("classified_at", existing?.classified_at),
+        hasSuperseded ? null : (existing?.superseded_by_memory_id ?? null),
+        nullableString("merged_from", existing?.merged_from),
+        nullableString("metadata_json", existing?.metadata_json),
         contextId,
     );
-    if (typeof row.superseded_by_memory_id === "number") {
+    if (hasSuperseded && typeof row.superseded_by_memory_id === "number") {
         const translated = mirrorIdentity(
             db,
             "memories",
@@ -1141,20 +1259,25 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
                 "INSERT INTO mirror_pending_references(domain, module_project, module_row_id, target_module_row_id) VALUES ('memories', ?, ?, ?) ON CONFLICT(domain, module_project, module_row_id) DO UPDATE SET target_module_row_id = excluded.target_module_row_id",
             ).run(moduleProject, feed.module_row_id, row.superseded_by_memory_id);
         }
-    } else {
+    } else if (hasSuperseded) {
         db.prepare(
             "DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
         ).run(moduleProject, feed.module_row_id);
     }
-    if (previous?.normalized_hash !== feed.content_hash) {
+    const appliedHash = has("normalized_hash") ? rowString(row, "normalized_hash") : previousHash;
+    if (previousHash !== appliedHash && appliedHash !== undefined) {
         db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(contextId);
     }
     // Store mapping changes in the regular memory feed so maps owned by this module are preserved
     // when data is synchronized back into the database. Rows without a `mapping` property are
     // ordinary memory updates and must not create mapping verification records.
-    if (Object.prototype.hasOwnProperty.call(row, "mapping")) {
+    if (has("mapping")) {
         const files = Array.isArray(row.mapping)
-            ? [...new Set(row.mapping.filter((file): file is string => typeof file === "string").sort())]
+            ? [
+                  ...new Set(
+                      row.mapping.filter((file): file is string => typeof file === "string").sort(),
+                  ),
+              ]
             : [""];
         db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(contextId);
         const insert = db.prepare(
@@ -1163,6 +1286,59 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
         for (const file of files.length > 0 ? files : [""]) {
             insert.run(contextId, file, rowNumber(row, "updated_at", Date.now()));
         }
+    }
+}
+
+function repairNullClobberedMemoryRows(db: Database): void {
+    const candidates = db
+        .prepare(
+            `SELECT memory.id, live.full_row_snapshot
+               FROM memories memory
+               JOIN mirror_identity identity
+                 ON identity.domain = 'memories'
+                AND identity.context_row_id = memory.id
+               JOIN mirror_live_memory_rows live
+                 ON live.module_project = identity.module_project
+                AND live.module_row_id = identity.module_row_id
+               JOIN authority_managed managed
+                 ON managed.project_path = memory.project_path
+                  OR managed.project_path = identity.module_project
+              WHERE (memory.source_type IS NULL OR memory.importance IS NULL)
+                AND live.full_row_snapshot IS NOT NULL
+              LIMIT 1000`,
+        )
+        .all() as Array<{ id: number; full_row_snapshot?: string | null }>;
+    const repair = db.prepare(
+        `UPDATE memories
+            SET source_type = COALESCE(?, source_type),
+                importance = COALESCE(?, importance)
+          WHERE id = ?`,
+    );
+    for (const candidate of candidates) {
+        if (!candidate.full_row_snapshot) continue;
+        let snapshot: Record<string, unknown>;
+        try {
+            const parsed: unknown = JSON.parse(candidate.full_row_snapshot);
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+            snapshot = parsed as Record<string, unknown>;
+        } catch {
+            continue;
+        }
+        const sourceType =
+            hasSnapshotField(snapshot, "source_type") && typeof snapshot.source_type === "string"
+                ? snapshot.source_type
+                : null;
+        const importance =
+            hasSnapshotField(snapshot, "importance") &&
+            typeof snapshot.importance === "number" &&
+            Number.isFinite(snapshot.importance)
+                ? snapshot.importance
+                : null;
+        if (sourceType === null && importance === null) continue;
+        // This bounded, idempotent repair handles stores where older sparse mapping records
+        // overwrote source_type and importance in context.db with null before the mirror began
+        // preserving existing values. It restores those fields when the source snapshot provides them.
+        repair.run(sourceType, importance, candidate.id);
     }
 }
 
@@ -1343,6 +1519,7 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
                 nextCursor = feed.feed_seq;
             }
             translateMemoryReferences(db);
+            if (page.domain === "memories") repairNullClobberedMemoryRows(db);
             for (const projectPath of touchedProjects) {
                 bumpDomainMutationEpoch(db, projectPath, page.domain);
             }
