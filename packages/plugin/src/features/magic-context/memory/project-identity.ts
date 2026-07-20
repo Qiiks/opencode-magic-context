@@ -289,9 +289,17 @@ export function resolveProjectIdentityStrict(directory: string): string {
         throw classifyGitError(error, directory);
     }
 
-    const firstLine = output.split("\n")[0]?.trim() ?? "";
-    const rootCommit = firstLine.slice(0, 64);
-    if (rootCommit.length < 7) {
+    // Repos with grafted histories (merged with --allow-unrelated-histories) have
+    // MULTIPLE root commits, and git's enumeration order varies by traversal. Taking
+    // whichever line comes first samples nondeterministically from that set, flapping
+    // the project identity between sessions and splitting the memory pool. Pin the
+    // derivation to the lexicographic minimum so it is a pure function of the set.
+    const rootCommit = output
+        .split("\n")
+        .map((line) => line.trim().slice(0, 64))
+        .filter((line) => /^[0-9a-f]{7,64}$/.test(line))
+        .sort()[0];
+    if (!rootCommit) {
         throw new ProjectIdentityError(
             "unknown",
             directory,

@@ -41,6 +41,22 @@ describe("resolveProjectIdentity directory fallback", () => {
         }
     });
 
+    test("derives a deterministic identity from grafted-history repos (multiple root commits)", () => {
+        const dir = tempDir();
+        try {
+            mkdirSync(join(dir, ".git"));
+            // Repos merged with --allow-unrelated-histories keep several live root
+            // commits, and git's enumeration order varies by traversal. The identity
+            // must be the lexicographic minimum of the SET, not the first line.
+            __setProjectIdentityTestHooks({
+                execFileSync: (() => "7e96b9e\n1e394c2\n4058752\n") as typeof execFileSync,
+            });
+            expect(resolveProjectIdentity(dir)).toBe("git:1e394c2");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("reuses a parent repository identity for subdirectory transient git failures", () => {
         const dir = tempDir();
         try {
