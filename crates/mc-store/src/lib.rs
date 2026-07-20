@@ -10517,28 +10517,22 @@ impl McStore {
             .map_err(|_| McStoreError::Serde("snapshot limit exceeds i64".to_string()))?;
         self.inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, project_path, category, normalized_hash
-                       FROM mc_memories WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
-                )?;
+                // The resnapshot consumer heals mirror rows from these snapshots, so they
+                // must carry the complete row like every other memories feed emission —
+                // a reduced projection here would null-clobber healed columns downstream.
+                let mut stmt = conn.prepare(&format!(
+                    "{MEMORY_FULL_SELECT_COLUMNS} FROM mc_memories WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+                ))?;
                 let rows = stmt
                     .query_map(params![cursor, limit], |row| {
-                        let id = row.get::<_, i64>(0)?;
-                        let project_path = row.get::<_, String>(1)?;
-                        let category = row.get::<_, String>(2)?;
-                        let normalized_hash = row.get::<_, String>(3)?;
+                        let memory = stored_memory_full_from_row(row)?;
                         Ok(ChangefeedRow {
                             feed_seq: 0,
                             domain: "memories".to_string(),
                             op: "insert".to_string(),
-                            module_row_id: id,
-                            full_row_snapshot: serde_json::json!({
-                                "id": id,
-                                "project_path": project_path,
-                                "category": category,
-                                "normalized_hash": &normalized_hash,
-                            }),
-                            content_hash: Some(normalized_hash),
+                            module_row_id: memory.id,
+                            content_hash: Some(memory.normalized_hash.clone()),
+                            full_row_snapshot: memory_feed_snapshot(&memory, None),
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -11283,6 +11277,14 @@ fn promote_facts_tx(
 
     Ok(promoted)
 }
+
+const MEMORY_FULL_SELECT_COLUMNS: &str =
+    "SELECT id, project_path, category, content, normalized_hash, importance, scope,
+            shareable, source_session_id, source_type, seen_count, retrieval_count,
+            first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
+            status, expires_at, verification_status, verified_at, classified_at,
+            superseded_by_memory_id, merged_from, metadata_json,
+            context_store_uuid, context_row_id";
 
 const MEMORY_FULL_SELECT_BY_ID: &str =
     "SELECT id, project_path, category, content, normalized_hash, importance, scope,
@@ -16946,5 +16948,24 @@ mod shadow_tests {
             .iter()
             .any(|row| row.full_row_snapshot.get("mapping").is_some()));
         assert_memory_feed_snapshots_complete(&store);
+
+        // The live-snapshot arm feeds the mirror resnapshot healer, so its rows must
+        // satisfy the same completeness invariant as changefeed emissions — a reduced
+        // projection here would null-clobber the very columns the heal exists to repair.
+        let live = store.pull_live_memory_snapshot(0, 100).unwrap();
+        assert!(!live.rows.is_empty());
+        for row in &live.rows {
+            let object = row.full_row_snapshot.as_object().unwrap();
+            for column in MEMORY_FEED_COLUMNS {
+                assert!(
+                    object.contains_key(*column),
+                    "live snapshot omitted column {column}"
+                );
+            }
+        }
+        assert!(live
+            .rows
+            .iter()
+            .any(|row| row.full_row_snapshot["source_type"].as_str().is_some()));
     }
 }
