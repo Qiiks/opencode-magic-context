@@ -2330,6 +2330,24 @@ const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 59,
+        description: "stage paged live memory resnapshots before atomic replacement",
+        up(db: Database): void {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS mirror_live_staging (
+                    generation TEXT NOT NULL,
+                    module_project TEXT NOT NULL,
+                    module_row_id INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    normalized_hash TEXT NOT NULL,
+                    PRIMARY KEY(generation, module_project, module_row_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_mirror_live_staging_generation
+                    ON mirror_live_staging(generation);
+            `);
+        },
+    },
 ];
 
 /**

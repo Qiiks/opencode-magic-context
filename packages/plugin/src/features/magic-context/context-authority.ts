@@ -285,6 +285,9 @@ export async function reconcileAuthorityProject(args: {
                 })
                 .immediate();
         });
+        if (domain === "memories") {
+            await ensureLiveMemoryResnapshot({ db: args.db, module: args.module, limit: 1000 });
+        }
         for (;;) {
             const cursor = getMirrorCursor(args.db, domain);
             const response = await args.module.mirrorPull({ domain, cursor, limit: 1000 });
@@ -569,6 +572,19 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
     }
 }
 
+function authorityDrainErrorCode(error: unknown): string | null {
+    let current = error;
+    for (let depth = 0; depth < 3; depth += 1) {
+        if (!current || typeof current !== "object") break;
+        const record = current as { code?: unknown; cause?: unknown };
+        if (typeof record.code === "string") return record.code;
+        current = record.cause;
+    }
+    return error instanceof Error && error.message.includes("authority_feed_head_advanced")
+        ? "authority_feed_head_advanced"
+        : null;
+}
+
 export async function drainAuthority(args: {
     db: Database;
     projectPath: string;
@@ -584,91 +600,112 @@ export async function drainAuthority(args: {
         throw new Error("memory authority drain requires the mirror.pull module route");
     }
     const contextStoreUuid = ensureContextStoreUuid(args.db);
-    const leaseStartedAt = Date.now();
-    let status = (
-        await args.module.authorityDrain({
-            method: "authority.drain.begin",
-            context_store_uuid: contextStoreUuid,
-            project: args.projectPath,
-            domain: args.domain,
-            action: "begin",
-            lease: `ts:${contextStoreUuid}`,
-            lease_started_at: leaseStartedAt,
-            lease_expires_at: leaseStartedAt + 60_000,
-        })
-    ).authority;
-    const coordinatorToken = status.coordinator_token;
-    if (typeof coordinatorToken !== "string" || coordinatorToken.length === 0) {
-        throw new Error("authority drain begin omitted coordinator_token");
-    }
-    const upperBound = status.captured_upper_bound ?? status.drain_cursor ?? 0;
-    while (getMirrorCursor(args.db, args.domain) < upperBound) {
-        const cursor = getMirrorCursor(args.db, args.domain);
-        const page = await args.module.mirrorPull({
-            domain: args.domain,
-            cursor,
-            limit: Math.max(1, Math.min(args.limit ?? 100, 1000)),
-        });
-        applyMirrorPage({ db: args.db, page: page.page });
-        const next = getMirrorCursor(args.db, args.domain);
-        if (next === cursor) break;
-    }
-    for (const step of [
-        "seed",
-        "memories",
-        "notes",
-        "compartments",
-        "reconcile",
-        "verify",
-    ] as const) {
-        status = (
+    const limit = Math.max(1, Math.min(args.limit ?? 100, 1000));
+
+    while (true) {
+        const leaseStartedAt = Date.now();
+        let status = (
             await args.module.authorityDrain({
-                method: `authority.drain_${step}`,
+                method: "authority.drain.begin",
                 context_store_uuid: contextStoreUuid,
                 project: args.projectPath,
                 domain: args.domain,
-                action: step,
-                generation: status.generation,
-                cursor: getMirrorCursor(args.db, args.domain),
-                coordinator_token: coordinatorToken,
-                now_ms: Date.now(),
+                action: "begin",
+                lease: `ts:${contextStoreUuid}`,
+                lease_started_at: leaseStartedAt,
+                lease_expires_at: leaseStartedAt + 60_000,
             })
         ).authority;
+        const coordinatorToken = status.coordinator_token;
+        if (typeof coordinatorToken !== "string" || coordinatorToken.length === 0) {
+            throw new Error("authority drain begin omitted coordinator_token");
+        }
+
+        if (args.domain === "memories") {
+            // Recovery drains share the ordinary mirror feed. Restore the module's canonical
+            // live identities before advancing its cursor, so replaying a tombstone cannot
+            // delete an identity that has not yet been restored.
+            await ensureLiveMemoryResnapshot({ db: args.db, module: args.module, limit });
+        }
+        const upperBound = status.captured_upper_bound ?? status.drain_cursor ?? 0;
+        while (getMirrorCursor(args.db, args.domain) < upperBound) {
+            const cursor = getMirrorCursor(args.db, args.domain);
+            const page = await args.module.mirrorPull({
+                domain: args.domain,
+                cursor,
+                limit,
+            });
+            applyMirrorPage({ db: args.db, page: page.page });
+            const next = getMirrorCursor(args.db, args.domain);
+            if (next === cursor) break;
+        }
+        for (const step of [
+            "seed",
+            "memories",
+            "notes",
+            "compartments",
+            "reconcile",
+            "verify",
+        ] as const) {
+            status = (
+                await args.module.authorityDrain({
+                    method: `authority.drain_${step}`,
+                    context_store_uuid: contextStoreUuid,
+                    project: args.projectPath,
+                    domain: args.domain,
+                    action: step,
+                    generation: status.generation,
+                    cursor: getMirrorCursor(args.db, args.domain),
+                    coordinator_token: coordinatorToken,
+                    now_ms: Date.now(),
+                })
+            ).authority;
+        }
+        const drainChecksum = typeof args.checksum === "function" ? args.checksum() : args.checksum;
+        let finished: AuthorityStatus;
+        try {
+            finished = (
+                await args.module.authorityDrain({
+                    method: "authority.drain.finish",
+                    context_store_uuid: contextStoreUuid,
+                    project: args.projectPath,
+                    domain: args.domain,
+                    action: "finish",
+                    generation: status.generation,
+                    checksum_expected: drainChecksum,
+                    checksum_actual: drainChecksum,
+                    verified: true,
+                    coordinator_token: coordinatorToken,
+                    now_ms: Date.now(),
+                })
+            ).authority;
+        } catch (error) {
+            if (authorityDrainErrorCode(error) === "authority_feed_head_advanced") {
+                // A non-facade writer may append after the prior bound. Beginning the next
+                // attempt captures a fresh head; replay remains bounded to that captured head.
+                continue;
+            }
+            throw error;
+        }
+        if (finished.state !== "TS") {
+            throw new Error("memory authority drain did not reactivate TypeScript ownership");
+        }
+        // A project marker fences both authority domains. Remove it only after neither
+        // domain remains module-owned; a one-domain drain must not reopen the other domain.
+        const remaining = await Promise.all(
+            AUTHORITY_DOMAINS.map((domain) =>
+                args.module.authorityStatus({
+                    context_store_uuid: contextStoreUuid,
+                    project: args.projectPath,
+                    domain,
+                }),
+            ),
+        );
+        if (remaining.every((result) => !result.authority || result.authority.state === "TS")) {
+            removeAuthorityManagedMarker(args.db, args.projectPath);
+        }
+        return finished;
     }
-    const drainChecksum = typeof args.checksum === "function" ? args.checksum() : args.checksum;
-    const finished = (
-        await args.module.authorityDrain({
-            method: "authority.drain.finish",
-            context_store_uuid: contextStoreUuid,
-            project: args.projectPath,
-            domain: args.domain,
-            action: "finish",
-            generation: status.generation,
-            checksum_expected: drainChecksum,
-            checksum_actual: drainChecksum,
-            verified: true,
-            coordinator_token: coordinatorToken,
-            now_ms: Date.now(),
-        })
-    ).authority;
-    if (finished.state !== "TS") {
-        throw new Error("memory authority drain did not reactivate TypeScript ownership");
-    }
-    // A project marker fences both authority domains. Remove it only after neither
-    // domain remains module-owned; a one-domain drain must not reopen the other domain.
-    const remaining = await Promise.all(
-        AUTHORITY_DOMAINS.map((domain) =>
-            args.module.authorityStatus({
-                context_store_uuid: contextStoreUuid,
-                project: args.projectPath,
-                domain,
-            }),
-        ),
-    );
-    if (remaining.every((result) => !result.authority || result.authority.state === "TS")) {
-        removeAuthorityManagedMarker(args.db, args.projectPath);
-    }
-    return finished;
 }
 
 function seedSourceRowId(row: Record<string, unknown>): number | null {
@@ -752,11 +789,15 @@ function upgradeMemoryMirrorNeedsResnapshot(db: Database): boolean {
     return live.count === 0 && identities.count > 0;
 }
 
-function replaceLiveMemorySnapshot(db: Database, rows: readonly ChangefeedRow[]): void {
-    db.prepare("DELETE FROM mirror_live_memory_rows").run();
+function stageLiveMemorySnapshotPage(
+    db: Database,
+    generation: string,
+    rows: readonly ChangefeedRow[],
+): void {
     const insert = db.prepare(
-        `INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO mirror_live_staging(
+            generation, module_project, module_row_id, category, normalized_hash
+         ) VALUES (?, ?, ?, ?, ?)`,
     );
     for (const feed of rows) {
         const row = feed.full_row_snapshot;
@@ -766,12 +807,26 @@ function replaceLiveMemorySnapshot(db: Database, rows: readonly ChangefeedRow[])
             throw new Error("live memory snapshot omitted project_path or normalized_hash");
         }
         insert.run(
+            generation,
             moduleProject,
             feed.module_row_id,
             rowString(row, "category", "CONSTRAINTS"),
             normalizedHash,
         );
     }
+}
+
+function installStagedLiveMemorySnapshot(db: Database, generation: string): void {
+    db.prepare("DELETE FROM mirror_live_memory_rows").run();
+    db.prepare(
+        `INSERT INTO mirror_live_memory_rows(
+            module_project, module_row_id, category, normalized_hash
+         )
+         SELECT module_project, module_row_id, category, normalized_hash
+           FROM mirror_live_staging
+          WHERE generation = ?`,
+    ).run(generation);
+    db.prepare("DELETE FROM mirror_live_staging").run();
 }
 
 function mirrorIdentity(
@@ -1174,7 +1229,7 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
     return nextCursor;
 }
 
-async function ensureLiveMemoryResnapshot(args: {
+export async function ensureLiveMemoryResnapshot(args: {
     db: Database;
     module: AuthorityModuleClient;
     limit: number;
@@ -1183,18 +1238,31 @@ async function ensureLiveMemoryResnapshot(args: {
     if (!initialStatus || initialStatus === "complete") return;
     if (initialStatus === "pending_check" && !upgradeMemoryMirrorNeedsResnapshot(args.db)) {
         withPrivilegedWriter(args.db, () => {
-            args.db.transaction(() => setMemoryResnapshotStatus(args.db, "complete")).immediate();
+            args.db
+                .transaction(() => {
+                    args.db.prepare("DELETE FROM mirror_live_staging").run();
+                    setMemoryResnapshotStatus(args.db, "complete");
+                })
+                .immediate();
         });
         return;
     }
     if (!args.module.mirrorPull) {
         throw new Error("memory mirror resnapshot requires the mirror.pull module route");
     }
+
+    const generation = `${Date.now().toString(36)}:${crypto.randomUUID()}`;
     withPrivilegedWriter(args.db, () => {
-        args.db.transaction(() => setMemoryResnapshotStatus(args.db, "resnapshotting")).immediate();
+        args.db
+            .transaction(() => {
+                // Each attempt owns one generation. Removing prior generations here keeps a
+                // crashed scan from accumulating alongside its replacement while live rows stay intact.
+                args.db.prepare("DELETE FROM mirror_live_staging").run();
+                setMemoryResnapshotStatus(args.db, "resnapshotting");
+            })
+            .immediate();
     });
 
-    const rows: ChangefeedRow[] = [];
     let cursor = 0;
     while (true) {
         const response = await args.module.mirrorPull({
@@ -1207,7 +1275,11 @@ async function ensureLiveMemoryResnapshot(args: {
         if (page.domain !== "memories" || page.cursor !== cursor) {
             throw new Error("live memory resnapshot returned a mismatched page");
         }
-        rows.push(...page.rows);
+        withPrivilegedWriter(args.db, () => {
+            args.db
+                .transaction(() => stageLiveMemorySnapshotPage(args.db, generation, page.rows))
+                .immediate();
+        });
         if (!page.has_more) break;
         if (page.next_cursor <= cursor) {
             throw new Error("live memory resnapshot did not advance its cursor");
@@ -1218,7 +1290,7 @@ async function ensureLiveMemoryResnapshot(args: {
     withPrivilegedWriter(args.db, () => {
         args.db
             .transaction(() => {
-                replaceLiveMemorySnapshot(args.db, rows);
+                installStagedLiveMemorySnapshot(args.db, generation);
                 setMemoryResnapshotStatus(args.db, "complete");
             })
             .immediate();

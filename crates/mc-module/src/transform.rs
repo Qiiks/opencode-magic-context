@@ -1772,6 +1772,7 @@ fn apply_once(
                 consumed_drop_ids: &consumed_drop_ids,
                 first_applied_command_ids: &first_applied_command_ids,
                 memory_revision: commit_memory_revision.as_ref(),
+                project_root: Some(ctx.project_directory),
                 overlays: TransformOverlayBatch {
                     max_seen_ordinal: pending_overlays.max_seen_ordinal,
                     tag_mints: &pending_overlays.tag_mints,
@@ -10701,6 +10702,7 @@ mod tests {
                     consumed_drop_ids: &[pending[0].id],
                     first_applied_command_ids: &command_ids,
                     memory_revision: None,
+                    project_root: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -10777,6 +10779,7 @@ mod tests {
                     consumed_drop_ids: &[pending_a[0].id],
                     first_applied_command_ids: &command_a,
                     memory_revision: None,
+                    project_root: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -12703,6 +12706,7 @@ mod tests {
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
                 memory_revision: None,
+                project_root: None,
                 overlays: TransformOverlayBatch::default(),
             },
         )

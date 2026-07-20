@@ -1,4 +1,5 @@
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
+import { isRustAuthorityDrainingError } from "../../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -377,21 +378,32 @@ async function runClassifyThroughModule(
                     : entry.shareable,
         };
     });
-    const applied = await args.moduleClient?.call({
-        sessionId: args.moduleSessionId as string,
-        projectRoot: args.moduleProjectRoot as string,
-        method: "memory.set_classification",
-        body: {
-            name: "memory.set_classification",
-            arguments: {
-                memory_project: args.projectIdentity,
-                context_store_uuid: args.moduleContextStoreUuid,
-                authority_generation: args.moduleAuthorityGeneration,
-                rows,
+    let applied: unknown;
+    try {
+        applied = await args.moduleClient?.call({
+            sessionId: args.moduleSessionId as string,
+            projectRoot: args.moduleProjectRoot as string,
+            method: "memory.set_classification",
+            body: {
+                name: "memory.set_classification",
+                arguments: {
+                    memory_project: args.projectIdentity,
+                    context_store_uuid: args.moduleContextStoreUuid,
+                    authority_generation: args.moduleAuthorityGeneration,
+                    rows,
+                },
             },
-        },
-        signal,
-    });
+            signal,
+        });
+    } catch (error) {
+        if (isRustAuthorityDrainingError(error)) {
+            throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
+        }
+        throw error;
+    }
+    if (isRustAuthorityDrainingError(applied)) {
+        throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
+    }
     const applyResult = (applied as { result?: unknown } | null)?.result ?? applied;
     if (!applyResult || typeof applyResult !== "object") {
         throw new Error("module returned invalid classification apply result");

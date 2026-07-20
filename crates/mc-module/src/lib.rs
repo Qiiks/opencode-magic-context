@@ -2584,7 +2584,26 @@ impl McHandler {
             .get(session_id)
             .is_some_and(|roots| roots.contains(project_root));
         if !root_observed {
-            return false;
+            let Some(store) = self.store.get() else {
+                return false;
+            };
+            let durable_root_observed = project_root.to_str().is_some_and(|root| {
+                store
+                    .knows_transform_session_root(session_id, root)
+                    .unwrap_or(false)
+            });
+            if !durable_root_observed || !store.has_cache_state(session_id).unwrap_or(false) {
+                return false;
+            }
+            // Cache the durable proof after a process restart. The row pairs the exact root with
+            // the accepted transform commit, so it cannot authorize the same session on root B.
+            self.transform_session_roots
+                .lock()
+                .expect("transform session roots mutex")
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(project_root.to_path_buf());
+            return true;
         }
         if self
             .store
@@ -5277,6 +5296,14 @@ impl McHandler {
         };
         match result {
             Ok(row) => respond(json!({ "ok": true, "authority": row })),
+            Err(McStoreError::AuthorityFeedHeadAdvanced { captured, found }) => {
+                HandlerOutcome::Error {
+                    code: "authority_feed_head_advanced".to_string(),
+                    message: format!(
+                        "authority_feed_head_advanced: captured {captured}, found {found}"
+                    ),
+                }
+            }
             Err(error) => HandlerOutcome::Error {
                 code: "authority_drain_failed".to_string(),
                 message: error.to_string(),
@@ -7426,21 +7453,23 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
         };
-        let authority_project = match store.authority_project_for_route(&route_root, "memories") {
-            Ok(Some(project)) => project,
-            Ok(None) => {
-                return HandlerOutcome::Error {
-                    code: "authority_not_module".to_string(),
-                    message: "classification requires MODULE memories authority".to_string(),
+        let authority_project =
+            match store.authority_project_state_for_route(&route_root, "memories") {
+                Ok(Some((project, state))) if state == "MODULE" => project,
+                Ok(Some(_)) => return authority_draining_error("memories"),
+                Ok(None) => {
+                    return HandlerOutcome::Error {
+                        code: "authority_not_module".to_string(),
+                        message: "classification requires MODULE memories authority".to_string(),
+                    }
                 }
-            }
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "authority_lookup_failed".to_string(),
-                    message: error.to_string(),
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "authority_lookup_failed".to_string(),
+                        message: error.to_string(),
+                    }
                 }
-            }
-        };
+            };
         if authority_project != memory_project {
             return HandlerOutcome::Error {
                 code: "facade_project_vocabulary_mismatch".to_string(),
@@ -7485,13 +7514,15 @@ impl McHandler {
                 shareable: row.get("shareable").and_then(Value::as_bool),
             });
         }
-        match store.set_memory_classification(
-            context_store_uuid,
-            memory_project,
-            authority_generation,
-            &updates,
-            now_ms(),
-        ) {
+        match store.with_facade_mutation(&route_root, "memories", || {
+            store.set_memory_classification(
+                context_store_uuid,
+                memory_project,
+                authority_generation,
+                &updates,
+                now_ms(),
+            )
+        }) {
             Ok(result) => respond(json!({
                 "accepted": result.accepted,
                 "rejected": result.rejected.iter().map(|row| json!({ "memory_id": row.memory_id, "reason": row.reason })).collect::<Vec<_>>(),
@@ -7507,6 +7538,9 @@ impl McHandler {
                     code: "authority_state_mismatch".to_string(),
                     message: format!("authority state is {found}, expected {expected}"),
                 }
+            }
+            Err(error) if store_error_is_authority_draining(&error) => {
+                authority_draining_error("memories")
             }
             Err(error) => HandlerOutcome::Error {
                 code: "classification_apply_failed".to_string(),
@@ -7550,12 +7584,15 @@ impl McHandler {
             return Err(store_unavailable_error());
         };
         let authority = store
-            .module_authority_for_project(requested_project, authority_domain)
+            .facade_authority_for_project(requested_project, authority_domain)
             .map_err(|error| HandlerOutcome::Error {
                 code: "authority_route_lookup_failed".to_string(),
                 message: error.to_string(),
             })?;
-        if let Some((context_store_uuid, project)) = authority {
+        if let Some((context_store_uuid, project, state)) = authority {
+            if state != "MODULE" {
+                return Err(authority_draining_error(authority_domain));
+            }
             store
                 .bind_authority_route(&context_store_uuid, &project, &route_project_root)
                 .map_err(|error| HandlerOutcome::Error {
@@ -7623,9 +7660,9 @@ impl McHandler {
             arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
         let memory_project_path = match self.store.get() {
             Some(store) => match store
-                .authority_project_for_route(&route_project_root, authority_domain)
+                .authority_project_state_for_route(&route_project_root, authority_domain)
             {
-                Ok(Some(authority_project)) => {
+                Ok(Some((authority_project, authority_state))) => {
                     if requested_project.is_some_and(|requested| requested != authority_project) {
                         return Err(HandlerOutcome::Error {
                             code: "facade_project_vocabulary_mismatch".to_string(),
@@ -7634,6 +7671,11 @@ impl McHandler {
                                 requested_project.unwrap_or_default()
                             ),
                         });
+                    }
+                    if bind_authority_for_write && authority_state != "MODULE" {
+                        // Reads and transforms may keep using the module identity while authority
+                        // drains, but facade mutations must retry instead of writing after ownership changes.
+                        return Err(authority_draining_error(authority_domain));
                     }
                     authority_project
                 }
@@ -7728,20 +7770,29 @@ impl McHandler {
                         "Error: 'content' is required when action is 'write'.",
                     );
                 };
-                match store.insert_memory(InsertMemoryInput {
-                    project_path: memory_project,
-                    route_project_root: Some(facade_scope.route_project_root.as_str()),
-                    category,
-                    content,
-                    source_session_id: Some(conversation_key),
-                    source_type: Some("agent"),
-                    importance: Some(50),
-                    expires_at: None,
-                    metadata_json: None,
-                    now_ms: now_ms(),
-                }) {
+                match store.with_facade_mutation(
+                    facade_scope.route_project_root.as_str(),
+                    "memories",
+                    || {
+                        store.insert_memory(InsertMemoryInput {
+                            project_path: memory_project,
+                            route_project_root: Some(facade_scope.route_project_root.as_str()),
+                            category,
+                            content,
+                            source_session_id: Some(conversation_key),
+                            source_type: Some("agent"),
+                            importance: Some(50),
+                            expires_at: None,
+                            metadata_json: None,
+                            now_ms: now_ms(),
+                        })
+                    },
+                ) {
                     Ok(id) => {
                         mcp_text_result(format!("Saved memory [ID: {id}] in {category}."), false)
+                    }
+                    Err(error) if store_error_is_authority_draining(&error) => {
+                        authority_draining_error("memories")
                     }
                     Err(error) => HandlerOutcome::Error {
                         code: "memory_store_failed".to_string(),
@@ -7760,11 +7811,18 @@ impl McHandler {
                         "Error: 'content' is required when action is 'update'.",
                     );
                 };
-                match memory_tool::update_memory(store, memory_project, id, content, now_ms()) {
+                match store.with_facade_mutation(
+                    facade_scope.route_project_root.as_str(),
+                    "memories",
+                    || memory_tool::update_memory(store, memory_project, id, content, now_ms()),
+                ) {
                     Ok(memory) => mcp_text_result(
                         format!("Updated memory [ID: {}] in {}.", memory.id, memory.category),
                         false,
                     ),
+                    Err(error) if store_error_is_authority_draining(&error) => {
+                        authority_draining_error("memories")
+                    }
                     Err(error) => tool_error_result(format!("Error: {error}")),
                 }
             }
@@ -7776,14 +7834,15 @@ impl McHandler {
                     );
                 }
                 let reason = string_arg(args, "reason");
-                let archived = match memory_tool::archive_memories(
-                    store,
-                    memory_project,
-                    &ids,
-                    reason,
-                    now_ms(),
+                let archived = match store.with_facade_mutation(
+                    facade_scope.route_project_root.as_str(),
+                    "memories",
+                    || memory_tool::archive_memories(store, memory_project, &ids, reason, now_ms()),
                 ) {
                     Ok(archived) => archived,
+                    Err(error) if store_error_is_authority_draining(&error) => {
+                        return authority_draining_error("memories");
+                    }
                     Err(error) => return tool_error_result(format!("Error: {error}")),
                 };
                 if archived.is_empty() {
@@ -7806,13 +7865,19 @@ impl McHandler {
                         "Error: 'content' is required when action is 'merge'.",
                     );
                 };
-                match memory_tool::merge_memories(
-                    store,
-                    memory_project,
-                    target_id,
-                    &source_ids,
-                    content,
-                    now_ms(),
+                match store.with_facade_mutation(
+                    facade_scope.route_project_root.as_str(),
+                    "memories",
+                    || {
+                        memory_tool::merge_memories(
+                            store,
+                            memory_project,
+                            target_id,
+                            &source_ids,
+                            content,
+                            now_ms(),
+                        )
+                    },
                 ) {
                     Ok(memory) => mcp_text_result(
                         format!(
@@ -7823,6 +7888,9 @@ impl McHandler {
                         ),
                         false,
                     ),
+                    Err(error) if store_error_is_authority_draining(&error) => {
+                        authority_draining_error("memories")
+                    }
                     Err(error) => tool_error_result(format!("Error: {error}")),
                 }
             }
@@ -8172,16 +8240,22 @@ impl McHandler {
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
                 if let Some(condition) = condition {
-                    match store.insert_project_note(NoteWriteInput {
-                        project_path: project,
-                        route_project_root: Some(facade_scope.route_project_root.as_str()),
-                        session_id: Some(session),
-                        content,
-                        surface_condition: Some(condition),
-                        anchor_block_id: anchor.as_deref(),
-                        anchor_ordinal: None,
-                        now_ms: now,
-                    }) {
+                    match store.with_facade_mutation(
+                        facade_scope.route_project_root.as_str(),
+                        "notes",
+                        || {
+                            store.insert_project_note(NoteWriteInput {
+                                project_path: project,
+                                route_project_root: Some(facade_scope.route_project_root.as_str()),
+                                session_id: Some(session),
+                                content,
+                                surface_condition: Some(condition),
+                                anchor_block_id: anchor.as_deref(),
+                                anchor_ordinal: None,
+                                now_ms: now,
+                            })
+                        },
+                    ) {
                         Ok(note) => mcp_text_result(
                             format!(
                                 "Created smart note #{}. Dreamer will evaluate the condition during nightly runs:\n- Content: {}\n- Condition: {}",
@@ -8189,20 +8263,32 @@ impl McHandler {
                             ),
                             false,
                         ),
+                        Err(error) if store_error_is_authority_draining(&error) => {
+                            authority_draining_error("notes")
+                        }
                         Err(error) => tool_error_result(format!("Error: {error}")),
                     }
                 } else {
-                    match store.insert_note(NoteInput {
-                        project_path: project,
-                        route_project_root: Some(facade_scope.route_project_root.as_str()),
-                        session_id: session,
-                        content,
-                        surface_condition: None,
-                        anchor_block_id: anchor.as_deref(),
-                        now_ms: now,
-                    }) {
+                    match store.with_facade_mutation(
+                        facade_scope.route_project_root.as_str(),
+                        "notes",
+                        || {
+                            store.insert_note(NoteInput {
+                                project_path: project,
+                                route_project_root: Some(facade_scope.route_project_root.as_str()),
+                                session_id: session,
+                                content,
+                                surface_condition: None,
+                                anchor_block_id: anchor.as_deref(),
+                                now_ms: now,
+                            })
+                        },
+                    ) {
                         Ok(note) => {
                             mcp_text_result(format!("Saved session note #{}.", note.id), false)
+                        }
+                        Err(error) if store_error_is_authority_draining(&error) => {
+                            authority_draining_error("notes")
                         }
                         Err(error) => tool_error_result(format!("Error: {error}")),
                     }
@@ -8311,14 +8397,20 @@ impl McHandler {
                         "Error: Note #{note_id} not found in your session/project or has no compatible fields to update."
                     ));
                 };
-                match store.update_note_cas(
-                    project,
-                    note_id,
-                    &current.status,
-                    current.status_version,
-                    content,
-                    condition.map(Some),
-                    now,
+                match store.with_facade_mutation(
+                    facade_scope.route_project_root.as_str(),
+                    "notes",
+                    || {
+                        store.update_note_cas(
+                            project,
+                            note_id,
+                            &current.status,
+                            current.status_version,
+                            content,
+                            condition.map(Some),
+                            now,
+                        )
+                    },
                 ) {
                     Ok(NoteCasOutcome::Applied(note)) => mcp_text_result(
                         format!("Updated note #{}: {}", note.id, note.content),
@@ -8327,6 +8419,9 @@ impl McHandler {
                     Ok(NoteCasOutcome::Conflict { .. }) => tool_error_result(format!(
                         "Error: Note #{note_id} changed concurrently; retry with a fresh read."
                     )),
+                    Err(error) if store_error_is_authority_draining(&error) => {
+                        authority_draining_error("notes")
+                    }
                     Err(error) => tool_error_result(format!("Error: {error}")),
                 }
             }
@@ -8336,17 +8431,26 @@ impl McHandler {
                         "Error: 'note_id' is required when action is 'dismiss'.",
                     );
                 };
-                match store.dismiss_note(
-                    project,
-                    session,
-                    note_id,
-                    string_arg(args, "content"),
-                    now,
+                match store.with_facade_mutation(
+                    facade_scope.route_project_root.as_str(),
+                    "notes",
+                    || {
+                        store.dismiss_note(
+                            project,
+                            session,
+                            note_id,
+                            string_arg(args, "content"),
+                            now,
+                        )
+                    },
                 ) {
                     Ok(Some(_)) => mcp_text_result(format!("Note #{note_id} dismissed."), false),
                     Ok(None) => tool_error_result(format!(
                         "Error: Note #{note_id} not found in your session/project or already dismissed."
                     )),
+                    Err(error) if store_error_is_authority_draining(&error) => {
+                        authority_draining_error("notes")
+                    }
                     Err(error) => tool_error_result(format!("Error: {error}")),
                 }
             }
@@ -8975,6 +9079,17 @@ fn session_unresolved_error() -> HandlerOutcome {
         code: "session_unresolved".to_string(),
         message: SESSION_UNRESOLVED_MESSAGE.to_string(),
     }
+}
+
+fn authority_draining_error(domain: &str) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "authority_draining".to_string(),
+        message: format!("{domain} authority is draining; retry after the ownership transition"),
+    }
+}
+
+fn store_error_is_authority_draining(error: &impl std::fmt::Display) -> bool {
+    error.to_string().contains("authority_draining")
 }
 
 fn authority_request_key(request: &Value) -> Option<(&str, &str, &str)> {
@@ -12612,6 +12727,105 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn opencode_transform_root_lineage_survives_a_real_handler_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let root_a = dir.path().join("project-a");
+        let root_b = dir.path().join("project-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let root_a_text = root_a.to_str().unwrap();
+        let identity = "git:restart-lineage";
+
+        {
+            let store = Arc::new(McStore::open(&descriptor).unwrap());
+            let handler = McHandler::with_producer_factory_config_resolver(
+                Arc::new(TestProducerFactory {
+                    state: Arc::new(ProducerState::default()),
+                }),
+                default_test_config(),
+                Arc::new(MissingSessionResolver),
+            );
+            handler.store.set(Arc::clone(&store)).ok().unwrap();
+            handler.bind_route(
+                7,
+                binding_with_harness(root_a_text, OPENCODE_HARNESS, "ses"),
+            );
+            let transformed =
+                call_transform_request_on_channel(&handler, 7, request(vec![ck("m0", 0, "a")]))
+                    .await;
+            assert_eq!(transformed["action"], "HARD");
+            assert!(store
+                .knows_transform_session_root("ses", root_a_text)
+                .unwrap());
+            for domain in ["memories", "notes"] {
+                activate_module_authority(&store, "context", identity, root_a_text, domain);
+            }
+        }
+
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::None)]);
+        let store = Arc::new(McStore::open(&descriptor).unwrap());
+        let handler = McHandler::with_producer_factory_config_resolver(
+            Arc::new(TestProducerFactory {
+                state: Arc::new(ProducerState::default()),
+            }),
+            default_test_config(),
+            resolver.clone(),
+        );
+        handler.store.set(Arc::clone(&store)).ok().unwrap();
+        handler.bind_route(
+            7,
+            binding_with_harness(root_a_text, OPENCODE_HARNESS, "ses"),
+        );
+
+        let memory = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "durable root proof",
+                "memory_project": identity,
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(memory));
+        let note = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "write",
+                "content": "durable note proof",
+                "memory_project": identity,
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(note));
+        assert!(resolver.calls().is_empty());
+
+        handler.bind_route(
+            8,
+            binding_with_harness(root_b.to_str().unwrap(), OPENCODE_HARNESS, "ses"),
+        );
+        let cross_root = call_facade_on_channel(
+            &handler,
+            8,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "must not cross roots",
+                "memory_project": identity,
+            }),
+        )
+        .await;
+        assert_eq!(error_code(cross_root), "session_unresolved");
+        assert_eq!(resolver.calls(), vec!["ses"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn claude_code_facade_resolves_instance_token_before_store_access() {
         let resolver = FakeSessionResolver::with(&[(
             "claude-instance-token",
@@ -13590,6 +13804,105 @@ mod tests {
             .rows
             .iter()
             .any(|row| row.op == "update" && row.module_row_id == fresh_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn draining_authority_rejects_every_facade_mutation_but_keeps_reads_resolved() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_root = project.to_str().unwrap();
+        let identity = "git:draining";
+        handler.bind_route(7, binding(route_root, "token"));
+        for domain in ["memories", "notes"] {
+            activate_module_authority(&store, "context", identity, route_root, domain);
+        }
+        let first = insert_memory(&store, identity, "CONSTRAINTS", "first", 1);
+        let second = insert_memory(&store, identity, "CONSTRAINTS", "second", 1);
+        let note = store
+            .insert_note(NoteInput {
+                project_path: identity,
+                route_project_root: Some(route_root),
+                session_id: "session",
+                content: "note",
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        let memory_drain = store
+            .authority_begin_drain("context", identity, "memories", "lease-memory", i64::MAX, 2)
+            .unwrap();
+        store
+            .authority_begin_drain("context", identity, "notes", "lease-notes", i64::MAX, 2)
+            .unwrap();
+        let memory_head = store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .next_cursor;
+        let note_head = store.pull_changefeed("notes", 0, 100).unwrap().next_cursor;
+
+        for arguments in [
+            json!({"action": "write", "category": "CONSTRAINTS", "content": "late"}),
+            json!({"action": "update", "ids": [first], "content": "late"}),
+            json!({"action": "archive", "ids": [first]}),
+            json!({"action": "merge", "ids": [first, second], "content": "late"}),
+        ] {
+            assert_eq!(
+                error_code(call_facade(&handler, "ctx_memory", arguments).await),
+                "authority_draining"
+            );
+        }
+        for arguments in [
+            json!({"action": "write", "content": "late"}),
+            json!({"action": "update", "note_id": note.id, "content": "late"}),
+            json!({"action": "dismiss", "note_id": note.id}),
+        ] {
+            assert_eq!(
+                error_code(call_facade(&handler, "ctx_note", arguments).await),
+                "authority_draining"
+            );
+        }
+        assert_eq!(
+            error_code(
+                call_facade(
+                    &handler,
+                    "memory.set_classification",
+                    json!({
+                        "memory_project": identity,
+                        "context_store_uuid": "context",
+                        "authority_generation": memory_drain.generation,
+                        "rows": []
+                    }),
+                )
+                .await
+            ),
+            "authority_draining"
+        );
+        assert!(!tool_is_error(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({"action": "get", "ids": [first]})
+            )
+            .await
+        ));
+        assert!(!tool_is_error(
+            call_facade(&handler, "ctx_note", json!({"action": "read"})).await
+        ));
+        assert_eq!(
+            store
+                .pull_changefeed("memories", 0, 100)
+                .unwrap()
+                .next_cursor,
+            memory_head
+        );
+        assert_eq!(
+            store.pull_changefeed("notes", 0, 100).unwrap().next_cursor,
+            note_head
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

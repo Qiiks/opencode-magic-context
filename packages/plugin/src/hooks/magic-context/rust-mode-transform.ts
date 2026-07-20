@@ -986,7 +986,11 @@ export function createRustModeTransform(
                         db: deps.db,
                         sessionId,
                         reader: {
-                            getCompartmentsAfter: options.moduleClient.getCompartmentsAfter,
+                            getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
+                                options.moduleClient.getCompartmentsAfter!(
+                                    mirroredSessionId,
+                                    afterSequence,
+                                ),
                         } satisfies ModuleCompartmentReader,
                     });
                 } catch (error) {

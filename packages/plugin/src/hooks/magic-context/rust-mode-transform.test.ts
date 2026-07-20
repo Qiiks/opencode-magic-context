@@ -456,6 +456,55 @@ describe("Rust mode authority adapter", () => {
         expect(secondOutput.messages).toEqual(native);
     });
 
+    it("preserves the receiver for a class-backed compartment mirror client", async () => {
+        const sessionId = `rust-class-compartments-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+
+        class ClassBackedModuleClient {
+            private readonly title = "receiver-bound compartment";
+
+            async call({ method }: Parameters<RustModeModuleClient["call"]>[0]) {
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            }
+
+            async getCompartmentsAfter(_sessionId: string, _afterSequence: number) {
+                if (this.title !== "receiver-bound compartment") {
+                    throw new Error("class receiver was detached");
+                }
+                return {
+                    max_sequence: 1,
+                    compartments: [
+                        {
+                            sequence: 1,
+                            start_message: 0,
+                            end_message: 0,
+                            start_message_id: "m1",
+                            end_message_id: "m1",
+                            title: this.title,
+                            content: "summary",
+                        },
+                    ],
+                };
+            }
+        }
+
+        const moduleClient: RustModeModuleClient = new ClassBackedModuleClient();
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const messages = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: [...messages] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(
+            db.prepare("SELECT title FROM compartments WHERE session_id = ?").get(sessionId),
+        ).toEqual({ title: "receiver-bound compartment" });
+    });
+
     it("sends tool_present false while availability remains provisional", async () => {
         const sessionId = `rust-availability-provisional-${Date.now()}`;
         sessions.push(sessionId);

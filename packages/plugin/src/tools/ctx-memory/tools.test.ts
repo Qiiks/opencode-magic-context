@@ -394,6 +394,33 @@ describe("createCtxMemoryTools", () => {
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
         });
 
+        it("maps a raced module drain rejection to the transition retry message", async () => {
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async () => {
+                        const error = new Error("authority is draining") as Error & {
+                            code: string;
+                        };
+                        error.code = "authority_draining";
+                        throw error;
+                    },
+                },
+            });
+            const result = await moduleTools.ctx_memory.execute(
+                { action: "write", category: "CONSTRAINTS", content: "retry me" },
+                toolContext(),
+            );
+            expect(result).toBe(
+                "Error: Rust memory authority is not ready; TypeScript fallback is disabled.",
+            );
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
         it("fails closed when module authority is active without the memory protocol", async () => {
             const moduleTools = createCtxMemoryTools({
                 db,

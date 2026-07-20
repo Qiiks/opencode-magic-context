@@ -49,3 +49,19 @@ export interface RustToolBackends {
     noteEvaluationAvailable?: (projectPath: string) => boolean;
     memorySync?: (sessionId: string) => void;
 }
+
+export function isRustAuthorityDrainingError(error: unknown): boolean {
+    let current = error;
+    for (let depth = 0; depth < 3; depth += 1) {
+        if (!current || typeof current !== "object") break;
+        const record = current as {
+            code?: unknown;
+            cause?: unknown;
+            error?: unknown;
+            result?: unknown;
+        };
+        if (record.code === "authority_draining") return true;
+        current = record.cause ?? record.error ?? record.result;
+    }
+    return error instanceof Error && error.message.includes("authority_draining");
+}

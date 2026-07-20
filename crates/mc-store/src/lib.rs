@@ -1714,6 +1714,107 @@ const MIGRATIONS: &[Migration] = &[
            );
         "#,
     },
+    Migration {
+        version: 33,
+        // Persist the authenticated session/root pair with cache state, and make the module
+        // writer transaction itself reject facade mutations after authority starts draining.
+        statements: r#"
+        CREATE TABLE IF NOT EXISTS mc_transform_session_roots (
+            session_id  TEXT NOT NULL,
+            project_root TEXT NOT NULL,
+            observed_at INTEGER NOT NULL,
+            PRIMARY KEY(session_id, project_root)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_transform_session_roots_observed
+            ON mc_transform_session_roots(observed_at);
+
+        CREATE TRIGGER mc_memories_facade_authority_insert
+        BEFORE INSERT ON mc_memories
+        WHEN mc_facade_authority_domain() = 'memories'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = mc_facade_authority_route()
+               AND authority.domain = 'memories'
+               AND authority.project = NEW.project_path
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        CREATE TRIGGER mc_memories_facade_authority_update
+        BEFORE UPDATE ON mc_memories
+        WHEN mc_facade_authority_domain() = 'memories'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = mc_facade_authority_route()
+               AND authority.domain = 'memories'
+               AND authority.project IN (OLD.project_path, NEW.project_path)
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        CREATE TRIGGER mc_memories_facade_authority_delete
+        BEFORE DELETE ON mc_memories
+        WHEN mc_facade_authority_domain() = 'memories'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = mc_facade_authority_route()
+               AND authority.domain = 'memories'
+               AND authority.project = OLD.project_path
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+
+        CREATE TRIGGER mc_notes_facade_authority_insert
+        BEFORE INSERT ON mc_notes
+        WHEN mc_facade_authority_domain() = 'notes'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = mc_facade_authority_route()
+               AND authority.domain = 'notes'
+               AND authority.project = NEW.project_path
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        CREATE TRIGGER mc_notes_facade_authority_update
+        BEFORE UPDATE ON mc_notes
+        WHEN mc_facade_authority_domain() = 'notes'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = mc_facade_authority_route()
+               AND authority.domain = 'notes'
+               AND authority.project IN (OLD.project_path, NEW.project_path)
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        CREATE TRIGGER mc_notes_facade_authority_delete
+        BEFORE DELETE ON mc_notes
+        WHEN mc_facade_authority_domain() = 'notes'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = mc_facade_authority_route()
+               AND authority.domain = 'notes'
+               AND authority.project = OLD.project_path
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        "#,
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -2475,6 +2576,8 @@ pub struct TransformCommit<'a> {
     pub consumed_drop_ids: &'a [i64],
     pub first_applied_command_ids: &'a [String],
     pub memory_revision: Option<&'a MemoryRevision>,
+    /// Authenticated filesystem root observed by the transform that owns this cache commit.
+    pub project_root: Option<&'a str>,
     pub overlays: TransformOverlayBatch<'a>,
 }
 
@@ -3097,6 +3200,11 @@ pub enum McStoreError {
         expected: u64,
         found: u64,
     },
+    /// The module feed advanced after a drain captured its replay bound.
+    AuthorityFeedHeadAdvanced {
+        captured: i64,
+        found: i64,
+    },
     Serde(String),
     MemoryDuplicateContent {
         id: i64,
@@ -3141,6 +3249,10 @@ impl std::fmt::Display for McStoreError {
                     "authority generation mismatch: expected {expected}, found {found}"
                 )
             }
+            McStoreError::AuthorityFeedHeadAdvanced { captured, found } => write!(
+                f,
+                "authority feed head advanced after drain capture: captured {captured}, found {found}"
+            ),
             McStoreError::Serde(e) => write!(f, "serde: {e}"),
             McStoreError::MemoryDuplicateContent { id } => {
                 write!(f, "memory content already exists as ID {id}")
@@ -3286,6 +3398,11 @@ enum ClassificationTxnOutcome {
 enum CommitOutcome {
     Committed(u64),
     CasConflict(u64),
+}
+
+enum AuthorityFinishDrainOutcome {
+    Finished(Box<AuthorityRow>),
+    FeedHeadAdvanced { captured: i64, found: i64 },
 }
 
 enum PublishTxnOutcome {
@@ -3595,12 +3712,35 @@ type AbandonHistorianHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut
 
 /// The Magic Context cache-state store: one single-writer SQLite handle for the
 /// module's lifetime.
+struct FacadeAuthorityScope {
+    owner: std::thread::ThreadId,
+    route_project_root: String,
+    domain: String,
+}
+
+struct FacadeMutationScopeGuard<'a> {
+    scope: &'a Mutex<Option<FacadeAuthorityScope>>,
+}
+
+impl Drop for FacadeMutationScopeGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
 pub struct McStore {
     inner: SqliteStore,
     /// The connection-local caller identity used by note ownership triggers. It is
     /// installed only while a fenced note mutation is executing, so an unwrapped SQL
     /// writer fails closed instead of inheriting a previous operation's project.
     note_caller_project: Arc<Mutex<Option<String>>>,
+    /// Facade scope is visible to SQLite triggers for the duration of a mutation. A separate
+    /// lock serializes scopes so one request cannot lend its authority identity to another.
+    facade_authority_scope: Arc<Mutex<Option<FacadeAuthorityScope>>>,
+    facade_mutation_lock: Mutex<()>,
     #[cfg(any(test, feature = "test-support"))]
     abandon_historian_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
@@ -3608,24 +3748,53 @@ pub struct McStore {
 }
 
 impl McStore {
-    /// Open from a resolved descriptor (acquires the single-writer lease) and apply
-    /// the cache-state migration chain. Open exactly ONCE per module lifetime.
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
         let inner = open_sqlite(descriptor)?;
         let note_caller_project = Arc::new(Mutex::new(None::<String>));
-        let udf_scope = Arc::clone(&note_caller_project);
-        // Register before migrations: migration 26 creates triggers that call this function,
-        // and the same connection must have it before the first note write is possible.
+        let facade_authority_scope = Arc::new(Mutex::new(None::<FacadeAuthorityScope>));
+        let note_udf_scope = Arc::clone(&note_caller_project);
+        let facade_domain_scope = Arc::clone(&facade_authority_scope);
+        let facade_route_scope = Arc::clone(&facade_authority_scope);
+        // Register before migrations: migrations create triggers that call these functions,
+        // and the same connection must expose them before the first guarded write is possible.
         inner.with_conn(move |conn| {
             conn.create_scalar_function(
                 "mc_note_caller_project",
                 0,
                 FunctionFlags::SQLITE_UTF8,
                 move |_context| {
-                    Ok(udf_scope
+                    Ok(note_udf_scope
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone()
+                        .unwrap_or_default())
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_facade_authority_domain",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                move |_context| {
+                    Ok(facade_domain_scope
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_ref()
+                        .filter(|scope| scope.owner == std::thread::current().id())
+                        .map(|scope| scope.domain.clone())
+                        .unwrap_or_default())
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_facade_authority_route",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                move |_context| {
+                    Ok(facade_route_scope
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_ref()
+                        .filter(|scope| scope.owner == std::thread::current().id())
+                        .map(|scope| scope.route_project_root.clone())
                         .unwrap_or_default())
                 },
             )
@@ -3634,13 +3803,85 @@ impl McStore {
         let store = McStore {
             inner,
             note_caller_project,
+            facade_authority_scope,
+            facade_mutation_lock: Mutex::new(()),
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             authority_project_resolution_fail_once: std::sync::atomic::AtomicBool::new(false),
         };
         store.repair_migration_30_authority_routes()?;
+        store.prune_transform_session_roots()?;
         Ok(store)
+    }
+
+    fn prune_transform_session_roots(&self) -> Result<(), McStoreError> {
+        const THIRTY_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        self.inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM mc_transform_session_roots WHERE observed_at < ?1",
+                    params![now_ms.saturating_sub(THIRTY_DAYS_MS)],
+                )?;
+                Ok(())
+            })
+            .map_err(Into::into)
+    }
+
+    /// Recover the authenticated transform lineage after a module process restart. Cache state
+    /// alone is insufficient: the exact project root must have been committed with that session.
+    pub fn knows_transform_session_root(
+        &self,
+        session_id: &str,
+        project_root: &str,
+    ) -> Result<bool, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT 1 FROM mc_transform_session_roots
+                          WHERE session_id = ?1 AND project_root = ?2",
+                        params![session_id, project_root],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some())
+            })
+            .map_err(Into::into)
+    }
+
+    /// Run one facade mutation while SQLite triggers can verify the route's authority state in
+    /// the mutation transaction. The scope is cleared on every normal return before another
+    /// facade mutation can enter.
+    pub fn with_facade_mutation<T, E>(
+        &self,
+        route_project_root: &str,
+        domain: &str,
+        mutation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let _mutation_guard = self
+            .facade_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut scope = self
+                .facade_authority_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *scope = Some(FacadeAuthorityScope {
+                owner: std::thread::current().id(),
+                route_project_root: route_project_root.to_string(),
+                domain: domain.to_string(),
+            });
+        }
+        let _scope_guard = FacadeMutationScopeGuard {
+            scope: &self.facade_authority_scope,
+        };
+        mutation()
     }
 
     /// Complete route normalization after schema upgrades using the same caller-identity
@@ -3718,6 +3959,68 @@ impl McStore {
                       ORDER BY context_store_uuid
                       LIMIT 1",
                     params![project, domain],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Resolve a facade-supplied identity while it is module-owned or draining. DRAINING remains
+    /// visible so callers can return a retryable transition error instead of falling back to a
+    /// filesystem route.
+    pub fn facade_authority_for_project(
+        &self,
+        project: &str,
+        domain: &str,
+    ) -> Result<Option<(String, String, String)>, McStoreError> {
+        validate_authority_domain(domain)?;
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT context_store_uuid, project, state
+                       FROM mc_authority
+                      WHERE project = ?1 AND domain = ?2
+                        AND state IN ('MODULE', 'DRAINING')
+                      ORDER BY context_store_uuid
+                      LIMIT 1",
+                    params![project, domain],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Return the authority identity and state bound to this daemon route while ownership is
+    /// active or draining. Mutation callers use the state; transforms and reads keep continuity.
+    pub fn authority_project_state_for_route(
+        &self,
+        route_project_root: &str,
+        domain: &str,
+    ) -> Result<Option<(String, String)>, McStoreError> {
+        validate_authority_domain(domain)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .authority_project_resolution_fail_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(McStoreError::Serde(
+                "injected authority project resolution failure".to_string(),
+            ));
+        }
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT authority.project, authority.state
+                       FROM mc_authority_route_bindings binding
+                       JOIN mc_authority authority
+                         ON authority.context_store_uuid = binding.context_store_uuid
+                        AND authority.project = binding.project
+                      WHERE binding.route_project_root = ?1
+                        AND authority.domain = ?2
+                        AND authority.state IN ('MODULE', 'DRAINING')",
+                    params![route_project_root, domain],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -5320,6 +5623,7 @@ impl McStore {
                 consumed_drop_ids,
                 first_applied_command_ids: &[],
                 memory_revision,
+                project_root: None,
                 overlays: TransformOverlayBatch::default(),
             },
         )
@@ -5338,6 +5642,7 @@ impl McStore {
             consumed_drop_ids,
             first_applied_command_ids,
             memory_revision,
+            project_root,
             overlays,
         } = request;
         let max_seen_ordinal = overlays
@@ -5435,6 +5740,16 @@ impl McStore {
                       meta        = excluded.meta",
                 params![session_id, next as i64, core_json, meta_json],
             )?;
+            if let Some(project_root) = project_root.filter(|root| !root.is_empty()) {
+                // Durable root lineage is committed with the cache CAS, so a restart cannot
+                // authenticate a root that never produced the accepted session state.
+                tx.execute(
+                    "INSERT OR IGNORE INTO mc_transform_session_roots(
+                         session_id, project_root, observed_at
+                     ) VALUES (?1, ?2, ?3)",
+                    params![session_id, project_root, overlays.created_at_ms],
+                )?;
+            }
 
             for input in overlays.tag_mints {
                 let block_id = input.block_id.trim();
@@ -9308,16 +9623,28 @@ impl McStore {
                         )));
                     }
                     // Takeover or same-lease resume mints a fresh token so the prior
-                    // coordinator cannot keep journaling with a stale attempt identity.
+                    // coordinator cannot keep journaling with a stale attempt identity. It also
+                    // captures a new feed head after a finish fence reports a late append.
                     let token = mint_coordinator_token(lease, lease_expires_at, current.generation);
+                    let feed_head: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
+                        params![domain],
+                        |row| row.get(0),
+                    )?;
+                    let captured_upper_bound = current
+                        .captured_upper_bound
+                        .unwrap_or(0)
+                        .max(feed_head);
                     tx.execute(
                         "UPDATE mc_authority
-                            SET coordinator_lease = ?1, lease_expires_at = ?2, coordinator_token = ?3
-                          WHERE context_store_uuid = ?4 AND project = ?5 AND domain = ?6",
+                            SET coordinator_lease = ?1, lease_expires_at = ?2, coordinator_token = ?3,
+                                captured_upper_bound = ?4
+                          WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7",
                         params![
                             lease,
                             lease_expires_at,
                             token,
+                            captured_upper_bound,
                             context_store_uuid,
                             project,
                             domain
@@ -9434,7 +9761,7 @@ impl McStore {
     }
 
     /// Complete DRAINING after the host has verified every journal step.
-    /// The checksum, generation, and coordinator token are intentionally supplied
+    /// The checksum, generation, coordinator token, and captured feed head are checked
     /// together so a stale coordinator cannot publish a partial handoff.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_finish_drain(
@@ -9450,7 +9777,8 @@ impl McStore {
         now_ms: i64,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.inner
+        let outcome = self
+            .inner
             .with_conn_fenced(|tx| {
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
@@ -9488,6 +9816,20 @@ impl McStore {
                         },
                     )));
                 }
+                let feed_head: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
+                    params![domain],
+                    |row| row.get(0),
+                )?;
+                let captured = current.captured_upper_bound.unwrap_or(0);
+                if feed_head != captured {
+                    // This comparison shares the transaction with the ownership flip. A writer
+                    // either commits before the flip and forces replay, or after TypeScript owns the domain.
+                    return Ok(AuthorityFinishDrainOutcome::FeedHeadAdvanced {
+                        captured,
+                        found: feed_head,
+                    });
+                }
                 tx.execute(
                     "UPDATE mc_authority SET state = 'TS', generation = generation + 1,
                             checksum_expected = ?1, checksum_actual = ?2, checksum_ok = ?3,
@@ -9508,8 +9850,16 @@ impl McStore {
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
                 )
+                .map(Box::new)
+                .map(AuthorityFinishDrainOutcome::Finished)
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_authority_sql_error)?;
+        match outcome {
+            AuthorityFinishDrainOutcome::Finished(row) => Ok(*row),
+            AuthorityFinishDrainOutcome::FeedHeadAdvanced { captured, found } => {
+                Err(McStoreError::AuthorityFeedHeadAdvanced { captured, found })
+            }
+        }
     }
 
     /// Upsert a seeded context row by its durable source key. The source key is
@@ -11029,6 +11379,44 @@ mod tests {
     }
 
     #[test]
+    fn transform_session_root_lineage_is_cache_committed_and_pruned_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let loaded = store.load("ses").unwrap();
+        store
+            .commit_transform(
+                "ses",
+                TransformCommit {
+                    expected: loaded.row_version,
+                    core: &loaded.core,
+                    meta: &loaded.meta,
+                    consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
+                    memory_revision: None,
+                    project_root: Some("/root-a"),
+                    overlays: TransformOverlayBatch {
+                        created_at_ms: 1,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        assert!(store
+            .knows_transform_session_root("ses", "/root-a")
+            .unwrap());
+        assert!(!store
+            .knows_transform_session_root("ses", "/root-b")
+            .unwrap());
+        drop(store);
+
+        let reopened = McStore::open(&descriptor(dir.path())).unwrap();
+        assert!(!reopened
+            .knows_transform_session_root("ses", "/root-a")
+            .unwrap());
+        assert!(reopened.has_cache_state("ses").unwrap());
+    }
+
+    #[test]
     fn stale_cas_expectation_conflicts() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -11143,6 +11531,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    project_root: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tag_mints,
@@ -11216,6 +11605,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    project_root: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tags,
@@ -11363,6 +11753,7 @@ mod tests {
                     consumed_drop_ids: &[pending[0].id],
                     first_applied_command_ids: &command_ids,
                     memory_revision: None,
+                    project_root: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -11810,6 +12201,7 @@ mod tests {
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
                         memory_revision: None,
+                        project_root: None,
                         overlays: TransformOverlayBatch {
                             max_seen_ordinal: Some(3),
                             temporal_marks: &temporal_marks,
@@ -11864,6 +12256,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    project_root: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(4),
                         temporal_marks: &late_mark,
@@ -12087,7 +12480,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=32).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=33).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -14718,7 +15111,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=32).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=33).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
@@ -15200,6 +15593,144 @@ mod shadow_tests {
                 .unwrap();
             assert_eq!(finished.state, "TS");
         }
+    }
+
+    #[test]
+    fn authority_finish_drain_fences_and_recaptures_a_late_feed_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let preparing = store
+            .authority_begin_prepare("ctx", "project", "memories")
+            .unwrap();
+        let checksum = store
+            .authority_seed_checksum("ctx", "project", "memories")
+            .unwrap();
+        store
+            .authority_verify_prepare(
+                "ctx",
+                "project",
+                "memories",
+                preparing.generation,
+                &checksum,
+                &checksum,
+            )
+            .unwrap();
+        store
+            .authority_ack_prepare("ctx", "project", "memories", preparing.generation)
+            .unwrap();
+        store
+            .bind_authority_route("ctx", "project", "/route")
+            .unwrap();
+        let draining = store
+            .authority_begin_drain("ctx", "project", "memories", "lease", 10_000, 1)
+            .unwrap();
+        let token = draining.coordinator_token.as_deref().unwrap();
+        for step in [
+            "seed",
+            "memories",
+            "notes",
+            "compartments",
+            "reconcile",
+            "verify",
+        ] {
+            store
+                .authority_drain_step(
+                    "ctx",
+                    "project",
+                    "memories",
+                    draining.generation,
+                    step,
+                    Some(0),
+                    token,
+                    2,
+                )
+                .unwrap();
+        }
+        let rejected = store.with_facade_mutation("/route", "memories", || {
+            store.insert_memory(InsertMemoryInput {
+                project_path: "project",
+                route_project_root: Some("/route"),
+                category: "CONSTRAINTS",
+                content: "rejected",
+                source_session_id: None,
+                source_type: Some("tool"),
+                importance: Some(50),
+                expires_at: None,
+                metadata_json: None,
+                now_ms: 3,
+            })
+        });
+        assert!(rejected
+            .unwrap_err()
+            .to_string()
+            .contains("authority_draining"));
+        assert_eq!(
+            store
+                .pull_changefeed("memories", 0, 100)
+                .unwrap()
+                .next_cursor,
+            0
+        );
+
+        store
+            .with_facade_mutation("/route", "memories", || {
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            store.insert_memory(InsertMemoryInput {
+                                project_path: "project",
+                                route_project_root: None,
+                                category: "CONSTRAINTS",
+                                content: "late",
+                                source_session_id: None,
+                                source_type: Some("tool"),
+                                importance: Some(50),
+                                expires_at: None,
+                                metadata_json: None,
+                                now_ms: 3,
+                            })
+                        })
+                        .join()
+                        .unwrap()
+                })
+            })
+            .unwrap();
+        assert!(matches!(
+            store.authority_finish_drain(
+                "ctx",
+                "project",
+                "memories",
+                draining.generation,
+                "same",
+                "same",
+                true,
+                token,
+                3,
+            ),
+            Err(McStoreError::AuthorityFeedHeadAdvanced {
+                captured: 0,
+                found: 1
+            })
+        ));
+
+        let recaptured = store
+            .authority_begin_drain("ctx", "project", "memories", "lease", 10_000, 4)
+            .unwrap();
+        assert_eq!(recaptured.captured_upper_bound, Some(1));
+        let finished = store
+            .authority_finish_drain(
+                "ctx",
+                "project",
+                "memories",
+                recaptured.generation,
+                "same",
+                "same",
+                true,
+                recaptured.coordinator_token.as_deref().unwrap(),
+                5,
+            )
+            .unwrap();
+        assert_eq!(finished.state, "TS");
     }
 
     #[test]

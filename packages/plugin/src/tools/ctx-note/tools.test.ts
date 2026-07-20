@@ -92,6 +92,30 @@ describe("createCtxNoteTools", () => {
         expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
     });
 
+    it("maps a raced module drain rejection to the transition retry message", async () => {
+        tools = createCtxNoteTools({
+            db,
+            resolveProjectPath: () => "git:project-a",
+            rustToolBackends: {
+                authorityState: async () => "MODULE",
+                note: async () => ({
+                    error: {
+                        code: "authority_draining",
+                        message: "authority is draining",
+                    },
+                }),
+            },
+        });
+        const result = await tools.ctx_note.execute(
+            { action: "write", content: "retry me" },
+            toolContext(),
+        );
+        expect(result).toBe(
+            "Error: Rust notes authority is not ready; TypeScript fallback is disabled.",
+        );
+        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
+    });
+
     it("keeps TS note handling when the notes domain reports TS authority", async () => {
         let routed = false;
         tools = createCtxNoteTools({

@@ -12,6 +12,7 @@ import {
     updateNote,
 } from "../../features/magic-context/storage";
 import type { RustNoteToolRequest, RustToolBackends } from "../../plugin/rust-tool-backends";
+import { isRustAuthorityDrainingError } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
@@ -169,6 +170,9 @@ function moduleNoteText(response: unknown): string | null {
     if (value !== null && typeof value === "object" && "result" in value) {
         value = (value as { result?: unknown }).result;
     }
+    if (isRustAuthorityDrainingError(value)) {
+        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+    }
     if (typeof value === "string") return value;
     if (value !== null && typeof value === "object") {
         const record = value as Record<string, unknown>;
@@ -311,6 +315,9 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     if (text !== null) return text;
                     return "Error: Rust module returned an invalid ctx_note response.";
                 } catch (error) {
+                    if (isRustAuthorityDrainingError(error)) {
+                        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+                    }
                     return `Error: Rust module ctx_note failed. ${error instanceof Error ? error.message : String(error)}`;
                 }
             }

@@ -41,6 +41,7 @@ import {
     resolveWorkspaceShareCategories,
     storedPathBelongsToWorkspace,
 } from "../../features/magic-context/workspaces";
+import { isRustAuthorityDrainingError } from "../../plugin/rust-tool-backends";
 import { sessionLog } from "../../shared/logger";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, DEFAULT_SEARCH_LIMIT } from "./constants";
@@ -89,6 +90,9 @@ function moduleMemoryText(response: unknown): string | null {
     let value = response;
     if (value !== null && typeof value === "object" && "result" in value) {
         value = (value as { result?: unknown }).result;
+    }
+    if (isRustAuthorityDrainingError(value)) {
+        return "Error: Rust memory authority is not ready; TypeScript fallback is disabled.";
     }
     if (typeof value === "string") return value;
     if (value !== null && typeof value === "object") {
@@ -438,6 +442,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             text ?? "Error: Rust module returned an invalid ctx_memory response."
                         );
                     } catch (error) {
+                        if (isRustAuthorityDrainingError(error)) {
+                            return "Error: Rust memory authority is not ready; TypeScript fallback is disabled.";
+                        }
                         return `Error: Rust module ctx_memory failed. ${error instanceof Error ? error.message : String(error)}`;
                     }
                 }
