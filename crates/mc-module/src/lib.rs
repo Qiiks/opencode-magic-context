@@ -1743,9 +1743,12 @@ pub struct McHandler {
     /// lock-free map) is appropriate because writes are rare (once per route open/close)
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
-    /// Channels that have carried a validated transform request. This is server-observed
-    /// provenance, unlike the harness string copied from a route bind.
-    transform_route_channels: Mutex<HashSet<u16>>,
+    /// Validated transform channel → (session, route root). The root is part of provenance;
+    /// a cache row for the same session cannot authenticate a facade opened on another root.
+    transform_route_channels: Mutex<HashMap<u16, (String, PathBuf)>>,
+    /// Roots previously observed on a validated transform for each session. This survives route
+    /// teardown so durable cache state remains usable only along an authenticated route lineage.
+    transform_session_roots: Mutex<HashMap<String, HashSet<PathBuf>>>,
     shadow_seeds: Mutex<ShadowSeedCoordinator>,
     transform_pages: Mutex<TransformPageCoordinator>,
     state_imports: Mutex<StateImportCoordinator>,
@@ -1787,6 +1790,20 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
 }
 
 struct MissingProducerFactory;
+
+struct DreamerRunGuard {
+    registry: Arc<Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for DreamerRunGuard {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .expect("dreamer registry mutex")
+            .remove(&self.session_id);
+    }
+}
 
 struct StringSetGuard {
     sessions: Arc<Mutex<HashSet<String>>>,
@@ -2113,7 +2130,8 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
-            transform_route_channels: Mutex::new(HashSet::new()),
+            transform_route_channels: Mutex::new(HashMap::new()),
+            transform_session_roots: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
@@ -2180,7 +2198,8 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
-            transform_route_channels: Mutex::new(HashSet::new()),
+            transform_route_channels: Mutex::new(HashMap::new()),
+            transform_session_roots: Mutex::new(HashMap::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
@@ -2557,7 +2576,16 @@ impl McHandler {
             .ok_or(BindingError::Unbound)
     }
 
-    fn module_knows_transform_session(&self, session_id: &str) -> bool {
+    fn module_knows_transform_session(&self, session_id: &str, project_root: &Path) -> bool {
+        let root_observed = self
+            .transform_session_roots
+            .lock()
+            .expect("transform session roots mutex")
+            .get(session_id)
+            .is_some_and(|roots| roots.contains(project_root));
+        if !root_observed {
+            return false;
+        }
         if self
             .store
             .get()
@@ -2565,18 +2593,11 @@ impl McHandler {
         {
             return true;
         }
-        let transform_channels = self
-            .transform_route_channels
+        self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
-            .clone();
-        self.bindings
-            .lock()
-            .expect("bindings mutex")
-            .iter()
-            .any(|(channel, binding)| {
-                transform_channels.contains(channel) && binding.session == session_id
-            })
+            .values()
+            .any(|(session, root)| session == session_id && root == project_root)
     }
 
     /// Persist the route's transport-to-identity mapping when a route becomes bound to an
@@ -5272,7 +5293,19 @@ impl McHandler {
         };
         let cursor = request.get("cursor").and_then(Value::as_i64).unwrap_or(0);
         let limit = request.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-        match store.pull_changefeed(domain, cursor, limit) {
+        let page = if request
+            .get("live_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if domain != "memories" {
+                return invalid_params_error("live mirror snapshots currently support memories");
+            }
+            store.pull_live_memory_snapshot(cursor, limit)
+        } else {
+            store.pull_changefeed(domain, cursor, limit)
+        };
+        match page {
             Ok(page) => respond(json!({ "ok": true, "page": page })),
             Err(error) => HandlerOutcome::Error {
                 code: "mirror_pull_failed".to_string(),
@@ -5593,7 +5626,16 @@ impl McHandler {
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
-            .insert(channel);
+            .insert(
+                channel,
+                (binding.session.clone(), binding.project_root.clone()),
+            );
+        self.transform_session_roots
+            .lock()
+            .expect("transform session roots mutex")
+            .entry(binding.session.clone())
+            .or_default()
+            .insert(binding.project_root.clone());
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
                 code: "authority_transform_page_in_progress".to_string(),
@@ -7128,11 +7170,15 @@ impl McHandler {
         )
     }
 
-    fn register_dreamer_run(&self, session_id: &str) {
+    fn register_dreamer_run(&self, session_id: &str) -> DreamerRunGuard {
         self.active_dreamer_runs
             .lock()
             .expect("dreamer registry mutex")
             .insert(session_id.to_string());
+        DreamerRunGuard {
+            registry: Arc::clone(&self.active_dreamer_runs),
+            session_id: session_id.to_string(),
+        }
     }
 
     fn unregister_dreamer_run(&self, session_id: &str) {
@@ -7260,7 +7306,7 @@ impl McHandler {
         }
 
         let child_session = child_session_id(&authority_project, command_id);
-        self.register_dreamer_run(&child_session);
+        let _dreamer_run_guard = self.register_dreamer_run(&child_session);
         let mut attempts = 0usize;
         let mut last_error = String::new();
         let mut output = None;
@@ -7312,7 +7358,6 @@ impl McHandler {
             producer.purge_session(&child_session).await;
         }
         if output.is_none() {
-            self.unregister_dreamer_run(&child_session);
             let response = json!({
                 "ok": false,
                 "code": "dreamer_run_failed",
@@ -7329,7 +7374,6 @@ impl McHandler {
                 message: last_error,
             };
         }
-        self.unregister_dreamer_run(&child_session);
         let (model, result) = output.expect("classifier output set");
         let response = json!({
             "ok": true,
@@ -7527,6 +7571,7 @@ impl McHandler {
         channel: u16,
         arguments: Option<&Map<String, Value>>,
         authority_domain: &str,
+        bind_authority_for_write: bool,
     ) -> Result<FacadeScope, HandlerOutcome> {
         let binding = self
             .facade_binding(channel)
@@ -7542,7 +7587,7 @@ impl McHandler {
         // cannot satisfy that provenance check.
         let conversation_key = if binding.harness == OPENCODE_HARNESS
             && !is_shadow_session(bound_session)
-            && self.module_knows_transform_session(bound_session)
+            && self.module_knows_transform_session(bound_session, &binding.project_root)
         {
             bound_session.to_string()
         } else {
@@ -7569,6 +7614,11 @@ impl McHandler {
         };
 
         let route_project_root = binding.project_root.to_string_lossy().to_string();
+        if bind_authority_for_write {
+            if let Some(arguments) = arguments {
+                self.bind_facade_route_for_write(channel, arguments, authority_domain)?;
+            }
+        }
         let requested_project =
             arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
         let memory_project_path = match self.store.get() {
@@ -7587,9 +7637,15 @@ impl McHandler {
                     }
                     authority_project
                 }
-                // A route without an authority binding remains path-scoped. This fallback is
-                // decided here once; lower note and memory operations never reinterpret it.
-                Ok(None) | Err(_) => route_project_root.clone(),
+                // A route without an authority binding remains path-scoped. Lookup failures are
+                // retryable errors: silently using the route could read or write the wrong owner.
+                Ok(None) => route_project_root.clone(),
+                Err(error) => {
+                    return Err(HandlerOutcome::Error {
+                        code: "authority_project_resolution_failed".to_string(),
+                        message: error.to_string(),
+                    })
+                }
             },
             None => route_project_root.clone(),
         };
@@ -7624,13 +7680,13 @@ impl McHandler {
         {
             return tool_error_result(format!("Error: {error}."));
         }
-        if matches!(action, "write" | "update" | "archive" | "merge") {
-            if let Err(outcome) = self.bind_facade_route_for_write(channel, args, "memories") {
-                return outcome;
-            }
-        }
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories")
+            .resolve_facade_scope(
+                channel,
+                Some(args),
+                "memories",
+                matches!(action, "write" | "update" | "archive" | "merge"),
+            )
             .await
         {
             Ok(scope) => scope,
@@ -7813,7 +7869,7 @@ impl McHandler {
         }
         let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories")
+            .resolve_facade_scope(channel, Some(args), "memories", false)
             .await
         {
             Ok(scope) => scope,
@@ -7866,7 +7922,7 @@ impl McHandler {
         };
         let args = &args;
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories")
+            .resolve_facade_scope(channel, Some(args), "memories", false)
             .await
         {
             Ok(scope) => scope,
@@ -7935,7 +7991,10 @@ impl McHandler {
                 message: "note.evaluate requires session_id".to_string(),
             };
         };
-        let scope = match self.resolve_facade_scope(channel, None, "notes").await {
+        let scope = match self
+            .resolve_facade_scope(channel, None, "notes", false)
+            .await
+        {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -8014,7 +8073,10 @@ impl McHandler {
                     .to_string(),
             };
         };
-        let scope = match self.resolve_facade_scope(channel, None, "notes").await {
+        let scope = match self
+            .resolve_facade_scope(channel, None, "notes", false)
+            .await
+        {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
@@ -8065,13 +8127,13 @@ impl McHandler {
         let action = string_arg(args, "action")
             .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
             .unwrap_or("read");
-        if matches!(action, "write" | "update" | "dismiss") {
-            if let Err(outcome) = self.bind_facade_route_for_write(channel, args, "notes") {
-                return outcome;
-            }
-        }
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "notes")
+            .resolve_facade_scope(
+                channel,
+                Some(args),
+                "notes",
+                matches!(action, "write" | "update" | "dismiss"),
+            )
             .await
         {
             Ok(scope) => scope,
@@ -12432,7 +12494,17 @@ mod tests {
             7,
             binding_with_harness(project_root, OPENCODE_HARNESS, "opencode-session"),
         );
-        handler.transform_route_channels.lock().unwrap().insert(7);
+        handler.transform_route_channels.lock().unwrap().insert(
+            7,
+            ("opencode-session".to_string(), PathBuf::from(project_root)),
+        );
+        handler
+            .transform_session_roots
+            .lock()
+            .unwrap()
+            .entry("opencode-session".to_string())
+            .or_default()
+            .insert(PathBuf::from(project_root));
 
         let memory = call_facade(
             &handler,
@@ -12497,6 +12569,46 @@ mod tests {
             .search_notes_like(project.to_str().unwrap(), "wrapper-instance", "token keyed")
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn opencode_cache_provenance_cannot_rebind_a_second_project_root() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::None)]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver.clone(),
+        );
+        let root_a = project.to_str().unwrap();
+        handler.bind_route(7, binding_with_harness(root_a, OPENCODE_HARNESS, "ses"));
+        let transformed =
+            call_transform_request_on_channel(&handler, 7, request(vec![ck("m0", 0, "a")])).await;
+        assert_eq!(transformed["action"], "HARD");
+        activate_module_authority(&store, "context", "git:identity", root_a, "memories");
+
+        let root_b = project.join("other-root");
+        let root_b = root_b.to_str().unwrap();
+        handler.bind_route(8, binding_with_harness(root_b, OPENCODE_HARNESS, "ses"));
+        let outcome = call_facade_on_channel(
+            &handler,
+            8,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "must not cross roots",
+                "memory_project": "git:identity",
+            }),
+        )
+        .await;
+        assert_eq!(error_code(outcome), "session_unresolved");
+        assert_eq!(resolver.calls(), vec!["ses"]);
+        assert_eq!(
+            store
+                .authority_project_for_route(root_b, "memories")
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12932,6 +13044,42 @@ mod tests {
         )
         .await;
         assert_eq!(error_code(timeout), "session_resolve_timeout");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_authority_lookup_failure_is_retryable_and_never_falls_back() {
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let project_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(project_root, "token"));
+        store.fail_next_authority_project_resolution_for_test();
+        let arguments = json!({
+            "action": "write",
+            "category": "CONSTRAINTS",
+            "content": "retry after authority lookup",
+        });
+
+        let failed = call_facade(&handler, "ctx_memory", arguments.clone()).await;
+        assert_eq!(error_code(failed), "authority_project_resolution_failed");
+        assert!(store
+            .load_active_memories(project_root, now_ms())
+            .unwrap()
+            .is_empty());
+
+        let retried = call_facade(&handler, "ctx_memory", arguments).await;
+        assert!(!tool_is_error(retried));
+        assert_eq!(
+            store
+                .load_active_memories(project_root, now_ms())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13396,8 +13544,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .generation;
-        let before = crate::m1_compose::m1_revision_signal(&store, "git:classify", "session")
-            .unwrap();
+        let before =
+            crate::m1_compose::m1_revision_signal(&store, "git:classify", "session").unwrap();
         let outcome = call_facade(
             &handler,
             "memory.set_classification",
@@ -13434,14 +13582,54 @@ mod tests {
             store.get_memory_full(fresh_id).unwrap().unwrap().importance,
             Some(91)
         );
-        let after = crate::m1_compose::m1_revision_signal(&store, "git:classify", "session")
-            .unwrap();
+        let after =
+            crate::m1_compose::m1_revision_signal(&store, "git:classify", "session").unwrap();
         assert_eq!(before, after, "classification metadata must not change m1");
         let feed = store.pull_changefeed("memories", 0, 100).unwrap();
         assert!(feed
             .rows
             .iter()
             .any(|row| row.op == "update" && row.module_row_id == fresh_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_dreamer_run_unregisters_its_child_session() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_root, "parent"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+        let child_session = child_session_id("git:identity", "cancel-command");
+        let handler = Arc::new(handler);
+        let running_handler = Arc::clone(&handler);
+        let task = tokio::spawn(async move {
+            running_handler
+                .handle_dreamer_run_task(
+                    7,
+                    &json!({
+                        "v": 1,
+                        "session_id": "parent",
+                        "task": CLASSIFY_TASK,
+                        "command_id": "cancel-command",
+                        "authority_generation": generation,
+                        "payload": { "prompt_body": "classify", "items": [] },
+                    }),
+                )
+                .await
+        });
+        wait_for_count(&producer.await_outputs, 1).await;
+        assert!(handler.dreamer_run_registered(&child_session));
+
+        task.abort();
+        let _ = task.await;
+        assert!(!handler.dreamer_run_registered(&child_session));
     }
 
     #[tokio::test(flavor = "current_thread")]
