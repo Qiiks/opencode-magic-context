@@ -262,6 +262,13 @@ interface ShadowStateSyncPayload {
         workspace?: ShadowWorkspacePayload | null;
         last_todo_state?: string;
         acked_watermarks?: ShadowWatermarks;
+        drop_seeds?: Array<{
+            block_id: string;
+            related_block_ids?: string[];
+            drop_mode: "full" | "truncated" | "edit_marker";
+            payload?: string;
+        }>;
+        drop_seed_skipped?: number;
     };
     watermarks: ShadowWatermarks;
     wireBatches?: ShadowStateSyncPayload[];
@@ -285,6 +292,8 @@ function buildPagedSeedPayloads(args: {
     compartments: unknown[];
     memories: unknown[];
     memoryMutations: unknown[];
+    dropSeeds?: ShadowStateSyncPayload["params"]["drop_seeds"];
+    dropSeedSkipped?: number;
     userProfile: string[];
     workspace: ShadowWorkspacePayload | null;
     lastTodoState: string;

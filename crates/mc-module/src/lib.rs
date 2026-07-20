@@ -54,11 +54,11 @@ use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, Storag
 use mc_store::{
     canonical_root, validate_state_import_compartments, HistorianPhase, InsertMemoryInput,
     MappingUpdate, McStore, McStoreError, NoteCasOutcome, NoteEvaluationInput, NoteInput,
-    NoteWriteInput, RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowMemoryMutationRow,
-    ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow,
-    ShadowWorkspaceRow, StateImportError, StateImportPreflight, StateImportValidationError,
-    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
-    TodoStateSetOutcome, VerificationUpdate, WrapupCommandRecord,
+    NoteWriteInput, RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowDropSeedRow,
+    ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest,
+    ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError, StateImportPreflight,
+    StateImportValidationError, StoredChunkTranscript, StoredCompartment, StoredMemoryMutation,
+    StoredNote, TodoStateSetOutcome, VerificationUpdate, WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -310,6 +310,22 @@ struct ShadowStateSyncWire {
     last_todo_state: Option<String>,
     #[serde(default)]
     acked_watermarks: Option<Value>,
+    #[serde(default)]
+    drop_seeds: Vec<ShadowDropSeedWire>,
+    #[serde(default)]
+    drop_seed_skipped: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShadowDropSeedWire {
+    #[serde(alias = "target_id")]
+    block_id: String,
+    #[serde(default)]
+    related_block_ids: Vec<String>,
+    #[serde(alias = "mode")]
+    drop_mode: String,
+    #[serde(default)]
+    payload: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6098,7 +6114,11 @@ impl McHandler {
                 .is_some_and(|object| object.contains_key(**field))
         })
         .count();
-        if (!seed_complete && scalar_tail_fields != 0) || (seed_complete && scalar_tail_fields != 4)
+        let drop_seed_skipped_present = request
+            .as_object()
+            .is_some_and(|object| object.contains_key("drop_seed_skipped"));
+        if !seed_complete && (scalar_tail_fields != 0 || drop_seed_skipped_present)
+            || seed_complete && scalar_tail_fields != 4
         {
             self.discard_shadow_seed(&binding.session);
             return HandlerOutcome::Error {
@@ -6403,6 +6423,17 @@ impl McHandler {
         parsed: ShadowStateSyncWire,
         lane: StateSyncLane,
     ) -> HandlerOutcome {
+        let drop_seeds: Vec<ShadowDropSeedRow> = parsed
+            .drop_seeds
+            .into_iter()
+            .map(|seed| ShadowDropSeedRow {
+                block_id: seed.block_id,
+                related_block_ids: seed.related_block_ids,
+                drop_mode: seed.drop_mode,
+                payload: seed.payload,
+            })
+            .collect();
+        let drop_seed_skipped = parsed.drop_seed_skipped;
         let compartments: Vec<StoredCompartment> = parsed
             .compartments
             .into_iter()
@@ -6509,6 +6540,8 @@ impl McHandler {
                 shadow_generation: parsed.shadow_generation,
                 expected_shadow_seq: parsed.expected_shadow_seq,
                 seed_boundary_id: parsed.seed_boundary_id.as_deref(),
+                drop_seeds: &drop_seeds,
+                drop_seed_skipped,
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &memory_mutations,
@@ -6524,6 +6557,8 @@ impl McHandler {
                 shadow_generation: parsed.shadow_generation,
                 expected_shadow_seq: parsed.expected_shadow_seq,
                 seed_boundary_id: parsed.seed_boundary_id.as_deref(),
+                drop_seeds: &drop_seeds,
+                drop_seed_skipped,
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &memory_mutations,
@@ -6540,6 +6575,7 @@ impl McHandler {
                 "shadow_seq": result.shadow_seq,
                 "row_version": result.row_version,
                 "memories_skipped": result.memories_skipped,
+                "drop_seeds_skipped": result.drop_seeds_skipped,
             })),
             Err(ShadowStateSyncError::GenerationMismatch { expected, found }) => {
                 HandlerOutcome::Error {
@@ -9282,16 +9318,19 @@ fn assemble_shadow_seed(
     let mut compartments = Vec::new();
     let mut memories = Vec::new();
     let mut memory_mutations = Vec::new();
+    let mut drop_seeds = Vec::new();
     let mut user_profile = Vec::new();
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
         memories.append(&mut batch.memories);
         memory_mutations.append(&mut batch.memory_mutations);
+        drop_seeds.append(&mut batch.drop_seeds);
         user_profile.append(&mut batch.user_profile);
     }
     compartments.append(&mut final_batch.compartments);
     memories.append(&mut final_batch.memories);
     memory_mutations.append(&mut final_batch.memory_mutations);
+    drop_seeds.append(&mut final_batch.drop_seeds);
     user_profile.append(&mut final_batch.user_profile);
     ShadowStateSyncWire {
         session_id: final_batch.session_id,
@@ -9310,6 +9349,8 @@ fn assemble_shadow_seed(
         workspace: final_batch.workspace,
         last_todo_state: final_batch.last_todo_state,
         acked_watermarks: final_batch.acked_watermarks,
+        drop_seeds,
+        drop_seed_skipped: final_batch.drop_seed_skipped,
     }
 }
 
@@ -20337,6 +20378,8 @@ mod tests {
                 shadow_generation: 1,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],

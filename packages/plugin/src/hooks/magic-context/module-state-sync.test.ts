@@ -7,6 +7,11 @@ import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { getCompartments } from "../../features/magic-context/storage";
+import {
+    insertTag,
+    updateTagDropMode,
+    updateTagStatus,
+} from "../../features/magic-context/storage-tags";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -34,7 +39,7 @@ function useTempDataHome(prefix: string): void {
 
 function createOpenCodeDb(
     sessionId: string,
-    messages: Array<{ id: string; role: string; summary?: boolean }>,
+    messages: Array<{ id: string; role: string; summary?: boolean; parts?: unknown[] }>,
 ): void {
     const dbPath = join(process.env.XDG_DATA_HOME ?? "", "opencode", "opencode.db");
     mkdirSync(dirname(dbPath), { recursive: true });
@@ -77,13 +82,15 @@ function createOpenCodeDb(
                     finish: message.summary === true ? "stop" : undefined,
                 }),
             );
-            insertPart.run(
-                message.id,
-                sessionId,
-                timestamp,
-                timestamp,
-                JSON.stringify({ type: "text", text: message.id }),
-            );
+            for (const part of message.parts ?? [{ type: "text", text: message.id }]) {
+                insertPart.run(
+                    message.id,
+                    sessionId,
+                    timestamp,
+                    timestamp,
+                    JSON.stringify(part),
+                );
+            }
         });
     } finally {
         closeQuietly(db);
@@ -141,6 +148,77 @@ function syntheticWireMessage(
         parts: [{ type: "text", text: id, synthetic: true }],
     };
 }
+
+describe("module drop-state cold-start seed", () => {
+    it("maps dropped message and tool tags to deterministic module blocks", async () => {
+        useTempDataHome("module-state-sync-drop-seed-");
+        const sessionId = "ses-drop-seed";
+        createOpenCodeDb(sessionId, [
+            {
+                id: "m1",
+                role: "assistant",
+                parts: [
+                    {
+                        type: "tool",
+                        callID: "call-1",
+                        tool: "edit",
+                        state: {
+                            status: "completed",
+                            input: {
+                                filePath: "src/main.ts",
+                                content: "a very long edit payload that should be hinted",
+                            },
+                            output: "large output",
+                        },
+                    },
+                ],
+            },
+            { id: "m2", role: "user" },
+        ]);
+        const db = createContextDb();
+        insertTag(db, sessionId, "call-1", "tool", 100, 1, 0, "edit", 20, "m1");
+        updateTagStatus(db, sessionId, 1, "dropped");
+        updateTagDropMode(db, sessionId, 1, "edit_marker");
+        insertTag(db, sessionId, "m2:p0", "message", 100, 2);
+        updateTagStatus(db, sessionId, 2, "dropped");
+        insertTag(db, sessionId, "missing-call", "tool", 100, 3, 0, "bash", 20, null);
+        updateTagStatus(db, sessionId, 3, "dropped");
+
+        const calls: unknown[] = [];
+        await syncModuleState({
+            client: {
+                async call(args) {
+                    calls.push(args.body);
+                    return { result: { shadow_seq: 1 } };
+                },
+            },
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            projectRoot: "/tmp/project",
+            force: true,
+        });
+
+        const body = calls[0] as {
+            drop_seeds: Array<{
+                block_id: string;
+                related_block_ids?: string[];
+                drop_mode: string;
+                payload?: string;
+            }>;
+            drop_seed_skipped: number;
+        };
+        expect(body.drop_seeds).toEqual([
+            expect.objectContaining({
+                block_id: "m1#0",
+                related_block_ids: ["m1#1"],
+                drop_mode: "edit_marker",
+            }),
+            expect.objectContaining({ block_id: "m2#0", drop_mode: "full" }),
+        ]);
+        expect(body.drop_seeds[0]?.payload).toContain("src/main.ts");
+        expect(body.drop_seed_skipped).toBe(1);
+    });
+});
 
 describe("module state authority direction", () => {
     it("omits module-owned memory sections from the TypeScript sender payload", async () => {

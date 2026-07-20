@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-use cortexkit_cache_core::CoreState;
+use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
@@ -3179,6 +3179,14 @@ pub struct ShadowMemoryMutationRow {
     pub mutation: StoredMemoryMutation,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowDropSeedRow {
+    pub block_id: String,
+    pub related_block_ids: Vec<String>,
+    pub drop_mode: String,
+    pub payload: Option<String>,
+}
+
 pub struct ShadowStateSyncRequest<'a> {
     pub session_id: &'a str,
     pub shadow_project_path: &'a str,
@@ -3186,6 +3194,8 @@ pub struct ShadowStateSyncRequest<'a> {
     pub expected_shadow_seq: u64,
     /// The producer's current flat compaction boundary. Present only on a full seed.
     pub seed_boundary_id: Option<&'a str>,
+    pub drop_seeds: &'a [ShadowDropSeedRow],
+    pub drop_seed_skipped: usize,
     pub compartments: &'a [StoredCompartment],
     pub memories: &'a [ShadowMemoryRow],
     pub memory_mutations: &'a [ShadowMemoryMutationRow],
@@ -3202,6 +3212,8 @@ pub struct ShadowStateSyncResult {
     pub row_version: u64,
     /// True when incoming memory sections were skipped because the module owns memories.
     pub memories_skipped: bool,
+    /// Number of TS drop rows that could not be materialized into frozen module units.
+    pub drop_seeds_skipped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3873,6 +3885,123 @@ pub struct McStore {
     abandon_historian_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
     authority_project_resolution_fail_once: std::sync::atomic::AtomicBool,
+}
+
+fn valid_drop_seed_block_id(block_id: &str) -> bool {
+    let Some((mid, index)) = block_id.rsplit_once('#') else {
+        return false;
+    };
+    !mid.is_empty() && !mid.contains('#') && index.parse::<usize>().is_ok()
+}
+
+fn seeded_drop_unit(
+    block_id: &str,
+    drop_mode: &str,
+    payload: Option<&str>,
+    related: bool,
+) -> Option<FrozenUnit> {
+    if !valid_drop_seed_block_id(block_id) {
+        return None;
+    }
+    let (kind, frozen_payload) = if related || drop_mode == "full" {
+        ("drop", "[dropped]".to_string())
+    } else if drop_mode == "truncated" || drop_mode == "skeleton" {
+        ("skeleton", "[dropped]".to_string())
+    } else if drop_mode == "edit_marker" {
+        ("edit_marker", payload.unwrap_or("[dropped]").to_string())
+    } else {
+        return None;
+    };
+    Some(FrozenUnit {
+        key: format!("red:{block_id}"),
+        kind: kind.to_string(),
+        frozen_payload,
+        durability_class: DurabilityClass::Lineage,
+        reset_rule: String::new(),
+    })
+}
+
+/// Materialize the TypeScript drop snapshot before the first transform. A tag
+/// may name a tool arc, so its paired result receives the module's normal drop
+/// unit while the call block keeps the requested skeleton or edit marker kind.
+fn materialize_drop_seed_units(
+    core: &mut CoreState,
+    session_id: &str,
+    seeds: &[ShadowDropSeedRow],
+    initial_skipped: usize,
+) -> usize {
+    let mut skipped = initial_skipped;
+    let mut candidates = BTreeMap::<String, FrozenUnit>::new();
+    for seed in seeds {
+        let Some(primary) = seeded_drop_unit(
+            &seed.block_id,
+            &seed.drop_mode,
+            seed.payload.as_deref(),
+            false,
+        ) else {
+            skipped = skipped.saturating_add(1);
+            eprintln!(
+                "mc-store: skipped invalid drop seed for session {session_id}: {}",
+                seed.block_id
+            );
+            continue;
+        };
+        let primary_key = primary.key.clone();
+        if let Some(existing) = candidates.get(&primary_key) {
+            if existing != &primary {
+                let existing_order = (&existing.kind, &existing.frozen_payload);
+                let primary_order = (&primary.kind, &primary.frozen_payload);
+                if primary_order < existing_order {
+                    candidates.insert(primary_key.clone(), primary);
+                }
+                eprintln!(
+                    "mc-store: resolved conflicting drop seed deterministically for session {session_id}: {}",
+                    primary_key
+                );
+            }
+        } else {
+            candidates.insert(primary_key, primary);
+        }
+        let mut related = seed.related_block_ids.clone();
+        related.sort();
+        related.dedup();
+        for block_id in related {
+            let Some(unit) = seeded_drop_unit(&block_id, "full", None, true) else {
+                skipped = skipped.saturating_add(1);
+                eprintln!(
+                    "mc-store: skipped invalid related drop seed for session {session_id}: {block_id}"
+                );
+                continue;
+            };
+            if let Some(existing) = candidates.get(&unit.key) {
+                if existing != &unit {
+                    eprintln!(
+                        "mc-store: ignored conflicting related drop seed for session {session_id}: {}",
+                        unit.key
+                    );
+                }
+            } else {
+                candidates.insert(unit.key.clone(), unit);
+            }
+        }
+    }
+
+    for (key, unit) in candidates {
+        if let Some(existing) = core
+            .frozen_units
+            .iter()
+            .find(|existing| existing.key == key)
+        {
+            if existing != &unit {
+                eprintln!(
+                    "mc-store: retained existing frozen drop unit for session {session_id}: {key}"
+                );
+            }
+            continue;
+        }
+        core.frozen_units.push(unit);
+    }
+    skipped
 }
 
 impl McStore {
@@ -6266,6 +6395,13 @@ impl McStore {
                 meta.pending_rewrite = None;
             }
 
+            let drop_seeds_skipped = materialize_drop_seed_units(
+                &mut core,
+                request.session_id,
+                request.drop_seeds,
+                request.drop_seed_skipped,
+            );
+
             for compartment in request.compartments {
                 upsert_compartment_tx(tx, request.session_id, compartment)?;
             }
@@ -6342,6 +6478,7 @@ impl McStore {
                 shadow_seq: meta.shadow_seq,
                 row_version: next,
                 memories_skipped,
+                drop_seeds_skipped,
             }))
         })?;
 
@@ -15109,6 +15246,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &[],
                 memories: &[own, shared, private],
                 memory_mutations: &[],
@@ -15175,6 +15314,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &mutations,
@@ -15205,6 +15346,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -15235,6 +15378,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -15266,6 +15411,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &initial,
                 memories: &[],
                 memory_mutations: &[],
@@ -15286,6 +15433,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 1,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &replacement,
                 memories: &[],
                 memory_mutations: &[],
@@ -15314,6 +15463,8 @@ mod shadow_tests {
                 shadow_generation: 1,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &replacement,
                 memories: &[],
                 memory_mutations: &[],
@@ -15340,6 +15491,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: Some("tail#1"),
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &compartments,
                 memories: &[],
                 memory_mutations: &[],
@@ -15357,6 +15510,114 @@ mod shadow_tests {
         assert_eq!(loaded.meta.shadow_seq, 0);
         assert!(loaded.core.boundary_id.is_empty());
         assert!(store.load_compartments(session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn drop_seed_units_are_frozen_before_transform_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "shadow:drop-seed";
+        let seeds = vec![
+            ShadowDropSeedRow {
+                block_id: "m1#0".to_string(),
+                related_block_ids: vec!["m1#1".to_string()],
+                drop_mode: "truncated".to_string(),
+                payload: None,
+            },
+            ShadowDropSeedRow {
+                block_id: "m2#0".to_string(),
+                related_block_ids: vec![],
+                drop_mode: "edit_marker".to_string(),
+                payload: Some("{\"filePath\":\"src/main.ts\"}".to_string()),
+            },
+        ];
+        let first = store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                drop_seeds: &seeds,
+                drop_seed_skipped: 0,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                user_profile: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+        assert_eq!(first.drop_seeds_skipped, 0);
+        let first_state = store.load(session).unwrap();
+        assert_eq!(first_state.core.frozen_units.len(), 3);
+        assert_eq!(first_state.core.frozen_units[0].key, "red:m1#0");
+        assert_eq!(first_state.core.frozen_units[0].kind, "skeleton");
+        assert_eq!(first_state.core.frozen_units[0].frozen_payload, "[dropped]");
+        assert_eq!(first_state.core.frozen_units[1].key, "red:m1#1");
+
+        let second = store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: session,
+                shadow_project_path: session,
+                shadow_generation: 0,
+                expected_shadow_seq: 1,
+                seed_boundary_id: None,
+                drop_seeds: &seeds,
+                drop_seed_skipped: 0,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                user_profile: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+        assert_eq!(second.drop_seeds_skipped, 0);
+        let second_state = store.load(session).unwrap();
+        assert_eq!(
+            second_state.core.frozen_units,
+            first_state.core.frozen_units
+        );
+    }
+
+    #[test]
+    fn invalid_drop_seed_is_counted_without_rejecting_state_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let seeds = [ShadowDropSeedRow {
+            block_id: "not-a-block".to_string(),
+            related_block_ids: vec![],
+            drop_mode: "full".to_string(),
+            payload: None,
+        }];
+        let result = store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: "shadow:drop-seed-invalid",
+                shadow_project_path: "shadow:drop-seed-invalid",
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                drop_seeds: &seeds,
+                drop_seed_skipped: 3,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                user_profile: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: serde_json::Value::Null,
+            })
+            .unwrap();
+        assert_eq!(result.drop_seeds_skipped, 4);
+        assert!(store
+            .load("shadow:drop-seed-invalid")
+            .unwrap()
+            .core
+            .frozen_units
+            .is_empty());
     }
 
     #[test]
@@ -15781,6 +16042,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &[],
                 memories: &[incoming],
                 memory_mutations: &[],
@@ -15869,6 +16132,8 @@ mod shadow_tests {
                     shadow_generation: 0,
                     expected_shadow_seq: 0,
                     seed_boundary_id: None,
+                    drop_seeds: &[],
+                    drop_seed_skipped: 0,
                     compartments: &[],
                     memories: &[incoming],
                     memory_mutations: &[],
@@ -15953,6 +16218,8 @@ mod shadow_tests {
                     shadow_generation: 0,
                     expected_shadow_seq: 0,
                     seed_boundary_id: None,
+                    drop_seeds: &[],
+                    drop_seed_skipped: 0,
                     compartments: &[],
                     memories: &[incoming],
                     memory_mutations: &[],
@@ -16786,6 +17053,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &[comp(0, 0, "first#0")],
                 memories: &[],
                 memory_mutations: &[],
@@ -16803,6 +17072,8 @@ mod shadow_tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &[comp(1, 1, "second#0")],
                 memories: &[],
                 memory_mutations: &[],

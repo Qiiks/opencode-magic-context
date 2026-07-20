@@ -6,6 +6,8 @@ import {
 } from "../../features/magic-context/memory/storage-memory";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
+import { getTagsBySession } from "../../features/magic-context/storage-tags";
+import type { TagEntry } from "../../features/magic-context/types";
 import {
     getMaxMemoryMutationIdForProjects,
     getMemoryMutationsForRenderByProjects,
@@ -20,7 +22,11 @@ import {
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
-import { MODULE_PAGE_MAX_BYTES, moduleWireBodyBytes } from "./module-wire";
+import {
+    MODULE_PAGE_MAX_BYTES,
+    moduleRawBlockMappings,
+    moduleWireBodyBytes,
+} from "./module-wire";
 import {
     readRawSessionMessageOrdinalById,
     readRawSessionMessagePartsById,
@@ -39,6 +45,17 @@ export interface ModuleWatermarks {
 export interface ModuleWorkspacePayload {
     fingerprint: string;
     members: Array<{ project_path: string; share_categories: string[] }>;
+}
+
+export type ModuleDropMode = "full" | "truncated" | "edit_marker";
+
+export interface ModuleDropSeed {
+    block_id: string;
+    /** Paired result blocks for a tool tag; they use the module's drop kind. */
+    related_block_ids?: string[];
+    drop_mode: ModuleDropMode;
+    /** Canonical edit-marker input, when the source tool carries one. */
+    payload?: string;
 }
 
 export interface ModuleStateSyncPayload {
@@ -60,6 +77,8 @@ export interface ModuleStateSyncPayload {
         workspace?: ModuleWorkspacePayload | null;
         last_todo_state?: string;
         acked_watermarks?: ModuleWatermarks;
+        drop_seeds?: ModuleDropSeed[];
+        drop_seed_skipped?: number;
     };
     watermarks: ModuleWatermarks;
     wireBatches?: ModuleStateSyncPayload[];
@@ -297,58 +316,15 @@ export function moduleWatermarksEqual(
     );
 }
 
-function flatBlockCountForRawMessage(message: RawMessageParts | null): number {
-    if (!message) return 1;
-    let count = 0;
-    for (const part of message.parts) {
-        if (!isRecord(part)) {
-            count += 1;
-            continue;
-        }
-        const type = typeof part.type === "string" ? part.type : "unknown";
-        switch (type) {
-            case "text":
-                if (part.ignored !== true) count += 1;
-                break;
-            case "reasoning":
-            case "file":
-            case "image":
-            case "step-start":
-            case "subtask":
-                count += 1;
-                break;
-            case "tool": {
-                count += 1;
-                const state = isRecord(part.state) ? part.state : undefined;
-                const status = state?.status;
-                const hasCompletedStatus = status === "completed" || status === "error";
-                const hasOutput = state
-                    ? typeof state.output === "string" || typeof state.error === "string"
-                    : typeof part.output === "string" || typeof part.error === "string";
-                if (hasCompletedStatus || hasOutput) count += 1;
-                break;
-            }
-            case "compaction":
-            case "step-finish":
-            case "snapshot":
-            case "patch":
-            case "agent":
-            case "retry":
-                break;
-            default:
-                count += 1;
-                break;
-        }
-    }
-    return Math.max(1, count);
-}
+
 
 function flatBlockIdForRawMessage(
     messageId: string,
     raw: RawMessageParts | null,
     edge: "start" | "end",
 ): string {
-    const blockIndex = edge === "start" ? 0 : flatBlockCountForRawMessage(raw) - 1;
+    const mappings = moduleRawBlockMappings(raw);
+    const blockIndex = edge === "start" ? 0 : (mappings.at(-1)?.blockIndex ?? 0);
     return `${messageId}#${blockIndex}`;
 }
 
@@ -444,10 +420,132 @@ function seedBoundaryFromSerializedCompartments(compartments: unknown[]): string
     return typeof tail?.end_message_id === "string" ? tail.end_message_id : null;
 }
 
+function canonicalSeedJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(canonicalSeedJson).join(",")}]`;
+    if (value !== null && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        return `{${Object.keys(record)
+            .sort()
+            .map((key) => `${JSON.stringify(key)}:${canonicalSeedJson(record[key])}`)
+            .join(",")}}`;
+    }
+    const encoded = JSON.stringify(value);
+    return encoded === undefined ? "null" : encoded;
+}
+
+function editMarkerSeedPayload(input: unknown): string | undefined {
+    if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
+    const copy = JSON.parse(JSON.stringify(input)) as Record<string, unknown>;
+    const pathKeys = new Set(["filePath", "file_path", "path"]);
+    const diffKeys = new Set(["oldString", "newString", "content", "old_string", "new_string"]);
+    for (const [key, value] of Object.entries(copy)) {
+        if (pathKeys.has(key) || !diffKeys.has(key) || typeof value !== "string") continue;
+        if (value.endsWith("...[truncated]")) continue;
+        if (value.length > 40) {
+            const end =
+                value.charCodeAt(39) >= 0xd800 && value.charCodeAt(39) <= 0xdbff ? 39 : 40;
+            copy[key] = `${value.slice(0, end)}...[truncated]`;
+        }
+    }
+    return canonicalSeedJson(copy);
+}
+
+function dropSeedAddress(tag: TagEntry): { messageId: string; partIndex: number | null } | null {
+    const match = /^(.*):(p|file)(\d+)$/.exec(tag.messageId);
+    if (!match) return { messageId: tag.messageId, partIndex: null };
+    return { messageId: match[1], partIndex: Number(match[3]) };
+}
+
+function buildDropSeeds(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    readRawById: (messageId: string) => RawMessageParts | null;
+}): { seeds: ModuleDropSeed[]; skipped: number } {
+    const byBlock = new Map<string, ModuleDropSeed>();
+    let skipped = 0;
+    const skip = (tag: TagEntry, reason: string): void => {
+        skipped += 1;
+        sessionLog(args.sessionId, `module drop seed skipped tag ${tag.tagNumber}: ${reason}`);
+    };
+    for (const tag of getTagsBySession(args.db, args.sessionId)) {
+        if (tag.status !== "dropped") continue;
+        if (tag.type === "tool") {
+            if (!tag.toolOwnerMessageId) {
+                skip(tag, "tool owner message is missing");
+                continue;
+            }
+            const raw = args.readRawById(tag.toolOwnerMessageId);
+            const mappings = moduleRawBlockMappings(raw);
+            const call = mappings.find(
+                (mapping) => mapping.kind === "tool_call" && mapping.callId === tag.messageId,
+            );
+            if (!call) {
+                skip(tag, "tool call no longer maps to a module block");
+                continue;
+            }
+            const related = mappings
+                .filter(
+                    (mapping) =>
+                        mapping.kind === "tool_result" && mapping.callId === tag.messageId,
+                )
+                .map((mapping) => `${tag.toolOwnerMessageId}#${mapping.blockIndex}`)
+                .sort();
+            const seed: ModuleDropSeed = {
+                block_id: `${tag.toolOwnerMessageId}#${call.blockIndex}`,
+                ...(related.length > 0 ? { related_block_ids: related } : {}),
+                drop_mode: tag.dropMode,
+                ...(tag.dropMode === "edit_marker"
+                    ? { payload: editMarkerSeedPayload(call.toolInput) }
+                    : {}),
+            };
+            const existing = byBlock.get(seed.block_id);
+            if (!existing || canonicalSeedJson(seed) < canonicalSeedJson(existing)) {
+                byBlock.set(seed.block_id, seed);
+            }
+            continue;
+        }
+        if (tag.messageId.length === 0) {
+            skip(tag, "message tag identity is empty");
+            continue;
+        }
+        const address = dropSeedAddress(tag);
+        if (!address) {
+            skip(tag, "message tag identity is empty");
+            continue;
+        }
+        const raw = args.readRawById(address.messageId);
+        const mappings = moduleRawBlockMappings(raw);
+        const mapping = mappings.find(
+            (candidate) =>
+                (address.partIndex === null || candidate.partIndex === address.partIndex) &&
+                (tag.type === "file" ? candidate.kind === "file" : candidate.kind === "text"),
+        );
+        if (!mapping) {
+            skip(tag, "message part no longer maps to a module block");
+            continue;
+        }
+        const seed: ModuleDropSeed = {
+            block_id: `${address.messageId}#${mapping.blockIndex}`,
+            drop_mode: tag.dropMode,
+        };
+        const existing = byBlock.get(seed.block_id);
+        if (!existing || canonicalSeedJson(seed) < canonicalSeedJson(existing)) {
+            byBlock.set(seed.block_id, seed);
+        }
+    }
+    return {
+        seeds: [...byBlock.values()].sort((left, right) =>
+            canonicalSeedJson(left).localeCompare(canonicalSeedJson(right)),
+        ),
+        skipped,
+    };
+}
+
 type SeedItem =
     | { kind: "compartment"; value: unknown }
     | { kind: "memory"; value: unknown }
     | { kind: "memory_mutation"; value: unknown }
+    | { kind: "drop_seed"; value: ModuleDropSeed }
     | { kind: "user_profile"; value: string };
 
 export function buildPagedModuleStateSyncPayloads(args: {
@@ -458,6 +556,8 @@ export function buildPagedModuleStateSyncPayloads(args: {
     compartments: unknown[];
     memories: unknown[];
     memoryMutations: unknown[];
+    dropSeeds?: ModuleDropSeed[];
+    dropSeedSkipped?: number;
     userProfile: string[];
     workspace: ModuleWorkspacePayload | null;
     lastTodoState: string;
@@ -472,6 +572,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         ...(args.omitAuthorityMemorySections
             ? []
             : args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const)),
+        ...(args.dropSeeds ?? []).map((value) => ({ kind: "drop_seed", value }) as const),
         ...args.userProfile.map((value) => ({ kind: "user_profile", value }) as const),
     ];
     const makePayload = (input: {
@@ -481,7 +582,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
         compartments: unknown[];
         memories: unknown[];
         memoryMutations: unknown[];
+        dropSeeds?: ModuleDropSeed[];
         userProfile: string[];
+        dropSeedSkipped?: number;
     }): ModuleStateSyncPayload => ({
         method: "state_sync",
         params: {
@@ -500,14 +603,18 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       memory_mutations: input.memoryMutations,
                   }),
             user_profile: input.userProfile,
+            ...(args.dropSeeds !== undefined ? { drop_seeds: input.dropSeeds } : {}),
             ...(input.complete
                 ? {
                       seed_boundary_id: args.seedBoundaryId,
                       workspace: args.workspace,
                       last_todo_state: args.lastTodoState,
-                      acked_watermarks: args.watermarks,
-                  }
-                : {}),
+                       acked_watermarks: args.watermarks,
+                       ...(args.dropSeedSkipped !== undefined
+                           ? { drop_seed_skipped: args.dropSeedSkipped }
+                           : {}),
+                   }
+                 : {}),
         },
         watermarks: args.watermarks,
     });
@@ -516,6 +623,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
             compartments: unknown[];
             memories: unknown[];
             memoryMutations: unknown[];
+            dropSeeds: ModuleDropSeed[];
             userProfile: string[];
         },
         item: SeedItem,
@@ -523,6 +631,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         if (item.kind === "compartment") batch.compartments.push(item.value);
         else if (item.kind === "memory") batch.memories.push(item.value);
         else if (item.kind === "memory_mutation") batch.memoryMutations.push(item.value);
+        else if (item.kind === "drop_seed") batch.dropSeeds.push(item.value);
         else batch.userProfile.push(item.value);
     };
 
@@ -533,11 +642,13 @@ export function buildPagedModuleStateSyncPayloads(args: {
             compartments: [],
             memories: [],
             memoryMutations: [],
+            dropSeeds: [],
             userProfile: [],
         } as {
             compartments: unknown[];
             memories: unknown[];
             memoryMutations: unknown[];
+            dropSeeds: ModuleDropSeed[];
             userProfile: string[];
         };
         for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
@@ -545,6 +656,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
                 compartments: [...current.compartments],
                 memories: [...current.memories],
                 memoryMutations: [...current.memoryMutations],
+                dropSeeds: [...current.dropSeeds],
                 userProfile: [...current.userProfile],
             };
             appendItem(candidate, items[itemIndex]);
@@ -553,6 +665,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
                 index: batches.length,
                 total: assumedTotal,
                 complete,
+                dropSeedSkipped: args.dropSeedSkipped,
                 ...candidate,
             });
             if (
@@ -569,16 +682,24 @@ export function buildPagedModuleStateSyncPayloads(args: {
                         index: batches.length,
                         total: assumedTotal,
                         complete: false,
+                        dropSeedSkipped: args.dropSeedSkipped,
                         ...current,
                     }),
                 );
             }
-            current = { compartments: [], memories: [], memoryMutations: [], userProfile: [] };
+            current = {
+                compartments: [],
+                memories: [],
+                memoryMutations: [],
+                dropSeeds: [],
+                userProfile: [],
+            };
             appendItem(current, items[itemIndex]);
             const itemOnlyPayload = makePayload({
                 index: batches.length,
                 total: assumedTotal,
                 complete: false,
+                dropSeedSkipped: args.dropSeedSkipped,
                 ...current,
             });
             if (
@@ -592,6 +713,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
                     index: batches.length,
                     total: assumedTotal,
                     complete: true,
+                    dropSeedSkipped: args.dropSeedSkipped,
                     ...current,
                 });
                 if (
@@ -605,6 +727,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
                         compartments: [],
                         memories: [],
                         memoryMutations: [],
+                        dropSeeds: [],
                         userProfile: [],
                     };
                 }
@@ -614,6 +737,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
             index: batches.length,
             total: assumedTotal,
             complete: true,
+            dropSeedSkipped: args.dropSeedSkipped,
             ...current,
         });
         if (
@@ -769,6 +893,12 @@ export async function buildModuleStateSyncPayload(args: {
               }))
             : [];
     const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
+    // When starting a module from an existing session, include all TypeScript
+    // units already dropped before the first transform. Otherwise the transform
+    // reads older raw data and needs another cache invalidation to process them.
+    const dropSeedState = args.force
+        ? buildDropSeeds({ db: args.pass.db, sessionId: args.pass.sessionId, readRawById })
+        : null;
     const payloadArgs = {
         shadowGeneration: args.state.shadowGeneration,
         expectedShadowSeq: args.state.lastAckedSeq,
@@ -780,6 +910,10 @@ export async function buildModuleStateSyncPayload(args: {
         compartments,
         memories,
         memoryMutations,
+        dropSeeds:
+            dropSeedState && dropSeedState.seeds.length > 0 ? dropSeedState.seeds : undefined,
+        dropSeedSkipped:
+            dropSeedState && dropSeedState.skipped > 0 ? dropSeedState.skipped : undefined,
         userProfile,
         workspace: workspace.workspace,
         lastTodoState: sessionMeta.lastTodoState ?? "",

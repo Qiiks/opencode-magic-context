@@ -1302,6 +1302,7 @@ fn apply_once(
     });
 
     let mut core = loaded.core.clone();
+    log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
     let mut meta = loaded.meta.clone();
     let mut commit_expected = loaded.row_version;
     if clear_pending_rewrite_on_present {
@@ -2137,6 +2138,26 @@ fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
         .iter()
         .filter_map(|u| u.key.strip_prefix(RED_KEY_PREFIX).map(str::to_string))
         .collect()
+}
+
+/// Seeded drops are accepted before the first projection is available. Once the
+/// first projection identifies a reasoning block, leave that unit durable for
+/// lineage idempotence but skip applying it to the signed block.
+fn log_reasoning_drop_seed_skips(core: &CoreState, live: &[&FlatBlock], session_id: &str) {
+    let reasoning: HashSet<&str> = live
+        .iter()
+        .filter(|block| is_reasoning_block(&block.wire))
+        .map(|block| block.id())
+        .collect();
+    for unit in &core.frozen_units {
+        if let Some(target) = unit.key.strip_prefix(RED_KEY_PREFIX) {
+            if reasoning.contains(target) {
+                eprintln!(
+                    "mc-module: skipped drop seed targeting reasoning block {target} for session {session_id}"
+                );
+            }
+        }
+    }
 }
 
 /// Commands whose first application froze at least one previously unfrozen target.
@@ -4737,7 +4758,10 @@ mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
-    use mc_store::{InsertMemoryInput, ModuleUsage, ShadowStateSyncRequest, StoredCompartment};
+    use mc_store::{
+        InsertMemoryInput, ModuleUsage, ShadowDropSeedRow, ShadowStateSyncRequest,
+        StoredCompartment,
+    };
 
     #[test]
     fn effective_context_limit_falls_back_below_plausible_floor() {
@@ -11960,6 +11984,59 @@ mod tests {
     }
 
     #[test]
+    fn seeded_drops_are_served_on_first_fold_and_replayed_on_defer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let seeds = [ShadowDropSeedRow {
+            block_id: "m1#0".to_string(),
+            related_block_ids: vec![],
+            drop_mode: "full".to_string(),
+            payload: None,
+        }];
+        store
+            .apply_shadow_state_sync(ShadowStateSyncRequest {
+                session_id: "seeded-drops",
+                shadow_project_path: "git:proj",
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                drop_seeds: &seeds,
+                drop_seed_skipped: 0,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                user_profile: &[],
+                workspace: None,
+                last_todo_state: None,
+                acked_watermarks: Value::Null,
+            })
+            .unwrap();
+
+        let request = req("seeded-drops", "cfg", vec![item("m1", 1, "raw history")]);
+        let ctx = pctx("git:proj", dir.path().to_str().unwrap(), 0);
+        let first = transform_with_projection(&store, &request, &ctx).unwrap();
+        assert_eq!(first.response.action, "HARD");
+        assert_eq!(
+            first
+                .response
+                .ck_messages
+                .as_ref()
+                .unwrap()
+                .last()
+                .unwrap()
+                .content[0]
+                .kind,
+            ck_wire::CkKind::Text {
+                text: "[dropped]".to_string(),
+            }
+        );
+
+        let second = transform_with_projection(&store, &request, &ctx).unwrap();
+        assert_eq!(second.response.action, "SOFT+");
+        assert_eq!(first.response.ck_messages, second.response.ck_messages);
+    }
+
+    #[test]
     fn seeded_boundary_validates_declared_trim_before_the_first_shadow_fold() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -11982,6 +12059,8 @@ mod tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: Some("b#0"),
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &compartments,
                 memories: &[],
                 memory_mutations: &[],

@@ -278,6 +278,8 @@ mod tests {
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],

@@ -3,7 +3,11 @@ import {
     getRawSessionStoredMessageCount,
     readRawSessionMessageOrdinalPage,
 } from "./read-session-chunk";
-import { isRawCompactionSummaryInfo, type RawMessageOrdinalAnchor } from "./read-session-raw";
+import {
+    isRawCompactionSummaryInfo,
+    type RawMessageOrdinalAnchor,
+    type RawMessageParts,
+} from "./read-session-raw";
 import type { MessageLike } from "./transform-operations";
 
 /** The maximum request page size accepted by the module facade. */
@@ -430,9 +434,88 @@ export function buildPagedModuleTransformPayloads(
     throw new Error("module transform page count did not stabilize");
 }
 
+export interface ModuleRawBlockMapping {
+    blockIndex: number;
+    partIndex: number;
+    kind: "text" | "reasoning" | "file" | "tool_call" | "tool_result" | "other";
+    callId?: string;
+    toolInput?: unknown;
+}
+
+function toolCallId(part: Record<string, unknown>, messageId: string, blockIndex: number): string {
+    return (
+        (typeof part.callID === "string" && part.callID) ||
+        (typeof part.callId === "string" && part.callId) ||
+        (typeof part.id === "string" && part.id) ||
+        `${messageId}#${blockIndex}`
+    );
+}
+
+/**
+ * Map raw OpenCode parts to the CK block indexes used by the Rust module. The
+ * drop seed must name the same block the module would reduce; counting raw
+ * parts is not enough because ignored parts disappear and completed tools
+ * become a call/result pair.
+ */
+export function moduleRawBlockMappings(
+    message: RawMessageParts | null,
+): ModuleRawBlockMapping[] {
+    if (!message) return [];
+    const mappings: ModuleRawBlockMapping[] = [];
+    let blockIndex = 0;
+    for (const [partIndex, partValue] of message.parts.entries()) {
+        if (partValue === null || typeof partValue !== "object" || Array.isArray(partValue)) continue;
+        const part = partValue as Record<string, unknown>;
+        const type = typeof part.type === "string" ? part.type : "unknown";
+        if (type === "text") {
+            if (part.ignored === true) continue;
+            mappings.push({ blockIndex, partIndex, kind: "text" });
+            blockIndex += 1;
+            continue;
+        }
+        if (type === "reasoning") {
+            mappings.push({ blockIndex, partIndex, kind: "reasoning" });
+            blockIndex += 1;
+            continue;
+        }
+        if (type === "tool") {
+            const callId = toolCallId(part, message.id, blockIndex);
+            const state =
+                part.state !== null && typeof part.state === "object" && !Array.isArray(part.state)
+                    ? (part.state as Record<string, unknown>)
+                    : undefined;
+            const input = state?.input ?? part.input ?? part.args ?? {};
+            mappings.push({ blockIndex, partIndex, kind: "tool_call", callId, toolInput: input });
+            blockIndex += 1;
+            if (state?.status === "completed" || state?.status === "error") {
+                mappings.push({ blockIndex, partIndex, kind: "tool_result", callId, toolInput: input });
+                blockIndex += 1;
+            }
+            continue;
+        }
+        if (type === "file") {
+            mappings.push({ blockIndex, partIndex, kind: "file" });
+            blockIndex += 1;
+            continue;
+        }
+        if (["image", "step-start", "subtask"].includes(type)) {
+            mappings.push({ blockIndex, partIndex, kind: "other" });
+            blockIndex += 1;
+            continue;
+        }
+        if (["compaction", "step-finish", "snapshot", "patch", "agent", "retry"].includes(type)) {
+            continue;
+        }
+        mappings.push({ blockIndex, partIndex, kind: "other" });
+        blockIndex += 1;
+    }
+    return mappings;
+}
+
 export const __moduleWireTest = {
     buildPagedModuleTransformPayloads,
     encodeOpenCodeMessagesToCk,
+    moduleRawBlockMappings,
     moduleWireBodyBytes,
     resolveOrdinalsForModule,
     toFlatModuleWireBody,
