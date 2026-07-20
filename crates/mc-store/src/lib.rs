@@ -1548,6 +1548,80 @@ const MIGRATIONS: &[Migration] = &[
         "#,
     },
     Migration {
+        version: 30,
+        // Migration history is immutable: live stores already recorded this idempotent route
+        // normalization step as version 30, so fresh stores must record the same version.
+        statements: r#"
+        DELETE FROM mc_memories
+         WHERE EXISTS (
+                SELECT 1
+                  FROM mc_authority_route_bindings binding
+                  JOIN mc_authority authority
+                    ON authority.context_store_uuid = binding.context_store_uuid
+                   AND authority.project = binding.project
+                   AND authority.domain = 'memories'
+                   AND authority.state = 'MODULE'
+                 WHERE binding.route_project_root = mc_memories.project_path
+               )
+           AND EXISTS (
+                SELECT 1
+                  FROM mc_authority_route_bindings binding
+                  JOIN mc_authority authority
+                    ON authority.context_store_uuid = binding.context_store_uuid
+                   AND authority.project = binding.project
+                   AND authority.domain = 'memories'
+                   AND authority.state = 'MODULE'
+                  JOIN mc_memories canonical
+                    ON canonical.project_path = binding.project
+                   AND canonical.category = mc_memories.category
+                   AND canonical.normalized_hash = mc_memories.normalized_hash
+                 WHERE binding.route_project_root = mc_memories.project_path
+               );
+        UPDATE mc_memories
+           SET project_path = (
+               SELECT binding.project
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'memories'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_memories.project_path
+           )
+         WHERE EXISTS (
+               SELECT 1
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'memories'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_memories.project_path
+           );
+        UPDATE mc_memory_mutation_log
+           SET project_path = (
+               SELECT binding.project
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'memories'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_memory_mutation_log.project_path
+           )
+         WHERE EXISTS (
+               SELECT 1
+                 FROM mc_authority_route_bindings binding
+                 JOIN mc_authority authority
+                   ON authority.context_store_uuid = binding.context_store_uuid
+                  AND authority.project = binding.project
+                  AND authority.domain = 'memories'
+                  AND authority.state = 'MODULE'
+                WHERE binding.route_project_root = mc_memory_mutation_log.project_path
+           );
+        "#,
+    },
+    Migration {
         version: 31,
         // Classify retries must replay the recorded module outcome instead of sending the
         // memory pool to a provider twice. This ledger is separate from cache revisions because
@@ -3529,6 +3603,8 @@ pub struct McStore {
     note_caller_project: Arc<Mutex<Option<String>>>,
     #[cfg(any(test, feature = "test-support"))]
     abandon_historian_hook: AbandonHistorianHook,
+    #[cfg(any(test, feature = "test-support"))]
+    authority_project_resolution_fail_once: std::sync::atomic::AtomicBool,
 }
 
 impl McStore {
@@ -3560,6 +3636,8 @@ impl McStore {
             note_caller_project,
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-support"))]
+            authority_project_resolution_fail_once: std::sync::atomic::AtomicBool::new(false),
         };
         store.repair_migration_30_authority_routes()?;
         Ok(store)
@@ -3647,15 +3725,24 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Return the authority identity bound to this daemon route while ownership is preparing,
-    /// active, or draining. Once the TypeScript side has fully taken ownership, use the route
-    /// itself as the fallback identity.
+    /// Return the authority identity bound to this daemon route only while ownership is active
+    /// or draining. PREPARING remains route-keyed so transforms cannot observe a partial seed;
+    /// the verified MODULE acknowledgement publishes the identity-key flip.
     pub fn authority_project_for_route(
         &self,
         route_project_root: &str,
         domain: &str,
     ) -> Result<Option<String>, McStoreError> {
         validate_authority_domain(domain)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .authority_project_resolution_fail_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(McStoreError::Serde(
+                "injected authority project resolution failure".to_string(),
+            ));
+        }
         self.inner
             .with_conn(|conn| {
                 conn.query_row(
@@ -3666,13 +3753,19 @@ impl McStore {
                         AND authority.project = binding.project
                       WHERE binding.route_project_root = ?1
                         AND authority.domain = ?2
-                        AND authority.state IN ('PREPARING', 'MODULE', 'DRAINING')",
+                        AND authority.state IN ('MODULE', 'DRAINING')",
                     params![route_project_root, domain],
                     |row| row.get(0),
                 )
                 .optional()
             })
             .map_err(Into::into)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_authority_project_resolution_for_test(&self) {
+        self.authority_project_resolution_fail_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Reject a facade write that crosses the route's active authority identity.
@@ -9755,6 +9848,54 @@ impl McStore {
             })
             .map_err(Into::into)
     }
+
+    /// Enumerate the module's currently live memory identities for a mirror upgrade.
+    /// This keyset snapshot is applied before old feed tombstones may delete context rows.
+    pub fn pull_live_memory_snapshot(
+        &self,
+        cursor: i64,
+        limit: usize,
+    ) -> Result<ChangefeedPage, McStoreError> {
+        let limit = i64::try_from(limit.clamp(1, 1000))
+            .map_err(|_| McStoreError::Serde("snapshot limit exceeds i64".to_string()))?;
+        self.inner
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, project_path, category, normalized_hash
+                       FROM mc_memories WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map(params![cursor, limit], |row| {
+                        let id = row.get::<_, i64>(0)?;
+                        let project_path = row.get::<_, String>(1)?;
+                        let category = row.get::<_, String>(2)?;
+                        let normalized_hash = row.get::<_, String>(3)?;
+                        Ok(ChangefeedRow {
+                            feed_seq: 0,
+                            domain: "memories".to_string(),
+                            op: "insert".to_string(),
+                            module_row_id: id,
+                            full_row_snapshot: serde_json::json!({
+                                "id": id,
+                                "project_path": project_path,
+                                "category": category,
+                                "normalized_hash": &normalized_hash,
+                            }),
+                            content_hash: Some(normalized_hash),
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let next_cursor = rows.last().map(|row| row.module_row_id).unwrap_or(cursor);
+                Ok(ChangefeedPage {
+                    domain: "memories".to_string(),
+                    cursor,
+                    next_cursor,
+                    has_more: rows.len() == limit as usize,
+                    rows,
+                })
+            })
+            .map_err(Into::into)
+    }
 }
 
 fn upsert_compartment_tx(
@@ -11946,6 +12087,22 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
+        let expected_versions = (1_i64..=32).collect::<Vec<_>>();
+        let fresh_versions = fresh
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT version FROM cortexkit_schema_version
+                     WHERE namespace = ?1 ORDER BY version",
+                )?;
+                let versions = statement
+                    .query_map(params![NS], |row| row.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(versions)
+            })
+            .unwrap();
+        assert_eq!(fresh_versions, expected_versions);
+        assert!(fresh_versions.contains(&30));
         let fresh_has_table = fresh
             .inner
             .with_conn(|conn| {
@@ -14485,7 +14642,7 @@ mod shadow_tests {
     }
 
     #[test]
-    fn authority_route_binding_schema_29_note_upgrade_rekeys_through_caller_fence() {
+    fn authority_route_binding_schema_30_live_upgrade_rekeys_through_caller_fence() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -14507,7 +14664,7 @@ mod shadow_tests {
         .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version <= 29)
+            .filter(|migration| migration.version <= 30)
         {
             conn.execute_batch(migration.statements).unwrap();
             conn.execute(
@@ -14548,19 +14705,20 @@ mod shadow_tests {
         drop(conn);
 
         let store = store(dir.path());
-        let schema_version = store
+        let versions = store
             .inner
             .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT MAX(version) FROM cortexkit_schema_version WHERE namespace = ?1",
-                    params![NS],
-                    |row| row.get::<_, i64>(0),
-                )
+                let mut statement = conn.prepare(
+                    "SELECT version FROM cortexkit_schema_version
+                     WHERE namespace = ?1 ORDER BY version",
+                )?;
+                let versions = statement
+                    .query_map(params![NS], |row| row.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(versions)
             })
             .unwrap();
-        // The repair must land regardless of how many later migrations exist, so pin the
-        // floor rather than the exact head version.
-        assert!(schema_version >= 30);
+        assert_eq!(versions, (1_i64..=32).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
@@ -14894,11 +15052,21 @@ mod shadow_tests {
     fn authority_state_machine_persists_generations_and_drain_journal() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
+        store
+            .bind_authority_route("store-uuid", "project", "/repo")
+            .unwrap();
         let preparing = store
             .authority_begin_prepare("store-uuid", "project", "memories")
             .unwrap();
         assert_eq!(preparing.state, "PREPARING");
         assert_eq!(preparing.generation, 1);
+        assert_eq!(
+            store
+                .authority_project_for_route("/repo", "memories")
+                .unwrap(),
+            None,
+            "PREPARING must keep transforms on the complete TypeScript snapshot"
+        );
         let module = store
             .authority_finish_prepare(
                 "store-uuid",
@@ -14912,11 +15080,25 @@ mod shadow_tests {
             .unwrap();
         assert_eq!(module.state, "MODULE");
         assert_eq!(module.generation, 2);
+        assert_eq!(
+            store
+                .authority_project_for_route("/repo", "memories")
+                .unwrap()
+                .as_deref(),
+            Some("project")
+        );
         let draining = store
             .authority_begin_drain("store-uuid", "project", "memories", "lease", 100, 0)
             .unwrap();
         assert_eq!(draining.state, "DRAINING");
         assert_eq!(draining.captured_upper_bound, Some(0));
+        assert_eq!(
+            store
+                .authority_project_for_route("/repo", "memories")
+                .unwrap()
+                .as_deref(),
+            Some("project")
+        );
         let token = draining.coordinator_token.clone().expect("token minted");
         let stepped = store
             .authority_drain_step(
