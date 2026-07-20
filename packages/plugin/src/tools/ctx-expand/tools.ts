@@ -43,7 +43,12 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
             summary: tool.schema.string().optional(),
         },
         async execute(args: CtxExpandArgs, toolContext) {
-            args = unwrapImitatedReducedArgs(args, ["message", "start"]);
+            args = unwrapImitatedReducedArgs(args, ["message", "start"], {
+                start: "number",
+                end: "number",
+                verbose: "boolean",
+                message: "number",
+            });
             const sessionId = toolContext.sessionID;
 
             // By-ordinal mode: full recovery of a single message from stored history.

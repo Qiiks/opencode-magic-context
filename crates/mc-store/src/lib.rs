@@ -1621,27 +1621,6 @@ const MIGRATIONS: &[Migration] = &[
                   AND authority.state = 'MODULE'
                 WHERE binding.route_project_root = mc_memory_mutation_log.project_path
            );
-        UPDATE mc_notes
-           SET project_path = (
-               SELECT binding.project
-                 FROM mc_authority_route_bindings binding
-                 JOIN mc_authority authority
-                   ON authority.context_store_uuid = binding.context_store_uuid
-                  AND authority.project = binding.project
-                  AND authority.domain = 'notes'
-                  AND authority.state = 'MODULE'
-                WHERE binding.route_project_root = mc_notes.project_path
-           )
-         WHERE EXISTS (
-               SELECT 1
-                 FROM mc_authority_route_bindings binding
-                 JOIN mc_authority authority
-                   ON authority.context_store_uuid = binding.context_store_uuid
-                  AND authority.project = binding.project
-                  AND authority.domain = 'notes'
-                  AND authority.state = 'MODULE'
-                WHERE binding.route_project_root = mc_notes.project_path
-           );
         "#,
     },
 ];
@@ -3526,12 +3505,45 @@ impl McStore {
             )
         })?;
         inner.migrate(NS, MIGRATIONS)?;
-        Ok(McStore {
+        let store = McStore {
             inner,
             note_caller_project,
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        })
+        };
+        store.repair_migration_30_authority_routes()?;
+        Ok(store)
+    }
+
+    /// Complete route normalization after schema upgrades using the same caller-identity
+    /// check as runtime note writes. Because the SQL migration cannot safely rekey several
+    /// note owners under one caller identity, replay this idempotent repair on every store
+    /// open, including stores that already recorded the upgraded schema version.
+    fn repair_migration_30_authority_routes(&self) -> Result<(), McStoreError> {
+        let bindings = self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT binding.context_store_uuid, binding.project, binding.route_project_root
+                   FROM mc_authority_route_bindings binding
+                  WHERE EXISTS (
+                        SELECT 1 FROM mc_authority authority
+                         WHERE authority.context_store_uuid = binding.context_store_uuid
+                           AND authority.project = binding.project
+                           AND authority.state = 'MODULE'
+                           AND authority.domain IN ('memories', 'notes')
+                  )
+                  ORDER BY binding.route_project_root",
+            )?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<Vec<(String, String, String)>, _>>()?;
+            Ok(rows)
+        })?;
+        for (context_store_uuid, project, route_project_root) in bindings {
+            self.with_note_conn_fenced(&route_project_root, |tx| {
+                normalize_authority_route_tx(tx, &context_store_uuid, &project, &route_project_root)
+            })?;
+        }
+        Ok(())
     }
 
     /// Associate a daemon-bound route root with an authority identity. The route path
@@ -3585,7 +3597,9 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Return the MODULE-authority identity currently bound to this daemon route.
+    /// Return the authority identity bound to this daemon route while ownership is preparing,
+    /// active, or draining. Once the TypeScript side has fully taken ownership, use the route
+    /// itself as the fallback identity.
     pub fn authority_project_for_route(
         &self,
         route_project_root: &str,
@@ -3602,7 +3616,7 @@ impl McStore {
                         AND authority.project = binding.project
                       WHERE binding.route_project_root = ?1
                         AND authority.domain = ?2
-                        AND authority.state = 'MODULE'",
+                        AND authority.state IN ('PREPARING', 'MODULE', 'DRAINING')",
                     params![route_project_root, domain],
                     |row| row.get(0),
                 )
@@ -3660,6 +3674,21 @@ impl McStore {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous;
                 result
             })
+            .map_err(Into::into)
+    }
+
+    /// Whether a session has committed module cache state. Facade identity shortcuts use
+    /// this as a provenance check; a client-supplied harness label cannot create this row.
+    pub fn has_cache_state(&self, session_id: &str) -> Result<bool, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .map(|exists| exists != 0)
             .map_err(Into::into)
     }
 
@@ -14230,6 +14259,101 @@ mod shadow_tests {
             .rows
             .iter()
             .any(|row| row.module_row_id == 2 && row.op == "tombstone"));
+    }
+
+    #[test]
+    fn authority_route_binding_schema_29_note_upgrade_rekeys_through_caller_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.create_scalar_function(
+            "mc_note_caller_project",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(String::new()),
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cortexkit_schema_version (
+                 namespace TEXT NOT NULL,
+                 version INTEGER NOT NULL,
+                 applied_at_unix INTEGER NOT NULL,
+                 PRIMARY KEY (namespace, version)
+             );",
+        )
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 29)
+        {
+            conn.execute_batch(migration.statements).unwrap();
+            conn.execute(
+                "INSERT INTO cortexkit_schema_version(namespace, version, applied_at_unix)
+                 VALUES (?1, ?2, 0)",
+                params![NS, migration.version],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.create_scalar_function(
+            "mc_note_caller_project",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |_context| Ok("/worktrees/repo".to_string()),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
+             VALUES ('/worktrees/repo', 'context', 'git:identity')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+             VALUES ('context', 'git:identity', 'notes', 'MODULE')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mc_notes(id, type, project_path, content, status, harness)
+             VALUES (1, 'smart', '/worktrees/repo', 'remember me', 'active', 'module')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = store(dir.path());
+        let schema_version = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT MAX(version) FROM cortexkit_schema_version WHERE namespace = ?1",
+                    params![NS],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(schema_version, 30);
+        assert_eq!(
+            store
+                .get_note_by_id("git:identity", "session", 1)
+                .unwrap()
+                .unwrap()
+                .project_path,
+            "git:identity"
+        );
+        let feed = store.pull_changefeed("notes", 0, 100).unwrap();
+        assert!(feed.rows.iter().any(|row| {
+            row.module_row_id == 1
+                && row.op == "update"
+                && row
+                    .full_row_snapshot
+                    .get("project_path")
+                    .and_then(Value::as_str)
+                    == Some("git:identity")
+        }));
     }
 
     #[test]

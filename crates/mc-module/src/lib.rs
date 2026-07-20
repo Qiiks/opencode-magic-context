@@ -1737,6 +1737,9 @@ pub struct McHandler {
     /// lock-free map) is appropriate because writes are rare (once per route open/close)
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
+    /// Channels that have carried a validated transform request. This is server-observed
+    /// provenance, unlike the harness string copied from a route bind.
+    transform_route_channels: Mutex<HashSet<u16>>,
     shadow_seeds: Mutex<ShadowSeedCoordinator>,
     transform_pages: Mutex<TransformPageCoordinator>,
     state_imports: Mutex<StateImportCoordinator>,
@@ -1844,6 +1847,7 @@ struct HistorianPrepareContext {
 
 struct WrapupPrepareContext {
     now: i64,
+    project_path: String,
     allow_unknown_module_retry: bool,
 }
 
@@ -2100,6 +2104,7 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
+            transform_route_channels: Mutex::new(HashSet::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
@@ -2165,6 +2170,7 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
+            transform_route_channels: Mutex::new(HashSet::new()),
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
@@ -2175,6 +2181,10 @@ impl McHandler {
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
     fn bind_route(&self, channel: u16, binding: SessionBinding) {
+        self.transform_route_channels
+            .lock()
+            .expect("transform route channels mutex")
+            .remove(&channel);
         let replacement = {
             let mut bindings = self.bindings.lock().expect("bindings mutex");
             let previous = bindings.insert(channel, binding);
@@ -2239,6 +2249,10 @@ impl McHandler {
 
     /// Remove a route and evict process-local session state after its final binding closes.
     fn unbind_route(&self, channel: u16) {
+        self.transform_route_channels
+            .lock()
+            .expect("transform route channels mutex")
+            .remove(&channel);
         let last_session_route = {
             let mut bindings = self.bindings.lock().expect("bindings mutex");
             bindings.remove(&channel).and_then(|binding| {
@@ -2527,6 +2541,28 @@ impl McHandler {
             .get(&channel)
             .cloned()
             .ok_or(BindingError::Unbound)
+    }
+
+    fn module_knows_transform_session(&self, session_id: &str) -> bool {
+        if self
+            .store
+            .get()
+            .is_some_and(|store| store.has_cache_state(session_id).unwrap_or(false))
+        {
+            return true;
+        }
+        let transform_channels = self
+            .transform_route_channels
+            .lock()
+            .expect("transform route channels mutex")
+            .clone();
+        self.bindings
+            .lock()
+            .expect("bindings mutex")
+            .iter()
+            .any(|(channel, binding)| {
+                transform_channels.contains(channel) && binding.session == session_id
+            })
     }
 
     /// Persist the route's transport-to-identity mapping when a route becomes bound to an
@@ -3200,6 +3236,7 @@ impl McHandler {
     ) -> PreparedWrapupAction {
         let WrapupPrepareContext {
             now,
+            project_path,
             allow_unknown_module_retry,
         } = context;
         let loaded = match store.load(&parsed.session_id) {
@@ -3241,7 +3278,6 @@ impl McHandler {
             .filter(|block| !block.synthetic)
             .cloned()
             .collect::<Vec<_>>();
-        let project_path = binding.project_root.to_string_lossy().to_string();
         let project_slug = project_slug(&binding.project_root);
         let assemble = assemble_historian_firing(
             &store,
@@ -4446,6 +4482,18 @@ impl McHandler {
             Some(store) => Arc::clone(store),
             None => return store_unavailable_error(),
         };
+        let route_project_root = binding.project_root.to_string_lossy().to_string();
+        let project_path = match store.authority_project_for_route(&route_project_root, "memories")
+        {
+            Ok(Some(project)) => project,
+            Ok(None) => route_project_root,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "authority_project_resolution_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
         if let Some(command_id) = command_id {
             match store.load_wrapup_command(&session_id, command_id) {
                 // Rows written by the current terminal-failure path carry a marker in their
@@ -4698,6 +4746,7 @@ impl McHandler {
                 &plan.boundary,
                 WrapupPrepareContext {
                     now: round_now,
+                    project_path: project_path.clone(),
                     allow_unknown_module_retry: unknown_module_observed_at.is_some(),
                 },
             );
@@ -5491,6 +5540,10 @@ impl McHandler {
                     .to_string(),
             };
         }
+        self.transform_route_channels
+            .lock()
+            .expect("transform route channels mutex")
+            .insert(channel);
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
                 code: "authority_transform_page_in_progress".to_string(),
@@ -5505,7 +5558,31 @@ impl McHandler {
             .lock()
             .expect("transform snapshots mutex")
             .begin(&parsed.session_id);
-        let project_path = binding.project_root.to_string_lossy().to_string();
+        let route_project_root = binding.project_root.to_string_lossy().to_string();
+        // Resolve the route root to the memory and note owner keys before any store read.
+        // Keep the filesystem directory only for project documents and configuration below.
+        let project_path = match store.authority_project_for_route(&route_project_root, "memories")
+        {
+            Ok(Some(project)) => project,
+            Ok(None) => route_project_root.clone(),
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "authority_project_resolution_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let note_project_path =
+            match store.authority_project_for_route(&route_project_root, "notes") {
+                Ok(Some(project)) => project,
+                Ok(None) => route_project_root.clone(),
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "authority_project_resolution_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            };
         let pass_now = now_ms();
         // This trace is intentionally outside the fenced cache-state commit: a rejected
         // pass must still leave a durable breadcrumb, and a trace failure must never
@@ -5514,7 +5591,8 @@ impl McHandler {
         let run_transform = || {
             let producer_ctx = transform::ProducerContext {
                 project_path: &project_path,
-                project_directory: &project_path,
+                note_project_path: &note_project_path,
+                project_directory: &route_project_root,
                 // The authority adapter resolves this from the model context limit and
                 // sends it on each pass. Keep the bind-time value only for older callers
                 // that omit the field, and reject unusable values without disabling decay.
@@ -6211,15 +6289,21 @@ impl McHandler {
         let authority_project = if lane.is_shadow() {
             None
         } else {
-            store
-                .authority_project_for_route(&root_path, "memories")
-                .ok()
-                .flatten()
+            match store.authority_project_for_route(&root_path, "memories") {
+                Ok(project) => project,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "authority_project_resolution_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            }
         };
+        let store_project_path = authority_project.as_deref().unwrap_or(&root_path);
         let (workspace, member_paths) = match if lane.is_shadow() {
             prepare_shadow_workspace(&binding.session, parsed.workspace)
         } else {
-            prepare_authority_workspace(&root_path, parsed.workspace)
+            prepare_authority_workspace(store_project_path, parsed.workspace)
         } {
             Ok(prepared) => prepared,
             Err(error) => return invalid_params_error(error),
@@ -6238,10 +6322,9 @@ impl McHandler {
                 } else {
                     authority_source_path(
                         memory.project_path.as_deref(),
-                        &root_path,
+                        store_project_path,
                         &member_paths,
                         has_workspace,
-                        authority_project.as_deref(),
                     )?
                 };
                 Ok(memory.into_row(project_path))
@@ -6265,10 +6348,9 @@ impl McHandler {
                 } else {
                     authority_source_path(
                         mutation.project_path.as_deref(),
-                        &root_path,
+                        store_project_path,
                         &member_paths,
                         has_workspace,
-                        authority_project.as_deref(),
                     )?
                 };
                 Ok(mutation.into_row(project_path))
@@ -6858,6 +6940,7 @@ impl McHandler {
         let project_path = binding.project_root.to_string_lossy().to_string();
         let producer_ctx = transform::ProducerContext {
             project_path: &shadow_project,
+            note_project_path: &shadow_project,
             project_directory: &project_path,
             history_budget_tokens: parsed
                 .pass_inputs
@@ -7056,58 +7139,62 @@ impl McHandler {
             return Err(session_unresolved_error());
         }
 
-        // OpenCode's Rust-mode adapter opens the facade route with the actual session id. The
-        // Claude Code wrapper instead supplies an instance token, so only the structurally
-        // identified OpenCode route may bypass session.resolve.
-        let conversation_key =
-            if binding.harness == OPENCODE_HARNESS && !is_shadow_session(bound_session) {
-                bound_session.to_string()
-            } else {
-                match self
-                    .session_resolver
-                    .resolve_session(&binding.project_root, &binding.harness, bound_session)
-                    .await
-                {
-                    Ok(Some(resolved)) => resolved.session_id,
-                    Ok(None) => return Err(session_unresolved_error()),
-                    Err(SessionResolveError::Timeout) => {
-                        return Err(HandlerOutcome::Error {
-                            code: "session_resolve_timeout".to_string(),
-                            message: "session.resolve timed out after 2s".to_string(),
-                        })
-                    }
-                    Err(error) => {
-                        return Err(HandlerOutcome::Error {
-                            code: "session_resolve_failed".to_string(),
-                            message: error.to_string(),
-                        })
-                    }
+        // Harness labels are client-supplied routing hints, not authentication. OpenCode may
+        // bypass session.resolve only after server-observed cache state or a live transform
+        // route proves that this exact session belongs to the module; wrapper token namespaces
+        // cannot satisfy that provenance check.
+        let conversation_key = if binding.harness == OPENCODE_HARNESS
+            && !is_shadow_session(bound_session)
+            && self.module_knows_transform_session(bound_session)
+        {
+            bound_session.to_string()
+        } else {
+            match self
+                .session_resolver
+                .resolve_session(&binding.project_root, &binding.harness, bound_session)
+                .await
+            {
+                Ok(Some(resolved)) => resolved.session_id,
+                Ok(None) => return Err(session_unresolved_error()),
+                Err(SessionResolveError::Timeout) => {
+                    return Err(HandlerOutcome::Error {
+                        code: "session_resolve_timeout".to_string(),
+                        message: "session.resolve timed out after 2s".to_string(),
+                    })
                 }
-            };
+                Err(error) => {
+                    return Err(HandlerOutcome::Error {
+                        code: "session_resolve_failed".to_string(),
+                        message: error.to_string(),
+                    })
+                }
+            }
+        };
 
         let route_project_root = binding.project_root.to_string_lossy().to_string();
         let requested_project =
             arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
-        let memory_project_path = match (requested_project, self.store.get()) {
-            (Some(requested_project), Some(store)) => {
-                match store.authority_project_for_route(&route_project_root, authority_domain) {
-                    Ok(Some(authority_project)) if authority_project == requested_project => {
-                        authority_project
-                    }
-                    Ok(Some(authority_project)) => {
+        let memory_project_path = match self.store.get() {
+            Some(store) => match store
+                .authority_project_for_route(&route_project_root, authority_domain)
+            {
+                Ok(Some(authority_project)) => {
+                    if requested_project.is_some_and(|requested| requested != authority_project) {
                         return Err(HandlerOutcome::Error {
                             code: "facade_project_vocabulary_mismatch".to_string(),
                             message: format!(
-                                "{authority_domain} facade route {route_project_root} is authority-managed as {authority_project}, but the request supplied {requested_project}"
+                                "{authority_domain} facade route {route_project_root} is authority-managed as {authority_project}, but the request supplied {}",
+                                requested_project.unwrap_or_default()
                             ),
                         });
                     }
-                    // Because the Thalamus leg does not provide an authority-route binding, use
-                    // its existing path-scoped project root when the binding is absent.
-                    Ok(None) | Err(_) => route_project_root.clone(),
+                    authority_project
                 }
-            }
-            _ => route_project_root.clone(),
+                // A route without an authority binding remains path-scoped. This fallback is
+                // decided here once; lower note and memory operations never reinterpret it.
+                Ok(None) | Err(_) => route_project_root.clone(),
+            },
+            None => route_project_root.clone(),
         };
         Ok(FacadeScope {
             memory_project_path,
@@ -8938,22 +9025,23 @@ fn shadow_source_path(
 
 fn authority_source_path(
     source_path: Option<&str>,
-    root_path: &str,
+    store_project_path: &str,
     member_paths: &HashMap<String, String>,
     has_workspace: bool,
-    authority_project: Option<&str>,
 ) -> Result<String, String> {
     let Some(source_path) = source_path else {
-        return Ok(root_path.to_string());
+        return Ok(store_project_path.to_string());
     };
     if !has_workspace {
-        // A bound authority route stores the stable project identity. Unbound test and
-        // legacy routes retain their route-root vocabulary until the route is known.
-        return Ok(if authority_project.is_some() {
-            source_path.to_string()
-        } else {
-            root_path.to_string()
-        });
+        // Wire paths are assertions, not alternate keys: accepting a route root or a third
+        // identity here would let one atomic state-sync mint rows outside the bound owner.
+        return (source_path == store_project_path)
+            .then(|| store_project_path.to_string())
+            .ok_or_else(|| {
+                format!(
+                    "authority memory project must equal the resolved project key {store_project_path}: {source_path}"
+                )
+            });
     }
     member_paths
         .get(source_path)
@@ -10724,6 +10812,7 @@ mod tests {
         connect_errors: Mutex<VecDeque<HistorianProducerError>>,
         await_results: Mutex<VecDeque<Result<ProducerOutput, HistorianProducerError>>>,
         outputs: Mutex<VecDeque<String>>,
+        next_fact: Mutex<Option<String>>,
         prompts: Mutex<Vec<String>>,
         on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
@@ -10787,11 +10876,18 @@ mod tests {
             {
                 return result;
             }
+            let output = match self.state.next_fact.lock().expect("next fact mutex").take() {
+                Some(fact) => {
+                    let (start, end) = prompt_ordinal_range(prompt).unwrap_or((1, 3));
+                    historian_output_with_fact(start, end, &fact)
+                }
+                None => historian_output_for_prompt(prompt),
+            };
             self.state
                 .outputs
                 .lock()
                 .expect("outputs mutex")
-                .push_back(historian_output_for_prompt(prompt));
+                .push_back(output);
             Ok(RunHandle {
                 run_id: format!("run-{n}"),
             })
@@ -11914,6 +12010,7 @@ mod tests {
             7,
             binding_with_harness(project_root, OPENCODE_HARNESS, "opencode-session"),
         );
+        handler.transform_route_channels.lock().unwrap().insert(7);
 
         let memory = call_facade(
             &handler,
@@ -11947,6 +12044,37 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claimed_opencode_harness_cannot_bypass_resolution_for_unknown_session() {
+        let resolver = FakeSessionResolver::with(&[("wrapper-instance", FakeResolve::None)]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver.clone(),
+        );
+        handler.bind_route(
+            7,
+            binding_with_harness(
+                project.to_str().unwrap(),
+                OPENCODE_HARNESS,
+                "wrapper-instance",
+            ),
+        );
+
+        let outcome = call_facade(
+            &handler,
+            "ctx_note",
+            json!({ "action": "write", "content": "must not be token keyed" }),
+        )
+        .await;
+        assert_eq!(error_code(outcome), "session_unresolved");
+        assert_eq!(resolver.calls(), vec!["wrapper-instance"]);
+        assert!(store
+            .search_notes_like(project.to_str().unwrap(), "wrapper-instance", "token keyed")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12020,6 +12148,79 @@ mod tests {
         assert_eq!(evaluated["status"], "ready");
         let output = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
         assert!(output.contains("surface after evaluation"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authority_note_lifecycle_resolves_identity_for_evaluate_render_and_ack() {
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        handler.bind_route(7, binding("/repo", "token"));
+        handler.bind_route(8, binding_with_harness("/repo", OPENCODE_HARNESS, "ses"));
+        activate_module_authority(&store, "context", "git:identity", "/repo", "notes");
+        let note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:identity",
+                route_project_root: Some("/repo"),
+                session_id: Some("ses"),
+                content: "identity note lifecycle",
+                surface_condition: Some("when ready"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 1,
+            })
+            .unwrap();
+
+        let evaluated = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "note.evaluate",
+                    "session_id": "ses",
+                    "note_id": note.id,
+                    "source_revision": note.status_version,
+                    "verdict": true
+                }),
+            )
+            .await;
+        assert!(matches!(evaluated, HandlerOutcome::Response(_)));
+
+        let rendered = call_transform_request_on_channel(
+            &handler,
+            8,
+            request(vec![ck("m0", 0, "live input")]),
+        )
+        .await;
+        assert!(synthetic_text(&rendered, 1).contains("identity note lifecycle"));
+        let pass_id = rendered["note_deliveries"][0]["transform_pass_id"]
+            .as_str()
+            .unwrap();
+        let ack = handler
+            .dispatch_value(
+                8,
+                json!({
+                    "method": "transform.ack",
+                    "session_id": "ses",
+                    "transform_pass_id": pass_id
+                }),
+            )
+            .await;
+        assert!(matches!(ack, HandlerOutcome::Response(_)));
+        assert_eq!(
+            store
+                .get_note_by_id("git:identity", "ses", note.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "surfaced"
+        );
+        assert!(store
+            .search_notes_like("/repo", "ses", "identity note lifecycle")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12768,6 +12969,121 @@ mod tests {
         );
         assert!(store
             .load_active_memories(route_project_root, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authority_activation_moves_render_reads_once_through_the_m1_revision() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let route_project_root = project.to_str().unwrap();
+        store
+            .replace_compartments("ses", &[stored_comp(1, 0, 0, "m0", "initial summary")])
+            .unwrap();
+        let request = request(vec![ck("m0", 0, "live input")]);
+        let initial = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(initial["action"], "HARD");
+
+        insert_memory(
+            &store,
+            "git:identity",
+            "CONSTRAINTS",
+            "identity-only memory",
+            1,
+        );
+        assert_eq!(store.load("ses").unwrap().meta.max_memory_id, 0);
+        assert_eq!(
+            store
+                .load_active_memories("git:identity", now_ms())
+                .unwrap()
+                .len(),
+            1
+        );
+        activate_module_authority(
+            &store,
+            "context",
+            "git:identity",
+            route_project_root,
+            "memories",
+        );
+
+        assert_eq!(
+            store
+                .authority_project_for_route(route_project_root, "memories")
+                .unwrap()
+                .as_deref(),
+            Some("git:identity")
+        );
+        let before_transition = store.load("ses").unwrap();
+        let identity_revision =
+            crate::m1_compose::m1_revision_signal(&store, "git:identity", "ses").unwrap();
+        assert_ne!(before_transition.meta.m1_revision, identity_revision);
+        let direct_m1 = crate::m1_compose::compose_m1_from_store(
+            &store,
+            "git:identity",
+            route_project_root,
+            "ses",
+            &before_transition.meta,
+            before_transition.meta.expiry_cutoff_ms,
+        )
+        .unwrap();
+        assert!(
+            direct_m1.body.contains("identity-only memory"),
+            "{}",
+            direct_m1.body
+        );
+        let transition = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(transition["action"], "SOFT");
+        assert!(
+            transition.to_string().contains("identity-only memory"),
+            "the coordinated soft pass must read the identity-keyed row: {transition}"
+        );
+        let stable = call_transform_request(&handler, request).await;
+        assert_eq!(stable["action"], "SOFT+");
+        assert_eq!(transition["ck_messages"], stable["ck_messages"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authority_historian_publication_promotes_facts_under_the_identity_key() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_project_root = project.to_str().unwrap();
+        activate_module_authority(
+            &store,
+            "context",
+            "git:identity",
+            route_project_root,
+            "memories",
+        );
+
+        let response = call_transform(&handler, big_messages()).await;
+        assert_eq!(response["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        let prompt = producer.prompts.lock().unwrap()[0].clone();
+        let (start, end) = prompt_ordinal_range(&prompt).unwrap();
+        {
+            let mut outputs = producer.outputs.lock().unwrap();
+            outputs.clear();
+            outputs.push_back(historian_output_with_fact(
+                start,
+                end,
+                "identity historian fact",
+            ));
+        }
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        wait_for_idle(&store).await;
+
+        assert!(store
+            .load_active_memories("git:identity", 0)
+            .unwrap()
+            .iter()
+            .any(|memory| memory.content == "identity historian fact"));
+        assert!(store
+            .load_active_memories(route_project_root, 0)
             .unwrap()
             .is_empty());
     }
@@ -14699,6 +15015,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn authority_wrapup_publication_promotes_facts_under_the_identity_key() {
+        let producer = Arc::new(ProducerState::default());
+        *producer.next_fact.lock().unwrap() = Some("identity wrapup fact".to_string());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_project_root = project.to_str().unwrap();
+        activate_module_authority(
+            &store,
+            "context",
+            "git:identity",
+            route_project_root,
+            "memories",
+        );
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+
+        assert_eq!(response["disposition"], json!("completed"), "{response}");
+        assert!(store
+            .load_active_memories("git:identity", 0)
+            .unwrap()
+            .iter()
+            .any(|memory| memory.content == "identity wrapup fact"));
+        assert!(store
+            .load_active_memories(route_project_root, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn wrapup_handler_contract_edges_hold() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) =
@@ -15960,6 +16313,7 @@ mod tests {
             &expected_request,
             &transform::ProducerContext {
                 project_path: &baseline_project_path,
+                note_project_path: &baseline_project_path,
                 project_directory: &baseline_project_path,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
                 memory_enabled: true,
@@ -16633,6 +16987,7 @@ mod tests {
             &req,
             &transform::ProducerContext {
                 project_path: &project_path_string,
+                note_project_path: &project_path_string,
                 project_directory: &project_path_string,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
                 memory_enabled: true,
@@ -17125,7 +17480,6 @@ mod tests {
                     "compartments": [shadow_compartment(0, "authority summary")],
                     "memories": [{
                         "id": 42,
-                        "project_path": "git:authority-source",
                         "category": "CONSTRAINTS",
                         "content": "authority memory"
                     }],
@@ -17217,6 +17571,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authority_state_sync_enforces_resolved_owner_and_preserves_foreign_members() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let route_project_root = project.to_str().unwrap();
+        activate_module_authority(
+            &store,
+            "context",
+            "git:identity",
+            route_project_root,
+            "memories",
+        );
+
+        let mismatched = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "memories": [{
+                        "id": 1,
+                        "project_path": "tenant:third-key",
+                        "category": "CONSTRAINTS",
+                        "content": "must roll back"
+                    }]
+                }),
+            )
+            .await;
+        assert_eq!(error_code(mismatched), "invalid_params");
+        assert!(store
+            .load_active_memories("tenant:third-key", 0)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .load_active_memories("git:identity", 0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 0);
+
+        let absent = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "memories": [{
+                        "id": 2,
+                        "category": "CONSTRAINTS",
+                        "content": "resolved owner"
+                    }],
+                    "memory_mutations": [{
+                        "id": 1,
+                        "mutation_type": "update",
+                        "target_memory_id": 2,
+                        "new_content": "resolved owner"
+                    }]
+                }),
+            )
+            .await;
+        assert!(matches!(absent, HandlerOutcome::Response(_)), "{absent:?}");
+        assert_eq!(
+            store.load_active_memories("git:identity", 0).unwrap()[0].content,
+            "resolved owner"
+        );
+        assert_eq!(
+            store
+                .max_memory_mutation_id(&["git:identity".to_string()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .max_memory_mutation_id(&[route_project_root.to_string()])
+                .unwrap(),
+            0
+        );
+
+        let workspace = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 1,
+                    "workspace": {
+                        "fingerprint": "workspace-v1",
+                        "members": [
+                            {"project_path": route_project_root, "share_categories": ["CONSTRAINTS"]},
+                            {"project_path": "git:foreign", "share_categories": ["CONSTRAINTS"]}
+                        ]
+                    },
+                    "memories": [
+                        {
+                            "id": 3,
+                            "project_path": route_project_root,
+                            "category": "CONSTRAINTS",
+                            "content": "workspace owner"
+                        },
+                        {
+                            "id": 4,
+                            "project_path": "git:foreign",
+                            "category": "CONSTRAINTS",
+                            "content": "workspace foreign"
+                        }
+                    ]
+                }),
+            )
+            .await;
+        assert!(matches!(workspace, HandlerOutcome::Response(_)));
+        assert!(store
+            .load_active_memories("git:identity", 0)
+            .unwrap()
+            .iter()
+            .any(|memory| memory.content == "workspace owner"));
+        assert_eq!(
+            store.load_active_memories("git:foreign", 0).unwrap()[0].content,
+            "workspace foreign"
+        );
+        assert!(store
+            .load_active_memories(route_project_root, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn authority_state_sync_storage_feeds_real_transform_m0() {
         let state = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
@@ -17240,7 +17723,6 @@ mod tests {
                     "compartments": [shadow_compartment(0, "authority summary")],
                     "memories": [{
                         "id": 42,
-                        "project_path": "git:authority-source",
                         "category": "CONSTRAINTS",
                         "content": "authority memory"
                     }],

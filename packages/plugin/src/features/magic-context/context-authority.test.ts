@@ -354,6 +354,73 @@ describe("memory authority protocol", () => {
         ).toEqual({ context_row_id: 9395 });
     });
 
+    test("canonical mapping survives legacy-first normalization tombstone ordering", () => {
+        const database = db();
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0)",
+                )
+                .run(9395, "git:identity", "CONFIG_VALUES", "drive model", "same-hash");
+        });
+
+        const row = (id: number, project_path: string) => ({
+            id,
+            project_path,
+            category: "CONFIG_VALUES",
+            content: "drive model",
+            normalized_hash: "same-hash",
+            status: "active",
+        });
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 3,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 100,
+                        full_row_snapshot: row(100, "/repo"),
+                        content_hash: "same-hash",
+                    },
+                    {
+                        feed_seq: 2,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 200,
+                        full_row_snapshot: row(200, "git:identity"),
+                        content_hash: "same-hash",
+                    },
+                    {
+                        feed_seq: 3,
+                        domain: "memories",
+                        op: "tombstone",
+                        module_row_id: 100,
+                        full_row_snapshot: row(100, "/repo"),
+                        content_hash: "same-hash",
+                    },
+                ],
+            },
+        });
+
+        expect(database.prepare("SELECT id, project_path FROM memories").get()).toEqual({
+            id: 9395,
+            project_path: "git:identity",
+        });
+        expect(
+            database
+                .prepare(
+                    "SELECT module_project, module_row_id, context_row_id FROM mirror_identity WHERE domain = 'memories'",
+                )
+                .all(),
+        ).toEqual([{ module_project: "git:identity", module_row_id: 200, context_row_id: 9395 }]);
+    });
+
     test("drain finish removes the marker only after module ownership returns to TS", async () => {
         const database = db();
         installAuthorityManagedMarker(database, "/repo");

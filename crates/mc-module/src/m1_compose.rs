@@ -202,6 +202,7 @@ fn render_note_delta(notes: &[StoredNote]) -> String {
 pub fn compose_m1_from_store(
     store: &McStore,
     project_path: &str,
+    note_project_path: &str,
     session_id: &str,
     meta: &ModuleMeta,
     now_ms: i64,
@@ -274,7 +275,7 @@ pub fn compose_m1_from_store(
     // which is the honest at-least-once contract.
     let (notes_block, note_deliveries) = claim_and_render_notes(
         store,
-        project_path,
+        note_project_path,
         session_id,
         &format!("m1:{}:{}", meta.m1_revision, now_ms),
         &format!("m1:{}:{}", meta.m1_revision, now_ms),
@@ -412,7 +413,7 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         // a HARD folded everything (folded_seq covers all, no new memories/mutations)
         let meta = meta_after_hard(5, Some(50), 100, 9, vec![1, 2]);
-        let m1 = compose_m1_from_store(&store, "git:proj", "ses", &meta, 0).unwrap();
+        let m1 = compose_m1_from_store(&store, "git:proj", "git:proj", "ses", &meta, 0).unwrap();
         assert_eq!(m1.body, M1_PLACEHOLDER, "no delta → the placeholder body");
         assert_eq!(m1.new_coverage, None);
     }
@@ -426,7 +427,7 @@ mod tests {
             .replace_compartments("ses", &[comp(1, 1, 10, "m10"), comp(2, 11, 20, "m20")])
             .unwrap();
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
-        let m1 = compose_m1_from_store(&store, "git:proj", "ses", &meta, 0).unwrap();
+        let m1 = compose_m1_from_store(&store, "git:proj", "git:proj", "ses", &meta, 0).unwrap();
 
         // C2 rides m1 at P1, and coverage extends 10 → 20 (the SOFT advances the anchor)
         assert!(m1.body.contains("<new-compartments>"), "{}", m1.body);
@@ -448,7 +449,7 @@ mod tests {
             .unwrap();
         // meta: folded_seq=1, coverage=10 (matches the only compartment), folded max_mem=0
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
-        let m1 = compose_m1_from_store(&store, "git:proj", "ses", &meta, 0).unwrap();
+        let m1 = compose_m1_from_store(&store, "git:proj", "git:proj", "ses", &meta, 0).unwrap();
 
         assert!(m1.body.contains("<new-memories>"), "{}", m1.body);
         assert!(m1.body.contains("new mem"));
@@ -512,7 +513,7 @@ mod tests {
                 "{case} must move the m1 signal"
             );
             let meta = meta_after_hard(1, Some(10), max_mem, cursor, manifest);
-            let m1 = compose_m1_from_store(&store, project, "ses", &meta, 0).unwrap();
+            let m1 = compose_m1_from_store(&store, project, project, "ses", &meta, 0).unwrap();
             assert!(m1.body.contains("<memory-updates>"), "{case}: {}", m1.body);
             assert_eq!(
                 m1.new_coverage, None,
@@ -547,7 +548,7 @@ mod tests {
             "additive inserts do not write the mutation log"
         );
         let meta = meta_after_hard(1, Some(10), 0, cursor, vec![]);
-        let m1 = compose_m1_from_store(&store, project, "ses", &meta, 0).unwrap();
+        let m1 = compose_m1_from_store(&store, project, project, "ses", &meta, 0).unwrap();
         assert!(m1.body.contains("<new-memories>"), "{}", m1.body);
         assert!(m1.body.contains("brand new"), "{}", m1.body);
     }
@@ -579,7 +580,7 @@ mod tests {
             .unwrap();
 
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
-        let m1 = compose_m1_from_store(&store, own, "ses", &meta, 0).unwrap();
+        let m1 = compose_m1_from_store(&store, own, own, "ses", &meta, 0).unwrap();
         assert!(
             m1.body.contains("own arch rule"),
             "the calling project's own non-shared new memory must ride m1 even when it is \

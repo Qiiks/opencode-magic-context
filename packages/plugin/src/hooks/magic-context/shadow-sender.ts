@@ -60,6 +60,7 @@ const CONNECT_BACKOFF_INITIAL_MS = 1_000;
  * stalls; beyond it callers get the same typed busy error as the shadow lane.
  */
 const SERIAL_LANE_MAX_WAITERS = 16;
+const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const SHADOW_SEND_TIMEOUT_MS = 15_000;
@@ -1503,6 +1504,17 @@ export function createShadowSender(
     };
 }
 
+interface SerialLaneWaiter {
+    sessionId: string;
+    signal?: AbortSignal;
+    deadlineMs: number;
+    resolve: (release: () => void) => void;
+    reject: (error: unknown) => void;
+    onAbort: () => void;
+    timer: ReturnType<typeof setTimeout>;
+    settled: boolean;
+}
+
 export class SubcShadowTransport implements ShadowTransport {
     private readonly connectionFile: string;
     private readonly moduleId: string;
@@ -1512,8 +1524,7 @@ export class SubcShadowTransport implements ShadowTransport {
     private routes = new Map<string, RouteHandle>();
     private activeSession: string | null = null;
     private nextProbeMs = 0;
-    private laneWaiters = 0;
-    private laneReleaseCallbacks: Array<() => void> = [];
+    private laneReleaseCallbacks: SerialLaneWaiter[] = [];
     private authorityProjectRoot = "";
     /**
      * Filesystem root used to bind authority/mirror routes. Authority request
@@ -1535,6 +1546,95 @@ export class SubcShadowTransport implements ShadowTransport {
         this.moduleId = moduleId;
         this.requestTimeoutMs = requestTimeoutMs;
         this.routeSessionPrefix = routeSessionPrefix;
+    }
+
+    private laneTimeoutError(): Error & { code?: string } {
+        const error = new Error("module transport deadline expired while queued") as Error & {
+            code?: string;
+        };
+        error.code = "ETIMEDOUT";
+        return error;
+    }
+
+    private laneRelease(): () => void {
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            this.activeSession = null;
+            this.dispatchNextLaneWaiter();
+        };
+    }
+
+    private dispatchNextLaneWaiter(): void {
+        if (this.activeSession !== null) return;
+        while (this.laneReleaseCallbacks.length > 0) {
+            const waiter = this.laneReleaseCallbacks.shift();
+            if (!waiter || waiter.settled) continue;
+            waiter.settled = true;
+            clearTimeout(waiter.timer);
+            waiter.signal?.removeEventListener("abort", waiter.onAbort);
+            if (waiter.signal?.aborted) {
+                waiter.reject(waiter.signal.reason ?? new Error("module transport call aborted"));
+                continue;
+            }
+            if (waiter.deadlineMs - Date.now() < SERIAL_LANE_MIN_REMAINING_MS) {
+                waiter.reject(this.laneTimeoutError());
+                continue;
+            }
+            this.activeSession = waiter.sessionId;
+            waiter.resolve(this.laneRelease());
+            return;
+        }
+    }
+
+    private acquireCorrectnessLane(
+        sessionId: string,
+        signal: AbortSignal | undefined,
+        deadlineMs: number,
+    ): Promise<() => void> {
+        if (signal?.aborted) {
+            return Promise.reject(signal.reason ?? new Error("module transport call aborted"));
+        }
+        if (deadlineMs - Date.now() < SERIAL_LANE_MIN_REMAINING_MS) {
+            return Promise.reject(this.laneTimeoutError());
+        }
+        if (this.activeSession === null && this.laneReleaseCallbacks.length === 0) {
+            this.activeSession = sessionId;
+            return Promise.resolve(this.laneRelease());
+        }
+        if (this.laneReleaseCallbacks.length >= SERIAL_LANE_MAX_WAITERS) {
+            const error = new Error("module transport queue is full") as Error & { code?: string };
+            error.code = "EBUSY";
+            return Promise.reject(error);
+        }
+        return new Promise<() => void>((resolve, reject) => {
+            const waiter = {} as SerialLaneWaiter;
+            const removeAndReject = (error: unknown): void => {
+                if (waiter.settled) return;
+                waiter.settled = true;
+                clearTimeout(waiter.timer);
+                signal?.removeEventListener("abort", waiter.onAbort);
+                const index = this.laneReleaseCallbacks.indexOf(waiter);
+                if (index >= 0) this.laneReleaseCallbacks.splice(index, 1);
+                reject(error);
+                if (this.activeSession === null) this.dispatchNextLaneWaiter();
+            };
+            waiter.sessionId = sessionId;
+            waiter.signal = signal;
+            waiter.deadlineMs = deadlineMs;
+            waiter.resolve = resolve;
+            waiter.reject = reject;
+            waiter.settled = false;
+            waiter.onAbort = () =>
+                removeAndReject(signal?.reason ?? new Error("module transport call aborted"));
+            waiter.timer = setTimeout(
+                () => removeAndReject(this.laneTimeoutError()),
+                Math.max(0, deadlineMs - Date.now()),
+            );
+            signal?.addEventListener("abort", waiter.onAbort, { once: true });
+            this.laneReleaseCallbacks.push(waiter);
+        });
     }
 
     async call(args: {
@@ -1575,10 +1675,8 @@ export class SubcShadowTransport implements ShadowTransport {
     }): Promise<unknown> {
         // Shadow mirror traffic is best-effort: each waiting closure would retain its
         // complete pass payload, so concurrent shadow work is dropped to keep transport
-        // memory bounded. Rust-mode authority/tool/transform calls are CORRECTNESS
-        // traffic that legitimately interleaves (a tool call lands mid-pass, the mirror
-        // consumer polls on its own cadence) — those serialize through a bounded FIFO
-        // instead of failing the pass.
+        // memory bounded. Rust-mode authority/tool/transform calls are correctness traffic
+        // and acquire the bounded FIFO below.
         const shadowLane =
             args.method === "shadow_transform" ||
             args.method === "state_sync" ||
@@ -1590,46 +1688,40 @@ export class SubcShadowTransport implements ShadowTransport {
             error.code = "EBUSY";
             throw error;
         }
-        if (!shadowLane && this.activeSession !== null) {
-            if (this.laneWaiters >= SERIAL_LANE_MAX_WAITERS) {
-                const error = new Error("module transport queue is full") as Error & {
-                    code?: string;
-                };
-                error.code = "EBUSY";
-                throw error;
-            }
-            this.laneWaiters += 1;
-            try {
-                while (this.activeSession !== null) {
-                    await new Promise<void>((resolve) => {
-                        this.laneReleaseCallbacks.push(resolve);
-                    });
-                }
-            } finally {
-                this.laneWaiters -= 1;
-            }
-        }
-        if (args.signal?.aborted) throw args.signal.reason;
 
-        this.activeSession = args.sessionId;
+        const deadlineMs = Date.now() + this.requestTimeoutMs;
+        const releaseLane = shadowLane
+            ? (() => {
+                  this.activeSession = args.sessionId;
+                  return this.laneRelease();
+              })()
+            : await this.acquireCorrectnessLane(args.sessionId, args.signal, deadlineMs);
         const onAbort = () => this.invalidateConnection();
         args.signal?.addEventListener("abort", onAbort, { once: true });
         try {
+            if (args.signal?.aborted) {
+                throw args.signal.reason ?? new Error("module transport call aborted");
+            }
+            // Queue residence consumes the same deadline as the request. Starting work with
+            // only scheduler noise left would let an earlier facade call overrun a transform's
+            // caller budget, so reject before opening or reusing a route.
+            const remainingMs = deadlineMs - Date.now();
+            if (remainingMs < SERIAL_LANE_MIN_REMAINING_MS) throw this.laneTimeoutError();
             const { client, route } = await this.ensureRoute(args.sessionId, args.projectRoot);
-            if (args.signal?.aborted) throw args.signal.reason;
+            if (args.signal?.aborted) {
+                throw args.signal.reason ?? new Error("module transport call aborted");
+            }
             return await client.request(route, args.body, {
                 priority: Priority.Background,
                 admissionClass: AdmissionClass.Normal,
-                timeoutMs: this.requestTimeoutMs,
+                timeoutMs: Math.max(1, deadlineMs - Date.now()),
             });
         } catch (error) {
             if (isConnectionFailure(error)) this.invalidateConnection();
             throw error;
         } finally {
             args.signal?.removeEventListener("abort", onAbort);
-            this.activeSession = null;
-            const next = this.laneReleaseCallbacks.shift();
-            next?.();
+            releaseLane();
         }
     }
 
@@ -1680,22 +1772,24 @@ export class SubcShadowTransport implements ShadowTransport {
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }> {
         this.authorityProjectRoot = args.project;
+        const { projectRoot, ...body } = args;
         const response = await this.authorityRequest(
             args.project,
-            args.projectRoot ?? this.bindRootForAuthority(),
+            projectRoot ?? this.bindRootForAuthority(),
             "authority.status",
-            args,
+            body,
         );
         return { authority: (response.authority as AuthorityStatus | null) ?? null };
     }
 
     async authorityPrepare(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }> {
         this.authorityProjectRoot = String(args.project ?? "");
+        const { projectRoot, ...body } = args;
         const response = await this.authorityRequest(
             String(args.project ?? "authority"),
-            this.bindRootForAuthority(),
+            typeof projectRoot === "string" ? projectRoot : this.bindRootForAuthority(),
             "authority.prepare",
-            args,
+            body,
         );
         if (!isRecord(response.authority)) throw new Error("authority.prepare omitted authority");
         return { authority: response.authority as unknown as AuthorityStatus };
@@ -1705,11 +1799,12 @@ export class SubcShadowTransport implements ShadowTransport {
         args: Record<string, unknown>,
     ): Promise<{ seeded: number; module_row_ids?: number[] }> {
         this.authorityProjectRoot = String(args.project ?? "");
+        const { projectRoot, ...body } = args;
         const response = await this.authorityRequest(
             String(args.project ?? "authority"),
-            this.bindRootForAuthority(),
+            typeof projectRoot === "string" ? projectRoot : this.bindRootForAuthority(),
             "authority.seed",
-            args,
+            body,
         );
         return {
             seeded: typeof response.seeded === "number" ? response.seeded : 0,
@@ -1724,11 +1819,12 @@ export class SubcShadowTransport implements ShadowTransport {
         const method = String(args.method ?? "authority.drain.step") as Parameters<
             SubcShadowTransport["authorityRequest"]
         >[2];
+        const { projectRoot, ...body } = args;
         const response = await this.authorityRequest(
             String(args.project ?? "authority"),
-            this.bindRootForAuthority(),
+            typeof projectRoot === "string" ? projectRoot : this.bindRootForAuthority(),
             method,
-            args,
+            body,
         );
         if (!isRecord(response.authority)) throw new Error("authority.drain omitted authority");
         return { authority: response.authority as unknown as AuthorityStatus };
@@ -1738,37 +1834,46 @@ export class SubcShadowTransport implements ShadowTransport {
         domain: "memories" | "notes";
         cursor: number;
         limit: number;
+        projectRoot?: string;
     }): Promise<{ page: ChangefeedPage }> {
+        const { projectRoot, ...body } = args;
         const response = await this.authorityRequest(
             `mirror:${args.domain}`,
-            this.bindRootForAuthority(),
+            projectRoot ?? this.bindRootForAuthority(),
             "mirror.pull",
-            args,
+            body,
         );
         if (!isRecord(response.page)) throw new Error("mirror.pull omitted page");
         return { page: response.page as unknown as ChangefeedPage };
     }
 
     closeSession(sessionId: string): void {
-        const route = this.routes.get(sessionId);
-        this.routes.delete(sessionId);
         const client = this.client;
-        if (route && client) {
-            void client.closeRoute(route).catch((error: unknown) => {
-                if (this.client === client && isConnectionFailure(error)) {
-                    this.invalidateConnection(client);
-                }
-            });
-            return;
+        const prefix = `${sessionId}\0`;
+        const routes = [...this.routes.entries()].filter(([key]) => key.startsWith(prefix));
+        for (const [key, route] of routes) {
+            this.routes.delete(key);
+            if (client) {
+                void client.closeRoute(route).catch((error: unknown) => {
+                    if (this.client === client && isConnectionFailure(error)) {
+                        this.invalidateConnection(client);
+                    }
+                });
+            }
         }
-        if (this.activeSession === sessionId) this.invalidateConnection(client);
+        if (routes.length === 0 && this.activeSession === sessionId) {
+            this.invalidateConnection(client);
+        }
     }
 
     private async ensureRoute(
         sessionId: string,
         projectRoot: string,
     ): Promise<{ client: SubcClient; route: RouteHandle }> {
-        const existing = this.routes.get(sessionId);
+        // One identity may legitimately have multiple filesystem routes (for example,
+        // worktrees). Reusing a route across roots would bind authority to the wrong tree.
+        const routeKey = `${sessionId}\0${projectRoot}`;
+        const existing = this.routes.get(routeKey);
         const client = await this.ensureConnected();
         if (existing) return { client, route: existing };
 
@@ -1789,7 +1894,7 @@ export class SubcShadowTransport implements ShadowTransport {
             error.code = "ECONNRESET";
             throw error;
         }
-        this.routes.set(sessionId, route);
+        this.routes.set(routeKey, route);
         return { client, route };
     }
 

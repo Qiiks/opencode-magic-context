@@ -1525,6 +1525,7 @@ mod tests {
     fn pctx<'a>() -> ProducerContext<'a> {
         ProducerContext {
             project_path: "git:proj",
+            note_project_path: "git:proj",
             project_directory: "/nonexistent-docs",
             history_budget_tokens: 60_000.0,
             memory_enabled: true,

@@ -374,7 +374,14 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             summary: tool.schema.string().optional(),
         },
         async execute(args: CtxMemoryArgs, toolContext) {
-            args = unwrapImitatedReducedArgs(args, ["action"]);
+            args = unwrapImitatedReducedArgs(args, ["action"], {
+                action: { type: "enum", values: CTX_MEMORY_DREAMER_ACTIONS },
+                content: "string",
+                category: { type: "enum", values: V2_MEMORY_CATEGORIES },
+                ids: { type: "array", items: "number", maxItems: 100 },
+                limit: "number",
+                reason: "string",
+            });
             // Sidekick consumes untrusted `/ctx-aug` prompt text and is retrieval-only;
             // fail closed even if a future permission list accidentally exposes this tool.
             if (toolContext.agent === SIDEKICK_AGENT) {

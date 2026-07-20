@@ -67,7 +67,7 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
             summary: tool.schema.string().optional(),
         },
         async execute(args: CtxReduceArgs, toolContext) {
-            args = unwrapImitatedReducedArgs(args, ["drop"]);
+            args = unwrapImitatedReducedArgs(args, ["drop"], { drop: "string" });
             const sessionId = toolContext.sessionID;
 
             if (!args.drop) {

@@ -129,6 +129,10 @@ struct LegacyCkItemWire {
 pub struct ProducerContext<'a> {
     /// The project identity the store reads key off (memories, mutation log, workspace).
     pub project_path: &'a str,
+    /// The note owner key resolved for this route's notes authority. Keeping it separate
+    /// lets independently transitioning domains retain one vocabulary without turning the
+    /// filesystem route into a store key.
+    pub note_project_path: &'a str,
     /// The project directory on disk, for reading ARCHITECTURE.md / STRUCTURE.md.
     pub project_directory: &'a str,
     /// The history budget in tokens for this pass. Authority callers resolve it from the
@@ -1521,7 +1525,7 @@ fn apply_once(
             core.pending_changes.clear();
             let (note_body, hard_note_deliveries) = claim_and_render_notes(
                 store,
-                ctx.project_path,
+                ctx.note_project_path,
                 &req.session_id,
                 &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
                 &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
@@ -1580,6 +1584,7 @@ fn apply_once(
             let m1 = compose_m1_from_store(
                 store,
                 ctx.project_path,
+                ctx.note_project_path,
                 &req.session_id,
                 &meta,
                 meta.expiry_cutoff_ms,
@@ -5351,6 +5356,7 @@ mod tests {
     fn pctx<'a>(project: &'a str, dir: &'a str, now_ms: i64) -> ProducerContext<'a> {
         ProducerContext {
             project_path: project,
+            note_project_path: project,
             project_directory: dir,
             history_budget_tokens: 60_000.0,
             memory_enabled: true,

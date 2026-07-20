@@ -14,7 +14,7 @@ import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/mag
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
-import { Database } from "../../shared/sqlite";
+import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
@@ -170,6 +170,92 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 }
 
 describe("Rust mode authority adapter", () => {
+    it("uses the resolved session directory instead of the plugin launch directory for authority routes", async () => {
+        const sessionId = "ses-directory-root";
+        installRawProvider(sessionId);
+        const db = makeDb();
+        withPrivilegedWriter(db, () => {
+            db.prepare(
+                "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'seed me', 'seed-hash', 0, 0, 0, 0)",
+            ).run("git:identity");
+        });
+        const authorityRoots: string[] = [];
+        const statuses = new Map<string, AuthorityStatus>();
+        const module: RustModeModuleClient = {
+            call: async () => {
+                throw new Error("stop after authority preparation");
+            },
+            authorityStatus: async (args) => {
+                authorityRoots.push(String(args.projectRoot));
+                return { authority: statuses.get(args.domain) ?? null };
+            },
+            authorityPrepare: async (args) => {
+                authorityRoots.push(String(args.projectRoot));
+                const domain = String(args.domain) as "memories" | "notes";
+                const phase = String(args.phase);
+                const base = {
+                    context_store_uuid: String(args.context_store_uuid),
+                    project: String(args.project),
+                    domain,
+                    generation: 1,
+                };
+                if (phase === "begin") {
+                    const authority = { ...base, state: "PREPARING" as const };
+                    statuses.set(domain, authority);
+                    return { authority };
+                }
+                if (phase === "complete") {
+                    const checksum = String(args.checksum_expected);
+                    const authority = {
+                        ...base,
+                        state: "PREPARING" as const,
+                        checksum_expected: checksum,
+                        checksum_actual: checksum,
+                        checksum_ok: true,
+                    };
+                    statuses.set(domain, authority);
+                    return { authority };
+                }
+                if (phase === "ack") {
+                    const authority = { ...base, state: "MODULE" as const };
+                    statuses.set(domain, authority);
+                    return { authority };
+                }
+                const authority = { ...base, state: "TS" as const };
+                statuses.set(domain, authority);
+                return { authority };
+            },
+            authoritySeed: async (args) => {
+                authorityRoots.push(String(args.projectRoot));
+                const rows = Array.isArray(args.rows) ? args.rows : [];
+                return { seeded: rows.length, module_row_ids: rows.map((_, index) => index + 1) };
+            },
+            mirrorPull: async (args) => {
+                authorityRoots.push(String(args.projectRoot));
+                return {
+                    page: {
+                        domain: args.domain,
+                        cursor: args.cursor,
+                        next_cursor: args.cursor,
+                        has_more: false,
+                        rows: [],
+                    },
+                };
+            },
+        };
+        const deps = makeDeps(db, module);
+        deps.directory = "/launch/root-a";
+        deps.projectPath = "git:identity";
+        deps.sessionDirectoryBySession?.set(sessionId, "/session/root-b");
+        const runner = createRustModeTransformImpl(deps, { moduleClient: module });
+        const messages = makeMessages(sessionId);
+
+        await runner.run(sessionId, messages, { messages: [...messages] }, makeMeta(db, sessionId));
+
+        expect(authorityRoots.length).toBeGreaterThan(0);
+        expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
+    });
+
     it("copies the resolved history budget onto the authority wire", () => {
         const body = __rustModeTransformTest.buildTransformBody({
             sessionId: "budget-wire",
@@ -598,7 +684,9 @@ describe("Rust mode authority adapter", () => {
 describe("prepareRustMemoryAuthority mixed restore", () => {
     it("reconciles remaining MODULE domains after a DRAINING resume before tools open", async () => {
         const db = makeDb();
-        const projectPath = "/mixed-restore";
+        const projectPath = "git:mixed-restore";
+        const projectRoot = "/worktrees/mixed-restore";
+        const authorityRoots: string[] = [];
         const statuses = new Map<string, AuthorityStatus | null>([
             [
                 "memories",
@@ -625,14 +713,16 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
         ]);
         const module: RustModeModuleClient = {
             call: async () => ({ ok: true }),
-            authorityStatus: async (args) => ({
-                authority: statuses.get(args.domain) ?? null,
-            }),
+            authorityStatus: async (args) => {
+                authorityRoots.push(String(args.projectRoot));
+                return { authority: statuses.get(args.domain) ?? null };
+            },
             authorityPrepare: async () => {
                 throw new Error("prepare should not run on mixed DRAINING resume");
             },
             authoritySeed: async () => ({ seeded: 0 }),
             authorityDrain: async (args) => {
+                authorityRoots.push(String(args.projectRoot));
                 if (args.action === "begin") {
                     return {
                         authority: {
@@ -676,15 +766,18 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
                     },
                 };
             },
-            mirrorPull: async (args) => ({
-                page: {
-                    domain: args.domain,
-                    cursor: args.cursor,
-                    next_cursor: args.cursor,
-                    has_more: false,
-                    rows: [],
-                },
-            }),
+            mirrorPull: async (args) => {
+                authorityRoots.push(String(args.projectRoot));
+                return {
+                    page: {
+                        domain: args.domain,
+                        cursor: args.cursor,
+                        next_cursor: args.cursor,
+                        has_more: false,
+                        rows: [],
+                    },
+                };
+            },
         };
         const state = {
             initialized: false,
@@ -708,6 +801,7 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
             lastObservedUserMessageId: null,
             syntheticLoopBreakerLogged: false,
             memoryAuthorityProject: null as string | null,
+            memoryAuthorityRoot: null as string | null,
             memoryAuthorityReady: false,
         };
         const preparedProjects: string[] = [];
@@ -715,6 +809,7 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
             db,
             module,
             projectPath,
+            projectRoot,
             state,
             onProjectPrepared: (prepared) => preparedProjects.push(prepared),
         });
@@ -723,7 +818,27 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
         // callback, so it must fire with the RESOLVED project — a session that resolves
         // a project other than the plugin's launch directory still gets its bridge.
         expect(preparedProjects).toEqual([projectPath]);
+        expect(authorityRoots.length).toBeGreaterThan(0);
+        expect(authorityRoots.every((root) => root === projectRoot)).toBe(true);
         expect(getAuthorityManagedMarker(db, projectPath)).not.toBeNull();
+        statuses.set("memories", {
+            context_store_uuid: "store",
+            project: projectPath,
+            domain: "memories",
+            state: "MODULE",
+            generation: 4,
+        });
+        const secondRoot = "/worktrees/mixed-restore-two";
+        await __rustModeTransformTest.prepareRustMemoryAuthority({
+            db,
+            module,
+            projectPath,
+            projectRoot: secondRoot,
+            state,
+        });
+        expect(authorityRoots).toContain(secondRoot);
+        expect(state.memoryAuthorityRoot).toBe(secondRoot);
+
         expect(() =>
             db
                 .prepare(
@@ -733,4 +848,3 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
         ).toThrow("managed by the Rust module");
     });
 });
-

@@ -452,7 +452,7 @@ export function createTransform(deps: TransformDeps) {
             ? createRustModeTransform(deps, {
                   moduleClient: deps.rustModeModuleClient,
                   hostClient: deps.client,
-                  projectRoot: deps.rustModeProjectRoot ?? deps.directory,
+                  projectRoot: deps.rustModeProjectRoot,
                   notifyParked: deps.onRustModeParked,
                   onProjectPrepared: deps.onRustModeProjectPrepared,
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,

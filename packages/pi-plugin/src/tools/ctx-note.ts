@@ -194,7 +194,18 @@ export function createCtxNoteTool(
 		description: CTX_NOTE_DESCRIPTION,
 		parameters: ParamsSchema,
 		async execute(_toolCallId, params: CtxNoteParams, _signal, _onUpdate, ctx) {
-			params = unwrapImitatedReducedArgs(params, ["action", "content"]);
+			params = unwrapImitatedReducedArgs(params, ["action", "content"], {
+				action: {
+					type: "enum",
+					values: ["write", "read", "dismiss", "update"],
+				},
+				content: "string",
+				surface_condition: "string",
+				note_id: "number",
+				filter: { type: "enum", values: FILTER_VALUES },
+				limit: "number",
+				offset: "number",
+			});
 			const sessionId = ctx.sessionManager.getSessionId();
 			const dreamerEnabled =
 				deps.resolveDreamerEnabled?.(ctx) ?? deps.dreamerEnabled;

@@ -240,7 +240,18 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             summary: tool.schema.string().optional(),
         },
         async execute(args: CtxNoteArgs, toolContext) {
-            args = unwrapImitatedReducedArgs(args, ["action", "content"]);
+            args = unwrapImitatedReducedArgs(args, ["action", "content"], {
+                action: { type: "enum", values: ["write", "read", "dismiss", "update"] },
+                content: "string",
+                surface_condition: "string",
+                filter: {
+                    type: "enum",
+                    values: ["all", "active", "pending", "ready", "dismissed"],
+                },
+                limit: "number",
+                offset: "number",
+                note_id: "number",
+            });
             const sessionId = toolContext.sessionID;
             // Infer write only on NON-EMPTY content. GPT-family models fill every
             // optional param (content:"" for a read), so a bare `typeof === "string"`

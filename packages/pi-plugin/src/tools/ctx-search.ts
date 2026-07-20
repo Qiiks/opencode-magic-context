@@ -207,7 +207,16 @@ export function createCtxSearchTool(
 			_onUpdate,
 			ctx,
 		) {
-			params = unwrapImitatedReducedArgs(params, ["query"]);
+			params = unwrapImitatedReducedArgs(params, ["query"], {
+				query: "string",
+				limit: "number",
+				sources: {
+					type: "array",
+					items: "string",
+					maxItems: 5,
+					values: ["memory", "message", "git_commit", "primer", "note"],
+				},
+			});
 			const query = params.query?.trim();
 			if (!query) {
 				return {

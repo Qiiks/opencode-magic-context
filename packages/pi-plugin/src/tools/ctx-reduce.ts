@@ -84,7 +84,7 @@ export function createCtxReduceTool(
 			_onUpdate,
 			ctx,
 		) {
-			params = unwrapImitatedReducedArgs(params, ["drop"]);
+			params = unwrapImitatedReducedArgs(params, ["drop"], { drop: "string" });
 			const sessionId = ctx.sessionManager.getSessionId();
 			const protectedTags = Math.max(
 				0,

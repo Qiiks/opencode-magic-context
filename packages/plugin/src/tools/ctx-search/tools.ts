@@ -182,7 +182,16 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
             summary: tool.schema.string().optional(),
         },
         async execute(args: CtxSearchArgs, toolContext) {
-            args = unwrapImitatedReducedArgs(args, ["query"]);
+            args = unwrapImitatedReducedArgs(args, ["query"], {
+                query: "string",
+                limit: "number",
+                sources: {
+                    type: "array",
+                    items: "string",
+                    maxItems: 5,
+                    values: ["memory", "message", "git_commit", "primer", "note"],
+                },
+            });
             const query = args.query?.trim();
             if (!query) {
                 return "Error: 'query' is required.";
