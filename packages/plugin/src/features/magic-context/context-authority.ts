@@ -36,10 +36,16 @@ export interface AuthorityDrainContended {
     retryable: true;
     state: "DRAINING";
     attempts: number;
-    authority: AuthorityStatus;
+    authority: AuthorityStatus | null;
 }
 
 export type AuthorityDrainResult = AuthorityStatus | AuthorityDrainContended;
+
+export interface AuthorityDrainResponse {
+    authority?: AuthorityStatus;
+    code?: string;
+    retryable?: boolean;
+}
 
 export interface AuthorityModuleClient {
     authorityStatus(args: {
@@ -49,7 +55,7 @@ export interface AuthorityModuleClient {
         domain: AuthorityDomain;
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
-    authorityDrain?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
+    authorityDrain?(args: Record<string, unknown>): Promise<AuthorityDrainResponse>;
     authoritySeed?(
         args: Record<string, unknown>,
     ): Promise<{ seeded: number; module_row_ids?: number[] }>;
@@ -615,20 +621,35 @@ export async function drainAuthority(args: {
     const limit = Math.max(1, Math.min(args.limit ?? 100, 1000));
     let recaptureAttempts = 0;
 
-    while (true) {
+    drainAttempt: while (true) {
         const leaseStartedAt = Date.now();
-        let status = (
-            await args.module.authorityDrain({
-                method: "authority.drain.begin",
-                context_store_uuid: contextStoreUuid,
-                project: args.projectPath,
-                domain: args.domain,
-                action: "begin",
-                lease: `ts:${contextStoreUuid}`,
-                lease_started_at: leaseStartedAt,
-                lease_expires_at: leaseStartedAt + 60_000,
-            })
-        ).authority;
+        const beginResponse = await args.module.authorityDrain({
+            method: "authority.drain.begin",
+            context_store_uuid: contextStoreUuid,
+            project: args.projectPath,
+            domain: args.domain,
+            action: "begin",
+            lease: `ts:${contextStoreUuid}`,
+            lease_started_at: leaseStartedAt,
+            lease_expires_at: leaseStartedAt + 60_000,
+        });
+        if (!beginResponse.authority) {
+            if (authorityDrainErrorCode(beginResponse) === "authority_feed_head_advanced") {
+                if (recaptureAttempts >= MAX_DRAIN_RECAPTURE_ATTEMPTS) {
+                    return {
+                        code: "authority_drain_contended",
+                        retryable: true,
+                        state: "DRAINING",
+                        attempts: recaptureAttempts,
+                        authority: beginResponse.authority ?? null,
+                    };
+                }
+                recaptureAttempts += 1;
+                continue;
+            }
+            throw new Error("authority drain begin omitted authority");
+        }
+        let status = beginResponse.authority;
         const coordinatorToken = status.coordinator_token;
         if (typeof coordinatorToken !== "string" || coordinatorToken.length === 0) {
             throw new Error("authority drain begin omitted coordinator_token");
@@ -660,38 +681,60 @@ export async function drainAuthority(args: {
             "reconcile",
             "verify",
         ] as const) {
-            status = (
-                await args.module.authorityDrain({
-                    method: `authority.drain_${step}`,
-                    context_store_uuid: contextStoreUuid,
-                    project: args.projectPath,
-                    domain: args.domain,
-                    action: step,
-                    generation: status.generation,
-                    cursor: getMirrorCursor(args.db, args.domain),
-                    coordinator_token: coordinatorToken,
-                    now_ms: Date.now(),
-                })
-            ).authority;
+            const stepResponse = await args.module.authorityDrain({
+                method: `authority.drain_${step}`,
+                context_store_uuid: contextStoreUuid,
+                project: args.projectPath,
+                domain: args.domain,
+                action: step,
+                generation: status.generation,
+                cursor: getMirrorCursor(args.db, args.domain),
+                coordinator_token: coordinatorToken,
+                now_ms: Date.now(),
+            });
+            if (!stepResponse.authority) {
+                if (authorityDrainErrorCode(stepResponse) === "authority_feed_head_advanced") {
+                    if (recaptureAttempts >= MAX_DRAIN_RECAPTURE_ATTEMPTS) {
+                        return {
+                            code: "authority_drain_contended",
+                            retryable: true,
+                            state: "DRAINING",
+                            attempts: recaptureAttempts,
+                            authority: status,
+                        };
+                    }
+                    recaptureAttempts += 1;
+                    continue drainAttempt;
+                }
+                throw new Error(`authority drain ${step} omitted authority`);
+            }
+            status = stepResponse.authority;
         }
         const drainChecksum = typeof args.checksum === "function" ? args.checksum() : args.checksum;
         let finished: AuthorityStatus;
         try {
-            finished = (
-                await args.module.authorityDrain({
-                    method: "authority.drain.finish",
-                    context_store_uuid: contextStoreUuid,
-                    project: args.projectPath,
-                    domain: args.domain,
-                    action: "finish",
-                    generation: status.generation,
-                    checksum_expected: drainChecksum,
-                    checksum_actual: drainChecksum,
-                    verified: true,
-                    coordinator_token: coordinatorToken,
-                    now_ms: Date.now(),
-                })
-            ).authority;
+            const finishResponse = await args.module.authorityDrain({
+                method: "authority.drain.finish",
+                context_store_uuid: contextStoreUuid,
+                project: args.projectPath,
+                domain: args.domain,
+                action: "finish",
+                generation: status.generation,
+                checksum_expected: drainChecksum,
+                checksum_actual: drainChecksum,
+                verified: true,
+                coordinator_token: coordinatorToken,
+                now_ms: Date.now(),
+            });
+            if (!finishResponse.authority) {
+                if (authorityDrainErrorCode(finishResponse) === "authority_feed_head_advanced") {
+                    throw Object.assign(new Error("authority_feed_head_advanced"), {
+                        code: "authority_feed_head_advanced",
+                    });
+                }
+                throw new Error("authority drain finish omitted authority");
+            }
+            finished = finishResponse.authority;
         } catch (error) {
             if (authorityDrainErrorCode(error) === "authority_feed_head_advanced") {
                 if (recaptureAttempts >= MAX_DRAIN_RECAPTURE_ATTEMPTS) {
@@ -833,11 +876,14 @@ type MirrorResnapshotStatus = "pending_check" | "resnapshotting" | "complete";
 interface MirrorResnapshotState {
     status: MirrorResnapshotStatus;
     generation: string | null;
+    updated_at: number;
 }
 
 function memoryResnapshotState(db: Database): MirrorResnapshotState | null {
     const row = db
-        .prepare("SELECT status, generation FROM mirror_resnapshot_state WHERE domain = 'memories'")
+        .prepare(
+            "SELECT status, generation, updated_at FROM mirror_resnapshot_state WHERE domain = 'memories'",
+        )
         .get() as MirrorResnapshotState | undefined;
     return row ?? null;
 }
@@ -913,9 +959,9 @@ function stageLiveMemorySnapshotPage(
     if (!owned) return false;
 
     const insert = db.prepare(
-        `INSERT INTO mirror_live_staging(
-            generation, module_project, module_row_id, category, normalized_hash, full_row_snapshot
-         ) VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO mirror_live_staging(
+             generation, module_project, module_row_id, category, normalized_hash, full_row_snapshot
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
     );
     for (const feed of rows) {
         const row = feed.full_row_snapshot;
@@ -1540,6 +1586,7 @@ export async function ensureLiveMemoryResnapshot(args: {
     module: AuthorityModuleClient;
     limit: number;
 }): Promise<void> {
+    let adoptedWinner = false;
     let generation: string;
     while (true) {
         const observed = memoryResnapshotState(args.db);
@@ -1566,20 +1613,24 @@ export async function ensureLiveMemoryResnapshot(args: {
                     .immediate();
             });
             if (completed) return;
+            // A sibling may have started a resnapshot between the check and this CAS. Re-read
+            // below and adopt its generation instead of turning a recoverable race into a pull
+            // failure.
             continue;
         }
         if (!args.module.mirrorPull) {
             throw new Error("memory mirror resnapshot requires the mirror.pull module route");
         }
 
-        generation = `${Date.now().toString(36)}:${crypto.randomUUID()}`;
+        const now = Date.now();
+        generation = `${now.toString(36)}:${crypto.randomUUID()}`;
         let claimed = false;
         withPrivilegedWriter(args.db, () => {
             args.db
                 .transaction(() => {
-                    // The state row is the cross-process owner lease. Every attempt must win this
-                    // compare-and-swap before it can stage or install, so an older paged caller
-                    // cannot publish after a newer caller has taken ownership and completed.
+                    // A stale resnapshot owner is safe to replace because the CAS fences every
+                    // page and install from the abandoned generation. The same CAS also lets a
+                    // concurrently-starting caller win deterministically.
                     claimed = casMemoryResnapshotState(
                         args.db,
                         observed,
@@ -1595,6 +1646,20 @@ export async function ensureLiveMemoryResnapshot(args: {
                 .immediate();
         });
         if (claimed) break;
+
+        // CAS loss is expected when another process begins the resnapshot first. Re-read once
+        // and adopt that winner's generation; do not report a hard pull error for the race.
+        const winner = memoryResnapshotState(args.db);
+        if (
+            !adoptedWinner &&
+            winner?.status === "resnapshotting" &&
+            typeof winner.generation === "string" &&
+            winner.generation.length > 0
+        ) {
+            generation = winner.generation;
+            adoptedWinner = true;
+            break;
+        }
     }
 
     let cursor = 0;

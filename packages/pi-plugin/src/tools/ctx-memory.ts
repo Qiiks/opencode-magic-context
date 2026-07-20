@@ -59,7 +59,7 @@ import { invalidateMemory } from "@magic-context/core/features/magic-context/mem
 import { computeNormalizedHash } from "@magic-context/core/features/magic-context/memory/normalize-hash";
 import {
 	normalizeStoredProjectPath,
-	resolveProjectIdentity,
+	resolveProjectIdentityForSession,
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -380,7 +380,12 @@ export function createCtxMemoryTool(
 				);
 			}
 
-			const projectIdentity = resolveProjectIdentity(ctx.cwd);
+			const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
+			if (!projectIdentity) {
+				return err(
+					"Error: Could not resolve project identity for memory action.",
+				);
+			}
 			await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);
 			const workspaceIdentitySet = resolveWorkspaceIdentitySet(
 				deps.db,

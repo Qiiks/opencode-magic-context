@@ -46,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 61;
+export const LATEST_SUPPORTED_VERSION = 62;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1484,11 +1484,25 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       );
       CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_project
         ON memory_mutation_log(project_path, id);
-      CREATE TABLE IF NOT EXISTS v22_identity_rekey_map (
-        old_project_path TEXT PRIMARY KEY,
-        new_project_path TEXT NOT NULL,
-        rekeyed_at INTEGER NOT NULL
-      );
+       CREATE TABLE IF NOT EXISTS v22_identity_rekey_map (
+         old_project_path TEXT PRIMARY KEY,
+         new_project_path TEXT NOT NULL,
+         rekeyed_at INTEGER NOT NULL
+       );
+       CREATE TABLE IF NOT EXISTS identity_merge_log (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         from_identity TEXT NOT NULL,
+         to_identity TEXT NOT NULL,
+         table_name TEXT NOT NULL,
+         row_id TEXT NOT NULL,
+         action TEXT NOT NULL,
+         target_row_id TEXT,
+         merged_at INTEGER NOT NULL
+       );
+       CREATE INDEX IF NOT EXISTS idx_identity_merge_log_identities
+         ON identity_merge_log(from_identity, to_identity, merged_at);
+       CREATE INDEX IF NOT EXISTS idx_identity_merge_log_table_row
+         ON identity_merge_log(table_name, row_id);
       CREATE TABLE IF NOT EXISTS workspaces (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,

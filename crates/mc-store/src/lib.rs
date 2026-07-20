@@ -387,6 +387,13 @@ const NO_ROW: i64 = -1;
 const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
 const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
 
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1846,6 +1853,18 @@ const MIGRATIONS: &[Migration] = &[
         );
         CREATE INDEX IF NOT EXISTS idx_mc_memory_mappings_project
             ON mc_memory_mappings(project_path, memory_id);
+        "#,
+    },
+    Migration {
+        version: 35,
+        // Cache rows are not deleted when a session is closed. Keep an explicit activity
+        // watermark so lineage pruning can distinguish an old idle session from one that
+        // still commits state, instead of treating row existence as proof of liveness.
+        statements: r#"
+        ALTER TABLE mc_cache_state ADD COLUMN last_activity_at INTEGER NOT NULL DEFAULT 0;
+        UPDATE mc_cache_state
+           SET last_activity_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+         WHERE last_activity_at = 0;
         "#,
     },
 ];
@@ -3926,21 +3945,20 @@ impl McStore {
 
     fn prune_transform_session_roots(&self) -> Result<(), McStoreError> {
         const THIRTY_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+        let now_ms = current_time_ms();
         self.inner
             .with_conn(|conn| {
-                // Age alone cannot prove that a root is dead: idle sessions still depend on
-                // their cache row after restart. Prune only aged lineage whose owning cache
-                // state has actually been deleted.
+                // Cache rows are retained across session teardown, so row existence is not
+                // activity. Prune lineage only when both the root observation and its cache
+                // activity watermark are older than the inactivity window. This keeps active
+                // sessions alive without depending on a deletion path that does not exist.
                 conn.execute(
                     "DELETE FROM mc_transform_session_roots AS roots
                       WHERE roots.observed_at < ?1
                         AND NOT EXISTS (
                             SELECT 1 FROM mc_cache_state AS cache
                              WHERE cache.session_id = roots.session_id
+                               AND cache.last_activity_at >= ?1
                         )",
                     params![now_ms.saturating_sub(THIRTY_DAYS_MS)],
                 )?;
@@ -6002,13 +6020,14 @@ impl McStore {
 
             // INSERT-or-UPDATE in the same fenced txn (bootstrap has no row to UPDATE).
             tx.execute(
-                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta)
-                  VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
+                  VALUES (?1, ?2, ?3, ?4, ?5)
                   ON CONFLICT(session_id) DO UPDATE SET
                       row_version = excluded.row_version,
                       core_state  = excluded.core_state,
-                      meta        = excluded.meta",
-                params![session_id, next as i64, core_json, meta_json],
+                      meta        = excluded.meta,
+                      last_activity_at = excluded.last_activity_at",
+                params![session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
             if let Some(project_root) = canonical_project_root.as_deref() {
                 // Durable root lineage is committed with the cache CAS, so a restart cannot
@@ -6308,13 +6327,14 @@ impl McStore {
                 Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
             };
             tx.execute(
-                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(session_id) DO UPDATE SET
                      row_version = excluded.row_version,
                      core_state  = excluded.core_state,
-                     meta        = excluded.meta",
-                params![request.session_id, next as i64, core_json, meta_json],
+                     meta        = excluded.meta,
+                     last_activity_at = excluded.last_activity_at",
+                params![request.session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
 
             Ok(ShadowSyncTxnOutcome::Committed(ShadowStateSyncResult {
@@ -6438,13 +6458,14 @@ impl McStore {
             let meta_json = serde_json::to_string(&meta)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             tx.execute(
-                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(session_id) DO UPDATE SET
                      row_version = excluded.row_version,
                      core_state  = excluded.core_state,
-                     meta        = excluded.meta",
-                params![session_id, next as i64, core_json, meta_json],
+                     meta        = excluded.meta,
+                     last_activity_at = excluded.last_activity_at",
+                params![session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
             Ok(ShadowResetResult {
                 shadow_generation: meta.shadow_generation,
@@ -13000,7 +13021,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=34).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=35).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -15642,7 +15663,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=34).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=35).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)

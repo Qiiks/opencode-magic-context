@@ -19,7 +19,7 @@
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getLastIndexedOrdinal } from "@magic-context/core/features/magic-context/message-index";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -232,7 +232,7 @@ export function createCtxNoteTool(
 							"Error: Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.",
 						);
 					}
-					const projectIdentity = resolveProjectIdentity(ctx.cwd);
+					const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
 					if (!projectIdentity) {
 						return err(
 							"Error: Could not resolve project identity for smart note.",
@@ -262,7 +262,7 @@ export function createCtxNoteTool(
 				if (typeof params.note_id !== "number") {
 					return err("Error: 'note_id' is required when action is 'dismiss'.");
 				}
-				const projectIdentity = resolveProjectIdentity(ctx.cwd);
+				const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
 				if (!projectIdentity) {
 					return err(
 						"Error: Could not resolve project identity for note dismiss.",
@@ -292,7 +292,7 @@ export function createCtxNoteTool(
 						"Error: Provide 'content' and/or 'surface_condition' to update.",
 					);
 				}
-				const projectIdentity = resolveProjectIdentity(ctx.cwd);
+				const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
 				if (!projectIdentity) {
 					return err(
 						"Error: Could not resolve project identity for note update.",
@@ -382,7 +382,7 @@ function readNotes(args: {
 	limit: number;
 	offset: number;
 }): string[] {
-	const projectIdentity = resolveProjectIdentity(args.cwd);
+	const projectIdentity = resolveProjectIdentityForSession(args.cwd);
 
 	if (args.filter === undefined) {
 		// Default mixed view: active session notes + READY smart notes.

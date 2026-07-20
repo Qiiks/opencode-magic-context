@@ -35,7 +35,7 @@ import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
-import { resolveProjectIdentityOrFallback } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
@@ -167,7 +167,7 @@ function resolveCurrentProject(ctx: { cwd: string }): {
 	projectIdentity: string;
 } {
 	const projectDir = ctx.cwd;
-	const projectIdentity = resolveProjectIdentityOrFallback(projectDir);
+	const projectIdentity = resolveProjectIdentityForSession(projectDir) ?? "";
 	return { projectDir, projectIdentity };
 }
 
@@ -683,8 +683,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// identity/path resolution uses ctx.cwd per hook/command so session cwd
 	// switches follow the active project without reloading config.
 	const projectDir = process.cwd();
-	const projectIdentity = resolveProjectIdentityOrFallback(projectDir);
-	const seenDreamerProjectIdentities = new Set<string>([projectIdentity]);
+	const projectIdentity = resolveProjectIdentityForSession(projectDir) ?? "";
+	const seenDreamerProjectIdentities = new Set<string>();
+	if (projectIdentity) seenDreamerProjectIdentities.add(projectIdentity);
 
 	try {
 		const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
@@ -749,7 +750,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	}
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
-	info(`registered embedding config for project ${projectIdentity}`);
+	info(
+		`registered embedding config for project ${projectIdentity ?? "(no project identity; cwd is $HOME)"}`,
+	);
 
 	type ResolvedPiProjectDeps = {
 		projectDir: string;
@@ -832,7 +835,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			hist.onStatusChange = (ctx) => {
 				updateStatusLine(ctx, {
 					db: database,
-					projectIdentity: resolveCurrentProject(ctx).projectIdentity,
+					projectIdentity: resolveCurrentProject(ctx).projectIdentity ?? "",
 				});
 			};
 		}
@@ -866,7 +869,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		});
 		const switchedConfig = switchedLoad.config;
 		const switchedIdentity =
-			identityOverride ?? resolveProjectIdentityOrFallback(dir);
+			identityOverride ?? resolveProjectIdentityForSession(dir) ?? "";
 		const built = buildProjectDeps(dir, switchedIdentity, switchedConfig);
 		projectDepsByDir.set(dir, built);
 		return built;

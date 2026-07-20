@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withContentLanguageDirective } from "@magic-context/core/agents/language-directive";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { isMemoryMigrationDone } from "@magic-context/core/features/magic-context/memory/memory-migration";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { isWrapupInProgress } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT } from "@magic-context/core/hooks/magic-context/compartment-prompt";
@@ -163,7 +163,8 @@ export function registerCtxSessionUpgradeCommand(
 			//   • none + migration already done → no-op "already upgraded"
 			//   • none + migration still pending → migration only (skip recomp)
 			if (upgradableCount === 0) {
-				const projectPath = resolveProjectIdentity(ctx.cwd);
+				const projectPath = resolveProjectIdentityForSession(ctx.cwd);
+				if (!projectPath) return;
 				// migrationPending mirrors OpenCode: only pending when memory is
 				// enabled AND the project hasn't been migrated yet.
 				const migrationPending =

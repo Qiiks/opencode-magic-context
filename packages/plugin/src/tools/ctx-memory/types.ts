@@ -51,7 +51,7 @@ export interface CtxMemoryToolDeps {
      * `ctx_memory` operates on the session's project, not the launch
      * directory's project.
      */
-    resolveProjectPath: (directory: string) => string;
+    resolveProjectPath: (directory: string) => string | undefined;
     memoryEnabled?: boolean;
     embeddingEnabled?: boolean;
     allowedActions?: CtxMemoryAction[];

@@ -27,7 +27,7 @@ export interface CtxNoteToolDeps {
      * Optional — when undefined, smart-note creation is rejected with an
      * explanatory error.
      */
-    resolveProjectPath?: (directory: string) => string;
+    resolveProjectPath?: (directory: string) => string | undefined;
     rustToolBackends?: RustToolBackends;
 }
 

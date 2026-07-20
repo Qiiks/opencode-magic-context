@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
     resolveProjectIdentity,
+    resolveProjectIdentityForSession,
 } from "./project-identity";
 
 function tempDir(): string {
@@ -22,6 +23,10 @@ afterEach(() => {
 });
 
 describe("resolveProjectIdentity directory fallback", () => {
+    test("does not bind the exact canonical home directory", () => {
+        expect(resolveProjectIdentityForSession(homedir())).toBeUndefined();
+        expect(resolveProjectIdentityForSession(join(homedir(), "a-project"))).not.toBeUndefined();
+    });
     test("flips dir: fallback to git: once a repo gains its first commit (no stale cache)", () => {
         const dir = tempDir();
         try {

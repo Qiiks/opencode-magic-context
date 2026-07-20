@@ -11,7 +11,7 @@ import { migrateMagicContextConfigLocations } from "./config/migrate-config-loca
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
-import { resolveProjectIdentityOrFallback } from "./features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
@@ -255,36 +255,43 @@ const server: Plugin = async (ctx) => {
     if (pluginConfig.enabled) {
         const dreamerRunnable = isDreamerRunnable(pluginConfig);
         const classifyModuleClient = createDreamTimerModuleClient(rustModeModuleClient);
-        const timerRegistration = {
-            directory: ctx.directory,
-            projectIdentity: resolveProjectIdentityOrFallback(ctx.directory),
-            client: ctx.client,
-            dreamerConfig: dreamerRunnable ? pluginConfig.dreamer : undefined,
-            language: pluginConfig.language,
-            transformMode: pluginConfig.transform_mode,
-            embeddingConfig: pluginConfig.embedding,
-            memoryEnabled: pluginConfig.memory?.enabled === true,
-            gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
-                ? {
-                      enabled: true,
-                      since_days: pluginConfig.memory.git_commit_indexing.since_days,
-                      max_commits: pluginConfig.memory.git_commit_indexing.max_commits,
-                  }
-                : undefined,
-            ensureRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
-            moduleClient: classifyModuleClient,
-        };
-        // Fail OPEN: the dream timer is best-effort background maintenance and must
-        // never abort the plugin load. This block is awaited and runs BEFORE the
-        // hooks are returned, so an unguarded throw here (e.g. a fatal DB open, or
-        // ensureRegistered failing) would escape server() and leave the transform /
-        // compaction pipeline unregistered — ballooning every session's context.
-        // openTimerDatabaseOrNull already degrades a fatal open to null, but we wrap
-        // the whole registration as defense in depth against any other throw path.
-        try {
-            stopDreamTimerRegistration = await startDreamScheduleTimer(timerRegistration);
-        } catch (err) {
-            log(`[magic-context] dream timer registration failed (continuing without it): ${err}`);
+        const timerProjectIdentity = resolveProjectIdentityForSession(ctx.directory);
+        if (!timerProjectIdentity) {
+            log("[magic-context] dream timer skipped: cwd is the user's home directory");
+        } else {
+            const timerRegistration = {
+                directory: ctx.directory,
+                projectIdentity: timerProjectIdentity,
+                client: ctx.client,
+                dreamerConfig: dreamerRunnable ? pluginConfig.dreamer : undefined,
+                language: pluginConfig.language,
+                transformMode: pluginConfig.transform_mode,
+                embeddingConfig: pluginConfig.embedding,
+                memoryEnabled: pluginConfig.memory?.enabled === true,
+                gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
+                    ? {
+                          enabled: true,
+                          since_days: pluginConfig.memory.git_commit_indexing.since_days,
+                          max_commits: pluginConfig.memory.git_commit_indexing.max_commits,
+                      }
+                    : undefined,
+                ensureRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+                moduleClient: classifyModuleClient,
+            };
+            // Fail OPEN: the dream timer is best-effort background maintenance and must
+            // never abort the plugin load. This block is awaited and runs BEFORE the
+            // hooks are returned, so an unguarded throw here (e.g. a fatal DB open, or
+            // ensureRegistered failing) would escape server() and leave the transform /
+            // compaction pipeline unregistered — ballooning every session's context.
+            // openTimerDatabaseOrNull already degrades a fatal open to null, but we wrap
+            // the whole registration as defense in depth against any other throw path.
+            try {
+                stopDreamTimerRegistration = await startDreamScheduleTimer(timerRegistration);
+            } catch (err) {
+                log(
+                    `[magic-context] dream timer registration failed (continuing without it): ${err}`,
+                );
+            }
         }
 
         // Start RPC server for TUI↔server communication (replaces SQLite plugin_messages bus).

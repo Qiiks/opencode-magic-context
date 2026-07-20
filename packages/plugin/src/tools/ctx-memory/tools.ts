@@ -403,6 +403,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             // can differ from the session's working directory when the user
             // runs `opencode -s <id>` from outside the project.
             const projectPath = deps.resolveProjectPath(toolContext.directory);
+            if (!projectPath) {
+                return "Error: Could not resolve project identity for memory action.";
+            }
             await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
             if (args.action !== "list") {
                 const marker = getAuthorityManagedMarker(deps.db, projectPath);

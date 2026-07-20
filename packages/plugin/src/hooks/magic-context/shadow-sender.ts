@@ -15,6 +15,7 @@ import {
 } from "@cortexkit/subc-client";
 import { getCompartmentsByEndMessageId } from "../../features/magic-context/compartment-storage";
 import type {
+    AuthorityDrainResponse,
     AuthorityStatus,
     ChangefeedPage,
 } from "../../features/magic-context/context-authority";
@@ -1820,7 +1821,7 @@ export class SubcShadowTransport implements ShadowTransport {
         };
     }
 
-    async authorityDrain(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }> {
+    async authorityDrain(args: Record<string, unknown>): Promise<AuthorityDrainResponse> {
         this.authorityProjectRoot = String(args.project ?? this.authorityProjectRoot);
         const method = String(args.method ?? "authority.drain.step") as Parameters<
             SubcShadowTransport["authorityRequest"]
@@ -1832,8 +1833,16 @@ export class SubcShadowTransport implements ShadowTransport {
             method,
             body,
         );
-        if (!isRecord(response.authority)) throw new Error("authority.drain omitted authority");
-        return { authority: response.authority as unknown as AuthorityStatus };
+        if (isRecord(response.authority)) {
+            return { authority: response.authority as unknown as AuthorityStatus };
+        }
+        if (typeof response.code === "string") {
+            return {
+                code: response.code,
+                retryable: response.retryable === true,
+            };
+        }
+        throw new Error("authority.drain omitted authority");
     }
 
     async mirrorPull(args: {

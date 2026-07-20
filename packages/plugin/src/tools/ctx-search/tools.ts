@@ -218,6 +218,9 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
             // can differ from the session's working directory when the user
             // runs `opencode -s <id>` from outside the project.
             const projectPath = deps.resolveProjectPath(toolContext.directory);
+            if (!projectPath) {
+                return "Error: Could not resolve project identity for search.";
+            }
             await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
             const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
             const memoryEnabled = embeddingSnapshot?.features.memoryEnabled ?? deps.memoryEnabled;

@@ -41,7 +41,7 @@ import {
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	clearSessionTracking,
 	scheduleIncrementalIndex,
@@ -621,9 +621,10 @@ function isContextHandlerSessionActive(sessionId: string): boolean {
 
 function updateSessionProjectTracking(
 	sessionId: string,
-	projectIdentity: string,
+	projectIdentity: string | undefined,
 	db?: ContextDatabase,
 ): void {
+	if (!projectIdentity) return;
 	const prev = lastSeenProjectIdentityBySession.get(sessionId);
 	if (prev && prev !== projectIdentity) {
 		const prevSessions = sessionsByProject.get(prev);
@@ -1891,7 +1892,8 @@ export function registerPiContextHandler(
 				baseOptions.resolveForProject?.(projectDirectory) ?? baseOptions;
 			const schedulerConfig = options.scheduler ?? DEFAULT_SCHEDULER_CONFIG;
 			const scheduler = schedulerFor(options);
-			const projectIdentity = resolveProjectIdentity(projectDirectory);
+			const projectIdentity =
+				resolveProjectIdentityForSession(projectDirectory) ?? "";
 			updateSessionProjectTracking(sessionId, projectIdentity, options.db);
 			logTransformTiming(
 				sessionId,

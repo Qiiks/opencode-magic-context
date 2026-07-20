@@ -30,7 +30,7 @@ import {
     runManualDream,
 } from "../../features/magic-context/dreamer/task-scheduler";
 import {
-    resolveProjectIdentityOrFallback,
+    resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import {
@@ -226,7 +226,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         return null;
     }
 
-    const projectPath = resolveProjectIdentityOrFallback(deps.directory);
+    const projectPath = resolveProjectIdentityForSession(deps.directory);
+    if (!projectPath) {
+        log("[magic-context] not binding a project identity for the user's home directory");
+        return null;
+    }
 
     // Startup consistency check: reconcile any compaction markers whose state
     // references rows that no longer exist in OpenCode's DB. This can happen
@@ -453,7 +457,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return "Embedding is already running for this session.";
         }
         await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+        if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         embedPauseBySession.delete(sessionId);
         const prior = embedRunStateBySession.get(sessionId);
@@ -545,7 +550,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         const ctrl = embedRunStateBySession.get(sessionId);
         if (ctrl) ctrl.abort();
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+        if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const cov = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
         return `Paused at ${cov.session.embedded}/${cov.session.total} compartments embedded.`;
@@ -553,7 +559,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const getEmbedStatusText = (sessionId: string): string => {
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+        if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
         const progress = recompProgressBySession.get(sessionId);
@@ -581,7 +588,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 // transform return first, keeping the hot path clean.
                 await new Promise((resolve) => setTimeout(resolve, 0));
                 await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-                const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+                const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+                if (!sessionProjectIdentity) return;
                 maybeSendProjectIdentitySessionWarning(sessionId, directory);
                 const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
                 if (!coverage.enabled) return;

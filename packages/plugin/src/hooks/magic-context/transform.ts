@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import {
     resolveProjectIdentity,
+    resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
@@ -1245,6 +1246,9 @@ export function createTransform(deps: TransformDeps) {
         const sessionProjectIdentity =
             projectIdentity ??
             (sessionDirectory ? resolveProjectIdentity(sessionDirectory) : deps.projectPath);
+        const sessionIdentityForBinding = sessionDirectory
+            ? resolveProjectIdentityForSession(sessionDirectory)
+            : undefined;
         if (sessionDirectory) {
             maybeSendProjectIdentityWarning(deps, sessionId, sessionDirectory, notificationParams);
         }
@@ -1254,12 +1258,12 @@ export function createTransform(deps: TransformDeps) {
         // Guarded to fire once per (session, identity) in this process so the
         // hot path carries no per-pass DB write once the binding is recorded.
         if (
-            sessionProjectIdentity &&
+            sessionIdentityForBinding &&
             sessionDirectoryResolvedFromHost &&
-            recordedSessionProjectIdentity.get(sessionId) !== sessionProjectIdentity
+            recordedSessionProjectIdentity.get(sessionId) !== sessionIdentityForBinding
         ) {
-            recordSessionProjectIdentity(db, sessionId, sessionProjectIdentity);
-            recordedSessionProjectIdentity.set(sessionId, sessionProjectIdentity);
+            recordSessionProjectIdentity(db, sessionId, sessionIdentityForBinding);
+            recordedSessionProjectIdentity.set(sessionId, sessionIdentityForBinding);
         }
 
         // Historian trigger decision — relocated here from the message.updated

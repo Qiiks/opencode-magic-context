@@ -50,7 +50,7 @@ import {
 	embedPromotedFacts,
 	promoteSessionFactsDurable,
 } from "@magic-context/core/features/magic-context/memory";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
 	clearEmergencyDrainLatch,
@@ -669,7 +669,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// memory block so historian can dedup new facts against existing
 			// project memories. Cross-harness coherence comes free here —
 			// memories written by OpenCode show up in this Pi historian run.
-			const projectPath = resolveProjectIdentity(directory);
+			const projectPath = resolveProjectIdentityForSession(directory);
+			if (!projectPath) {
+				rollbackDrainReservation();
+				return;
+			}
 			const memories = getMemoriesByProject(db, projectPath, [
 				"active",
 				"permanent",

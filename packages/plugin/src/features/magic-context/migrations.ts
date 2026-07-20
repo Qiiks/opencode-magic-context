@@ -2382,6 +2382,28 @@ const MIGRATIONS: Migration[] = [
             ).run(Date.now());
         },
     },
+    {
+        version: 62,
+        description: "durable row-level project identity merge audit log",
+        up(db: Database): void {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS identity_merge_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_identity TEXT NOT NULL,
+                    to_identity TEXT NOT NULL,
+                    table_name TEXT NOT NULL,
+                    row_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    target_row_id TEXT,
+                    merged_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_identity_merge_log_identities
+                    ON identity_merge_log(from_identity, to_identity, merged_at);
+                CREATE INDEX IF NOT EXISTS idx_identity_merge_log_table_row
+                    ON identity_merge_log(table_name, row_id);
+            `);
+        },
+    },
 ];
 
 /**

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+    type AuthorityDrainResponse,
     type AuthorityModuleClient,
     type AuthorityStatus,
     checksumAuthoritySeedRows,
@@ -75,7 +76,7 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
     authoritySeed?(
         args: Record<string, unknown>,
     ): Promise<{ seeded: number; module_row_ids?: number[] }>;
-    authorityDrain?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
+    authorityDrain?(args: Record<string, unknown>): Promise<AuthorityDrainResponse>;
     mirrorPull?(args: {
         domain: "memories" | "notes";
         cursor: number;
@@ -362,17 +363,22 @@ function authoritySeedRows(
                   )
                   .all(projectPath, projectPath);
     const memoryRows = snapshots.filter(isRecord);
-    const mappings = domain === "memories"
-        ? getMemoryVerifications(db, memoryRows.map((row) => Number(row.id)))
-        : new Map<number, { files: string[]; hasSentinel: boolean }>();
+    const mappings =
+        domain === "memories"
+            ? getMemoryVerifications(
+                  db,
+                  memoryRows.map((row) => Number(row.id)),
+              )
+            : new Map<number, { files: string[]; hasSentinel: boolean }>();
     return memoryRows.map((snapshot) => {
         const id = Number(snapshot.id);
         const mapping = mappings.get(id);
-        const seededSnapshot = domain === "memories" && mapping
-            ? { ...snapshot, mapping: mapping.hasSentinel ? null : mapping.files }
-            : domain === "notes" && snapshot.project_path == null
-                ? { ...snapshot, project_path: projectPath }
-                : snapshot;
+        const seededSnapshot =
+            domain === "memories" && mapping
+                ? { ...snapshot, mapping: mapping.hasSentinel ? null : mapping.files }
+                : domain === "notes" && snapshot.project_path == null
+                  ? { ...snapshot, project_path: projectPath }
+                  : snapshot;
         return { source_row_id: snapshot.id, snapshot: seededSnapshot };
     });
 }
@@ -443,21 +449,28 @@ async function prepareRustMemoryAuthority(args: {
         const current = statuses.get(domain);
         if (current?.state !== "DRAINING") continue;
         resumedDrain = true;
-        const drained = await drainAuthority({
-            db,
-            projectPath,
-            domain,
-            module: authorityModule,
-            checksum: () =>
-                checksumSeedRows(
-                    db
-                        .prepare(
-                            `SELECT * FROM ${domain === "memories" ? "memories" : "notes"} WHERE project_path = ? ORDER BY id ASC`,
-                        )
-                        .all(projectPath)
-                        .filter(isRecord),
-                ),
-        });
+        let drained: Awaited<ReturnType<typeof drainAuthority>> | undefined;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            drained = await drainAuthority({
+                db,
+                projectPath,
+                domain,
+                module: authorityModule,
+                checksum: () =>
+                    checksumSeedRows(
+                        db
+                            .prepare(
+                                `SELECT * FROM ${domain === "memories" ? "memories" : "notes"} WHERE project_path = ? ORDER BY id ASC`,
+                            )
+                            .all(projectPath)
+                            .filter(isRecord),
+                    ),
+            });
+            if (!("code" in drained)) break;
+        }
+        if (!drained) {
+            throw new MemoryAuthorityUnavailableError("authority drain did not return a result");
+        }
         if ("code" in drained) {
             throw new MemoryAuthorityUnavailableError(
                 `${drained.code}; the next scheduled transform will resume the drain`,

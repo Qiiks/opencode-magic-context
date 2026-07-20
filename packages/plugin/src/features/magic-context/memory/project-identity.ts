@@ -14,6 +14,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { log } from "../../../shared/logger";
 
@@ -405,6 +406,19 @@ export function takeDubiousOwnershipProjectIdentityWarning(directory: string): s
     return formatDubiousOwnershipWarning(canonical);
 }
 
+/**
+ * Compare filesystem-canonical paths so a symlink spelling of $HOME cannot
+ * accidentally create a second directory identity. Descendants remain valid
+ * project directories; only the exact home directory is rejected.
+ */
+export function isUserHomeDirectory(directory: string): boolean {
+    try {
+        return realpathSync.native(path.resolve(directory)) === realpathSync.native(homedir());
+    } catch {
+        return false;
+    }
+}
+
 export function resolveProjectIdentity(directory: string): string {
     const canonical = path.resolve(directory);
     const cachedFallback = directoryFallbackCache.get(canonical);
@@ -496,6 +510,11 @@ function hasGitDirInAncestorChain(startDirectory: string): boolean {
         }
         current = parent;
     }
+}
+
+export function resolveProjectIdentityForSession(directory: string): string | undefined {
+    if (isUserHomeDirectory(directory)) return undefined;
+    return resolveProjectIdentityOrFallback(directory);
 }
 
 /**

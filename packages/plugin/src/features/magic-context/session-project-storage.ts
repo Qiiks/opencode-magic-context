@@ -1,5 +1,6 @@
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { isUserHomeDirectory } from "./memory/project-identity";
 
 const SESSION_CHUNK_REPAIR_BATCH_SIZE = 100;
 
@@ -81,9 +82,18 @@ function getRepairProjectChunkProjectStatement(db: Database): PreparedStatement 
 export function recordSessionProjectIdentity(
     db: Database,
     sessionId: string,
-    projectPath: string,
+    projectPath: string | undefined,
 ): void {
     if (!sessionId || !projectPath) return;
+    // A session started exactly at the user's home directory is not a project.
+    // The guard is repeated here because background backfills can call this
+    // function without passing through the transform resolver.
+    if (
+        !projectPath.startsWith("git:") &&
+        !projectPath.startsWith("dir:") &&
+        isUserHomeDirectory(projectPath)
+    )
+        return;
     const harness = getHarness();
     const now = Date.now();
     db.transaction(() => {

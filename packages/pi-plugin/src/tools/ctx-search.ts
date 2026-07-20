@@ -20,7 +20,7 @@ import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	parseIdShapedQuery,
 	resolveMemoriesByIdsForSearch,
@@ -227,7 +227,19 @@ export function createCtxSearchTool(
 			}
 
 			const sessionId = ctx.sessionManager.getSessionId();
-			const projectIdentity = resolveProjectIdentity(ctx.cwd);
+			const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
+			if (!projectIdentity) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Error: Could not resolve project identity for search.",
+						},
+					],
+					details: undefined,
+					isError: true,
+				};
+			}
 			await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);
 			const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
 			const memoryEnabled =
