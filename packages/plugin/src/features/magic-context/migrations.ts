@@ -2320,6 +2320,13 @@ const MIGRATIONS: Migration[] = [
                 );
                 CREATE INDEX IF NOT EXISTS idx_mirror_live_memory_content
                     ON mirror_live_memory_rows(module_project, category, normalized_hash);
+                CREATE TABLE IF NOT EXISTS mirror_resnapshot_state (
+                    domain TEXT PRIMARY KEY CHECK(domain = 'memories'),
+                    status TEXT NOT NULL CHECK(status IN ('pending_check', 'resnapshotting', 'complete')),
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO mirror_resnapshot_state(domain, status, updated_at)
+                VALUES ('memories', 'pending_check', 0);
             `);
         },
     },

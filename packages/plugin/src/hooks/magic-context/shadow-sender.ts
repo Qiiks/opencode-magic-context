@@ -1834,6 +1834,7 @@ export class SubcShadowTransport implements ShadowTransport {
         domain: "memories" | "notes";
         cursor: number;
         limit: number;
+        live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: ChangefeedPage }> {
         const { projectRoot, ...body } = args;

@@ -10,6 +10,7 @@ import {
     getModuleNoteEvaluationBridge,
     installAuthorityManagedMarker,
     prepareAuthority,
+    pullAndApplyMirrorPage,
     reconcileAuthorityProject,
     registerModuleNoteEvaluationBridge,
 } from "./context-authority";
@@ -419,6 +420,126 @@ describe("memory authority protocol", () => {
                 )
                 .all(),
         ).toEqual([{ module_project: "git:identity", module_row_id: 200, context_row_id: 9395 }]);
+    });
+
+    test("schema-57 mirror upgrades resnapshot before either tombstone order", async () => {
+        const row = (id: number, projectPath: string) => ({
+            id,
+            project_path: projectPath,
+            category: "CONFIG_VALUES",
+            content: "drive model",
+            normalized_hash: "same-hash",
+            status: "active",
+        });
+        const scenarios = [
+            {
+                name: "legacy cleanup leaves canonical live",
+                live: [row(200, "git:identity")],
+                tombstones: [row(100, "/repo")],
+                survives: true,
+            },
+            {
+                name: "canonical cleanup leaves legacy live",
+                live: [row(100, "/repo")],
+                tombstones: [row(200, "git:identity")],
+                survives: true,
+            },
+            {
+                name: "both deleted legacy first",
+                live: [],
+                tombstones: [row(100, "/repo"), row(200, "git:identity")],
+                survives: false,
+            },
+            {
+                name: "both deleted canonical first",
+                live: [],
+                tombstones: [row(200, "git:identity"), row(100, "/repo")],
+                survives: false,
+            },
+        ];
+
+        for (const scenario of scenarios) {
+            const database = db();
+            database.exec(`
+                DROP TABLE mirror_resnapshot_state;
+                DROP TABLE mirror_live_memory_rows;
+                DELETE FROM schema_migrations WHERE version = 58;
+            `);
+            withPrivilegedWriter(database, () => {
+                database
+                    .prepare(
+                        "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (9395, 'git:identity', 'CONFIG_VALUES', 'drive model', 'same-hash', 0, 0, 0, 0)",
+                    )
+                    .run();
+                database
+                    .prepare(
+                        "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', '/repo', 100, 9395)",
+                    )
+                    .run();
+                database
+                    .prepare(
+                        "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 20, 0)",
+                    )
+                    .run();
+            });
+            runMigrations(database);
+            const calls: Array<{ live_only?: boolean }> = [];
+            const module: AuthorityModuleClient = {
+                authorityStatus: async () => ({ authority: null }),
+                authorityPrepare: async () => ({ authority: authority("PREPARING", 1) }),
+                mirrorPull: async (args) => {
+                    calls.push(args);
+                    if (args.live_only) {
+                        return {
+                            page: {
+                                domain: "memories",
+                                cursor: args.cursor,
+                                next_cursor: scenario.live.at(-1)?.id ?? args.cursor,
+                                has_more: false,
+                                rows: scenario.live.map((snapshot) => ({
+                                    feed_seq: 0,
+                                    domain: "memories" as const,
+                                    op: "insert" as const,
+                                    module_row_id: snapshot.id,
+                                    full_row_snapshot: snapshot,
+                                    content_hash: "same-hash",
+                                })),
+                            },
+                        };
+                    }
+                    return {
+                        page: {
+                            domain: "memories",
+                            cursor: args.cursor,
+                            next_cursor: args.cursor + scenario.tombstones.length,
+                            has_more: false,
+                            rows: scenario.tombstones.map((snapshot, index) => ({
+                                feed_seq: args.cursor + index + 1,
+                                domain: "memories" as const,
+                                op: "tombstone" as const,
+                                module_row_id: snapshot.id,
+                                full_row_snapshot: snapshot,
+                                content_hash: "same-hash",
+                            })),
+                        },
+                    };
+                },
+            };
+
+            await pullAndApplyMirrorPage({ db: database, module, domain: "memories" });
+            expect(calls[0]?.live_only, scenario.name).toBe(true);
+            expect(
+                database.prepare("SELECT id FROM memories WHERE id = 9395").get() != null,
+                scenario.name,
+            ).toBe(scenario.survives);
+            expect(
+                database
+                    .prepare("SELECT status FROM mirror_resnapshot_state WHERE domain = 'memories'")
+                    .get(),
+                scenario.name,
+            ).toEqual({ status: "complete" });
+            database.close();
+        }
     });
 
     test("drain finish removes the marker only after module ownership returns to TS", async () => {

@@ -47,6 +47,7 @@ export interface AuthorityModuleClient {
         domain: AuthorityDomain;
         cursor: number;
         limit: number;
+        live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: ChangefeedPage }>;
 }
@@ -724,6 +725,55 @@ function rowNullableString(row: Record<string, unknown>, key: string): string | 
     return typeof value === "string" ? value : null;
 }
 
+type MirrorResnapshotStatus = "pending_check" | "resnapshotting" | "complete";
+
+function memoryResnapshotStatus(db: Database): MirrorResnapshotStatus | null {
+    const row = db
+        .prepare("SELECT status FROM mirror_resnapshot_state WHERE domain = 'memories'")
+        .get() as { status?: MirrorResnapshotStatus } | undefined;
+    return row?.status ?? null;
+}
+
+function setMemoryResnapshotStatus(db: Database, status: MirrorResnapshotStatus): void {
+    db.prepare(
+        `INSERT INTO mirror_resnapshot_state(domain, status, updated_at)
+         VALUES ('memories', ?, ?)
+         ON CONFLICT(domain) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`,
+    ).run(status, Date.now());
+}
+
+function upgradeMemoryMirrorNeedsResnapshot(db: Database): boolean {
+    const live = db.prepare("SELECT COUNT(*) AS count FROM mirror_live_memory_rows").get() as {
+        count: number;
+    };
+    const identities = db
+        .prepare("SELECT COUNT(*) AS count FROM mirror_identity WHERE domain = 'memories'")
+        .get() as { count: number };
+    return live.count === 0 && identities.count > 0;
+}
+
+function replaceLiveMemorySnapshot(db: Database, rows: readonly ChangefeedRow[]): void {
+    db.prepare("DELETE FROM mirror_live_memory_rows").run();
+    const insert = db.prepare(
+        `INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash)
+         VALUES (?, ?, ?, ?)`,
+    );
+    for (const feed of rows) {
+        const row = feed.full_row_snapshot;
+        const moduleProject = rowString(row, "project_path");
+        const normalizedHash = rowString(row, "normalized_hash");
+        if (!moduleProject || !normalizedHash) {
+            throw new Error("live memory snapshot omitted project_path or normalized_hash");
+        }
+        insert.run(
+            moduleProject,
+            feed.module_row_id,
+            rowString(row, "category", "CONSTRAINTS"),
+            normalizedHash,
+        );
+    }
+}
+
 function mirrorIdentity(
     db: Database,
     domain: AuthorityDomain,
@@ -1078,6 +1128,27 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
     let nextCursor = durableCursor;
     withPrivilegedWriter(db, () => {
         db.transaction(() => {
+            let resnapshotStatus =
+                page.domain === "memories" ? memoryResnapshotStatus(db) : "complete";
+            if (
+                page.domain === "memories" &&
+                durableCursor === 0 &&
+                resnapshotStatus !== "complete"
+            ) {
+                // A cursor-zero replay observes every insert before its tombstone, so it is
+                // equivalent to a live resnapshot and may safely enable destructive cleanup.
+                setMemoryResnapshotStatus(db, "complete");
+                resnapshotStatus = "complete";
+            }
+            if (
+                page.domain === "memories" &&
+                resnapshotStatus !== "complete" &&
+                page.rows.some((feed) => feed.op === "tombstone")
+            ) {
+                // Upgrade cursors can start after a canonical insert. Never delete through a
+                // tombstone until the module's current live identities have been captured.
+                throw new Error("memory mirror resnapshot must complete before tombstones");
+            }
             const touchedProjects = new Set<string>();
             for (const feed of page.rows) {
                 if (feed.domain !== page.domain || feed.feed_seq <= nextCursor) continue;
@@ -1103,6 +1174,57 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
     return nextCursor;
 }
 
+async function ensureLiveMemoryResnapshot(args: {
+    db: Database;
+    module: AuthorityModuleClient;
+    limit: number;
+}): Promise<void> {
+    const initialStatus = memoryResnapshotStatus(args.db);
+    if (!initialStatus || initialStatus === "complete") return;
+    if (initialStatus === "pending_check" && !upgradeMemoryMirrorNeedsResnapshot(args.db)) {
+        withPrivilegedWriter(args.db, () => {
+            args.db.transaction(() => setMemoryResnapshotStatus(args.db, "complete")).immediate();
+        });
+        return;
+    }
+    if (!args.module.mirrorPull) {
+        throw new Error("memory mirror resnapshot requires the mirror.pull module route");
+    }
+    withPrivilegedWriter(args.db, () => {
+        args.db.transaction(() => setMemoryResnapshotStatus(args.db, "resnapshotting")).immediate();
+    });
+
+    const rows: ChangefeedRow[] = [];
+    let cursor = 0;
+    while (true) {
+        const response = await args.module.mirrorPull({
+            domain: "memories",
+            cursor,
+            limit: args.limit,
+            live_only: true,
+        });
+        const page = response.page;
+        if (page.domain !== "memories" || page.cursor !== cursor) {
+            throw new Error("live memory resnapshot returned a mismatched page");
+        }
+        rows.push(...page.rows);
+        if (!page.has_more) break;
+        if (page.next_cursor <= cursor) {
+            throw new Error("live memory resnapshot did not advance its cursor");
+        }
+        cursor = page.next_cursor;
+    }
+
+    withPrivilegedWriter(args.db, () => {
+        args.db
+            .transaction(() => {
+                replaceLiveMemorySnapshot(args.db, rows);
+                setMemoryResnapshotStatus(args.db, "complete");
+            })
+            .immediate();
+    });
+}
+
 export async function pullAndApplyMirrorPage(args: {
     db: Database;
     module: AuthorityModuleClient;
@@ -1112,11 +1234,15 @@ export async function pullAndApplyMirrorPage(args: {
     if (!args.module.mirrorPull) {
         throw new Error("memory mirror consumer requires the mirror.pull module route");
     }
+    const limit = Math.max(1, Math.min(args.limit ?? 100, 1000));
+    if (args.domain === "memories") {
+        await ensureLiveMemoryResnapshot({ db: args.db, module: args.module, limit });
+    }
     const cursor = getMirrorCursor(args.db, args.domain);
     const response = await args.module.mirrorPull({
         domain: args.domain,
         cursor,
-        limit: Math.max(1, Math.min(args.limit ?? 100, 1000)),
+        limit,
     });
     return applyMirrorPage({ db: args.db, page: response.page });
 }

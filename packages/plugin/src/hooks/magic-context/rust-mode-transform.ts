@@ -79,6 +79,7 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         domain: "memories" | "notes";
         cursor: number;
         limit: number;
+        live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: import("../../features/magic-context/context-authority").ChangefeedPage }>;
     closeSession?(sessionId: string): void;
