@@ -14558,7 +14558,9 @@ mod shadow_tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, 30);
+        // The repair must land regardless of how many later migrations exist, so pin the
+        // floor rather than the exact head version.
+        assert!(schema_version >= 30);
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
