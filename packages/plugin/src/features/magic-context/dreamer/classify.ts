@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
 import { isRustAuthorityDrainingError } from "../../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../../plugin/types";
@@ -356,7 +358,13 @@ async function runClassifyThroughModule(
             v: 1,
             session_id: args.moduleSessionId,
             task: "classify",
-            command_id: `classify:${args.moduleCommandId ?? Date.now()}:${chunk.map((m) => m.id).join(",")}`,
+            // Chunk membership must stay in the id for retry idempotency, but a large
+            // chunk's literal id list can exceed the module's 256-byte command-id cap,
+            // so the membership rides as a digest.
+            command_id: `classify:${args.moduleCommandId ?? Date.now()}:${createHash("sha256")
+                .update(chunk.map((m) => m.id).join(","))
+                .digest("hex")
+                .slice(0, 24)}`,
             authority_generation: args.moduleAuthorityGeneration,
             payload: {
                 prompt_body: prompt,
