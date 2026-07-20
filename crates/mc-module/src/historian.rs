@@ -583,19 +583,50 @@ pub trait HistorianProducerDriver: Send {
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError>;
+    async fn start_with_generation(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        _max_output_tokens: u32,
+        _temperature: f64,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        self.start(session_id, system, prompt, model).await
+    }
     async fn await_output(
         &mut self,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError>;
+    async fn await_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        _timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        self.await_output(run_id).await
+    }
     async fn redrain_output(
         &mut self,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError> {
         self.await_output(run_id).await
     }
+    async fn redrain_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        _timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        self.redrain_output(run_id).await
+    }
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
     async fn close(&mut self);
+    /// Delete the provider session on every terminal path. The default calls close()
+    /// for compatibility with older test producers, while production producers override
+    /// this method to explicitly delete session data before closing.
+    async fn purge_session(&mut self, _session_id: &str) {
+        self.close().await;
+    }
 }
 
 #[subc_client_rs::async_trait]
@@ -615,6 +646,27 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::start(self, session_id, system, prompt, model).await
     }
 
+    async fn start_with_generation(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        max_output_tokens: u32,
+        temperature: f64,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        HistorianProducer::start_with_generation(
+            self,
+            session_id,
+            system,
+            prompt,
+            model,
+            max_output_tokens,
+            temperature,
+        )
+        .await
+    }
+
     async fn await_output(
         &mut self,
         run_id: &str,
@@ -629,6 +681,22 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::redrain_output(self, run_id).await
     }
 
+    async fn await_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        HistorianProducer::await_output_with_timeout(self, run_id, timeout).await
+    }
+
+    async fn redrain_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        HistorianProducer::redrain_output_with_timeout(self, run_id, timeout).await
+    }
+
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError> {
         HistorianProducer::status(self, run_id).await
     }
@@ -639,6 +707,15 @@ impl HistorianProducerDriver for HistorianProducer {
 
     async fn close(&mut self) {
         HistorianProducer::close(self).await;
+    }
+
+    async fn purge_session(&mut self, session_id: &str) {
+        if HistorianProducer::purge_session(self, session_id)
+            .await
+            .is_err()
+        {
+            HistorianProducer::close(self).await;
+        }
     }
 }
 

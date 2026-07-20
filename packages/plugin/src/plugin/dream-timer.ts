@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
+import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
 import {
@@ -96,6 +97,14 @@ interface ProjectRegistration {
     primerRawProviderFactory?: (
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
+    moduleClient?: ClassifyModuleClient & {
+        authorityStatus?: (args: {
+            context_store_uuid: string;
+            project: string;
+            projectRoot?: string;
+            domain: "memories" | "notes";
+        }) => Promise<{ authority: { state?: string; generation?: number } | null }>;
+    };
 }
 
 /** Singleton timer state. */
@@ -400,6 +409,7 @@ async function sweepProject(
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreamerConfig),
             ensureProjectRegistered: reg.ensureRegistered,
             language: reg.language,
+            moduleClient: reg.moduleClient,
         });
         const ran = await runDueTasksForProject({
             db,

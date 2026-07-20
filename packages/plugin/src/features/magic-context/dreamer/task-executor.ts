@@ -17,6 +17,7 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getCompartmentEvents } from "../compartment-events";
+import { getContextStoreUuid } from "../context-authority";
 import {
     getMemoriesByProject,
     getMemoryCountsByStatus,
@@ -26,7 +27,7 @@ import {
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
-import { runClassify } from "./classify";
+import { type ClassifyModuleClient, runClassify } from "./classify";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import {
@@ -90,6 +91,15 @@ export interface DreamTaskExecutorDeps {
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
     language?: string;
+    /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
+    moduleClient?: ClassifyModuleClient & {
+        authorityStatus?: (args: {
+            context_store_uuid: string;
+            project: string;
+            projectRoot?: string;
+            domain: "memories" | "notes";
+        }) => Promise<{ authority: { state?: string; generation?: number } | null }>;
+    };
 }
 
 /** A failed task either hot-retries (transient: provider/network/rate-limit/
@@ -315,6 +325,47 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "classify-memories") {
                 // Cache-neutral metadata write (classified_at/importance/scope/
                 // shareable) — no memory_changes telemetry (status counts unchanged).
+                let moduleArgs:
+                    | Pick<
+                          import("./classify").ClassifyArgs,
+                          | "moduleClient"
+                          | "moduleSessionId"
+                          | "moduleProjectRoot"
+                          | "moduleContextStoreUuid"
+                          | "moduleAuthorityGeneration"
+                          | "moduleCommandId"
+                      >
+                    | undefined;
+                const moduleTransport = deps.moduleClient;
+                if (moduleTransport?.authorityStatus) {
+                    const contextStoreUuid = getContextStoreUuid(db);
+                    if (!contextStoreUuid) {
+                        throw new Error("Rust classify requires a context store identity");
+                    }
+                    const authority = await moduleTransport.authorityStatus({
+                        context_store_uuid: contextStoreUuid,
+                        project: projectIdentity,
+                        projectRoot: deps.sessionDirectory,
+                        domain: "memories",
+                    });
+                    if (authority.authority?.state === "MODULE") {
+                        const generation = authority.authority.generation;
+                        if (typeof generation !== "number") {
+                            throw new Error("Rust classify authority response omitted generation");
+                        }
+                        const moduleClient: ClassifyModuleClient = {
+                            call: (callArgs) => moduleTransport.call(callArgs),
+                        };
+                        moduleArgs = {
+                            moduleClient,
+                            moduleSessionId: projectIdentity,
+                            moduleProjectRoot: deps.sessionDirectory,
+                            moduleContextStoreUuid: contextStoreUuid,
+                            moduleAuthorityGeneration: generation,
+                            moduleCommandId: `${startedAt}:${holderId}`,
+                        };
+                    }
+                }
                 const result = await runClassify({
                     db,
                     client: deps.client,
@@ -326,6 +377,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
+                    ...moduleArgs,
                 });
                 recordRun("completed", null);
                 log(

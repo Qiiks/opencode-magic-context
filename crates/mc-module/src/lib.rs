@@ -18,6 +18,7 @@
 
 pub mod boundary;
 pub mod ck_wire;
+pub mod classify;
 pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
@@ -66,6 +67,11 @@ use subc_client_rs::{
 };
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
+use classify::{
+    child_session_id, CLASSIFY_AWAIT_TIMEOUT, CLASSIFY_MAX_OUTPUT_TOKENS,
+    CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK, CLASSIFY_TEMPERATURE,
+    MAX_CLASSIFY_PROMPT_BYTES,
+};
 use config::{ConfigCache, McModuleConfig};
 use healing::{tail_reclaim, SerializerProfile};
 use historian::{reattach_historian_producer, run_historian_firing, HistorianProducerDriver};
@@ -1740,6 +1746,9 @@ pub struct McHandler {
     shadow_seeds: Mutex<ShadowSeedCoordinator>,
     transform_pages: Mutex<TransformPageCoordinator>,
     state_imports: Mutex<StateImportCoordinator>,
+    /// Module-minted zero-tool dreamer sessions. Prefixes are diagnostics only;
+    /// only registered ids may bypass transform after route validation.
+    active_dreamer_runs: Arc<Mutex<HashSet<String>>>,
 }
 
 #[async_trait]
@@ -2103,6 +2112,7 @@ impl McHandler {
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
+            active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -2168,6 +2178,7 @@ impl McHandler {
             shadow_seeds: Mutex::new(ShadowSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
+            active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -2249,6 +2260,9 @@ impl McHandler {
             })
         };
         if let Some(session) = last_session_route {
+            if session.starts_with("mc-dreamer:") {
+                self.unregister_dreamer_run(&session);
+            }
             self.scheduler_observations
                 .lock()
                 .expect("scheduler observations mutex")
@@ -5451,12 +5465,48 @@ impl McHandler {
             .session_id
             .starts_with(historian::MC_CHILD_SESSION_PREFIX)
         {
+            // The established historian namespace remains accepted for compatibility with
+            // existing producer sessions. Dreamer IDs instead require registration and route
+            // validation before they may bypass the transform.
             let mut response = transform::TransformResponse::passthrough(
                 parsed.messages.iter().map(|m| m.ck.clone()).collect(),
                 parsed.full_array_fingerprint.clone(),
             );
             attach_native_messages(&mut response, &parsed, 0);
             return respond(serde_json::to_value(response).unwrap_or(Value::Null));
+        }
+        if self.dreamer_run_registered(&parsed.session_id) {
+            // Registration is the authority for a dreamer exemption. Validate the route
+            // before trusting it so a stale or cross-project channel cannot bypass transform.
+            match self.resolve_binding(channel, &parsed.session_id) {
+                Ok(binding) if !is_shadow_session(&binding.session) => {
+                    let mut response = transform::TransformResponse::passthrough(
+                        parsed.messages.iter().map(|m| m.ck.clone()).collect(),
+                        parsed.full_array_fingerprint.clone(),
+                    );
+                    attach_native_messages(&mut response, &parsed, 0);
+                    return respond(serde_json::to_value(response).unwrap_or(Value::Null));
+                }
+                Ok(_) => {
+                    return HandlerOutcome::Error {
+                        code: "plain_transform_on_shadow_binding".to_string(),
+                        message: "registered dreamer session cannot use a shadow route".to_string(),
+                    }
+                }
+                Err(BindingError::Unbound) => {
+                    return HandlerOutcome::Error {
+                        code: "route_unbound".to_string(),
+                        message: "registered dreamer session has no bound route".to_string(),
+                    }
+                }
+                Err(BindingError::SessionMismatch) => {
+                    return HandlerOutcome::Error {
+                        code: "session_mismatch".to_string(),
+                        message: "registered dreamer session does not match the bound route"
+                            .to_string(),
+                    }
+                }
+            }
         }
         let parsed = Arc::new(parsed);
         let store = match self.store.get() {
@@ -6995,11 +7045,358 @@ impl McHandler {
         )
     }
 
+    fn register_dreamer_run(&self, session_id: &str) {
+        self.active_dreamer_runs
+            .lock()
+            .expect("dreamer registry mutex")
+            .insert(session_id.to_string());
+    }
+
+    fn unregister_dreamer_run(&self, session_id: &str) {
+        self.active_dreamer_runs
+            .lock()
+            .expect("dreamer registry mutex")
+            .remove(session_id);
+    }
+
+    fn dreamer_run_registered(&self, session_id: &str) -> bool {
+        self.active_dreamer_runs
+            .lock()
+            .expect("dreamer registry mutex")
+            .contains(session_id)
+    }
+
+    async fn handle_dreamer_run_task(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (ledger_session, binding) =
+            match self.management_binding(channel, request, "dreamer.run_task") {
+                Ok(value) => value,
+                Err(outcome) => return outcome,
+            };
+        let Some(store) = self.store.get().cloned() else {
+            return store_unavailable_error();
+        };
+        let Some(task) = request.get("task").and_then(Value::as_str) else {
+            return invalid_params_error("dreamer.run_task requires task");
+        };
+        if task != CLASSIFY_TASK {
+            // Enumerating the task here is a capability boundary: callers cannot use this
+            // route to select an arbitrary system prompt, model, or tool-enabled run.
+            return invalid_params_error(format!("unknown dreamer task {task:?}"));
+        }
+        let Some(command_id) = request.get("command_id").and_then(Value::as_str) else {
+            return invalid_params_error("dreamer.run_task requires command_id");
+        };
+        if command_id.trim().is_empty() || command_id.len() > 256 {
+            return invalid_params_error("dreamer.run_task command_id must be 1-256 bytes");
+        }
+        let Some(authority_generation) =
+            request.get("authority_generation").and_then(Value::as_u64)
+        else {
+            return invalid_params_error("dreamer.run_task requires authority_generation");
+        };
+        let route_root = binding.project_root.to_string_lossy().to_string();
+        let Some(project) = (match store.authority_project_for_route(&route_root, "memories") {
+            Ok(project) => project,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "authority_lookup_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        }) else {
+            return HandlerOutcome::Error {
+                code: "authority_not_module".to_string(),
+                message: "memories authority for this route is not MODULE".to_string(),
+            };
+        };
+        let Some((context_store_uuid, authority_project)) =
+            (match store.module_authority_for_project(&project, "memories") {
+                Ok(authority) => authority,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "authority_lookup_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            })
+        else {
+            return HandlerOutcome::Error {
+                code: "authority_not_module".to_string(),
+                message: "memories authority for this route is not MODULE".to_string(),
+            };
+        };
+        let authority =
+            match store.authority_status(&context_store_uuid, &authority_project, "memories") {
+                Ok(Some(authority)) => authority,
+                Ok(None) => {
+                    return HandlerOutcome::Error {
+                        code: "authority_not_module".to_string(),
+                        message: "memories authority row is missing".to_string(),
+                    }
+                }
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "authority_lookup_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+        if authority.state != "MODULE" {
+            return HandlerOutcome::Error {
+                code: "authority_not_module".to_string(),
+                message: format!("memories authority is {}", authority.state),
+            };
+        }
+        if authority.generation != authority_generation {
+            return HandlerOutcome::Error {
+                code: "authority_generation_mismatch".to_string(),
+                message: format!(
+                    "authority generation is {}, request used {authority_generation}",
+                    authority.generation
+                ),
+            };
+        }
+        let Some(payload) = request.get("payload").and_then(Value::as_object) else {
+            return invalid_params_error("dreamer.run_task requires an object payload");
+        };
+        let Some(prompt_body) = payload.get("prompt_body").and_then(Value::as_str) else {
+            return invalid_params_error("classify payload requires prompt_body");
+        };
+        if prompt_body.len() > MAX_CLASSIFY_PROMPT_BYTES {
+            return HandlerOutcome::Error {
+                code: "payload_too_large".to_string(),
+                message: format!("classify prompt_body exceeds {MAX_CLASSIFY_PROMPT_BYTES} bytes"),
+            };
+        }
+        if payload.get("items").and_then(Value::as_array).is_none() {
+            return invalid_params_error("classify payload requires items");
+        }
+
+        if let Ok(Some(recorded)) = store.load_dream_task_command(&ledger_session, command_id) {
+            return replay_dream_task_response(&recorded.response_json);
+        }
+
+        let child_session = child_session_id(&authority_project, command_id);
+        self.register_dreamer_run(&child_session);
+        let mut attempts = 0usize;
+        let mut last_error = String::new();
+        let mut output = None;
+        for model in &binding.config.model_chain {
+            attempts += 1;
+            let mut producer = match self.producer_factory.connect(&binding.project_root).await {
+                Ok(producer) => producer,
+                Err(error) => {
+                    last_error = error.to_string();
+                    continue;
+                }
+            };
+            let started = producer
+                .start_with_generation(
+                    &child_session,
+                    CLASSIFY_SYSTEM_PROMPT,
+                    prompt_body,
+                    model,
+                    CLASSIFY_MAX_OUTPUT_TOKENS,
+                    CLASSIFY_TEMPERATURE,
+                )
+                .await;
+            let attempt_output = match started {
+                Ok(handle) => match producer
+                    .await_output_with_timeout(&handle.run_id, CLASSIFY_AWAIT_TIMEOUT)
+                    .await
+                {
+                    Ok(result) => Ok(result),
+                    Err(HistorianProducerError::TimedOut) => {
+                        producer
+                            .redrain_output_with_timeout(&handle.run_id, CLASSIFY_RECOVERY_TIMEOUT)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            match attempt_output {
+                Ok(result) => {
+                    // The module never parses manifests. A capped result is still returned
+                    // with truncated=true so the host's fail-closed parser remains the
+                    // authority for output validity.
+                    output = Some((model.clone(), result));
+                    producer.purge_session(&child_session).await;
+                    break;
+                }
+                Err(error) => last_error = error.to_string(),
+            }
+            producer.purge_session(&child_session).await;
+        }
+        if output.is_none() {
+            self.unregister_dreamer_run(&child_session);
+            let response = json!({
+                "ok": false,
+                "code": "dreamer_run_failed",
+                "message": if last_error.is_empty() { "classify producer has no usable model" } else { &last_error },
+            });
+            let _ = store.record_dream_task_command(
+                &ledger_session,
+                command_id,
+                &response.to_string(),
+                now_ms(),
+            );
+            return HandlerOutcome::Error {
+                code: "dreamer_run_failed".to_string(),
+                message: last_error,
+            };
+        }
+        self.unregister_dreamer_run(&child_session);
+        let (model, result) = output.expect("classifier output set");
+        let response = json!({
+            "ok": true,
+            "manifest_text": result.text,
+            "truncated": result.length_capped,
+            "diagnostics": {
+                "task": CLASSIFY_TASK,
+                "model": model,
+                "attempts": attempts,
+                "child_session_id": child_session,
+                "temperature": CLASSIFY_TEMPERATURE,
+                "max_output_tokens": CLASSIFY_MAX_OUTPUT_TOKENS,
+                "await_timeout_ms": CLASSIFY_AWAIT_TIMEOUT.as_millis(),
+                "recovery_timeout_ms": CLASSIFY_RECOVERY_TIMEOUT.as_millis(),
+            }
+        });
+        match store.record_dream_task_command(
+            &ledger_session,
+            command_id,
+            &response.to_string(),
+            now_ms(),
+        ) {
+            Ok(recorded) => replay_dream_task_response(&recorded.response_json),
+            Err(error) => HandlerOutcome::Error {
+                code: "dreamer_ledger_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_memory_set_classification(
+        &self,
+        channel: u16,
+        request: &Value,
+    ) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request, &["rows"]) else {
+            return invalid_params_error("memory.set_classification requires arguments");
+        };
+        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
+            return invalid_params_error("memory.set_classification requires memory_project");
+        };
+        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
+            return outcome;
+        }
+        let binding = match self.facade_binding(channel) {
+            Ok(binding) => binding,
+            Err(_) => return session_unresolved_error(),
+        };
+        let route_root = binding.project_root.to_string_lossy().to_string();
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let authority_project = match store.authority_project_for_route(&route_root, "memories") {
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                return HandlerOutcome::Error {
+                    code: "authority_not_module".to_string(),
+                    message: "classification requires MODULE memories authority".to_string(),
+                }
+            }
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "authority_lookup_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        if authority_project != memory_project {
+            return HandlerOutcome::Error {
+                code: "facade_project_vocabulary_mismatch".to_string(),
+                message: format!(
+                    "classification route is owned by {authority_project}, not {memory_project}"
+                ),
+            };
+        }
+        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
+        else {
+            return invalid_params_error("memory.set_classification requires context_store_uuid");
+        };
+        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
+        else {
+            return invalid_params_error("memory.set_classification requires authority_generation");
+        };
+        let Some(rows) = args.get("rows").and_then(Value::as_array) else {
+            return invalid_params_error("memory.set_classification requires rows");
+        };
+        let mut updates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(row) = row.as_object() else {
+                return invalid_params_error("classification rows must be objects");
+            };
+            let Some(memory_id) = row.get("memory_id").and_then(Value::as_i64) else {
+                return invalid_params_error("classification row requires memory_id");
+            };
+            let Some(hash) = row.get("content_hash_at_prompt").and_then(Value::as_str) else {
+                return invalid_params_error("classification row requires content_hash_at_prompt");
+            };
+            updates.push(mc_store::ClassificationUpdate {
+                memory_id,
+                content_hash_at_prompt: hash.to_string(),
+                importance: row
+                    .get("importance")
+                    .and_then(Value::as_i64)
+                    .map(|value| value as i32),
+                scope: row
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                shareable: row.get("shareable").and_then(Value::as_bool),
+            });
+        }
+        match store.set_memory_classification(
+            context_store_uuid,
+            memory_project,
+            authority_generation,
+            &updates,
+            now_ms(),
+        ) {
+            Ok(result) => respond(json!({
+                "accepted": result.accepted,
+                "rejected": result.rejected.iter().map(|row| json!({ "memory_id": row.memory_id, "reason": row.reason })).collect::<Vec<_>>(),
+            })),
+            Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
+                HandlerOutcome::Error {
+                    code: "authority_generation_mismatch".to_string(),
+                    message: format!("authority generation is {found}, request used {expected}"),
+                }
+            }
+            Err(McStoreError::AuthorityStateMismatch { expected, found }) => {
+                HandlerOutcome::Error {
+                    code: "authority_state_mismatch".to_string(),
+                    message: format!("authority state is {found}, expected {expected}"),
+                }
+            }
+            Err(error) => HandlerOutcome::Error {
+                code: "classification_apply_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     async fn handle_facade_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         let Some(name) = request.get("name").and_then(Value::as_str) else {
             return unrecognized_request_error(&request);
         };
         match name {
+            "memory.set_classification" => {
+                self.handle_memory_set_classification(channel, &request)
+                    .await
+            }
             "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
@@ -7908,6 +8305,7 @@ impl McHandler {
                 | "authority.drain_finish" => self.handle_authority_drain_value(&request, method),
                 "mirror.pull" => self.handle_mirror_pull_value(&request),
                 "guidance.get" => self.handle_guidance_value(channel, &request),
+                "dreamer.run_task" => self.handle_dreamer_run_task(channel, &request).await,
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
                 "transform" => {
@@ -8138,6 +8536,30 @@ fn need_full_sync_response(full_array_fingerprint: Option<String>) -> HandlerOut
         ))
         .unwrap_or(Value::Null),
     )
+}
+
+fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
+    let Ok(response) = serde_json::from_str::<Value>(response_json) else {
+        return HandlerOutcome::Error {
+            code: "dreamer_ledger_corrupt".to_string(),
+            message: "recorded dreamer response is not valid JSON".to_string(),
+        };
+    };
+    if response.get("ok").and_then(Value::as_bool) == Some(false) {
+        return HandlerOutcome::Error {
+            code: response
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("dreamer_run_failed")
+                .to_string(),
+            message: response
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("dreamer task failed")
+                .to_string(),
+        };
+    }
+    respond(response)
 }
 
 fn respond(value: Value) -> HandlerOutcome {
@@ -12731,6 +13153,94 @@ mod tests {
             feed.rows.len() >= 6,
             "every mutation must append changefeed state"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classification_facade_hash_fences_rows_and_keeps_m1_revision_stable() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_project_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_project_root, "token"));
+        activate_module_authority(
+            &store,
+            "context",
+            "git:classify",
+            route_project_root,
+            "memories",
+        );
+        let fresh_id = insert_memory(
+            &store,
+            "git:classify",
+            "PROJECT_RULES",
+            "fresh classification",
+            1,
+        );
+        let stale_id = insert_memory(
+            &store,
+            "git:classify",
+            "PROJECT_RULES",
+            "stale classification",
+            1,
+        );
+        let fresh_hash = store
+            .get_memory_full(fresh_id)
+            .unwrap()
+            .unwrap()
+            .normalized_hash;
+        let generation = store
+            .authority_status("context", "git:classify", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+        let before = crate::m1_compose::m1_revision_signal(&store, "git:classify", "session")
+            .unwrap();
+        let outcome = call_facade(
+            &handler,
+            "memory.set_classification",
+            json!({
+                "memory_project": "git:classify",
+                "context_store_uuid": "context",
+                "authority_generation": generation,
+                "rows": [
+                    {
+                        "memory_id": fresh_id,
+                        "content_hash_at_prompt": fresh_hash,
+                        "importance": 91,
+                        "scope": "project",
+                        "shareable": true
+                    },
+                    {
+                        "memory_id": stale_id,
+                        "content_hash_at_prompt": "stale-hash",
+                        "importance": 1,
+                        "scope": "project",
+                        "shareable": true
+                    }
+                ]
+            }),
+        )
+        .await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("classification facade failed: {other:?}"),
+        };
+        assert_eq!(response["accepted"], json!([fresh_id]));
+        assert_eq!(response["rejected"][0]["reason"], "stale");
+        assert_eq!(
+            store.get_memory_full(fresh_id).unwrap().unwrap().importance,
+            Some(91)
+        );
+        let after = crate::m1_compose::m1_revision_signal(&store, "git:classify", "session")
+            .unwrap();
+        assert_eq!(before, after, "classification metadata must not change m1");
+        let feed = store.pull_changefeed("memories", 0, 100).unwrap();
+        assert!(feed
+            .rows
+            .iter()
+            .any(|row| row.op == "update" && row.module_row_id == fresh_id));
     }
 
     #[tokio::test(flavor = "current_thread")]

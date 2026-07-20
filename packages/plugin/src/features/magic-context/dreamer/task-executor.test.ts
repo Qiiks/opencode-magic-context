@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { ensureContextStoreUuid } from "../context-authority";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -283,6 +284,76 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         // stamped → no longer unclassified) and importance moved off the default.
         const stillUnclassified = getUnclassifiedMemoryIds(db, ids);
         expect(stillUnclassified).toEqual([]);
+    });
+
+    test("rust MODULE route uses the module manifest and host-side sensitive-text veto", async () => {
+        db = freshDb();
+        const project = "/repo/rust-classify";
+        ensureContextStoreUuid(db);
+        const sensitive = insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "Use token sk-test-secret only on my localhost machine.",
+        });
+        for (let i = 0; i < 11; i += 1) {
+            insertMemory(db, {
+                projectPath: project,
+                category: "ARCHITECTURE",
+                content: `The cache-neutral classification path is module-owned (${i}).`,
+            });
+        }
+        const moduleCalls: Array<{ method: string; body: unknown }> = [];
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [{ id: "parent" }] })),
+                create: mock(async () => ({ data: { id: "must-not-create" } })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const moduleClient = {
+            authorityStatus: mock(async () => ({ authority: { state: "MODULE", generation: 3 } })),
+            call: mock(async (args: { method: string; body: unknown }) => {
+                moduleCalls.push(args);
+                if (args.method === "dreamer.run_task") {
+                    const body = args.body as { payload: { items: Array<{ memory_id: number }> } };
+                    return {
+                        ok: true,
+                        manifest_text: `<classify>${body.payload.items
+                            .map(
+                                (item) =>
+                                    `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
+                            )
+                            .join("")}</classify>`,
+                        truncated: false,
+                    };
+                }
+                return { accepted: [sensitive.id], rejected: [] };
+            }),
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            moduleClient: moduleClient as never,
+        });
+        const leaseKey = leaseKeyFor("classify-memories", project);
+        expect(acquireLease(db, "holder-rust-classify", leaseKey)).toBe(true);
+        const result = await executor(
+            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "holder-rust-classify", leaseKey },
+        );
+        expect(result.status).toBe("completed");
+        expect(client.session.create).not.toHaveBeenCalled();
+        expect(moduleCalls.map((call) => call.method)).toEqual([
+            "dreamer.run_task",
+            "memory.set_classification",
+        ]);
+        const applyBody = moduleCalls[1].body as {
+            arguments: { rows: Array<{ memory_id: number; shareable: boolean }> };
+        };
+        expect(
+            applyBody.arguments.rows.find((row) => row.memory_id === sensitive.id)?.shareable,
+        ).toBe(false);
     });
 });
 
